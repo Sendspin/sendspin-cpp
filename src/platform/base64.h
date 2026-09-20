@@ -13,22 +13,9 @@
 // limitations under the License.
 
 /// @file base64.h
-/// @brief Platform-abstracted base64 helpers.
-///
-/// Provides two sets of helpers:
-///
-/// 1. **Standard base64 encode/decode** (`platform_base64_encode` / `platform_base64_decode`):
-///    wrap mbedTLS on ESP and a built-in implementation on host.  Handle the `+`/`/` alphabet
-///    with `=` padding (decode also tolerates missing padding on host; ESP's mbedTLS backend
-///    requires exact padding; see the b64url wrappers below for how that is bridged).
-///
-/// 2. **URL-safe base64url** (`b64url_encode` / `b64url_decode`): thin wrappers around
-///    platform_base64_encode/decode that transliterate the `-`/`_` alphabet to `+`/`/` (and
-///    back) and add/strip `=` padding, so the URL-safe helpers are *identical* on host and ESP
-///    and both route through the platform's real base64 implementation instead of
-///    reimplementing the bit-accumulator loop a second time. Output has no `=` padding
-///    (RFC 4648 section 5). These are required for Noise-protocol key identifiers (PSK IDs, peer
-///    IDs).
+/// @brief Platform-abstracted base64: `platform_base64_*` wrap mbedTLS on ESP and a built-in
+/// codec on host, for the standard `+`/`/` alphabet with `=` padding; `b64url_*` are portable
+/// wrappers for the URL-safe alphabet used by Noise key identifiers (PSK IDs, peer IDs).
 
 #pragma once
 
@@ -92,13 +79,7 @@ static constexpr unsigned char BASE64_DECODE_TABLE[128] = {
 };
 // clang-format on
 
-/// @brief Decodes base64 data (host implementation)
-/// @param[out] dst Output buffer, or nullptr for a size query.
-/// @param dlen Capacity of the output buffer in bytes.
-/// @param[out] olen Set to the number of decoded bytes written.
-/// @param src Pointer to the base64-encoded input data.
-/// @param slen Length of the input data in bytes.
-/// @return 0 on success, non-zero on error.
+/// @brief Decodes base64 data (host implementation); same contract as the ESP one above.
 inline int platform_base64_decode(uint8_t* dst, size_t dlen, size_t* olen, const uint8_t* src,
                                   size_t slen) {
     // Skip trailing padding and whitespace
@@ -150,17 +131,7 @@ static constexpr char BASE64_ENCODE_TABLE[65] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 // clang-format on
 
-/// @brief Encodes bytes to base64 (standard `+`/`/` alphabet, `=` padded; host implementation).
-/// Mirrors mbedtls_base64_encode's contract so the b64url wrappers below can share one
-/// implementation for both platforms.
-/// @param[out] dst Output buffer; must be non-null with dlen >= the required size (see olen).
-/// @param dlen Capacity of the output buffer in bytes, including room for the trailing NUL.
-/// @param[out] olen On success, the number of encoded bytes written (excluding the trailing
-///             NUL that is also written to dst[olen]). On error, the required dlen (including
-///             the trailing NUL).
-/// @param src Pointer to the raw input bytes.
-/// @param slen Length of the input data in bytes.
-/// @return 0 on success, non-zero on error (buffer too small).
+/// @brief Encodes bytes to base64 (host implementation); same contract as the ESP one above.
 inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const uint8_t* src,
                                   size_t slen) {
     if (slen == 0) {
@@ -208,29 +179,16 @@ inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const
 #endif  // ESP_PLATFORM
 
 // ============================================================================
-// Base64url helpers: portable, identical on both ESP and host.
-//
-// Implement the URL-safe base64 alphabet (RFC 4648 section 5) with no `=` padding:
-//   - encode uses `-` and `_` instead of `+` and `/`
-//   - encode strips trailing `=` padding
-//   - decode tolerates missing `=` padding
-//
-// Both are thin wrappers around platform_base64_encode/decode: transliterate the alphabet,
-// add/strip `=` padding, and delegate the actual bit-accumulator work to the platform
-// implementation above (mbedTLS on ESP, the built-in decoder/encoder on host). This avoids a
-// second, hand-rolled base64 codec and, on ESP, routes url-safe encode/decode through mbedTLS
-// like the standard-alphabet path already does. mbedTLS's decoder requires input padded to a
-// multiple of 4 characters, so decode always re-pads before delegating; the host decoder
-// tolerates that padding as a no-op (it strips trailing `=` itself), so one code path is
-// correct on both platforms.
+// Base64url helpers (RFC 4648 section 5): the `-`/`_` alphabet, no `=` padding, identical on
+// both platforms. Both transliterate the alphabet and delegate the bit-accumulator work to
+// platform_base64_encode/decode rather than hand-rolling a second codec. mbedTLS's decoder
+// requires input padded to a multiple of 4, so decode always re-pads; the host decoder strips
+// trailing `=` itself, so one path is correct on both platforms.
 // ============================================================================
 
 namespace sendspin {
 
-/// @brief Encode bytes to base64url, no `=` padding (RFC 4648 section 5).
-/// @param data  Input bytes.
-/// @param len   Number of bytes.
-/// @return ASCII string using only `A-Z a-z 0-9 - _`.
+/// @brief Encode bytes to base64url: an ASCII string of `A-Z a-z 0-9 - _`, no `=` padding.
 inline std::string b64url_encode(const uint8_t* data, size_t len) {
     if (len == 0) {
         return std::string();
@@ -258,9 +216,7 @@ inline std::string b64url_encode(const uint8_t* data, size_t len) {
     return out;
 }
 
-/// @brief Decode base64url, tolerating missing `=` padding (RFC 4648 section 5).
-/// @param s  Null-terminated base64url string.
-/// @return Decoded bytes, or std::nullopt on invalid input.
+/// @brief Decode base64url, tolerating missing `=` padding; nullopt on invalid input.
 inline std::optional<std::vector<uint8_t>> b64url_decode(const char* s) {
     size_t slen = std::strlen(s);
 
