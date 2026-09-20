@@ -50,9 +50,8 @@ constexpr int64_t seconds_to_us(double s) {
 }
 
 /// @brief Deadline (seconds) for a nursery connection to become operational (hello handshake
-/// complete AND first server/activate applied; connection.md "Multiple servers
-/// (server-initiated)"), measured from delivery (inbound, already WS-upgraded) or initiation
-/// (outbound, before DNS/TCP resolve)
+/// complete and first server/activate applied; connection.md "Multiple servers
+/// (server-initiated)"), measured from the connection's delivery or initiation
 ///
 /// Reaps peers that connect and then stall before becoming operational, and outbound sockets whose
 /// transport never delivers a close (host IXWebSocket). Sockets that never upgrade are
@@ -65,17 +64,10 @@ static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ES
 
 /// @brief Deadline (seconds) for the current (already-admitted) connection to re-prove itself
 /// after SendspinConnection::handle_noise_rehandshake() or ::note_pairing_finalize_ack() resets
-/// its operational state.
+/// its operational state. Enforced by ConnectionManager::scan_reprove_watchdog().
 ///
-/// Read by the re-proving watchdog in ConnectionManager::scan_reprove_watchdog() (called every
-/// tick from loop()), which is gated on
-/// !current_connection_->is_operational(). current_connection_ is never non-operational for any
-/// other reason: a nursery entry is only ever promoted once it is already operational (see
-/// promote_or_arbitrate_nursery_entry()), and an in-progress pairing-code PAKE exchange keeps
-/// is_operational() true throughout (that flow has its own timeouts, PAIRING_ATTEMPT_TIMEOUT_US
-/// and pairing_window_open(); see connection_manager.cpp). Shares NURSERY_ESTABLISH_TIMEOUT_S's
-/// value by design (same "reach the next protocol milestone within a bounded window" semantics)
-/// but is named separately because it applies to the current slot, not the nursery.
+/// Shares NURSERY_ESTABLISH_TIMEOUT_S's value and "reach the next milestone within a bounded
+/// window" semantics, named separately because it applies to the current slot, not the nursery.
 static constexpr double REPROVE_TIMEOUT_S = NURSERY_ESTABLISH_TIMEOUT_S;
 
 /// @brief Timeout in microseconds (derived from REPROVE_TIMEOUT_S).
@@ -95,26 +87,20 @@ int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config);
 ///
 /// stop() waits this long times the number of goodbyes it issued: on the ESP server path every
 /// goodbye is queued to the single httpd worker and handed to lwIP in turn, so a fixed bound
-/// would let the last of several peers lose its goodbye to the close. Per goodbye this is a few
-/// scheduler quanta for the worker to dequeue the frame. The host transports send synchronously,
-/// so on host the wait resolves before it starts. Send completion is best-effort (see
-/// SendspinConnection::send_text_message): a session that closes first never reports, so this is
-/// a cap on how long stop() blocks for its peers' sake, never a guarantee the goodbye arrived.
+/// would let the last of several peers lose its goodbye to the close. Send completion is
+/// best-effort, so this caps how long stop() blocks, never a guarantee the goodbye arrived.
 static constexpr uint32_t GOODBYE_FLUSH_TIMEOUT_MS = 50;
 
 /// @brief Counts the goodbye sends stop() is waiting on
 ///
 /// Shared by stop() and each connection's completion callback through a shared_ptr captured by
-/// value, so a completion that runs on a transport thread after stop() has given up (an ESP httpd
-/// worker draining late) touches only this record, never stop()'s stack or the manager.
+/// value, so a late completion touches only this record.
 struct GoodbyeWait {
-    /// @brief Registers one goodbye whose completion is awaited
     void add_pending() {
         std::lock_guard<std::mutex> lock(this->mutex);
         ++this->pending;
     }
 
-    /// @brief Records one completion; wakes wait() when none remain
     void complete_one() {
         {
             std::lock_guard<std::mutex> lock(this->mutex);
@@ -125,8 +111,7 @@ struct GoodbyeWait {
         this->cv.notify_all();
     }
 
-    /// @brief Blocks until every registered goodbye has completed or the bound elapses
-    /// @param timeout_ms Maximum time to wait.
+    /// @brief Blocks until every registered goodbye has completed, or `timeout_ms` elapses.
     /// @return true if every goodbye completed, false if the bound elapsed first.
     bool wait(uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mutex);
@@ -141,10 +126,8 @@ struct GoodbyeWait {
 
 /// @brief A connection that has not completed the hello handshake
 ///
-/// Unproven connections never occupy the current-connection slot; they wait in the bounded nursery
-/// until they establish, then are promoted (or released after losing the handoff comparison to an
-/// established incumbent). Inbound entries arrive WS-upgraded, so their hello is armed at
-/// admission; outbound entries arm theirs when the transport's connected event arrives.
+/// Inbound entries arrive WS-upgraded, so their hello is armed at admission; outbound entries arm
+/// theirs when the transport's connected event arrives.
 struct NurseryEntry {
     std::shared_ptr<SendspinConnection> conn;  ///< Observer; the session slot / transport owns
     bool inbound{false};  ///< true if accepted by the WS server, false for connect_to()
@@ -159,12 +142,9 @@ struct NurseryEntry {
 /// flush_deferred_releases() performs them lock-free.
 ///
 /// A role thread that holds its own reference (the sync task pins the connection whose time
-/// filter its stream uses) does not destroy it either: it hands the reference back through
-/// release_from_role_thread(), which queues it here with main_loop_only set. An outbound
-/// connection's destructor joins its transport thread (see above), which would otherwise land on
-/// the audio thread: the transport teardown on a stack sized for Opus decode, and a stall as long
-/// as the join. The inbound destructors are trivial, so the hand-over costs them only the one
-/// conn_ptr_mutex_ take per stream and keeps one rule for both.
+/// filter its stream uses) hands it back through release_from_role_thread(), which queues it
+/// here with main_loop_only set, so the outbound destructor's transport join never lands on the
+/// audio thread. Inbound destructors are trivial but take the same route, for one rule.
 struct DeferredRelease {
     std::shared_ptr<SendspinConnection> conn;  ///< A reference to drop; not necessarily the last
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: no goodbye owed, just release
@@ -179,7 +159,7 @@ struct DeferredRelease {
 /// The provider write is an NVS commit on ESP: tens of milliseconds during which nothing else
 /// may enter the manager: no network thread in on_new_connection(), and no off-main-loop caller
 /// resolving the current connection through current_shared(). Locked sections therefore only
-/// decide WHICH record (or server_id) the write covers, or, for PERSIST_RECORDS, apply the RAM
+/// decide which record (or server_id) the write covers, or, for PERSIST_RECORDS, apply the RAM
 /// half and stage the array write that owes it; flush_pending_record_ops() performs the writes
 /// with no lock held.
 struct PendingRecordOp {
@@ -204,8 +184,6 @@ enum class PairingDropAction : uint8_t {
 
 /// @brief Deferred pair/abort event: the server (or wire) sent pair/abort during pairing.
 /// Processed on the main loop in ConnectionManager::loop().
-/// (The server/pair-finalize ack is committed synchronously on the network thread, and the
-/// leftover-activate case is handled inline in the activate handler, so neither is deferred.)
 struct PairAbortEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection on which the abort arrived
     PairAbortReason reason{};                  ///< Parsed abort reason
@@ -287,11 +265,9 @@ struct ServerActivateEvent {
 ///
 /// conn->pairing_session().code_emitted / .window_shown are the sole record of whether a pairing
 /// code or pairing-window prompt is still showing, and every path that ends a pairing attempt
-/// clears that state (cleanup_connection_state() on the current-slot drop path,
-/// clear_pairing_state()) before it gets a chance to dismiss the prompt. Capture the flags
-/// BEFORE that cleanup runs, then dismiss afterward (dismiss_pairing_ui(), or the client's
-/// note_*() calls on the stop() path) so the dismissal still happens even though the flags it
-/// would have read are already gone.
+/// clears that state before it gets a chance to dismiss the prompt. Capture the flags first,
+/// then dismiss afterward (dismiss_pairing_ui(), or the client's note_*() calls on the stop()
+/// path).
 struct PairingUiSnapshot {
     bool code_was_emitted;
     bool window_was_shown;
@@ -311,40 +287,12 @@ struct PairingUiSnapshot {
  * server/activate admitted. The platform ws_server delivers inbound connections only after
  * observing their WebSocket upgrade, so the manager never reasons about raw sockets that might
  * not speak WebSocket; those are closed inside the platform layer. Invariant:
- * `current_connection_ != nullptr` implies `current_connection_->is_operational()`, EXCEPT for
- * the transient window while an already-admitted connection re-proves itself: after a successful
- * in-band re-handshake (SendspinConnection::handle_noise_rehandshake(), after which the server
- * owes a fresh server/activate under the new keys) or after the server acks
- * client/pair-finalize and is expected to rekey via one
- * (SendspinConnection::note_pairing_finalize_ack()). The invariant is restored once that
- * activation arrives. If it does not, the re-proving-deadline check (REPROVE_TIMEOUT_US) in
- * scan_reprove_watchdog(), called every tick from loop(), drops the connection. For why this
- * state is tracked as independent flags rather than a single phase enum, see the
- * lifecycle-flag axes note above SendspinConnection's atomic flag members in connection.h.
+ * `current_connection_ != nullptr` implies `current_connection_->is_operational()`, except in the
+ * re-proving window bounded by scan_reprove_watchdog().
  *
  * Every event-driven path here runs between SendspinClient::start() and ::stop(), so
  * client_->record_store_ and client_->identity_ are non-null and are not null-checked, except
  * where a site says why.
- *
- * Typical usage:
- *  1. Construct with a `SendspinClient*`.
- *  2. Call `start()` to open admission and create the WebSocket server.
- *  3. Call `loop()` periodically to drive connection state, process deferred events, and retry
- *     hellos.
- *  4. Call `connect_to()` to initiate an outgoing client connection when needed.
- *  5. Call `disconnect()` to gracefully close the active connection, or `stop()` to tear
- *     every connection and the server down synchronously.
- *
- * @code
- * ConnectionManager manager(client);
- * manager.start();
- *
- * while (running) {
- *     manager.loop();
- * }
- *
- * manager.stop(SendspinGoodbyeReason::SHUTDOWN);
- * @endcode
  */
 class ConnectionManager {
 public:
@@ -361,10 +309,9 @@ public:
 
     /// @brief Disconnects from the current server.
     ///
-    /// Must be called from the main loop thread: conn->disconnect() runs outside conn_ptr_mutex_
-    /// (it can block on the transport, and on host outbound it joins the transport thread), so
-    /// only the main loop's serialization keeps it from racing loop()'s reap/handoff release of
-    /// the same connection into two concurrent transport stops.
+    /// Main-loop thread only: conn->disconnect() runs outside conn_ptr_mutex_ (see
+    /// DeferredRelease), so only the main loop's serialization keeps it from racing loop()'s own
+    /// release of the same connection.
     /// @param reason The goodbye reason to send before closing.
     void disconnect(SendspinGoodbyeReason reason);
 
@@ -399,10 +346,7 @@ public:
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
     /// events, retries hello, calls loop() on active connections.
     ///
-    /// Implemented as a short driver over the named private steps in the "loop() decomposition"
-    /// section below; each step keeps its own locking.
-    ///
-    /// Tick cost: most steps are gated on one of the atomic hints in "Atomic fields" below
+    /// Tick cost: most steps are gated on one of the atomic hints
     /// (has_pending_events_, nursery_size_, has_current_, deferred_size_,
     /// pending_record_ops_size_), so they pay only the atomic loads needed to decide there is
     /// nothing to do. flush_pending_admission(),
@@ -417,7 +361,6 @@ public:
     // ========================================
 
     /// @brief Returns true if there is an active connection with completed handshake.
-    /// @return True if connected and handshake is complete, false otherwise.
     bool is_connected() const;
 
     /// @brief Returns the current active connection. Main-thread only.
@@ -431,14 +374,11 @@ public:
         return this->current_connection_.get();
     }
 
-    /// @brief Returns a shared_ptr to the current connection. Thread-safe.
-    /// The visualizer's drain thread, the public accessors on SendspinClient (callable from any
-    /// thread) and the sync task's once-per-stream pin must use this instead of current(): the
-    /// shared_ptr keeps the connection alive for the duration of the caller's use even if the
-    /// main loop concurrently drops or replaces the current connection. The main-loop drains
-    /// (artwork, metadata, color) come through here too. It takes conn_ptr_mutex_ under the same
-    /// lock order as current().
-    /// @return Shared pointer to the current connection, or nullptr if none.
+    /// @brief Returns a shared_ptr to the current connection, or nullptr if none. Thread-safe.
+    ///
+    /// Any caller that is not the main loop must use this instead of current(): the shared_ptr
+    /// keeps the connection alive for the duration of the caller's use even if the main loop
+    /// concurrently drops or replaces it. Takes conn_ptr_mutex_ in the same lock order.
     std::shared_ptr<SendspinConnection> current_shared() const {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         return this->current_connection_;
@@ -447,35 +387,23 @@ public:
     /// @brief Takes a role thread's connection reference back so the main loop destroys it.
     /// Thread-safe.
     ///
-    /// A role thread that outlives the manager's own reference (the sync task's stream pin) would
-    /// otherwise run ~SendspinConnection itself, which joins the transport thread: see
-    /// DeferredRelease. The reference is queued instead, as a main-loop-only entry, and destroyed
-    /// by the next flush_deferred_releases(); this is the one deferred-release push site that
-    /// does not flush on its own thread. loop() flushes twice per tick, and
-    /// SendspinClient::stop() flushes once more after it has joined the role threads, so a
-    /// hand-over can outlive its stream by at most one tick and never outlives the run.
-    /// @param conn The reference to hand over; taken by value, so callers should move. Null is a
-    ///        no-op.
+    /// Queued as a main-loop-only DeferredRelease, so ~SendspinConnection's transport join never
+    /// runs on a role thread. The one deferred-release push site that does not flush on its own
+    /// thread; loop() flushes twice per tick and SendspinClient::stop() once after the joins.
+    /// @param conn The reference to hand over; taken by value. Null is a no-op.
     void release_from_role_thread(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Performs the queued goodbye sends and connection releases from deferred_releases_.
-    /// Call on the main loop only: it performs every queued entry, including the main-loop-only
-    /// hand-overs (see flush_deferred_releases_off_loop()). Caller must NOT hold conn_ptr_mutex_
-    /// (see DeferredRelease). A queued release is performed exactly once. Called after every
-    /// locked section that can queue a release, by loop() as a backstop, and by
-    /// SendspinClient::stop() after the role threads are joined.
-    ///
-    /// Early-returns without locking when deferred_size_ reads 0; see the definition for the
-    /// soundness argument.
+    /// Main loop only; performs every queued entry, including the main-loop-only hand-overs.
+    /// Caller must not hold conn_ptr_mutex_ (see DeferredRelease). A queued release is performed
+    /// exactly once. Called after every locked section that can queue a release, by loop() as a
+    /// backstop, and by SendspinClient::stop() after the role threads are joined. Early-returns
+    /// without locking when deferred_size_ reads 0.
     void flush_deferred_releases();
 
-    /// @brief Performs the queued releases that any thread may perform, leaving the
-    /// main-loop-only ones for loop().
-    ///
-    /// The network-thread counterpart of flush_deferred_releases(), for on_new_connection(),
-    /// whose own rejections (a surplus peer that is owed a goodbye) must still leave on the
-    /// thread that took them rather than wait a tick. A skipped entry keeps deferred_size_
-    /// nonzero, so the next loop() flush picks it up.
+    /// @brief flush_deferred_releases() for a network thread: leaves the main-loop-only entries
+    /// queued. Used by on_new_connection(), whose own rejections must leave on the thread that
+    /// took them. A skipped entry keeps deferred_size_ nonzero for the next loop() flush.
     void flush_deferred_releases_off_loop();
 
     /// @brief psk_ids backing a currently-open connection, provisional or admitted. Thread-safe.
@@ -497,12 +425,9 @@ public:
 
     /// @brief Schedules an on_pairing_succeeded notification for deferred delivery in loop().
     ///
-    /// Called from SendspinClient::process_json_message() on the NETWORK thread when the
-    /// server/pair-finalize ack handler actually stores a long-term record. This is the one
-    /// pairing outcome notification that originates off the main loop, so it rides the same
-    /// pending_*_events_ / has_pending_events_ idiom as every other cross-thread mutation in
-    /// this class (not a bespoke thread-safe queue): loop() drains it and calls
-    /// SendspinClient::note_pairing_succeeded(), which queues the actual listener callback for
+    /// Called from SendspinClient::process_json_message() on the network thread when the
+    /// server/pair-finalize ack handler stores a long-term record. loop() drains it and calls
+    /// SendspinClient::note_pairing_succeeded(), which queues the listener callback for
     /// SendspinClient::loop() to fire unlocked.
     /// @param server_id The base64url public key of the newly paired server (moved).
     void schedule_pairing_succeeded(std::string server_id);
@@ -520,11 +445,10 @@ public:
     // ========================================
 
     /// @brief Sets the last-played server_id for handoff preference decisions. Main loop only.
-    /// @param server_id The server_id string of the last-played server; empty clears it.
+    /// @param server_id The server_id of the last-played server; empty clears it.
     void set_last_played_server_id(const std::string& server_id);
 
-    /// @brief Returns the current last-played server_id. Main loop only.
-    /// @return The server_id of the last-played server, or nullopt if unset.
+    /// @brief Returns the current last-played server_id, or nullopt if unset. Main loop only.
     const std::optional<std::string>& last_played_server_id() const {
         return this->last_played_server_id_;
     }
@@ -544,15 +468,12 @@ private:
     // ========================================
     // loop() decomposition
     // ========================================
-    // loop() is a short driver over the named steps below. Behavior, locking shape, and
-    // processing order are exactly as documented on loop() and on ConnectionManager above. Each
-    // method's doc comment states its
-    // lock contract; see loop()'s definition in connection_manager.cpp for the exact call
-    // sequence and the flush_deferred_releases() calls between steps.
+    // loop() is a short driver over the named steps below; each keeps its own locking, stated
+    // on its doc comment.
 
     /// @brief Snapshot of every deferred queue, filled by one swap under conn_mutex_ in
     /// swap_out_pending_events(). Lives in drained_events_ so the swap hands the queues back
-    /// buffers that keep their capacity. Private to ConnectionManager; never exposed outside it.
+    /// buffers that keep their capacity.
     struct DrainedEvents {
         std::vector<std::shared_ptr<SendspinConnection>> connected, disconnected;
         std::vector<ServerActivateEvent> activates;
@@ -639,7 +560,6 @@ private:
     // Connection setup
     // ========================================
     /// @brief Attaches message and lifecycle callbacks to a connection.
-    /// @param conn The connection to configure.
     void setup_connection_callbacks(SendspinConnection* conn);
     /// @brief Admits an incoming server connection into the nursery and starts its prove stage
     ///
@@ -657,42 +577,33 @@ private:
     ///             out from under in-flight httpd workers.
     void on_new_connection(std::shared_ptr<SendspinServerConnection> conn);
 
-    /// @brief Finds the nursery entry holding the given connection. Caller must hold
+    /// @brief Finds the nursery entry holding `conn`, or nursery_.end(). Caller must hold
     /// conn_ptr_mutex_.
-    /// @param conn The connection to look up.
-    /// @return Iterator into nursery_, or nursery_.end() if the connection is not in the nursery.
     std::vector<NurseryEntry>::iterator find_in_nursery(const SendspinConnection* conn);
 
-    /// @brief Refreshes nursery_size_ from nursery_.size(). Every nursery_ mutation site calls
-    /// this immediately afterward, in the same critical section, so the hint atomic can never
-    /// drift from the container. Caller must hold conn_ptr_mutex_.
+    // Each refresh_* helper below re-derives its hint atomic from the container's .size() in the
+    // same critical section as the mutation, so the hint can never drift. Caller must hold
+    // conn_ptr_mutex_.
+
+    /// @brief Refreshes nursery_size_ from nursery_.size().
     void refresh_nursery_size_hint();
 
     /// @brief Shared body of the two flush entry points.
     /// @param on_main_loop false leaves the main-loop-only entries queued (see DeferredRelease).
     void flush_deferred_releases(bool on_main_loop);
 
-    /// @brief Refreshes deferred_size_ from deferred_releases_.size(). Every deferred_releases_
-    /// mutation site calls this immediately afterward, in the same critical section, so the hint
-    /// atomic can never drift from the container. Caller must hold conn_ptr_mutex_.
+    /// @brief Refreshes deferred_size_ from deferred_releases_.size().
     void refresh_deferred_size_hint();
 
-    /// @brief Refreshes pending_record_ops_size_ from pending_record_ops_.size(). Every
-    /// pending_record_ops_ mutation site calls this immediately afterward, in the same critical
-    /// section, so the hint atomic can never drift from the container. Caller must hold
-    /// conn_ptr_mutex_.
+    /// @brief Refreshes pending_record_ops_size_ from pending_record_ops_.size().
     void refresh_record_ops_size_hint();
 
-    /// @brief Appends an entry to the nursery and refreshes nursery_size_ (via
-    /// refresh_nursery_size_hint()) in the same critical section, so the hint atomic can never
-    /// drift from nursery_.size(). Caller must hold conn_ptr_mutex_.
-    /// @param entry The nursery entry to add.
+    /// @brief Appends an entry to nursery_ and refreshes the hint.
     void push_nursery_entry(NurseryEntry entry);
 
-    /// @brief Assigns current_connection_ and refreshes has_current_ in the same critical section,
-    /// so the hint atomic can never drift from "current_connection_ != nullptr". Pass nullptr to
-    /// clear the slot. Caller must hold conn_ptr_mutex_ and call flush_pending_admission() after
-    /// dropping it: installing a connection only stages its admission.
+    /// @brief Assigns current_connection_ and refreshes has_current_. Pass nullptr to clear the
+    /// slot. Caller must hold conn_ptr_mutex_ and call flush_pending_admission() after dropping
+    /// it: installing a connection only stages its admission.
     /// @param conn The connection to install as current, or nullptr to clear; moved from.
     void set_current_connection(std::shared_ptr<SendspinConnection> conn);
 
@@ -710,17 +621,12 @@ private:
     void stage_record_op(PendingRecordOp::Kind kind, std::string value);
 
     /// @brief Applies the staged ops' RAM halves in staging order, so a second op on the same
-    /// record always lands after the first, then performs at most one records write and one
-    /// last-played write. Caller must NOT hold conn_ptr_mutex_ (see PendingRecordOp).
+    /// record lands after the first, then performs at most one records write and one last-played
+    /// write. Caller must not hold conn_ptr_mutex_ (see PendingRecordOp).
     ///
-    /// Called unconditionally once per tick, like flush_pending_admission() and
-    /// flush_deferred_releases() beside it, so it is not coupled to loop()'s lifecycle-block
-    /// gate, and again from stop(), which is the last chance a staged write gets. It does not
-    /// cover a staging site added LATER in loop() than this call: that op waits for the next
-    /// tick or the stop, and a manager destroyed without a stop() logs what it drops. Keep
-    /// staging sites ahead of this call, or add a second call the way flush_deferred_releases()
-    /// does. Early-returns without locking when pending_record_ops_size_ reads 0, so an idle
-    /// tick pays one acquire-load.
+    /// Called once per tick and again from stop(). An op staged later in loop() than this call
+    /// waits for the next tick or the stop; a manager destroyed without a stop() logs what it
+    /// drops. Early-returns without locking when pending_record_ops_size_ reads 0.
     void flush_pending_record_ops();
 
     /// @brief Sets has_pending_events_, the lock-free gate loop() polls before acquiring
@@ -734,10 +640,6 @@ private:
     /// the same critical section, so loop() can never miss a pushed event. Every
     /// pending_*_events_ push in this class goes through this one template instead of a per-queue
     /// single-use method. Caller must hold conn_mutex_.
-    /// @tparam Container Type of a pending_*_events_ member (deduced).
-    /// @tparam T Type of the item being pushed (deduced; forwarded into push_back).
-    /// @param container The pending_*_events_ queue to append to.
-    /// @param item The event to append (forwarded).
     template <typename Container, typename T>
     void queue_pending(Container& container, T&& item) {
         container.push_back(std::forward<T>(item));
@@ -747,18 +649,14 @@ private:
     /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
     /// goodbye+release on deferred_releases_. Caller must hold conn_ptr_mutex_ and call
     /// flush_deferred_releases() after dropping it.
-    /// @param it Valid iterator into nursery_.
     /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
     ///        already gone so no goodbye should be attempted.
     /// @return Iterator to the entry after the erased one.
     std::vector<NurseryEntry>::iterator release_nursery_entry(
         std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason);
 
-    /// @brief Appends a release to deferred_releases_ and refreshes deferred_size_ (via
-    /// refresh_deferred_size_hint()) in the same critical section, so the hint atomic can never
-    /// drift from deferred_releases_.size(). Caller must hold conn_ptr_mutex_ and call
-    /// flush_deferred_releases() after dropping it.
-    /// @param conn The connection to release; empty on return (moved from).
+    /// @brief Appends a release to deferred_releases_ and refreshes the hint. Caller must hold
+    /// conn_ptr_mutex_ and call flush_deferred_releases() after dropping it.
     /// @param reason The goodbye reason to send before closing, or nullopt when no goodbye is
     ///        owed (the transport is gone, the close is deliberately silent, or another entry
     ///        covers it).
@@ -796,20 +694,18 @@ private:
     // Connection lifecycle
     // ========================================
     /// @brief Tears down a lost connection (current or nursery). Caller must hold conn_ptr_mutex_.
-    /// @param conn The connection that was lost.
     void on_connection_lost(SendspinConnection* conn);
     /// @brief Decides whether an incoming connection should be admitted over the current one.
     ///
-    /// Applies admission.h::should_admit_connection for the activity-priority arbitration. Trust
-    /// enforcement (admission.h::admissible) is applied separately, before this is ever consulted,
-    /// in loop()'s server/activate handling.
+    /// Applies admission.h::should_admit_connection; trust enforcement runs earlier, on the
+    /// activate.
     /// @param current The existing active connection, or nullptr if none is admitted yet.
     /// @param new_conn The newly proven candidate connection. Must not be null.
     /// @return True if the new connection should become current, false to keep the existing one
     ///         (or reject the newcomer, when current is null this always returns true).
     bool should_switch_to_new_server(const SendspinConnection* current,
                                      const SendspinConnection* new_conn) const;
-    /// @brief Updates last_played_server_id when the ADMITTED (current) connection carries the
+    /// @brief Updates last_played_server_id when the admitted (current) connection carries the
     /// PLAYBACK activity, per the last-playback server of connection.md "Multiple servers
     /// (server-initiated)".
     /// No-op if conn is not the current connection, or does not declare PLAYBACK.
@@ -825,15 +721,10 @@ private:
     ///
     /// Erases the entry from the nursery unconditionally (it never returns to the nursery).
     /// Calls should_switch_to_new_server() when a current connection already exists. The incoming
-    /// side is always operational. The incumbent normally is too, with one documented exception:
-    /// the re-proving window (see the class-level note above), during which it has been rewound
-    /// by an in-band re-handshake or a pair-finalize ack. Its activities stay valid across a
-    /// routine rekey, so arbitration on them is still correct there; the pair-finalize case is
-    /// the one where they go stale, and should_switch_to_new_server() answers it by telling
-    /// admission.h that the pairing is no longer in flight (suppressing its not-displaced rule)
-    /// while leaving the activities themselves, and therefore every rank comparison, intact.
-    /// On the winning outcome (promotion, whether or not it displaced an incumbent), notifies the
-    /// client, publishes state, and records playback activity. Caller must hold conn_ptr_mutex_.
+    /// side is always operational; the incumbent may be in its re-proving window, where its
+    /// activities are still rank-correct, so arbitration on them stays valid. On the winning
+    /// outcome, notifies the client, publishes state, and records playback activity. Caller must
+    /// hold conn_ptr_mutex_.
     /// @param it Valid iterator into nursery_ whose connection satisfies is_operational().
     /// @return Iterator to the entry after the erased one (for use in a scanning loop).
     std::vector<NurseryEntry>::iterator promote_or_arbitrate_nursery_entry(
@@ -890,9 +781,7 @@ private:
     /// satisfies this; start() warns when a configured value does not.
     static constexpr size_t NURSERY_CAPACITY = 2;
 
-    /// @brief Maximum connections open at once: the admitted one plus the nursery bound, which
-    /// is NURSERY_CAPACITY + 1 because an outbound entry does not count against the capacity
-    /// (see NURSERY_CAPACITY above).
+    /// @brief Maximum connections open at once: the admitted one plus the nursery bound.
     static constexpr size_t MAX_OPEN_CONNECTIONS = NURSERY_CAPACITY + 2;
 
     // pairing.md "Pairing Records" requires the client to cap its concurrently open paired
@@ -957,16 +846,13 @@ private:
     /// needs (the pending-notification vectors it clears must not race the queue pushes below).
     /// Caller must hold conn_ptr_mutex_; `conn` must be non-null.
     ///
-    /// @param conn               Connection whose pairing attempt is ending. Must be non-null.
     /// @param wire_abort_reason  If set, sends pair/abort(wire_abort_reason) to the peer first
     ///        (best-effort). Leave nullopt when the abort was received from the peer, or when
     ///        pairing.md "Protocol Errors" forbids sending one.
-    /// @param drop_action        Whether/how the connection is closed. KEEP_OPEN leaves it open.
-    ///        CLOSE_SILENTLY drops it via drop_connection() without a client/goodbye.
-    ///        CLOSE_WITH_GOODBYE drops it via drop_connection() using goodbye_reason.
+    /// @param drop_action        Disposition for the connection; see PairingDropAction.
     /// @param public_reason      Reason delivered to the application via on_pairing_failed.
-    /// @param goodbye_reason     Goodbye reason passed to drop_connection() when drop_action is
-    ///        CLOSE_WITH_GOODBYE; read only then, so callers for the other actions omit it.
+    /// @param goodbye_reason     Read only when drop_action is CLOSE_WITH_GOODBYE, so callers for
+    ///        the other actions omit it.
     void abort_pairing_attempt(
         SendspinConnection* conn, std::optional<PairAbortReason> wire_abort_reason,
         PairingDropAction drop_action, SendspinPairAbortReason public_reason,
@@ -976,10 +862,8 @@ private:
     // Pairing-code main-loop handlers
     // ========================================
 
-    /// @brief Handle a server pairing-code message on the main loop.
-    /// Advances the PairingStep state machine for the connection.
-    /// @param conn The connection that received the message. Must be non-null.
-    /// @param event The parsed server pairing message.
+    /// @brief Handle a server pairing-code message on the main loop: advances the PairingStep
+    /// state machine for the connection. `conn` must be non-null.
     void handle_pairing_message(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
     /// @brief Handles PairingMessageKind::PAIR_INIT: begins a round (pairing.md "Rounds"),
@@ -1081,11 +965,9 @@ private:
     // Unpair main-loop handler
     // ========================================
 
-    /// @brief Handles a server/unpair event on the main loop.
-    /// Checks PSK category (LONG_TERM only), removes the matched record, and disconnects with
-    /// the UNPAIRED reason.
-    /// @param conn The connection that received server/unpair. Must be non-null.
-    /// @param event The server/unpair event.
+    /// @brief Handles a server/unpair event on the main loop: checks PSK category (LONG_TERM
+    /// only), removes the matched record, and disconnects with the UNPAIRED reason. `conn` must
+    /// be non-null.
     void handle_server_unpair(SendspinConnection* conn, const ServerUnpairEvent& event);
 
     // Struct fields
@@ -1174,30 +1056,19 @@ private:
     /// conn_mutex_ acquisition entirely when nothing is pending.
     std::atomic<bool> has_pending_events_{false};
 
-    /// nursery_.size(), refreshed under conn_ptr_mutex_ immediately after every nursery_
-    /// mutation (always re-derived from .size(), never incremented/decremented in place, so it
-    /// cannot drift). Lets loop() skip the copies/loop() block, the hello-retry scan, and the
-    /// nursery reap scan when the nursery is empty, and keeps the lifecycle block running while
-    /// any nursery connection exists even with no swapped-out events (its promotion scan is
-    /// level-triggered on connection flags, not edge-triggered on events). Every refresh goes
-    /// through refresh_nursery_size_hint().
+    /// nursery_.size(). Lets loop() skip the connection-copy block, the hello-retry scan and the
+    /// nursery reap when the nursery is empty, and keeps the lifecycle block running while any
+    /// nursery connection exists (its promotion scan is level-triggered on connection flags).
     std::atomic<size_t> nursery_size_{0};
 
-    /// True whenever current_connection_ is non-null. Refreshed under conn_ptr_mutex_ at every
-    /// assignment (promotion, handoff, drop_connection's exchange, destructor). Lets loop() skip
-    /// the copies/loop() block when there is no current connection and the nursery is empty.
+    /// True whenever current_connection_ is non-null. Lets loop() skip the connection-copy block
+    /// when there is no current connection and the nursery is empty.
     std::atomic<bool> has_current_{false};
 
-    /// deferred_releases_.size(), refreshed under conn_ptr_mutex_ after every push (see
-    /// queue_deferred_release()) and after the drain swap in flush_deferred_releases(). Lets
-    /// flush_deferred_releases() early-return without locking when nothing is queued. Every
-    /// refresh goes through refresh_deferred_size_hint().
+    /// deferred_releases_.size(). Lets flush_deferred_releases() early-return without locking.
     std::atomic<size_t> deferred_size_{0};
 
-    /// pending_record_ops_.size(), refreshed under conn_ptr_mutex_ after every push (see
-    /// stage_record_op()) and after the drain swap in flush_pending_record_ops(). Lets that flush
-    /// early-return without locking when nothing is staged. Every refresh goes through
-    /// refresh_record_ops_size_hint().
+    /// pending_record_ops_.size(). Lets flush_pending_record_ops() early-return without locking.
     std::atomic<size_t> pending_record_ops_size_{0};
 };
 
