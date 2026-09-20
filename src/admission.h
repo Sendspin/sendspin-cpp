@@ -20,10 +20,9 @@
 /// "server/activate", and the priority arbitration in connection.md "Multiple servers
 /// (server-initiated)".
 ///
-/// All functions are pure (no side effects, no connection state mutations) so they can be
-/// unit-tested independently of the network layer. The admission handler in
-/// ConnectionManager::loop() applies them on the MAIN LOOP thread; do NOT call from the
-/// network thread.
+/// All functions are pure, so they unit-test independently of the network layer. The admission
+/// handler in ConnectionManager::loop() applies them on the main loop thread; do not call from
+/// the network thread.
 
 #pragma once
 
@@ -42,9 +41,6 @@ namespace sendspin {
 
 /// @brief Whether `activities` contains `target`. Activity lists are always tiny, so a linear
 /// scan is used everywhere in this file instead of a set.
-/// @param activities Activities to scan.
-/// @param target     Activity to look for.
-/// @return true if `target` appears in `activities`.
 inline bool contains_activity(const std::vector<SendspinActivity>& activities,
                               SendspinActivity target) {
     for (const auto& a : activities) {
@@ -86,10 +82,6 @@ inline bool activity_set_allowed(PskCategory category, bool has_playback, bool h
 }
 
 /// @brief activity_set_allowed() for a declared activity list.
-/// @param category    PSK category matched during the Noise handshake.
-/// @param activities  Activities declared in the server/activate message.
-/// @param unpaired_access  Whether unpaired (Sentinel) access is enabled in the record store.
-/// @return true if the activity set is allowed for the given category/config.
 inline bool activities_allowed(PskCategory category,
                                const std::vector<SendspinActivity>& activities,
                                bool unpaired_access) {
@@ -101,11 +93,6 @@ inline bool activities_allowed(PskCategory category,
 /// @brief Whether a connection declaring `activities` is "playback-capable": `activities`
 /// extended with PLAYBACK is an allowed set for the matched PSK category. A connection already
 /// declaring PLAYBACK is playback-capable exactly when its own `activities` are allowed.
-///
-/// Used both by admissible() (below) and by the client's re-evaluation of persisted
-/// `active_roles` on every server/activate: if a later activation changes activities so the
-/// connection is no longer playback-capable without explicitly sending active_roles, the
-/// persisted roles are treated as empty rather than the message rejected.
 ///
 /// @param category    PSK category matched during the Noise handshake.
 /// @param activities  Activities declared in the server/activate message.
@@ -148,10 +135,7 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
 /// Callers must only use this for an activate that admissible() already rejected: for an
 /// admissible one the return value is meaningless.
 ///
-/// @param category        PSK category matched during the Noise handshake.
-/// @param activities      Activities declared in the server/activate message.
-/// @param has_roles       Whether the effective active_roles set is non-empty.
-/// @param unpaired_access Whether unpaired (Sentinel) access is enabled.
+/// @param category, activities, has_roles, unpaired_access  Same as admissible().
 /// @return PAIRING_REQUIRED if enabling unpaired access would have admitted it, else UNAUTHORIZED.
 inline SendspinGoodbyeReason inadmissible_reject_reason(
     PskCategory category, const std::vector<SendspinActivity>& activities, bool has_roles,
@@ -170,9 +154,6 @@ inline SendspinGoodbyeReason inadmissible_reject_reason(
 ///
 /// connection.md "Multiple servers (server-initiated)" ranks playback above pairing and an empty
 /// set lowest, so playback=2 > pairing=1 > none=0.
-///
-/// @param activities Activities declared by the connection.
-/// @return Integer rank (0-2).
 inline int activity_rank(const std::vector<SendspinActivity>& activities) {
     bool has_playback = false;
     bool has_pairing = false;
@@ -202,12 +183,6 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 ///   5. Both rank-0 (empty activities): admit only if
 ///      incoming.server_id == last_playback_server_id && admitted.server_id != last_playback.
 ///
-/// @param incoming_activities    Activities of the incoming connection.
-/// @param incoming_server_id     server_id of the incoming connection.
-/// @param admitted_activities    Activities of the currently admitted connection.
-/// @param admitted_server_id     server_id of the currently admitted connection.
-/// @param has_admitted           Whether there is an admitted connection at all.
-/// @param last_playback_server_id  The last-playback server_id, or nullopt if unset.
 /// @param admitted_pairing_in_flight  Whether the admitted connection's pairing exchange is still
 ///        in flight. True is the plain reading of rule 2. Pass false only when the admitted side
 ///        declares PAIRING but has already been acked with server/pair-finalize, so rule 2 stops
@@ -226,14 +201,10 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
     const int incoming_rank = activity_rank(incoming_activities);
     const int admitted_rank = activity_rank(admitted_activities);
 
-    // An in-flight pairing is not displaced by incoming rank 1 (pairing) or rank 2 (playback).
-    // "In-flight" is the operative word: once the server has acked server/pair-finalize the
-    // exchange is complete, and the admitted connection keeps declaring PAIRING only because its
-    // activities snapshot is not rewritten until the post-rekey activate arrives. The caller
-    // passes admitted_pairing_in_flight=false for that window so this shield stops applying,
-    // while the rank comparisons below still use the real (stale but rank-correct) activities.
-    // Substituting an empty set here instead would drop the admitted side to rank 0 and hand a
-    // rank-0 newcomer the last_playback tiebreak below, which it could never have won before.
+    // An in-flight pairing is not displaced by incoming rank 1 or 2. The caller passes
+    // admitted_pairing_in_flight=false once server/pair-finalize is acked. Substituting an empty
+    // activity set instead would drop the admitted side to rank 0 and hand a rank-0 newcomer the
+    // last_playback tiebreak below, which it could never have won before.
     if (admitted_pairing_in_flight && admitted_rank == 1 &&
         (incoming_rank == 1 || incoming_rank == 2)) {
         return false;
@@ -243,7 +214,6 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
         return incoming_rank > admitted_rank;
     }
 
-    // Equal rank.
     if (incoming_rank == 0) {
         // Both-empty: resolve by last_playback server_id.
         if (!last_playback_server_id.has_value()) {
@@ -253,7 +223,6 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
                 admitted_server_id != *last_playback_server_id);
     }
 
-    // Equal non-zero rank -> admit the incoming connection.
     return true;
 }
 
