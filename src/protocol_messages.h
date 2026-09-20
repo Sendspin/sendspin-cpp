@@ -53,22 +53,13 @@ enum SendspinBinaryRole : uint8_t {
     SENDSPIN_ROLE_ARTWORK = 2,  // 000010xx (IDs 8-11)
 };
 
-/// @brief Extracts the role field from a standard 4-slot binary message type byte
-/// @param type Binary message type byte.
-/// @return Role portion of the type (bits 7-2).
-/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). The visualizer
-///          range (IDs 16-23) is dispatched by range in SendspinClient::process_binary_message
-///          and must not be routed through this helper: get_binary_role(16) yields 4, which
-///          matches no SendspinBinaryRole enumerator.
+/// @brief Role field (bits 7-2) of a standard 4-slot binary type byte
+/// Valid only for PLAYER/ARTWORK (IDs 4-11); the visualizer's 8-slot range is dispatched by range
+/// in SendspinClient::process_binary_message, not through these helpers.
 inline uint8_t get_binary_role(uint8_t type) {
     return type >> 2;
 }
-/// @brief Extracts the slot field from a standard 4-slot binary message type byte
-/// @param type Binary message type byte.
-/// @return Slot portion of the type (bits 1-0).
-/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). It masks bits
-///          1-0, so it cannot address the visualizer's 8-slot range (e.g. IDs 16 and 20 both
-///          alias to slot 0); those messages are dispatched by range, not by slot.
+/// @brief Slot field (bits 1-0) of a standard 4-slot binary type byte; same restriction
 inline uint8_t get_binary_slot(uint8_t type) {
     return type & 0x03;
 }
@@ -120,9 +111,7 @@ enum class SendspinRole : uint8_t {
     COUNT,       // Not a role; bounds the walk in active_role_mask(). Keep last.
 };
 
-/// @brief Converts a SendspinRole value to its protocol wire string representation
-/// @param role The role to convert.
-/// @return Null-terminated protocol string for the role (e.g., "player@v1").
+/// @brief Protocol wire string for a role (e.g. "player@v1")
 inline const char* to_cstr(SendspinRole role) {
     switch (role) {
         case SendspinRole::PLAYER:
@@ -148,9 +137,6 @@ inline const char* to_cstr(SendspinRole role) {
 /// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
 /// version that was active: a client offered `player@v1` that is handed `player@v2` implements
 /// neither the new version's behavior nor, any longer, the old one's.
-/// @param active_roles The set to search, as the server wrote it.
-/// @param role The role to look for.
-/// @return true when `active_roles` names this exact versioned role.
 inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole role) {
     const char* name = to_cstr(role);
     for (const auto& active : active_roles) {
@@ -166,7 +152,6 @@ inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole r
 /// One version per family is implemented, so a family name identifies a role exactly; a caller
 /// that knows only the family can then use the same exact-version test as the receive gate.
 /// @param family Role family name without the "@vN" suffix.
-/// @return The matching role, or nullopt if this library implements no role in that family.
 inline std::optional<SendspinRole> role_for_family(const std::string& family) {
     for (uint8_t i = 0; i < static_cast<uint8_t>(SendspinRole::COUNT); ++i) {
         const auto role = static_cast<SendspinRole>(i);
@@ -182,8 +167,6 @@ inline std::optional<SendspinRole> role_for_family(const std::string& family) {
 }
 
 /// @brief Bit that represents `role` in an active-role mask
-/// @param role The role to map.
-/// @return Single-bit mask value for `role`.
 inline uint16_t role_mask_bit(SendspinRole role) {
     return static_cast<uint16_t>(1U << static_cast<uint8_t>(role));
 }
@@ -194,8 +177,6 @@ static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 16, "role mask is a u
 ///
 /// The mask is what the receive path reads (a connection publishes it atomically), so it is built
 /// with the same exact-version test role removal uses and the two can never disagree.
-/// @param active_roles The set from a server/activate.
-/// @return OR of role_mask_bit() for every implemented role named in the set.
 inline uint16_t active_role_mask(const std::vector<std::string>& active_roles) {
     uint16_t mask = 0;
     for (uint8_t i = 0; i < static_cast<uint8_t>(SendspinRole::COUNT); ++i) {
@@ -215,9 +196,7 @@ enum class SendspinActivity : uint8_t {
     PAIRING,   // A pairing exchange
 };
 
-/// @brief Converts a SendspinActivity value to its protocol wire string
-/// @param activity The activity to convert.
-/// @return Null-terminated protocol string (e.g., "playback").
+/// @brief Protocol wire string for an activity (e.g. "playback")
 inline const char* to_cstr(SendspinActivity activity) {
     switch (activity) {
         case SendspinActivity::PLAYBACK:
@@ -229,9 +208,7 @@ inline const char* to_cstr(SendspinActivity activity) {
     }
 }
 
-/// @brief Parses a wire string into a SendspinActivity.
-/// @param str The string to parse.
-/// @return The matching enum value, or std::nullopt if the string is unrecognized.
+/// @brief Parses a wire string into a SendspinActivity; nullopt if unrecognized
 inline std::optional<SendspinActivity> activity_from_string(const std::string& str) {
     if (str == "playback") {
         return SendspinActivity::PLAYBACK;
@@ -249,9 +226,7 @@ enum class SendspinPairMethod : uint8_t {
     STATIC_PAIRING_CODE,   // Fixed pairing code via PAKE
 };
 
-/// @brief Converts a SendspinPairMethod value to its protocol wire string.
-/// @param method The method to convert.
-/// @return Null-terminated protocol string (e.g., "pairing_psk").
+/// @brief Protocol wire string for a pairing method (e.g. "pairing_psk")
 inline const char* to_cstr(SendspinPairMethod method) {
     switch (method) {
         case SendspinPairMethod::PAIRING_PSK:
@@ -265,9 +240,7 @@ inline const char* to_cstr(SendspinPairMethod method) {
     }
 }
 
-/// @brief Parses a wire string into a SendspinPairMethod.
-/// @param str The string to parse.
-/// @return The matching enum value, or std::nullopt if unrecognized.
+/// @brief Parses a wire string into a SendspinPairMethod; nullopt if unrecognized
 inline std::optional<SendspinPairMethod> pair_method_from_string(const std::string& str) {
     if (str == "pairing_psk") {
         return SendspinPairMethod::PAIRING_PSK;
@@ -281,9 +254,7 @@ inline std::optional<SendspinPairMethod> pair_method_from_string(const std::stri
     return std::nullopt;
 }
 
-/// @brief Converts a pairing-code emission format to its protocol wire string.
-/// @param format The format to convert.
-/// @return Null-terminated protocol string ("digits" or "qr_code").
+/// @brief Protocol wire string for an emission format ("digits" or "qr_code")
 inline const char* to_cstr(SendspinPairingCodeFormat format) {
     switch (format) {
         case SendspinPairingCodeFormat::DIGITS:
@@ -295,9 +266,7 @@ inline const char* to_cstr(SendspinPairingCodeFormat format) {
     }
 }
 
-/// @brief Parses a wire string into a pairing-code emission format.
-/// @param str The string to parse.
-/// @return The matching enum value, or std::nullopt if unrecognized.
+/// @brief Parses a wire string into a pairing-code emission format; nullopt if unrecognized
 inline std::optional<SendspinPairingCodeFormat> pairing_code_format_from_string(
     const std::string& str) {
     if (str == "digits") {
@@ -309,9 +278,7 @@ inline std::optional<SendspinPairingCodeFormat> pairing_code_format_from_string(
     return std::nullopt;
 }
 
-/// @brief Converts a pairing-code out-channel to its protocol wire string.
-/// @param channel The channel to convert.
-/// @return Null-terminated protocol string ("display" or "speaker").
+/// @brief Protocol wire string for an out-channel ("display" or "speaker")
 inline const char* to_cstr(SendspinPairingCodeChannel channel) {
     switch (channel) {
         case SendspinPairingCodeChannel::DISPLAY:
@@ -324,9 +291,8 @@ inline const char* to_cstr(SendspinPairingCodeChannel channel) {
 }
 
 /// @brief Reason a pairing attempt was aborted (pairing.md "Client <-> Server: pair/abort")
-/// The client emits every reason: pairing_code_mismatch comes from the code-based flows, the rest
-/// from the shared attempt handling. The spec lets a server send pairing_code_mismatch or
-/// user_cancelled, and the full set is parsed so an unexpected one is still named.
+/// The client emits every reason; the full set is parsed so an unexpected one from a server is
+/// still named.
 enum class PairAbortReason : uint8_t {
     ATTEMPT_TIMEOUT,        // attempt_timeout
     CONCURRENT_ATTEMPT,     // concurrent_attempt
@@ -335,9 +301,7 @@ enum class PairAbortReason : uint8_t {
     USER_CANCELLED,         // user_cancelled
 };
 
-/// @brief Converts a PairAbortReason to its wire string.
-/// @param reason The reason to convert.
-/// @return Null-terminated wire string (e.g., "method_not_supported").
+/// @brief Wire string for an abort reason (e.g. "method_not_supported")
 inline const char* to_cstr(PairAbortReason reason) {
     switch (reason) {
         case PairAbortReason::ATTEMPT_TIMEOUT:
@@ -355,9 +319,7 @@ inline const char* to_cstr(PairAbortReason reason) {
     }
 }
 
-/// @brief Maps the internal PairAbortReason to the public SendspinPairAbortReason.
-/// @param reason The internal reason to map.
-/// @return The matching SendspinPairAbortReason, or UNKNOWN if unrecognized.
+/// @brief Maps the internal PairAbortReason to the public one; UNKNOWN if unrecognized
 inline SendspinPairAbortReason to_public_abort_reason(PairAbortReason reason) {
     switch (reason) {
         case PairAbortReason::ATTEMPT_TIMEOUT:
@@ -375,9 +337,7 @@ inline SendspinPairAbortReason to_public_abort_reason(PairAbortReason reason) {
     }
 }
 
-/// @brief Parses a wire string into a PairAbortReason.
-/// @param str The string to parse.
-/// @return The matching enum value, or std::nullopt if unrecognized.
+/// @brief Parses a wire string into a PairAbortReason; nullopt if unrecognized
 inline std::optional<PairAbortReason> pair_abort_reason_from_string(const std::string& str) {
     if (str == "attempt_timeout") {
         return PairAbortReason::ATTEMPT_TIMEOUT;
@@ -926,113 +886,75 @@ struct ServerPairConfirmPayload {
 // Protocol functions
 // ============================================================================
 
-/// @brief Determines the message type of an incoming server-to-client JSON message
-/// @param root Parsed JSON object from the message.
-/// @return The matching message type, or UNKNOWN if not recognized.
+// Every process_*() below takes the parsed JSON object and fills a caller-owned struct in place,
+// returning false on a missing or malformed required field.
+
+/// @brief Determines the message type of an incoming server-to-client JSON message; UNKNOWN if
+/// not recognized
 SendspinServerToClientMessageType determine_message_type(JsonObject root);
 
 /// @brief Parses a server/hello JSON message into the provided struct.
 /// Under encryption, only the name field is parsed; server_id comes from the Noise
 /// handshake result, not from server/hello.
-/// @param root Parsed JSON object from the message.
-/// @param hello_msg [out] Struct to populate with parsed fields.
-/// @return true if parsing succeeded, false on missing required fields.
 bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg);
 
 /// @brief Parses a server/activate JSON message into the provided struct.
-/// @param root Parsed JSON object from the message.
-/// @param activate_msg [out] Struct to populate with parsed fields.
-/// @return true if parsing succeeded, false on missing required fields.
 bool process_server_activate_message(JsonObject root, ServerActivateMessage* activate_msg);
 
-/// @brief Parses a server/time JSON message and computes time offset and max error
-/// @param root Parsed JSON object from the message.
+/// @brief Parses a server/time JSON message and computes the server-to-client clock offset and
+/// the round-trip error bound, both in microseconds
 /// @param timestamp Client timestamp when the message was received (microseconds).
-/// @param offset [out] Computed time offset between server and client clocks (microseconds).
-/// @param max_error [out] Upper bound on clock error from the round-trip (microseconds).
-/// @return true if parsing and computation succeeded, false otherwise.
 bool process_server_time_message(JsonObject root, int64_t timestamp, int64_t* offset,
                                  int64_t* max_error);
 
 /// @brief Parses a group/update JSON message into the provided struct
-/// @param root Parsed JSON object from the message.
-/// @param group_msg [out] Struct to populate with parsed fields.
-/// @return true if parsing succeeded, false on missing required fields.
 bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg);
 
-/// @brief Merges a GroupUpdateObject delta into the current group state
-/// @param current [out] Current group state to update in place.
-/// @param updates Delta object containing only the fields that changed.
+/// @brief Merges a GroupUpdateObject delta, which carries only the changed fields, into the
+/// current group state
 void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObject& updates);
 
 /// @brief Parses a server/command JSON message into the provided struct
-/// @param root Parsed JSON object from the message.
-/// @param cmd_msg [out] Struct to populate with parsed fields.
-/// @return true if parsing succeeded, false on missing required fields.
 bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg);
 
-/// @brief Parses the metadata section of a server/state JSON message
+/// @brief Parses the metadata section of a server/state JSON message; true if the section was
+/// present and parsed
 ///
-/// The server/state sections are parsed individually rather than into one aggregate struct: the
-/// caller runs on the network task, whose stack is bounded on ESP-IDF (at least
-/// SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE) and also carries the in-band re-handshake, and
-/// an aggregate would keep every section's storage live in the caller's frame for the whole parse.
-/// Each function fills a caller-owned struct in place and reports whether that section was present.
-///
-/// @param root Parsed JSON object from the message.
-/// @param metadata [out] Struct to populate with the parsed state.
-/// @return true if the message carried a metadata section that parsed successfully.
+/// The server/state sections are parsed one at a time, not into an aggregate struct: the caller
+/// runs on the network task, whose stack is bounded on ESP-IDF (at least
+/// SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE), and an aggregate would keep every section's
+/// storage live in that frame for the whole parse.
 bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* metadata);
 
-/// @brief Parses the color section of a server/state JSON message
-/// @param root Parsed JSON object from the message.
-/// @param color [out] Struct to populate with the parsed state.
-/// @return true if the message carried a color section that parsed successfully.
+/// @brief Parses the color section of a server/state JSON message; true if the section was
+/// present and parsed
 bool process_server_state_color(JsonObject root, ServerColorStateObject* color);
 
-/// @brief Parses the controller section of a server/state JSON message
-/// @param root Parsed JSON object from the message.
-/// @param controller_state [out] Struct to populate with parsed fields.
-/// @return true if the message carried a controller section that parsed successfully.
+/// @brief Parses the controller section of a server/state JSON message; true if the section was
+/// present and parsed
 bool process_server_state_controller(JsonObject root,
                                      ServerStateControllerObject* controller_state);
 
 /// @brief Parses a stream/start JSON message into the provided struct
-/// @param root Parsed JSON object from the message.
-/// @param stream_msg [out] Struct to populate with parsed fields.
-/// @return true if parsing succeeded, false on missing required fields.
 bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg);
 
 /// @brief Parses a stream/end JSON message into the provided struct
-/// @param root Parsed JSON object from the message.
-/// @param end_msg [out] Struct to populate with parsed fields.
-/// @return true if parsing succeeded, false on missing required fields.
 bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg);
 
 /// @brief Parses a stream/clear JSON message into the provided struct
-/// @param root Parsed JSON object from the message.
-/// @param clear_msg [out] Struct to populate with parsed fields.
-/// @return true if parsing succeeded, false on missing required fields.
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg);
 
-/// @brief Formats a client hello message as a JSON string for sending to the server
-/// @param msg Message to serialize.
-/// @return Hello message serialized into JSON format.
+/// @brief Formats a client/hello message as a JSON string
 std::string format_client_hello_message(const ClientHelloMessage* msg);
 
-/// @brief Formats a client state message as a JSON string for sending to the server
-/// @param msg Message to serialize.
-/// @return State message serialized into JSON format.
+/// @brief Formats a client/state message as a JSON string
 std::string format_client_state_message(const ClientStateMessage* msg);
 
-/// @brief Formats a client/leave message as a JSON string for sending to the server
+/// @brief Formats a client/leave message as a JSON string
 /// messaging.md "client/leave": leaves the client's current group; no payload fields.
-/// @return Leave message serialized into JSON format.
 std::string format_client_leave_message();
 
-/// @brief Formats a client/goodbye message as a JSON string for sending to the server
-/// @param reason The reason for disconnecting.
-/// @return Goodbye message serialized into JSON format.
+/// @brief Formats a client/goodbye message as a JSON string
 std::string format_client_goodbye_message(SendspinGoodbyeReason reason);
 
 /// Buffer size for format_client_time_message(). Fits the longest possible message:
@@ -1043,42 +965,31 @@ static constexpr size_t TIME_MESSAGE_BUF_SIZE = 96;
 ///
 /// Hot path on the time-sync send side: avoids any heap allocation by writing the fixed-shape
 /// message directly into the caller's stack buffer. A 96-byte buffer is always large enough.
-/// @param buf Destination buffer.
-/// @param cap Capacity of `buf` in bytes (recommend >= 96).
 /// @param client_transmitted The client transmit timestamp (microseconds). Should be captured
 ///                           as close as possible to the actual wire send.
 /// @return Number of bytes written (excluding any null terminator), or 0 on error.
 size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted);
 
-/// @brief Formats a client/command message as a JSON string for sending to the server
+/// @brief Formats a client/command message as a JSON string
 /// @param cmd The playback command plus any command-specific parameters. Only the parameter
 /// relevant to the command is serialized (e.g. position_ms for SEEK); others are ignored.
-/// @return Command message serialized into JSON format.
 std::string format_client_command_message(const ClientCommandControllerObject& cmd);
 
 /// @brief Formats a client/pair-finalize message carrying long_term_psk directly (Pairing PSK
 /// flow only). The PSK is 32 raw bytes, base64url-encoded (no padding, 43 chars).
-/// @param psk 32-byte long-term PSK to embed in the message.
-/// @return JSON string for the client/pair-finalize message.
 std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk);
 
 /// @brief Formats a client/pair-finalize message carrying wrapped_psk (pairing-code flows only;
 /// see pairing.md "Wrapping"). wrapped_psk is 48 raw bytes, base64url-encoded (no padding, 64
 /// chars).
-/// @param wrapped_psk 48-byte wrapped PSK (ciphertext || tag) to embed in the message.
-/// @return JSON string for the client/pair-finalize message.
 std::string format_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk);
 
 /// @brief Formats a pair/abort message as a JSON string.
 /// Sent by the client when it cannot proceed with the selected pairing method.
-/// @param reason The abort reason.
-/// @return JSON string for the pair/abort message.
 std::string format_pair_abort_message(PairAbortReason reason);
 
-/// @brief Parses a pair/abort JSON message into the provided struct.
-/// @param root Parsed JSON object from the message.
-/// @param abort_msg [out] Struct to populate with the parsed abort reason.
-/// @return true if parsing succeeded, false on missing or unrecognized reason.
+/// @brief Parses a pair/abort JSON message into the provided struct; false on a missing or
+/// unrecognized reason
 bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg);
 
 // ============================================================================
@@ -1087,23 +998,17 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg);
 
 /// @brief Parses a server/pair-init JSON message into the provided struct.
 /// Validates base64url encoding and decoded length of nonce_A (must be 32 bytes).
-/// @param root Parsed JSON object.
 /// @param payload [out] Struct to populate; nullptr for validation-only.
-/// @return true if the message is well-formed, false otherwise.
 bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* payload);
 
 /// @brief Parses a server/pair-auth JSON message into the provided struct.
 /// Validates base64url encoding and decoded length of pake_msg_1 (must be 32 bytes).
-/// @param root Parsed JSON object.
 /// @param payload [out] Struct to populate; nullptr for validation-only.
-/// @return true if the message is well-formed, false otherwise.
 bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* payload);
 
 /// @brief Parses a server/pair-confirm JSON message into the provided struct.
 /// Validates base64url encoding and decoded length of server_kc (must be 64 bytes).
-/// @param root Parsed JSON object.
 /// @param payload [out] Struct to populate; nullptr for validation-only.
-/// @return true if the message is well-formed, false otherwise.
 bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload);
 
 /// @brief Formats a client/pair-pending message as a JSON string.
@@ -1111,17 +1016,13 @@ bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPaylo
 /// no pairing window is open; client/pair-init follows once a window opens. Does not start the
 /// attempt or its timeout.
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
-///                      handshake.
-/// @return JSON string for the client/pair-pending message.
+///                      handshake (see SendspinConnection::get_pairing_index()).
 std::string format_client_pair_pending_message(uint32_t pairing_index);
 
 /// @brief Formats a client/pair-init message as a JSON string.
 /// Starts the dynamic-pairing-code attempt; carries commit_B = SHA-256(PAIRING_COMMIT_LABEL ||
 /// nonce_B) and the required pairing_index counter (pairing.md "Pairing index").
 /// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
-/// @param pairing_index Count of pairing server/activate messages received since the last Noise
-///                      handshake (see SendspinConnection::get_pairing_index()).
-/// @return JSON string for the client/pair-init message.
 std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
                                             uint32_t pairing_index);
 
@@ -1129,22 +1030,17 @@ std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commi
 /// The form used by every flow that carries no commit_B: the static pairing code, sent after the
 /// operator confirms the pairing-window gesture and before starting CPace RESPONDER, and Pairing
 /// PSK, sent immediately before client/pair-finalize (pairing.md "Pairing PSK Flow").
-/// @param pairing_index Count of pairing server/activate messages received since the last Noise
-///                      handshake.
-/// @return JSON string for the client/pair-init message with only pairing_index set.
 std::string format_client_pair_init_message(uint32_t pairing_index);
 
 /// @brief Formats a client/pair-retry message as a JSON string.
 /// Sent in place of client/pair-confirm when server_kc fails to verify and the client admits
 /// another round (pairing.md "Client -> Server: client/pair-retry"). The payload is empty: the
 /// attempt, its pairing code and its running attempt timeout all carry over.
-/// @return JSON string for the client/pair-retry message.
 std::string format_client_pair_retry_message();
 
 /// @brief Formats a client/pair-auth message as a JSON string.
 /// Sent in response to server/pair-auth; carries the client's CPace public share.
 /// @param pake_msg_2 32-byte client CPace public share (base64url-encoded on the wire).
-/// @return JSON string for the client/pair-auth message.
 std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2);
 
 /// @brief Formats a client/pair-confirm message as a JSON string.
@@ -1153,7 +1049,6 @@ std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_
 /// @param client_kc       64-byte client CPace confirmation tag (base64url-encoded on the wire).
 /// @param wrapped_nonce_b 48-byte wrapping of nonce_B (base64url-encoded on the wire, 64 chars);
 ///                        see pairing.md "Wrapping".
-/// @return JSON string for the client/pair-confirm message.
 std::string format_client_pair_confirm_message(
     const std::array<uint8_t, 64>& client_kc,
     const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b);
@@ -1161,7 +1056,6 @@ std::string format_client_pair_confirm_message(
 /// @brief Formats a client/pair-confirm message with no commitment opening (the Static Pairing
 /// Code Flow, which sends no commit_B and so has nothing to open).
 /// @param client_kc 64-byte client CPace confirmation tag (base64url-encoded on the wire).
-/// @return JSON string for the client/pair-confirm message with client_kc only.
 std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc);
 
 }  // namespace sendspin
