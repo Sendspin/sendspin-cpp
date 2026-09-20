@@ -13,16 +13,8 @@
 // limitations under the License.
 
 /// @file field25519.h
-/// @brief Self-contained 256-bit modular arithmetic over GF(2^255-19).
-///
-/// Provides only what CPace-X25519-SHA512 needs:
-///   - fp_mul(a, b): modular multiplication
-///   - fp_pow(base, exp): modular exponentiation (used for inv and Legendre)
-///   - fp_inv(a): modular inverse via Fermat: a^(p-2) mod p
-///   - fp_from_le(bytes): decode 32 little-endian bytes to a Fp value
-///   - fp_to_le(v): encode a Fp value to 32 little-endian bytes
-///
-/// No external dependencies; compiles on both host (x86/arm) and ESP32.
+/// @brief Self-contained 256-bit modular arithmetic over GF(2^255-19), providing only what
+/// CPace-X25519-SHA512 needs. No external dependencies; one code path on host and ESP32.
 
 #pragma once
 
@@ -102,7 +94,7 @@ inline std::array<uint8_t, 32> fp_to_le(const Fp& a) {
 // products plus add/subtract carry propagation. A 64-bit host could express these
 // with `unsigned __int128`, but 32-bit targets (e.g. Xtensa/ESP32) have no such
 // type. These helpers implement the wide operations using only uint64_t, so there
-// is a SINGLE code path on every platform and the host tests validate exactly what
+// is a single code path on every platform and the host tests validate exactly what
 // runs on the device.
 // ============================================================================
 
@@ -149,16 +141,11 @@ inline uint64_t sbb64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t& borr
 // ============================================================================
 
 inline Fp fp_reduce(const Fp& a) {
-    // Attempt to subtract p: compute r = a - p.
-    // If a >= p, r is in [0, p-1] (no borrow from the top).
-    // If a < p, the subtraction underflows (borrow set) and we keep a.
     Fp r;
     uint64_t borrow = 0;
     for (int i = 0; i < 4; ++i) {
         r.limbs[i] = sbb64(a.limbs[i], FP_P.limbs[i], borrow, borrow);
     }
-    // If borrow == 0: a >= p, use r (the subtracted result).
-    // If borrow != 0: a < p, keep a.
     if (borrow == 0) {
         return r;
     }
@@ -170,7 +157,7 @@ inline Fp fp_reduce(const Fp& a) {
 //
 // The single conditional subtraction above is only enough for inputs below 2p.
 // The 38-fold in fp_mul/fp_scale leaves a value that is merely below 2^256, and
-// 2^256 = 2p + 38, so an input in [2p, 2^256) needs a SECOND subtraction: one
+// 2^256 = 2p + 38, so an input in [2p, 2^256) needs a second subtraction: one
 // pass would leave it in [p, p+38), i.e. still non-canonical. That band is not
 // exotic: it is reachable whenever the true result is congruent to a value
 // below 38, which is exactly what an inverse or a Legendre exponentiation
@@ -197,8 +184,7 @@ inline Fp fp_reduce_full(const Fp& a) {
 // ============================================================================
 
 inline Fp fp_mul(const Fp& a, const Fp& b) {
-    // Compute a 512-bit product using 64-bit limbs.
-    // lo[0..7]: product limbs (lo[0] = least significant 64 bits)
+    // lo[0..7]: 512-bit product limbs (lo[0] = least significant 64 bits)
     uint64_t lo[8]{};
 
     for (int i = 0; i < 4; ++i) {
@@ -217,13 +203,7 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
         lo[i + 4] += carry;
     }
 
-    // Now reduce: n = lo[0..3] + lo[4..7] * 2^256
-    // 2^256 = 2 * 2^255 = 2 * (p + 19) = 2p + 38
-    // So lo[4..7] * 2^256 mod p = lo[4..7] * 38  (mod p, since 2p = 0).
-    // Actually: 2^255 mod p = 19, so 2^256 mod p = 38.
-    // Apply: result = lo[0..3] + lo[4..7] * 38, then reduce the top bit.
-
-    // Pass 1: fold upper 256 bits (lo[4..7]) using multiplier 38.
+    // Pass 1: fold upper 256 bits (lo[4..7]) using multiplier 38 (see the banner above).
     Fp r;
     {
         uint64_t carry = 0;
@@ -259,8 +239,7 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
         }
     }
 
-    // Pass 2: fully reduce. The folded value is only bounded by 2^256 (= 2p + 38), not by
-    // 2p, so this needs the two-subtraction reduce.
+    // Pass 2: fully reduce (the fold is only bounded by 2^256 = 2p + 38).
     return fp_reduce_full(r);
 }
 
@@ -333,14 +312,8 @@ inline Fp fp_scale(const Fp& a, uint64_t s) {
         r.limbs[i] = adc64(plo, carry, 0, c1);
         carry = phi + c1;  // small: s < 2^26 so phi < 2^26
     }
-    // `carry` here is the carry out of limb 3 from the loop above, i.e. the true
-    // overflow past 2^256 (bounded by s < 2^26): its positional value is 2^256, and
-    // 2^256 mod p = 38, so folding it back in as carry*38 (added into limb 0) is
-    // correct. That addition can itself carry out of limb 0, though (a carry with
-    // positional value 2^64, not 2^256), so it must be propagated limb-by-limb
-    // (0 -> 1 -> 2 -> 3), not folded by 38 again. Only a carry that makes it all the
-    // way out of limb 3 a second time has positional value 2^256 and is legitimately
-    // foldable by 38.
+    // Same carry fold as fp_mul: positional value 2^256, folded by 38 into limb 0, then the
+    // resulting 2^64-valued carry propagated limb-by-limb (the bound here is s < 2^26).
     {
         uint64_t addend = carry * 38ULL;
         uint64_t prop = 0;
@@ -349,9 +322,6 @@ inline Fp fp_scale(const Fp& a, uint64_t s) {
             r.limbs[i] = adc64(r.limbs[i], prop, 0, prop);
         }
         if (prop) {
-            // Carry made it out of limb 3: limbs[1..3] just wrapped to zero and limbs[0]
-            // holds a value <= addend, so adding 38 more cannot overflow limb 0 again.
-            // A single non-looping add is provably sufficient.
             r.limbs[0] = r.limbs[0] + 38ULL;
         }
     }
