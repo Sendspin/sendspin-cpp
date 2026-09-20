@@ -100,7 +100,7 @@ public:
     /// @brief Triggers the underlying socket to close
     ///
     /// This is a low-level method that directly triggers the httpd session to close.
-    /// It does NOT send a goodbye message first.
+    /// It does not send a goodbye message first.
     ///
     /// Relationship with disconnect():
     /// - disconnect() is the high-level API that sends a goodbye message, then calls

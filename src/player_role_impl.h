@@ -74,7 +74,7 @@ struct PlayerRole::Impl {
         InboxSlot<ServerPlayerStreamObject> stream_params_slot;
         InboxSlot<ServerCommandMessage> command_slot;
         // Client state from the sync task. Latest-wins by design (the old ring events were
-        // collapsed to the newest at drain time anyway), and deliberately NOT on the event
+        // collapsed to the newest at drain time anyway), and deliberately not on the event
         // ring: the sync task is the one producer that can keep emitting while the main loop
         // stalls, and un-coalesced state transitions must not be able to fill the shared ring
         // and starve non-idempotent lifecycle events out of it.

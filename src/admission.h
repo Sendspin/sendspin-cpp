@@ -177,7 +177,7 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 ///
 /// Rules, from connection.md "Multiple servers (server-initiated)":
 ///   1. If no currently admitted connection -> admit.
-///   2. An in-flight pairing (admitted rank 1) is NOT displaced by incoming rank 1 or 2.
+///   2. An in-flight pairing (admitted rank 1) is not displaced by incoming rank 1 or 2.
 ///   3. Higher incoming rank displaces.
 ///   4. Equal non-zero rank -> admit.
 ///   5. Both rank-0 (empty activities): admit only if

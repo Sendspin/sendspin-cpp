@@ -1045,7 +1045,7 @@ void SendspinClient::cleanup_connection_state() {
 
     // Also wipes any not-yet-dispatched pairing listener notifications. Callers that need a
     // notification to survive teardown (e.g. handle_pair_abort's on_pairing_failed /
-    // on_clear_pairing_code) must call the corresponding note_*() AFTER
+    // on_clear_pairing_code) must call the corresponding note_*() after
     // cleanup_connection_state() returns; see the ConnectionManager pairing handlers.
     this->event_state_->pairing_notes.clear();
 
@@ -1595,7 +1595,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             // server/pair-finalize: server acked our client/pair-finalize. A sanctioned
             // exception to the receive-path rule (conventions.md "Threading and cross-thread
             // state"):
-            // Commit the pending pairing record to RAM synchronously HERE (network thread), NOT
+            // Commit the pending pairing record to RAM synchronously here (network thread), not
             // deferred to the main loop: the server rekeys onto the new long-term PSK immediately
             // after this ack, and its re-handshake msg1 (the next message on this same thread)
             // resolves that PSK against the RecordStore. The record must therefore be resolvable
@@ -1633,7 +1633,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     SS_LOGI(TAG, "server/pair-finalize: no pending pairing record to store");
                 }
                 if (stored_record) {
-                    // Stage the durable write for the main loop, BEFORE schedule_pairing_succeeded
+                    // Stage the durable write for the main loop, before schedule_pairing_succeeded
                     // so the tick that fires on_pairing_succeeded has already observed the dirty
                     // bit in its inbox poll (loop() takes that snapshot after ConnectionManager's
                     // event drain collects the note).

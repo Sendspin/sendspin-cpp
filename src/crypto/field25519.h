@@ -64,7 +64,7 @@ static constexpr Fp FP_LEGENDRE = {{
 }};
 
 /// @brief Decode 32 little-endian bytes into a Fp.
-/// The top bit is NOT cleared here; callers (Elligator2) clear it themselves.
+/// The top bit is not cleared here; callers (Elligator2) clear it themselves.
 inline Fp fp_from_le(const uint8_t* b) {
     Fp r;
     for (int i = 0; i < 4; ++i) {

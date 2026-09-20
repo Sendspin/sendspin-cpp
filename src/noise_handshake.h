@@ -22,7 +22,7 @@
 ///   2. Recv  `server/init` (TEXT): prologue = bytes(client/init) || bytes(server/init)
 ///   3. Recv  `noise/handshake` msg1 (TEXT): build a KKpsk2 responder with no PSK bound yet,
 ///      read msg1 through it, extract psk_id from the decrypted payload
-///   4. Resolve psk_id via RecordStore; bind the resolved PSK onto the SAME responder
+///   4. Resolve psk_id via RecordStore; bind the resolved PSK onto the same responder
 ///      (NoiseSession::set_psk): valid because KKpsk2 processes the "psk" token in msg2,
 ///      not msg1
 ///   5. Send  `noise/handshake` msg2 (TEXT): write msg2, split -> transport
@@ -88,7 +88,7 @@ enum class HandshakeFrameResult {
 ///   1. Build a session with no PSK bound.
 ///   2. Read msg1 through it to extract psk_id.
 ///   3. Resolve psk_id via record_store.
-///   4. Bind the resolved PSK onto the SAME session (NoiseSession::set_psk).
+///   4. Bind the resolved PSK onto the same session (NoiseSession::set_psk).
 ///   5. Write msg2 and split -> new session.
 ///
 /// @param msg1_json      Decrypted noise/handshake JSON string (the re-handshake msg1 envelope).
