@@ -60,31 +60,6 @@ using SendCompleteCallback = std::function<void(bool)>;
  *
  * The hub owns connection instances and uses callbacks to receive notifications about messages,
  * handshake completion, and disconnection events.
- *
- * Key responsibilities:
- * - Abstract base for platform-specific WebSocket transports (server and client variants)
- * - Owns and drives the time filter (Kalman-based NTP-style synchronization)
- * - Manages the reassembly payload buffer for fragmented WebSocket frames
- * - Tracks hello handshake state (client_hello_sent / server_hello_received)
- *
- * Usage:
- * 1. Construct a concrete subclass (SendspinServerConnection or SendspinClientConnection)
- * 2. Set the on_connected_cb, on_disconnected_cb, on_json_message_cb, and on_binary_message_cb
- *    callbacks
- * 3. Call start() to initialize the transport and begin connecting
- * 4. Call loop() periodically to drive the state machine and process events
- * 5. Call send_text_message() to send JSON messages to the peer
- * 6. Call disconnect() to send a goodbye message and close the connection
- *
- * @code
- * // Concrete subclass provided by the platform layer
- * auto conn = std::make_unique<SendspinClientConnection>(url, config);
- * conn->on_connected_cb = [](SendspinConnection* c) { c->send_text_message(hello_json, {}); };
- * conn->on_json_message_cb = [](SendspinConnection* c, const char* d, size_t n, int64_t t) {...};
- * conn->on_disconnected_cb = [](SendspinConnection* c) { handle_disconnect(); };
- * conn->start();
- * // Call conn->loop() from a periodic task
- * @endcode
  */
 class SendspinConnection : public std::enable_shared_from_this<SendspinConnection> {
 public:
@@ -112,7 +87,7 @@ public:
     /// @brief Closes the underlying transport immediately, without blocking and without ever
     /// joining/stopping the calling thread.
     ///
-    /// disconnect() is NOT safe to call from the network thread on every platform: on host
+    /// disconnect() is not safe to call from the network thread on every platform: on host
     /// outbound it ends up calling ix::WebSocket::stop(), and on ESP outbound it ends up calling
     /// esp_websocket_client_stop(), and both of those join/block the transport's own worker
     /// thread. Calling either one from a callback already running on that same thread (e.g. from
@@ -122,15 +97,10 @@ public:
     /// process via std::terminate().
     ///
     /// Each platform implements this with whichever non-blocking close primitive it already uses
-    /// elsewhere for the same hazard (see the allocation-failure paths in the platform .cpp files
-    /// for precedent): host uses ix::WebSocket::close() (async), ESP client reports the loss and
-    /// leaves the actual esp_websocket_client_stop() to the owning connection's destructor (run
-    /// off the websocket task), and both server transports use their existing trigger_close().
+    /// elsewhere for the same hazard.
     ///
-    /// The connection is still guaranteed to be reported lost exactly once from the manager's
-    /// point of view even when a platform's implementation also lets the transport's normal
-    /// asynchronous close/disconnect event fire afterwards: ConnectionManager::drop_connection()
-    /// treats a repeat disconnect for a connection it no longer manages as a no-op.
+    /// A connection is still reported lost exactly once: ConnectionManager::drop_connection()
+    /// no-ops on a repeat disconnect for a connection it no longer manages.
     virtual void close_transport_now() = 0;
 
     /// @brief Checks if the transport connection is established
@@ -152,16 +122,11 @@ public:
         return this->client_hello_sent_ && this->server_hello_received_;
     }
 
-    /// @brief Checks if the connection has fully proven itself: hello handshake complete AND
-    /// the first server/activate has been received and applied.
+    /// @brief True once the connection has proven itself: hello handshake complete and the first
+    /// server/activate applied.
     ///
-    /// This is the nursery's PROVE gate (see ConnectionManager): a connection never occupies
-    /// the current slot until this is true, so admission/trust/arbitration always run on real
-    /// activity data. Note that is_handshake_complete() already implies the Noise handshake is
-    /// complete when one is installed, because client/hello and server/hello are themselves
-    /// encrypted application traffic that cannot be sent/received before the Noise transport
-    /// is active.
-    /// @return true once hello + first server/activate are both done.
+    /// This is the nursery's prove gate (see ConnectionManager). is_handshake_complete() already
+    /// implies the Noise handshake, since both hellos are encrypted application traffic.
     bool is_operational() const {
         return this->is_handshake_complete() && this->first_activate_received();
     }
@@ -173,7 +138,7 @@ public:
     /// the Sentinel PSK (a spec constant, so effectively any peer on the network) can reach that
     /// state. Admission is where the PSK category is actually checked against the requested
     /// activities (see admission.h), so anything that drives shared client state (the roles)
-    /// must gate on THIS, not on the handshake having succeeded.
+    /// must gate on this, not on the handshake having succeeded.
     ///
     /// Written on the main loop only (see set_admitted()); atomic because the network thread
     /// reads it on the message-dispatch path.
@@ -271,10 +236,6 @@ public:
     /// "Noise_KKpsk2_25519_ChaChaPoly_SHA256"), or an empty string if none was set.
     /// Used to select the AEAD cipher for pairing.md "Wrapping" (see
     /// platform/crypto.h aead_cipher_name_from_noise_suite()).
-    ///
-    /// Virtual so a fake connection can report a canned suite name without an active Noise
-    /// session (mirroring get_noise_handshake_hash() below); production connections keep the
-    /// same implementation via dynamic dispatch.
     virtual const std::string& get_noise_suite_name() const {
         return this->noise_suite_name_;
     }
@@ -310,9 +271,7 @@ public:
         return this->noise_transport_.send_json(json, len);
     }
 
-    /// @brief Encrypt and send a JSON string as a Noise transport binary frame.
-    /// Thin delegate to NoiseTransport::send_json().
-    /// @return SsErr::OK on success.
+    /// @brief std::string overload of send_encrypted_text().
     SsErr send_encrypted_text(const std::string& json) {
         return this->noise_transport_.send_json(json);
     }
@@ -324,14 +283,8 @@ public:
     ///   frame is encrypted.
     /// - If not yet encrypted (pre-handshake), routes through send_text_message().
     ///
-    /// All role senders (client/hello, client/state, client/command, client/goodbye) use this
-    /// method. client/time is the one exception: its two send_time_message() overrides capture
-    /// the transmit timestamp as close to the wire send as possible and avoid std::string
-    /// materialization on the hot path, so they encrypt and send directly instead of routing
-    /// through here.
-    /// @param json    JSON string to send.
-    /// @param cb      Optional send-complete callback (best-effort; see send_text_message).
-    /// @param allow_before_hello  Passed through to send_text_message on the pre-noise path.
+    /// All role senders use this method. client/time is the one exception: send_time_message()
+    /// encrypts and sends directly, for the reasons on its own declaration.
     /// @return SsErr::OK if queued/sent, error code otherwise.
     /// @note The encrypted path blocks on the Noise session mutex, which the network thread also
     ///       holds across its own sends. On an ESP outbound connection that send blocks for up to
@@ -388,11 +341,9 @@ public:
     ///        guaranteed to fire: if the connection is torn down before the queued send runs, or
     ///        the message is dropped by the pre-hello gate, the callback is skipped. Treat it as a
     ///        best-effort completion notification, not an unconditional "send finished" signal.
-    /// @param allow_before_hello If true, the message may be sent before the client/hello has been
-    ///        sent on this connection (used for the hello itself and for goodbye). If false (the
-    ///        default), platform transports that send asynchronously drop the message when no
-    ///        client/hello has been sent yet, preserving the "hello is always first" protocol
-    ///        invariant. Synchronous transports ignore this flag.
+    /// @param allow_before_hello Lets the message precede this connection's client/hello (used by
+    ///        the hello itself and by goodbye). Otherwise asynchronous transports drop it, which
+    ///        is what keeps "hello is always first". Synchronous transports ignore the flag.
     /// @return SsErr::OK if queued successfully, error code otherwise.
     virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                                     bool allow_before_hello = false) = 0;
@@ -432,12 +383,8 @@ public:
     /// client/goodbye (or any other application-level message). Every call site is reached from
     /// dispatch_completed_message() on the network thread, so this routes to
     /// close_transport_now() (non-blocking on every platform) instead of disconnect() (which is
-    /// not network-thread-safe on host/ESP outbound; see close_transport_now()'s doc comment).
-    /// Also disables further message dispatch first, matching the existing allocation-failure
-    /// precedent in the platform .cpp files, so a stale frame cannot reach role queues while the
-    /// close is in flight.
-    /// @param reason Kept only for parity with disconnect()'s signature; no goodbye is
-    ///        actually transmitted.
+    /// not network-thread-safe on host/ESP outbound; see close_transport_now()). Dispatch is
+    /// disabled first, so a stale frame cannot reach role queues while the close is in flight.
     void close_silently(SendspinGoodbyeReason /*reason*/) {
         this->disable_message_dispatch();
         this->close_transport_now();
@@ -447,15 +394,13 @@ public:
     // Server information accessors
     // ========================================
 
-    /// @brief Gets the server ID (from the Noise handshake result, set at COMPLETE; empty
-    /// until then when a Noise handshake is installed on this connection).
-    /// @return The server ID string.
+    /// @brief Gets the server ID from the Noise handshake result (set at COMPLETE; empty until
+    /// then when a Noise handshake is installed on this connection).
     const std::string& get_server_id() const {
         return this->server_information_.server_id;
     }
 
-    /// @brief Gets the server information from the server/hello message
-    /// @return The ServerInformationObject (fields empty until hello is received).
+    /// @brief Gets the server information from the server/hello message (empty until received).
     const ServerInformationObject& get_server_information() const {
         return this->server_information_;
     }
@@ -464,9 +409,7 @@ public:
     // server/activate state accessors
     // ========================================
 
-    /// @brief Returns the current activity set declared by server/activate.
-    /// Main-loop-only: mutated only by apply_server_activate(), which the connection manager
-    /// calls while applying a deferred ServerActivateEvent on the main loop.
+    /// @brief Returns the current activity set declared by server/activate. Main-loop-only.
     const std::vector<SendspinActivity>& get_activities() const {
         return this->activities_;
     }
@@ -495,17 +438,10 @@ public:
     /// when no Noise handshake has completed).
     ///
     /// Returns by value under psk_id_mutex_, which both writers also hold, so this is safe from
-    /// any thread at any time. It deliberately does NOT return a reference: psk_id_ is rewritten
-    /// on the network thread at handshake COMPLETE and at every in-band re-handshake, and a
-    /// server may start a re-handshake at any point after admission, so a reader has no way to
-    /// exclude a later write by argument, so only the locking form exists: a reference-returning
-    /// accessor would let a caller retain a pointer into psk_id_ that a concurrent re-handshake
-    /// could rewrite out from under it.
-    ///
-    /// Every call site is cold (first activate per handshake, remove-record, unpair), so the
-    /// copy is not on any hot path. Callers that need the value more than once must read it once
-    /// into a local: two calls can straddle a re-handshake and observe different psk_ids.
-    /// @return Copy of the psk_id, or an empty string if no handshake has completed.
+    /// any thread. psk_id_ is rewritten on the network thread at every in-band re-handshake, and
+    /// a server may start one at any point after admission, so a caller that needs the value more
+    /// than once must read it into a local: two calls can straddle a re-handshake and observe
+    /// different psk_ids. Every call site is cold, so the copy is off any hot path.
     std::string get_psk_id() const {
         std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
         return this->psk_id_;
@@ -598,10 +534,8 @@ public:
 
         PairingSession() = default;
 
-        /// @brief Wipes the pairing code and both binding nonces on destruction, the same
-        /// discipline every PSK-bearing struct follows (see SendspinPairingRecord in config.h).
-        /// `prs` lives on the heap, so releasing it unwiped would leave the code in freed
-        /// memory after every attempt. `cpace` wipes its own scalar, MAC key and ISK here.
+        /// @brief Wipes the pairing code and both binding nonces on destruction. `prs` lives on
+        /// the heap, so releasing it unwiped would leave the code in freed memory.
         ~PairingSession() {
             secure_zero_container(this->nonce_b);
             secure_zero_container(this->nonce_a);
@@ -691,41 +625,29 @@ public:
         std::construct_at(&this->pairing_session_);
     }
 
-    /// @brief Clear first_activate_received_ and re-arm the provisional timeout after the
-    /// server acks server/pair-finalize.
-    ///
-    /// After the server acks pair-finalize it rekeys via an in-band re-handshake. Re-arming the
-    /// provisional timer means ConnectionManager::loop()'s re-proving-deadline check
-    /// (REPROVE_TIMEOUT_US, gated on this connection being current and !is_operational()) will
-    /// drop the connection if the server acks but never re-handshakes. It also sets
-    /// pairing_finalized_, so admission stops shielding this connection as an in-flight pairing
-    /// while activities_ still reads [PAIRING]. Runs on the network thread;
-    /// provisional_time_us_ is atomic. Implemented in connection.cpp to avoid pulling
-    /// platform/time.h into this header.
+    /// @brief Clears first_activate_received_ and re-arms the provisional timeout after the
+    /// server acks server/pair-finalize, so the re-proving watchdog bounds the rekey that
+    /// follows. Also sets pairing_finalized_, which stops admission shielding this connection as
+    /// an in-flight pairing. Network thread; defined in connection.cpp.
     void note_pairing_finalize_ack();
 
     /// @brief ORs the roles a just-received server/activate names into the active-role mask.
     ///
-    /// Runs on the network thread, where the activate is parsed, so a role the activation ADDS is
+    /// Runs on the network thread, where the activate is parsed, so a role the activation adds is
     /// already active for the receive gate when the traffic that legitimately follows it arrives:
     /// messaging.md "server/state" has the server send a re-added role's state promptly, without
-    /// waiting for the client's next main-loop tick. Removals are deliberately not applied
-    /// here: they take effect in apply_server_activate() on the main loop, in the same step that
-    /// tears the removed roles down, so the gate and the teardown always agree on when a role
-    /// stopped.
-    /// @param active_roles The active_roles of the activate just received (empty when it omitted
-    ///                     the field, which adds nothing).
+    /// waiting for the client's next main-loop tick. Removals are applied in
+    /// apply_server_activate() on the main loop, in the same step that tears the removed roles
+    /// down, so the gate and the teardown agree on when a role stopped.
     void note_activated_roles(const std::vector<std::string>& active_roles) {
         this->active_role_mask_.fetch_or(active_role_mask(active_roles), std::memory_order_acq_rel);
     }
 
     /// @brief Takes back the mask bits a refused activation added.
     ///
-    /// Main-loop only. note_activated_roles() adds a just-received activation's roles on the
-    /// network thread, before admissibility is judged. An activation the main loop then rejects
-    /// while keeping the connection open never reaches apply_server_activate(); without this the
-    /// receive gate would go on admitting traffic for a role this client never activated.
-    /// @param refused_roles The active_roles of the refused activation (empty when it named none).
+    /// Main-loop only. An activation the main loop rejects while keeping the connection open
+    /// never reaches apply_server_activate(); without this the receive gate would go on admitting
+    /// traffic for a role this client never activated.
     void withdraw_activated_roles(const std::vector<std::string>& refused_roles) {
         this->publish_role_mask(active_role_mask(refused_roles));
     }
@@ -739,7 +661,6 @@ public:
     /// mask is rebuilt by apply_server_activate() and read atomically, so the receive path may
     /// call it from the network thread while the main loop applies an activation; active_roles_
     /// itself is main-loop-only and must not be walked from there.
-    /// @param role The role to test.
     bool is_role_active(SendspinRole role) const {
         return (this->active_role_mask_.load(std::memory_order_acquire) & role_mask_bit(role)) != 0;
     }
@@ -761,8 +682,6 @@ public:
     /// Main-loop-only: called by ConnectionManager::loop() while applying a deferred
     /// ServerActivateEvent, never from the network thread, so activities_/active_roles_ need
     /// no synchronization of their own.
-    /// @param activities Activity list from the message.
-    /// @param active_roles Optional roles list (nullopt = keep prior set).
     /// @param pairing_method Method from the activation's pairing object (nullopt when absent).
     ///                       Ignored (stored as nullopt) unless `activities` includes PAIRING
     ///                       (spec: "A client ignores this field when activities does not
@@ -778,10 +697,8 @@ public:
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
         }
-        // Republished on every activation, sticky set included, so the mask the receive path reads
-        // cannot drift from active_roles_. Only the roles this activation takes out are withdrawn:
-        // a later activation whose bits the network thread has already OR'd in is not this one's
-        // to erase.
+        // Republished on every activation, sticky set included, so the mask cannot drift from
+        // active_roles_. Only the roles this activation takes out are withdrawn.
         this->publish_role_mask(
             static_cast<uint16_t>(previous & ~active_role_mask(this->active_roles_)));
         bool has_pairing = false;
@@ -862,11 +779,9 @@ public:
     ///
     /// Updated by `send_time_message()` on each call. The serialization happens between when
     /// `client_transmitted` is captured and when the bytes hit the wire, so this EMA estimates
-    /// the constant bias subtracted from the embedded timestamp. Reported alongside per-burst
-    /// stats for diagnostics. Atomic so the httpd worker (ESP server) can update it while the
-    /// hub thread reads it.
+    /// the constant bias subtracted from the embedded timestamp. Atomic so the httpd worker (ESP
+    /// server) can update it while the hub thread reads it.
     // cppcheck-suppress unusedFunction
-    // Not currently called by this repo's own sources.
     int64_t get_serialize_ema_us() const {
         return this->serialize_ema_us_.load(std::memory_order_relaxed);
     }
@@ -907,12 +822,8 @@ public:
     }
 
     /// @brief Marks that the WebSocket upgrade completed
-    /// @note Distinct from is_connected(): on ESP the socket is accepted (and is_connected() true)
-    ///       before any WebSocket handshake, so this flag signals that the peer spoke the WebSocket
-    ///       protocol. Set by the platform ws_server just before it delivers an inbound connection
-    ///       to the manager, or by the outbound transport's connected callback, either way on a
-    ///       network thread. Read on the main loop (reap diagnostics), hence atomic with
-    ///       release/acquire ordering.
+    /// @note Distinct from is_connected(): on ESP the socket is accepted before any WebSocket
+    ///       handshake, so this flag signals that the peer spoke WebSocket.
     void mark_ws_upgraded() {
         this->ws_upgraded_.store(true, std::memory_order_release);
     }
@@ -1185,7 +1096,7 @@ protected:
     /// active_roles_ as a bitmask of the roles this library implements, so the network thread can
     /// test a role without reading the vector the main loop rewrites. Written by
     /// note_activated_roles() on the network thread and through publish_role_mask() on the main
-    /// loop, never with a plain store: the two writers overlap.
+    /// loop, never with a plain store (see publish_role_mask()).
     std::atomic<uint16_t> active_role_mask_{0};
 
     /// Pairing method from the pairing object of the last pairing server/activate; nullopt
@@ -1241,54 +1152,22 @@ protected:
 
     /// Lifecycle-flag axes.
     ///
-    /// The six atomic flags in this section are not one linear lifecycle. They form three
-    /// independent axes:
+    /// The six atomic flags below are three independent axes, not one linear lifecycle:
+    ///  - Transport: ws_upgraded_.
+    ///  - Proving: noise_handshake_complete_ (set once, never cleared, not even by an in-band
+    ///    re-handshake, which keeps the transport active), client_hello_sent_ /
+    ///    server_hello_received_ (once per connection; connection.md "Re-handshake" re-sends
+    ///    neither hello), and first_activate_received_, which the server owes again after every
+    ///    re-handshake.
+    ///  - Admission: admitted_, whether this connection occupies the manager's current slot.
+    ///    Orthogonal to proving: an operational nursery loser is never admitted, and a
+    ///    re-handshaking current connection is admitted but not operational.
     ///
-    ///  - Transport axis: ws_upgraded_. Set once by the platform ws_server / outbound connected
-    ///    callback (network thread); read for reap diagnostics (see SetupStage in
-    ///    connection_manager.cpp).
-    ///  - Proving axis: noise_handshake_complete_ is set ONCE on the network thread at handshake
-    ///    COMPLETE and never cleared: not even by an in-band re-handshake, because the transport
-    ///    stays active across it. client_hello_sent_ / server_hello_received_ track the hello
-    ///    exchange, which happens once per connection (connection.md "Re-handshake": neither
-    ///    hello is re-sent), and the RESETTABLE first_activate_received_ tracks the activation,
-    ///    which the server owes again after every re-handshake.
-    ///  - Admission axis: admitted_ (whether this connection occupies the manager's current
-    ///    slot). Written only by ConnectionManager::set_current_connection() / drop_connection() on
-    ///    the main loop; read by the network thread's role-dispatch gate. Orthogonal to proving:
-    ///    an operational nursery loser is never admitted, and after a re-handshake the current
-    ///    connection is admitted but temporarily NOT operational.
-    ///
-    /// Writer/thread map:
-    ///  - client_hello_sent_: set by the hello send-completion callback in
-    ///    ConnectionManager::send_hello_message (httpd worker thread on ESP, inline on host);
-    ///    cleared by the outbound transports' disconnect handlers (esp/host
-    ///    client_connection.cpp, transport thread). Inbound connections are never reset on
-    ///    disconnect: a dropped server connection is torn down, not reused.
-    ///  - server_hello_received_: set by SendspinClient::process_json_message on server/hello
-    ///    (network thread); cleared by the same path as client_hello_sent_.
-    ///  - first_activate_received_: set by apply_server_activate (main loop only); cleared by
-    ///    handle_noise_rehandshake and note_pairing_finalize_ack (both network thread).
-    ///  - noise_handshake_complete_: set once in handle_noise_handshake_text at COMPLETE (network
-    ///    thread); never cleared.
-    ///  - admitted_: main loop only (ConnectionManager).
-    ///  - ws_upgraded_: network threads (platform ws_server / connect_to connected callback).
-    ///
-    /// Why not a single phase enum:
-    ///  - The order is not total: client_hello_sent_ and server_hello_received_ flip
-    ///    independently on different threads and can complete in either order (a nonconforming
-    ///    peer's server/hello can race ahead of our client/hello send completion). That is exactly
-    ///    why the manager's promotion scan is level-triggered rather than edge-triggered. A single
-    ///    enum would force an ordering that does not exist.
-    ///  - Transitions are non-monotonic by design: handle_noise_rehandshake and
-    ///    note_pairing_finalize_ack both rewind first_activate_received_ from the network thread
-    ///    while the main loop reads it. Monotonic-transition assertions would fire on
-    ///    legitimate operation.
-    ///  - The axes are orthogonal (see above), so one scalar cannot represent, e.g., "admitted but
-    ///    not operational" during re-proving.
-    ///  - The sanctioned way to get a readable single "phase" is to DERIVE it on demand from these
-    ///    flags, as SetupStage in connection_manager.cpp does for reap diagnostics: derived,
-    ///    never stored, so it cannot go stale.
+    /// Each flag's own comment below names its writers and threads. Do not fold them into one
+    /// phase enum: client_hello_sent_ and server_hello_received_ complete in either order, and
+    /// handle_noise_rehandshake() / note_pairing_finalize_ack() rewind first_activate_received_
+    /// from the network thread. Derive a phase on demand instead, as SetupStage in
+    /// connection_manager.cpp does for reap diagnostics.
 
     /// PSK category resolved by the Noise handshake (set at COMPLETE, or re-handshake).
     /// Atomic because get_psk_category() is read on the main loop (build_hello_message via the

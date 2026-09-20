@@ -80,11 +80,8 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendComple
     // main-loop check cannot race the network-thread re-handshake swap: send_encrypted_text
     // re-checks the session under NoiseTransport's own lock.
     if (this->noise_transport_.is_active()) {
-        // Post-handshake: all application JSON must be encrypted. The encrypted hot path
-        // consumes the caller's buffer directly (no std::string materialization).
-        // The callback is not forwarded through the encrypted path (the transport's send
-        // methods call send_binary_message with a null cb). Best-effort: fire it as success
-        // if encryption succeeds, fire it as failure otherwise.
+        // Post-handshake: encrypt straight from the caller's buffer. The transport's send path
+        // takes no callback, so fire cb here on the encrypt result (best-effort).
         SsErr err = this->send_encrypted_text(json, len);
         if (cb) {
             cb(err == SsErr::OK);
@@ -156,9 +153,7 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
             return;
         }
         // Record the server's identity (public key) and the PSK category/psk_id that admitted
-        // the connection, resolved by the handshake. Trust enforcement (ConnectionManager,
-        // reading get_psk_category()/get_psk_id()) happens on the main loop against
-        // server/activate, not here. Every write below happens-before the release store of
+        // the connection, resolved by the handshake. Every write below happens-before the store of
         // noise_handshake_complete_ just after it, so main-loop readers that observe
         // is_operational() (itself gated behind server_hello_received_/client_hello_sent_,
         // which cannot be true before the Noise transport is active) see these values.
@@ -194,11 +189,8 @@ bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
         return false;
     }
 
-    // Restart the re-proving watchdog: the connection is once again "awaiting its first
-    // server/activate" (under the new keys). ConnectionManager::loop()'s re-proving-deadline
-    // check reads this timestamp for current_connection_ (gated on !is_operational()) and
-    // drops the connection after REPROVE_TIMEOUT_US (see connection_manager.h) if the post-swap
-    // server/activate does not arrive in time.
+    // Restart the re-proving watchdog (ConnectionManager::scan_reprove_watchdog()): the
+    // connection is once again awaiting its first server/activate, under the new keys.
     //
     // This must precede the first_activate_received_ store below. The watchdog reads
     // is_operational() and then get_provisional_time_us() while holding nothing that excludes
@@ -371,12 +363,9 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
     // type from the leading plaintext byte. Cleartext TEXT frames carry only the pre-transport
     // handshake exchange (server/init, noise/handshake), which the handshake driver consumes.
     //
-    // A third state exists briefly: WS-upgraded with no handshake driver yet. An outbound
-    // connection sits there between its transport connected callback and the main loop calling
-    // init_noise_handshake() (see ConnectionManager::drain_lifecycle_events), and a connection
-    // rejected at nursery capacity never gets a driver at all. Nothing legitimate arrives in
-    // either case (a server speaks only after client/init), so any frame there is
-    // unauthenticated and is dropped.
+    // A WS-upgraded connection with no driver yet (outbound between connect and
+    // init_noise_handshake(), or one rejected at nursery capacity) never hears anything
+    // legitimate, so its frames are dropped.
     const bool noise_active = this->noise_handshake_complete_.load(std::memory_order_acquire);
     const bool noise_pending = !noise_active && this->noise_handshake_;
 
@@ -437,15 +426,12 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
     }
 
     if (noise_pending) {
-        // A handshake driver is installed but the transport is not up yet, so this frame is
-        // unauthenticated application data. It must NOT reach the unencrypted dispatch below: that
-        // path hands the bytes straight to the role binary handlers, which would let any peer
-        // that merely completed the WebSocket upgrade inject audio/artwork/visualizer data with
-        // the whole Noise/PSK/admission chain bypassed. The TEXT branch above already refuses
-        // the same trick by routing pre-handshake text into the handshake driver.
-        //
-        // Treated as a handshake-phase failure per connection.md "Failure Handling": close the
-        // WebSocket without sending any application-level message.
+        // A handshake driver is installed but the transport is not up, so this frame is
+        // unauthenticated application data. It must not reach the unencrypted dispatch below:
+        // that path hands the bytes to the role binary handlers, letting any peer that merely
+        // completed the WebSocket upgrade inject audio/artwork data with the Noise/PSK/admission
+        // chain bypassed. Treated as a handshake-phase failure per connection.md "Failure
+        // Handling": close without any application-level message.
         SS_LOGW(TAG, "Binary frame before the Noise handshake completed; closing connection");
         this->reset_websocket_payload();
         this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
@@ -499,21 +485,14 @@ void SendspinConnection::replay_pre_admission_messages(const HeldMessageVisitor&
 // ============================================================================
 
 void SendspinConnection::note_pairing_finalize_ack() {
-    // After the server acks pair-finalize it rekeys via an in-band re-handshake. Resetting
-    // first_activate_received_ and re-arming the provisional timer means
-    // ConnectionManager::loop()'s re-proving-deadline check (REPROVE_TIMEOUT_US, gated on
-    // !current_connection_->is_operational()) will drop the connection if the server acks but
-    // never re-handshakes.
-    //
     // Stamp the provisional timer before clearing first_activate_received_, for the reason given
     // in handle_noise_rehandshake(): the watchdog reads is_operational() and then
     // get_provisional_time_us() unsynchronized, so the reverse order lets it pair "not
     // operational" with this connection's previous, arbitrarily old stamp and drop it.
     this->set_provisional_time_us(platform_time_us());
     this->first_activate_received_.store(false, std::memory_order_release);
-    // Mark the activities snapshot stale: the exchange is protocol-complete (the record is
-    // stored) but activities_ still reads [PAIRING] until the post-rekey activate lands, and
-    // admission must not keep shielding this connection as an in-flight pairing meanwhile.
+    // Mark the activities snapshot stale: activities_ still reads [PAIRING] until the post-rekey
+    // activate lands, and admission must not keep shielding this as an in-flight pairing.
     this->pairing_finalized_.store(true, std::memory_order_release);
 }
 
