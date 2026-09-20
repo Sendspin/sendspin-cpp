@@ -37,10 +37,7 @@ namespace {
 /// @brief Shared load -> string_view -> decode -> warn-on-failure -> secure_zero(blob) shape used
 /// by the RECORDS and PAIRING_PSK loaders below. STATIC_PAIRING_CODE (no decoder, no PSK bytes)
 /// and PAIR_CONFIG (no PSK bytes) differ enough to stay direct.
-/// @param decode_fail_suffix Appended to the "Stored "%s" blob failed to decode; " warning, so
-///        each caller keeps its own original message verbatim.
-/// @return The decoded value, or nullopt if the blob was absent or failed to decode. The raw
-///         blob is wiped before returning on BOTH the success and decode-failure paths.
+/// @return The decoded value, or nullopt. The raw blob is wiped on both paths.
 template <typename T>
 std::optional<T> load_decode_wipe(SendspinPersistenceProvider& provider, const char* key,
                                   std::optional<T> (*decode)(std::string_view),
@@ -166,7 +163,7 @@ void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpair
     // First-boot seed: the application's configured default for unpaired access applies only on
     // a genuine first boot; a loaded config always wins.
     //
-    // !loaded_config alone is NOT sufficient evidence of a first boot, and getting that wrong
+    // !loaded_config alone is not sufficient evidence of a first boot, and getting that wrong
     // fails open. loaded_config stays false both when the persistence_keys::PAIR_CONFIG blob was
     // never stored and when it was stored but failed to decode: the provider interface gives no
     // way to distinguish "absent" from "present but unreadable" (load_blob() returns nullopt for
@@ -177,7 +174,7 @@ void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpair
     // Any surviving provisioned material therefore vetoes the seed: this is a reboot with a
     // damaged config, not a first boot, and the safe default is the restrictive one.
     //
-    // A store that lost EVERYTHING is indistinguishable from a factory-fresh device by
+    // A store that lost everything is indistinguishable from a factory-fresh device by
     // construction, so the seed does apply there, as it does when there is no provider at all.
     const bool previously_provisioned = !this->records_.empty() || this->pairing_psk_.has_value();
     if (previously_provisioned) {
@@ -188,16 +185,10 @@ void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpair
     } else {
         this->unpaired_access_enabled_ = initial_unpaired_access_enabled;
     }
-    // Scope note: only unpaired_access_enabled_ is protected this way, and deliberately so. It
-    // defaults to false, so declining to seed it can only ever withhold a permission. The sibling
-    // flags (pairing_psk_enabled_, dynamic_pairing_code_enabled_) default to TRUE, so a config that
-    // fails to load does resurrect a pairing method an operator had turned off, and the write below
-    // persists that. Forcing those to false here is not a correct fix: a provider that seeds
-    // records or a Pairing PSK without implementing config persistence at all returns nullopt for
-    // exactly the same reason a damaged one does, and disabling pairing for it would break a
-    // legitimate integration. Closing that hole properly needs the provider interface to
-    // distinguish "never stored" from "could not be read" (a tri-state load result) rather than
-    // more guessing here.
+    // Only unpaired_access_enabled_ is protected this way: it defaults to false, so declining to
+    // seed it can only withhold a permission. The sibling flags default to true, and forcing them
+    // false here would break a provider that seeds records or a Pairing PSK without implementing
+    // config persistence at all, which returns nullopt for the same reason a damaged store does.
     //
     // No lock needed here: the constructor runs before this object is reachable by any other
     // thread.
@@ -248,7 +239,6 @@ void RecordStore::provision_pairing_psk_if_needed() {
 std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk_id,
                                                           PskCategory category) const {
     // Runs on the network thread; lock against main-loop mutations of records_/pairing_psk_.
-    // Calls the unlocked record_by_psk_id() helper, so no recursive acquisition occurs.
     std::lock_guard<std::mutex> lock(this->mutex_);
     return this->resolve_by_psk_id_locked(psk_id, category);
 }
@@ -351,9 +341,9 @@ bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_us
 
 bool RecordStore::store_record_superseding(SendspinPairingRecord record,
                                            const std::vector<std::string>& psk_ids_in_use) {
-    // RAM-only: this runs on the NETWORK thread (the server/pair-finalize ack handler), where the
-    // record must become resolvable before the handler returns: the server's follow-up
-    // re-handshake is the next message on that thread. See the header for the rest.
+    // RAM-only: runs on the network thread (the server/pair-finalize ack handler), where the
+    // record must resolve before the handler returns, since the server's follow-up re-handshake
+    // is the next message on that thread.
     std::lock_guard<std::mutex> lock(this->mutex_);
 
     size_t idx = this->find_index(record.psk_id);
@@ -369,8 +359,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
         if (!will_supersede_existing && !this->has_capacity_locked() &&
             !this->evict_one_locked(psk_ids_in_use)) {
             // Only reachable if every record at capacity backs an open connection, which the
-            // connection budget rules out (see MIN_MAX_RECORDS). Fails closed: an unresolvable
-            // record drops the connection when the server rekeys onto it.
+            // connection budget rules out (see MIN_MAX_RECORDS).
             SS_LOGW(TAG, "Storage full (%zu/%zu) and nothing evictable; rejecting record %s",
                     this->records_.size(), this->max_records_, incoming_psk_id.c_str());
             return false;
@@ -384,9 +373,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
         idx = this->records_.size() - 1;
     }
 
-    // Retire any OTHER record still bound to this server_id: pairing mints a fresh per-server
-    // PSK that REPLACES whatever that server held before, so leaving the prior record in place
-    // would let re-pairing accumulate a second working PSK for the same server.
+    // Retire any other record still bound to this server_id (see the header).
     const std::string superseded_server_id = this->records_[idx].server_id;
     for (size_t i = 0; i < this->records_.size();) {
         if (i != idx && this->records_[i].server_id == superseded_server_id) {
@@ -413,10 +400,9 @@ bool RecordStore::persist_records(bool report_rejection) {
     if (this->save_encoded_records(encoded)) {
         return true;
     }
-    // One warning covers every durable change the rejected blob leaves RAM-only. Nothing is
-    // retried: a provider that cannot write will not start writing because it is asked again,
-    // and the RAM state stays authoritative for this boot either way. A batch carrying only the
-    // advisory `used` flag asks for silence instead (see report_rejection).
+    // One warning covers every durable change the rejected blob leaves RAM-only; nothing is
+    // retried, and RAM stays authoritative for this boot. A batch carrying only the advisory
+    // `used` flag asks for silence instead (see report_rejection).
     if (report_rejection) {
         SS_LOGW(TAG,
                 "Provider rejected the pairing-record write; the store's contents are RAM-only "
@@ -452,13 +438,10 @@ bool RecordStore::note_record_used(const std::string& psk_id) {
                         this->records_.end());
         }
 
-        // The recency order stays in RAM. This runs on the first activate of EVERY long-term
-        // session, so persisting the reorder would rewrite the whole records blob per connection
-        // in steady state: on ESP, an NVS erase cycle per connection for advisory bookkeeping.
-        // The order is rebuilt from use, so a reboot only loses the ordering among records
-        // nothing has connected on since.
-        //
-        // The `used` flag is durable, so its first flip is written.
+        // The recency order stays in RAM: this runs on the first activate of every long-term
+        // session, so persisting the reorder would cost an NVS erase cycle per connection for
+        // bookkeeping that use rebuilds anyway. The durable `used` flag is different, so its
+        // first flip is written.
         if (this->records_.back().used) {
             return false;
         }
@@ -516,35 +499,15 @@ bool RecordStore::persist_config() {
 // Locking discipline for records_ persistence
 // ============================================================================
 //
-// records_ is guarded by mutex_ (see the class comment in record_store.h). Every mutation that
-// touches records_ AND needs to persist it follows one uniform discipline: mutate records_ and
-// encode the WHOLE array under mutex_ (encode_records_locked()), then DROP the lock and hand the
-// encoded blob to the provider (save_encoded_records()). The provider write is an NVS commit on
-// ESP, tens of milliseconds long, and resolve_by_psk_id() takes this same mutex on the network
-// thread for every handshake, so holding it across the write would block a handshake for the
-// length of a flash commit.
+// Every path that mutates records_ and needs to persist it encodes the whole array under mutex_
+// (encode_records_locked()), then drops the lock before handing the blob to the provider
+// (save_encoded_records()). The provider write is an NVS commit on ESP, tens of milliseconds, and
+// resolve_by_psk_id() takes the same mutex on the network thread for every handshake.
 //
-// Encode and save do not need to be atomic with respect to each other. persist_records(), the
-// one path that saves, is main-loop-only, so its encode/save pairs are serialized by thread
-// confinement and two blobs cannot land out of order.
-// The only writer that can slip into the gap is a network-thread store_record_superseding(),
-// which is RAM-only: the saved blob then predates that insert, which was already true (it was
-// not in records_ when the encode ran) and is repaired by the persist_records() flush the insert
-// schedules onto the main loop.
-//
-// A resolve landing in the gap sees the new RAM state while flash still holds the old blob. That
-// is the answer it wants: RAM is the authority for the current boot, since a provider may reject
-// the write outright and leave the same divergence permanently, and the blob only decides what
-// comes back after a reboot.
-//
-// store_record_superseding() is the exception: it mutates records_
-// WITHOUT persisting at all, because it runs on the network thread where the provider may not be
-// called. Its deferred flush is persist_records() (the public wrapper below), scheduled onto the
-// main loop by the client via INBOX_TOPIC_RECORDS; one flush write covers the insert and the
-// retire together.
-//
-// Preconditions: encode_records_locked() with mutex_ held, save_encoded_records() with it
-// dropped.
+// The two halves need not be atomic: persist_records() is main-loop-only, so blobs cannot land
+// out of order, and the one writer that can slip into the gap (store_record_superseding, on the
+// network thread) is RAM-only and schedules its own flush. A resolve in the gap sees the new RAM
+// state, which is the authority for the boot; the blob only decides what survives a reboot.
 std::string RecordStore::encode_records_locked() const {
     if (this->provider_ == nullptr) {
         return {};
@@ -559,10 +522,8 @@ bool RecordStore::save_encoded_records(std::string& encoded) {
     const bool ok = this->provider_->save_blob(persistence_keys::RECORDS,
                                                reinterpret_cast<const uint8_t*>(encoded.data()),
                                                encoded.size());
-    // The encoded blob is base64 PSK text for every stored record; wipe it now that save_blob()
-    // has its own copy (or has rejected it), rather than leaving it for the caller's string to
-    // be freed unwiped. This is the one blob write on every records_ mutation path (see the
-    // locking-discipline comment above), so it covers store/remove/mark-used/supersede alike.
+    // The encoded blob is base64 PSK text; wipe it now that save_blob() has its own copy (or has
+    // rejected it).
     secure_zero(encoded.data(), encoded.size());
     return ok;
 }
