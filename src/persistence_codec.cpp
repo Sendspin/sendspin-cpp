@@ -48,8 +48,8 @@ struct PskIdAndBytes {
 };
 
 /// @brief Parses and validates the "psk_id"/"psk" fields common to a record and a Pairing PSK.
-/// @param obj    The object to read.
-/// @param reason Set to the rejection reason when the parse fails; untouched on success.
+/// @param reason Set to the rejection reason when the parse fails; untouched on success. Every
+///        rejection path below sets it, for the callers that log it.
 /// @return nullopt if psk_id is missing/empty, psk is missing, or psk does not base64url-decode
 ///         to exactly 32 bytes.
 std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj, const char** reason) {
@@ -83,9 +83,6 @@ std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj, const cha
 
 /// @brief Parses a pairing record from a JSON object (a top-level record blob, or one entry of
 /// a records array). Ignores an entry-local "v", if present.
-/// @param obj    The object to read.
-/// @param reason Set to the rejection reason when the parse fails; untouched on success. Every
-///        rejection path sets it, for the callers that log it.
 /// @return The record, or nullopt when the object is not a usable one.
 std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, const char** reason) {
     auto core = parse_psk_id_and_psk(obj, reason);
@@ -141,9 +138,6 @@ void write_record_fields(TTarget& target, const SendspinPairingRecord& r) {
 }
 
 /// @brief Parses an accepted Pairing PSK from a JSON object.
-/// @param obj    The object to read.
-/// @param reason Set to the rejection reason when the parse fails; untouched on success. Every
-///        rejection path sets it, for the callers that log it.
 /// @return The Pairing PSK, or nullopt when the object does not carry a usable one.
 std::optional<SendspinPairingPsk> psk_from_object(JsonObjectConst obj, const char** reason) {
     auto core = parse_psk_id_and_psk(obj, reason);
