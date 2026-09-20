@@ -78,9 +78,6 @@ public:
     /// static keys and do not involve the PSK), resolves the real PSK via the record store,
     /// binds it with `set_psk`, and only then calls `write_msg2_and_split`.
     ///
-    /// @param suite_name  Full Noise suite name (e.g. NOISE_SUITE_CHACHAPOLY).
-    /// @param local_priv  32-byte X25519 private key.
-    /// @param remote_pub  32-byte X25519 public key of the remote (server).
     /// @param prologue    Exact prologue bytes (init messages, or prior hash on re-handshake).
     /// @param psk         32-byte PSK, or nullptr to bind it later via `set_psk`.
     /// @return Session ready for `read_msg1`, or nullopt on error.
@@ -95,8 +92,6 @@ public:
     // ========================================
 
     /// @brief Decrypt Noise message 1 and return its plaintext payload.
-    /// @param msg1_bytes   Raw bytes received in the noise/handshake frame.
-    /// @param msg1_len     Length of msg1_bytes.
     /// @return Decrypted payload, or empty vector on auth failure.
     std::vector<uint8_t> read_msg1(const uint8_t* msg1_bytes, size_t msg1_len);
 
@@ -108,14 +103,11 @@ public:
     /// `write_msg2_and_split`, including after `read_msg1`. Calling it more than once
     /// simply replaces the previously bound key.
     ///
-    /// @param psk  32-byte PSK.
-    /// @return true on success, false if the handshake state is null/consumed or noise-c
-    ///         rejects the key.
+    /// @return false if the handshake state is null/consumed or noise-c rejects the key.
     bool set_psk(const uint8_t* psk);
 
     /// @brief Encrypt Noise message 2 (payload = `{}` UTF-8) and split into
     /// transport cipher states.
-    /// @param[out] msg2_out  Buffer to receive the Noise ciphertext bytes.
     /// @return true on success; transport mode is now active.
     bool write_msg2_and_split(std::vector<uint8_t>& msg2_out);
 
@@ -129,16 +121,13 @@ public:
     // ========================================
 
     /// @brief Encrypt plaintext for transport.
-    /// @param plaintext  Input bytes (modified in-place; caller must supply
-    ///                   `len + 16` bytes of capacity).
-    /// @param len        Number of plaintext bytes.
-    /// @param capacity   Total capacity of `plaintext` buffer.
+    /// @param plaintext  Input bytes (modified in-place; the caller must supply `len + 16`
+    ///                   bytes of capacity).
     /// @return Number of ciphertext bytes (len + 16 tag), or 0 on error.
     size_t encrypt(uint8_t* plaintext, size_t len, size_t capacity);
 
     /// @brief Decrypt ciphertext in-place.
-    /// @param ciphertext  Input bytes (modified in-place).
-    /// @param len         Number of ciphertext bytes (plaintext + 16-byte tag).
+    /// @param len  Number of ciphertext bytes (plaintext + 16-byte tag).
     /// @return Number of plaintext bytes, or 0 on auth failure.
     size_t decrypt(uint8_t* ciphertext, size_t len);
 

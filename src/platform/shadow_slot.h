@@ -26,15 +26,12 @@ namespace sendspin {
 /// @brief Thread-safe shadow slot for passing the latest value of T between any two threads: one
 /// writer, one reader, latest-value-wins.
 ///
-/// The writer thread locks briefly to write or merge a value; the reader thread locks briefly to
-/// move the value out if dirty. General contract: safe between any single-writer/single-reader
-/// thread pair, not just producer/consumer pairs outside the main loop: e.g. the sync task's
-/// playback-progress slot (audio callback thread to sync task thread) and a connection's pending
-/// pairing record (main loop writer to network-thread reader). State bound for the main loop's
-/// own read side instead goes through Inbox / InboxSlot (see inbox.h) when there are many such
-/// producers to consolidate onto one shared mutex and a single lock-free poll() read per tick;
-/// ShadowSlot remains the right primitive for a single producer/single consumer pair regardless
-/// of which (if either) side is the main loop.
+/// The writer locks briefly to write or merge a value; the reader locks briefly to move it out
+/// if dirty. Safe between any single-writer/single-reader thread pair, whichever side (if either)
+/// is the main loop: the sync task's playback-progress slot and a connection's pending pairing
+/// record both use it. State bound for the main loop's read side goes through Inbox / InboxSlot
+/// (see inbox.h) instead, which consolidates many producers onto one mutex and one lock-free
+/// poll() per tick.
 template <typename T>
 class ShadowSlot {
 public:
@@ -46,7 +43,6 @@ public:
     ShadowSlot& operator=(const ShadowSlot&) = delete;
 
     /// @brief Overwrite the slot with a new value (latest-wins)
-    /// @param value The new value to store.
     void write(T value) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->slot_ = std::move(value);
@@ -54,8 +50,6 @@ public:
     }
 
     /// @brief Merge a delta into the slot using a callable: fn(T& current, T&& delta)
-    /// @param fn Callable that merges `delta` into the current slot value.
-    /// @param delta The new partial value to merge in.
     template <typename MergeFn>
     void merge(MergeFn&& fn, T delta) {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -63,9 +57,7 @@ public:
         this->dirty_ = true;
     }
 
-    /// @brief Move the accumulated value out if dirty
-    /// @param[out] out Receives the stored value if the slot is dirty.
-    /// @return true if a value was taken, false if the slot was clean.
+    /// @brief Move the accumulated value out if dirty; false when the slot was clean
     bool take(T& out) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         if (!this->dirty_) {
