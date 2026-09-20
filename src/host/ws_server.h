@@ -44,22 +44,6 @@ class SendspinServerConnection;
  * so the bound cannot be silently rescoped by an IXWebSocket upgrade. Such sockets are invisible
  * to the rest of the library. Connection close events are reported via ConnectionClosedCallback.
  *
- * Usage:
- * 1. Set the new_connection, connection_closed, and find_connection callbacks
- * 2. Optionally set the maximum connection count with set_max_connections()
- * 3. Call start() to begin accepting connections
- * 4. Call stop() to shut down the server
- *
- * @code
- * SendspinWsServer server;
- * server.set_new_connection_callback([&](auto conn) {
- *     store_connection(std::move(conn));
- * });
- * server.set_connection_closed_callback([&](std::shared_ptr<SendspinServerConnection> conn) {
- *     remove_connection(std::move(conn));
- * });
- * server.start(&client, false, 5);
- * @endcode
  */
 class SendspinWsServer {
 public:
@@ -78,12 +62,8 @@ public:
     /// Returns a shared_ptr to keep the connection alive during message dispatch.
     using FindConnectionCallback = std::function<std::shared_ptr<SendspinConnection>(int sockfd)>;
 
-    /// @brief Starts the WebSocket server on the configured port
-    /// @param client Pointer to the SendspinClient (stored for context).
-    /// @param task_stack_in_psram Ignored on host builds.
-    /// @param task_priority Ignored on host builds.
-    /// @param task_stack_size Ignored on host builds (ESP-IDF httpd task stack size).
-    /// @return true if the server started successfully, false on error
+    /// @brief Starts the WebSocket server on the configured port; the three task parameters are
+    /// ESP-IDF httpd settings and are ignored here.
     bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority,
                size_t task_stack_size);
 
@@ -92,21 +72,17 @@ public:
 
     /// @brief No-op on host builds. On ESP the manager loop drives the pending-upgrade reap
     /// through this; here IXWebSocket delivers Open events and times out stalled handshakes on
-    /// its own threads (bounded by WS_HANDSHAKE_TIMEOUT_SECS, pinned in start()).
+    /// its own threads (bounded by WS_HANDSHAKE_TIMEOUT_SECS, pinned in start()). Kept as an
+    /// instance method for symmetry with the ESP build.
     // cppcheck-suppress functionStatic
-    // Instance method by API design, matching the ESP build's stateful tick() (see
-    // src/esp/ws_server.h): both platforms expose the same shape so ConnectionManager::loop()
-    // does not need to special-case one over the other.
     void tick() {}
 
     /// @brief Sets the callback invoked when a client connection closes
-    /// @param callback Function called with the closed connection.
     void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
         this->connection_closed_callback_ = std::move(callback);
     }
 
     /// @brief Sets the callback used to look up an existing connection by socket fd
-    /// @param callback Function that returns the connection for a given socket fd, or nullptr.
     void set_find_connection_callback(FindConnectionCallback&& callback) {
         this->find_connection_callback_ = std::move(callback);
     }
@@ -116,32 +92,26 @@ public:
     /// manager's nursery, and one spare socket so a surplus peer can receive a goodbye (see
     /// ConnectionManager::NURSERY_CAPACITY's socket-budget invariant). Enforced by IXWebSocket
     /// at accept.
-    /// @param max_connections Maximum connection count.
     void set_max_connections(uint8_t max_connections) {
         this->max_connections_ = max_connections;
     }
 
     /// @brief Sets the TCP port the WebSocket server listens on
-    /// @param port Port number.
     void set_port(uint16_t port) {
         this->server_port_ = port;
     }
 
-    /// @brief No-op on host builds; control port is an ESP-IDF httpd concept
+    /// @brief No-op on host builds; the control port is an ESP-IDF httpd concept. Kept as an
+    /// instance method for symmetry with the ESP build.
     // cppcheck-suppress functionStatic
-    // Instance method by API design, matching the ESP build's stateful set_ctrl_port() (see
-    // src/esp/ws_server.h): both platforms expose the same shape so callers do not need to
-    // special-case one over the other.
     void set_ctrl_port(uint16_t /*ctrl_port*/) {}
 
     /// @brief Sets the callback invoked when a new client connection is accepted
-    /// @param callback Function called with ownership of the new SendspinServerConnection.
     void set_new_connection_callback(NewConnectionCallback&& callback) {
         this->new_connection_callback_ = std::move(callback);
     }
 
-    /// @brief Returns true if the WebSocket server has been started
-    /// @return true if the server is currently running, false otherwise
+    /// @brief Whether the WebSocket server is currently running
     bool is_started() const {
         return this->server_ != nullptr;
     }
@@ -149,29 +119,23 @@ public:
 protected:
     // Struct fields
 
-    /// @brief Callback to notify the client when a socket closes
     ConnectionClosedCallback connection_closed_callback_;
 
-    /// @brief Callback to find a connection by socket fd
     FindConnectionCallback find_connection_callback_;
 
-    /// @brief Callback to notify the client of new connections
     NewConnectionCallback new_connection_callback_;
 
     // Pointer fields
 
-    /// @brief Pointer to the SendspinClient (stored as user context for callbacks)
+    /// @brief Stored as the user context for the IX callbacks
     SendspinClient* client_{nullptr};
 
-    /// @brief The IXWebSocket server instance
     std::unique_ptr<ix::WebSocketServer> server_;
 
     // Numeric fields
 
-    /// @brief Maximum number of simultaneous connections (see set_max_connections)
     uint8_t max_connections_{SendspinClientConfig::DEFAULT_SERVER_MAX_CONNECTIONS};
 
-    /// @brief TCP port the WebSocket server listens on
     uint16_t server_port_{SendspinClientConfig::DEFAULT_SERVER_PORT};
 };
 

@@ -32,35 +32,16 @@
 namespace sendspin {
 
 /**
- * @brief ESP-IDF HTTP server WebSocket connection representing a single Sendspin server session
+ * @brief ESP-IDF httpd WebSocket connection representing a single Sendspin server session
  *
- * Implements the SendspinConnection interface for the server role, where the ESP device
- * hosts an HTTP server and the Sendspin server connects to it as a WebSocket client.
- *
- * Manages:
- * - The socket file descriptor for the accepted connection
- * - Sending text messages (hello, state, time, goodbye, commands)
- * - The httpd handle reference (owned by SendspinWsServer)
- *
- * Usage:
- * 1. Created by SendspinWsServer when a new connection is accepted
- * 2. start() is called to begin message processing
- * 3. loop() is called periodically to handle time synchronization
- * 4. disconnect() is called to gracefully close with goodbye message
- *
- * @code
- * // Typical usage via SendspinWsServer (not constructed directly):
- * SendspinWsServer ws_server;
- * ws_server.start(port);
- * // SendspinWsServer creates SendspinServerConnection instances internally
- * // when incoming WebSocket connections are accepted.
- * @endcode
+ * Implements SendspinConnection for the server role, where the ESP device hosts the HTTP server
+ * and the Sendspin server connects to it as a WebSocket client. Instances are created by
+ * SendspinWsServer, never directly; the httpd session owns them (see ws_server.h).
  */
 class SendspinServerConnection : public SendspinConnection {
 public:
-    /// @brief Constructs a server connection with the given httpd handle and socket
-    /// @param server The httpd handle (owned by the server listener).
-    /// @param sockfd The socket file descriptor for this connection.
+    /// @brief Constructs a server connection over an accepted httpd session; the handle is
+    /// owned by the server listener.
     SendspinServerConnection(httpd_handle_t server, int sockfd);
 
     ~SendspinServerConnection() override = default;
@@ -75,25 +56,17 @@ public:
     /// @brief Periodic loop processing (handles time message sending)
     void loop() override;
 
-    /// @brief Gracefully disconnects by sending a goodbye message, then closing
-    ///
-    /// This is the high-level API for disconnection. It:
-    /// 1. Sends a goodbye message with the specified reason
-    /// 2. Calls trigger_close() after the message is sent (via async completion callback)
-    /// 3. Invokes on_complete callback (if provided) after goodbye send completes
-    ///
-    /// @param reason The reason for disconnecting (sent in goodbye message).
-    /// @param on_complete Optional callback invoked after goodbye send completes (or fails).
-    ///                    Invoked from httpd worker thread - use defer() if main loop context is
-    ///                    needed.
+    /// @brief Sends a goodbye carrying @p reason, then calls trigger_close() from the send's
+    /// async completion callback.
+    /// @param on_complete Optional; invoked after the goodbye send completes or fails, on the
+    ///                    httpd worker thread. Use defer() if main-loop context is needed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
     /// @brief Closes the transport immediately without blocking (see base class doc comment).
     /// Delegates to trigger_close(), the same async primitive disconnect() already uses.
     void close_transport_now() override;
 
-    /// @brief Checks if the socket connection is valid
-    /// @return true if connected, false otherwise.
+    /// @brief Whether the socket connection is valid
     bool is_connected() const override;
 
     /// @brief Marks the connection closed after the httpd session ends
@@ -107,9 +80,6 @@ public:
     }
 
     /// @brief Sends a text message to the server with a completion callback
-    /// @param message The message string to send.
-    /// @param on_complete Callback invoked after send completes.
-    /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
                             bool allow_before_hello) override;
 
@@ -122,11 +92,8 @@ public:
     bool send_time_message() override;
 
     /// @brief Sends a binary WebSocket frame to the connected client (async, via httpd worker)
-    /// @param data   Binary payload bytes.
-    /// @param len    Number of bytes.
     /// @param on_complete Optional completion callback (best-effort; may be skipped on teardown).
     /// @param allow_before_hello If true, bypasses the pre-hello send gate.
-    /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
                               bool allow_before_hello) override;
 
@@ -167,7 +134,6 @@ protected:
     /// @param type              HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY.
     /// @param on_complete       Completion callback, if any.
     /// @param allow_before_hello If true, bypasses the pre-hello send gate.
-    /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr queue_async_send(const uint8_t* data, size_t len, httpd_ws_type_t type,
                            SendCompleteCallback on_complete, bool allow_before_hello);
 
