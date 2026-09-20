@@ -61,9 +61,9 @@ public:
     /// @brief Called when the cached metadata is dropped: the connection to the server was lost,
     /// or a server/activate took the metadata role out of the session's active roles
     ///
-    /// Implementations should clear any displayed track metadata (title, artist, artwork URL,
-    /// progress, etc.) since the previous state is no longer valid. Idempotent by contract: a
-    /// second clear with nothing to clear must be a no-op. A role removed from an active session
+    /// Implementations should clear any displayed track metadata, since the previous state is no
+    /// longer valid. Idempotent by contract: a second clear with nothing to clear must be a
+    /// no-op. A role removed from an active session
     /// can be added back by a later activation, which resumes with a fresh on_metadata().
     virtual void on_metadata_clear() {}
 };
@@ -108,18 +108,13 @@ public:
     explicit MetadataRole(SendspinClient* client);
     ~MetadataRole();
 
-    /// @brief Sets the listener for metadata events
-    /// @note The listener must outlive this role
-    /// @param listener Pointer to the listener implementation
+    /// @brief Sets the listener for metadata events; it must outlive this role
     void set_listener(MetadataRoleListener* listener);
 
-    /// @brief Returns the track duration in milliseconds
-    /// @return Track duration in milliseconds, or 0 if unknown or the stream is live
+    /// @brief Returns the track duration in milliseconds, or 0 if unknown or the stream is live
     uint32_t get_track_duration_ms() const;
 
-    /// @brief Returns the interpolated track progress in milliseconds
-    /// @return Estimated playback position in milliseconds, interpolated from the last server
-    /// update
+    /// @brief Returns the track progress in milliseconds, interpolated from the last server update
     uint32_t get_track_progress_ms() const;
 
 private:
