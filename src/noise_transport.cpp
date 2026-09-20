@@ -220,7 +220,7 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
 // ============================================================================
 
 size_t NoiseTransport::decrypt_in_place(uint8_t* ciphertext, size_t len) {
-    // NETWORK THREAD ONLY; unlocked by design (see the file comment).
+    // Network thread only; unlocked by design (see the file comment).
     if (!this->session_) {
         return 0;
     }
@@ -228,7 +228,7 @@ size_t NoiseTransport::decrypt_in_place(uint8_t* ciphertext, size_t len) {
 }
 
 NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaintext, size_t len) {
-    // NETWORK THREAD ONLY (reassembly state is unlocked).
+    // Network thread only (reassembly state is unlocked).
     if (len == 0) {
         SS_LOGW(TAG, "accept_plaintext: empty plaintext");
         return {};

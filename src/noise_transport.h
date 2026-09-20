@@ -23,7 +23,7 @@
 ///     non-fragmented path also fills and encrypts the reused send_buf_ member under the same
 ///     lock, so that reuse is safe precisely because this path is fully serialized (see
 ///     send_buf_'s doc comment).
-///   - DECRYPT (decrypt_in_place) and reassembly (accept_plaintext): NETWORK THREAD ONLY.
+///   - DECRYPT (decrypt_in_place) and reassembly (accept_plaintext): network thread only.
 ///     The decrypt path is deliberately unlocked: the only writer that can replace the session
 ///     mid-connection (send_msg2_and_swap, driven by an inbound re-handshake frame) runs on the
 ///     same network thread, so decrypt and swap are sequential, never concurrent.
@@ -72,7 +72,7 @@ public:
         /// flight, a non-fragment message while one is in flight, a nonzero reserved flag bit,
         /// an orig_type of 1, a fragment frame missing its flags byte, or a first fragment
         /// missing its orig_type, rather than the benign "no complete message yet"
-        /// mid-reassembly state. The caller MUST close the connection when this is true.
+        /// mid-reassembly state. The caller must close the connection when this is true.
         bool malformed{false};
     };
 
@@ -113,35 +113,28 @@ public:
 
     /// @brief Encrypt and send pre-typed binary data as a Noise transport frame.
     /// @param data  Pointer to type-prefixed binary bytes (first byte is the role type byte).
-    /// @param len   Total length including the type byte.
-    /// @return SsErr::OK on success, INVALID_STATE if the transport is not active.
     SsErr send_binary(const uint8_t* data, size_t len);
 
     /// @brief Re-handshake commit: encrypt and send msg2 under the OLD session, then swap to
     /// the new session, all inside one locked region so a concurrent encrypt cannot interleave
     /// between the msg2 send and the swap. Called on the network thread.
-    /// @param msg2_text     The noise/handshake msg2 JSON to send under the old keys.
-    /// @param next_session  The new cipher session to swap in.
     /// @return SsErr::OK on success (session swapped); on error the old session is kept.
     SsErr send_msg2_and_swap(const std::string& msg2_text,
                              std::unique_ptr<NoiseSession> next_session);
 
     // ========================================
-    // Inbound (decrypt + reassemble); NETWORK THREAD ONLY
+    // Inbound (decrypt + reassemble); network thread only
     // ========================================
 
     /// @brief Decrypts one transport frame in-place. Unlocked by design: see the file comment
     /// (decrypt is sequential with the session swap on the same thread).
-    /// @param ciphertext  Frame bytes (modified in-place).
-    /// @param len         Ciphertext length (plaintext + 16-byte tag).
+    /// @param len  Ciphertext length (plaintext + 16-byte tag).
     /// @return Plaintext length, or 0 on auth failure / no active session.
     size_t decrypt_in_place(uint8_t* ciphertext, size_t len);
 
     /// @brief Routes one decrypted plaintext frame through the fragment state machine.
     /// Non-fragment frames are returned directly; type-1 fragment frames are buffered until one
     /// carrying FRAGMENT_FLAG_LAST produces the reassembled message.
-    /// @param plaintext  Decrypted frame bytes (type byte first).
-    /// @param len        Plaintext length.
     /// @return The complete message (type byte first), or {nullptr, 0} if the frame was
     ///         consumed by reassembly, discarded, or dropped as malformed.
     CompleteMessage accept_plaintext(uint8_t* plaintext, size_t len);
@@ -157,7 +150,6 @@ public:
     ///
     /// Written by SendspinConnection::set_admitted() on the main loop; read on the network
     /// thread by accept_plaintext(), same arrangement as the connection's own admitted_ flag.
-    /// @param admitted Whether the connection now occupies the admitted slot.
     void set_admitted(bool admitted) {
         this->admitted_.store(admitted, std::memory_order_release);
     }
@@ -165,9 +157,7 @@ public:
 private:
     /// @brief Encrypt one frame and emit it via the frame sink. Caller must hold session_mutex_,
     /// which excludes a concurrent re-handshake session swap from racing the encrypt.
-    /// @param buf           Frame buffer holding the plaintext; encrypted in-place.
     /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + 16 (AEAD tag).
-    /// @param plaintext_len Plaintext byte count at the start of buf.
     SsErr encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity, size_t plaintext_len);
 
     /// @brief Fragment a plaintext > MAX_TRANSPORT_PLAINTEXT into multiple frames and
@@ -176,36 +166,22 @@ private:
     ///
     /// The plaintext is passed as its type byte plus the payload rather than as one contiguous
     /// buffer, so no caller has to stage a copy of a message this large.
-    /// @param orig_type  Type byte of the message being fragmented.
-    /// @param data       Payload bytes following the type byte.
-    /// @param data_len   Length of data.
     ///
-    /// Caller must hold session_mutex_ for the WHOLE call, and it stays held across every
-    /// frame. The fragments of one logical message must reach the wire consecutively: a peer
-    /// that sees a non-fragment frame between them treats it as a messaging.md "Malformed
-    /// sequences" protocol error and closes the connection (see accept_plaintext()). Releasing the
-    /// lock between frames would let a concurrent send_json()/send_binary() on another thread
-    /// interleave exactly such a frame.
+    /// Caller must hold session_mutex_ across every frame: the fragments of one logical message
+    /// must reach the wire consecutively, since a peer that sees a non-fragment frame between
+    /// them treats it as a messaging.md "Malformed sequences" error (see accept_plaintext()), and
+    /// releasing the lock between frames would let a concurrent send interleave one.
     SsErr fragment_and_send_locked(uint8_t orig_type, const uint8_t* data, size_t data_len);
 
     /// @brief Fills send_buf_ with an optional prefix followed by data, then encrypts and
-    /// sends it. Caller must hold session_mutex_ for the whole call: this fills send_buf_ and
-    /// calls encrypt_and_send_frame_locked() inside one critical section, as send_buf_'s doc
-    /// comment requires.
-    /// @param prefix      Bytes written to the start of send_buf_, or nullptr for none.
-    /// @param prefix_len  Length of prefix (0 if prefix is nullptr).
-    /// @param data        Payload bytes written after prefix.
-    /// @param data_len    Length of data.
+    /// sends it. Caller must hold session_mutex_ across the whole call, as send_buf_ requires.
     SsErr fill_and_encrypt_locked(const uint8_t* prefix, size_t prefix_len, const uint8_t* data,
                                   size_t data_len);
 
     /// @brief Grows a PlatformBuffer to at least `needed` bytes (geometric growth, contents
     /// preserved, capacity retained across calls), optionally capped.
-    /// @param buf     Buffer to grow.
-    /// @param needed  Minimum required size.
     /// @param cap     Upper bound on the grown size, or 0 for uncapped.
     /// @param what    Noun describing the buffer, used in the allocation-failure log line.
-    /// @return false on allocation failure.
     bool grow_buffer(PlatformBuffer& buf, size_t needed, size_t cap, const char* what);
 
     /// @brief The reassembly cap in force: MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES until the
@@ -248,13 +224,10 @@ private:
     /// Reused scratch buffer for the non-fragmented send path (send_json, send_binary,
     /// send_msg2_and_swap). Grown on demand by ensure_send_buf() to fit each frame (geometric
     /// growth, same idiom as reasm_buf_/reasm_reserve()), capped at MAX_TRANSPORT_PLAINTEXT + 16
-    /// bytes (largest plaintext that path ever handles, plus AEAD tag room). Typical traffic
-    /// (client/time, client/state, pairing JSON) settles at a working-set size well under that
-    /// ceiling instead of paying it on every connection. Guarded by session_mutex_:
-    /// every caller fills and encrypts it while holding the lock, so concurrent
-    /// send_json/send_binary/send_msg2_and_swap calls from different threads (any thread may
-    /// call these; see the file comment) never touch it at the same time. Placed per
-    /// buffer_location_ like reasm_buf_ (PSRAM-preferring by default on ESP).
+    /// bytes, so typical traffic settles at a working-set size well under that ceiling instead of
+    /// paying it on every connection. Guarded by session_mutex_: every caller fills and encrypts
+    /// it while holding the lock, so concurrent sends from different threads never touch it at
+    /// the same time. Placed per buffer_location_ like reasm_buf_.
     PlatformBuffer send_buf_;
 
     /// Guards the send-side encrypt path against the re-handshake session swap.
