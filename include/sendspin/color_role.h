@@ -64,10 +64,10 @@ public:
     /// @brief Called when the cached colors are dropped: the connection to the server was lost,
     /// or a server/activate took the color role out of the session's active roles
     ///
-    /// Implementations should reset any displayed colors to a neutral or default state since the
-    /// previous palette is no longer valid. Idempotent by contract: a second clear with nothing to
-    /// clear must be a no-op. A role removed from an active session can be added back by a later
-    /// activation, which resumes with a fresh on_color().
+    /// Implementations should reset displayed colors to a neutral default. Idempotent by
+    /// contract: a second clear with nothing to clear must be a no-op. A role removed from an
+    /// active session can be added back by a later activation, which resumes with a fresh
+    /// on_color().
     virtual void on_color_clear() {}
 };
 
@@ -105,9 +105,7 @@ public:
     explicit ColorRole(SendspinClient* client);
     ~ColorRole();
 
-    /// @brief Sets the listener for color events
-    /// @note The listener must outlive this role
-    /// @param listener Pointer to the listener implementation
+    /// @brief Sets the listener for color events; it must outlive this role
     void set_listener(ColorRoleListener* listener);
 
 private:
