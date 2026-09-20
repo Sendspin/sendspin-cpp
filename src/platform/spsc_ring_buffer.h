@@ -13,8 +13,15 @@
 // limitations under the License.
 
 /// @file spsc_ring_buffer.h
-/// @brief Platform-abstracted single-producer/single-consumer ring buffer backed by a FreeRTOS
-/// NOSPLIT ring buffer on ESP and a mutex/condition-variable implementation on host
+/// @brief Single-producer/single-consumer ring buffer with caller-provided storage: a FreeRTOS
+/// NOSPLIT ring buffer on ESP, a mutex/condition-variable implementation on host
+///
+/// Items are written as contiguous blobs and read back in order, through either the one-phase
+/// send() or the two-phase acquire()/commit(). The consumer calls return_item() after processing
+/// each received item.
+///
+/// A blocking receive() can be interrupted from any thread with wake_receiver(), so callers must
+/// treat a nullptr return as "re-check state and retry", not as proof the timeout elapsed.
 
 #pragma once
 
@@ -30,38 +37,7 @@
 
 namespace sendspin {
 
-/**
- * @brief Single-producer/single-consumer ring buffer with caller-provided storage
- *
- * Backed by a FreeRTOS NOSPLIT ring buffer on ESP and a mutex/condition-variable
- * implementation on host. Items are written as contiguous blobs and read back in
- * the same order. Supports both a one-phase send() and a two-phase acquire()/commit()
- * path for zero-copy writes.
- *
- * A blocking receive() can be interrupted from any thread with wake_receiver(): the
- * blocked (or next blocking) receive returns nullptr immediately without consuming
- * data. Callers must therefore treat a nullptr return as "re-check state and retry",
- * not as proof the timeout elapsed.
- *
- * Usage:
- * 1. Allocate a storage buffer, then call create() with a pointer to it
- * 2. Write data with send() or acquire()/commit() from the producer thread
- * 3. Read data with receive() from the consumer thread
- * 4. Call return_item() after processing each received item
- *
- * @code
- * static uint8_t buf[4096];
- * SpscRingBuffer rb;
- * rb.create(sizeof(buf), buf);
- *
- * rb.send(data, data_len, 100);
- *
- * size_t sz;
- * void* item = rb.receive(&sz, UINT32_MAX);
- * // process item...
- * rb.return_item(item);
- * @endcode
- */
+/// @brief Single-producer/single-consumer ring buffer (ESP-IDF implementation)
 class SpscRingBuffer {
 public:
     SpscRingBuffer() = default;
@@ -79,9 +55,6 @@ public:
     SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
 
     /// @brief Creates the ring buffer with caller-provided storage
-    /// @param size Total storage size in bytes.
-    /// @param storage Pointer to pre-allocated storage (must outlive this object).
-    /// @return true on success.
     bool create(size_t size, uint8_t* storage) {
         this->handle_ =
             xRingbufferCreateStatic(size, RINGBUF_TYPE_NOSPLIT, storage, &this->structure_);
@@ -97,14 +70,12 @@ public:
         return true;
     }
 
-    /// @brief Returns true if the ring buffer has been successfully created
-    /// @return true if the ring buffer is ready for use.
+    /// @brief Whether the ring buffer has been created
     bool is_created() const {
         return this->handle_ != nullptr;
     }
 
-    /// @brief Returns the number of committed items waiting to be received
-    /// @return Count of items written and committed but not yet received by the consumer.
+    /// @brief Committed items written but not yet received
     size_t items_waiting() const {
         if (this->handle_ == nullptr) {
             return 0;
@@ -114,14 +85,12 @@ public:
         return static_cast<size_t>(items);
     }
 
-    /// @brief Returns true if no committed items are waiting to be received
-    /// @return true if the ring buffer has no items pending for the consumer.
+    /// @brief Whether no committed items are waiting for the consumer
     bool is_empty() const {
         return this->items_waiting() == 0;
     }
 
     /// @brief Two-phase write: acquire contiguous space
-    /// @param size Number of bytes to acquire.
     /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
     /// @return Pointer to acquired space, or nullptr on timeout.
     void* acquire(size_t size, uint32_t timeout_ms) {
@@ -134,8 +103,6 @@ public:
     }
 
     /// @brief Two-phase write: commit previously acquired space
-    /// @param ptr Pointer returned by a prior call to acquire().
-    /// @return true on success.
     bool commit(void* ptr) {
         bool ok = xRingbufferSendComplete(this->handle_, ptr) == pdTRUE;
         if (ok) {
@@ -145,10 +112,7 @@ public:
     }
 
     /// @brief One-phase write: copy data into the ring buffer
-    /// @param data Pointer to the data to copy.
-    /// @param size Number of bytes to copy.
     /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
-    /// @return true if the data was written successfully.
     bool send(const void* data, size_t size, uint32_t timeout_ms) {
         bool ok = xRingbufferSend(this->handle_, data, size, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
         if (ok) {
@@ -182,18 +146,14 @@ public:
         return xRingbufferReceive(this->handle_, item_size, 0);
     }
 
-    /// @brief Wakes the consumer out of a blocking receive() without providing data
-    ///
-    /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
-    /// collapse into one, and a wake that races an arriving item may be absorbed by that
-    /// item's delivery, so callers must re-check their stop/command state after every
-    /// receive() return, not only after nullptr returns. Safe to call from any thread.
+    /// @brief Wakes the consumer out of a blocking receive(); one-shot, redundant wakes
+    /// collapse, and a wake racing an arriving item may be absorbed by that item's delivery.
+    /// Safe to call from any thread.
     void wake_receiver() {
         xSemaphoreGive(this->items_or_wake_sem_);
     }
 
     /// @brief Return a previously received item to the ring buffer
-    /// @param ptr Pointer returned by a prior call to receive().
     void return_item(void* ptr) {
         vRingbufferReturnItem(this->handle_, ptr);
     }
@@ -220,37 +180,7 @@ private:
 
 namespace sendspin {
 
-/**
- * @brief Single-producer/single-consumer ring buffer with caller-provided storage
- *
- * Backed by a mutex/condition-variable implementation on host. Items are written as
- * contiguous blobs and read back in the same order. Supports both a one-phase send()
- * and a two-phase acquire()/commit() path for zero-copy writes.
- *
- * A blocking receive() can be interrupted from any thread with wake_receiver(): the
- * blocked (or next blocking) receive returns nullptr immediately without consuming
- * data. Callers must therefore treat a nullptr return as "re-check state and retry",
- * not as proof the timeout elapsed.
- *
- * Usage:
- * 1. Allocate a storage buffer, then call create() with a pointer to it
- * 2. Write data with send() or acquire()/commit() from the producer thread
- * 3. Read data with receive() from the consumer thread
- * 4. Call return_item() after processing each received item
- *
- * @code
- * static uint8_t buf[4096];
- * SpscRingBuffer rb;
- * rb.create(sizeof(buf), buf);
- *
- * rb.send(data, data_len, 100);
- *
- * size_t sz;
- * void* item = rb.receive(&sz, UINT32_MAX);
- * // process item...
- * rb.return_item(item);
- * @endcode
- */
+/// @brief Single-producer/single-consumer ring buffer (host implementation)
 class SpscRingBuffer {
 public:
     SpscRingBuffer() = default;
@@ -261,9 +191,6 @@ public:
     SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
 
     /// @brief Creates the ring buffer with caller-provided storage
-    /// @param size Total storage size in bytes.
-    /// @param storage Pointer to pre-allocated storage (must outlive this object).
-    /// @return true on success.
     bool create(size_t size, uint8_t* storage) {
         // Item offsets always advance in ALIGNMENT multiples, so an unaligned tail would
         // desynchronize the writer/reader dummy-filler accounting (and a tail smaller than
@@ -282,28 +209,24 @@ public:
         return true;
     }
 
-    /// @brief Returns true if the ring buffer has been successfully created
-    /// @return true if the ring buffer is ready for use.
+    /// @brief Whether the ring buffer has been created
     bool is_created() const {
         return this->created_;
     }
 
-    /// @brief Returns the number of committed items waiting to be received
-    /// @return Count of items written and committed but not yet received by the consumer.
+    /// @brief Committed items written but not yet received
     size_t items_waiting() const {
         std::lock_guard<std::mutex> lock(this->mtx_);
         return this->items_waiting_;
     }
 
-    /// @brief Returns true if no committed items are waiting to be received
-    /// @return true if the ring buffer has no items pending for the consumer.
+    /// @brief Whether no committed items are waiting for the consumer
     bool is_empty() const {
         std::lock_guard<std::mutex> lock(this->mtx_);
         return this->items_waiting_ == 0;
     }
 
     /// @brief Two-phase write: acquire contiguous space
-    /// @param size Number of bytes to acquire.
     /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
     /// @return Pointer to acquired space, or nullptr on timeout.
     void* acquire(size_t size, uint32_t timeout_ms) {
@@ -347,8 +270,6 @@ public:
     }
 
     /// @brief Two-phase write: commit previously acquired space
-    /// @param ptr Pointer returned by a prior call to acquire().
-    /// @return true on success.
     bool commit(void* ptr) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         auto* header =
@@ -360,10 +281,7 @@ public:
     }
 
     /// @brief One-phase write: copy data into the ring buffer
-    /// @param data Pointer to the data to copy.
-    /// @param size Number of bytes to copy.
     /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
-    /// @return true if the data was written successfully.
     bool send(const void* data, size_t size, uint32_t timeout_ms) {
         void* dest = acquire(size, timeout_ms);
         if (dest == nullptr) {
@@ -406,12 +324,9 @@ public:
         return result;
     }
 
-    /// @brief Wakes the consumer out of a blocking receive() without providing data
-    ///
-    /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
-    /// collapse into one, and a wake that races an arriving item may be absorbed by that
-    /// item's delivery, so callers must re-check their stop/command state after every
-    /// receive() return, not only after nullptr returns. Safe to call from any thread.
+    /// @brief Wakes the consumer out of a blocking receive(); one-shot, redundant wakes
+    /// collapse, and a wake racing an arriving item may be absorbed by that item's delivery.
+    /// Safe to call from any thread.
     void wake_receiver() {
         {
             std::lock_guard<std::mutex> lock(this->mtx_);
@@ -421,7 +336,6 @@ public:
     }
 
     /// @brief Return a previously received item to the ring buffer
-    /// @param ptr Pointer returned by a prior call to receive().
     void return_item(void* ptr) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         auto* header =
