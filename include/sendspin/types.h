@@ -77,11 +77,8 @@ enum class MemoryLocation : uint8_t {
 // Encryption / trust types (public API surface)
 // ============================================================================
 
-/// @brief Trust level of an active connection.
-///
-/// Derived from which PSK category was matched during the Noise handshake:
-///   LONG_TERM PSK -> USER (the server has a stored pairing record)
-///   PAIRING or SENTINEL PSK -> NONE (no prior pairing or unpaired access)
+/// @brief Trust level of an active connection, from the PSK category matched during the Noise
+/// handshake
 enum class ConnectionTrust : uint8_t {
     NONE,  // No long-term pairing record; Sentinel or Pairing PSK was used.
     USER,  // Long-term pairing record matched; connection is from a paired server.
