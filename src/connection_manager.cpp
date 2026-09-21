@@ -1633,9 +1633,9 @@ void ConnectionManager::flush_pending_record_ops() {
         ops.swap(this->pending_record_ops_);
         this->refresh_record_ops_size_hint();
     }
-    // Every records op rewrites the whole array, so applying their RAM halves first and saving
-    // once expresses the same final state in one NVS erase cycle instead of one per op. The
-    // last-played value is a different key and keeps its own write.
+    // Applying the RAM halves first and persisting once lets the store coalesce: a slot several
+    // ops touched is written once, carrying its final state. The last-played value is a different
+    // key and keeps its own write.
     bool records_dirty = false;
     // A pairing or a revocation, as opposed to the advisory `used` flag.
     bool durable_change = false;
@@ -1654,9 +1654,9 @@ void ConnectionManager::flush_pending_record_ops() {
         }
     }
     if (records_dirty) {
-        // A batch that carries only the `used` flag stays silent on a rejected write: the flag
-        // is advisory bookkeeping, rebuilt from use, and this runs on the first activate of
-        // every long-term session.
+        // A batch that carries only the `used` flag and the recency order stays silent on a
+        // rejected write: both are advisory bookkeeping, rebuilt from use, and this runs on the
+        // first activate of every long-term session.
         this->client_->record_store_->persist_records(durable_change);
     }
 }
@@ -2756,7 +2756,7 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
     // the network thread and must miss it from this instant: deferring it would leave the
     // credential usable for the length of the writes staged ahead of it. RecordStore::mutex_ is
     // the innermost lock (docs/conventions.md, "Threading and cross-thread state"), so taking it
-    // here is in order. Only the blob write is staged (see PendingRecordOp).
+    // here is in order. Only the slot write is staged (see PendingRecordOp).
     if (this->client_->record_store_->note_record_removed(event.matched_psk_id)) {
         this->stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
     }

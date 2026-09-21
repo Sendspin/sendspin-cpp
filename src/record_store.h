@@ -103,7 +103,8 @@ struct ResolvedPsk {
 
 /// @brief In-memory client pairing record store.
 ///
-/// Thread-safety: `records_` and `pairing_psk_` are guarded by `mutex_`. Cross-thread access
+/// Thread-safety: `records_`, its dirty-slot bookkeeping and `pairing_psk_` are guarded by
+/// `mutex_`. Cross-thread access
 /// goes through `resolve_by_psk_id` (network thread, Noise handshake and re-handshake) or the
 /// one network-thread mutator, `store_record_superseding`, which is RAM-only and defers its
 /// provider flush, `persist_records`, to the main loop. The pairing config and `pairing_psk_`
@@ -115,6 +116,10 @@ public:
     /// @brief Default cap on retained long-term records; mirrors
     /// SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS.
     static constexpr size_t DEFAULT_MAX_RECORDS = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS;
+
+    /// @brief Ceiling over any configured cap: persistence_keys::RECORD_ORDER names one slot
+    /// per byte, so the largest slot number the store can persist is 254.
+    static constexpr size_t MAX_MAX_RECORDS = 255;
 
     /// @brief Floor under any configured cap. pairing.md "Pairing Records" requires room for at
     /// least 5 records, and requires the client to cap its concurrently open paired connections
@@ -128,8 +133,10 @@ public:
     /// @param provider Persistence provider, or nullptr for an in-memory-only store.
     /// @param initial_unpaired_access_enabled First-boot default for unpaired (Sentinel) access.
     ///        Applied only when no pairing config was loaded; a loaded config always wins.
-    /// @param max_records Cap on the number of long-term records retained. Defaults to
-    ///        DEFAULT_MAX_RECORDS and is raised to MIN_MAX_RECORDS when a caller asks for less.
+    /// @param max_records Cap on the number of long-term records retained, which is also the
+    ///        number of persistence slots. Defaults to DEFAULT_MAX_RECORDS, is raised to
+    ///        MIN_MAX_RECORDS when a caller asks for less, and lowered to MAX_MAX_RECORDS when a
+    ///        caller asks for more.
     explicit RecordStore(SendspinPersistenceProvider* provider,
                          bool initial_unpaired_access_enabled = false,
                          size_t max_records = DEFAULT_MAX_RECORDS);
@@ -174,37 +181,43 @@ public:
     bool store_record_superseding(SendspinPairingRecord record,
                                   const std::vector<std::string>& psk_ids_in_use = {});
 
-    /// @brief Encode records_ and save it under persistence_keys::RECORDS. Main loop only: it
-    /// calls the provider. The deferred flush half of store_record_superseding(),
-    /// note_record_removed() and note_record_used(); logs the durability warning itself on a
-    /// rejected write, so callers may ignore the return value.
-    /// @param report_rejection Whether a rejected write is worth a warning. False for a write
-    ///        that only carries the advisory `used` flag, which is rebuilt from use and whose
-    ///        rejection would otherwise be reported on the first activate of every long-term
-    ///        session on a device whose store is full or read-only.
-    /// @return true on success (or when there is no provider); false on a rejected write.
+    /// @brief Save the record slots that changed since the last call, plus the record-order
+    /// blob when the eviction order moved. Main loop only: it calls the provider. The deferred
+    /// flush half of store_record_superseding(), note_record_removed() and note_record_used();
+    /// logs the durability warning itself on a rejected write, so callers may ignore the return
+    /// value.
+    ///
+    /// Several mutations between two calls coalesce: a slot is written once, carrying whatever
+    /// it holds at this call. A rejected write is not retried, so the slot leaves the dirty set
+    /// either way and RAM stays authoritative for the boot.
+    /// @param report_rejection Whether a rejected write is worth a warning. False for a batch
+    ///        that only carries the advisory `used` flag and the recency order, which are
+    ///        rebuilt from use and whose rejection would otherwise be reported on the first
+    ///        activate of every long-term session on a device whose store is full or read-only.
+    /// @return true when every owed write was accepted (or when there is nothing to write, or no
+    ///         provider); false when any write was rejected.
     bool persist_records(bool report_rejection = true);
 
     /// @brief Erase the long-term record identified by psk_id from RAM, leaving the durable half
-    /// to a later persist_records(). No-op if absent.
+    /// (emptying its slot and rewriting the order) to a later persist_records(). No-op if absent.
     ///
     /// For a revocation that must take effect before the caller's own lock is dropped: this takes
     /// only mutex_, the innermost lock, so a network-thread resolve_by_psk_id() misses the record
-    /// from here on even though the blob is written later.
+    /// from here on even though the slot is emptied later.
     /// @param psk_id The record to erase.
-    /// @return true when a record was erased, and the array therefore needs persisting.
+    /// @return true when a record was erased, and the store therefore needs persisting.
     [[nodiscard]] bool note_record_removed(const std::string& psk_id);
 
     /// @brief Flag the record at psk_id as used and make it the most recently used one in RAM,
     /// leaving the durable half to a later persist_records(). No-op if absent.
     ///
     /// `records_` is kept least-recently-used first, the order eviction reads (see
-    /// store_record_superseding). The reorder stays in RAM; only the first flip of the durable
-    /// `used` flag is worth persisting, so recency across a reboot is approximate (see the
-    /// definition for why).
+    /// store_record_superseding). A reorder dirties only persistence_keys::RECORD_ORDER, a blob
+    /// of one byte per stored record, so recency survives a reboot at the cost of that one small
+    /// write; the record's own slot is rewritten only on the first flip of its `used` flag.
     /// @param psk_id The record to flag.
-    /// @return true when the durable `used` flag flipped, and the array therefore needs
-    ///         persisting; false when only the RAM recency order moved.
+    /// @return true when the recency order moved or the durable `used` flag flipped, and the
+    ///         store therefore needs persisting.
     [[nodiscard]] bool note_record_used(const std::string& psk_id);
 
     // ========================================
@@ -275,14 +288,43 @@ public:
 
 private:
     // ========================================
+    // Slotted storage
+    // ========================================
+
+    /// @brief Slot number a record not yet assigned one carries, and the value first_free_slot()
+    /// returns when the store is full. Out of range of every real slot because max_records_ is
+    /// capped at MAX_MAX_RECORDS.
+    static constexpr uint8_t UNASSIGNED_SLOT = 255;
+
+    /// @brief A record and the persistence slot holding it.
+    ///
+    /// The slot names the persistence_keys::record_slot_key() the record is written under. It is
+    /// store bookkeeping, not part of the record's storage format: it is recovered on load from
+    /// which key the record came out of.
+    struct StoredRecord {
+        SendspinPairingRecord record;
+        uint8_t slot{UNASSIGNED_SLOT};
+    };
+
+    /// @brief One owed provider write: a slot key or persistence_keys::RECORD_ORDER, with the
+    /// bytes to store. An empty blob for a slot key frees that slot.
+    struct SlotWrite {
+        std::string key;
+        std::string blob;
+    };
+
+    // ========================================
     // Construction helpers
     // ========================================
     // Called in this order from the constructor; see the constructor definition in the .cpp for
     // the full first-boot / damaged-config reasoning that ties the load and provisioning steps
     // together.
 
-    /// @brief Load records_ from the provider's RECORDS blob, if present.
+    /// @brief Load records_ from the provider's record slots, then apply the stored order.
     void load_records_from_provider();
+
+    /// @brief Reorder the just-loaded records_ by the provider's RECORD_ORDER blob, if present.
+    void load_record_order_from_provider();
 
     /// @brief Load pairing_psk_ from the provider's PAIRING_PSK blob, if present, correcting its
     /// psk_id if it disagrees with the loaded secret.
@@ -310,6 +352,18 @@ private:
     [[nodiscard]] bool has_capacity_locked() const {
         return this->records_.size() < this->max_records_;
     }
+    /// @brief The record occupying a slot, or nullptr when the slot is free. Call with mutex_
+    /// held; the pointer does not survive a mutation of records_.
+    [[nodiscard]] const StoredRecord* record_in_slot(uint8_t slot) const;
+
+    /// @brief The lowest slot number no record occupies, or UNASSIGNED_SLOT when the store is
+    /// full. Call with mutex_ held, after a capacity check.
+    [[nodiscard]] uint8_t first_free_slot_locked() const;
+
+    /// @brief Note that a slot's blob no longer matches records_, so the next persist_records()
+    /// writes it. Idempotent within a batch. Call with mutex_ held.
+    void mark_slot_dirty_locked(uint8_t slot);
+
     /// @brief Body of resolve_by_psk_id(); call with mutex_ held.
     [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id_locked(const std::string& psk_id,
                                                                       PskCategory category) const;
@@ -339,16 +393,17 @@ private:
     ///         the boot. The sole caller discards it.
     bool persist_config();
 
-    /// @brief Encode the whole records_ array for persistence_keys::RECORDS. Call with mutex_
-    /// held, so the snapshot is exactly what is in memory at that moment.
-    /// @return The blob to save, or empty when there is no provider.
-    [[nodiscard]] std::string encode_records_locked() const;
+    /// @brief Encode every owed write and clear the dirty bookkeeping. Call with mutex_ held, so
+    /// each blob is exactly what is in memory at that moment.
+    /// @return The writes to perform, in slot order with the order blob last; empty when nothing
+    ///         is owed or there is no provider.
+    [[nodiscard]] std::vector<SlotWrite> take_dirty_writes_locked();
 
-    /// @brief Save an encoded blob under persistence_keys::RECORDS and wipe it. Call with mutex_
-    /// dropped: the provider write is flash I/O.
-    /// @param encoded The encoded blob; wiped in place before returning.
-    /// @return true on success (or when there is no provider); false on a rejected write.
-    bool save_encoded_records(std::string& encoded);
+    /// @brief Hand one encoded write to the provider and wipe it. Call with mutex_ dropped: the
+    /// provider write is flash I/O.
+    /// @param write The key and blob to store; the blob is wiped in place before returning.
+    /// @return true on success, false on a rejected write.
+    bool save_slot_write(SlotWrite& write);
 
     // Struct fields
     /// Mutable so the const `resolve_by_psk_id` can lock it.
@@ -356,7 +411,11 @@ private:
 
     std::optional<SendspinPairingPsk> pairing_psk_;
 
-    std::vector<SendspinPairingRecord> records_;
+    /// Least recently used first: the order eviction and persistence_keys::RECORD_ORDER read.
+    std::vector<StoredRecord> records_;
+
+    /// Slots whose stored blob no longer matches records_, awaiting the next persist_records().
+    std::vector<uint8_t> dirty_slots_;
 
     /// Configured static pairing code (8 decimal digits).
     std::optional<std::string> static_pairing_code_;
@@ -368,6 +427,8 @@ private:
     size_t max_records_{DEFAULT_MAX_RECORDS};
 
     // 8-bit fields
+    /// Whether the record-order blob no longer matches records_'s order.
+    bool order_dirty_{false};
     bool dynamic_pairing_code_enabled_{true};
     bool pairing_psk_enabled_{true};
     bool static_pairing_code_enabled_{false};

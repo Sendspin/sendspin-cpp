@@ -16,8 +16,8 @@
 /// @brief Storage-format codec for the persistence structs in sendspin/config.h
 ///
 /// `SendspinPersistenceProvider` (sendspin/client.h) is a plain blob store. The library is the
-/// only caller of this codec: for the `persistence_keys::RECORDS`, `PAIRING_PSK` and
-/// `PAIR_CONFIG` keys it turns `SendspinPairingRecord` / `SendspinPairingPsk` /
+/// only caller of this codec: for the record slot keys (`persistence_keys::record_slot_key()`),
+/// `PAIRING_PSK` and `PAIR_CONFIG` it turns `SendspinPairingRecord` / `SendspinPairingPsk` /
 /// `SendspinPairingConfig` into the JSON blob a provider stores, and back. A provider must not
 /// parse these blobs itself. It is public so a custom provider or a test can inspect or seed that
 /// content in the same format.
@@ -30,11 +30,6 @@
 ///
 /// - Record: `{"v":1,"psk_id":"...","psk":"<base64url>","server_id":"...","label":"...",
 ///   "used":bool}`, with "label" omitted when absent.
-/// - Records array: `{"v":1,"records":[<record objects, without their own "v">]}`. The array
-///   wrapper carries "v" once; each entry has the same fields as a record minus "v".
-///   `decode_pairing_record()` still accepts an entry that has its own "v" (it is ignored like
-///   any other unknown field), so a single record object round-trips whether it came from
-///   `encode_pairing_record()` or was lifted out of a records array.
 /// - Pairing PSK: `{"v":1,"psk_id":"...","psk":"<base64url>","label":"..."}`, with "label"
 ///   omitted when absent.
 /// - Pairing config: `{"v":1,"pairing_psk_enabled":bool,"unpaired_access_enabled":bool,
@@ -57,10 +52,6 @@
 ///   fails to parse, "psk_id" is missing or empty, "psk" is missing, or "psk" does not
 ///   base64url-decode to exactly 32 bytes. A record additionally needs a non-empty "server_id",
 ///   without which the PSK could never pass the post-match server check.
-/// - `decode_pairing_records()` returns `std::nullopt` only when the JSON fails to parse or the
-///   root has no array "records" field. An individual entry that fails record validation is
-///   skipped rather than failing the whole decode: a provider should not lose its entire store
-///   to one corrupt entry.
 /// - `decode_pairing_config()` returns `std::nullopt` only when the JSON fails to parse or the
 ///   root is not an object. Missing fields take the `SendspinPairingConfig` struct's defaults.
 /// - `base64url_decode()` follows RFC 4648 section 5: encode never pads, decode tolerates
@@ -71,10 +62,14 @@
 /// Storage keys are the fixed constants in `persistence_keys` (sendspin/client.h), not a
 /// provider's choice.
 ///
-/// `RECORDS` holds the whole records array as one blob (`encode_pairing_records()` /
-/// `decode_pairing_records()`) rather than one entry per record: an encoded record is roughly 250
-/// bytes, so the default 12-record store comes out around 3 KB, under a typical NVS entry's ~4 KB
-/// limit. It also sidesteps needing `psk_id` (43 characters) as a storage key, which would not fit
+/// Long-term records are stored one per key, under the slot keys
+/// `persistence_keys::record_slot_key()` names, with `persistence_keys::RECORD_ORDER` holding
+/// their eviction order. A slot's blob is one record (`encode_pairing_record()` /
+/// `decode_pairing_record()`), or empty when the slot is free, so a pairing or a revocation
+/// rewrites one slot instead of every record, and a corrupt slot costs one record instead of the
+/// store. A record the library writes encodes to 184 bytes (three 43-character base64url fields
+/// plus fixed framing); a label, which the library never sets itself, adds 11 bytes plus its
+/// JSON-escaped length. Slot numbers keep the keys short: `psk_id` (43 characters) would not fit
 /// an NVS key at all.
 
 #pragma once
@@ -99,16 +94,6 @@ std::string encode_pairing_record(const SendspinPairingRecord& r);
 /// @brief Decodes a pairing record from its JSON storage format.
 /// @return The decoded record, or std::nullopt on parse failure or an invalid psk_id/psk.
 std::optional<SendspinPairingRecord> decode_pairing_record(std::string_view bytes);
-
-/// @brief Encodes a vector of pairing records to their JSON storage format (a single blob
-/// holding the whole array, suitable for a provider that stores the record list as one entry).
-std::string encode_pairing_records(const std::vector<SendspinPairingRecord>& v);
-
-/// @brief Decodes a vector of pairing records from its JSON storage format. Entries that fail
-/// record validation are skipped rather than failing the whole decode.
-/// @return The decoded records (possibly fewer than were encoded, if some entries were corrupt),
-///         or std::nullopt on parse failure or a missing/non-array "records" field.
-std::optional<std::vector<SendspinPairingRecord>> decode_pairing_records(std::string_view bytes);
 
 /// @brief Encodes the accepted Pairing PSK to its JSON storage format.
 std::string encode_pairing_psk(const SendspinPairingPsk& p);

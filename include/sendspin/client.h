@@ -196,14 +196,16 @@ public:
     }
 
     /// @brief Persist bytes under key. Returning true means durably stored (the library gates
-    /// revocation durability on it for removals from the "records" key).
+    /// revocation durability on it for a cleared record slot). A zero-length write is a real
+    /// write: it is how a record slot is emptied, and the key must read back as an empty blob
+    /// afterwards.
     ///
     /// A rejected write is reported, not retried: the in-memory state stays authoritative for
     /// this boot and the library logs what will be lost at the next reboot. The case that matters
-    /// is a rejected removal from `persistence_keys::RECORDS`: the store still holds the old array
-    /// and hands the revoked record back at the next boot, silently making the revoked PSK valid
-    /// again (the record is dropped from RAM either way). A provider that queues writes should
-    /// return true and surface its own failures.
+    /// is a rejected write of the empty blob that clears a revoked record's slot: the store still
+    /// holds the old record and hands it back at the next boot, silently making the revoked PSK
+    /// valid again (the record is dropped from RAM either way). A provider that queues writes
+    /// should return true and surface its own failures.
     /// @return true on success, false on failure.
     virtual bool save_blob(const std::string& /*key*/, const uint8_t* /*data*/, size_t /*len*/) {
         return false;
@@ -226,10 +228,11 @@ public:
 /// Every key is at most 12 characters, comfortably under the 15-character NVS key limit.
 /// Providers are pure byte stores: they must not parse or reinterpret these values.
 ///
-/// - `RECORDS`, `PAIRING_PSK`, and `PAIR_CONFIG` hold a versioned JSON blob produced by the
-///   codec in `sendspin/persistence_codec.h` (`encode_pairing_records()` /
-///   `decode_pairing_records()`, `encode_pairing_psk()` / `decode_pairing_psk()`,
-///   `encode_pairing_config()` / `decode_pairing_config()` respectively).
+/// - A record slot key (`record_slot_key()`), `PAIRING_PSK`, and `PAIR_CONFIG` hold a versioned
+///   JSON blob produced by the codec in `sendspin/persistence_codec.h`
+///   (`encode_pairing_record()` / `decode_pairing_record()`, `encode_pairing_psk()` /
+///   `decode_pairing_psk()`, `encode_pairing_config()` / `decode_pairing_config()`
+///   respectively).
 /// - `KEYPAIR`, `STATIC_PAIRING_CODE`, and `LAST_PLAYED` hold raw bytes: see each constant's
 ///   comment.
 /// - `OUTPUT_DELAY` holds an ASCII decimal string rather than raw uint16_t bytes, for
@@ -240,9 +243,28 @@ namespace persistence_keys {
 /// 32 raw bytes: the static X25519 private key. No codec, no encoding.
 inline constexpr const char* KEYPAIR = "keypair";
 
-/// Codec blob: the whole `SendspinPairingRecord` array (`encode_pairing_records()` /
-/// `decode_pairing_records()`). Stays present once any record exists, including as an empty array.
-inline constexpr const char* RECORDS = "records";
+/// Prefix of the per-slot record keys; see `record_slot_key()`.
+inline constexpr const char* RECORD_SLOT_PREFIX = "rec_";
+
+/// Raw bytes: the slot numbers of the occupied record slots, least recently used first, one byte
+/// per slot. It decides which record is evicted when a pairing arrives at a full store, so it is
+/// rewritten whenever that order changes. A slot number naming no stored record is ignored on
+/// load, and a stored record this blob does not name sorts after the ones it does.
+inline constexpr const char* RECORD_ORDER = "rec_order";
+
+/// @brief Key of one long-term record slot: `RECORD_SLOT_PREFIX` followed by the decimal slot
+/// number, for example `rec_0`.
+///
+/// Each slot holds one `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` /
+/// `decode_pairing_record()`), or an EMPTY blob when the slot is free. Only the slot that
+/// changed is written, so a pairing or a revocation costs one record-sized write rather than a
+/// rewrite of every record. Slot numbers run from 0 to `SendspinClientConfig::max_pairing_records
+/// - 1`; a slot key is absent until that slot is first filled.
+/// @param slot The slot number.
+/// @return The storage key for that slot.
+inline std::string record_slot_key(size_t slot) {
+    return std::string(RECORD_SLOT_PREFIX) + std::to_string(slot);
+}
 
 /// Codec blob: the accepted `SendspinPairingPsk` (`encode_pairing_psk()` / `decode_pairing_psk()`).
 inline constexpr const char* PAIRING_PSK = "pairing_psk";

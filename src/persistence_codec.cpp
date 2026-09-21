@@ -81,8 +81,7 @@ std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj, const cha
     return out;
 }
 
-/// @brief Parses a pairing record from a JSON object (a top-level record blob, or one entry of
-/// a records array). Ignores an entry-local "v", if present.
+/// @brief Parses a pairing record from a decoded record blob's root object.
 /// @return The record, or nullopt when the object is not a usable one.
 std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, const char** reason) {
     auto core = parse_psk_id_and_psk(obj, reason);
@@ -120,12 +119,9 @@ std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, con
     return rec;
 }
 
-/// @brief Writes the "psk_id"/"psk"/"server_id"/"label"/"used" fields shared by
-/// encode_pairing_record() and encode_pairing_records() into a JSON object or document root.
-/// @param target A JsonDocument (top-level record) or JsonObject (one array entry); both support
-///        the same operator[] assignment used here.
-template <typename TTarget>
-void write_record_fields(TTarget& target, const SendspinPairingRecord& r) {
+/// @brief Writes the "psk_id"/"psk"/"server_id"/"label"/"used" fields of a record into the
+/// document root encode_pairing_record() serializes.
+void write_record_fields(JsonDocument& target, const SendspinPairingRecord& r) {
     target["psk_id"] = r.psk_id;
     std::string psk_b64 = base64url_encode(r.psk.data(), r.psk.size());
     target["psk"] = psk_b64;
@@ -188,49 +184,16 @@ std::optional<SendspinPairingRecord> decode_pairing_record(std::string_view byte
     if (obj.isNull()) {
         return std::nullopt;
     }
-    const char* reason = "";
-    return record_from_object(obj, &reason);
-}
-
-std::string encode_pairing_records(const std::vector<SendspinPairingRecord>& v) {
-    JsonDocument doc = make_zeroizing_json_document();
-    doc["v"] = RECORD_CODEC_VERSION;
-    JsonArray arr = doc["records"].to<JsonArray>();
-    for (const auto& r : v) {
-        JsonObject obj = arr.add<JsonObject>();
-        write_record_fields(obj, r);
-    }
-    std::string out;
-    // The records blob is the one multi-kilobyte document this codec writes; reserving the
-    // measured size avoids the geometric growth that would transiently hold old plus new (and
-    // would shed the intermediate buffers, which carry base64 PSK text, unwiped).
-    out.reserve(measureJson(doc) + 1);
-    serializeJson(doc, out);
-    return out;
-}
-
-std::optional<std::vector<SendspinPairingRecord>> decode_pairing_records(std::string_view bytes) {
-    JsonDocument doc = make_zeroizing_json_document();
-    JsonObjectConst root = parse_root_object(bytes, doc);
-    if (root.isNull() || !root["records"].is<JsonArrayConst>()) {
-        return std::nullopt;
-    }
-    std::vector<SendspinPairingRecord> out;
-    for (JsonVariantConst entry : root["records"].as<JsonArrayConst>()) {
-        JsonObjectConst obj = entry.as<JsonObjectConst>();
-        const char* reason = "the codec cannot read it";
-        auto rec = record_from_object(obj, &reason);
-        if (rec.has_value()) {
-            out.push_back(std::move(rec.value()));
-            continue;
-        }
-        // A record the codec cannot accept is skipped so the rest of the blob still loads; the
-        // reason is logged because the server that holds such a record has to pair again.
-        SS_LOGW(TAG, "Skipping stored pairing record %s: %s",
+    const char* reason = "the codec cannot read it";
+    auto rec = record_from_object(obj, &reason);
+    if (!rec.has_value()) {
+        // Logged here because the server that holds this record has to pair again; the caller
+        // only knows which key failed, not why.
+        SS_LOGW(TAG, "Rejecting stored pairing record %s: %s",
                 obj["psk_id"].is<const char*>() ? obj["psk_id"].as<const char*>() : "(no psk_id)",
                 reason);
     }
-    return out;
+    return rec;
 }
 
 // ============================================================================

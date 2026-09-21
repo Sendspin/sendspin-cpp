@@ -162,7 +162,7 @@ struct DeferredRelease {
 /// may enter the manager: no network thread in on_new_connection(), and no off-main-loop caller
 /// resolving the current connection through current_shared(). Locked sections therefore only
 /// decide which record (or server_id) the write covers, or, for PERSIST_RECORDS, apply the RAM
-/// half and stage the array write that owes it; flush_pending_record_ops() performs the writes
+/// half and stage the slot write that owes it; flush_pending_record_ops() performs the writes
 /// with no lock held.
 struct PendingRecordOp {
     enum class Kind : uint8_t {
@@ -624,8 +624,9 @@ private:
     void stage_record_op(PendingRecordOp::Kind kind, std::string value);
 
     /// @brief Applies the staged ops' RAM halves in staging order, so a second op on the same
-    /// record lands after the first, then performs at most one records write and one last-played
-    /// write. Caller must not hold conn_ptr_mutex_ (see PendingRecordOp).
+    /// record lands after the first, then performs one records flush (which writes only the slots
+    /// those ops dirtied) and at most one last-played write. Caller must not hold conn_ptr_mutex_
+    /// (see PendingRecordOp).
     ///
     /// Called once per tick and again from stop(). An op staged later in loop() than this call
     /// waits for the next tick or the stop; a manager destroyed without a stop() logs what it
