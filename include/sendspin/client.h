@@ -201,7 +201,11 @@ public:
     /// afterwards.
     ///
     /// A rejected write is reported, not retried: the in-memory state stays authoritative for
-    /// this boot and the library logs what will be lost at the next reboot. The case that matters
+    /// this boot and the library logs what will be lost at the next reboot. What a rejection
+    /// costs decides the level: a write that changes which records the next boot holds, or that
+    /// clears the transitional `records` key, warns; one the next boot rebuilds by itself (the
+    /// recency order in `RECORD_ORDER`, a record's `"used"` flag) reports at debug. The case that
+    /// matters
     /// is a rejected write of the empty blob that clears a revoked record's slot: the store still
     /// holds the old record and hands it back at the next boot, silently making the revoked PSK
     /// valid again (the record is dropped from RAM either way). A provider that queues writes
@@ -238,6 +242,12 @@ public:
 /// - `OUTPUT_DELAY` holds an ASCII decimal string rather than raw uint16_t bytes, for
 ///   debuggability and to avoid an endianness dependency; decode it with a bounds check and
 ///   treat an invalid value as absent.
+/// - One transitional key no constant below names: `"records"`, which held every long-term
+///   record before they moved to one slot per key. The library loads it once at `start()` and,
+///   when it is not empty, writes it empty once so the long-term PSKs in it stop sitting in
+///   storage; nothing ever reads its contents. A provider that dispatches on a fixed key set
+///   must accept a load and a save for that literal key until the first release carrying the
+///   per-slot layout has shipped, after which the library stops touching it.
 namespace persistence_keys {
 
 /// 32 raw bytes: the static X25519 private key. No codec, no encoding.
