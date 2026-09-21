@@ -482,8 +482,8 @@ byte-for-byte.
 
 Every method is invoked on the main loop thread, for every key, so a provider needs no locking
 of its own. (The one library write that originates on the network thread -- the pairing record
-committed when a pairing finalizes -- is staged internally and flushed to
-`save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
+committed when a pairing finalizes -- is staged internally and flushed to that record's slot key
+from the next `loop()` tick.)
 No internal library lock is held across the call, so a slow write does not stall the audio path
 or a Noise handshake -- but it does stop the main loop for its duration, so the call must be one
 bounded storage operation, and it must not call back into the client.
@@ -502,7 +502,8 @@ for each of these:
 | Key | Contents |
 |---|---|
 | `persistence_keys::KEYPAIR` | 32 raw bytes: the static X25519 private key. No codec. |
-| `persistence_keys::RECORDS` | The WHOLE `SendspinPairingRecord` array as one codec blob (`encode_pairing_records()` / `decode_pairing_records()` in `sendspin/persistence_codec.h`). Stays present (possibly as an empty array) once any record has ever existed. |
+| `persistence_keys::record_slot_key(n)` | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or an EMPTY blob when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
+| `persistence_keys::RECORD_ORDER` | Raw bytes: the occupied slot numbers, least recently used first, one byte per slot. Decides which record a pairing at capacity evicts. |
 | `persistence_keys::PAIRING_PSK` | The accepted `SendspinPairingPsk` as one codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). |
 | `persistence_keys::STATIC_PAIRING_CODE` | Raw UTF-8 bytes: the configured static pairing code (8 decimal digits). |
 | `persistence_keys::PAIR_CONFIG` | The `SendspinPairingConfig` as one codec blob (`encode_pairing_config()` / `decode_pairing_config()`). |
@@ -510,37 +511,46 @@ for each of these:
 | `persistence_keys::OUTPUT_DELAY` | ASCII decimal string (e.g. `"150"`): the player's output delay in milliseconds. Chosen over raw `uint16_t` bytes for debuggability and to avoid an endianness dependency. |
 
 `sendspin/persistence_codec.h` is public so a custom provider (or a test) can inspect or seed
-the `RECORDS` / `PAIRING_PSK` / `PAIR_CONFIG` content in exactly the format the library itself
+the record slot / `PAIRING_PSK` / `PAIR_CONFIG` content in exactly the format the library itself
 produces -- it is not something a provider hand-rolls its own version of.
+
+Only the keys a change actually touches are written: a pairing writes one slot (and the order),
+a revocation writes one slot empty (and the order), and a session that reorders recency writes
+only the order. A provider sizing fixed-length storage can size a slot at **184 bytes**, which
+is what a record the library writes encodes to; a `label`, which only a provider seeding its own
+record sets, adds 11 bytes plus the label's length. The order blob is one byte per stored
+record.
 
 #### Durability contract
 
-- `save_blob()` returning `true` means DURABLY stored. A `false` return is reported, not
-  retried: the in-memory state stays authoritative for the current boot, and the library logs a
-  warning naming what will be lost (or come back) at the next reboot. For
-  `persistence_keys::RECORDS` specifically: a rejected write of a just-paired record leaves the
-  pairing working for this boot only (`on_pairing_succeeded` still fires; the record is gone
-  after a reboot), and a rejected write of a removal means the store still holds the old array
-  and will hand the revoked record back at the next boot, silently making the revoked PSK valid
-  again (the revoked record is always dropped from RAM regardless of the return value).
+- `save_blob()` returning `true` means DURABLY stored, including for a zero-length write, which
+  is how a record slot is freed. A `false` return is reported, not retried: the in-memory state
+  stays authoritative for the current boot, and the library logs a warning naming the key and
+  what will be lost (or come back) at the next reboot. For a record slot specifically: a rejected
+  write of a just-paired record leaves the pairing working for this boot only
+  (`on_pairing_succeeded` still fires; the record is gone after a reboot), and a rejected write
+  of a removal means the store still holds the old record and will hand it back at the next boot,
+  silently making the revoked PSK valid again (the revoked record is always dropped from RAM
+  regardless of the return value).
 - `erase_blob()` is for the application's own use; the library never calls it. Every blob the
-  library owns is rewritten in place or left alone (a removal from `RECORDS` re-saves the
-  shrunken array, so that key stays present). The hook is here so an application that wipes the
-  library keyspace itself, for example on a factory reset, has a working delete over the same
-  store. Absent counts as success.
+  library owns is rewritten in place or left alone (a removal writes its slot empty rather than
+  erasing the key). The hook is here so an application that wipes the library keyspace itself,
+  for example on a factory reset, has a working delete over the same store. Absent counts as
+  success.
 
 #### Record capacity
 
 The library's built-in `RecordStore` caps the number of long-term records it will hold at
 `SendspinClientConfig::max_pairing_records`, which defaults to
-`SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). An encoded record is roughly 250
-bytes, so the default keeps the serialized `RECORDS` blob comfortably under a typical NVS
-entry's ~4 KB limit. A pairing at the cap evicts the least recently used record that no open
-connection is resolving against, since a pairing never fails for lack of record storage;
-replacing a record already held for a given `psk_id` or `server_id` evicts nothing, because that
-never grows the store. An evicted server's next handshake lands in the Sentinel fallback, where
-it can offer its operator re-pairing. The protocol requires room for at least 5 records, so a
-smaller configured cap is raised to that floor. Raise or lower the cap by setting
+`SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). The cap is also the number of record
+slot keys the store may use, one per record. A pairing at the cap evicts the least recently used
+record that no open connection is resolving against, since a pairing never fails for lack of
+record storage; replacing a record already held for a given `psk_id` or `server_id` evicts
+nothing, because that never grows the store. Recency survives a reboot: it is what
+`persistence_keys::RECORD_ORDER` holds. An evicted server's next handshake lands in the Sentinel
+fallback, where it can offer its operator re-pairing. The protocol requires room for at least 5
+records, so a smaller configured cap is raised to that floor, and a cap above 255 is lowered to
+that ceiling (the largest slot number the order blob can name). Raise or lower the cap by setting
 `max_pairing_records` before calling `start()`:
 
 ```cpp
@@ -550,8 +560,8 @@ config.max_pairing_records = 32;
 
 Every method has a default no-op / `nullopt` implementation, so you can implement only the
 keys your deployment actually needs. The minimum useful set for a deployed device is
-`persistence_keys::KEYPAIR` (for stable identity) and `persistence_keys::RECORDS` (for pairing
-to survive reboots).
+`persistence_keys::KEYPAIR` (for stable identity) and the record slot keys (for pairing to
+survive reboots).
 
 ```cpp
 struct MyPersistenceProvider : SendspinPersistenceProvider {
@@ -818,8 +828,8 @@ stored one, which is what a provisioning tool needs to print the token for the k
 It returns `nullopt` before `start()`, since the token also carries the client's identity.
 
 After pairing completes, `on_pairing_succeeded` fires and the long-term record is stored
-by the library as a `persistence_keys::RECORDS` blob. Subsequent boots load that same blob;
-no further provisioning is needed.
+by the library in the first free record slot. Subsequent boots load that same slot; no further
+provisioning is needed.
 
 #### Pairing-code pairing
 
