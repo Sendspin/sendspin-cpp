@@ -29,6 +29,7 @@
 #include "constants.h"
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "fake_persistence.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
@@ -103,7 +104,7 @@ constexpr uint16_t COLOR_BOTH_DUE_TEST_PORT = 19045;
 constexpr uint16_t BLOCKING_RECORD_WRITE_TEST_PORT = 19046;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
-// record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
+// record persisted via save_blob() to a record slot key, so the pairing-flow test below
 // can assert on the psk_id/server_id/psk that pairing generated and persisted, and hand the same
 // psk/psk_id back to the fake server for the follow-up in-band re-handshake. The
 // server/pair-finalize commit is RAM-only on the network thread; the save_blob call this
@@ -112,7 +113,7 @@ constexpr uint16_t BLOCKING_RECORD_WRITE_TEST_PORT = 19046;
 // threading beyond its documented contract.
 class PairingCapturePersistenceProvider : public SendspinPersistenceProvider {
 public:
-    // load_blob(RECORDS) is not overridden beyond the base class's nullopt default: "starts with
+    // The record slots are not served beyond the base class's nullopt default: "starts with
     // no pairing records" above, so restating it here would be a no-op override.
 
     // Optionally pre-seed an accepted Pairing PSK, so a fake server can connect on it directly
@@ -148,21 +149,20 @@ public:
             std::string encoded = encode_pairing_psk(this->configured_pairing_psk_.value());
             return std::vector<uint8_t>(encoded.begin(), encoded.end());
         }
-        if (key == persistence_keys::RECORDS && this->seeded_long_term_record_.has_value()) {
-            std::string encoded =
-                encode_pairing_records({this->seeded_long_term_record_.value()});
-            return std::vector<uint8_t>(encoded.begin(), encoded.end());
+        if (is_record_key(key) && this->seeded_long_term_record_.has_value()) {
+            return seeded_record_blob({this->seeded_long_term_record_.value()}, key);
         }
         return std::nullopt;
     }
 
     bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
-        if (key != persistence_keys::RECORDS) {
-            return true;  // pair_config etc. are not under test here.
+        if (!is_record_key(key) || key == persistence_keys::RECORD_ORDER) {
+            return true;  // pair_config and the recency order are not under test here.
         }
-        std::string_view text(reinterpret_cast<const char*>(data), len);
-        auto decoded = decode_pairing_records(text).value_or(std::vector<SendspinPairingRecord>{});
-        if (decoded.empty()) {
+        // An empty slot write frees that slot and carries no record to capture.
+        auto decoded = decode_pairing_record(std::string_view(
+            reinterpret_cast<const char*>(data), len));
+        if (!decoded.has_value()) {
             return true;
         }
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -170,7 +170,7 @@ public:
             this->rejected_record_saves_++;
             return false;
         }
-        this->captured_ = decoded.front();
+        this->captured_ = std::move(decoded.value());
         return true;
     }
 
@@ -179,7 +179,7 @@ public:
         return this->captured_;
     }
 
-    // When set, save_blob(RECORDS, ...) rejects any write that carries a record (simulating a
+    // When set, a slot write that carries a record is rejected (simulating a
     // persistence-provider failure, e.g. storage full). Used to verify the deferred fail-open
     // contract: the pairing still completes on the RAM commit, and the rejected flush (counted
     // below) is only a durability warning.
@@ -2194,109 +2194,24 @@ TEST(EncryptedLifecycle, PairFinalizeDoesNotDeadlockAgainstAnAdmission) {
         << "the server/pair-finalize handler never committed its record";
 }
 
-// Seeds a set of LONG_TERM records and keeps the persisted "records" array up to date, so an
+// Seeds a set of LONG_TERM records into the slot layout RecordStore loads them from, so an
 // unpair test can assert on what the store would come back with after a reboot as well as on
 // what it resolves right now. TestPersistenceProvider rejects writes on purpose (see its
-// comment), so it cannot show what a removal persists; this provider accepts them.
-class RecordsMirrorPersistenceProvider : public SendspinPersistenceProvider {
-public:
-    explicit RecordsMirrorPersistenceProvider(std::vector<SendspinPairingRecord> records)
-        : records_(std::move(records)) {}
-
-    /// Seeds the stored pairing config. Must be called before start(): a client that already
-    /// holds records is not on its first boot, so SendspinClientConfig's unpaired-access seed no
-    /// longer applies and the stored config is the only way in.
-    void set_unpaired_access_enabled(bool enabled) {
-        this->unpaired_access_enabled_ = enabled;
-    }
-
-    /// Stands in for a store that cannot take the records blob at all (full or read-only NVS).
-    /// A rejected write counts as neither a save nor a change to what the next boot loads.
-    void set_reject_records(bool reject) {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        this->reject_records_ = reject;
-    }
-
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        if (key == persistence_keys::PAIR_CONFIG) {
-            SendspinPairingConfig config;
-            config.unpaired_access_enabled = this->unpaired_access_enabled_;
-            std::string encoded = encode_pairing_config(config);
-            return std::vector<uint8_t>(encoded.begin(), encoded.end());
-        }
-        if (key != persistence_keys::RECORDS) {
-            return std::nullopt;
-        }
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        std::string encoded = encode_pairing_records(this->records_);
-        return std::vector<uint8_t>(encoded.begin(), encoded.end());
-    }
-
-    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
-        if (key == persistence_keys::LAST_PLAYED) {
-            std::lock_guard<std::mutex> lock(this->mutex_);
-            this->last_played_.assign(reinterpret_cast<const char*>(data), len);
-            return true;
-        }
-        if (key != persistence_keys::RECORDS) {
-            return true;  // The keypair and pair config are not under test here.
-        }
-        std::string_view text(reinterpret_cast<const char*>(data), len);
-        auto decoded = decode_pairing_records(text);
-        if (!decoded.has_value()) {
-            return false;
-        }
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        if (this->reject_records_) {
-            return false;
-        }
-        this->records_ = std::move(decoded.value());
-        ++this->records_saves_;
-        return true;
-    }
-
-    /// @brief How many times the records blob has been written.
-    [[nodiscard]] size_t records_saves() const {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        return this->records_saves_;
-    }
-
-    /// @brief The last-played server_id the store holds.
-    [[nodiscard]] std::string last_played() const {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        return this->last_played_;
-    }
-
-    /// @brief Whether the record the store would load carries the durable used flag.
-    [[nodiscard]] bool persisted_used(const std::string& psk_id) const {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        for (const auto& record : this->records_) {
-            if (record.psk_id == psk_id) {
-                return record.used;
-            }
-        }
-        return false;
-    }
-
-    /// @brief The psk_ids the store would load on the next boot.
-    [[nodiscard]] std::vector<std::string> persisted_psk_ids() const {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        std::vector<std::string> ids;
-        ids.reserve(this->records_.size());
-        for (const auto& record : this->records_) {
-            ids.push_back(record.psk_id);
-        }
-        return ids;
-    }
-
-private:
-    mutable std::mutex mutex_;
-    std::vector<SendspinPairingRecord> records_;
-    size_t records_saves_{0};
-    bool unpaired_access_enabled_{false};
-    bool reject_records_{false};
-    std::string last_played_{};
-};
+// comment), so it cannot show what a removal persists; InMemoryPersistenceProvider accepts them
+// and counts the writes per key, which is what the coalescing tests below read.
+/// @param records The records to seed, least recently used first.
+/// @param unpaired_access_enabled Seeds the stored pairing config: a client that already holds
+///        records is not on its first boot, so SendspinClientConfig's unpaired-access seed no
+///        longer applies and the stored config is the only way in.
+std::unique_ptr<InMemoryPersistenceProvider> make_record_store_provider(
+    const std::vector<SendspinPairingRecord>& records, bool unpaired_access_enabled = false) {
+    auto provider = std::make_unique<InMemoryPersistenceProvider>();
+    seed_records(*provider, records);
+    SendspinPairingConfig config;
+    config.unpaired_access_enabled = unpaired_access_enabled;
+    provider->seed_blob(persistence_keys::PAIR_CONFIG, blob_bytes(encode_pairing_config(config)));
+    return provider;
+}
 
 /// Build a LONG_TERM record for `identity` with a random PSK.
 SendspinPairingRecord make_record_for(const Identity& identity) {
@@ -2320,8 +2235,8 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
     SendspinPairingRecord bystander_record = make_record_for(bystander_identity);
 
     TestNetworkProvider network;
-    RecordsMirrorPersistenceProvider persistence(
-        std::vector<SendspinPairingRecord>{unpairing_record, bystander_record});
+    auto provider = make_record_store_provider({unpairing_record, bystander_record});
+    InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Unpair Record Test Client";
     config.server_port = UNPAIR_RECORD_TEST_PORT;
@@ -2351,28 +2266,28 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
     EXPECT_EQ(bystander_resolved->category, PskCategory::LONG_TERM);
 
     // ...and gone for the next one: the removal reached the provider through the main loop.
-    EXPECT_EQ(persistence.persisted_psk_ids(),
-              std::vector<std::string>{bystander_record.psk_id})
-        << "the persisted records blob must hold exactly the surviving record";
+    EXPECT_EQ(persisted_psk_ids(persistence), std::vector<std::string>{bystander_record.psk_id})
+        << "the persisted slots must hold exactly the surviving record";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
 }
 
-// Every records op rewrites the whole array, so a tick carrying more than one of them must still
-// reach the provider once: on ESP each save is an NVS erase cycle, and flash wear is a budget
+// A tick carrying more than one records op must write each slot those ops touched exactly once,
+// and no other slot: on ESP each save is an NVS erase cycle, and flash wear is a budget
 // (docs/conventions.md, "Embedded resource discipline"). The two ops here are the pair a real tick
 // carries, staged by the activate drain and the unpair drain in the same locked block, on two
 // different records so both halves genuinely need the write.
-TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteTheBlobOnce) {
+TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteEachTouchedSlotOnce) {
     Identity used_identity = Identity::generate().value();
     Identity unpairing_identity = Identity::generate().value();
     SendspinPairingRecord used_record = make_record_for(used_identity);
     SendspinPairingRecord unpairing_record = make_record_for(unpairing_identity);
 
     TestNetworkProvider network;
-    RecordsMirrorPersistenceProvider persistence(
-        std::vector<SendspinPairingRecord>{used_record, unpairing_record});
+    // Slot 0 holds used_record, slot 1 unpairing_record (seed_records() lays them out in order).
+    auto provider = make_record_store_provider({used_record, unpairing_record});
+    InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Coalesced Record Write Test Client";
     // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
@@ -2383,7 +2298,7 @@ TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteTheBlobOnce) {
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
     ConnectionManager& manager = *client.connection_manager_;
-    const size_t saves_before = persistence.records_saves();
+    const size_t writes_before = record_writes(persistence);
 
     HoldTestConnection conn;
     ServerUnpairEvent event;
@@ -2399,11 +2314,17 @@ TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteTheBlobOnce) {
     manager.flush_pending_record_ops();
     manager.flush_deferred_releases();
 
-    EXPECT_EQ(persistence.records_saves() - saves_before, 1u)
-        << "the tick's record ops must land as one blob write";
-    // Control: the one blob carries both changes, so this is coalescing rather than a lost write.
-    EXPECT_EQ(persistence.persisted_psk_ids(), std::vector<std::string>{used_record.psk_id})
-        << "the written blob must hold exactly the surviving record";
+    // Slot 0 carries the used flag, slot 1 is emptied, and the order blob loses the revoked
+    // record: three writes, each key once.
+    EXPECT_EQ(record_writes(persistence) - writes_before, 3u)
+        << "the tick's record ops must write each touched key once";
+    EXPECT_EQ(persistence.save_attempts(persistence_keys::record_slot_key(0)), 1)
+        << "the mark-used op must write its own slot once";
+    EXPECT_EQ(persistence.save_attempts(persistence_keys::record_slot_key(1)), 1)
+        << "the unpair must write its own slot once";
+    // Control: the writes carry both changes, so this is coalescing rather than a lost write.
+    EXPECT_EQ(persisted_psk_ids(persistence), std::vector<std::string>{used_record.psk_id})
+        << "the written slots must hold exactly the surviving record";
     const auto* marked = client.record_store_->record_by_psk_id(used_record.psk_id);
     ASSERT_NE(marked, nullptr);
     EXPECT_TRUE(marked->used) << "the mark-used op was dropped instead of coalesced";
@@ -2415,13 +2336,13 @@ TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteTheBlobOnce) {
 // flagged carries no durable change, so the flush must not spend an NVS erase cycle on it. This
 // runs on the first activate of every long-term session, so a write here would be one per
 // connection in steady state.
-TEST(EncryptedLifecycle, AMarkUsedOpThatFlipsNothingWritesNoBlob) {
+TEST(EncryptedLifecycle, AMarkUsedOpThatFlipsNothingWritesNothing) {
     Identity used_identity = Identity::generate().value();
     SendspinPairingRecord used_record = make_record_for(used_identity);
 
     TestNetworkProvider network;
-    RecordsMirrorPersistenceProvider persistence(
-        std::vector<SendspinPairingRecord>{used_record});
+    auto provider = make_record_store_provider({used_record});
+    InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Repeat Mark Used Test Client";
     // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
@@ -2433,25 +2354,26 @@ TEST(EncryptedLifecycle, AMarkUsedOpThatFlipsNothingWritesNoBlob) {
     ASSERT_TRUE(client.start());
     ConnectionManager& manager = *client.connection_manager_;
 
-    // Control: the first flip is durable, so it does write.
-    const size_t saves_before_first = persistence.records_saves();
+    // Control: the first flip is durable, so it does write. The store holds one record, which is
+    // already the most recently used one, so the recency order never moves here.
+    const size_t writes_before_first = record_writes(persistence);
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
     }
     manager.flush_pending_record_ops();
-    EXPECT_EQ(persistence.records_saves() - saves_before_first, 1u)
+    EXPECT_EQ(record_writes(persistence) - writes_before_first, 1u)
         << "the first flip of the durable used flag must reach the provider";
 
-    const size_t saves_before_repeat = persistence.records_saves();
+    const size_t writes_before_repeat = record_writes(persistence);
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
     }
     manager.flush_pending_record_ops();
 
-    EXPECT_EQ(persistence.records_saves(), saves_before_repeat)
-        << "a mark-used op that flips nothing must not rewrite the records blob";
+    EXPECT_EQ(record_writes(persistence), writes_before_repeat)
+        << "a mark-used op that flips nothing must not write a record key";
     const auto* marked = client.record_store_->record_by_psk_id(used_record.psk_id);
     ASSERT_NE(marked, nullptr);
     EXPECT_TRUE(marked->used) << "the RAM flag must still be set";
@@ -2468,8 +2390,8 @@ TEST(EncryptedLifecycle, StopFlushesARecordOpStagedAfterTheLastTick) {
     SendspinPairingRecord used_record = make_record_for(used_identity);
 
     TestNetworkProvider network;
-    RecordsMirrorPersistenceProvider persistence(
-        std::vector<SendspinPairingRecord>{used_record});
+    auto provider = make_record_store_provider({used_record});
+    InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Stop Flushes Staged Record Op Test Client";
     // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
@@ -2481,32 +2403,32 @@ TEST(EncryptedLifecycle, StopFlushesARecordOpStagedAfterTheLastTick) {
     ASSERT_TRUE(client.start());
     ConnectionManager& manager = *client.connection_manager_;
 
-    const size_t saves_before = persistence.records_saves();
+    const size_t writes_before = record_writes(persistence);
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
     }
-    ASSERT_EQ(persistence.records_saves(), saves_before)
+    ASSERT_EQ(record_writes(persistence), writes_before)
         << "staging under the lock must not write on its own";
 
     client.stop();
 
-    EXPECT_EQ(persistence.records_saves() - saves_before, 1u)
+    EXPECT_EQ(record_writes(persistence) - writes_before, 1u)
         << "the op staged after the last tick never reached the provider";
-    EXPECT_TRUE(persistence.persisted_used(used_record.psk_id))
-        << "the blob stop() wrote must carry the staged flip";
+    EXPECT_TRUE(persisted_used(persistence, used_record.psk_id))
+        << "the slot stop() wrote must carry the staged flip";
 }
 
 // The last-played server_id lives under its own key, so a tick that stages only that write must
-// leave the records blob alone: the two are coalesced separately, and rewriting the array for a
-// handoff would be an NVS erase cycle nothing asked for.
-TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordsBlob) {
+// leave every record key alone: the two are coalesced separately, and rewriting a record slot for
+// a handoff would be an NVS erase cycle nothing asked for.
+TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordKey) {
     Identity paired_identity = Identity::generate().value();
     SendspinPairingRecord paired_record = make_record_for(paired_identity);
 
     TestNetworkProvider network;
-    RecordsMirrorPersistenceProvider persistence(
-        std::vector<SendspinPairingRecord>{paired_record});
+    auto provider = make_record_store_provider({paired_record});
+    InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Last Played Only Test Client";
     config.server_port = 0;
@@ -2516,7 +2438,7 @@ TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordsBlob) {
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
     ConnectionManager& manager = *client.connection_manager_;
-    const size_t saves_before = persistence.records_saves();
+    const size_t writes_before = record_writes(persistence);
 
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
@@ -2524,16 +2446,18 @@ TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordsBlob) {
     }
     manager.flush_pending_record_ops();
 
-    EXPECT_EQ(persistence.records_saves(), saves_before)
-        << "a last-played write must not drag the records blob along";
+    EXPECT_EQ(record_writes(persistence), writes_before)
+        << "a last-played write must not drag a record key along";
     // Control: the op was performed rather than dropped.
-    EXPECT_EQ(persistence.last_played(), paired_record.server_id)
+    auto last_played = persistence.blob(persistence_keys::LAST_PLAYED);
+    ASSERT_TRUE(last_played.has_value());
+    EXPECT_EQ(std::string(last_played->begin(), last_played->end()), paired_record.server_id)
         << "the staged last-played write never reached the provider";
 
     client.stop();
 }
 
-// A store that cannot take the blob does not undo the RAM decisions the locked handlers already
+// A store that cannot take the writes does not undo the RAM decisions the locked handlers already
 // made: the revoked credential stays revoked for this boot (leaving it usable because flash is
 // full is strictly worse).
 TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
@@ -2543,8 +2467,8 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     SendspinPairingRecord unpairing_record = make_record_for(unpairing_identity);
 
     TestNetworkProvider network;
-    RecordsMirrorPersistenceProvider persistence(
-        std::vector<SendspinPairingRecord>{used_record, unpairing_record});
+    auto provider = make_record_store_provider({used_record, unpairing_record});
+    InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Rejected Coalesced Write Test Client";
     config.server_port = 0;
@@ -2554,7 +2478,7 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
     ConnectionManager& manager = *client.connection_manager_;
-    persistence.set_reject_records(true);
+    reject_record_saves(persistence);
 
     HoldTestConnection conn;
     ServerUnpairEvent event;
@@ -2577,8 +2501,8 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     ASSERT_NE(marked, nullptr);
     EXPECT_TRUE(marked->used);
     // ...and the provider still holds what it accepted last, which is what a reboot loads.
-    EXPECT_EQ(persistence.persisted_psk_ids().size(), 2u)
-        << "a rejected write must not be mirrored as if it had landed";
+    EXPECT_EQ(persisted_psk_ids(persistence).size(), 2u)
+        << "a rejected write must not change what the next boot loads";
 
     client.stop();
 }
@@ -2634,12 +2558,11 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     SendspinPairingRecord paired_record = make_record_for(paired_identity);
 
     TestNetworkProvider network;
-    RecordsMirrorPersistenceProvider persistence(
-        std::vector<SendspinPairingRecord>{paired_record});
+    auto provider = make_record_store_provider({paired_record}, /*unpaired_access_enabled=*/true);
+    InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Unpair Sentinel Test Client";
     config.server_port = UNPAIR_SENTINEL_TEST_PORT;
-    persistence.set_unpaired_access_enabled(true);
 
     SendspinClient client(config);
     client.set_network_provider(&network);
@@ -2665,7 +2588,7 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
 
     // The paired server's record is untouched: it was never what this session ran on.
     EXPECT_TRUE(client.record_store_->resolve_by_psk_id(paired_record.psk_id, PskCategory::LONG_TERM).has_value());
-    EXPECT_EQ(persistence.persisted_psk_ids(), std::vector<std::string>{paired_record.psk_id});
+    EXPECT_EQ(persisted_psk_ids(persistence), std::vector<std::string>{paired_record.psk_id});
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -2737,7 +2660,7 @@ TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
 
 namespace {
 
-// A persistence provider whose records write parks until the test releases it, standing in for an
+// A persistence provider whose record writes park until the test releases it, standing in for an
 // NVS commit of tens of milliseconds. It serves the one seeded long-term record, so the peer
 // below resolves to PskCategory::LONG_TERM and its first activate reaches the flush's
 // persist_records().
@@ -2747,15 +2670,14 @@ public:
         : records_{std::move(record)} {}
 
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        if (key != persistence_keys::RECORDS) {
+        if (!is_record_key(key)) {
             return std::nullopt;
         }
-        std::string encoded = encode_pairing_records(this->records_);
-        return std::vector<uint8_t>(encoded.begin(), encoded.end());
+        return seeded_record_blob(this->records_, key);
     }
 
     bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
-        if (key != persistence_keys::RECORDS) {
+        if (!is_record_key(key)) {
             return true;  // The keypair and pairing config must not park the tick.
         }
         std::unique_lock<std::mutex> lock(this->mutex_);

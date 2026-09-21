@@ -27,6 +27,7 @@
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "noise_test_helpers.h"
+#include "record_test_helpers.h"
 #include "test_util.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
@@ -107,9 +108,8 @@ public:
     }
 
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        if (key == persistence_keys::RECORDS) {
-            std::string encoded = encode_pairing_records(this->records_);
-            return std::vector<uint8_t>(encoded.begin(), encoded.end());
+        if (is_record_key(key)) {
+            return seeded_record_blob(this->records_, key);
         }
         if (key == persistence_keys::LAST_PLAYED && !this->last_played_server_id_.empty()) {
             return std::vector<uint8_t>(this->last_played_server_id_.begin(),

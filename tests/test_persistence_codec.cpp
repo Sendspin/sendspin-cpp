@@ -41,16 +41,6 @@ std::array<uint8_t, 32> make_psk(uint8_t seed) {
     return psk;
 }
 
-/// The minimal record object the record decoder accepts.
-std::string well_formed_record_entry() {
-    return R"({"server_id":"srv-ok","psk_id":"rec-ok","psk":")" +
-           base64url_encode(make_psk(0x11).data(), 32) + R"("})";
-}
-
-std::string well_formed_records_blob() {
-    return R"({"v":1,"records":[)" + well_formed_record_entry() + "]}";
-}
-
 }  // namespace
 
 // ============================================================================
@@ -181,91 +171,28 @@ TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
 }
 
 // ============================================================================
-// SendspinPairingRecord list round-trip
+// Slot sizing
 // ============================================================================
 
-TEST(PersistenceCodec, RecordsArrayRoundTrip) {
-    std::vector<SendspinPairingRecord> recs;
-    SendspinPairingRecord r1;
-    r1.psk_id = "a";
-    r1.psk = make_psk(1);
-    r1.server_id = "srv-a";
-    recs.push_back(r1);
+// Records are stored one per key, so the per-slot size is what a provider sizes fixed-length
+// storage against; persistence_codec.h and the integration guide quote it, and a field added to
+// the storage format moves it.
+TEST(PersistenceCodec, EncodedRecordMatchesTheDocumentedSlotSize) {
+    SendspinPairingRecord r;
+    // The three 43-character base64url fields a real record carries: psk_id and server_id are
+    // 32-byte values encoded the same way as the psk.
+    r.psk = make_psk(0x80);
+    r.psk_id = base64url_encode(r.psk.data(), r.psk.size());
+    r.server_id = base64url_encode(make_psk(0x81).data(), 32);
+    r.used = true;
 
-    SendspinPairingRecord r2;
-    r2.psk_id = "b";
-    r2.psk = make_psk(2);
-    r2.server_id = "srv-b";
-    r2.used = true;
-    recs.push_back(r2);
+    EXPECT_EQ(encode_pairing_record(r).size(), 184u)
+        << "the documented per-slot size must match what the codec writes";
 
-    std::string blob = encode_pairing_records(recs);
-    // Entries do not carry their own "v" (only the array wrapper does): the "v" key substring
-    // appears exactly once in the whole blob.
-    size_t count = 0;
-    for (size_t pos = blob.find(R"("v":)"); pos != std::string::npos;
-        pos = blob.find(R"("v":)", pos + 1)) {
-        ++count;
-    }
-    EXPECT_EQ(count, 1u);
-
-    auto decoded = decode_pairing_records(blob);
-    ASSERT_TRUE(decoded.has_value());
-    ASSERT_EQ(decoded->size(), 2u);
-    EXPECT_EQ((*decoded)[0].psk_id, "a");
-    EXPECT_EQ((*decoded)[0].server_id, "srv-a");
-    EXPECT_EQ((*decoded)[1].psk_id, "b");
-    EXPECT_TRUE((*decoded)[1].used);
-}
-
-TEST(PersistenceCodec, RecordsArrayEmptyRoundTrip) {
-    std::string blob = encode_pairing_records({});
-    auto decoded = decode_pairing_records(blob);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_TRUE(decoded->empty());
-}
-
-// The array wrapper's malformed-shape family. Entry-level corruption is a different rule
-// (RecordsArraySkipsCorruptEntryKeepsGoodOnes): a bad wrapper loses the whole blob, a bad entry
-// loses only itself.
-TEST(PersistenceCodec, RecordsArrayDecodeRejectsMalformedWrapper) {
-    struct Row {
-        const char* name;
-        std::string blob;
-        bool expect_ok;
-    };
-    const Row rows[] = {
-        {"not-json", "{not json", false},
-        {"missing-records-field", R"({"v":1})", false},
-        {"records-not-an-array", R"({"v":1,"records":"oops"})", false},
-        // Control: see well_formed_records_blob().
-        {"well-formed-wrapper", well_formed_records_blob(), true},
-    };
-
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        EXPECT_EQ(decode_pairing_records(row.blob).has_value(), row.expect_ok);
-    }
-}
-
-TEST(PersistenceCodec, RecordsArraySkipsCorruptEntryKeepsGoodOnes) {
-    std::string good_psk = base64url_encode(make_psk(9).data(), 32);
-    std::string blob = R"({"v":1,"records":[)"
-                       R"({"server_id":"srv-1","psk_id":"good-1","psk":")" +
-                       good_psk +
-                       R"("},)"
-                       R"({"server_id":"srv-bad","psk_id":"bad","psk":"not-valid-base64!!"},)"
-                       R"({"server_id":"srv-2","psk":")" +
-                       good_psk +
-                       R"("},)"  // missing psk_id
-                       R"({"server_id":"srv-3","psk_id":"good-2","psk":")" +
-                       good_psk + R"("}]})";
-
-    auto decoded = decode_pairing_records(blob);
-    ASSERT_TRUE(decoded.has_value());
-    ASSERT_EQ(decoded->size(), 2u);
-    EXPECT_EQ((*decoded)[0].psk_id, "good-1");
-    EXPECT_EQ((*decoded)[1].psk_id, "good-2");
+    // Control: a label costs its own length plus 11 bytes of framing, which is the other half of
+    // the documented figure.
+    r.label = "kitchen";
+    EXPECT_EQ(encode_pairing_record(r).size(), 184u + 11u + r.label->size());
 }
 
 // ============================================================================
