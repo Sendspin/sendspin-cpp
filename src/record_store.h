@@ -191,8 +191,11 @@ public:
     /// it holds at this call. A rejected write is not retried, so the slot leaves the dirty set
     /// either way and RAM stays authoritative for the boot.
     ///
-    /// A rejection is reported per key rather than per batch: only a record slot decides what
-    /// the next boot holds, so only that warns. The recency order is rebuilt from use.
+    /// A rejection is reported per write rather than per batch, and by what the write carries
+    /// rather than by its key: a write that decides which records the next boot holds, or that
+    /// clears PSK material out of the pre-slot key, warns; one the next boot rebuilds from use
+    /// (the recency order, the `used` flag) reports at debug. The same slot key carries both
+    /// kinds, so the durability travels on the write.
     /// @return true when every owed write was accepted (or when there is nothing to write, or no
     ///         provider); false when any write was rejected.
     bool persist_records();
@@ -299,6 +302,9 @@ private:
     /// returns when the store is full. Out of range of every real slot because max_records_ is
     /// capped at MAX_MAX_RECORDS.
     static constexpr uint8_t UNASSIGNED_SLOT = 255;
+    static_assert(MAX_MAX_RECORDS - 1 < UNASSIGNED_SLOT,
+                  "the highest slot the ceiling allows must stay below the unassigned sentinel, "
+                  "or a stored record is indistinguishable from one awaiting a slot");
 
     /// @brief A record and the persistence slot holding it.
     ///
@@ -315,6 +321,18 @@ private:
     struct SlotWrite {
         std::string key;
         std::string blob;
+        /// Whether losing this write costs the next boot a record it must otherwise hold or drop.
+        /// Set from the change that dirtied the slot, not from the key: the same slot key carries
+        /// a pairing (durable) and a flip of the `used` flag the next boot rebuilds from use
+        /// (advisory). Decides whether a rejection warns or reports at debug.
+        bool durable{false};
+    };
+
+    /// @brief A slot owing a write, with the durability of the change that dirtied it. Two
+    /// mutations of one slot between flushes coalesce into one write, durable if either was.
+    struct DirtySlot {
+        uint8_t slot;
+        bool durable;
     };
 
     // ========================================
@@ -371,7 +389,10 @@ private:
 
     /// @brief Note that a slot's blob no longer matches records_, so the next persist_records()
     /// writes it. Idempotent within a batch. Call with mutex_ held.
-    void mark_slot_dirty_locked(uint8_t slot);
+    /// @param slot The slot to write.
+    /// @param durable Whether the change costs a record at the next boot if the write is
+    ///        rejected; see SlotWrite::durable. ORed in when the slot is already dirty.
+    void mark_slot_dirty_locked(uint8_t slot, bool durable);
 
     /// @brief Body of resolve_by_psk_id(); call with mutex_ held.
     [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id_locked(const std::string& psk_id,
@@ -424,7 +445,7 @@ private:
     std::vector<StoredRecord> records_;
 
     /// Slots whose stored blob no longer matches records_, awaiting the next persist_records().
-    std::vector<uint8_t> dirty_slots_;
+    std::vector<DirtySlot> dirty_slots_;
 
     /// Configured static pairing code (8 decimal digits).
     std::optional<std::string> static_pairing_code_;

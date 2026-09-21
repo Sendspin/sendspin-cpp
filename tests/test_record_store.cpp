@@ -642,43 +642,97 @@ TEST(RecordStore, AMarkUsedThatChangesNothingReportsNoChangeWhileAWriteIsPending
         << "an activate that reorders recency owes a write";
 }
 
-// The durability warning is decided per key. Only a record slot decides what the next boot
-// holds, so only it warns; the recency order is rebuilt from use and would otherwise warn on the
-// first activate of every long-term session against a full or read-only store.
-TEST(RecordStore, OnlyARejectedRecordSlotWarnsAboutWhatTheNextBootLoses) {
-    InMemoryPersistenceProvider provider;
-    SendspinPairingRecord older = make_client_record("server-older");
-    SendspinPairingRecord newer = make_client_record("server-newer");
-    seed_records(provider, {older, newer});
-    RecordStore store(&provider);
-    reject_record_saves(provider);
+// A rejected write reports what it actually costs the next boot. The durability travels on the
+// write rather than on its key: a record slot carries both a pairing, which the next boot cannot
+// rebuild, and a flip of the `used` flag, which it rebuilds on the first activate of every
+// long-term session and which would otherwise warn once per connection against a full or
+// read-only store.
+TEST(RecordStore, ARejectedWriteWarnsOnlyWhenTheNextBootCannotRebuildIt) {
+    // Seeded least recently used first. The first two already carry the used flag, so activating
+    // one moves the recency order and nothing else; the third does not, so activating it (it is
+    // already the most recent) flips the flag and nothing else.
+    auto seeded = [] {
+        SendspinPairingRecord older = make_client_record("server-older");
+        SendspinPairingRecord newer = make_client_record("server-newer");
+        SendspinPairingRecord fresh = make_client_record("server-fresh");
+        older.used = true;
+        newer.used = true;
+        return std::vector<SendspinPairingRecord>{older, newer, fresh};
+    };
 
-    std::string order_only_output;
-    {
-        // A record already carrying its used flag reorders and nothing else, so this flush owes
-        // the order key alone.
-        StderrCapture capture;
-        ASSERT_TRUE(store.note_record_used(newer.psk_id));
-        EXPECT_FALSE(store.persist_records());
-        ASSERT_TRUE(store.note_record_used(older.psk_id));
-        EXPECT_FALSE(store.persist_records());
-        order_only_output = capture.release();
-    }
-    EXPECT_EQ(order_only_output.find(persistence_keys::RECORD_ORDER), std::string::npos)
-        << "a rejected recency-order write must not warn: " << order_only_output;
+    using Action = void (*)(RecordStore&, const std::vector<SendspinPairingRecord>&);
+    struct Row {
+        const char* name;
+        bool seed_legacy_key;
+        Action act;
+        /// The key the warning must name, or nullptr when the rejection must stay below warn.
+        const char* warns_about;
+        /// A phrase of the warning that says what the rejection costs; nullptr with warns_about.
+        const char* cost;
+    };
+    const Row rows[] = {
+        {"used-flip-only", false,
+         [](RecordStore& store, const std::vector<SendspinPairingRecord>& records) {
+             ASSERT_TRUE(store.note_record_used(records[2].psk_id));
+             EXPECT_FALSE(store.persist_records());
+         },
+         nullptr, nullptr},
+        {"order-only", false,
+         [](RecordStore& store, const std::vector<SendspinPairingRecord>& records) {
+             ASSERT_TRUE(store.note_record_used(records[0].psk_id));
+             EXPECT_FALSE(store.persist_records());
+         },
+         nullptr, nullptr},
+        // Control: a write the next boot cannot reconstruct says so.
+        {"pairing", false,
+         [](RecordStore& store, const std::vector<SendspinPairingRecord>&) {
+             auto outcome = store.resolve_pairing_outcome("server-paired");
+             ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
+             EXPECT_FALSE(store.persist_records());
+         },
+         "rec_3", "will not survive a reboot"},
+        {"revocation", false,
+         [](RecordStore& store, const std::vector<SendspinPairingRecord>& records) {
+             EXPECT_FALSE(remove_record(store, records[0].psk_id));
+         },
+         "rec_0", "valid again"},
+        // The pre-slot key costs no record, but a rejected clear leaves long-term PSKs in
+        // storage, so it warns rather than passing as bookkeeping. It is owed once per device.
+        {"legacy-clear", true, [](RecordStore& store, const std::vector<SendspinPairingRecord>&) {
+             EXPECT_FALSE(store.persist_records());
+         },
+         "records", "stay in storage"},
+    };
 
-    // Control: a revocation's rejected slot write says what the next boot will get wrong, even
-    // though the same batch also carries the order key.
-    std::string slot_output;
-    {
-        StderrCapture capture;
-        EXPECT_FALSE(remove_record(store, older.psk_id));
-        slot_output = capture.release();
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InMemoryPersistenceProvider provider;
+        const std::vector<SendspinPairingRecord> records = seeded();
+        seed_records(provider, records);
+        if (row.seed_legacy_key) {
+            provider.seed_blob("records", blob_bytes(R"([{"v":1,"psk_id":"old","psk":"old"}])"));
+        }
+        RecordStore store(&provider);
+        reject_record_saves(provider);
+        provider.reject_save_keys.insert("records");
+
+        std::string output;
+        {
+            StderrCapture capture;
+            row.act(store, records);
+            output = capture.release();
+        }
+
+        if (row.warns_about == nullptr) {
+            EXPECT_TRUE(output.empty())
+                << "a rejected write the next boot rebuilds must stay below warn: " << output;
+            continue;
+        }
+        EXPECT_NE(output.find(row.warns_about), std::string::npos)
+            << "the warning must name the rejected key: " << output;
+        EXPECT_NE(output.find(row.cost), std::string::npos)
+            << "the warning must say what the rejection costs: " << output;
     }
-    EXPECT_NE(slot_output.find(persistence_keys::record_slot_key(0)), std::string::npos)
-        << "a rejected record-slot write must warn: " << slot_output;
-    EXPECT_NE(slot_output.find("valid again"), std::string::npos)
-        << "the warning must name what a rejected removal costs: " << slot_output;
 }
 
 // Two slots carrying the same psk_id would leave a revoked credential working: a removal erases
@@ -731,6 +785,16 @@ TEST(RecordStore, TheLegacyRecordsKeyIsEmptiedOnceAndNotTouchedAgain) {
         << "an already-cleared key must not be rewritten at every boot";
     EXPECT_TRUE(rebooted.persist_records());
     EXPECT_EQ(provider.save_attempts(legacy_key), writes_before);
+
+    // Control: a device that never held the key is the common case, and it must not be written
+    // at all -- a provider that only knows the documented keyspace would reject that write.
+    InMemoryPersistenceProvider fresh_provider;
+    RecordStore fresh_store(&fresh_provider);
+    auto outcome = fresh_store.resolve_pairing_outcome("server-fresh");
+    ASSERT_TRUE(fresh_store.store_record_superseding(outcome.record, {}));
+    ASSERT_TRUE(fresh_store.persist_records());
+    EXPECT_EQ(fresh_provider.save_attempts(legacy_key), 0)
+        << "a store that never found the pre-slot key must not write it";
 }
 
 // The mark-used path writes exactly what changed: the first flip of the durable `used` flag
@@ -882,8 +946,11 @@ TEST(RecordStore, ConfiguredCapacityIsHonouredAboveTheProtocolFloor) {
     const Row rows[] = {
         {"above-the-floor", RecordStore::MIN_MAX_RECORDS + 1, RecordStore::MIN_MAX_RECORDS + 1},
         {"below-the-floor", 2, RecordStore::MIN_MAX_RECORDS},
-        // The record-order blob names one slot per byte, so slot numbers must fit a uint8_t.
-        {"above-the-ceiling", RecordStore::MAX_MAX_RECORDS + 10, RecordStore::MAX_MAX_RECORDS},
+        // The record-order blob names one slot per byte and 255 is the sentinel a record
+        // awaiting a slot carries, so the highest usable slot is 254 and the cap is 255. Stated
+        // as literals: written in terms of MAX_MAX_RECORDS the row moves with the constant it
+        // exists to pin.
+        {"above-the-ceiling", 300, 255},
     };
 
     for (const Row& row : rows) {
