@@ -903,7 +903,11 @@ TEST(RecordStore, ConfiguredCapacityIsHonouredAboveTheProtocolFloor) {
         EXPECT_TRUE(store.resolve_by_psk_id(psk_ids.front(), PskCategory::LONG_TERM).has_value())
             << "nothing may be evicted before the effective cap is reached";
         EXPECT_EQ(persisted_psk_ids(provider, row.effective).size(), row.effective)
-            << "every slot up to the cap must persist, including the highest one";
+            << "every slot up to the cap must persist";
+        ASSERT_TRUE(stored_record_in_slot(provider, row.effective - 1).has_value())
+            << "the highest slot the cap allows must be usable and persisted";
+        EXPECT_EQ(stored_record_in_slot(provider, row.effective - 1)->psk_id, psk_ids.back())
+            << "the last record stored must be the one in the highest slot";
 
         auto overflow = store.resolve_pairing_outcome("server-overflow");
         ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
