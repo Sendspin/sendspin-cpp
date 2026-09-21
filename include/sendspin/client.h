@@ -233,8 +233,8 @@ public:
 ///   (`encode_pairing_record()` / `decode_pairing_record()`, `encode_pairing_psk()` /
 ///   `decode_pairing_psk()`, `encode_pairing_config()` / `decode_pairing_config()`
 ///   respectively).
-/// - `KEYPAIR`, `STATIC_PAIRING_CODE`, and `LAST_PLAYED` hold raw bytes: see each constant's
-///   comment.
+/// - `RECORD_ORDER`, `KEYPAIR`, `STATIC_PAIRING_CODE`, and `LAST_PLAYED` hold raw bytes: see
+///   each constant's comment.
 /// - `OUTPUT_DELAY` holds an ASCII decimal string rather than raw uint16_t bytes, for
 ///   debuggability and to avoid an endianness dependency; decode it with a bounds check and
 ///   treat an invalid value as absent.

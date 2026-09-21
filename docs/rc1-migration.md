@@ -36,6 +36,12 @@ item against the current code before acting on it; line numbers drift as phases 
   recency order in `persistence_keys::RECORD_ORDER`, so a change writes only the slot it touched
   and eviction is correct across a reboot. BREAK: the old single `records` key is not read or
   migrated, so a device that paired before this change comes up unpaired and has to pair again.
+  Because that key still holds long-term PSKs for every server the device was paired to, the
+  store overwrites it once with an empty blob on the first boot that finds it non-empty, through
+  the same deferred flush every other record write goes through. It is a one-time cleanup for
+  devices upgrading across this break and can be deleted (`LEGACY_RECORDS_KEY` and
+  `note_legacy_records_key()` in `src/record_store.cpp`) once the first release carrying it has
+  shipped.
 - Operator cancellation of a pairing window arrives through a new
   `SendspinClient::cancel_pairing_window()`, the counterpart to the existing
   `confirm_pairing_window()`. It is a runtime action, not pairing configuration, so it does not
