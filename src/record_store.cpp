@@ -22,6 +22,7 @@
 #include "sendspin/persistence_codec.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstring>
 #include <string>
@@ -33,6 +34,11 @@ static const char* const TAG = "sendspin.record_store";
 namespace sendspin {
 
 namespace {
+
+/// @brief The key long-term records shared before they moved to one slot per key. It is not part
+/// of persistence_keys: nothing reads it, and the store's only interest in it is emptying it
+/// once (see load_records_from_provider()).
+constexpr const char* LEGACY_RECORDS_KEY = "records";
 
 /// @brief Shared load -> string_view -> decode -> warn-on-failure -> secure_zero(blob) shape used
 /// by the record-slot and PAIRING_PSK loaders below. STATIC_PAIRING_CODE (no decoder, no PSK
@@ -96,12 +102,42 @@ void RecordStore::load_records_from_provider() {
         const std::string key = persistence_keys::record_slot_key(slot);
         auto decoded = load_decode_wipe<SendspinPairingRecord>(
             *this->provider_, key.c_str(), decode_pairing_record, "ignoring that record");
-        if (decoded.has_value()) {
-            this->records_.push_back(
-                StoredRecord{std::move(decoded.value()), static_cast<uint8_t>(slot)});
+        if (!decoded.has_value()) {
+            continue;
         }
+        // Two slots carrying the same psk_id would leave a revoked credential resolving: a
+        // removal erases the first match from records_ and empties only that slot, so the
+        // duplicate survives both the boot and the flush. Lowering max_pairing_records and
+        // raising it again can produce one, so the lower slot wins and the later one is cleared.
+        if (this->record_by_psk_id(decoded->psk_id) != nullptr) {
+            SS_LOGW(TAG, "Clearing \"%s\": psk_id %s is already stored in a lower slot",
+                    key.c_str(), decoded->psk_id.c_str());
+            // Owed an empty write, or the duplicate would come back at every boot and outlive a
+            // revocation of the record it shadows. Constructor: no other thread holds the store.
+            this->mark_slot_dirty_locked(static_cast<uint8_t>(slot));
+            continue;
+        }
+        this->records_.push_back(
+            StoredRecord{std::move(decoded.value()), static_cast<uint8_t>(slot)});
     }
     this->load_record_order_from_provider();
+    this->note_legacy_records_key();
+}
+
+void RecordStore::note_legacy_records_key() {
+    // The pre-slot key holds base64url long-term PSKs for every server paired before the move to
+    // per-slot keys. Nothing reads it any more and nothing else would ever overwrite it, so the
+    // store empties it once: an empty blob rather than erase_blob(), which belongs to the
+    // application and which this store's own free-slot marker does not use either. The write is
+    // owed to the next persist_records() like any other, so it lands on the main loop.
+    auto blob = this->provider_->load_blob(LEGACY_RECORDS_KEY);
+    if (!blob.has_value() || blob->empty()) {
+        return;
+    }
+    secure_zero(blob->data(), blob->size());
+    SS_LOGW(TAG, "Clearing the pre-slot \"%s\" blob; the records it holds are not migrated",
+            LEGACY_RECORDS_KEY);
+    this->legacy_records_dirty_ = true;
 }
 
 void RecordStore::load_record_order_from_provider() {
@@ -441,12 +477,14 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
 
     // Retire any other record still bound to this server_id (see the header).
     const std::string superseded_server_id = this->records_[idx].record.server_id;
+    uint8_t retired_slot = UNASSIGNED_SLOT;
     for (size_t i = 0; i < this->records_.size();) {
         if (i != idx && this->records_[i].record.server_id == superseded_server_id) {
             SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
                     this->records_[i].record.psk_id.c_str(), superseded_server_id.c_str());
             this->mark_slot_dirty_locked(this->records_[i].slot);
             this->order_dirty_ = true;
+            retired_slot = this->records_[i].slot;
             this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(i));
             if (i < idx) {
                 --idx;
@@ -457,14 +495,22 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
     }
 
     if (this->records_[idx].slot == UNASSIGNED_SLOT) {
-        this->records_[idx].slot = this->first_free_slot_locked();
+        // A supersede takes the slot its own retire just freed, so re-pairing a server costs one
+        // record-sized write rather than a write of the new record plus an empty write of the old
+        // slot. Anything else takes the lowest free slot, which at capacity is the one the
+        // eviction above freed.
+        this->records_[idx].slot =
+            (retired_slot != UNASSIGNED_SLOT) ? retired_slot : this->first_free_slot_locked();
     }
+    // The capacity check, the eviction and the retire above between them guarantee a free slot
+    // below the cap; writing UNASSIGNED_SLOT would name a key the load path never reads.
+    assert(this->records_[idx].slot < this->max_records_ && "record assigned no usable slot");
     this->mark_slot_dirty_locked(this->records_[idx].slot);
 
     return true;
 }
 
-bool RecordStore::persist_records(bool report_rejection) {
+bool RecordStore::persist_records() {
     std::vector<SlotWrite> writes;
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -476,18 +522,30 @@ bool RecordStore::persist_records(bool report_rejection) {
             continue;
         }
         all_accepted = false;
-        // Nothing is retried, and RAM stays authoritative for this boot. A batch carrying only
-        // the advisory `used` flag and the recency order asks for silence instead (see
-        // report_rejection).
-        if (report_rejection) {
-            SS_LOGW(TAG,
-                    "Provider rejected the \"%s\" write; that change is RAM-only for this boot: "
-                    "a record stored since the last accepted write will not survive a reboot, and "
-                    "a record dropped since it will be valid again after one",
+        // Nothing is retried, and RAM stays authoritative for this boot. What a rejection costs
+        // depends on the key, so the message does too: only a record slot decides what the next
+        // boot holds. The recency order and the pre-slot cleanup are bookkeeping the next boot
+        // rebuilds or reattempts, and a rejected order write happens on the first activate of
+        // every long-term session against a full or read-only store, so it stays quiet.
+        if (write.key == persistence_keys::RECORD_ORDER || write.key == LEGACY_RECORDS_KEY) {
+            SS_LOGD(TAG,
+                    "Provider rejected the \"%s\" write; the next boot rebuilds or reattempts it, "
+                    "and no record is at stake",
                     write.key.c_str());
+            continue;
         }
+        SS_LOGW(TAG,
+                "Provider rejected the \"%s\" write; that change is RAM-only for this boot: "
+                "a record stored since the last accepted write will not survive a reboot, and "
+                "a record dropped since it will be valid again after one",
+                write.key.c_str());
     }
     return all_accepted;
+}
+
+bool RecordStore::has_pending_writes() const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->order_dirty_ || this->legacy_records_dirty_ || !this->dirty_slots_.empty();
 }
 
 bool RecordStore::note_record_removed(const std::string& psk_id) {
@@ -510,6 +568,7 @@ bool RecordStore::note_record_used(const std::string& psk_id) {
     }
 
     // Keeps records_ least-recently-used first for eviction (see evict_one_locked).
+    bool changed = false;
     const size_t last = this->records_.size() - 1;
     if (idx != last) {
         std::rotate(this->records_.begin() + static_cast<ptrdiff_t>(idx),
@@ -519,13 +578,17 @@ bool RecordStore::note_record_used(const std::string& psk_id) {
         // than a rewrite of the records themselves. A re-activate of the record that is already
         // most recent moves nothing and writes nothing.
         this->order_dirty_ = true;
+        changed = true;
     }
 
     if (!this->records_.back().record.used) {
         this->records_.back().record.used = true;
         this->mark_slot_dirty_locked(this->records_.back().slot);
+        changed = true;
     }
-    return this->order_dirty_ || !this->dirty_slots_.empty();
+    // What THIS call made dirty, not whatever else is owed: a caller that flushes only when this
+    // returns true must not be the one to carry away another path's pending write.
+    return changed;
 }
 
 // ============================================================================
@@ -594,6 +657,7 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
     if (this->provider_ == nullptr) {
         this->dirty_slots_.clear();
         this->order_dirty_ = false;
+        this->legacy_records_dirty_ = false;
         return writes;
     }
     writes.reserve(this->dirty_slots_.size() + 1);
@@ -619,6 +683,13 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
         }
         writes.push_back(std::move(order));
         this->order_dirty_ = false;
+    }
+
+    if (this->legacy_records_dirty_) {
+        SlotWrite legacy;
+        legacy.key = LEGACY_RECORDS_KEY;  // Empty blob: see note_legacy_records_key().
+        writes.push_back(std::move(legacy));
+        this->legacy_records_dirty_ = false;
     }
     return writes;
 }

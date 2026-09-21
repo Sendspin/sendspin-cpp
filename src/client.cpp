@@ -155,7 +155,8 @@ struct SendspinClient::EventState {
     InboxSlot<GroupUpdateObject> group_slot{inbox, INBOX_TOPIC_GROUP};
     /// Pure wakeup (the bool payload carries no information): set by the network-thread
     /// server/pair-finalize handler after RecordStore::store_record_superseding() mutates the
-    /// store RAM-only, drained by loop() into RecordStore::persist_records(). Exists because the
+    /// store RAM-only (and by start(), for a store that came up owing a write), drained by loop()
+    /// into RecordStore::persist_records(). Exists because the
     /// persistence provider is main-loop-only, so the durable write cannot happen where the RAM
     /// commit must (see that handler). Deliberately its own slot rather than a deferred
     /// connection event: cleanup_connection_state() wipes those, and a staged write must not be
@@ -303,6 +304,13 @@ bool SendspinClient::start() {
             return false;
         }
         this->identity_provider_ = this->persistence_provider_;
+    }
+
+    // A store that came up owing a write (the one-time clearing of the pre-slot records key)
+    // flushes on the first tick, through the same deferred path a pairing uses: the provider is
+    // main-loop-only and the store never calls it itself outside that flush.
+    if (this->record_store_->has_pending_writes()) {
+        this->event_state_->records_dirty_slot.write(true);
     }
 
     // Load persisted state

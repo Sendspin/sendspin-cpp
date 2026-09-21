@@ -130,7 +130,8 @@ void reject_record_saves(TProvider& provider,
 }
 
 /// How many writes a store has taken for any record key: the slots plus the recency order.
-/// TProvider is any fake with save_attempts(key).
+/// TProvider is any fake with save_attempts(key). Pass the store's cap when it is not the
+/// default, or the slots above the default go uncounted.
 template <typename TProvider>
 size_t record_writes(const TProvider& provider,
                      size_t max_records = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS) {
@@ -144,7 +145,8 @@ size_t record_writes(const TProvider& provider,
 
 /// The records `provider` holds, least recently used first: what the next boot loads. Reads the
 /// stored slots and the record-order blob the way the store's load path does, so a test can state
-/// what survives a reboot without building a second RecordStore over the same provider.
+/// what survives a reboot without building a second RecordStore over the same provider. Pass the
+/// store's cap when it is not the default, or the slots above the default go unread.
 inline std::vector<SendspinPairingRecord> persisted_records(
     SendspinPersistenceProvider& provider,
     size_t max_records = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS) {
@@ -182,9 +184,11 @@ inline std::vector<std::string> persisted_psk_ids(
     return ids;
 }
 
-/// Whether the record the next boot loads for psk_id carries the durable used flag.
-inline bool persisted_used(SendspinPersistenceProvider& provider, const std::string& psk_id) {
-    for (const auto& record : persisted_records(provider)) {
+/// Whether the record the next boot loads for psk_id carries the durable used flag. Pass the
+/// store's cap when it is not the default, or the slots above the default go unread.
+inline bool persisted_used(SendspinPersistenceProvider& provider, const std::string& psk_id,
+                           size_t max_records = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS) {
+    for (const auto& record : persisted_records(provider, max_records)) {
         if (record.psk_id == psk_id) {
             return record.used;
         }

@@ -190,13 +190,17 @@ public:
     /// Several mutations between two calls coalesce: a slot is written once, carrying whatever
     /// it holds at this call. A rejected write is not retried, so the slot leaves the dirty set
     /// either way and RAM stays authoritative for the boot.
-    /// @param report_rejection Whether a rejected write is worth a warning. False for a batch
-    ///        that only carries the advisory `used` flag and the recency order, which are
-    ///        rebuilt from use and whose rejection would otherwise be reported on the first
-    ///        activate of every long-term session on a device whose store is full or read-only.
+    ///
+    /// A rejection is reported per key rather than per batch: only a record slot decides what
+    /// the next boot holds, so only that warns. The recency order is rebuilt from use.
     /// @return true when every owed write was accepted (or when there is nothing to write, or no
     ///         provider); false when any write was rejected.
-    bool persist_records(bool report_rejection = true);
+    bool persist_records();
+
+    /// @brief Whether any write is owed to the next persist_records(). The caller uses it to
+    /// stage that flush for a store that came up owing one (the pre-slot records key).
+    /// @return true when a slot, the record order, or the pre-slot key needs writing.
+    [[nodiscard]] bool has_pending_writes() const;
 
     /// @brief Erase the long-term record identified by psk_id from RAM, leaving the durable half
     /// (emptying its slot and rewriting the order) to a later persist_records(). No-op if absent.
@@ -326,6 +330,10 @@ private:
     /// @brief Reorder the just-loaded records_ by the provider's RECORD_ORDER blob, if present.
     void load_record_order_from_provider();
 
+    /// @brief Owe an empty write for the pre-slot records key when the provider still holds one,
+    /// so the long-term PSKs in it do not sit in storage unreferenced. One-time per device.
+    void note_legacy_records_key();
+
     /// @brief Load pairing_psk_ from the provider's PAIRING_PSK blob, if present, correcting its
     /// psk_id if it disagrees with the loaded secret.
     void load_pairing_psk_from_provider();
@@ -357,7 +365,8 @@ private:
     [[nodiscard]] const StoredRecord* record_in_slot(uint8_t slot) const;
 
     /// @brief The lowest slot number no record occupies, or UNASSIGNED_SLOT when the store is
-    /// full. Call with mutex_ held, after a capacity check.
+    /// full. Call with mutex_ held, after a capacity check; the caller asserts the result is a
+    /// usable slot, since UNASSIGNED_SLOT would name a key the load path never reads.
     [[nodiscard]] uint8_t first_free_slot_locked() const;
 
     /// @brief Note that a slot's blob no longer matches records_, so the next persist_records()
@@ -429,6 +438,9 @@ private:
     // 8-bit fields
     /// Whether the record-order blob no longer matches records_'s order.
     bool order_dirty_{false};
+    /// Whether the pre-slot records key still needs its one empty write; see
+    /// note_legacy_records_key().
+    bool legacy_records_dirty_{false};
     bool dynamic_pairing_code_enabled_{true};
     bool pairing_psk_enabled_{true};
     bool static_pairing_code_enabled_{false};

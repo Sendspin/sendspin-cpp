@@ -1637,8 +1637,6 @@ void ConnectionManager::flush_pending_record_ops() {
     // ops touched is written once, carrying its final state. The last-played value is a different
     // key and keeps its own write.
     bool records_dirty = false;
-    // A pairing or a revocation, as opposed to the advisory `used` flag.
-    bool durable_change = false;
     for (const auto& op : ops) {
         switch (op.kind) {
             case PendingRecordOp::Kind::MARK_USED:
@@ -1646,7 +1644,6 @@ void ConnectionManager::flush_pending_record_ops() {
                 break;
             case PendingRecordOp::Kind::PERSIST_RECORDS:
                 records_dirty = true;
-                durable_change = true;
                 break;
             case PendingRecordOp::Kind::LAST_PLAYED:
                 this->client_->write_last_played_server(op.value);
@@ -1654,10 +1651,9 @@ void ConnectionManager::flush_pending_record_ops() {
         }
     }
     if (records_dirty) {
-        // A batch that carries only the `used` flag and the recency order stays silent on a
-        // rejected write: both are advisory bookkeeping, rebuilt from use, and this runs on the
-        // first activate of every long-term session.
-        this->client_->record_store_->persist_records(durable_change);
+        // Whatever else is owed goes out with it: persist_records() decides per key whether a
+        // rejection is worth a warning, so carrying a pairing's slot write here loses nothing.
+        this->client_->record_store_->persist_records();
     }
 }
 

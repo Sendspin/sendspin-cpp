@@ -24,9 +24,10 @@
 // save_blob / erase_blob); RecordStore and FilePersistenceProvider are pure byte stores for the
 // record slot / "pairing_psk" / "pair_config" keys, so tests that need to inspect or shape what
 // is actually stored go through the codec in sendspin/persistence_codec.h and the slot helpers
-// in record_test_helpers.h, exactly like production code does. Most fakes here share tests/fake_persistence.h's InMemoryPersistenceProvider;
-// a handful of tests need bespoke behavior (observing removals specifically, serving
-// mismatched/canned codec content) and keep a local fake for that.
+// in record_test_helpers.h, exactly like production code does. Most fakes here share
+// tests/fake_persistence.h's InMemoryPersistenceProvider; a handful of tests need bespoke
+// behavior (observing removals specifically, serving mismatched/canned codec content) and keep a
+// local fake for that.
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
@@ -84,15 +85,15 @@ static SendspinPairingPsk make_pairing_psk(const std::optional<std::string>& lab
 }
 
 /// The production mark-used sequence: ConnectionManager::flush_pending_record_ops() calls
-/// note_record_used() and persists the array only when the durable flag flipped.
+/// note_record_used() and flushes only when that call changed something durable.
 static void touch_record(RecordStore& store, const std::string& psk_id) {
     if (store.note_record_used(psk_id)) {
-        (void) store.persist_records(/*report_rejection=*/false);
+        (void) store.persist_records();
     }
 }
 
 /// The production revocation sequence: ConnectionManager::handle_server_unpair() erases under
-/// its own lock and the flush persists the array.
+/// its own lock and the flush empties the slot.
 static bool remove_record(RecordStore& store, const std::string& psk_id) {
     if (!store.note_record_removed(psk_id)) {
         return false;
@@ -260,14 +261,16 @@ TEST(RecordStore, BootsFromBlobStoreSeededViaCodec) {
 // starts.
 TEST(RecordStore, ACorruptSlotLosesOnlyThatRecord) {
     InMemoryPersistenceProvider provider;
+    SendspinPairingRecord corrupted = make_client_record("server-corrupt");
     SendspinPairingRecord survivor = make_client_record("server-survivor");
-    seed_records(provider, {make_client_record("server-corrupt"), survivor});
+    seed_records(provider, {corrupted, survivor});
     provider.seed_blob(persistence_keys::record_slot_key(0),
                        blob_bytes("not valid json at all {{{"));
 
     RecordStore store(&provider);
 
-    EXPECT_EQ(store.records_.size(), 1u) << "only the corrupt slot may be dropped";
+    EXPECT_FALSE(store.resolve_by_psk_id(corrupted.psk_id, PskCategory::LONG_TERM).has_value())
+        << "the corrupt slot's record must not resolve";
     EXPECT_TRUE(store.resolve_by_psk_id(survivor.psk_id, PskCategory::LONG_TERM).has_value())
         << "the intact slot must still load";
     EXPECT_TRUE(store.pairing_psk().has_value()) << "the store must still start";
@@ -486,6 +489,10 @@ TEST(RecordStore, BootRestoresTheRecencyOrderFromTheOrderKey) {
     const Row rows[] = {
         {"stored-order-outranks-slot-order", {4, 0, 1, 2, 3}, 4},
         {"slot-number-naming-no-record-is-ignored", {9, 4, 0, 1, 2, 3}, 4},
+        // A blob that names only some slots: the record it names sorts FIRST (least recently
+        // used), the ones it does not sort after it in slot order. Appending the unnamed
+        // records ahead of the named one instead would make slot 0 the victim.
+        {"order-names-only-some-slots", {3}, 3},
         // Control: with no order key at all the store falls back to slot order, so the first
         // slot is the victim. This is what says the rows above read the blob rather than
         // evicting slot 4 for some other reason.
@@ -570,6 +577,160 @@ TEST(RecordStore, RemovingARecordWritesOnlyItsSlotAndTheOrder) {
     EXPECT_FALSE(stored_record_in_slot(provider, 1).has_value())
         << "the revoked record's slot must be emptied, not left holding it";
     EXPECT_EQ(persisted_psk_ids(provider), std::vector<std::string>{keeper.psk_id});
+}
+
+// A supersede reuses the slot its own retire just freed, which is what makes "a pairing costs
+// one record-sized write" true. Taking the lowest free slot instead would put the new record in
+// a slot an earlier revocation freed and empty the superseded one as well: two record writes,
+// two NVS erase cycles on ESP, per re-pair.
+TEST(RecordStore, ASupersedeReusesTheSlotItsRetireFreed) {
+    InMemoryPersistenceProvider provider;
+    RecordStore store(&provider);
+
+    auto pair_with = [&store](const std::string& server_id) {
+        auto outcome = store.resolve_pairing_outcome(server_id);
+        EXPECT_TRUE(store.store_record_superseding(outcome.record, {}));
+        EXPECT_TRUE(store.persist_records());
+        return outcome.record.psk_id;
+    };
+
+    const std::string psk_a = pair_with("server-a");  // slot 0
+    const std::string psk_b = pair_with("server-b");  // slot 1
+    ASSERT_TRUE(remove_record(store, psk_a));         // slot 0 is free again, and lower than 1
+
+    const int slot0_before = provider.save_attempts(persistence_keys::record_slot_key(0));
+    const int slot1_before = provider.save_attempts(persistence_keys::record_slot_key(1));
+    const std::string psk_b2 = pair_with("server-b");
+
+    EXPECT_EQ(provider.save_attempts(persistence_keys::record_slot_key(1)) - slot1_before, 1)
+        << "the superseding record must be written into the slot its own retire freed";
+    EXPECT_EQ(provider.save_attempts(persistence_keys::record_slot_key(0)) - slot0_before, 0)
+        << "a supersede must not take a slot an earlier revocation freed";
+    ASSERT_TRUE(stored_record_in_slot(provider, 1).has_value());
+    EXPECT_EQ(stored_record_in_slot(provider, 1)->psk_id, psk_b2);
+    EXPECT_FALSE(stored_record_in_slot(provider, 0).has_value());
+
+    // Control: a pairing that supersedes nothing still takes the lowest free slot.
+    const std::string psk_c = pair_with("server-c");
+    ASSERT_TRUE(stored_record_in_slot(provider, 0).has_value());
+    EXPECT_EQ(stored_record_in_slot(provider, 0)->psk_id, psk_c);
+    EXPECT_FALSE(store.resolve_by_psk_id(psk_b, PskCategory::LONG_TERM).has_value())
+        << "the superseded PSK must stop resolving";
+}
+
+// note_record_used() reports what THIS call made dirty, not everything the store owes. A caller
+// that flushes only on true (ConnectionManager::flush_pending_record_ops()) would otherwise
+// carry away a pairing's or a revocation's pending slot write on a tick where nothing about the
+// activate changed.
+TEST(RecordStore, AMarkUsedThatChangesNothingReportsNoChangeWhileAWriteIsPending) {
+    InMemoryPersistenceProvider provider;
+    SendspinPairingRecord revoked = make_client_record("server-revoked");
+    SendspinPairingRecord other = make_client_record("server-other");
+    SendspinPairingRecord active = make_client_record("server-active");
+    seed_records(provider, {revoked, other, active});
+    RecordStore store(&provider);
+
+    touch_record(store, active.psk_id);  // already last: flips its used flag and flushes it
+    ASSERT_TRUE(store.note_record_removed(revoked.psk_id));  // durable, not yet flushed
+
+    EXPECT_FALSE(store.note_record_used(active.psk_id))
+        << "an activate that moves nothing and flips nothing must not report the pending "
+           "revocation as its own change";
+
+    // Control: an activate that does change something reports it, pending write or not.
+    EXPECT_TRUE(store.note_record_used(other.psk_id))
+        << "an activate that reorders recency owes a write";
+}
+
+// The durability warning is decided per key. Only a record slot decides what the next boot
+// holds, so only it warns; the recency order is rebuilt from use and would otherwise warn on the
+// first activate of every long-term session against a full or read-only store.
+TEST(RecordStore, OnlyARejectedRecordSlotWarnsAboutWhatTheNextBootLoses) {
+    InMemoryPersistenceProvider provider;
+    SendspinPairingRecord older = make_client_record("server-older");
+    SendspinPairingRecord newer = make_client_record("server-newer");
+    seed_records(provider, {older, newer});
+    RecordStore store(&provider);
+    reject_record_saves(provider);
+
+    std::string order_only_output;
+    {
+        // A record already carrying its used flag reorders and nothing else, so this flush owes
+        // the order key alone.
+        StderrCapture capture;
+        ASSERT_TRUE(store.note_record_used(newer.psk_id));
+        EXPECT_FALSE(store.persist_records());
+        ASSERT_TRUE(store.note_record_used(older.psk_id));
+        EXPECT_FALSE(store.persist_records());
+        order_only_output = capture.release();
+    }
+    EXPECT_EQ(order_only_output.find(persistence_keys::RECORD_ORDER), std::string::npos)
+        << "a rejected recency-order write must not warn: " << order_only_output;
+
+    // Control: a revocation's rejected slot write says what the next boot will get wrong, even
+    // though the same batch also carries the order key.
+    std::string slot_output;
+    {
+        StderrCapture capture;
+        EXPECT_FALSE(remove_record(store, older.psk_id));
+        slot_output = capture.release();
+    }
+    EXPECT_NE(slot_output.find(persistence_keys::record_slot_key(0)), std::string::npos)
+        << "a rejected record-slot write must warn: " << slot_output;
+    EXPECT_NE(slot_output.find("valid again"), std::string::npos)
+        << "the warning must name what a rejected removal costs: " << slot_output;
+}
+
+// Two slots carrying the same psk_id would leave a revoked credential working: a removal erases
+// one entry from RAM and empties one slot, so the duplicate resolves again at the next boot.
+// Lowering max_pairing_records and raising it back can produce that layout with no provider
+// corruption at all, so the load path drops the higher slot and clears it.
+TEST(RecordStore, ADuplicatePskIdInASecondSlotDoesNotOutliveARevocation) {
+    InMemoryPersistenceProvider provider;
+    SendspinPairingRecord keeper = make_client_record("server-keeper");
+    SendspinPairingRecord duplicated = make_client_record("server-duplicated");
+    seed_records(provider, {keeper, duplicated});
+    provider.seed_blob(persistence_keys::record_slot_key(2),
+                       blob_bytes(encode_pairing_record(duplicated)));
+
+    {
+        RecordStore store(&provider);
+        ASSERT_TRUE(
+            store.resolve_by_psk_id(duplicated.psk_id, PskCategory::LONG_TERM).has_value());
+        ASSERT_TRUE(remove_record(store, duplicated.psk_id));
+    }
+
+    RecordStore rebooted(&provider);
+    EXPECT_FALSE(rebooted.resolve_by_psk_id(duplicated.psk_id, PskCategory::LONG_TERM).has_value())
+        << "a revoked psk_id must not come back from a duplicate slot";
+    // Control: the record that was never duplicated is untouched by the dedupe.
+    EXPECT_TRUE(rebooted.resolve_by_psk_id(keeper.psk_id, PskCategory::LONG_TERM).has_value());
+}
+
+// A device upgrading from the single pre-slot records key still holds long-term PSKs under it.
+// Nothing reads that key any more, so the store empties it once, through the same deferred
+// flush every other write goes through, and then leaves it alone.
+TEST(RecordStore, TheLegacyRecordsKeyIsEmptiedOnceAndNotTouchedAgain) {
+    InMemoryPersistenceProvider provider;
+    const std::string legacy_key = "records";
+    provider.seed_blob(legacy_key, blob_bytes(R"([{"v":1,"psk_id":"old","psk":"old"}])"));
+
+    {
+        RecordStore store(&provider);
+        EXPECT_TRUE(store.has_pending_writes()) << "the cleanup must be owed to the next flush";
+        EXPECT_TRUE(store.persist_records());
+        ASSERT_TRUE(provider.blob(legacy_key).has_value());
+        EXPECT_TRUE(provider.blob(legacy_key)->empty())
+            << "the pre-slot blob must stop holding PSK material";
+    }
+
+    // Control: a later boot finds it already empty and owes nothing.
+    const int writes_before = provider.save_attempts(legacy_key);
+    RecordStore rebooted(&provider);
+    EXPECT_FALSE(rebooted.has_pending_writes())
+        << "an already-cleared key must not be rewritten at every boot";
+    EXPECT_TRUE(rebooted.persist_records());
+    EXPECT_EQ(provider.save_attempts(legacy_key), writes_before);
 }
 
 // The mark-used path writes exactly what changed: the first flip of the durable `used` flag
@@ -727,18 +888,32 @@ TEST(RecordStore, ConfiguredCapacityIsHonouredAboveTheProtocolFloor) {
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, row.configured);
+        // A real provider so the ceiling row also exercises the persistence edge it defines:
+        // slot 254 and an order blob of 255 bytes.
+        InMemoryPersistenceProvider provider;
+        RecordStore store(&provider, /*initial_unpaired_access_enabled=*/false, row.configured);
 
+        std::vector<std::string> psk_ids;
         for (size_t i = 0; i < row.effective; ++i) {
             auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+            psk_ids.push_back(outcome.record.psk_id);
             ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
         }
-        EXPECT_EQ(store.records_.size(), row.effective)
+        ASSERT_TRUE(store.persist_records());
+        EXPECT_TRUE(store.resolve_by_psk_id(psk_ids.front(), PskCategory::LONG_TERM).has_value())
             << "nothing may be evicted before the effective cap is reached";
+        EXPECT_EQ(persisted_psk_ids(provider, row.effective).size(), row.effective)
+            << "every slot up to the cap must persist, including the highest one";
 
         auto overflow = store.resolve_pairing_outcome("server-overflow");
         ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
-        EXPECT_EQ(store.records_.size(), row.effective) << "the effective cap still bounds the store";
+        ASSERT_TRUE(store.persist_records());
+        EXPECT_FALSE(store.resolve_by_psk_id(psk_ids.front(), PskCategory::LONG_TERM).has_value())
+            << "the effective cap still bounds the store, so the oldest record goes";
+        EXPECT_TRUE(store.resolve_by_psk_id(psk_ids[1], PskCategory::LONG_TERM).has_value())
+            << "exactly one record may be evicted";
+        EXPECT_EQ(persisted_psk_ids(provider, row.effective).size(), row.effective)
+            << "the evicted record's slot must be reused, not added to";
     }
 }
 
@@ -1289,8 +1464,10 @@ TEST(RecordStore, RecordWithoutServerIdIsSkipped) {
 
     RecordStore store(&provider);
 
-    EXPECT_EQ(store.records_.size(), 1u) << "the unbound record must be skipped, the bound kept";
-    EXPECT_NE(store.record_by_psk_id(bound.psk_id), nullptr);
+    EXPECT_FALSE(store.resolve_by_psk_id("unbound", PskCategory::LONG_TERM).has_value())
+        << "a record with no server_id must not resolve";
+    EXPECT_TRUE(store.resolve_by_psk_id(bound.psk_id, PskCategory::LONG_TERM).has_value())
+        << "the neighbouring slot must still load";
 }
 
 // erase_blob() reports success for an absent key as well as an erased one, so an application
