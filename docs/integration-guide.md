@@ -516,10 +516,11 @@ produces -- it is not something a provider hand-rolls its own version of.
 
 Only the keys a change actually touches are written: a pairing writes one slot (and the order),
 a revocation writes one slot empty (and the order), and a session that reorders recency writes
-only the order. A provider sizing fixed-length storage can size a slot at **184 bytes**, which
-is what a record the library writes encodes to; a `label`, which only a provider seeding its own
-record sets, adds 11 bytes plus the label's length. The order blob is one byte per stored
-record.
+only the order. A provider sizing fixed-length storage can size a slot at **185 bytes**, which
+is what a freshly paired record encodes to -- the first blob every pairing writes, and the larger
+of the two states a record reaches (once its `"used"` flag flips to `true` the blob is one byte
+shorter). A `label`, which only a provider seeding its own record sets, adds 11 bytes plus the
+label's length. The order blob is one byte per stored record.
 
 #### Durability contract
 
@@ -531,7 +532,10 @@ record.
   (`on_pairing_succeeded` still fires; the record is gone after a reboot), and a rejected write
   of a removal means the store still holds the old record and will hand it back at the next boot,
   silently making the revoked PSK valid again (the revoked record is always dropped from RAM
-  regardless of the return value).
+  regardless of the return value). A supersede and an eviction both write the new record over the
+  old one's slot, so a rejected write there leaves the OLD record in storage: after a reboot the
+  client is paired to the server it evicted, or holds the pre-supersede PSK for a server that has
+  already discarded it, which then falls back to unpaired (Sentinel) access.
 - `erase_blob()` is for the application's own use; the library never calls it. Every blob the
   library owns is rewritten in place or left alone (a removal writes its slot empty rather than
   erasing the key). The hook is here so an application that wipes the library keyspace itself,

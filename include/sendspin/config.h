@@ -177,7 +177,7 @@ struct SendspinClientConfig {
     bool initial_unpaired_access_enabled{false};
 
     /// @brief Default maximum number of long-term pairing records the store retains. Each record
-    /// occupies its own persistence key of at most 184 bytes plus a label, so the cap sets how
+    /// occupies its own persistence key of at most 185 bytes plus a label, so the cap sets how
     /// many keys the store may use rather than the size of any one of them (see
     /// persistence_codec.h's keyspace doc). Pairing at the cap evicts the least recently used
     /// record rather than failing; replacing a record already held for a given psk_id or

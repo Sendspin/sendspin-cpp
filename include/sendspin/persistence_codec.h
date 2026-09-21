@@ -67,10 +67,12 @@
 /// their eviction order. A slot's blob is one record (`encode_pairing_record()` /
 /// `decode_pairing_record()`), or empty when the slot is free, so a pairing or a revocation
 /// rewrites one slot instead of every record, and a corrupt slot costs one record instead of the
-/// store. A record the library writes encodes to 184 bytes (three 43-character base64url fields
-/// plus fixed framing); a label, which the library never sets itself, adds 11 bytes plus its
-/// JSON-escaped length. Slot numbers keep the keys short: `psk_id` (43 characters) would not fit
-/// an NVS key at all.
+/// store. A record the library writes encodes to 185 bytes (three 43-character base64url fields
+/// plus fixed framing): that is the freshly paired `"used":false` form, which is the first blob
+/// every pairing writes and the larger of the two states a record reaches (the flag flipping to
+/// `true` costs one byte less). A label, which the library never sets itself, adds 11 bytes plus
+/// its JSON-escaped length. Slot numbers keep the keys short: `psk_id` (43 characters) would not
+/// fit an NVS key at all.
 
 #pragma once
 

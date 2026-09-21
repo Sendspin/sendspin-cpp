@@ -178,21 +178,37 @@ TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
 // storage against; persistence_codec.h and the integration guide quote it, and a field added to
 // the storage format moves it.
 TEST(PersistenceCodec, EncodedRecordMatchesTheDocumentedSlotSize) {
-    SendspinPairingRecord r;
-    // The three 43-character base64url fields a real record carries: psk_id and server_id are
-    // 32-byte values encoded the same way as the psk.
-    r.psk = make_psk(0x80);
-    r.psk_id = base64url_encode(r.psk.data(), r.psk.size());
-    r.server_id = base64url_encode(make_psk(0x81).data(), 32);
-    r.used = true;
+    struct Row {
+        const char* name;
+        bool used;
+        size_t expected;
+    };
+    const Row rows[] = {
+        // The documented figure: the freshly paired form, which every pairing writes first.
+        {"freshly-paired-used-false", false, 185u},
+        // Control: the only other state a record reaches. "true" is one byte shorter than
+        // "false", so this row is what the documented figure must NOT be sized against.
+        {"activated-used-true", true, 184u},
+    };
 
-    EXPECT_EQ(encode_pairing_record(r).size(), 184u)
-        << "the documented per-slot size must match what the codec writes";
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SendspinPairingRecord r;
+        // The three 43-character base64url fields a real record carries: psk_id and server_id are
+        // 32-byte values encoded the same way as the psk.
+        r.psk = make_psk(0x80);
+        r.psk_id = base64url_encode(r.psk.data(), r.psk.size());
+        r.server_id = base64url_encode(make_psk(0x81).data(), 32);
+        r.used = row.used;
 
-    // Control: a label costs its own length plus 11 bytes of framing, which is the other half of
-    // the documented figure.
-    r.label = "kitchen";
-    EXPECT_EQ(encode_pairing_record(r).size(), 184u + 11u + r.label->size());
+        EXPECT_EQ(encode_pairing_record(r).size(), row.expected)
+            << "the documented per-slot size must match what the codec writes";
+
+        // A label costs its own length plus 11 bytes of framing, which is the other half of the
+        // documented figure.
+        r.label = "kitchen";
+        EXPECT_EQ(encode_pairing_record(r).size(), row.expected + 11u + r.label->size());
+    }
 }
 
 // ============================================================================
