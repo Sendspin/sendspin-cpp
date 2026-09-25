@@ -979,8 +979,6 @@ TEST(ArtworkTransfer, EveryEndOfTheStreamDropsTheTransferInFlight) {
     };
     const Row rows[] = {
         {"stream/end", [](ArtworkRole::Impl& impl) { impl.handle_stream_end(live_generation(impl)); }},
-        {"stream/clear",
-         [](ArtworkRole::Impl& impl) { impl.handle_stream_clear(live_generation(impl)); }},
         {"a new stream/start",
          [](ArtworkRole::Impl& impl) {
              impl.handle_stream_start(ServerArtworkStreamObject{}, live_generation(impl));
@@ -1084,7 +1082,7 @@ TEST(ArtworkFrameDoneGate, SupersedeKeepsNewestParked) {
 }
 
 // ============================================================================
-// Clear as a delivery: stream/end and stream/clear each owe exactly one ack
+// Clear as a delivery: a stream/end owes exactly one ack
 // ============================================================================
 
 TEST(ArtworkFrameDoneGate, ClearIsADeliveryAndDropsParked) {
@@ -1106,7 +1104,7 @@ TEST(ArtworkFrameDoneGate, ClearIsADeliveryAndDropsParked) {
         listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
         << "a gated image was decoded; decodes: " << listener.decode_count();
 
-    impl->handle_stream_ring_event(ArtworkEventType::STREAM_CLEAR);
+    impl->handle_stream_ring_event(ArtworkEventType::STREAM_END);
     listener.wait_until([&] { return listener.clears.size() >= 1; });
 
     // The clear itself owes an ack; acking it must NOT resurrect the dropped, parked B.

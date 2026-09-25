@@ -1408,38 +1408,29 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
         case SendspinServerToClientMessageType::STREAM_CLEAR: {
             StreamClearMessage clear_msg;
             if (process_stream_clear_message(root, &clear_msg)) {
+                // messaging.md "stream/clear": only player and visualizer streams clear, and an
+                // omitted roles list clears both.
                 bool clear_player = !clear_msg.roles.has_value();
-                bool clear_artwork = !clear_msg.roles.has_value();
                 bool clear_visualizer = !clear_msg.roles.has_value();
 
                 if (clear_msg.roles.has_value()) {
                     for (const auto& role : clear_msg.roles.value()) {
                         if (role == "player") {
                             clear_player = true;
-                        } else if (role == "artwork") {
-                            clear_artwork = true;
                         } else if (role == "visualizer") {
                             clear_visualizer = true;
                         }
                     }
                 }
 
-                SS_LOGD(TAG, "Stream clear - player:%d artwork:%d visualizer:%d", clear_player,
-                        clear_artwork, clear_visualizer);
+                SS_LOGD(TAG, "Stream clear - player:%d visualizer:%d", clear_player,
+                        clear_visualizer);
 
 #ifdef SENDSPIN_ENABLE_PLAYER
                 if (this->player_ && clear_player &&
                     role_accepts_traffic(conn, SendspinRole::PLAYER)) {
                     this->player_->impl_->handle_stream_clear(
                         this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                }
-#endif
-
-#ifdef SENDSPIN_ENABLE_ARTWORK
-                if (this->artwork_ && clear_artwork &&
-                    role_accepts_traffic(conn, SendspinRole::ARTWORK)) {
-                    this->artwork_->impl_->handle_stream_clear(
-                        this->artwork_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 }
 #endif
 

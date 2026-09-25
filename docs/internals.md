@@ -119,7 +119,7 @@ State currently on the Inbox:
 
 | Endpoint | Topic bit | Data | Producer |
 |----------|-----------|------|----------|
-| Event ring | `INBOX_TOPIC_EVENTS` | Lifecycle events (`TimeResponsePayload`, `PLAYER_STREAM` STREAM_START/STREAM_END, `ARTWORK_STREAM` STREAM_END/STREAM_CLEAR, `VISUALIZER_STREAM` STREAM_START/STREAM_END/STREAM_CLEAR, plus `CONTROLLER_CLEARED` / `METADATA_CLEARED` / `COLOR_CLEARED`) via `InboxEvent` | Network thread (`TimeResponsePayload`, `PLAYER_STREAM`, `ARTWORK_STREAM`, `VISUALIZER_STREAM`) / main-loop thread (`*_CLEARED` and the synthetic `cleanup()` stream events) |
+| Event ring | `INBOX_TOPIC_EVENTS` | Lifecycle events (`TimeResponsePayload`, `PLAYER_STREAM` STREAM_START/STREAM_END, `ARTWORK_STREAM` STREAM_END, `VISUALIZER_STREAM` STREAM_START/STREAM_END/STREAM_CLEAR, plus `CONTROLLER_CLEARED` / `METADATA_CLEARED` / `COLOR_CLEARED`) via `InboxEvent` | Network thread (`TimeResponsePayload`, `PLAYER_STREAM`, `ARTWORK_STREAM`, `VISUALIZER_STREAM`) / main-loop thread (`*_CLEARED` and the synthetic `cleanup()` stream events) |
 | `Client::group_slot` | `INBOX_TOPIC_GROUP` | `GroupUpdateObject` (field-by-field delta merge) | Network thread |
 | `Client::records_dirty_slot` | `INBOX_TOPIC_RECORDS` | `bool` (pure wakeup, latest wins) | Network thread (`server/pair-finalize` handler) |
 | `ControllerRole::Impl::slot` | `INBOX_TOPIC_CONTROLLER` | `ServerStateControllerObject` (latest wins) | Network thread |
@@ -202,7 +202,7 @@ for the framing and fragmentation details.
 | `GROUP_UPDATE` | Merges into `Client::group_slot` (`InboxSlot<GroupUpdateObject>`) |
 | `STREAM_START` | Writes to the player's `stream_params_slot`, pushes a `PLAYER_STREAM` (STREAM_START) event onto the inbox ring. Marks the artwork stream active, ends any transfer in flight, and bumps the slot epoch of every channel whose configuration changed (`changed_channel_mask()`), releasing those channels' `DECODE_DELIVERED` ack gates; the notification queue and `display_slot` are left alone, since the epoch stamp is what invalidates stale entries. Writes the config to the visualizer's `config_slot` and pushes a `VISUALIZER_STREAM` (STREAM_START) event onto the inbox ring. |
 | `STREAM_END` | Pushes a `PLAYER_STREAM` (STREAM_END) event onto the inbox ring and signals sync task `COMMAND_STREAM_END`; pushes `ARTWORK_STREAM` (STREAM_END) and `VISUALIZER_STREAM` (STREAM_END) events onto the inbox ring |
-| `STREAM_CLEAR` | Pushes `ARTWORK_STREAM` (STREAM_CLEAR) and `VISUALIZER_STREAM` (STREAM_CLEAR) events onto the inbox ring; for the player, signals sync task `COMMAND_STREAM_CLEAR` and enqueues a `CHUNK_TYPE_STREAM_CLEAR_MARKER` chunk into the encoded ring buffer (no player listener callback - a seek is not a stream lifecycle event) |
+| `STREAM_CLEAR` | Pushes a `VISUALIZER_STREAM` (STREAM_CLEAR) event onto the inbox ring; for the player, signals sync task `COMMAND_STREAM_CLEAR` and enqueues a `CHUNK_TYPE_STREAM_CLEAR_MARKER` chunk into the encoded ring buffer (no player listener callback - a seek is not a stream lifecycle event) |
 
 #### JSON parse arena (`src/platform/json_arena.h`)
 

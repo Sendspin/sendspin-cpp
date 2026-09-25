@@ -633,20 +633,9 @@ void ArtworkRole::Impl::handle_stream_end(uint32_t generation) {
     this->enqueue_stream_event(ArtworkEventType::STREAM_END, generation);
 }
 
-void ArtworkRole::Impl::handle_stream_clear(uint32_t generation) {
-    // No accepts(generation) gate, unlike the player's and visualizer's clear: both effects below
-    // are a subset of cleanup()'s, so a clear that lands after a teardown changes nothing. The
-    // queued event still carries the generation and the drain discards it.
-    this->stream_active = false;
-    this->discard_all_pending();
-
-    this->enqueue_stream_event(ArtworkEventType::STREAM_CLEAR, generation);
-}
-
 void ArtworkRole::Impl::enqueue_stream_event(ArtworkEventType event, uint32_t generation) const {
     push_event_or_log(this->inbox, InboxEventType::ARTWORK_STREAM, static_cast<uint8_t>(event), TAG,
-                      event == ArtworkEventType::STREAM_END ? "STREAM_END" : "STREAM_CLEAR",
-                      generation);
+                      "STREAM_END", generation);
 }
 
 // ============================================================================
@@ -660,7 +649,6 @@ void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
     // ordered ahead of display delivery for the tick.
     switch (event) {
         case ArtworkEventType::STREAM_END:
-        case ArtworkEventType::STREAM_CLEAR:
             this->held_display_mask = 0;
             this->held_display_clear = 0;
             this->event_state->display_slot.reset();
@@ -698,7 +686,7 @@ void ArtworkRole::Impl::drain_events() {
     // Fold any newly published display update into the main-thread holds. Latest-wins per
     // artwork slot, same as the old per-slot ShadowSlot overwrite: a bit set in valid_mask means
     // timestamps[i] is a fresher pending display than whatever (if anything) slot i already
-    // held. Any STREAM_END/STREAM_CLEAR for this tick has already run via
+    // held. Any STREAM_END for this tick has already run via
     // handle_stream_ring_event() before this call (see the comment there), so a lifecycle event
     // arriving this tick has already cleared held_display_mask before we get here.
     ArtworkDisplayUpdate update{};
@@ -808,7 +796,7 @@ void ArtworkRole::Impl::cleanup() {
     this->stream_active = false;
     this->discard_all_pending();
 
-    // Stale ring-borne events (an in-flight STREAM_END/STREAM_CLEAR queued before this teardown)
+    // Stale ring-borne events (an in-flight STREAM_END queued before this teardown)
     // need no per-event ring reset either way: on the connection-loss path
     // SendspinClient::cleanup_connection_state()'s inbox.reset_events() has already wiped them,
     // and on the deactivation path, which leaves the ring alone for the roles that stay active,

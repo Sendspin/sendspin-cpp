@@ -42,7 +42,6 @@ struct ClientStateMessage;
 /// @brief Deferred artwork event types
 enum class ArtworkEventType : uint8_t {
     STREAM_END,
-    STREAM_CLEAR,
 };
 
 /// @brief Maximum number of artwork slots (2-bit slot field in protocol binary type byte)
@@ -189,7 +188,6 @@ struct ArtworkRole::Impl {
     // accepts().
     void handle_stream_start(const ServerArtworkStreamObject& stream, uint32_t generation);
     void handle_stream_end(uint32_t generation);
-    void handle_stream_clear(uint32_t generation);
     void handle_stream_ring_event(ArtworkEventType event);
     // True if this tick has drainable artwork work. The display-slot bit covers newly decoded
     // images; a nonzero held_display_mask means displays folded in on a prior tick are still
