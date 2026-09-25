@@ -1416,6 +1416,29 @@ TEST_F(PairingStateMachineTest, DynamicCodeAttemptTimeout) {
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::CLEAR_CODE));
 }
 
+// pairing.md "Entering and leaving pairing": the attempt timeout bounds the Pairing PSK Flow too,
+// where the client waits on server/pair-finalize after sending its own.
+TEST_F(PairingStateMachineTest, PairingPskAttemptTimeout) {
+    FakeConnection* conn =
+        this->inject_current_connection("server-psk-timeout", SendspinPairMethod::PAIRING_PSK);
+    this->enter_pairing(conn);
+    this->client_->loop();
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
+
+    const int64_t deadline = conn->pairing_session().attempt_deadline_us;
+    EXPECT_GT(deadline, platform_time_us()) << "pair-init must arm the attempt deadline";
+    this->client_->loop();
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
+
+    conn->pairing_session().attempt_deadline_us = platform_time_us() - 1;
+    this->client_->loop();
+
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "attempt_timeout");
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+    EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::ATTEMPT_TIMEOUT);
+    EXPECT_FALSE(conn->is_pairing_in_progress());
+}
+
 // ============================================================================
 // Sequence violations
 // ============================================================================

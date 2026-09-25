@@ -514,7 +514,8 @@ public:
         /// The pairing code as CPace consumes it (PRS, pairing.md "PAKE"): the six or eight ASCII
         /// digits, or the 24 raw bytes of the qr_code emission format.
         std::vector<uint8_t> prs;
-        int64_t attempt_deadline_us{0};  ///< platform_time_us() deadline for the whole attempt.
+        /// platform_time_us() deadline for the whole attempt; the Pairing PSK Flow arms it too.
+        int64_t attempt_deadline_us{0};
         /// pairing_index captured when this attempt entered pairing (see
         /// SendspinConnection::bump_pairing_index()). Sent on client/pair-init and reused
         /// verbatim for the CPace sid, so both stay consistent even if the connection's running

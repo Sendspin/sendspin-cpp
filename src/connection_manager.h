@@ -544,7 +544,7 @@ private:
     /// nursery_size_ hint says there is something to scan.
     void scan_hello_and_nursery();
 
-    /// @brief Aborts a pairing-code exchange on the current connection that has stalled past
+    /// @brief Aborts a pairing attempt on the current connection that has stalled past
     /// PAIRING_ATTEMPT_TIMEOUT_US. Suppressed once the pairing is finalized: the session is
     /// only reset at the post-rekey activate, and the deadline elapsing inside that window
     /// must not abort a completed pairing. Also held while the connection awaits a

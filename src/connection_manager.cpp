@@ -1117,9 +1117,9 @@ void ConnectionManager::scan_hello_and_nursery() {
 }
 
 void ConnectionManager::scan_pairing_attempt_timeout() {
-    // Abort a pairing-code exchange that has stalled past PAIRING_ATTEMPT_TIMEOUT_US (pairing.md
+    // Abort a pairing attempt that has stalled past PAIRING_ATTEMPT_TIMEOUT_US (pairing.md
     // "Entering and leaving pairing"). local_abort_pairing also withdraws the emitted code.
-    // Only the current connection can host a pairing-code session (see the pairing branch in
+    // Only the current connection can host a pairing attempt (see the pairing branch in
     // promote_or_arbitrate_nursery_entry()).
     std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
     if (this->current_connection_ != nullptr) {
@@ -1143,9 +1143,8 @@ void ConnectionManager::scan_pairing_attempt_timeout() {
         }
         const auto& ps = this->current_connection_->pairing_session();
         const int64_t now_us = platform_time_us();
-        const bool attempt_expired = ps.step != SendspinConnection::PairingStep::IDLE &&
-                                     ps.attempt_deadline_us != 0 &&
-                                     now_us >= ps.attempt_deadline_us;
+        const bool attempt_expired =
+            ps.attempt_deadline_us != 0 && now_us >= ps.attempt_deadline_us;
         if (attempt_expired) {
             SS_LOGW(TAG, "Pairing attempt timed out for server_id=%s; aborting",
                     this->current_connection_->get_server_id().c_str());
@@ -2100,6 +2099,7 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
     // PSK flow has no PAKE round and so no commit_B.
     SS_LOGI(TAG, "Sending client/pair-init (pairing_psk) for server_id=%s", server_id.c_str());
     conn->send_app_json(format_client_pair_init_message(pairing_index), nullptr);
+    conn->pairing_session().attempt_deadline_us = platform_time_us() + PAIRING_ATTEMPT_TIMEOUT_US;
 
     // Send client/pair-finalize with the long-term PSK (base64url-encoded, 43 chars).
     SS_LOGI(TAG, "Sending client/pair-finalize for server_id=%s", server_id.c_str());
@@ -2230,8 +2230,8 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
             // A server pairing message (server/pair-init, server/pair-auth, or
             // server/pair-confirm) failed to parse. If no pairing-code session is active on this
             // connection, the frame is a stray protocol violation: e.g. a code-flow message
-            // arriving during a pairing_psk exchange, which never touches pairing_session_
-            // (ps.step stays IDLE). So drop it without tearing the connection down.
+            // arriving during a pairing_psk exchange, which leaves ps.step IDLE. So drop it
+            // without tearing the connection down.
             if (ps.step == SendspinConnection::PairingStep::IDLE) {
                 SS_LOGW(TAG,
                         "handle_pairing_message: malformed pairing frame with no active "
