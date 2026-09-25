@@ -602,32 +602,11 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             return DecodeResult::SKIPPED;
         }
 
-        size_t decoded_size = 0;
-        bool decoded = sync_context.decoder->decode_audio_chunk(
-            sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
-            sync_context.decode_buffer->get_buffer_end(), sync_context.decode_buffer->free(),
-            &decoded_size);
-        if (!decoded) {
-            // The decoder raises its decoded-size estimate when it meets an unusually large chunk
-            // (e.g. a multi-frame Opus packet bigger than the typical 20ms buffer). Grow the
-            // buffer to the new estimate (plus the reserved spare frame) and retry once.
-            size_t needed =
-                sync_context.decoder->get_decode_buffer_size() + sync_context.bytes_per_frame;
-            if (needed > sync_context.decode_buffer->capacity() &&
-                sync_context.decode_buffer->reallocate(needed)) {
-                decoded = sync_context.decoder->decode_audio_chunk(
-                    sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
-                    sync_context.decode_buffer->get_buffer_end(),
-                    sync_context.decode_buffer->free(), &decoded_size);
-            }
-        }
-        if (!decoded) {
-            SS_LOGE(TAG, "Failed to decode audio chunk");
+        if (!this->decode_whole_chunk(sync_context)) {
             this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
             sync_context.encoded_entry = nullptr;
             return DecodeResult::FAILED;
         }
-        sync_context.decode_buffer->increase_buffer_length(decoded_size);
         sync_context.decoded_timestamp = client_timestamp;
     }
 
@@ -636,6 +615,50 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
     sync_context.encoded_entry = nullptr;
 
     return DecodeResult::SUCCESS;
+}
+
+bool SyncTask::decode_whole_chunk(SyncContext& sync_context) {
+    const uint8_t* input = sync_context.encoded_entry->data();
+    size_t remaining = sync_context.encoded_entry->data_size;
+    size_t produced = 0;
+    while (remaining > 0) {
+        // Room for the decoder's next unit, plus the spare frame soft sync inserts into.
+        const size_t unit_size = sync_context.decoder->get_decode_buffer_size();
+        const size_t needed_free = unit_size + sync_context.bytes_per_frame;
+        if (sync_context.decode_buffer->free() < needed_free &&
+            !sync_context.decode_buffer->reallocate(sync_context.decode_buffer->available() +
+                                                    needed_free)) {
+            SS_LOGE(TAG, "Failed to grow decode buffer");
+            break;
+        }
+
+        size_t consumed = 0;
+        size_t decoded_size = 0;
+        if (!sync_context.decoder->decode_audio_chunk(
+                input, remaining, sync_context.decode_buffer->get_buffer_end(),
+                sync_context.decode_buffer->free() - sync_context.bytes_per_frame, &consumed,
+                &decoded_size)) {
+            break;
+        }
+        sync_context.decode_buffer->increase_buffer_length(decoded_size);
+        produced += decoded_size;
+        input += consumed;
+        remaining -= consumed;
+
+        // A call with the room it asked for that neither progressed nor raised its estimate
+        // would repeat forever.
+        if (consumed == 0 && sync_context.decoder->get_decode_buffer_size() == unit_size) {
+            break;
+        }
+    }
+
+    if (remaining > 0) {
+        // All or nothing. The buffer was empty on entry, so this drops just this chunk's output.
+        sync_context.decode_buffer->decrease_buffer_length(produced);
+        SS_LOGE(TAG, "Failed to decode audio chunk");
+        return false;
+    }
+    return true;
 }
 
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {

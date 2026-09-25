@@ -243,6 +243,10 @@ protected:
     /// @brief Decodes the current encoded chunk
     DecodeResult decode_chunk(SyncContext& sync_context);
 
+    /// @brief Decodes all of the current encoded chunk into the decode buffer, growing it as the
+    /// decoder asks. On failure the buffer is left as it was.
+    bool decode_whole_chunk(SyncContext& sync_context);
+
     /// @brief Waits in IDLE for a codec header to arrive in the ring buffer
     /// Discards stale audio chunks. Returns true if a codec header was found.
     /// Returns false if COMMAND_STOP was signaled.

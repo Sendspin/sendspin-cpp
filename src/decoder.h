@@ -39,9 +39,9 @@ namespace sendspin {
  * Usage:
  * 1. Call process_header() with the first chunk to initialize the codec and stream info
  * 2. Allocate an output buffer of at least get_decode_buffer_size() bytes
- * 3. Call decode_audio_chunk() for each encoded chunk to fill the output buffer. For Opus this
- *    estimate can grow mid-stream: if decode_audio_chunk() returns false and
- *    get_decode_buffer_size() has increased, enlarge the buffer to the new size and call again.
+ * 3. Call decode_audio_chunk() for each encoded chunk. While it consumes less than the whole
+ *    chunk, keep what it decoded, make at least get_decode_buffer_size() bytes free, and call
+ *    again with the rest.
  * 4. Call reset_decoders() when the stream ends or a new stream starts
  *
  * @code
@@ -51,9 +51,10 @@ namespace sendspin {
  * decoder.process_header(header_data, header_size, CHUNK_TYPE_FLAC_HEADER, &stream_info);
  *
  * std::vector<uint8_t> output(decoder.get_decode_buffer_size());
+ * size_t consumed = 0;
  * size_t decoded_size = 0;
- * decoder.decode_audio_chunk(encoded_data, encoded_size,
- *                            output.data(), output.size(), &decoded_size);
+ * decoder.decode_audio_chunk(encoded_data, encoded_size, output.data(), output.size(), &consumed,
+ *                            &decoded_size);
  * @endcode
  */
 class SendspinDecoder {
@@ -81,12 +82,12 @@ public:
     /// @param data_size Size of the encoded audio data in bytes.
     /// @param output_buffer Pointer to the buffer where decoded audio will be written.
     /// @param output_buffer_size Size of the output buffer in bytes.
-    /// @param[out] decoded_size Pointer to store the number of decoded bytes written.
-    /// @return True if successful, false otherwise. For Opus, a false return may simply mean the
-    /// chunk decodes to more than output_buffer_size bytes; in that case get_decode_buffer_size()
-    /// has increased, so resize output_buffer to it and call again.
+    /// @param[out] consumed Encoded bytes decoded. Less than data_size means the output ran out
+    ///             of room: make get_decode_buffer_size() bytes free and call again with the rest.
+    /// @param[out] decoded_size Decoded bytes written.
+    /// @return False on a decode error.
     bool decode_audio_chunk(const uint8_t* data, size_t data_size, uint8_t* output_buffer,
-                            size_t output_buffer_size, size_t* decoded_size);
+                            size_t output_buffer_size, size_t* consumed, size_t* decoded_size);
 
     /// @brief Returns the currently active codec format.
     /// @return The codec format in use for decoding.
@@ -95,9 +96,8 @@ public:
     }
 
     /// @brief Returns the size to allocate for the decoded-output buffer.
-    /// @details For FLAC and PCM this is a fixed upper bound. For Opus it starts at the common 20ms
-    /// frame size and grows (up to the 120ms spec maximum) when decode_audio_chunk() meets a larger
-    /// packet; that call returns false until the caller resizes its buffer to the new value.
+    /// @details The free space decode_audio_chunk() needs to make progress: one maximum-size FLAC
+    /// frame, 120 ms of PCM, or one Opus packet (20 ms, raised to 120 ms on a larger packet).
     /// @return Required decoded-output buffer size in bytes.
     size_t get_decode_buffer_size() const {
         return this->decode_buffer_size_;
