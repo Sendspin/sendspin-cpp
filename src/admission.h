@@ -177,7 +177,8 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 ///
 /// Rules, from connection.md "Multiple servers (server-initiated)":
 ///   1. If no currently admitted connection -> admit.
-///   2. An in-flight pairing (admitted rank 1) is not displaced by incoming rank 1 or 2.
+///   2. An admitted connection with an in-flight pairing, alone or alongside playback, is not
+///      displaced by incoming rank 1 or 2.
 ///   3. Higher incoming rank displaces.
 ///   4. Equal non-zero rank -> admit.
 ///   5. Both rank-0 (empty activities): admit only if
@@ -205,8 +206,8 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
     // admitted_pairing_in_flight=false once server/pair-finalize is acked. Substituting an empty
     // activity set instead would drop the admitted side to rank 0 and hand a rank-0 newcomer the
     // last_playback tiebreak below, which it could never have won before.
-    if (admitted_pairing_in_flight && admitted_rank == 1 &&
-        (incoming_rank == 1 || incoming_rank == 2)) {
+    if (admitted_pairing_in_flight &&
+        contains_activity(admitted_activities, SendspinActivity::PAIRING) && incoming_rank != 0) {
         return false;
     }
 

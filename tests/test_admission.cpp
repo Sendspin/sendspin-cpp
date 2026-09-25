@@ -273,6 +273,10 @@ TEST(ShouldAdmitConnection, RankAndPairingShieldDecideDisplacement) {
         // Rule 2: an in-flight pairing is not displaced by rank 1 or rank 2.
         {"rule2/in-flight-pairing/vs-pairing", Acts{PR}, Acts{PR}, true, true, false},
         {"rule2/in-flight-pairing/vs-playback", Acts{PB}, Acts{PR}, true, true, false},
+        {"rule2/in-flight-pairing-with-playback/vs-playback", Acts{PB}, Acts{PB, PR}, true, true,
+         false},
+        {"rule2/in-flight-pairing-with-playback/vs-pairing", Acts{PR}, Acts{PB, PR}, true, true,
+         false},
         // Rule 3: rank decides.
         {"rule3/pairing-vs-playback", Acts{PR}, Acts{PB}, true, true, false},
         {"rule3/empty-vs-playback", Acts{}, Acts{PB}, true, true, false},
@@ -280,6 +284,8 @@ TEST(ShouldAdmitConnection, RankAndPairingShieldDecideDisplacement) {
         // Rule 4: equal non-zero rank admits the incoming connection.
         {"rule4/playback-vs-playback", Acts{PB}, Acts{PB}, true, true, true},  // Control:
         {"rule4/pairing-vs-finished-pairing", Acts{PR}, Acts{PR}, true, false, true},  // Control:
+        {"rule4/playback-vs-finished-pairing-with-playback", Acts{PB}, Acts{PB, PR}, true, false,
+         true},  // Control:
     };
 
     for (const Row& row : rows) {
