@@ -492,6 +492,11 @@ void SendspinClient::loop() {
             this->listener_->on_time_sync_updated(
                 static_cast<float>(conn->get_time_filter()->get_error()));
         }
+        if (this->client_state_held_ && conn->is_time_synced()) {
+            // current_shared(): see send_text().
+            auto shared = this->connection_manager_->current_shared();
+            this->publish_client_state(shared.get());
+        }
     }
 
     this->drain_inbox();
@@ -1062,6 +1067,7 @@ void SendspinClient::cleanup_connection_state() {
     // The trust level is per-connection state: with no active connection there is nothing to
     // trust, so the getter reports NONE until the next handshake completes.
     this->current_trust_ = ConnectionTrust::NONE;
+    this->client_state_held_ = false;
 
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
@@ -1845,6 +1851,19 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // is_operational() also covers the first server/activate: before that we do not yet know
     // which activities and roles this connection is admitted for.
     if (conn == nullptr || !conn->is_connected() || !conn->is_operational()) {
+        return;
+    }
+
+    // messaging.md "client/state": a player reports `available: true` only after clock
+    // synchronization, and `false` would mean it will not yield, so the state waits for the time
+    // filter's first measurement; loop() sends it then.
+    bool waits_for_clock = false;
+#ifdef SENDSPIN_ENABLE_PLAYER
+    waits_for_clock = this->available_ && this->player_ &&
+                      conn->is_role_active(SendspinRole::PLAYER) && !conn->is_time_synced();
+#endif
+    this->client_state_held_ = waits_for_clock;
+    if (waits_for_clock) {
         return;
     }
 

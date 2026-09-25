@@ -238,6 +238,11 @@ the spec text in each case.
 - `pairing.md` "Entering and leaving pairing" has an expired attempt send `pair/abort`, while
   `connection.md` "Re-handshake" forbids any client message between Noise message 1 and the new
   `server/activate`. The client holds the abort until the activation arrives.
+- The aiosendspin client sends its initial player `client/state` with `available: true` as soon
+  as it is activated (`client/connection.py` `_send_full_client_state()`) and gates only the
+  source object on `is_time_synchronized()`. `messaging.md` "client/state" says a player or
+  source reports `available: true` only after it has established clock synchronization. This
+  client holds the state until its time filter has a measurement.
 
 ## Residual gaps
 
@@ -337,7 +342,7 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
 The controller role, visualizer binary layouts (IDs 16-20), metadata progress math and
 scheduled-update gating, the `client/goodbye` reason set, the 30 second provisional timeout, the
 activity-rank arbitration and last-playback tiebreak, the stored-`server_id` post-match check,
-arrival time taken after decrypt and reassembly, `available: true` gated on time-filter
-convergence, `stream/clear` buffer discard, mid-stream format switches, and, since phase 3a, the
+arrival time taken after decrypt and reassembly, `stream/clear` buffer discard, mid-stream
+format switches, and, since phase 3a, the
 fragmentation wire format, the audio chunk header, the post-re-handshake sequence and the
 category-to-activities table.

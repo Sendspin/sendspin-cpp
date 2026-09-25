@@ -93,6 +93,10 @@ constexpr uint16_t REPROVE_REHANDSHAKE_TEST_PORT = 19011;
 constexpr uint16_t COMBINED_FIRST_TEST_PORT = 19012;
 constexpr uint16_t COMBINED_REKEY_TEST_PORT = 19013;
 constexpr uint16_t AVAILABILITY_TEST_PORT = 19079;
+constexpr uint16_t CLOCK_GATE_SYNCED_TEST_PORT = 19080;
+constexpr uint16_t CLOCK_GATE_UNSYNCED_TEST_PORT = 19081;
+constexpr uint16_t CLOCK_GATE_NO_PLAYER_TEST_PORT = 19082;
+constexpr uint16_t CLOCK_GATE_UNAVAILABLE_TEST_PORT = 19083;
 constexpr uint16_t RESELECT_PAIRING_TEST_PORT = 19015;
 constexpr uint16_t ROLE_STATE_OBJECTS_TEST_PORT = 19016;
 constexpr uint16_t ROLE_ADDED_STATE_TEST_PORT = 19017;
@@ -939,6 +943,70 @@ TEST(EncryptedLifecycle, AvailabilityIsDeviceStateAndPublishesOnChange) {
     pump_for(client, 100);
 }
 
+// messaging.md "client/state": an available player reports its state only after clock
+// synchronization; a client with no active player, or an unavailable one, does not wait. The first
+// row is the control: every later row differs from it in one input.
+TEST(EncryptedLifecycle, ClientStateWaitsForClockSyncOnlyForAnAvailablePlayer) {
+    struct Row {
+        const char* name;
+        uint16_t port;
+        bool with_player;
+        bool answer_time;
+        bool available;
+        bool expect_state;
+    };
+    const Row rows[] = {
+        {"Control: available player, clock synced", CLOCK_GATE_SYNCED_TEST_PORT, true, true, true,
+         true},
+        {"available player, clock never synced", CLOCK_GATE_UNSYNCED_TEST_PORT, true, false, true,
+         false},
+        {"no player role, clock never synced", CLOCK_GATE_NO_PLAYER_TEST_PORT, false, false, true,
+         true},
+        {"unavailable player, clock never synced", CLOCK_GATE_UNAVAILABLE_TEST_PORT, true, false,
+         false, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SendspinClientConfig config;
+        config.name = "Clock Gate Test Client";
+        config.server_port = row.port;
+        config.time_burst_interval_ms = 100;
+
+        PairedClientBundle bundle(config);
+        SendspinClient& client = bundle.client();
+        CountingPlayerListener player_listener;
+        if (row.with_player) {
+            client.add_player(make_pcm_player_config()).set_listener(&player_listener);
+        } else {
+            client.add_metadata();
+        }
+        ASSERT_TRUE(bundle.start());
+        client.set_available(row.available);
+
+        FakeEncryptedServerOptions options;
+        options.answer_time = row.answer_time;
+        options.first_roles_json = row.with_player ? R"(["player@v1"])" : R"(["metadata@v1"])";
+        auto server = connect_paired_server(bundle.peer, row.port, std::move(options));
+
+        // The first client/time shows the connection is operational.
+        pump_until(client, [&] { return server->got_client_time(); });
+        if (row.expect_state) {
+            pump_until(client, [&] { return server->client_state_count() > 0; });
+            JsonDocument doc;
+            ASSERT_EQ(deserializeJson(doc, server->client_states().front()),
+                      DeserializationError::Ok);
+            EXPECT_EQ(doc["payload"]["available"].as<bool>(), row.available);
+        } else {
+            pump_for(client, 300);
+            EXPECT_EQ(server->client_state_count(), 0)
+                << "an available player reported its state before its clock synchronized";
+        }
+
+        client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+        pump_for(client, 100);
+    }
+}
+
 // pairing.md "Entering and leaving pairing": pairing runs alongside playback, and a
 // server/activate that adds 'pairing' does not by itself affect active_roles, streams or group
 // membership. messaging.md "server/activate" lists ['playback', 'pairing'] as an allowed set for
@@ -1169,6 +1237,7 @@ TEST(EncryptedLifecycle, ClientStateCarriesAnObjectForEachActiveRole) {
     ASSERT_TRUE(bundle.start());
 
     FakeEncryptedServerOptions options;
+    options.answer_time = true;  // An active player's state waits for clock sync.
     options.first_roles_json = R"(["player@v1","visualizer@v1"])";
     auto server = std::make_unique<FakeEncryptedServer>(
         server_url(ROLE_STATE_OBJECTS_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
@@ -1213,6 +1282,7 @@ TEST(EncryptedLifecycle, ActivateThatAddsARoleSendsItsClientState) {
     ASSERT_TRUE(bundle.start());
 
     FakeEncryptedServerOptions options;
+    options.answer_time = true;  // An active player's state waits for clock sync.
     options.first_roles_json = R"(["player@v1"])";
     auto server = std::make_unique<FakeEncryptedServer>(
         server_url(ROLE_ADDED_STATE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),

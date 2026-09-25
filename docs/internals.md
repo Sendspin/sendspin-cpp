@@ -456,6 +456,8 @@ Time sync uses a burst-based NTP-style protocol:
 
 High-performance networking (e.g., disabling WiFi power saving) is acquired for the duration of a burst and released when complete.
 
+The filter's first measurement, taken when the first burst completes, gates playback (`handle_load_chunk()`) and the client's state. messaging.md "client/state" lets a player report `available: true` only after clock synchronization, and `false` would mean it will not yield, so `publish_client_state()` holds the state while an active player is available and unsynced (`client_state_held_`), and `loop()` sends the full state once the filter is synced. The first burst starts at the activating `server/activate` and runs its exchanges back to back, so on a LAN the state goes out a few hundred milliseconds later, inside the 5 s aiosendspin allows.
+
 ### Kalman Filter (`src/time_filter.h`)
 
 Two-dimensional state vector: `[offset, drift]`.

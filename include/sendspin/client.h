@@ -810,8 +810,9 @@ private:
 
     /// @brief Publishes the current client state to the specified connection
     ///
-    /// Takes no lock of its own: its main-loop callers already hold conn_ptr_mutex_, which is
-    /// what keeps `conn` alive for the call.
+    /// Held while an available, active player has no clock sync yet (see client_state_held_).
+    /// Takes no lock of its own: its main-loop callers already hold conn_ptr_mutex_ or a
+    /// shared_ptr, which is what keeps `conn` alive for the call.
     void publish_client_state(SendspinConnection* conn);
 
     // ========================================
@@ -952,6 +953,8 @@ private:
     // 8-bit fields
     /// Consumer-owned availability; see set_available(). Main loop only.
     bool available_{true};
+    /// A client/state held for clock sync, which loop() sends once synced. Main loop only.
+    bool client_state_held_{false};
     /// Trust level of the active connection; written by on_handshake_complete() and reset by
     /// cleanup_connection_state(), both main loop only, so get_current_trust() needs no lock.
     ConnectionTrust current_trust_{ConnectionTrust::NONE};
