@@ -466,6 +466,24 @@ std::string persisted_delay(const InMemoryPersistenceProvider& provider) {
 
 }  // namespace
 
+// roles/player/v1.md "client/state player object": volume is 0-100, so a consumer value above
+// that is reported at the maximum.
+TEST(PlayerRoleVolume, ValueOverTheSpecMaximumIsClamped) {
+    struct Row {
+        uint8_t requested;
+        uint8_t reported;
+    };
+    for (const Row& row : {Row{0, 0}, Row{100, 100}, Row{101, 100}, Row{255, 100}}) {
+        SCOPED_TRACE(static_cast<int>(row.requested));
+        auto impl = make_impl();
+        impl->update_volume(row.requested);
+        ClientStateMessage state;
+        impl->build_state_fields(state);
+        ASSERT_TRUE(state.player.has_value());
+        EXPECT_EQ(state.player->volume, row.reported);
+    }
+}
+
 // roles/player/v1.md "server/command player object": set_output_delay is only honored while the
 // player advertises it in supported_commands.
 TEST(PlayerRoleOutputDelay, SetOutputDelayCommandIsIgnoredUnlessAdvertised) {

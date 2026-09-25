@@ -62,6 +62,8 @@ static constexpr size_t AUDIO_CHUNK_HEADER_SIZE = BINARY_TIMESTAMP_SIZE + BINARY
 /// @brief Upper bound on the output delay, per roles/player/v1.md "Output delay": clients MUST
 /// clamp output_delay_ms to the range 0-5000.
 static constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000U;
+/// @brief Upper bound on the reported volume, per roles/player/v1.md "client/state player object".
+static constexpr uint8_t MAX_VOLUME = 100U;
 static constexpr uint32_t HEADER_SEND_TIMEOUT_MS = 100U;
 // Denominator for the advertised buffer capacity fraction: advertises (N-1)/N of capacity
 static constexpr size_t AUDIO_BUFFER_ADVERTISE_DENOMINATOR = 5;
@@ -191,7 +193,7 @@ uint8_t PlayerRole::get_volume() const {
 // ============================================================================
 
 void PlayerRole::Impl::update_volume(uint8_t volume) {
-    this->volume = volume;
+    this->volume = std::min(volume, MAX_VOLUME);
     this->client->publish_state();
 }
 

@@ -167,7 +167,7 @@ public:
     // ========================================
 
     /// @brief Updates the volume and publishes client state to the server. Main loop only.
-    /// @param volume New volume level
+    /// @param volume New volume level, clamped to 0-100
     void update_volume(uint8_t volume);
 
     /// @brief Updates the mute state and publishes client state to the server. Main loop only.
