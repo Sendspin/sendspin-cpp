@@ -128,7 +128,7 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
 ///
 /// Runs on the network thread, so it reads the connection's atomic role mask. `conn` is never null
 /// at the dispatch points: the admission gate ahead of them returns first.
-bool role_accepts_traffic(const SendspinConnection* conn, SendspinRole role) {
+[[maybe_unused]] bool role_accepts_traffic(const SendspinConnection* conn, SendspinRole role) {
     if (conn->is_role_active(role)) {
         return true;
     }
@@ -138,8 +138,8 @@ bool role_accepts_traffic(const SendspinConnection* conn, SendspinRole role) {
 
 /// @brief Whether an activation drops `role` out of the active set, logging the transition once
 /// for every role rather than once per call site.
-bool role_removed(const std::vector<std::string>& before, const std::vector<std::string>& after,
-                  SendspinRole role) {
+[[maybe_unused]] bool role_removed(const std::vector<std::string>& before,
+                                   const std::vector<std::string>& after, SendspinRole role) {
     if (!role_in(before, role) || role_in(after, role)) {
         return false;
     }
