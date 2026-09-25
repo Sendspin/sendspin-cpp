@@ -380,9 +380,11 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         }
 
         if (noise_active) {
-            // Post-handshake TEXT frames are a protocol error.
-            SS_LOGD(TAG, "Unexpected TEXT frame after Noise handshake is complete; ignoring");
+            // connection.md "Failure Handling": a cleartext message after the switch to transport
+            // mode is a silent failure.
+            SS_LOGW(TAG, "TEXT frame in transport mode; closing connection");
             this->reset_websocket_payload();
+            this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
             return;
         }
 

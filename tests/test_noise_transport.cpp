@@ -1413,6 +1413,27 @@ TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     EXPECT_TRUE(conn.sent_binary_.empty());
 }
 
+// connection.md "Failure Handling": a cleartext message after the switch to transport mode is a
+// silent failure, even one that would be valid JSON.
+TEST(NoiseTransport, CleartextFrameInTransportModeClosesSilently) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+
+    TestConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+    int calls = 0;
+    conn.on_json_message_cb = [&calls](SendspinConnection* /*c*/, const char* /*d*/, size_t /*n*/,
+                                       int64_t /*t*/) { ++calls; };
+
+    conn.inject_text_payload(R"({"type":"server/state","payload":{}})");
+
+    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(conn.close_transport_now_calls_, 1);
+    EXPECT_TRUE(conn.disconnect_calls_.empty()) << "the close must be silent";
+    EXPECT_TRUE(conn.sent_text_.empty());
+    EXPECT_TRUE(conn.sent_binary_.empty());
+}
+
 // ============================================================================
 // Fragmentation threshold: exactly at and one byte over MAX_TRANSPORT_PLAINTEXT
 // ============================================================================
