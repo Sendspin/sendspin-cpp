@@ -494,9 +494,8 @@ event: `save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stor
 
 #### Keyspace
 
-Every key but the transitional one at the end of the table is a fixed constant from the
-`persistence_keys` namespace (`sendspin/client.h`), at most 12 characters (comfortably under a
-typical NVS key's 15-character limit). A provider must not invent its own keys; it only needs to
+Every key comes from the `persistence_keys` namespace (`sendspin/client.h`), at most 12
+characters (comfortably under a typical NVS key's 15-character limit). A provider must not invent its own keys; it only needs to
 store and return whatever bytes the library gives it for each of these:
 
 | Key | Contents |
@@ -509,7 +508,6 @@ store and return whatever bytes the library gives it for each of these:
 | `persistence_keys::PAIR_CONFIG` | The `SendspinPairingConfig` as one codec blob (`encode_pairing_config()` / `decode_pairing_config()`). |
 | `persistence_keys::LAST_PLAYED` | Raw UTF-8 bytes: the `server_id` (base64url public key) of the last server that played audio. |
 | `persistence_keys::OUTPUT_DELAY` | ASCII decimal string (e.g. `"150"`): the player's output delay in milliseconds. Chosen over raw `uint16_t` bytes for debuggability and to avoid an endianness dependency. |
-| `"records"` (transitional, no constant) | The single key long-term records shared before they moved to one slot per key. The library loads it once at `start()` and, when it is not empty, writes it empty once so the long-term PSKs in it stop sitting in storage; it never reads their contents. A provider that dispatches on a fixed key set must accept a load and a save for this literal key until the first release carrying the per-slot layout has shipped, after which the library stops touching it. |
 
 `sendspin/persistence_codec.h` is public so a custom provider (or a test) can inspect or seed
 the record slot / `PAIRING_PSK` / `PAIR_CONFIG` content in exactly the format the library itself
@@ -528,8 +526,7 @@ label's length. The order blob is one byte per stored record.
 - `save_blob()` returning `true` means DURABLY stored, including for a zero-length write, which
   is how a record slot is freed. A `false` return is reported, not retried: the in-memory state
   stays authoritative for the current boot. What the rejection costs decides the level: a write
-  that changes which records the next boot holds, or that clears the transitional `records` key,
-  logs a warning naming the key and what will be lost (or come back) at the next reboot, while a
+  that changes which records the next boot holds logs a warning naming the key and what will be lost (or come back) at the next reboot, while a
   write the next boot rebuilds by itself (the recency order in `RECORD_ORDER`, a record's
   `"used"` flag, which flips on the first activate of every long-term session) reports at debug.
   For a record slot specifically: a rejected
