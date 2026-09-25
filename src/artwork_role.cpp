@@ -558,10 +558,9 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         // streamed_channels is also cleared by cleanup(), which the main loop runs on a live
         // connection when a server/activate removes the artwork role.
         //
-        // Any transfer in flight ends here whatever changed: the server MUST cancel a transfer
-        // before a stream/start that changes its channel, and one still in flight across a
-        // stream/start that did not change its channel would be carrying bytes for a
-        // configuration nothing re-announces.
+        // A transfer in flight ends here only if its channel changed; the server cancels those
+        // first (roles/artwork/v1.md "Artwork (Binary)"), and one on an unchanged channel
+        // continues.
         //
         // Release a changed channel's DECODE_DELIVERED ack gate: its epoch was just bumped, so
         // that decode's eventual display can no longer fire, and leaving the gate armed would
@@ -579,7 +578,9 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         this->stream_active = true;
         const uint8_t changed = this->changed_channel_mask(stream);
         this->streamed_channels = stream.channels;
-        this->transfer = ArtworkTransfer{};
+        if ((changed & static_cast<uint8_t>(1U << this->transfer.slot)) != 0) {
+            this->transfer = ArtworkTransfer{};
+        }
         for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
             if ((changed & static_cast<uint8_t>(1U << slot)) == 0) {
                 continue;

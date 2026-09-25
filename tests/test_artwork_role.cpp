@@ -936,6 +936,41 @@ TEST(ArtworkStreamStart, PendingImagesSurviveOnlyUnchangedChannels) {
     }
 }
 
+// roles/artwork/v1.md "Artwork (Binary)": the server cancels a transfer before a stream/start that
+// changes its channel, so a transfer on a channel the stream/start leaves alone continues.
+TEST(ArtworkStreamStart, TransferInFlightSurvivesOnlyAnUnchangedChannel) {
+    struct Row {
+        const char* name;
+        ServerArtworkStreamObject restart;
+        bool transfer_survives;
+    };
+    const Row rows[] = {
+        {"Control: another channel changed", two_channel_stream(100, 200), true},
+        {"the transfer's channel changed", two_channel_stream(200, 100), false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordingListener listener;
+        auto impl = make_impl(make_two_ungated_slot_config());
+        impl->listener = &listener;
+        ASSERT_TRUE(impl->start());
+        impl->handle_stream_start(two_channel_stream(100, 100), live_generation(*impl));
+
+        const std::vector<uint8_t> image = make_image('A', 100);
+        ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
+        ASSERT_TRUE(feed(*impl, 0, part_body({image.begin(), image.begin() + 60})));
+        impl->handle_stream_start(row.restart, live_generation(*impl));
+
+        // The rest of the image is a valid part only while its transfer is still in flight.
+        EXPECT_EQ(feed(*impl, 0, part_body({image.begin() + 60, image.end()})),
+                  row.transfer_survives);
+        if (row.transfer_survives) {
+            listener.wait_until([&] { return listener.decodes.size() >= 1; });
+            EXPECT_EQ(listener.decode_marker_at(0), 'A');
+        }
+    }
+}
+
 // ============================================================================
 // Stream lifecycle and disconnect drop the transfer in flight
 // ============================================================================
