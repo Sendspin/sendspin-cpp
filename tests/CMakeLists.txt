@@ -71,7 +71,8 @@ set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS
 # public surface does not expose: the sync task's run state and its encoded ring, the artwork
 # transfer in flight and its drain-side slot buffers, the visualizer's stream flag and ring, a
 # state role's held scheduled update and its teardown generation (including a direct
-# handle_server_state() call with that generation), plus the queued-event probe that proves
+# handle_server_state() call with that generation), the controller's supported-commands mask
+# (seeded so a command reaches the inactive-role send gate), plus the queued-event probe that proves
 # ordering without a sleep (a role inbox's topic bits and the connection manager's pending-event
 # flag).
 set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)

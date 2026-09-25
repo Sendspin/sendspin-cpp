@@ -474,6 +474,9 @@ struct PlayerSupportObject {
     size_t buffer_capacity{};
 };
 
+/// @brief Protocol maximum for every volume field: volume is 0-100 on the wire.
+static constexpr uint8_t VOLUME_MAX = 100;
+
 /// @brief Player state reported by the client to the server in client/state messages
 struct ClientPlayerStateObject {
     uint8_t volume{};

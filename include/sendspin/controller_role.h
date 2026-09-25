@@ -151,7 +151,9 @@ public:
     /// @brief Sends a controller command to the server
     ///
     /// Sent only while controller@v1 is among the connection's active roles; a command issued
-    /// outside that window is dropped rather than queued.
+    /// outside that window is dropped rather than queued. A command missing from the latest
+    /// supported_commands, or without the parameter it requires (volume in 0-100, mute,
+    /// position_ms, offset_ms), is dropped with a warning.
     /// @param cmd The command plus any command-specific parameters
     void send_command(const ClientCommandControllerObject& cmd);
 

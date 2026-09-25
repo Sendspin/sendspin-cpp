@@ -25,6 +25,7 @@
 #include "artwork_role_impl.h"  // In-flight transfer state after a removal; private, see CMakeLists
 #include "connection_manager.h"  // Pending-activate flag, to queue an event ahead of a removal
 #include "color_role_impl.h"     // Held scheduled palette after a removal
+#include "controller_role_impl.h"  // Seeded supported-commands mask for the inactive-role send gate
 #include "crypto/constants.h"
 #include "metadata_role_impl.h"  // Held scheduled metadata state after a removal
 #include "lifecycle_test_fixtures.h"
@@ -69,6 +70,7 @@ constexpr uint16_t STALE_START_TEST_PORT = 19037;
 constexpr uint16_t STALE_START_CONTROL_TEST_PORT = 19038;
 constexpr uint16_t INACTIVE_TRAFFIC_TEST_PORT = 19039;
 constexpr uint16_t VERSION_REPLACED_TEST_PORT = 19040;
+constexpr uint16_t INACTIVE_ROLE_SEND_TEST_PORT = 19085;
 
 /// How long a scenario pumps to give a callback that must NOT fire every chance to fire.
 constexpr int SETTLE_MS = 300;
@@ -797,6 +799,47 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     ASSERT_TRUE(server->send_binary_body({SENDSPIN_BINARY_ARTWORK_IMAGE}));
     pump_until(client, [&] { return !client.is_connected(); });
 
+    pump_for(client, 100);
+}
+
+// A role that the server has not activated drives no traffic of its own: messaging.md
+// "server/activate" has servers tolerate inactive-role objects only because a client that has
+// received the removal stops sending them. The client is admitted here with the player role
+// alone, so its controller commands must stay off the wire until an activate adds the role.
+//
+// An inactive controller can hold no server/state, so the offered command is seeded: without it
+// the supported_commands check would drop the command before it reached the gate under test.
+TEST(RoleDeactivation, ControllerCommandsWaitForTheRoleToBeActive) {
+    PairedClientBundle bundle(make_config(INACTIVE_ROLE_SEND_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    auto& controller = client.add_controller();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["player@v1"])";
+    auto server =
+        connect_paired_server(bundle.peer, INACTIVE_ROLE_SEND_TEST_PORT, std::move(options));
+    pump_until(client, [&] { return client.is_connected(); });
+
+    controller.impl_->supported_commands_mask =
+        1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY);
+    controller.send_command({.command = SendspinControllerCommand::PLAY});
+    pump_for(client, 100);
+    EXPECT_TRUE(server->controller_commands().empty())
+        << "a controller command was sent while controller@v1 was not active";
+
+    // Control: the same command goes out once an activate adds the role, so the gate is refusing
+    // on activation rather than dropping controller commands outright.
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["player@v1","controller@v1"]}})"));
+    pump_until(client, [&] {
+        controller.send_command({.command = SendspinControllerCommand::PLAY});
+        return !server->controller_commands().empty();
+    });
+    EXPECT_EQ(server->controller_commands().front(), "play");
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
 }
 

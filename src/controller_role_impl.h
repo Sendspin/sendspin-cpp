@@ -97,6 +97,9 @@ struct ControllerRole::Impl {
     ControllerRoleListener* listener{nullptr};
 
     // 32-bit fields
+    /// @brief One bit per command in controller_state.supported_commands (see command_bit()).
+    /// Written with it on the main loop; atomic because send_command() may run on any thread.
+    std::atomic<uint32_t> supported_commands_mask{0};
     /// @brief Teardown generation, bumped by cleanup() and re-checked at every point of effect
     /// (see accepts()). Atomic because the network thread reads it.
     std::atomic<uint32_t> cleanup_generation{0};

@@ -992,7 +992,7 @@ controller.send_command({.command = SendspinControllerCommand::SEEK, .position_m
 controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = -10000});
 ```
 
-Fields that do not match the command are ignored when the message is serialized. The server clamps seeks to the seekable range and ignores any command not present in the controller state's `supported_commands`.
+Fields that do not match the command are ignored when the message is serialized. The client drops, with a warning, a command missing from the latest controller state's `supported_commands`, and one without the field it requires (`volume` in 0-100, `muted`, `position_ms`, `offset_ms`); gate your UI on `supported_commands` so such calls are not made. The server clamps seeks to the seekable range.
 
 A command is sent only while the server has `controller@v1` among the connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. That gate lives in `SendspinClient::send_text()`, which every role-originated message goes through and which therefore takes the role family (`"controller"`) alongside the message; the client's own messages do not use it.
 

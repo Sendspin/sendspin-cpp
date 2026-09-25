@@ -85,7 +85,7 @@ constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
 constexpr uint16_t REACTIVATE_PAIRING_TEST_PORT = 19003;
 constexpr uint16_t UNPAIR_RECORD_TEST_PORT = 19004;
 constexpr uint16_t UNPAIR_SENTINEL_TEST_PORT = 19005;
-constexpr uint16_t INACTIVE_ROLE_SEND_TEST_PORT = 19006;
+constexpr uint16_t CONTROLLER_VALIDATION_TEST_PORT = 19006;
 constexpr uint16_t LEAVE_TEST_PORT = 19007;
 constexpr uint16_t LEAVE_PAIRING_TEST_PORT = 19009;
 constexpr uint16_t REKEY_ROLE_SEND_TEST_PORT = 19010;
@@ -1007,6 +1007,80 @@ TEST(EncryptedLifecycle, ClientStateWaitsForClockSyncOnlyForAnAvailablePlayer) {
     }
 }
 
+namespace {
+
+/// Sends a controller server/state offering `commands_json` and pumps until the client holds it:
+/// roles/controller/v1.md "client/command controller object" lets a command name only an offered
+/// command.
+void offer_controller_commands(SendspinClient& client, FakeEncryptedServer& server,
+                               const ControllerRole& controller,
+                               const std::string& commands_json = R"(["play","pause"])") {
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/state","payload":{"controller":{"supported_commands":)" +
+        commands_json + R"(,"volume":50,"muted":false,"repeat":"off","shuffle":false}}})"));
+    pump_until(client,
+               [&] { return !controller.get_controller_state().supported_commands.empty(); });
+}
+
+}  // namespace
+
+// roles/controller/v1.md "client/command controller object": a command must be among the
+// latest supported_commands, and "Command behaviour" requires volume, mute, position_ms and
+// offset_ms for the commands that take them. Anything else is dropped rather than sent.
+TEST(EncryptedLifecycle, ControllerCommandsNeedAnOfferedCommandAndItsParameter) {
+    SendspinClientConfig config;
+    config.name = "Controller Validation Test Client";
+    config.server_port = CONTROLLER_VALIDATION_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    auto& controller = client.add_controller();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["controller@v1"])";
+    auto server =
+        connect_paired_server(bundle.peer, CONTROLLER_VALIDATION_TEST_PORT, std::move(options));
+    pump_until(client, [&] { return client.is_connected(); });
+    offer_controller_commands(client, *server, controller,
+                              R"(["play","volume","mute","seek","seek_relative"])");
+
+    // `sent_as` is the command's wire name when it goes out, null when it must be dropped.
+    using Cmd = SendspinControllerCommand;
+    struct Row {
+        ClientCommandControllerObject cmd;
+        const char* sent_as;
+    };
+    const Row rows[] = {
+        {{.command = Cmd::PLAY}, "play"},  // Control:
+        {{.command = Cmd::NEXT}, nullptr},  // not offered
+        {{.command = Cmd::VOLUME}, nullptr},
+        {{.command = Cmd::VOLUME, .volume = 101}, nullptr},
+        {{.command = Cmd::VOLUME, .volume = 100}, "volume"},  // Control:
+        {{.command = Cmd::MUTE}, nullptr},
+        {{.command = Cmd::MUTE, .muted = true}, "mute"},  // Control:
+        {{.command = Cmd::SEEK}, nullptr},
+        {{.command = Cmd::SEEK, .position_ms = 1000}, "seek"},  // Control:
+        {{.command = Cmd::SEEK_RELATIVE}, nullptr},
+        {{.command = Cmd::SEEK_RELATIVE, .offset_ms = -5000}, "seek_relative"},  // Control:
+    };
+
+    std::vector<std::string> expected;
+    for (const Row& row : rows) {
+        controller.send_command(row.cmd);
+        if (row.sent_as != nullptr) {
+            expected.emplace_back(row.sent_as);
+        }
+    }
+    // Commands go out in order, so once the last one sent has arrived every dropped one would have.
+    pump_until(client, [&] { return server->controller_commands().size() >= expected.size(); });
+    pump_for(client, 100);
+    EXPECT_EQ(server->controller_commands(), expected);
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
 // pairing.md "Entering and leaving pairing": pairing runs alongside playback, and a
 // server/activate that adds 'pairing' does not by itself affect active_roles, streams or group
 // membership. messaging.md "server/activate" lists ['playback', 'pairing'] as an allowed set for
@@ -1058,6 +1132,7 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
     pump_until(client, [&] { return player_listener.stream_starts == 1; });
     stream_audio_until(client, server, player_listener, 1);
 
+    offer_controller_commands(client, server, controller);
     controller.send_command({.command = SendspinControllerCommand::PLAY});
     pump_until(client, [&] { return server.controller_commands().size() == 1; });
     client.leave();
@@ -1133,49 +1208,6 @@ TEST(EncryptedLifecycle, AnActivateThatReselectsPairingStartsTheNewAttempt) {
     EXPECT_TRUE(server.pair_abort_reasons().empty()) << "re-selecting pairing is not an abort";
     EXPECT_TRUE(server.pair_init_preceded_finalize())
         << "the new attempt opens with client/pair-init, like any other";
-
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-    pump_for(client, 100);
-}
-
-// A role that the server has not activated drives no traffic of its own: messaging.md
-// "server/activate" has servers tolerate inactive-role objects only because a client that has
-// received the removal stops sending them. The client is admitted here with the player role
-// alone, so its controller commands must stay off the wire until an activate adds the role.
-TEST(EncryptedLifecycle, ControllerCommandsWaitForTheRoleToBeActive) {
-    SendspinClientConfig config;
-    config.name = "Inactive Role Send Test Client";
-    config.server_port = INACTIVE_ROLE_SEND_TEST_PORT;
-
-    PairedClientBundle bundle(config);
-    SendspinClient& client = bundle.client();
-    auto& controller = client.add_controller();
-    ASSERT_TRUE(bundle.start());
-
-    FakeEncryptedServerOptions options;
-    options.first_roles_json = R"(["player@v1"])";
-    auto server = std::make_unique<FakeEncryptedServer>(
-        server_url(INACTIVE_ROLE_SEND_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
-        std::move(options));
-
-    pump_until(client, [&] { return client.is_connected(); });
-
-    controller.send_command({.command = SendspinControllerCommand::PLAY});
-    pump_for(client, 100);
-    EXPECT_TRUE(server->controller_commands().empty())
-        << "a controller command was sent while controller@v1 was not active";
-
-    // Control: the same command goes out once an activate adds the role, so the gate is refusing
-    // on activation rather than dropping controller commands outright.
-    ASSERT_TRUE(server->send_app_json(
-        R"({"type":"server/activate","payload":{"activities":["playback"],)"
-        R"("active_roles":["player@v1","controller@v1"]}})"));
-    pump_until(client, [&] {
-        controller.send_command({.command = SendspinControllerCommand::PLAY});
-        return !server->controller_commands().empty();
-    });
-    EXPECT_EQ(server->controller_commands().front(), "play");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1365,6 +1397,7 @@ TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) 
     pump_until(client, [&] { return server->client_hello_count() > 0; });
     ASSERT_TRUE(server->send_app_json(controller_activate));
     pump_until(client, [&] { return client.is_connected(); });
+    offer_controller_commands(client, *server, controller);
     controller.send_command({.command = SendspinControllerCommand::PLAY});
     pump_until(client, [&] { return !server->controller_commands().empty(); });
     const size_t before_rekey = server->controller_commands().size();
@@ -1444,6 +1477,7 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
 
     // ...and its role is active, which is what active_roles surviving the pairing activity means
     // in practice.
+    offer_controller_commands(client, server, controller);
     controller.send_command({.command = SendspinControllerCommand::PLAY});
     pump_until(client, [&] { return !server.controller_commands().empty(); });
 

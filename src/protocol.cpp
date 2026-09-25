@@ -44,9 +44,6 @@ static const char* const TAG = "sendspin.protocol";
 // Static helpers
 // ============================================================================
 
-/// @brief Protocol maximum for volume fields (volume is 0-100 on the wire).
-static constexpr uint8_t VOLUME_MAX = 100;
-
 /// @brief Reads an optional unsigned-integer field with strict type and optional range validation.
 /// Absent or null returns nullopt silently (a legal state for an optional field). A present value
 /// that is the wrong JSON type, outside the target type's range, or outside [min, max] is logged

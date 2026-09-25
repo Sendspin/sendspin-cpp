@@ -56,7 +56,42 @@ void ControllerRole::Impl::attach_inbox(Inbox& inbox) {
     this->event_state->slot.bind(inbox, INBOX_TOPIC_CONTROLLER);
 }
 
+/// @brief The command's bit in ControllerRole::Impl::supported_commands_mask.
+static uint32_t command_bit(SendspinControllerCommand command) {
+    static_assert(static_cast<uint8_t>(SendspinControllerCommand::SEEK_RELATIVE) < 32,
+                  "every command needs a bit in supported_commands_mask");
+    return 1U << static_cast<uint8_t>(command);
+}
+
+/// @brief Whether `cmd` carries the parameter roles/controller/v1.md "Command behaviour" requires
+/// for its command, in range.
+static bool has_required_parameter(const ClientCommandControllerObject& cmd) {
+    switch (cmd.command) {
+        case SendspinControllerCommand::VOLUME:
+            return cmd.volume.has_value() && *cmd.volume <= VOLUME_MAX;
+        case SendspinControllerCommand::MUTE:
+            return cmd.muted.has_value();
+        case SendspinControllerCommand::SEEK:
+            return cmd.position_ms.has_value();
+        case SendspinControllerCommand::SEEK_RELATIVE:
+            return cmd.offset_ms.has_value();
+        default:
+            return true;
+    }
+}
+
 void ControllerRole::Impl::send_command(const ClientCommandControllerObject& cmd) const {
+    // roles/controller/v1.md "client/command controller object": only a command listed in the
+    // latest supported_commands, with its required parameter.
+    if ((this->supported_commands_mask.load(std::memory_order_relaxed) &
+         command_bit(cmd.command)) == 0) {
+        SS_LOGW(TAG, "Dropping '%s': not in the server's supported_commands", to_cstr(cmd.command));
+        return;
+    }
+    if (!has_required_parameter(cmd)) {
+        SS_LOGW(TAG, "Dropping '%s': missing or out-of-range parameter", to_cstr(cmd.command));
+        return;
+    }
     std::string command_message = format_client_command_message(cmd);
     this->client->send_text(command_message, "controller");
 }
@@ -77,6 +112,11 @@ void ControllerRole::Impl::drain_events() {
     ServerStateControllerObject state;
     if (this->event_state->slot.take(state)) {
         this->controller_state = std::move(state);
+        uint32_t mask = 0;
+        for (const auto command : this->controller_state.supported_commands) {
+            mask |= command_bit(command);
+        }
+        this->supported_commands_mask.store(mask, std::memory_order_relaxed);
         if (this->listener) {
             this->listener->on_controller_state(this->controller_state);
         }
@@ -96,6 +136,7 @@ void ControllerRole::Impl::cleanup() {
     this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
     this->event_state->slot.reset();
     this->controller_state = {};
+    this->supported_commands_mask.store(0, std::memory_order_relaxed);
 
     // Unstamped: a clear is idempotent, so it is delivered whatever teardown overtook it.
     push_event_or_log(this->inbox, InboxEventType::CONTROLLER_CLEARED, 0, TAG,
