@@ -1344,7 +1344,8 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     EXPECT_GT(conn->time_message_send_count_, 0)
         << "client/time must keep flowing while activities declare pairing";
 
-    this->client_->update_state(SendspinClientState::SYNCHRONIZED);
+    // Any change publishes.
+    this->client_->set_available(false);
     EXPECT_TRUE(any_frame_of_type(conn->sent_text_, "client/state"))
         << "client/state must keep flowing while activities declare pairing";
 

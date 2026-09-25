@@ -885,11 +885,8 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/state";
-    // messaging.md "client/state": the payload's client-level field is the boolean `available`,
-    // not a multi-valued state string. It is true only when the client is operational
-    // (SYNCHRONIZED); every other internal state (ERROR, EXTERNAL_SOURCE) reports false, matching
-    // "External Source Handling"'s available:false contract.
-    root["payload"]["available"] = (msg->state == SendspinClientState::SYNCHRONIZED);
+    // messaging.md "External Source Handling": false means the client will not yield to Sendspin.
+    root["payload"]["available"] = msg->available;
 
     if (msg->player.has_value()) {
         const ClientPlayerStateObject& player_state = msg->player.value();

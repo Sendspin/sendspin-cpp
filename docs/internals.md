@@ -127,13 +127,12 @@ State currently on the Inbox:
 | `ColorRole::Impl::slot` | `INBOX_TOPIC_COLOR` | `PendingColorStates` (oldest + newest `ServerColorStateObject`, coalescing merge) | Network thread |
 | `PlayerRole::Impl::EventState::stream_params_slot` | `INBOX_TOPIC_PLAYER_STREAM_PARAMS` | `ServerPlayerStreamObject` (latest wins) | Network thread |
 | `PlayerRole::Impl::EventState::command_slot` | `INBOX_TOPIC_PLAYER_COMMAND` | `ServerCommandMessage` (field-by-field merge) | Network thread |
-| `PlayerRole::Impl::EventState::state_slot` | `INBOX_TOPIC_PLAYER_STATE` | `SendspinClientState` (latest wins) | Sync task thread |
 | `VisualizerRole::Impl::EventState::config_slot` | `INBOX_TOPIC_VISUALIZER_CONFIG` | `ServerVisualizerStreamObject` (latest wins) | Network thread |
 | `ArtworkRole::Impl::EventState::display_slot` | `INBOX_TOPIC_ARTWORK_DISPLAY` | `ArtworkDisplayUpdate` (per-slot display timestamp + epoch, merged) | Artwork decode thread |
 
 One family of main-loop-bound notifications deliberately stays off the Inbox: the pairing/trust listener notifications (`on_pairing_started`, `on_pairing_succeeded`, `on_pairing_failed`, `on_trust_changed`, and the pairing-code/pairing-window prompts). They are queued as tagged `PairingNote` entries in `SendspinClient::EventState::pairing_notes` by the `note_*()` methods, produced only on the main loop (by `ConnectionManager` while `conn_ptr_mutex_` is held, and by `stop()` for the pairing-UI dismissals) and dispatched later in the same `SendspinClient::loop()` tick after that lock is released. The deferral exists to fire the callbacks unlocked, not to cross threads, and the payloads carry strings the POD-only ring cannot, so no mutex or topic bit is involved. Dispatch moves the queue out first (so a callback that re-enters connection teardown cannot invalidate the iteration), then fires grouped by note type in a fixed precedence order (started, succeeded, trust, failed, display-code, clear-code, open-window, close-window) rather than queue order; the window/code-clear types coalesce to at most one callback per tick. `cleanup_connection_state()` clears the queue and bumps the same drain generation the ring drain uses, so a teardown re-entered from a dispatch callback also abandons the rest of that tick's already-moved batch.
 
-All roles have been migrated onto the Inbox. The controller/metadata/color roles write or merge server state into their `InboxSlot` from `handle_server_state()`, and their disconnect clear arrives as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The player role owns three `InboxSlot`s (stream params, command, and client state, on its `EventState`) plus `PLAYER_STREAM` lifecycle events on the shared ring; its disconnect clear is the synthetic STREAM_END that `cleanup()` pushes onto the ring. The visualizer role writes its stream config to `config_slot` and delivers STREAM_START/END/CLEAR as `VISUALIZER_STREAM` ring events (no per-tick `drain_events()`; the config is taken when the START event is dispatched). The artwork role merges per-slot display timestamps (tagged with the channel's decode-time `slot_epochs[slot]` value) into `display_slot`, delivers STREAM_END/CLEAR as `ARTWORK_STREAM` ring events, and keeps a per-tick `drain_events()` for its server-clock display-deadline sweep. Both roles' disconnect clears are synthetic stream events that `cleanup()` pushes onto the ring.
+All roles have been migrated onto the Inbox. The controller/metadata/color roles write or merge server state into their `InboxSlot` from `handle_server_state()`, and their disconnect clear arrives as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The player role owns two `InboxSlot`s (stream params and command, on its `EventState`) plus `PLAYER_STREAM` lifecycle events on the shared ring; its disconnect clear is the synthetic STREAM_END that `cleanup()` pushes onto the ring. The visualizer role writes its stream config to `config_slot` and delivers STREAM_START/END/CLEAR as `VISUALIZER_STREAM` ring events (no per-tick `drain_events()`; the config is taken when the START event is dispatched). The artwork role merges per-slot display timestamps (tagged with the channel's decode-time `slot_epochs[slot]` value) into `display_slot`, delivers STREAM_END/CLEAR as `ARTWORK_STREAM` ring events, and keeps a per-tick `drain_events()` for its server-clock display-deadline sweep. Both roles' disconnect clears are synthetic stream events that `cleanup()` pushes onto the ring.
 
 ### SpscRingBuffer (`src/platform/spsc_ring_buffer.h`)
 
@@ -305,13 +304,11 @@ Most roles implement `drain_events()` to process their deferred state on the mai
 
 ### PlayerRole::Impl::drain_events() (`src/player_role.cpp`)
 
-Three stages, processed in order:
+Two stages, processed in order:
 
-**1. Client state updates**: Takes from `state_slot` (latest-wins `InboxSlot`, written by the sync task). Calls `client_->update_state()`.
+**1. Server commands**: Takes from `command_slot`. Checks each field independently (volume, mute, output_delay) and fires the corresponding listener callback.
 
-**2. Server commands**: Takes from `command_slot`. Checks each field independently (volume, mute, output_delay) and fires the corresponding listener callback.
-
-**3. Stream lifecycle**: The most complex part:
+**2. Stream lifecycle**: The most complex part:
 
 ```api
 PLAYER_STREAM ring events → on_stream_ring_event() → awaiting_sync_idle_events list
@@ -414,7 +411,7 @@ INITIAL_SYNC ──→ LOAD_CHUNK ──→ SYNCHRONIZE_AUDIO ──→ TRANSFER
 
 **INITIAL_SYNC**: Fills the audio pipeline with silence to prime DMA buffers. Sleeps briefly after sending to let the audio stack start consuming. Once the first playback-progress callback confirms frames were consumed, it queues `extra_startup_silence_ms` of additional silence (see `PlayerRoleConfig`) and drains it before advancing to LOAD_CHUNK. This extra lead gives the decode pipeline slack to stay ahead of the sink at stream start, preventing the initial-playback stutter caused by the decoder briefly falling behind.
 
-**LOAD_CHUNK**: Reads the next encoded chunk from the ring buffer. Waits for time sync (on the pinned connection's filter) if not yet available. Decodes audio via FLAC/Opus/PCM decoder. On a ring-buffer underflow (no chunk ready) **while still aligning** (startup or post-seek), it feeds silence toward the sink to keep the DAC fed while the decode pipeline catches up, instead of letting it run dry; SYNCHRONIZE_AUDIO then re-aligns the next chunk against wherever the silence carried us. In steady state it does **not** fill - an empty buffer there means the stream is winding down, and stuffing silence would pile up in the sink and delay a rapid restart (a genuine underrun instead surfaces as an error in SYNCHRONIZE_AUDIO).
+**LOAD_CHUNK**: Reads the next encoded chunk from the ring buffer. Waits for time sync (on the pinned connection's filter) if not yet available. Decodes audio via FLAC/Opus/PCM decoder. On a ring-buffer underflow (no chunk ready) **while still aligning** (startup or post-seek), it feeds silence toward the sink to keep the DAC fed while the decode pipeline catches up, instead of letting it run dry; SYNCHRONIZE_AUDIO then re-aligns the next chunk against wherever the silence carried us. In steady state it does **not** fill - an empty buffer there means the stream is winding down, and stuffing silence would pile up in the sink and delay a rapid restart (a genuine underrun instead surfaces in SYNCHRONIZE_AUDIO as a logged loss of sync).
 
 **SYNCHRONIZE_AUDIO**: Computes the sync error:
 
@@ -432,7 +429,7 @@ Where `decoded_timestamp` is the server timestamp converted to client time (via 
 | -100 to -5000 us | **Soft sync**: remove last frame (blend into second-to-last) |
 | -100 to +100 us | **Dead zone**: pass audio through unmodified |
 
-Hard sync sets a flag that switches to a tighter 500 us settle threshold until the error is small enough to exit hard sync mode.
+Hard sync sets a flag that switches to a tighter 500 us settle threshold until the error is small enough to exit hard sync mode. A hard sync outside alignment (startup or post-seek) is a loss of sync, logged when it starts and when the next in-tolerance sync ends it.
 
 **TRANSFER_AUDIO**: Writes PCM data to the audio sink via `on_audio_write`. If silence was inserted (hard sync ahead), transfers silence first, then re-enters SYNCHRONIZE_AUDIO for the held-back decoded data.
 

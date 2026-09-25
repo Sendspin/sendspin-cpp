@@ -816,7 +816,6 @@ TEST(Protocol, FormatClientHelloVisualizerSupport) {
 // frame-rate cap, and the spectrum layout, which is sent only with that type.
 TEST(Protocol, FormatClientStateVisualizerCarriesStreamConfig) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
     ClientVisualizerStateObject vis{};
     vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
                  VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
@@ -849,7 +848,6 @@ TEST(Protocol, FormatClientStateVisualizerCarriesStreamConfig) {
 // empty array, and the frame-rate cap that applies once it asks for a periodic type.
 TEST(Protocol, FormatClientStateVisualizerWithoutTypesStillReportsRateMax) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
     ClientVisualizerStateObject vis{};
     vis.rate_max = 24;
     msg.visualizer = vis;
@@ -865,7 +863,6 @@ TEST(Protocol, FormatClientStateVisualizerWithoutTypesStillReportsRateMax) {
 // Control: a client with no visualizer role sends no visualizer object at all.
 TEST(Protocol, FormatClientStateOmitsVisualizerWhenUnset) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
@@ -905,7 +902,6 @@ TEST(Protocol, FormatClientLeaveHasEmptyPayload) {
 // differ here so a serializer that emitted one of them under another's key would be caught.
 TEST(Protocol, FormatClientStatePlayerCarriesTimingFields) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
     ClientPlayerStateObject player{};
     player.output_delay_ms = 120;
     player.required_lead_time_ms = 340;
@@ -942,7 +938,6 @@ TEST(Protocol, FormatClientHelloPlayerSupportOmitsSupportedCommands) {
 // value is the (possibly empty) list of commands the player accepts.
 TEST(Protocol, FormatClientStatePlayerCarriesSupportedCommands) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
     ClientPlayerStateObject player{};
     player.supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE,
                                  SendspinPlayerCommand::SET_OUTPUT_DELAY};
@@ -961,7 +956,6 @@ TEST(Protocol, FormatClientStatePlayerCarriesSupportedCommands) {
 // dropping it, which a server reads as a player whose state it must not try to set.
 TEST(Protocol, FormatClientStatePlayerEmptySupportedCommandsIsStillEmitted) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
     msg.player = ClientPlayerStateObject{};
 
     JsonDocument doc;
@@ -974,7 +968,6 @@ TEST(Protocol, FormatClientStatePlayerEmptySupportedCommandsIsStillEmitted) {
 // serializer that skipped falsy timing fields would pass the test above and fail this one.
 TEST(Protocol, FormatClientStatePlayerReportsZeroTimingFields) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
     msg.player = ClientPlayerStateObject{};
 
     JsonDocument doc;
@@ -990,7 +983,6 @@ TEST(Protocol, FormatClientStatePlayerReportsZeroTimingFields) {
 // serializer that wrote one channel's value under another's key would be caught.
 TEST(Protocol, FormatClientStateArtworkChannels) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
     ClientArtworkStateObject artwork{};
     artwork.channels.push_back({SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 240});
     artwork.channels.push_back({SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 48});
@@ -1018,7 +1010,6 @@ TEST(Protocol, FormatClientStateArtworkChannels) {
 // are required only for a channel that is actually served.
 TEST(Protocol, FormatClientStateArtworkNoneChannelOmitsFormatAndSize) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
     ClientArtworkStateObject artwork{};
     artwork.channels.push_back({SendspinImageSource::NONE, SendspinImageFormat::JPEG, 320, 240});
     msg.artwork = artwork;
@@ -1037,37 +1028,24 @@ TEST(Protocol, FormatClientStateArtworkNoneChannelOmitsFormatAndSize) {
 // state unchanged on the server rather than declaring an empty channel list.
 TEST(Protocol, FormatClientStateOmitsArtworkWhenUnset) {
     ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
     EXPECT_TRUE(doc["payload"]["artwork"].isUnbound());
 }
 
-// messaging.md "client/state": the client-level field is the boolean `available`, not a
-// multi-valued state string, and the spec has no separate error signal (see "External Source
-// Handling"). No legacy top-level "state" key may appear either: a strict-mode server hard-rejects
-// a client/state carrying an unknown field.
+// messaging.md "client/state": the client-level field is the boolean `available`. No top-level
+// "state" key may appear: a strict-mode server rejects a client/state carrying an unknown field.
 TEST(Protocol, FormatClientStateReportsAvailabilityAsABoolean) {
-    struct Row {
-        const char* name;
-        SendspinClientState state;
-        bool expected_available;
-    };
-    const Row rows[] = {
-        {"Control: synchronized", SendspinClientState::SYNCHRONIZED, true},
-        {"error", SendspinClientState::ERROR, false},
-        {"external source", SendspinClientState::EXTERNAL_SOURCE, false},
-    };
-
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
+    for (const bool available : {true, false}) {
+        SCOPED_TRACE(available ? "available" : "unavailable");
         ClientStateMessage msg;
-        msg.state = row.state;
+        msg.available = available;
 
         JsonDocument doc;
         ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
-        EXPECT_EQ(doc["payload"]["available"].as<bool>(), row.expected_available);
+        ASSERT_TRUE(doc["payload"]["available"].is<bool>());
+        EXPECT_EQ(doc["payload"]["available"].as<bool>(), available);
         EXPECT_FALSE(doc["payload"]["state"].is<const char*>())
             << "client/state must not carry the legacy top-level 'state' field";
     }

@@ -225,7 +225,6 @@ void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
     this->inbox = &inbox;
     this->event_state->stream_params_slot.bind(inbox, INBOX_TOPIC_PLAYER_STREAM_PARAMS);
     this->event_state->command_slot.bind(inbox, INBOX_TOPIC_PLAYER_COMMAND);
-    this->event_state->state_slot.bind(inbox, INBOX_TOPIC_PLAYER_STATE);
 }
 
 bool PlayerRole::Impl::start() {
@@ -466,12 +465,6 @@ void PlayerRole::Impl::on_stream_ring_event(PlayerStreamCallbackType event) {
 }
 
 void PlayerRole::Impl::drain_events() {
-    // --- Client state events (from the sync task, via the latest-wins state slot) ---
-    SendspinClientState state{};
-    if (this->event_state->state_slot.take(state)) {
-        this->client->update_state(state);
-    }
-
     // --- Server command events (volume, mute, output delay) ---
     // Check each field independently since multiple command types may have been
     // merged into one inbox slot between drain ticks.
@@ -620,7 +613,6 @@ void PlayerRole::Impl::cleanup() {
     // discards them (see event_is_current()).
     this->event_state->stream_params_slot.reset();
     this->event_state->command_slot.reset();
-    this->event_state->state_slot.reset();
 
     // Enqueue a clean STREAM_END - drain_events() will fire the callback (enqueue_stream_event()
     // logs if the ring is too full to take it)
@@ -649,14 +641,6 @@ bool PlayerRole::Impl::send_audio_chunk(const uint8_t* data, size_t data_size, i
 
     return this->sync_task->write_audio_chunk(data, data_size, timestamp,
                                               static_cast<ChunkType>(chunk_type), timeout_ms);
-}
-
-void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) const {
-    // Latest-wins slot, never the shared event ring: consecutive transitions between drains
-    // collapse to the newest (matching the drain's semantics), and a sync task that keeps
-    // transitioning while the main loop stalls cannot fill the ring and starve the
-    // non-idempotent lifecycle events that live there.
-    this->event_state->state_slot.write(state);
 }
 
 void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event,

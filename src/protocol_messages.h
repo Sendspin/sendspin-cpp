@@ -363,19 +363,6 @@ inline std::optional<PairAbortReason> pair_abort_reason_from_string(const std::s
 
 // --- types.h ---
 
-inline const char* to_cstr(SendspinClientState state) {
-    switch (state) {
-        case SendspinClientState::SYNCHRONIZED:
-            return "synchronized";
-        case SendspinClientState::EXTERNAL_SOURCE:
-            return "external_source";
-        case SendspinClientState::ERROR:
-            // Intentional fallthrough
-        default:
-            return "error";
-    }
-}
-
 inline const char* to_cstr(SendspinGoodbyeReason reason) {
     switch (reason) {
         case SendspinGoodbyeReason::ANOTHER_SERVER:
@@ -801,7 +788,7 @@ struct ClientHelloMessage {
 
 /// @brief Outgoing client/state message reporting client playback state to the server
 struct ClientStateMessage {
-    SendspinClientState state{};
+    bool available{true};
     std::optional<ClientPlayerStateObject> player{};
     std::optional<ClientArtworkStateObject> artwork{};
     std::optional<ClientVisualizerStateObject> visualizer{};

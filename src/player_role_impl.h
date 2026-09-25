@@ -73,12 +73,6 @@ struct PlayerRole::Impl {
     struct EventState {
         InboxSlot<ServerPlayerStreamObject> stream_params_slot;
         InboxSlot<ServerCommandMessage> command_slot;
-        // Client state from the sync task. Latest-wins by design (the old ring events were
-        // collapsed to the newest at drain time anyway), and deliberately not on the event
-        // ring: the sync task is the one producer that can keep emitting while the main loop
-        // stalls, and un-coalesced state transitions must not be able to fill the shared ring
-        // and starve non-idempotent lifecycle events out of it.
-        InboxSlot<SendspinClientState> state_slot;
     };
 
     // ========================================
@@ -109,7 +103,7 @@ struct PlayerRole::Impl {
     // ever consumed from the STREAM_START branch while that event sits in
     // awaiting_sync_idle_events, which the awaiting_sync_idle_events term above already covers.
     bool needs_drain(uint32_t pending_bits) const {
-        return (pending_bits & (INBOX_TOPIC_PLAYER_COMMAND | INBOX_TOPIC_PLAYER_STATE)) != 0 ||
+        return (pending_bits & INBOX_TOPIC_PLAYER_COMMAND) != 0 ||
                !this->awaiting_sync_idle_events.empty();
     }
     void drain_events();
@@ -149,7 +143,6 @@ struct PlayerRole::Impl {
 
     bool send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
                           uint8_t chunk_type, uint32_t timeout_ms) const;
-    void enqueue_state_update(SendspinClientState state) const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
     void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation) const;

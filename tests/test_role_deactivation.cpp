@@ -540,9 +540,9 @@ TEST(RoleDeactivation, ReAddedPlayerPublishesItsStateAndPlaysAgain) {
     const size_t states_before_readd = server->client_states().size();
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","metadata@v1"])")));
 
-    // The teardown above returned the sync task to idle, which publishes a client/state of its
-    // own; that state carries no player object (publish_client_state() gates each role object on
-    // the connection's active roles) and may still be in flight here. Waiting for "one more
+    // The activate that removed the player published a client/state of its own; that state
+    // carries no player object (publish_client_state() gates each role object on the
+    // connection's active roles) and may still be in flight here. Waiting for "one more
     // state than before" would therefore be satisfied by it, so wait for a state published after
     // the re-add that carries the object, and assert on that one. A re-add that publishes no such
     // state hangs here and the suite watchdog names it, as everywhere else in this file.

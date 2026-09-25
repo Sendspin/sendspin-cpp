@@ -1032,20 +1032,16 @@ player.update_output_delay(50);  // User-adjustable delay in ms
 player.set_output_delay_adjustable(true);
 ```
 
-## Updating Client State
+## External Sources
 
-Report the client's overall state to the server. Use this when your device switches to an external audio source or encounters an error:
+A device can be taken over by something other than Sendspin: a local source, another protocol,
+an HDMI input. How it tells the server depends on whether Sendspin may take it back (messaging.md
+"External Source Handling").
 
-```cpp
-client.update_state(SendspinClientState::EXTERNAL_SOURCE);  // Playing from another source
-client.update_state(SendspinClientState::ERROR);             // Error condition
-client.update_state(SendspinClientState::SYNCHRONIZED);      // Back to normal
-```
-
-## Leaving the Group
+### Leaving the Group
 
 A device that plays a local source it can be interrupted out of stays available and leaves its
-group instead of reporting itself unavailable:
+group:
 
 ```cpp
 client.leave();  // Sends client/leave
@@ -1053,12 +1049,26 @@ client.leave();  // Sends client/leave
 
 The server treats this as it treats a client becoming unavailable: the client ends up alone in a
 stopped group and rejoins only when an operator switches it back. Availability is unchanged, so
-the server may still take the client over for new playback. A device that will not yield reports
-`SendspinClientState::EXTERNAL_SOURCE` instead.
+the server may still take the client over for new playback.
 
 Leaving is only meaningful while the group is playing; a client in a stopped group keeps its
 grouping by staying. The call needs an admitted connection that has received its first
 `server/activate`, and is ignored (with a log) otherwise. Call it from the main loop thread.
+
+### Reporting Unavailability
+
+A device that will not yield to Sendspin while the other activity runs reports itself
+unavailable, and available again as soon as it would yield:
+
+```cpp
+client.set_available(false);  // client/state with available: false
+client.set_available(true);   // Sendspin may take the device over again
+bool available = client.is_available();
+```
+
+The server moves an unavailable client into a stopped group of its own and does not take it over
+until it is available again. Availability is kept across disconnects and `stop()`/`start()`, and
+only a change publishes a `client/state`. Call it from the main loop thread.
 
 ## Querying State
 
@@ -1425,14 +1435,6 @@ format arrives as the `format` argument of `on_display_pairing_code`.
 | `SET_OUTPUT_DELAY` | Output delay adjustment from the server |
 
 These represent commands the server can send to the player. The player advertises which commands it supports. Enable `SET_OUTPUT_DELAY` with `player.set_output_delay_adjustable(true)`.
-
-### SendspinClientState
-
-| Value | Description |
-|---|---|
-| `SYNCHRONIZED` | Normal synchronized state |
-| `ERROR` | Error state |
-| `EXTERNAL_SOURCE` | Playing from an external source |
 
 ### SendspinGoodbyeReason
 

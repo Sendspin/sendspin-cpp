@@ -374,7 +374,6 @@ void SendspinClient::stop() {
     //    group_state_ from a delta that arrived before the stop.
     this->cleanup_connection_state();
     this->group_state_ = GroupUpdateObject{};
-    this->state_ = SendspinClientState::SYNCHRONIZED;
 
     // A pairing attempt cut short by the stop leaves its code or pairing-window prompt showing.
     // Queue the dismissals now, after cleanup_connection_state() wiped the pending notes, so the
@@ -923,8 +922,11 @@ std::optional<ServerInformationObject> SendspinClient::get_server_information() 
 // State updates
 // ============================================================================
 
-void SendspinClient::update_state(SendspinClientState state) {
-    this->state_ = state;
+void SendspinClient::set_available(bool available) {
+    if (available == this->available_) {
+        return;
+    }
+    this->available_ = available;
     // current_shared(): see send_text().
     auto conn = this->connection_manager_->current_shared();
     this->publish_client_state(conn.get());
@@ -1847,7 +1849,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     }
 
     ClientStateMessage state_msg;
-    state_msg.state = this->state_;
+    state_msg.available = this->available_;
 
     // messaging.md "client/state": a role object is included only while that role is active.
     // This client goes further and includes every active role's object on every update, so the

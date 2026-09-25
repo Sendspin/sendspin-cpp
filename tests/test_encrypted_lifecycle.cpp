@@ -92,6 +92,7 @@ constexpr uint16_t REKEY_ROLE_SEND_TEST_PORT = 19010;
 constexpr uint16_t REPROVE_REHANDSHAKE_TEST_PORT = 19011;
 constexpr uint16_t COMBINED_FIRST_TEST_PORT = 19012;
 constexpr uint16_t COMBINED_REKEY_TEST_PORT = 19013;
+constexpr uint16_t AVAILABILITY_TEST_PORT = 19079;
 constexpr uint16_t RESELECT_PAIRING_TEST_PORT = 19015;
 constexpr uint16_t ROLE_STATE_OBJECTS_TEST_PORT = 19016;
 constexpr uint16_t ROLE_ADDED_STATE_TEST_PORT = 19017;
@@ -893,6 +894,46 @@ TEST(EncryptedLifecycle, LeaveIsSentOnlyOnAnActivatedConnection) {
     pump_until(client, [&] { return client.is_connected(); });
     client.leave();
     pump_until(client, [&] { return server->client_leave_count() == 1; });
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// messaging.md "External Source Handling": availability set before a connection reaches its first
+// client/state, each change publishes once, and restating the current value sends nothing.
+TEST(EncryptedLifecycle, AvailabilityIsDeviceStateAndPublishesOnChange) {
+    SendspinClientConfig config;
+    config.name = "Availability Test Client";
+    config.server_port = AVAILABILITY_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+    client.set_available(false);
+    EXPECT_FALSE(client.is_available());
+
+    auto available_in = [](const std::string& state) {
+        JsonDocument doc;
+        EXPECT_EQ(deserializeJson(doc, state), DeserializationError::Ok);
+        return doc["payload"]["available"].as<bool>();
+    };
+
+    auto server = connect_paired_server(bundle.peer, AVAILABILITY_TEST_PORT);
+    pump_until(client, [&] { return !server->client_states().empty(); });
+    EXPECT_FALSE(available_in(server->client_states().front()))
+        << "the first client/state lost the availability set before the connection";
+
+    const size_t states_before_change = server->client_states().size();
+    client.set_available(true);
+    pump_until(client,
+               [&] { return server->client_states().size() > states_before_change; });
+    EXPECT_TRUE(available_in(server->client_states().back()));
+
+    const size_t states_before_repeat = server->client_states().size();
+    client.set_available(true);
+    pump_for(client, 50);
+    EXPECT_EQ(server->client_states().size(), states_before_repeat)
+        << "restating the current availability published a client/state";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

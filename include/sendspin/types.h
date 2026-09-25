@@ -27,13 +27,6 @@ namespace sendspin {
 // Common types
 // ============================================================================
 
-/// @brief Client playback state reported to the server
-enum class SendspinClientState : uint8_t {
-    SYNCHRONIZED,     // Client is synchronized and playing from the server
-    ERROR,            // Client encountered a playback error
-    EXTERNAL_SOURCE,  // Client is playing from a non-Sendspin source
-};
-
 /// @brief Reason sent in a client/goodbye message when disconnecting
 enum class SendspinGoodbyeReason : uint8_t {
     ANOTHER_SERVER,      // Client is switching to another server

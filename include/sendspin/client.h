@@ -607,11 +607,18 @@ public:
     // State updates
     // ========================================
 
-    /// @brief Updates the client state (synchronized, error, external_source) and publishes
+    /// @brief Sets whether the client is available for Sendspin playback; publishes on a change
     ///
-    /// Main loop only: the stored state it writes is the same state the publish reads.
-    /// @param state The new client state to publish
-    void update_state(SendspinClientState state);
+    /// messaging.md "External Source Handling": false only while the device will not yield to
+    /// Sendspin, which moves it to a stopped group of its own. An activity Sendspin may interrupt
+    /// calls leave() instead. Kept across disconnects and stop()/start(). Main loop only.
+    /// @param available false while the device will not yield to Sendspin.
+    void set_available(bool available);
+
+    /// @brief Whether the client reports itself available; see set_available(). Main loop only.
+    bool is_available() const {
+        return this->available_;
+    }
 
     /// @brief Leaves the current group with messaging.md "client/leave". Main loop only.
     ///
@@ -620,8 +627,7 @@ public:
     /// server treats it as it treats a client becoming unavailable: this client ends up alone in
     /// a stopped group, and rejoins only when an operator switches it back. Leaving does not
     /// change availability, so the server may still take the client over for new playback; a
-    /// client that will not yield reports SendspinClientState::EXTERNAL_SOURCE through
-    /// update_state() instead.
+    /// client that will not yield calls set_available(false) instead.
     ///
     /// Only meaningful while the group is playing: a client in a stopped group keeps its
     /// grouping by staying. Ignored, with a log, unless a connection is admitted and its latest
@@ -943,10 +949,9 @@ private:
     std::unique_ptr<VisualizerRole> visualizer_;
 #endif
 
-    // 32-bit fields
-    SendspinClientState state_{SendspinClientState::SYNCHRONIZED};
-
     // 8-bit fields
+    /// Consumer-owned availability; see set_available(). Main loop only.
+    bool available_{true};
     /// Trust level of the active connection; written by on_handshake_complete() and reset by
     /// cleanup_connection_state(), both main loop only, so get_current_trust() needs no lock.
     ConnectionTrust current_trust_{ConnectionTrust::NONE};
