@@ -306,9 +306,9 @@ bool SendspinClient::start() {
         this->identity_provider_ = this->persistence_provider_;
     }
 
-    // A store that came up owing a write (the one-time clearing of the pre-slot records key)
-    // flushes on the first tick, through the same deferred path a pairing uses: the provider is
-    // main-loop-only and the store never calls it itself outside that flush.
+    // A store that came up owing a write (a duplicate slot cleared at load) flushes on the first
+    // tick, through the same deferred path a pairing uses: the provider is main-loop-only and the
+    // store never calls it itself outside that flush.
     if (this->record_store_->has_pending_writes()) {
         this->event_state_->records_dirty_slot.write(true);
     }

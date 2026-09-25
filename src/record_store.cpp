@@ -35,11 +35,6 @@ namespace sendspin {
 
 namespace {
 
-/// @brief The key long-term records shared before they moved to one slot per key. It is not part
-/// of persistence_keys: nothing reads it, and the store's only interest in it is emptying it
-/// once (see load_records_from_provider()).
-constexpr const char* LEGACY_RECORDS_KEY = "records";
-
 /// @brief Shared load -> string_view -> decode -> warn-on-failure -> secure_zero(blob) shape used
 /// by the record-slot and PAIRING_PSK loaders below. STATIC_PAIRING_CODE (no decoder, no PSK
 /// bytes) and PAIR_CONFIG (no PSK bytes) differ enough to stay direct.
@@ -124,23 +119,6 @@ void RecordStore::load_records_from_provider() {
             StoredRecord{std::move(decoded.value()), static_cast<uint8_t>(slot)});
     }
     this->load_record_order_from_provider();
-    this->note_legacy_records_key();
-}
-
-void RecordStore::note_legacy_records_key() {
-    // The pre-slot key holds base64url long-term PSKs for every server paired before the move to
-    // per-slot keys. Nothing reads it any more and nothing else would ever overwrite it, so the
-    // store empties it once: an empty blob rather than erase_blob(), which belongs to the
-    // application and which this store's own free-slot marker does not use either. The write is
-    // owed to the next persist_records() like any other, so it lands on the main loop.
-    auto blob = this->provider_->load_blob(LEGACY_RECORDS_KEY);
-    if (!blob.has_value() || blob->empty()) {
-        return;
-    }
-    secure_zero(blob->data(), blob->size());
-    SS_LOGW(TAG, "Clearing the pre-slot \"%s\" blob; the records it holds are not migrated",
-            LEGACY_RECORDS_KEY);
-    this->legacy_records_dirty_ = true;
 }
 
 void RecordStore::load_record_order_from_provider() {
@@ -543,15 +521,6 @@ bool RecordStore::persist_records() {
                     write.key.c_str());
             continue;
         }
-        // The pre-slot key is the one durable write that costs no record: it is owed once per
-        // device, and what a rejection leaves behind is key material, not a pairing.
-        if (write.key == LEGACY_RECORDS_KEY) {
-            SS_LOGW(TAG,
-                    "Provider rejected the \"%s\" write; the long-term PSKs in the pre-slot key "
-                    "stay in storage until a later boot clears it",
-                    write.key.c_str());
-            continue;
-        }
         SS_LOGW(TAG,
                 "Provider rejected the \"%s\" write; that change is RAM-only for this boot: "
                 "a record stored since the last accepted write will not survive a reboot, and "
@@ -563,7 +532,7 @@ bool RecordStore::persist_records() {
 
 bool RecordStore::has_pending_writes() const {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    return this->order_dirty_ || this->legacy_records_dirty_ || !this->dirty_slots_.empty();
+    return this->order_dirty_ || !this->dirty_slots_.empty();
 }
 
 bool RecordStore::note_record_removed(const std::string& psk_id) {
@@ -677,7 +646,6 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
     if (this->provider_ == nullptr) {
         this->dirty_slots_.clear();
         this->order_dirty_ = false;
-        this->legacy_records_dirty_ = false;
         return writes;
     }
     writes.reserve(this->dirty_slots_.size() + 1);
@@ -707,15 +675,6 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
         }
         writes.push_back(std::move(order));
         this->order_dirty_ = false;
-    }
-
-    if (this->legacy_records_dirty_) {
-        SlotWrite legacy;
-        legacy.key = LEGACY_RECORDS_KEY;  // Empty blob: see note_legacy_records_key().
-        // Durable: a rejection leaves long-term PSKs sitting in storage.
-        legacy.durable = true;
-        writes.push_back(std::move(legacy));
-        this->legacy_records_dirty_ = false;
     }
     return writes;
 }

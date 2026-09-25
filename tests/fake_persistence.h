@@ -20,7 +20,7 @@
 /// revocation-durability warnings). Prefer this over a bespoke per-file provider when a test
 /// only needs a generic blob store with optional failure injection; keep a bespoke fake when a
 /// test needs to observe or shape a specific call in a way this one does not (e.g. distinguishing
-/// an add from a removal on the "records" key, or serving canned/mismatched codec content).
+/// an add from a removal on a record slot key, or serving canned/mismatched codec content).
 
 #pragma once
 

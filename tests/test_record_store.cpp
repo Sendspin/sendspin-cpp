@@ -663,7 +663,6 @@ TEST(RecordStore, ARejectedWriteWarnsOnlyWhenTheNextBootCannotRebuildIt) {
     using Action = void (*)(RecordStore&, const std::vector<SendspinPairingRecord>&);
     struct Row {
         const char* name;
-        bool seed_legacy_key;
         Action act;
         /// The key the warning must name, or nullptr when the rejection must stay below warn.
         const char* warns_about;
@@ -671,37 +670,31 @@ TEST(RecordStore, ARejectedWriteWarnsOnlyWhenTheNextBootCannotRebuildIt) {
         const char* cost;
     };
     const Row rows[] = {
-        {"used-flip-only", false,
+        {"used-flip-only",
          [](RecordStore& store, const std::vector<SendspinPairingRecord>& records) {
              ASSERT_TRUE(store.note_record_used(records[2].psk_id));
              EXPECT_FALSE(store.persist_records());
          },
          nullptr, nullptr},
-        {"order-only", false,
+        {"order-only",
          [](RecordStore& store, const std::vector<SendspinPairingRecord>& records) {
              ASSERT_TRUE(store.note_record_used(records[0].psk_id));
              EXPECT_FALSE(store.persist_records());
          },
          nullptr, nullptr},
         // Control: a write the next boot cannot reconstruct says so.
-        {"pairing", false,
+        {"pairing",
          [](RecordStore& store, const std::vector<SendspinPairingRecord>&) {
              auto outcome = store.resolve_pairing_outcome("server-paired");
              ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
              EXPECT_FALSE(store.persist_records());
          },
          "rec_3", "will not survive a reboot"},
-        {"revocation", false,
+        {"revocation",
          [](RecordStore& store, const std::vector<SendspinPairingRecord>& records) {
              EXPECT_FALSE(remove_record(store, records[0].psk_id));
          },
          "rec_0", "valid again"},
-        // The pre-slot key costs no record, but a rejected clear leaves long-term PSKs in
-        // storage, so it warns rather than passing as bookkeeping. It is owed once per device.
-        {"legacy-clear", true, [](RecordStore& store, const std::vector<SendspinPairingRecord>&) {
-             EXPECT_FALSE(store.persist_records());
-         },
-         "records", "stay in storage"},
     };
 
     for (const Row& row : rows) {
@@ -709,12 +702,8 @@ TEST(RecordStore, ARejectedWriteWarnsOnlyWhenTheNextBootCannotRebuildIt) {
         InMemoryPersistenceProvider provider;
         const std::vector<SendspinPairingRecord> records = seeded();
         seed_records(provider, records);
-        if (row.seed_legacy_key) {
-            provider.seed_blob("records", blob_bytes(R"([{"v":1,"psk_id":"old","psk":"old"}])"));
-        }
         RecordStore store(&provider);
         reject_record_saves(provider);
-        provider.reject_save_keys.insert("records");
 
         std::string output;
         {
@@ -759,42 +748,6 @@ TEST(RecordStore, ADuplicatePskIdInASecondSlotDoesNotOutliveARevocation) {
         << "a revoked psk_id must not come back from a duplicate slot";
     // Control: the record that was never duplicated is untouched by the dedupe.
     EXPECT_TRUE(rebooted.resolve_by_psk_id(keeper.psk_id, PskCategory::LONG_TERM).has_value());
-}
-
-// A device upgrading from the single pre-slot records key still holds long-term PSKs under it.
-// Nothing reads that key any more, so the store empties it once, through the same deferred
-// flush every other write goes through, and then leaves it alone.
-TEST(RecordStore, TheLegacyRecordsKeyIsEmptiedOnceAndNotTouchedAgain) {
-    InMemoryPersistenceProvider provider;
-    const std::string legacy_key = "records";
-    provider.seed_blob(legacy_key, blob_bytes(R"([{"v":1,"psk_id":"old","psk":"old"}])"));
-
-    {
-        RecordStore store(&provider);
-        EXPECT_TRUE(store.has_pending_writes()) << "the cleanup must be owed to the next flush";
-        EXPECT_TRUE(store.persist_records());
-        ASSERT_TRUE(provider.blob(legacy_key).has_value());
-        EXPECT_TRUE(provider.blob(legacy_key)->empty())
-            << "the pre-slot blob must stop holding PSK material";
-    }
-
-    // Control: a later boot finds it already empty and owes nothing.
-    const int writes_before = provider.save_attempts(legacy_key);
-    RecordStore rebooted(&provider);
-    EXPECT_FALSE(rebooted.has_pending_writes())
-        << "an already-cleared key must not be rewritten at every boot";
-    EXPECT_TRUE(rebooted.persist_records());
-    EXPECT_EQ(provider.save_attempts(legacy_key), writes_before);
-
-    // Control: a device that never held the key is the common case, and it must not be written
-    // at all -- a provider that only knows the documented keyspace would reject that write.
-    InMemoryPersistenceProvider fresh_provider;
-    RecordStore fresh_store(&fresh_provider);
-    auto outcome = fresh_store.resolve_pairing_outcome("server-fresh");
-    ASSERT_TRUE(fresh_store.store_record_superseding(outcome.record, {}));
-    ASSERT_TRUE(fresh_store.persist_records());
-    EXPECT_EQ(fresh_provider.save_attempts(legacy_key), 0)
-        << "a store that never found the pre-slot key must not write it";
 }
 
 // The mark-used path writes exactly what changed: the first flip of the durable `used` flag

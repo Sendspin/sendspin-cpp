@@ -192,17 +192,16 @@ public:
     /// either way and RAM stays authoritative for the boot.
     ///
     /// A rejection is reported per write rather than per batch, and by what the write carries
-    /// rather than by its key: a write that decides which records the next boot holds, or that
-    /// clears PSK material out of the pre-slot key, warns; one the next boot rebuilds from use
-    /// (the recency order, the `used` flag) reports at debug. The same slot key carries both
-    /// kinds, so the durability travels on the write.
+    /// rather than by its key: a write that decides which records the next boot holds warns;
+    /// one the next boot rebuilds from use (the recency order, the `used` flag) reports at
+    /// debug. The same slot key carries both kinds, so the durability travels on the write.
     /// @return true when every owed write was accepted (or when there is nothing to write, or no
     ///         provider); false when any write was rejected.
     bool persist_records();
 
     /// @brief Whether any write is owed to the next persist_records(). The caller uses it to
-    /// stage that flush for a store that came up owing one (the pre-slot records key).
-    /// @return true when a slot, the record order, or the pre-slot key needs writing.
+    /// stage that flush for a store that came up owing one (a duplicate slot cleared at load).
+    /// @return true when a slot or the record order needs writing.
     [[nodiscard]] bool has_pending_writes() const;
 
     /// @brief Erase the long-term record identified by psk_id from RAM, leaving the durable half
@@ -348,10 +347,6 @@ private:
     /// @brief Reorder the just-loaded records_ by the provider's RECORD_ORDER blob, if present.
     void load_record_order_from_provider();
 
-    /// @brief Owe an empty write for the pre-slot records key when the provider still holds one,
-    /// so the long-term PSKs in it do not sit in storage unreferenced. One-time per device.
-    void note_legacy_records_key();
-
     /// @brief Load pairing_psk_ from the provider's PAIRING_PSK blob, if present, correcting its
     /// psk_id if it disagrees with the loaded secret.
     void load_pairing_psk_from_provider();
@@ -459,9 +454,6 @@ private:
     // 8-bit fields
     /// Whether the record-order blob no longer matches records_'s order.
     bool order_dirty_{false};
-    /// Whether the pre-slot records key still needs its one empty write; see
-    /// note_legacy_records_key().
-    bool legacy_records_dirty_{false};
     bool dynamic_pairing_code_enabled_{true};
     bool pairing_psk_enabled_{true};
     bool static_pairing_code_enabled_{false};
