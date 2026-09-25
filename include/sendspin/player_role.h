@@ -184,10 +184,9 @@ public:
 
     /// @brief Enables or disables the output delay adjustment command. Main loop only.
     ///
-    /// When disabled, the stored delay is not applied to audio sync timing and is reported
-    /// as 0 in client state, per the Sendspin spec (a delay that is not exposed as a knob
-    /// must not be applied). The stored value is preserved and takes effect again if
-    /// adjustability is re-enabled.
+    /// When disabled, the stored delay is not applied to audio sync timing, is reported as 0 in
+    /// client state, and a server set_output_delay command is ignored. The stored value is
+    /// preserved and takes effect again if adjustability is re-enabled.
     /// @param adjustable true if the delay can be adjusted at runtime
     void set_output_delay_adjustable(bool adjustable);
 

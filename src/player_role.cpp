@@ -487,7 +487,13 @@ void PlayerRole::Impl::drain_events() {
                 }
             }
 
-            if (player_cmd.output_delay_ms.has_value()) {
+            // roles/player/v1.md "server/command player object": a command absent from the
+            // current supported_commands is ignored.
+            const bool delay_advertised =
+                this->output_delay_adjustable.load(std::memory_order_relaxed);
+            if (player_cmd.output_delay_ms.has_value() && !delay_advertised) {
+                SS_LOGD(TAG, "Ignoring set_output_delay: not in supported_commands");
+            } else if (player_cmd.output_delay_ms.has_value()) {
                 this->update_output_delay(player_cmd.output_delay_ms.value());
                 if (this->listener) {
                     this->listener->on_output_delay_changed(

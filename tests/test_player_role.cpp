@@ -466,6 +466,26 @@ std::string persisted_delay(const InMemoryPersistenceProvider& provider) {
 
 }  // namespace
 
+// roles/player/v1.md "server/command player object": set_output_delay is only honored while the
+// player advertises it in supported_commands.
+TEST(PlayerRoleOutputDelay, SetOutputDelayCommandIsIgnoredUnlessAdvertised) {
+    for (const bool adjustable : {false, true}) {
+        SCOPED_TRACE(adjustable ? "advertised" : "not advertised");
+        auto impl = make_impl();
+        impl->output_delay_adjustable.store(adjustable);
+
+        ServerPlayerCommandObject player_cmd;
+        player_cmd.command = SendspinPlayerCommand::SET_OUTPUT_DELAY;
+        player_cmd.output_delay_ms = 300;
+        ServerCommandMessage cmd;
+        cmd.player = player_cmd;
+        impl->handle_server_command(cmd, live_generation(*impl));
+        impl->drain_events();
+
+        EXPECT_EQ(impl->output_delay_ms.load(), adjustable ? 300 : 0);
+    }
+}
+
 // A server (or a consumer control) asking for more than the spec allows is held at the maximum
 // rather than accepted, so the player never reports a delay it may not run at.
 TEST(PlayerRoleOutputDelay, RequestOverTheSpecMaximumIsClamped) {
