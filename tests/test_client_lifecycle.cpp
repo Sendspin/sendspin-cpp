@@ -81,6 +81,7 @@ constexpr uint16_t SYNC_PIN_STOP_TEST_PORT = 19075;
 constexpr uint16_t SYNC_PIN_DROP_TEST_PORT = 19076;
 constexpr uint16_t SYNC_PIN_MIDSTREAM_TEST_PORT = 19077;
 constexpr uint16_t VISUALIZER_SPECTRUM_TEST_PORT = 19078;
+constexpr uint16_t VISUALIZER_STALE_TEST_PORT = 19084;
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
@@ -410,8 +411,12 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     EXPECT_EQ(listener.stream_ends, 1);
 }
 
+/// How far ahead of now a visualizer frame is stamped so it is still in the future when the drain
+/// thread takes it, clear of the time filter's error on the same host.
+constexpr int64_t VISUALIZER_LEAD_US = 50 * 1000;
+
 // Pumps until pred() holds, sending one loudness frame per iteration stamped `lead_us` ahead of
-// the current time (the drain thread drops a frame whose display time is well past). A frame
+// the current time (the drain thread drops a frame whose display time has passed). A frame
 // can be lost to the ring's documented wake race right after a stream/start (the drain thread
 // may take the clear marker as a stray entry and then discard up to a marker that is gone),
 // which production shrugs off because the next frame follows; so does this.
@@ -469,7 +474,8 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     auto server = connect_paired_server(bundle.peer, VISUALIZER_TEST_PORT, options);
     pump_until_synced(client);
     ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
-    send_loudness_until(client, *server, 0, [&] { return listener.loudness.load() >= 1; });
+    send_loudness_until(client, *server, VISUALIZER_LEAD_US,
+                        [&] { return listener.loudness.load() >= 1; });
     client.stop();
 }
 
@@ -494,6 +500,17 @@ private:
     std::vector<uint16_t> bins_;
 };
 
+/// A visualizer asking for four spectrum bins.
+VisualizerRoleConfig make_spectrum_visualizer_config() {
+    VisualizerRoleConfig visualizer;
+    visualizer.stream.types = {VisualizerDataType::SPECTRUM};
+    visualizer.support.buffer_capacity = 4096;
+    visualizer.stream.rate_max = 30;
+    visualizer.stream.spectrum = VisualizerSpectrumConfig{
+        .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
+    return visualizer;
+}
+
 /// A visualizer stream/start serving `served_bins` spectrum bins.
 std::string stream_start_spectrum_json(unsigned served_bins) {
     return R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
@@ -502,8 +519,8 @@ std::string stream_start_spectrum_json(unsigned served_bins) {
            R"(,"scale":"mel","f_min":40,"f_max":16000}}}})";
 }
 
-// Pumps until pred() holds, sending one four-bin spectrum frame per iteration stamped at the
-// current time. A frame can be lost to the ring's documented wake race right after a
+// Pumps until pred() holds, sending one four-bin spectrum frame per iteration stamped
+// VISUALIZER_LEAD_US ahead. A frame can be lost to the ring's documented wake race right after a
 // stream/start (see send_loudness_until), so frames keep coming until one is delivered.
 void send_spectrum_until(SendspinClient& client, FakeEncryptedServer& server,
                          const std::function<bool()>& pred) {
@@ -512,7 +529,8 @@ void send_spectrum_until(SendspinClient& client, FakeEncryptedServer& server,
         if (pred()) {
             return true;
         }
-        server.send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, platform_time_us(), four_bins);
+        server.send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+                           platform_time_us() + VISUALIZER_LEAD_US, four_bins);
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         return false;
     });
@@ -529,13 +547,7 @@ TEST(ClientLifecycle, TheServedSpectrumBinCountGovernsTheDeliveredFrame) {
     PairedClientBundle bundle(std::move(config));
     SendspinClient& client = bundle.client();
 
-    VisualizerRoleConfig visualizer;
-    visualizer.stream.types = {VisualizerDataType::SPECTRUM};
-    visualizer.support.buffer_capacity = 4096;
-    visualizer.stream.rate_max = 30;
-    visualizer.stream.spectrum = VisualizerSpectrumConfig{
-        .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
-    client.add_visualizer(std::move(visualizer)).set_listener(&listener);
+    client.add_visualizer(make_spectrum_visualizer_config()).set_listener(&listener);
 
     FakeEncryptedServerOptions options;
     options.answer_time = true;
@@ -547,6 +559,48 @@ TEST(ClientLifecycle, TheServedSpectrumBinCountGovernsTheDeliveredFrame) {
 
     send_spectrum_until(client, *server, [&] { return listener.frames.load() >= 1; });
     EXPECT_EQ(listener.last_bins(), (std::vector<uint16_t>{10, 20}));
+
+    client.stop();
+}
+
+// roles/visualizer/v1.md "Visualization Data (Binary)": data already in the past is dropped and
+// stale frames are never rendered, however slightly late. The ring is FIFO, so once the in-time
+// frame sent after them is delivered, every stale frame ahead of it has been dropped.
+TEST(ClientLifecycle, VisualizerFramesAlreadyInThePastAreNeverDelivered) {
+    constexpr int64_t STALE_BY_US = 10 * 1000;
+    RecordingSpectrumListener listener;
+    auto config = make_config(VISUALIZER_STALE_TEST_PORT);
+    config.time_burst_interval_ms = 100;  // Sync promptly: the drain thread needs client time
+    PairedClientBundle bundle(std::move(config));
+    SendspinClient& client = bundle.client();
+    client.add_visualizer(make_spectrum_visualizer_config()).set_listener(&listener);
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+
+    ASSERT_TRUE(bundle.start());
+    auto server = connect_paired_server(bundle.peer, VISUALIZER_STALE_TEST_PORT, options);
+    pump_until_synced(client);
+    ASSERT_TRUE(server->send_app_json(stream_start_spectrum_json(4)));
+    send_spectrum_until(client, *server, [&] { return listener.frames.load() >= 1; });
+    // Let the helper's frames still ahead of their display time drain first.
+    auto& ring = client.visualizer()->impl_->drain_task->ring_buffer;
+    pump_until(client, [&] { return ring.is_empty(); });
+    pump_for(client, static_cast<int>(2 * VISUALIZER_LEAD_US / 1000));
+    const size_t delivered_before = listener.frames.load();
+
+    const std::string stale_bins("\x00\x01\x00\x01\x00\x01\x00\x01", 8);
+    for (int i = 0; i < 5; ++i) {
+        server->send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, platform_time_us() - STALE_BY_US,
+                            stale_bins);
+    }
+    const std::string fresh_bins("\x00\x02\x00\x02\x00\x02\x00\x02", 8);
+    server->send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+                        platform_time_us() + VISUALIZER_LEAD_US, fresh_bins);
+    pump_until(client, [&] { return listener.frames.load() > delivered_before; });
+
+    EXPECT_EQ(listener.frames.load(), delivered_before + 1);
+    EXPECT_EQ(listener.last_bins(), (std::vector<uint16_t>{2, 2, 2, 2}));
 
     client.stop();
 }

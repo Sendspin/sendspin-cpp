@@ -146,14 +146,16 @@ public:
     int last_clear_slot{-1};
 };
 
-// Pumps until `done`, feeding loudness frames stamped for immediate display.
+// Pumps until `done`, feeding loudness frames stamped just ahead of now so the drain thread does
+// not drop them as already past.
 void send_loudness_until(SendspinClient& client, FakeEncryptedServer& server,
                          const std::function<bool()>& done) {
+    constexpr int64_t LEAD_US = 50 * 1000;
     pump_until(client, [&] {
         if (done()) {
             return true;
         }
-        server.send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, platform_time_us(),
+        server.send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, platform_time_us() + LEAD_US,
                            std::string("\x00\x10", 2));
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         return false;

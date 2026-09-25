@@ -76,8 +76,6 @@ static constexpr uint32_t MARKER_ENQUEUE_TIMEOUT_MS = 100U;
 /// that a wake bug degrades to a slow reaction rather than a hang.
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 5000U;
 
-static constexpr int64_t TOO_OLD_THRESHOLD_US = 20000;  // 20ms
-
 // ============================================================================
 // Big-endian helpers
 // ============================================================================
@@ -642,37 +640,34 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Sleep until display time (interruptible via event flags)
-        int64_t now = platform_time_us();
-        if (client_ts > now) {
-            uint32_t wait_ms = static_cast<uint32_t>((client_ts - now) / US_PER_MS);
-            if (wait_ms > 0) {
-                cmd =
-                    flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, wait_ms);
-                if (cmd & COMMAND_STOP) {
-                    rb.return_item(item);
-                    break;
-                }
-                if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
-                    // The held item was popped before the signal, so it predates the boundary
-                    // and is discarded along with the buffered pre-boundary entries.
-                    rb.return_item(item);
-                    if (cmd & COMMAND_FLUSH) {
-                        self->flush_ring_buffer();
-                    }
-                    if (cmd & COMMAND_CLEAR) {
-                        self->discard_to_clear_marker();
-                    }
-                    continue;
-                }
-            }
-        }
-
-        // Check if too old after waking
-        now = platform_time_us();
-        if (now - client_ts > TOO_OLD_THRESHOLD_US) {
+        // roles/visualizer/v1.md "Visualization Data (Binary)": a frame already in the past is
+        // dropped, never rendered.
+        const int64_t now = platform_time_us();
+        if (client_ts < now) {
             rb.return_item(item);
             continue;
+        }
+
+        // Sleep until display time (interruptible via event flags)
+        const auto wait_ms = static_cast<uint32_t>((client_ts - now) / US_PER_MS);
+        if (wait_ms > 0) {
+            cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, wait_ms);
+            if (cmd & COMMAND_STOP) {
+                rb.return_item(item);
+                break;
+            }
+            if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
+                // The held item was popped before the signal, so it predates the boundary and is
+                // discarded along with the buffered pre-boundary entries.
+                rb.return_item(item);
+                if (cmd & COMMAND_FLUSH) {
+                    self->flush_ring_buffer();
+                }
+                if (cmd & COMMAND_CLEAR) {
+                    self->discard_to_clear_marker();
+                }
+                continue;
+            }
         }
 
         if (self->listener == nullptr) {

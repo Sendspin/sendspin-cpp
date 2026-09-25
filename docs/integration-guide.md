@@ -371,7 +371,8 @@ Call `frame_done()` from the main loop thread. It is a safe no-op when the slot 
 ```cpp
 struct MyVisualizerListener : VisualizerRoleListener {
     // THREAD SAFETY: Data callbacks fire on a dedicated drain thread at each
-    // frame's display timestamp. Copy data quickly and defer heavy processing.
+    // frame's display timestamp. A frame already past its display time is
+    // dropped, so copy data quickly and defer heavy processing.
     void on_loudness(int64_t client_timestamp, uint16_t loudness) override {
         update_vu_meter(loudness);
     }
