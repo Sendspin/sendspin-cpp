@@ -187,6 +187,8 @@ struct PlayerRole::Impl {
     // on_stream_end() from firing without a matching on_stream_start()
     bool stream_active{false};
     std::atomic<bool> output_delay_adjustable{false};
+    // Set by the client while it is unavailable; read by handle_binary() on the network thread.
+    std::atomic<bool> discard_audio{false};
     uint8_t volume{0};
 };
 

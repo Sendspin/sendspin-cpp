@@ -325,6 +325,12 @@ SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len,
         SS_LOGV(TAG, "Audio chunk carries no encoded frame");
         return;
     }
+    // roles/player/v1.md "Audio Chunks (Binary)": an unavailable client discards otherwise
+    // valid audio.
+    if (this->discard_audio.load(std::memory_order_relaxed)) {
+        SS_LOGV(TAG, "Discarding audio chunk while unavailable");
+        return;
+    }
     if (!this->send_audio_chunk(chunk->audio, chunk->audio_len, chunk->timestamp_us,
                                 CHUNK_TYPE_ENCODED_AUDIO, 0)) {
         SS_LOGW(TAG, "Failed to send audio chunk");

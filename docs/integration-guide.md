@@ -1067,8 +1067,9 @@ bool available = client.is_available();
 ```
 
 The server moves an unavailable client into a stopped group of its own and does not take it over
-until it is available again. Availability is kept across disconnects and `stop()`/`start()`, and
-only a change publishes a `client/state`. Call it from the main loop thread.
+until it is available again. Until the server ends the stream, the player discards the audio
+that still arrives. Availability is kept across disconnects and `stop()`/`start()`, and only a
+change publishes a `client/state`. Call it from the main loop thread.
 
 ## Querying State
 

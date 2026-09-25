@@ -814,6 +814,7 @@ PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
         std::make_unique<PlayerRole>(std::move(config), this, this->persistence_provider_);
     this->player_->impl_->attach_inbox(this->event_state_->inbox);
     this->player_->impl_->attach_connection_manager(*this->connection_manager_);
+    this->player_->impl_->discard_audio.store(!this->available_, std::memory_order_relaxed);
     return *this->player_;
 }
 #endif
@@ -932,6 +933,11 @@ void SendspinClient::set_available(bool available) {
         return;
     }
     this->available_ = available;
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (this->player_) {
+        this->player_->impl_->discard_audio.store(!available, std::memory_order_relaxed);
+    }
+#endif
     // current_shared(): see send_text().
     auto conn = this->connection_manager_->current_shared();
     this->publish_client_state(conn.get());

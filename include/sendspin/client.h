@@ -611,7 +611,8 @@ public:
     ///
     /// messaging.md "External Source Handling": false only while the device will not yield to
     /// Sendspin, which moves it to a stopped group of its own. An activity Sendspin may interrupt
-    /// calls leave() instead. Kept across disconnects and stop()/start(). Main loop only.
+    /// calls leave() instead. While unavailable, the player discards incoming audio. Kept across
+    /// disconnects and stop()/start(). Main loop only.
     /// @param available false while the device will not yield to Sendspin.
     void set_available(bool available);
 

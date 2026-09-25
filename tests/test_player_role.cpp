@@ -424,6 +424,36 @@ TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
     }
 }
 
+// roles/player/v1.md "Audio Chunks (Binary)": while the client is unavailable the player
+// discards incoming audio, whether availability changed before or after the role was added.
+TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
+    struct Row {
+        const char* name;
+        bool available_when_added;
+        bool available_on_arrival;
+        bool queued;
+    };
+    const Row rows[] = {
+        {"available", true, true, true},  // Control:
+        {"became unavailable", true, false, false},
+        {"unavailable before add", false, false, false},
+        {"available again", false, true, true},  // Control:
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SendspinClient client(make_client_config("player-availability"));
+        client.set_available(row.available_when_added);
+        PlayerRole::Impl& impl = *client.add_player(make_player_config()).impl_;
+        ASSERT_TRUE(impl.sync_task->init(&impl, impl.config.audio_buffer_capacity));
+        client.set_available(row.available_on_arrival);
+
+        const std::vector<uint8_t> chunk = audio_chunk();
+        impl.handle_binary(chunk.data(), chunk.size(), live_generation(impl));
+        EXPECT_EQ(!impl.sync_task->encoded_ring_buffer_->is_empty(), row.queued);
+    }
+}
+
 // ============================================================================
 // Output delay: spec clamp, write avoidance, and the persisted-value range
 // ============================================================================
