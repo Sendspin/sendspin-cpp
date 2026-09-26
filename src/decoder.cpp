@@ -123,9 +123,8 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
             }
             this->current_stream_info_ = *stream_info;
             this->current_codec_ = SendspinCodecFormat::PCM;
-            static constexpr uint32_t PCM_MAX_CHUNK_MS = 120U;
-            this->decode_buffer_size_ =
-                stream_info->ms_to_bytes(PCM_MAX_CHUNK_MS);  // PCM max chunk size
+            // Room for any valid chunk, so one call decodes it.
+            this->decode_buffer_size_ = stream_info->ms_to_bytes(MAX_AUDIO_CHUNK_MS);
             break;
         }
         default: {

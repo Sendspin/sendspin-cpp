@@ -621,7 +621,10 @@ bool SyncTask::decode_whole_chunk(SyncContext& sync_context) {
     const uint8_t* input = sync_context.encoded_entry->data();
     size_t remaining = sync_context.encoded_entry->data_size;
     size_t produced = 0;
-    while (remaining > 0) {
+    // roles/player/v1.md "Server Audio Send Constraints": no chunk is longer than 150 ms, which
+    // also caps the buffer at 150 ms plus one decoder unit.
+    const size_t max_produced = sync_context.current_stream_info.ms_to_bytes(MAX_AUDIO_CHUNK_MS);
+    while (remaining > 0 && produced <= max_produced) {
         // Room for the decoder's next unit, plus the spare frame soft sync inserts into.
         const size_t unit_size = sync_context.decoder->get_decode_buffer_size();
         const size_t needed_free = unit_size + sync_context.bytes_per_frame;
@@ -652,13 +655,17 @@ bool SyncTask::decode_whole_chunk(SyncContext& sync_context) {
         }
     }
 
-    if (remaining > 0) {
-        // All or nothing. The buffer was empty on entry, so this drops just this chunk's output.
-        sync_context.decode_buffer->decrease_buffer_length(produced);
-        SS_LOGE(TAG, "Failed to decode audio chunk");
-        return false;
+    if (remaining == 0 && produced <= max_produced) {
+        return true;
     }
-    return true;
+    // All or nothing. The buffer was empty on entry, so this drops just this chunk's output.
+    sync_context.decode_buffer->decrease_buffer_length(produced);
+    if (produced > max_produced) {
+        SS_LOGE(TAG, "Audio chunk decodes to more than %" PRIu32 " ms", MAX_AUDIO_CHUNK_MS);
+    } else {
+        SS_LOGE(TAG, "Failed to decode audio chunk");
+    }
+    return false;
 }
 
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {

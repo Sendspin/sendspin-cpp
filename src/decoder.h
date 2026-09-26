@@ -28,6 +28,10 @@
 
 namespace sendspin {
 
+/// @brief Longest audio chunk a server may send (roles/player/v1.md "Server Audio Send
+/// Constraints").
+static constexpr uint32_t MAX_AUDIO_CHUNK_MS = 150U;
+
 /**
  * @brief Audio decoder wrapper supporting FLAC, Opus, and raw PCM codec formats
  *
@@ -97,7 +101,8 @@ public:
 
     /// @brief Returns the size to allocate for the decoded-output buffer.
     /// @details The free space decode_audio_chunk() needs to make progress: one maximum-size FLAC
-    /// frame, 120 ms of PCM, or one Opus packet (20 ms, raised to 120 ms on a larger packet).
+    /// frame, MAX_AUDIO_CHUNK_MS of PCM, or one Opus packet (20 ms, raised to 120 ms on a larger
+    /// packet).
     /// @return Required decoded-output buffer size in bytes.
     size_t get_decode_buffer_size() const {
         return this->decode_buffer_size_;

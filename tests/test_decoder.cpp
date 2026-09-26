@@ -133,9 +133,10 @@ TEST(Decoder, FlacChunkEndingMidFrameIsAnError) {
                                             buffer.data(), buffer.size(), &consumed, &decoded));
 }
 
-// A PCM chunk longer than the decode buffer (up to the 150 ms roles/player/v1.md "Server Audio Send
-// Constraints" allow) copies whole frames per call; a chunk that is not whole frames is rejected.
-TEST(Decoder, PcmChunkLongerThanTheBufferResumesAndPartialFramesAreRejected) {
+// A PCM chunk as long as roles/player/v1.md "Server Audio Send Constraints" allows (150 ms) fits
+// the decode buffer in one call; with less room, whole frames are copied per call and the caller
+// resumes. A chunk that is not whole frames is rejected.
+TEST(Decoder, PcmChunkAtTheSpecMaximumFitsOneCallAndPartialFramesAreRejected) {
     SendspinDecoder decoder;
     AudioStreamInfo info;
     const sendspin::DummyHeader header{.sample_rate = 48000, .bits_per_sample = 16, .channels = 2};
@@ -146,10 +147,11 @@ TEST(Decoder, PcmChunkLongerThanTheBufferResumesAndPartialFramesAreRejected) {
     for (size_t i = 0; i < chunk.size(); ++i) {
         chunk[i] = static_cast<uint8_t>(i * 7);
     }
-    ASSERT_GT(chunk.size(), decoder.get_decode_buffer_size());
 
     int calls = 0;
     EXPECT_EQ(decode_resuming(decoder, chunk, decoder.get_decode_buffer_size(), &calls), chunk);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(decode_resuming(decoder, chunk, chunk.size() / 2, &calls), chunk);
     EXPECT_EQ(calls, 2);
 
     std::vector<uint8_t> buffer(chunk.size());
