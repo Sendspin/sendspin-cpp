@@ -143,7 +143,7 @@ A blocking `receive()` is interruptible from any thread via `wake_receiver()`: t
 Used for:
 
 - **Encoded audio**: Via the `SendspinAudioRingBuffer` wrapper (which adds chunk headers and exposes `write_chunk` / `receive_chunk` / `return_chunk`). Network thread writes chunks; sync task reads and decodes them.
-- **Visualizer frames**: Used directly. Network thread writes one entry per visualizer binary message; drain thread reads them at the correct playback time.
+- **Visualizer frames**: Used directly. Network thread writes one entry per visualizer binary message, prefixed with its arrival time; drain thread drops a frame whose display time was already past on arrival, delivers the rest `display_offset_ms` ahead of their display time, and drops a backlog more than 20 ms behind that.
 
 ### Other Primitives
 

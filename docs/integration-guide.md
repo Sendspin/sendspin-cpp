@@ -371,8 +371,9 @@ Call `frame_done()` from the main loop thread. It is a safe no-op when the slot 
 ```cpp
 struct MyVisualizerListener : VisualizerRoleListener {
     // THREAD SAFETY: Data callbacks fire on a dedicated drain thread at each
-    // frame's display timestamp. A frame already past its display time is
-    // dropped, so copy data quickly and defer heavy processing.
+    // frame's display timestamp, less VisualizerRoleConfig::display_offset_ms.
+    // A frame that arrives after its display time is dropped, as is a backlog
+    // more than 20 ms behind, so copy data quickly and defer heavy processing.
     void on_loudness(int64_t client_timestamp, uint16_t loudness) override {
         update_vu_meter(loudness);
     }
@@ -1324,6 +1325,7 @@ Configuration passed to `client.add_visualizer()`.
 | `support` | `VisualizerSupportObject` | - | Visualizer capabilities advertised to the server during the hello handshake |
 | `stream` | `VisualizerStreamConfig` | - | Stream configuration reported to the server in `client/state` |
 | `psram_stack` | `bool` | `false` | Allocate drain thread stack in PSRAM (ESP-IDF only) |
+| `display_offset_ms` | `int32_t` | `0` | Fires the data callbacks this far ahead of each frame's display time (negative delays them), for a consumer's own render latency. The callbacks' `client_timestamp` stays the display time. |
 | `priority` | `unsigned` | `2` | FreeRTOS priority for the drain thread (ESP-IDF only) |
 
 `VisualizerSupportObject` fields:

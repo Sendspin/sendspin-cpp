@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "platform/time.h"
 #include "protocol_messages.h"
 #include "visualizer_role_impl.h"
 
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -225,14 +227,23 @@ TEST(VisualizerHandleBinary, ForwardsMessageVerbatim) {
     put_be64(data, 123456);
     put_be16(data, 0xABCD);
 
+    const int64_t before_us = platform_time_us();
     impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
+    const int64_t after_us = platform_time_us();
 
+    // Entry = [wire_type][arrival stamp(4), host order][data...]: the drain thread judges
+    // staleness against the arrival time, not against when it dequeues the entry.
+    constexpr size_t HEADER = 1 + sizeof(uint32_t);
     std::vector<uint8_t> entry;
     ASSERT_TRUE(pop_entry(*impl, entry));
-    // Entry = [wire_type][data...]
-    ASSERT_EQ(entry.size(), data.size() + 1);
+    ASSERT_EQ(entry.size(), data.size() + HEADER);
     EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
-    EXPECT_TRUE(std::equal(data.begin(), data.end(), entry.begin() + 1));
+    uint32_t stamp = 0;
+    std::memcpy(&stamp, entry.data() + 1, sizeof(stamp));
+    const int64_t arrival_us = sendspin::visualizer_arrival_from_stamp(stamp, after_us);
+    EXPECT_GE(arrival_us, before_us);
+    EXPECT_LE(arrival_us, after_us);
+    EXPECT_TRUE(std::equal(data.begin(), data.end(), entry.begin() + HEADER));
 
     // A message longer than any this type defines is stored whole as well: the network thread
     // neither truncates nor caps, so a spectrum with many bins survives the ring intact.
@@ -240,8 +251,67 @@ TEST(VisualizerHandleBinary, ForwardsMessageVerbatim) {
     impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
 
     ASSERT_TRUE(pop_entry(*impl, entry));
-    ASSERT_EQ(entry.size(), data.size() + 1);
-    EXPECT_TRUE(std::equal(data.begin(), data.end(), entry.begin() + 1));
+    ASSERT_EQ(entry.size(), data.size() + HEADER);
+    EXPECT_TRUE(std::equal(data.begin(), data.end(), entry.begin() + HEADER));
+}
+
+// The drain thread stores only the low 32 bits of the arrival time; the full value comes back
+// from the age those bits give against `now`, including across the low word's wrap.
+TEST(VisualizerArrivalStamp, RecoversTheArrivalTimeAcrossTheLowWordWrap) {
+    constexpr int64_t WRAP = int64_t{1} << 32;
+    struct Row {
+        const char* name;
+        int64_t arrival_us;
+        int64_t now;
+    };
+    const Row rows[] = {
+        {"same low word", 5'000'000, 5'001'234},
+        {"low word wrapped since arrival", WRAP - 50, WRAP + 100},
+        {"several wraps into the clock", 3 * WRAP + 7, 3 * WRAP + 1'000'007},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(
+            sendspin::visualizer_arrival_from_stamp(static_cast<uint32_t>(row.arrival_us), row.now),
+            row.arrival_us);
+    }
+}
+
+// roles/visualizer/v1.md "Visualization Data (Binary)": a frame already in the past on arrival is
+// dropped. Everything else is delivered display_offset_ms ahead of its display time, or on
+// arrival when that is later, unless the drain thread is more than the lag bound behind that.
+TEST(VisualizerDeliveryWait, DropsLateArrivalsAndBacklogAndShiftsByTheOffset) {
+    constexpr int64_t MS = 1000;
+    constexpr int64_t LAG = sendspin::VISUALIZER_MAX_DELIVERY_LAG_US;
+    constexpr int64_t ARRIVAL = 1'000'000;
+    struct Row {
+        const char* name;
+        int64_t client_ts;
+        int32_t offset_ms;
+        int64_t now;
+        std::optional<int64_t> wait_us;
+    };
+    const Row rows[] = {
+        {"Control: in time, waits for the display time", ARRIVAL + 50 * MS, 0, ARRIVAL, 50 * MS},
+        {"already past on arrival", ARRIVAL - 1, 0, ARRIVAL, std::nullopt},
+        {"Control: due exactly on arrival", ARRIVAL, 0, ARRIVAL, 0},
+        {"reached after its display time behind a sibling", ARRIVAL + 10 * MS, 0,
+         ARRIVAL + 15 * MS, 0},
+        {"Control: at the lag bound", ARRIVAL + 10 * MS, 0, ARRIVAL + 10 * MS + LAG, 0},
+        {"past the lag bound", ARRIVAL + 10 * MS, 0, ARRIVAL + 10 * MS + LAG + 1, std::nullopt},
+        {"positive offset fires early", ARRIVAL + 50 * MS, 15, ARRIVAL, 35 * MS},
+        {"negative offset delays", ARRIVAL + 50 * MS, -10, ARRIVAL, 60 * MS},
+        {"offset beyond the lead delivers on arrival", ARRIVAL + 50 * MS, 100, ARRIVAL, 0},
+        {"Control: lag from arrival, at the bound", ARRIVAL + 50 * MS, 100, ARRIVAL + LAG, 0},
+        {"lag from arrival, past the bound", ARRIVAL + 50 * MS, 100, ARRIVAL + LAG + 1,
+         std::nullopt},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(
+            sendspin::visualizer_delivery_wait_us(row.client_ts, ARRIVAL, row.offset_ms, row.now),
+            row.wait_us);
+    }
 }
 
 TEST(VisualizerHandleBinary, DropsMessageWithoutTimestamp) {

@@ -30,11 +30,14 @@ static const char* const TAG = "sendspin.visualizer";
 // Entry format constants
 // ============================================================================
 
-// Each ring buffer entry preserves the full wire message: [wire_type(1)][server_ts(8)][payload].
-// buffer_capacity is the ring's total RAM budget, not a wire-data quota: on top of these bytes
-// each entry costs an aligned per-entry ItemHeader, so effective wire-data capacity is smaller
-// (see the buffer_capacity note in config.h).
+// Each ring buffer entry is [wire_type(1)][arrival(4)][server_ts(8)][payload]: the wire message
+// after its type byte, preceded by the low 32 bits of the local time the network thread received
+// it (see visualizer_arrival_from_stamp()). buffer_capacity is the ring's total RAM budget, not a
+// wire-data quota: on top of these bytes each entry costs an aligned per-entry ItemHeader, so
+// effective wire-data capacity is smaller (see the buffer_capacity note in config.h).
 static constexpr size_t ENTRY_TYPE_SIZE = 1;
+static constexpr size_t ARRIVAL_SIZE = sizeof(uint32_t);
+static constexpr size_t ENTRY_HEADER_SIZE = ENTRY_TYPE_SIZE + ARRIVAL_SIZE;
 static constexpr size_t TIMESTAMP_SIZE = 8;
 
 // Minimum payload bytes after the timestamp, per wire message type
@@ -47,11 +50,30 @@ static constexpr size_t PEAK_PAYLOAD_SIZE = 1;      // uint8 strength
 static constexpr uint8_t BEAT_FLAG_DOWNBEAT = 0x01;
 
 // buffer_capacity is the ring's RAM budget, but each entry costs an 8-byte ItemHeader plus 8-byte
-// alignment on top of its wire message, so the smallest entries (beat/peak, 10 wire bytes -> 24
-// stored) leave only ~1/3 of the budget for actual wire data. Advertise that effective fraction to
-// the server (not the raw budget) so its flow control never sends more than the ring can hold. This
-// mirrors the player role's conservative buffer advertisement.
+// alignment on top of its entry, so the smallest entries (beat/peak, 10 wire bytes -> 24 stored;
+// f_peak, 13 -> 32) leave only ~1/3 of the budget for actual wire data. Advertise that effective
+// fraction to the server (not the raw budget) so its flow control never sends more than the ring
+// can hold. This mirrors the player role's conservative buffer advertisement.
 static constexpr size_t BUFFER_ADVERTISE_DIVISOR = 3;
+
+/// @brief Ring storage for an entry of `entry_size` bytes: an 8-byte item header plus the entry
+/// rounded up to 8 bytes, the host ring's layout and no less than the ESP ring stores.
+static constexpr size_t stored_entry_size(size_t entry_size) {
+    return 8 + ((entry_size + 7) / 8) * 8;
+}
+
+/// @brief Whether a message with `payload_size` bytes after its timestamp stores within the
+/// advertised fraction.
+static constexpr bool fits_advertised_fraction(size_t payload_size) {
+    const size_t wire_size = ENTRY_TYPE_SIZE + TIMESTAMP_SIZE + payload_size;
+    return BUFFER_ADVERTISE_DIVISOR * wire_size >=
+           stored_entry_size(ENTRY_HEADER_SIZE + TIMESTAMP_SIZE + payload_size);
+}
+static_assert(fits_advertised_fraction(BEAT_PAYLOAD_SIZE) &&
+                  fits_advertised_fraction(PEAK_PAYLOAD_SIZE) &&
+                  fits_advertised_fraction(LOUDNESS_PAYLOAD_SIZE) &&
+                  fits_advertised_fraction(F_PEAK_PAYLOAD_SIZE),
+              "the advertised buffer_capacity would exceed what the ring holds");
 
 // Event flag bits for drain thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
@@ -264,7 +286,7 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
         return;
     }
 
-    // Forward the raw message verbatim: [wire_type][server_ts(8)][payload]. Like the player and
+    // Forward the raw message verbatim behind its arrival time. Like the player and
     // artwork roles, the network thread stays dumb: it records the message and hands it to the
     // drain thread, which owns all structural validation and per-type truncation. The only other
     // check here is that a timestamp is present, since the drain thread needs it to schedule the
@@ -274,8 +296,10 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
         return;
     }
 
-    // Build entry: [wire_type][server_ts(8)][payload]. Use acquire+commit to avoid double-copy.
-    size_t entry_size = ENTRY_TYPE_SIZE + len;
+    // Build entry: [wire_type][arrival(4)][server_ts(8)][payload]. Use acquire+commit to avoid
+    // double-copy.
+    const auto arrival = static_cast<uint32_t>(platform_time_us());
+    size_t entry_size = ENTRY_HEADER_SIZE + len;
     void* dest = this->drain_task->ring_buffer.acquire(entry_size, 0);
     if (dest == nullptr) {
         return;  // Buffer full, drop
@@ -283,7 +307,8 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
 
     auto* entry = static_cast<uint8_t*>(dest);
     entry[0] = binary_type;
-    std::memcpy(entry + ENTRY_TYPE_SIZE, data, len);
+    std::memcpy(entry + ENTRY_TYPE_SIZE, &arrival, ARRIVAL_SIZE);
+    std::memcpy(entry + ENTRY_HEADER_SIZE, data, len);
 
     this->drain_task->ring_buffer.commit(dest);
 }
@@ -452,6 +477,25 @@ void VisualizerRole::Impl::cleanup() {
 // Drain thread helpers
 // ============================================================================
 
+int64_t visualizer_arrival_from_stamp(uint32_t stamp, int64_t now) {
+    // Unsigned subtraction of the low words gives the age modulo 2^32 us.
+    return now - static_cast<uint32_t>(static_cast<uint32_t>(now) - stamp);
+}
+
+std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int64_t arrival_us,
+                                                   int32_t display_offset_ms, int64_t now) {
+    // A frame that arrived in time and only waited behind others sharing its timestamp is not
+    // stale.
+    if (client_ts < arrival_us) {
+        return std::nullopt;
+    }
+    const int64_t deliver_at_us = client_ts - static_cast<int64_t>(display_offset_ms) * US_PER_MS;
+    if (now - std::max(deliver_at_us, arrival_us) > VISUALIZER_MAX_DELIVERY_LAG_US) {
+        return std::nullopt;
+    }
+    return std::max<int64_t>(deliver_at_us - now, 0);
+}
+
 VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* payload,
                                              size_t payload_len, uint8_t configured_bins,
                                              bool tracks_downbeats,
@@ -568,6 +612,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
 
     auto& rb = self->drain_task->ring_buffer;
     auto& flags = self->drain_task->event_flags;
+    const int32_t offset_ms = self->config.display_offset_ms;
 
     // Reused across iterations to avoid a heap alloc/free per frame. The vector's capacity
     // grows to the largest bin count seen and is resized (not reallocated) after that.
@@ -623,16 +668,18 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Entry format: [wire_type][server_ts(8)][payload]. This also drops any leftover 1-byte
-        // clear marker whose COMMAND_CLEAR was already handled (everything before it was consumed
-        // in order, so the boundary it marks has already been honored).
-        if (item_size < ENTRY_TYPE_SIZE + TIMESTAMP_SIZE) {
+        // Entry format: [wire_type][arrival(4)][server_ts(8)][payload]. This also drops any
+        // leftover 1-byte clear marker whose COMMAND_CLEAR was already handled (everything before
+        // it was consumed in order, so the boundary it marks has already been honored).
+        if (item_size < ENTRY_HEADER_SIZE + TIMESTAMP_SIZE) {
             rb.return_item(item);
             continue;
         }
         auto* raw = static_cast<const uint8_t*>(item);
         uint8_t wire_type = raw[0];
-        int64_t server_ts = read_be64(raw + ENTRY_TYPE_SIZE);
+        uint32_t arrival_stamp = 0;
+        std::memcpy(&arrival_stamp, raw + ENTRY_TYPE_SIZE, ARRIVAL_SIZE);
+        int64_t server_ts = read_be64(raw + ENTRY_HEADER_SIZE);
         int64_t client_ts = self->client->get_client_time(server_ts);
 
         if (client_ts == 0) {
@@ -640,16 +687,17 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // roles/visualizer/v1.md "Visualization Data (Binary)": a frame already in the past is
-        // dropped, never rendered.
         const int64_t now = platform_time_us();
-        if (client_ts < now) {
+        const std::optional<int64_t> wait_us = visualizer_delivery_wait_us(
+            client_ts, visualizer_arrival_from_stamp(arrival_stamp, now), offset_ms, now);
+        if (!wait_us.has_value()) {
             rb.return_item(item);
             continue;
         }
 
-        // Sleep until display time (interruptible via event flags)
-        const auto wait_ms = static_cast<uint32_t>((client_ts - now) / US_PER_MS);
+        // Sleep until delivery time (interruptible via event flags)
+        const auto wait_ms =
+            static_cast<uint32_t>(std::min<int64_t>(*wait_us / US_PER_MS, UINT32_MAX));
         if (wait_ms > 0) {
             cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, wait_ms);
             if (cmd & COMMAND_STOP) {
@@ -678,8 +726,8 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         // Decode and deliver. The network thread forwards messages verbatim, so decode validates
         // each payload's length before reading. Copy out of the slot, release it via the guard,
         // then deliver, so a slow listener callback never blocks the network producer.
-        const uint8_t* payload = raw + ENTRY_TYPE_SIZE + TIMESTAMP_SIZE;
-        size_t payload_len = item_size - ENTRY_TYPE_SIZE - TIMESTAMP_SIZE;
+        const uint8_t* payload = raw + ENTRY_HEADER_SIZE + TIMESTAMP_SIZE;
+        size_t payload_len = item_size - ENTRY_HEADER_SIZE - TIMESTAMP_SIZE;
 
         SlotGuard guard{rb, item};
         VisualizerDelivery out =

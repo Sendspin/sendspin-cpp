@@ -82,6 +82,8 @@ constexpr uint16_t SYNC_PIN_DROP_TEST_PORT = 19076;
 constexpr uint16_t SYNC_PIN_MIDSTREAM_TEST_PORT = 19077;
 constexpr uint16_t VISUALIZER_SPECTRUM_TEST_PORT = 19078;
 constexpr uint16_t VISUALIZER_STALE_TEST_PORT = 19084;
+constexpr uint16_t VISUALIZER_SHARED_TS_TEST_PORT = 19086;
+constexpr uint16_t VISUALIZER_OFFSET_TEST_PORT = 19088;
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
@@ -482,10 +484,20 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
 /// Records the bins of the last spectrum frame the drain thread delivered.
 class RecordingSpectrumListener : public VisualizerRoleListener {
 public:
-    void on_spectrum(int64_t /*client_timestamp*/, const std::vector<uint16_t>& bins) override {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        this->bins_ = bins;
+    void on_spectrum(int64_t client_timestamp, const std::vector<uint16_t>& bins) override {
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            this->bins_ = bins;
+            if (!bins.empty()) {
+                this->first_bins_.push_back(bins[0]);
+            }
+            this->client_timestamp_ = client_timestamp;
+            this->delivered_at_ = platform_time_us();
+        }
         this->frames.fetch_add(1);
+        if (!bins.empty() && bins[0] >= this->hold_from_bin.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(this->hold_ms.load()));
+        }
     }
 
     std::vector<uint16_t> last_bins() const {
@@ -493,11 +505,31 @@ public:
         return this->bins_;
     }
 
+    /// How many delivered frames had `bin` as their first bin.
+    size_t delivered(uint16_t bin) const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return static_cast<size_t>(
+            std::count(this->first_bins_.begin(), this->first_bins_.end(), bin));
+    }
+
+    /// How long before its client_timestamp the last frame was delivered (negative: after).
+    int64_t last_lead_us() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->client_timestamp_ - this->delivered_at_;
+    }
+
     std::atomic<size_t> frames{0};
+    /// Frames whose first bin is at least hold_from_bin hold the drain thread for hold_ms, as a
+    /// listener that takes time to render would.
+    std::atomic<uint16_t> hold_from_bin{0xFFFF};
+    std::atomic<int> hold_ms{0};
 
 private:
     mutable std::mutex mutex_;
     std::vector<uint16_t> bins_;
+    std::vector<uint16_t> first_bins_;
+    int64_t client_timestamp_{0};
+    int64_t delivered_at_{0};
 };
 
 /// A visualizer asking for four spectrum bins.
@@ -563,46 +595,126 @@ TEST(ClientLifecycle, TheServedSpectrumBinCountGovernsTheDeliveredFrame) {
     client.stop();
 }
 
-// roles/visualizer/v1.md "Visualization Data (Binary)": data already in the past is dropped and
-// stale frames are never rendered, however slightly late. The ring is FIFO, so once the in-time
-// frame sent after them is delivered, every stale frame ahead of it has been dropped.
-TEST(ClientLifecycle, VisualizerFramesAlreadyInThePastAreNeverDelivered) {
-    constexpr int64_t STALE_BY_US = 10 * 1000;
-    RecordingSpectrumListener listener;
-    auto config = make_config(VISUALIZER_STALE_TEST_PORT);
-    config.time_burst_interval_ms = 100;  // Sync promptly: the drain thread needs client time
-    PairedClientBundle bundle(std::move(config));
-    SendspinClient& client = bundle.client();
-    client.add_visualizer(make_spectrum_visualizer_config()).set_listener(&listener);
+// A synced client with a four-bin spectrum stream running and its warm-up frames delivered.
+// Frames are told apart by their bin values, and every wait retries or samples rather than
+// bounding elapsed time, so a slow host can only make a test take longer.
+class VisualizerDelivery : public ::testing::Test {
+protected:
+    void start(uint16_t port, int32_t display_offset_ms = 0) {
+        auto config = make_config(port);
+        config.time_burst_interval_ms = 100;  // Sync promptly: the drain thread needs client time
+        this->bundle = std::make_unique<PairedClientBundle>(std::move(config));
+        VisualizerRoleConfig visualizer = make_spectrum_visualizer_config();
+        visualizer.display_offset_ms = display_offset_ms;
+        this->client().add_visualizer(std::move(visualizer)).set_listener(&this->listener);
 
-    FakeEncryptedServerOptions options;
-    options.answer_time = true;
-
-    ASSERT_TRUE(bundle.start());
-    auto server = connect_paired_server(bundle.peer, VISUALIZER_STALE_TEST_PORT, options);
-    pump_until_synced(client);
-    ASSERT_TRUE(server->send_app_json(stream_start_spectrum_json(4)));
-    send_spectrum_until(client, *server, [&] { return listener.frames.load() >= 1; });
-    // Let the helper's frames still ahead of their display time drain first.
-    auto& ring = client.visualizer()->impl_->drain_task->ring_buffer;
-    pump_until(client, [&] { return ring.is_empty(); });
-    pump_for(client, static_cast<int>(2 * VISUALIZER_LEAD_US / 1000));
-    const size_t delivered_before = listener.frames.load();
-
-    const std::string stale_bins("\x00\x01\x00\x01\x00\x01\x00\x01", 8);
-    for (int i = 0; i < 5; ++i) {
-        server->send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, platform_time_us() - STALE_BY_US,
-                            stale_bins);
+        FakeEncryptedServerOptions options;
+        options.answer_time = true;
+        ASSERT_TRUE(this->bundle->start());
+        this->server = connect_paired_server(this->bundle->peer, port, options);
+        pump_until_synced(this->client());
+        ASSERT_TRUE(this->server->send_app_json(stream_start_spectrum_json(4)));
+        send_spectrum_until(this->client(), *this->server,
+                            [&] { return this->listener.frames.load() >= 1; });
+        // Let the warm-up frames still queued behind the first one deliver, so a test's frames
+        // reach an idle drain thread instead of waiting behind them.
+        auto& ring = this->client().visualizer()->impl_->drain_task->ring_buffer;
+        pump_until(this->client(), [&] { return ring.is_empty(); });
+        pump_for(this->client(), static_cast<int>(2 * VISUALIZER_LEAD_US / 1000));
     }
-    const std::string fresh_bins("\x00\x02\x00\x02\x00\x02\x00\x02", 8);
-    server->send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
-                        platform_time_us() + VISUALIZER_LEAD_US, fresh_bins);
-    pump_until(client, [&] { return listener.frames.load() > delivered_before; });
 
-    EXPECT_EQ(listener.frames.load(), delivered_before + 1);
-    EXPECT_EQ(listener.last_bins(), (std::vector<uint16_t>{2, 2, 2, 2}));
+    void TearDown() override {
+        if (this->bundle) {
+            this->client().stop();
+        }
+    }
 
-    client.stop();
+    SendspinClient& client() {
+        return this->bundle->client();
+    }
+
+    /// Sends a spectrum frame whose four bins all hold `bin`, stamped `display_us`.
+    void send_frame_at(int64_t display_us, uint16_t bin) {
+        std::string bins;
+        for (int i = 0; i < 4; ++i) {
+            bins.push_back(static_cast<char>(bin >> 8));
+            bins.push_back(static_cast<char>(bin & 0xFF));
+        }
+        this->server->send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, display_us, bins);
+    }
+
+    RecordingSpectrumListener listener;
+    std::unique_ptr<PairedClientBundle> bundle;
+    std::unique_ptr<FakeEncryptedServer> server;
+};
+
+// roles/visualizer/v1.md "Visualization Data (Binary)": data already in the past on arrival is
+// dropped. The ring is FIFO, so once an in-time frame sent after them is delivered, every late
+// frame ahead of it has been judged.
+TEST_F(VisualizerDelivery, FramesAlreadyInThePastOnArrivalAreDropped) {
+    ASSERT_NO_FATAL_FAILURE(this->start(VISUALIZER_STALE_TEST_PORT));
+    for (int i = 0; i < 5; ++i) {
+        this->send_frame_at(platform_time_us() - 10 * 1000, 1);
+    }
+    pump_until(this->client(), [&] {
+        if (this->listener.delivered(2) > 0) {
+            return true;
+        }
+        this->send_frame_at(platform_time_us() + VISUALIZER_LEAD_US, 2);  // Control:
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return false;
+    });
+
+    EXPECT_EQ(this->listener.delivered(1), 0U) << "a frame late on arrival was delivered";
+}
+
+// A server sends one message per visualization type for each analysis frame, all with the same
+// timestamp, and a listener that takes 3 ms per frame leaves the drain thread reaching each
+// sibling after that timestamp. Every sibling arrived in time, so a whole group is delivered.
+// Groups repeat until one completes, so a stall that pushes a sibling past the lag bound only
+// costs another group; judging lateness at dequeue never completes one.
+TEST_F(VisualizerDelivery, FramesSharingATimestampAreAllDelivered) {
+    ASSERT_NO_FATAL_FAILURE(this->start(VISUALIZER_SHARED_TS_TEST_PORT));
+    constexpr uint16_t FIRST_GROUP_BIN = 100;
+    constexpr uint16_t SIBLINGS = 4;
+    this->listener.hold_from_bin = FIRST_GROUP_BIN;
+    this->listener.hold_ms = 3;
+
+    auto group_delivered = [&](uint16_t group) {
+        for (uint16_t i = 0; i < SIBLINGS; ++i) {
+            if (this->listener.delivered(FIRST_GROUP_BIN + group * SIBLINGS + i) == 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+    uint16_t groups_sent = 0;
+    pump_until(this->client(), [&] {
+        for (uint16_t group = 0; group < groups_sent; ++group) {
+            if (group_delivered(group)) {
+                return true;
+            }
+        }
+        const int64_t display_us = platform_time_us() + VISUALIZER_LEAD_US;
+        for (uint16_t i = 0; i < SIBLINGS; ++i) {
+            this->send_frame_at(display_us, FIRST_GROUP_BIN + groups_sent * SIBLINGS + i);
+        }
+        ++groups_sent;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return false;
+    });
+}
+
+// VisualizerRoleConfig::display_offset_ms shifts delivery from the display time, which the
+// callback's client_timestamp still reports. A negative offset is used because a delay is
+// checkable without an upper bound: a slow host only delivers later. The wait rounds down to
+// whole milliseconds, so delivery can come up to 1 ms before the shifted time.
+TEST_F(VisualizerDelivery, DisplayOffsetShiftsDeliveryFromTheDisplayTime) {
+    constexpr int32_t OFFSET_MS = -300;
+    ASSERT_NO_FATAL_FAILURE(this->start(VISUALIZER_OFFSET_TEST_PORT, OFFSET_MS));
+
+    EXPECT_LE(this->listener.last_lead_us(), (OFFSET_MS + 1) * 1000)
+        << "delivered " << this->listener.last_lead_us() << " us before the display time";
 }
 
 /// Counts high-performance requests and releases without touching the client, as the listener

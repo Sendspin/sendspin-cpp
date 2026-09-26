@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -67,6 +68,30 @@ VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* p
                                              size_t payload_len, uint8_t configured_bins,
                                              bool tracks_downbeats,
                                              std::vector<uint16_t>& spectrum_out);
+
+/// @brief How far behind its delivery time a frame that arrived in time may still be delivered. A
+/// frame only falls this far behind when the listener has held the drain thread; past it, the
+/// backlog is dropped rather than replayed late.
+static constexpr int64_t VISUALIZER_MAX_DELIVERY_LAG_US = 20000;
+
+/// @brief Recovers a frame's arrival time from the low 32 bits of platform_time_us() the network
+/// thread stored with it. Exact while the frame is younger than 2^32 us (about 71 minutes).
+int64_t visualizer_arrival_from_stamp(uint32_t stamp, int64_t now);
+
+/// @brief Decides when the drain thread delivers a frame. Pure, so the timing rules are unit
+/// tested with `now` as an argument.
+///
+/// roles/visualizer/v1.md "Visualization Data (Binary)": a frame already in the past on arrival
+/// is dropped. The rest are delivered display_offset_ms ahead of the display time (negative
+/// delays them), or on arrival when that is later, unless the drain thread has fallen more than
+/// VISUALIZER_MAX_DELIVERY_LAG_US behind that point.
+/// @param client_ts         Display time in client time.
+/// @param arrival_us        When the network thread received the frame.
+/// @param display_offset_ms VisualizerRoleConfig::display_offset_ms.
+/// @param now               The current platform_time_us().
+/// @return Microseconds to wait before delivering (0 to deliver now), or std::nullopt to drop.
+std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int64_t arrival_us,
+                                                   int32_t display_offset_ms, int64_t now);
 
 /// @brief Private implementation of the visualizer role
 struct VisualizerRole::Impl {

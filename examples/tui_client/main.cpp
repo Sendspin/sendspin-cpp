@@ -608,8 +608,9 @@ int main(int argc, char* argv[]) {
             .f_min = 40,
             .f_max = 16000,
         };
-        vis_role = &client.add_visualizer(
-            VisualizerRoleConfig{.support = vis_support, .stream = vis_stream});
+        // The UI redraws about every 30 ms, so a frame waits about 15 ms on average to be drawn.
+        vis_role = &client.add_visualizer(VisualizerRoleConfig{
+            .support = vis_support, .stream = vis_stream, .display_offset_ms = 15});
     }
 #else
     (void)enable_visualizer;

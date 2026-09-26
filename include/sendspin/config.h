@@ -521,6 +521,12 @@ struct VisualizerRoleConfig {
     VisualizerStreamConfig stream;
     bool psram_stack{false};  ///< Allocate drain thread stack in PSRAM (ESP-IDF only)
 
+    /// @brief Fires the data callbacks this many milliseconds before the frame's display time
+    /// (negative delays them), so a consumer that renders on its own cadence can set its render
+    /// latency here. The callbacks' client_timestamp stays the display time. The sign follows
+    /// ImageSlotPreference::display_offset_ms.
+    int32_t display_offset_ms{0};
+
     /// @brief Default FreeRTOS priority for the visualization drain thread (ESP-IDF only).
     /// Delivering frames is best-effort work, so it sits below the network and httpd tasks
     /// (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY).
