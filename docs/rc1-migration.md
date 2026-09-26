@@ -218,8 +218,10 @@ Not implemented, deliberately:
   the loop-thread pairing chain (`handle_pairing_message` -> `CPace::start` ->
   `cpace_calculate_generator` -> `cpace_elligator2` / `fp_pow`, and `CPace::derive` /
   `CPace::compute_mac` -> `hmac_sha512` -> `Sha512::update`), `dispatch_json_message()` on the
-  network task, and the headroom left in `DEFAULT_HTTPD_STACK_SIZE` and
-  `DEFAULT_WEBSOCKET_STACK_SIZE` on the re-handshake chain that set them.
+  network task, the headroom left in `DEFAULT_HTTPD_STACK_SIZE` and
+  `DEFAULT_WEBSOCKET_STACK_SIZE` on the re-handshake chain that set them, and the headroom left in
+  `SYNC_TASK_STACK_SIZE` on the sync task's Opus chain (`thread_entry` -> `decode_chunk` ->
+  `decode_whole_chunk` -> `decode_audio_chunk` -> `opus_decode`).
 
 ## To raise upstream
 
