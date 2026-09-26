@@ -95,12 +95,11 @@ struct PlayerRole::Impl {
     void handle_server_command(const ServerCommandMessage& cmd, uint32_t generation) const;
     void on_stream_ring_event(PlayerStreamCallbackType event);
     // True if this tick has drainable player work. The command-slot bit covers server
-    // volume/mute/output-delay commands; the state-slot bit covers client-state updates from
-    // the sync task; a non-empty awaiting_sync_idle_events is a main-thread-only flag set by
-    // on_stream_ring_event() above during this tick's ring dispatch, or carried over from a
-    // prior tick while a STREAM_END waits for the sync task to go idle. stream_params_slot's
-    // own topic bit (INBOX_TOPIC_PLAYER_STREAM_PARAMS) needs no separate term here: it is only
-    // ever consumed from the STREAM_START branch while that event sits in
+    // volume/mute/output-delay commands; a non-empty awaiting_sync_idle_events is a
+    // main-thread-only flag set by on_stream_ring_event() above during this tick's ring dispatch,
+    // or carried over from a prior tick while a STREAM_END waits for the sync task to go idle.
+    // stream_params_slot's own topic bit (INBOX_TOPIC_PLAYER_STREAM_PARAMS) needs no separate term
+    // here: it is only ever consumed from the STREAM_START branch while that event sits in
     // awaiting_sync_idle_events, which the awaiting_sync_idle_events term above already covers.
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & INBOX_TOPIC_PLAYER_COMMAND) != 0 ||

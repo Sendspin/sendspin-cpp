@@ -42,9 +42,9 @@ class SendspinClient;
 ///    delivery is un-acked is buffered latest-wins and delivered after frame_done(slot), then owes
 ///    its own. It waits behind the outstanding delivery rather than replacing it, so a consumer
 ///    presenting a delivery is never interrupted.
-///  - A stream end or clear is a lifecycle event, not a payload: it fires on_image_clear()
-///    immediately for every configured slot, discards anything buffered, replaces whatever was
-///    outstanding, and owes one frame_done() afterwards.
+///  - A stream end is a lifecycle event, not a payload: it fires on_image_clear() immediately for
+///    every configured slot, discards anything buffered, replaces whatever was outstanding, and
+///    owes one frame_done() afterwards.
 ///
 /// A frame decoded but never displayed is released automatically when its display can no longer
 /// fire (a stream restart; the server replacing or cancelling the image before its display was
@@ -84,10 +84,10 @@ public:
 
     /// @brief Called on the main loop thread when artwork should be cleared for a slot
     ///
-    /// Fires for every configured slot on stream end or stream clear, on connection loss, and
-    /// when a server/activate takes the artwork role out of the session's active roles (the last
-    /// two also drop any in-flight transfer). Fires for a single slot when the server clears that
-    /// channel (the artwork for the current item is gone, e.g. a track with no album art). A
+    /// Fires for every configured slot on stream end, on connection loss, and when a
+    /// server/activate takes the artwork role out of the session's active roles (each also drops
+    /// any in-flight transfer). Fires for a single slot when the server clears that channel (the
+    /// artwork for the current item is gone, e.g. a track with no album art). A
     /// per-channel clear is scheduled to its server timestamp exactly like on_image_display(),
     /// ImageSlotPreference::display_offset_ms included, so it lands on the item boundary rather
     /// than as soon as it arrives.

@@ -141,10 +141,10 @@ static PairingUiSnapshot snapshot_pairing_ui(SendspinConnection* conn) {
     return {conn->pairing_session().code_emitted, conn->pairing_session().window_shown};
 }
 
-/// @brief Overall deadline for a pairing-code attempt, bounding it from its first message
-/// (pairing.md "Entering and leaving pairing" recommends 2 minutes). It spans every round of the
-/// attempt: a retry keeps the running deadline rather than re-arming it. On expiry the attempt is
-/// aborted with reason attempt_timeout and the emitted code is withdrawn.
+/// @brief Overall deadline for a pairing attempt in any flow, bounding it from its first message
+/// (pairing.md "Entering and leaving pairing" recommends 2 minutes). In the pairing-code flows it
+/// spans every round: a retry keeps the running deadline rather than re-arming it. On expiry the
+/// attempt is aborted with reason attempt_timeout and any emitted code is withdrawn.
 static constexpr double PAIRING_ATTEMPT_TIMEOUT_S = 120.0;
 
 /// @brief Attempt deadline in microseconds (derived from PAIRING_ATTEMPT_TIMEOUT_S).

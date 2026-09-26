@@ -148,7 +148,7 @@ public:
     /// @brief Sets the listener for controller events; it must outlive this role
     void set_listener(ControllerRoleListener* listener);
 
-    /// @brief Sends a controller command to the server
+    /// @brief Sends a controller command to the server; callable from any thread
     ///
     /// Sent only while controller@v1 is among the connection's active roles; a command issued
     /// outside that window is dropped rather than queued. A command missing from the latest

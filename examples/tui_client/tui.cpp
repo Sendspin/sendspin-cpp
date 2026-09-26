@@ -909,8 +909,8 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         return true;
     }
 
-    // Seek backward (relative). Server clamps to the seekable range and ignores 'seek_relative' if
-    // it isn't in the controller's supported_commands.
+    // Seek backward (relative). The server clamps to the seekable range; the library drops
+    // 'seek_relative' itself if the server did not list it in supported_commands.
     if (event == kSeekBackEvent) {
         {
             std::lock_guard<std::mutex> lock(state.mutex);

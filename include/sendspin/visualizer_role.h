@@ -52,10 +52,11 @@ struct ServerVisualizerStreamObject {
 /// mapped linearly in dB across that range.
 ///
 /// THREAD SAFETY: the per-type data callbacks (on_loudness, on_beat, on_f_peak,
-/// on_spectrum, on_peak) fire on a dedicated drain thread at each frame's display
-/// timestamp. Implementations must be thread-safe for these methods (copy data quickly,
-/// defer heavy processing). on_visualizer_stream_start/end/clear fire on the main loop
-/// thread.
+/// on_spectrum, on_peak) fire on a dedicated drain thread, VisualizerRoleConfig::display_offset_ms
+/// ahead of each frame's display timestamp (client_timestamp stays the display time). A frame
+/// already past its display time on arrival, or more than 20 ms behind schedule, is dropped
+/// without a callback. Implementations must be thread-safe for these methods (copy data quickly,
+/// defer heavy processing). on_visualizer_stream_start/end/clear fire on the main loop thread.
 class VisualizerRoleListener {
 public:
     virtual ~VisualizerRoleListener() = default;

@@ -495,10 +495,10 @@ struct VisualizerSpectrumConfig {
 struct VisualizerSupportObject {
     /// @brief Total RAM budget in bytes for the internal ring buffer (the exact allocation size).
     /// This is not the amount of wire data that fits: each entry stores its full wire message
-    /// (message-type byte + timestamp + data) plus an aligned per-entry ItemHeader, so for the
-    /// small visualizer entries only roughly a third of this budget holds actual wire data. The
-    /// client advertises that effective (~1/3) capacity to the server, not this raw budget, so the
-    /// server's flow control does not overrun the ring
+    /// (message-type byte + timestamp + data), a 4-byte arrival stamp and an aligned per-entry
+    /// ItemHeader, so for the small visualizer entries only roughly a third of this budget holds
+    /// actual wire data. The client advertises that effective (~1/3) capacity to the server, not
+    /// this raw budget, so the server's flow control does not overrun the ring
     size_t buffer_capacity{};
 };
 

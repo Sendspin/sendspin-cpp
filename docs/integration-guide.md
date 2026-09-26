@@ -332,20 +332,20 @@ struct MyArtworkListener : ArtworkRoleListener {
 };
 ```
 
-**Knowing when there is no artwork.** Artwork stays valid until the server replaces or clears it, and the artwork role is independent of the metadata role, so a track change alone sends nothing: the next track of the same album keeps showing the image already delivered. When an item genuinely has no artwork, the server clears that channel and `on_image_clear()` fires for that slot alone, scheduled to its server timestamp like a display (`display_offset_ms` included) so it lands on the item boundary. `on_image_clear()` also fires for every configured slot on stream end, stream clear, disconnect, and a `server/activate` that takes the artwork role out of the session's active roles.
+**Knowing when there is no artwork.** Artwork stays valid until the server replaces or clears it, and the artwork role is independent of the metadata role, so a track change alone sends nothing: the next track of the same album keeps showing the image already delivered. When an item genuinely has no artwork, the server clears that channel and `on_image_clear()` fires for that slot alone, scheduled to its server timestamp like a display (`display_offset_ms` included) so it lands on the item boundary. `on_image_clear()` also fires for every configured slot on stream end, disconnect, and a `server/activate` that takes the artwork role out of the session's active roles.
 
 | What happened | What the listener sees |
 | --- | --- |
 | Artwork unchanged (e.g. next track of the same album) | nothing; the current image stays valid |
 | Item has no artwork | `on_image_clear(slot)` for that slot |
-| Stream ended or cleared, connection lost, or the role deactivated | `on_image_clear(slot)` for every configured slot |
+| Stream ended, connection lost, or the role deactivated | `on_image_clear(slot)` for every configured slot |
 
 **Cross-fades with back-pressure (opt-in).** By default the role decodes and displays every frame as it arrives. A slot can instead opt into a back-pressure gate by setting `ImageSlotPreference::require_frame_done`. With the gate on, the role keeps at most one un-acked *delivery* (a frame or a clear) in flight for that slot. Call `ArtworkRole::frame_done(slot)` from the main loop exactly once for every `on_image_display()` and `on_image_clear()` that slot receives, e.g. once a cross-fade animation finishes. An extra call is a harmless no-op, but a missed one wedges the slot: there is no timeout, the acknowledgment is the contract.
 
-Payloads and stream-level clears reach the gate differently:
+Payloads and a stream end reach the gate differently:
 
 - A **frame or per-channel clear** arriving while a delivery is un-acked is buffered latest-wins and delivered only after `frame_done(slot)`, and then owes its own `frame_done()`. It waits behind the outstanding delivery rather than replacing it, so a consumer presenting a delivery is never interrupted. The exception is a delivery that has not reached `on_image_display()` yet: the server announcing a newer image for the slot replaces it outright, its display never fires, and the gate reopens for the buffered payload.
-- A **stream end or stream clear** is a lifecycle event, not a payload, so it is never buffered: it fires `on_image_clear()` immediately for every configured slot, discards anything buffered, and replaces whatever delivery was outstanding. Exactly one `frame_done()` is owed afterward whatever was in flight.
+- A **stream end** is a lifecycle event, not a payload, so it is never buffered: it fires `on_image_clear()` immediately for every configured slot, discards anything buffered, and replaces whatever delivery was outstanding. Exactly one `frame_done()` is owed afterward whatever was in flight.
 
 Pair the gate with `ImageSlotPreference::display_offset_ms` to start a fade before the track boundary (positive fires the display early, mirroring `PlayerRoleConfig::fixed_delay_us`), and use `lateness_ms` to shorten the fade so it still ends on schedule:
 
@@ -1115,6 +1115,8 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 | All other listener methods | Main loop thread |
 
 `PlayerRole::notify_audio_played()` is thread-safe and is designed to be called from an audio output callback thread.
+
+`ControllerRole::send_command()` is callable from any thread.
 
 `ArtworkRole::frame_done()` must be called from the main loop thread (typically from inside `on_image_display()`/`on_image_clear()` or when a cross-fade animation completes).
 

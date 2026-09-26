@@ -344,7 +344,7 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
 The controller role, visualizer binary layouts (IDs 16-20), metadata progress math and
 scheduled-update gating, the `client/goodbye` reason set, the 30 second provisional timeout, the
 activity-rank arbitration and last-playback tiebreak, the stored-`server_id` post-match check,
-arrival time taken after decrypt and reassembly, `stream/clear` buffer discard, mid-stream
+arrival time taken once the final fragment has arrived, `stream/clear` buffer discard, mid-stream
 format switches, and, since phase 3a, the
 fragmentation wire format, the audio chunk header, the post-re-handshake sequence and the
 category-to-activities table.

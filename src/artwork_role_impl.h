@@ -276,8 +276,8 @@ struct ArtworkRole::Impl {
     // if it is that slot's. Both a cancel message and a fresh announce need exactly this.
     void discard_pending(uint8_t slot);
     // Discards every channel's pending image, and forgets the streamed configuration so the next
-    // stream/start compares against nothing. A stream end or clear and a disconnect each end the
-    // whole stream this way; a stream/start discards only the channels it changed (see
+    // stream/start compares against nothing. A stream end and a disconnect each end the whole
+    // stream this way; a stream/start discards only the channels it changed (see
     // changed_channel_mask()).
     void discard_all_pending();
     // Which channels this stream/start changed the configuration of, as a slot bitmask. Every
@@ -356,12 +356,12 @@ struct ArtworkRole::Impl {
     std::atomic<uint32_t> cleanup_generation{0};
 
     /// @brief Per-channel delivery epoch, bumped whenever the channel's pending image is
-    /// discarded: by a stream start/end/clear or cleanup (every channel at once), and by a cancel
-    /// message or a fresh announce (that channel alone, per roles/artwork/v1.md "Artwork
-    /// (Binary)"). A notification, a decode hand-off, and a held display all carry the epoch they
-    /// were made under, so each drops itself at its next check instead of having to be hunted
-    /// down across three threads. An image already displayed has left the pipeline, which is what
-    /// makes the current image survive a cancel.
+    /// discarded: by a stream end or cleanup (every channel at once), by a stream/start (the
+    /// channels whose configuration it changed), and by a cancel message or a fresh announce (that
+    /// channel alone, per roles/artwork/v1.md "Artwork (Binary)"). A notification, a decode
+    /// hand-off, and a held display all carry the epoch they were made under, so each drops itself
+    /// at its next check instead of having to be hunted down across three threads. An image already
+    /// displayed has left the pipeline, which is what makes the current image survive a cancel.
     std::atomic<uint32_t> slot_epochs[ARTWORK_MAX_SLOTS]{};
 
     // 8-bit fields
