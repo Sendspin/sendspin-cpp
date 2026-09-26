@@ -103,6 +103,10 @@ if(ESP_IDF_BUILD)
     # Apply ESP-IDF configuration
     sendspin_configure_esp_idf(${COMPONENT_LIB} ${COMPONENT_DIR})
 
+    # Deferred to the end of configuration: noise-c and this component require each other, so its
+    # target may not exist yet when this file runs.
+    cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR} CALL sendspin_enable_noise_name_tables)
+
 # ==============================================================================
 # Host Build
 # ==============================================================================
