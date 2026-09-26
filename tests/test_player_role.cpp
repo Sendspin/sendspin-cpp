@@ -515,11 +515,24 @@ TEST(PlayerRoleVolume, ValueOverTheSpecMaximumIsClamped) {
 }
 
 // roles/player/v1.md "server/command player object": set_output_delay is only honored while the
-// player advertises it in supported_commands.
+// player advertises it in supported_commands, which the consumer sees as on_output_delay_changed().
 TEST(PlayerRoleOutputDelay, SetOutputDelayCommandIsIgnoredUnlessAdvertised) {
+    class DelayListener : public PlayerRoleListener {
+    public:
+        size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
+            return length;
+        }
+        void on_output_delay_changed(uint16_t delay_ms) override {
+            this->changes.push_back(delay_ms);
+        }
+        std::vector<uint16_t> changes;
+    };
+
     for (const bool adjustable : {false, true}) {
         SCOPED_TRACE(adjustable ? "advertised" : "not advertised");
+        DelayListener listener;  // Outlives the role that holds it
         auto impl = make_impl();
+        impl->listener = &listener;
         impl->output_delay_adjustable.store(adjustable);
 
         ServerPlayerCommandObject player_cmd;
@@ -530,7 +543,7 @@ TEST(PlayerRoleOutputDelay, SetOutputDelayCommandIsIgnoredUnlessAdvertised) {
         impl->handle_server_command(cmd, live_generation(*impl));
         impl->drain_events();
 
-        EXPECT_EQ(impl->output_delay_ms.load(), adjustable ? 300 : 0);
+        EXPECT_EQ(listener.changes, adjustable ? std::vector<uint16_t>{300} : std::vector<uint16_t>{});
     }
 }
 

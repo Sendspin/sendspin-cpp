@@ -903,8 +903,9 @@ TEST(EncryptedLifecycle, LeaveIsSentOnlyOnAnActivatedConnection) {
     pump_for(client, 100);
 }
 
-// messaging.md "External Source Handling": availability set before a connection reaches its first
-// client/state, each change publishes once, and restating the current value sends nothing.
+// messaging.md "External Source Handling": availability is device state. Set before a connection,
+// and kept across stop()/start(), it reaches the first client/state; each change publishes once,
+// and restating the current value sends nothing.
 TEST(EncryptedLifecycle, AvailabilityIsDeviceStateAndPublishesOnChange) {
     SendspinClientConfig config;
     config.name = "Availability Test Client";
@@ -914,6 +915,8 @@ TEST(EncryptedLifecycle, AvailabilityIsDeviceStateAndPublishesOnChange) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
     client.set_available(false);
+    client.stop();
+    ASSERT_TRUE(bundle.start());
     EXPECT_FALSE(client.is_available());
 
     auto available_in = [](const std::string& state) {
@@ -925,7 +928,7 @@ TEST(EncryptedLifecycle, AvailabilityIsDeviceStateAndPublishesOnChange) {
     auto server = connect_paired_server(bundle.peer, AVAILABILITY_TEST_PORT);
     pump_until(client, [&] { return !server->client_states().empty(); });
     EXPECT_FALSE(available_in(server->client_states().front()))
-        << "the first client/state lost the availability set before the connection";
+        << "the first client/state lost the availability set before the restart";
 
     const size_t states_before_change = server->client_states().size();
     client.set_available(true);

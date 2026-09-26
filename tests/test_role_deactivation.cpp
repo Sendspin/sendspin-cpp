@@ -461,6 +461,22 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
         client.metadata()->impl_->cleanup_generation.load(std::memory_order_acquire));
     pump_until(client, [&] { return metadata_listener.updates == 2; });
 
+    // roles/controller/v1.md "client/command controller object": the removal discarded the offered
+    // commands with the rest of the state, so after a re-add nothing goes out until a new
+    // server/state offers it.
+    ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","controller@v1"])")));
+    pump_for(client, SETTLE_MS);
+    client.controller()->send_command({.command = SendspinControllerCommand::PLAY});
+    pump_for(client, SETTLE_MS);
+    EXPECT_TRUE(server->controller_commands().empty())
+        << "a command the removed role's state offered was sent after the re-add";
+
+    // Control: once a server/state offers it again, the same command goes out.
+    ASSERT_TRUE(server->send_app_json(controller_state_json(42)));
+    pump_until(client, [&] { return controller_listener.updates == 2; });
+    client.controller()->send_command({.command = SendspinControllerCommand::PLAY});
+    pump_until(client, [&] { return !server->controller_commands().empty(); });
+
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
 }

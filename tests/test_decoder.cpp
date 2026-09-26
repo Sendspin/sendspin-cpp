@@ -18,15 +18,23 @@
 #include "audio_stream_info.h"
 #include "audio_types.h"
 #include "decoder.h"
+#include "platform/memory.h"
+#include "sync_task.h"
+#include "transfer_buffer.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <opus.h>
 #include <vector>
 
 using sendspin::AudioStreamInfo;
 using sendspin::SendspinDecoder;
+using sendspin::SyncContext;
+using sendspin::SyncTask;
+using sendspin::TransferBuffer;
 
 namespace {
 
@@ -151,7 +159,8 @@ TEST(Decoder, PcmChunkAtTheSpecMaximumFitsOneCallAndPartialFramesAreRejected) {
     int calls = 0;
     EXPECT_EQ(decode_resuming(decoder, chunk, decoder.get_decode_buffer_size(), &calls), chunk);
     EXPECT_EQ(calls, 1);
-    EXPECT_EQ(decode_resuming(decoder, chunk, chunk.size() / 2, &calls), chunk);
+    // Room for half the chunk plus part of a frame: the first call still stops at a whole frame.
+    EXPECT_EQ(decode_resuming(decoder, chunk, chunk.size() / 2 + 1, &calls), chunk);
     EXPECT_EQ(calls, 2);
 
     std::vector<uint8_t> buffer(chunk.size());
@@ -159,4 +168,136 @@ TEST(Decoder, PcmChunkAtTheSpecMaximumFitsOneCallAndPartialFramesAreRejected) {
     size_t decoded = 0;
     EXPECT_FALSE(decoder.decode_audio_chunk(chunk.data(), info.frames_to_bytes(1) + 1,
                                             buffer.data(), buffer.size(), &consumed, &decoded));
+}
+
+namespace {
+
+constexpr int OPUS_FRAMES_40_MS = 1920;  // 40 ms at 48 kHz
+
+/// One 40 ms Opus packet of 48 kHz stereo silence, twice the 20 ms the decoder first sizes for.
+std::vector<uint8_t> opus_packet_40_ms() {
+    int error = OPUS_OK;
+    OpusEncoder* encoder = opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, &error);
+    EXPECT_EQ(error, OPUS_OK);
+    if (encoder == nullptr) {
+        return {};
+    }
+    const std::vector<int16_t> pcm(OPUS_FRAMES_40_MS * 2, 0);
+    std::vector<uint8_t> packet(4000);
+    const int packet_size = opus_encode(encoder, pcm.data(), OPUS_FRAMES_40_MS, packet.data(),
+                                        static_cast<opus_int32>(packet.size()));
+    opus_encoder_destroy(encoder);
+    EXPECT_GT(packet_size, 0);
+    packet.resize(packet_size > 0 ? static_cast<size_t>(packet_size) : 0);
+    return packet;
+}
+
+/// The 48 kHz stereo header the PCM and Opus rows share.
+const sendspin::DummyHeader STEREO_48K_HEADER{
+    .sample_rate = 48000, .bits_per_sample = 16, .channels = 2};
+
+}  // namespace
+
+// An Opus packet longer than the 20 ms the decoder first sizes for consumes nothing and raises the
+// estimate; with that much room the same packet then decodes whole.
+TEST(Decoder, OpusPacketLongerThanTheEstimateRaisesItAndDecodesOnRetry) {
+    const std::vector<uint8_t> packet = opus_packet_40_ms();
+    ASSERT_FALSE(packet.empty());
+
+    SendspinDecoder decoder;
+    AudioStreamInfo info;
+    ASSERT_TRUE(decoder.process_header(reinterpret_cast<const uint8_t*>(&STEREO_48K_HEADER),
+                                       sizeof(STEREO_48K_HEADER),
+                                       sendspin::CHUNK_TYPE_OPUS_DUMMY_HEADER, &info));
+    const size_t first_estimate = decoder.get_decode_buffer_size();
+
+    std::vector<uint8_t> buffer(first_estimate);
+    size_t consumed = 0;
+    size_t decoded = 0;
+    ASSERT_TRUE(decoder.decode_audio_chunk(packet.data(), packet.size(), buffer.data(),
+                                           buffer.size(), &consumed, &decoded));
+    EXPECT_EQ(consumed, 0U);
+    EXPECT_EQ(decoded, 0U);
+    ASSERT_GT(decoder.get_decode_buffer_size(), first_estimate);
+
+    buffer.resize(decoder.get_decode_buffer_size());
+    ASSERT_TRUE(decoder.decode_audio_chunk(packet.data(), packet.size(), buffer.data(),
+                                           buffer.size(), &consumed, &decoded));
+    EXPECT_EQ(consumed, packet.size());
+    EXPECT_EQ(decoded, info.frames_to_bytes(OPUS_FRAMES_40_MS));
+}
+
+namespace {
+
+/// A sync context decoding `header`'s stream, with the decode buffer the sync task allocates at a
+/// codec header: one decoder unit plus the soft-sync spare frame.
+void start_context(SyncContext& context, const std::vector<uint8_t>& header,
+                   sendspin::ChunkType header_type) {
+    context.decoder = std::make_unique<SendspinDecoder>();
+    ASSERT_TRUE(context.decoder->process_header(header.data(), header.size(), header_type,
+                                                &context.current_stream_info));
+    context.bytes_per_frame = context.current_stream_info.frames_to_bytes(1);
+    context.decode_buffer =
+        TransferBuffer::create(context.decoder->get_decode_buffer_size() + context.bytes_per_frame,
+                               sendspin::MemoryLocation::PREFER_EXTERNAL);
+    ASSERT_NE(context.decode_buffer, nullptr);
+}
+
+/// Storage for a ring entry holding `chunk`, laid out as the encoded ring stores it.
+std::vector<uint64_t> ring_entry(const std::vector<uint8_t>& chunk) {
+    std::vector<uint64_t> storage(
+        (sizeof(sendspin::AudioRingBufferEntry) + chunk.size()) / sizeof(uint64_t) + 1);
+    auto* entry = reinterpret_cast<sendspin::AudioRingBufferEntry*>(storage.data());
+    entry->chunk_type = sendspin::CHUNK_TYPE_ENCODED_AUDIO;
+    entry->data_size = chunk.size();
+    std::memcpy(entry->data(), chunk.data(), chunk.size());
+    return storage;
+}
+
+}  // namespace
+
+// The sync task decodes a chunk all or nothing: every frame, growing the buffer as the decoder
+// asks, or, when any part fails or the whole decodes past roles/player/v1.md "Server Audio Send
+// Constraints" (150 ms), none of it.
+TEST(SyncTaskDecodeWholeChunk, DecodesEveryFrameOrLeavesTheBufferEmpty) {
+    const std::vector<uint8_t> stereo_48k_header(
+        reinterpret_cast<const uint8_t*>(&STEREO_48K_HEADER),
+        reinterpret_cast<const uint8_t*>(&STEREO_48K_HEADER) + sizeof(STEREO_48K_HEADER));
+    const std::vector<uint8_t> opus_packet = opus_packet_40_ms();
+    ASSERT_FALSE(opus_packet.empty());
+    struct Row {
+        const char* name;
+        const std::vector<uint8_t>* header;
+        sendspin::ChunkType header_type;
+        std::vector<uint8_t> chunk;
+        size_t output_bytes;  // 0 when the chunk must fail
+    };
+    const Row rows[] = {
+        {"Control: three FLAC frames outgrow a one-frame buffer", &FLAC_HEADER,
+         sendspin::CHUNK_TYPE_FLAC_HEADER, FLAC_FRAMES, 3 * FLAC_FRAME_PCM_BYTES},
+        {"FLAC chunk ending mid-frame", &FLAC_HEADER, sendspin::CHUNK_TYPE_FLAC_HEADER,
+         std::vector<uint8_t>(FLAC_FRAMES.begin(), FLAC_FRAMES.end() - 10), 0},
+        {"Control: 40 ms Opus packet grows the 20 ms buffer and retries", &stereo_48k_header,
+         sendspin::CHUNK_TYPE_OPUS_DUMMY_HEADER, opus_packet, 7680},
+        {"Control: PCM chunk of 150 ms", &stereo_48k_header,
+         sendspin::CHUNK_TYPE_PCM_DUMMY_HEADER, std::vector<uint8_t>(28800, 0x11), 28800},
+        {"PCM chunk of 151 ms", &stereo_48k_header, sendspin::CHUNK_TYPE_PCM_DUMMY_HEADER,
+         std::vector<uint8_t>(28800 + 192, 0x11), 0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SyncContext context;
+        ASSERT_NO_FATAL_FAILURE(start_context(context, *row.header, row.header_type));
+        std::vector<uint64_t> storage = ring_entry(row.chunk);
+        context.encoded_entry = reinterpret_cast<sendspin::AudioRingBufferEntry*>(storage.data());
+
+        EXPECT_EQ(SyncTask::decode_whole_chunk(context), row.output_bytes != 0);
+        EXPECT_EQ(context.decode_buffer->available(), row.output_bytes);
+        if (row.header_type == sendspin::CHUNK_TYPE_FLAC_HEADER && row.output_bytes != 0) {
+            const std::vector<uint8_t> pcm = flac_source_pcm();
+            ASSERT_EQ(context.decode_buffer->available(), pcm.size());
+            EXPECT_EQ(std::memcmp(context.decode_buffer->get_buffer_start(), pcm.data(), pcm.size()),
+                      0);
+        }
+    }
 }

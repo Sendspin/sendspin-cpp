@@ -57,6 +57,11 @@ add_executable(sendspin_tests
     ../examples/common/file_persistence_provider.cpp
 )
 
+# test_decoder.cpp calls SyncTask::decode_whole_chunk(), the sync task's chunk-resume loop, which
+# is a protected static member: it grows the decode buffer, resumes the decoder and rolls a failed
+# chunk back, and nothing on the public surface reaches it without the sync thread.
+set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
+
 # test_client_lifecycle.cpp checks what a role's stop() left in its ring, which nothing on the
 # public surface reports, and installs a stand-in connection in ConnectionManager's admitted slot
 # (and drops it mid-publish) to pin publish_state()'s hold on it; it reads the private members

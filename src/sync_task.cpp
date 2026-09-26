@@ -602,7 +602,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             return DecodeResult::SKIPPED;
         }
 
-        if (!this->decode_whole_chunk(sync_context)) {
+        if (!decode_whole_chunk(sync_context)) {
             this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
             sync_context.encoded_entry = nullptr;
             return DecodeResult::FAILED;
