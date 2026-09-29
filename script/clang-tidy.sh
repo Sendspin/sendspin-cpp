@@ -56,5 +56,12 @@ if [ "$1" = "--fix" ]; then
     FIX_FLAG="--fix"
 fi
 
+# A non-Apple clang-tidy (e.g. Homebrew LLVM) does not know where the macOS SDK keeps the
+# standard library headers, so point it there
+EXTRA_ARGS=""
+if [ "$(uname)" = "Darwin" ] && command -v xcrun &> /dev/null; then
+    EXTRA_ARGS="--extra-arg=-isysroot --extra-arg=$(xcrun --show-sdk-path)"
+fi
+
 echo "Running clang-tidy..."
-$CLANG_TIDY -p "$BUILD_DIR" $FIX_FLAG $SOURCES
+$CLANG_TIDY -p "$BUILD_DIR" $FIX_FLAG $EXTRA_ARGS $SOURCES
