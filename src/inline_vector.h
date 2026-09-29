@@ -28,15 +28,12 @@ namespace sendspin {
 
 /// @brief Vector with a compile-time capacity and inline storage; never touches the heap
 ///
-/// For containers whose size has a proven bound, so the storage can be part of the owning object
-/// instead of a heap buffer. Slots past size() hold value-initialized T, and every path that
-/// shrinks the vector (erase(), clear()) resets the vacated slots to T{}, so whatever a removed
-/// element owns (a shared_ptr's reference) is released at the removal, not whenever its slot is
-/// next overwritten. That matters for shared_ptr elements whose release has to happen at a known
-/// point (see DeferredRelease).
+/// For containers with a proven size bound. erase() and clear() overwrite every removed element
+/// (by the shift or a reset to T{}), so its resources (e.g. a shared_ptr reference) are released
+/// at the removal.
 ///
 /// Requires T to be default-constructible, move-constructible, and move-assignable. Not copyable
-/// or movable: transfer contents with swap(), which leaves both sides consistent.
+/// or movable; use swap().
 template <typename T, size_t N>
 class InlineVector {
 public:
@@ -47,7 +44,7 @@ public:
     InlineVector(const InlineVector&) = delete;
     InlineVector& operator=(const InlineVector&) = delete;
 
-    /// @brief Appends `value`. Precondition: size() < N; the caller's bound guarantees room.
+    /// @brief Appends `value`. Precondition: size() < N.
     /// @param value The element to append (moved in).
     void push_back(T value) {
         assert(this->count_ < N && "InlineVector capacity exceeded");
@@ -63,7 +60,7 @@ public:
         return pos;
     }
 
-    /// @brief Removes every element, resetting each slot to T{} now.
+    /// @brief Removes every element.
     void clear() {
         for (auto& item : *this) {
             item = T{};

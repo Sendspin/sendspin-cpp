@@ -417,7 +417,7 @@ private:
     /// entries do not count against the capacity in either direction: a user-initiated connect_to()
     /// is admitted even against full inbound slots, and an in-flight connect_to() never causes an
     /// inbound peer to be rejected. An outbound entry always replaces any previous one, so the
-    /// bound on the whole nursery is NURSERY_CAPACITY + 1.
+    /// whole nursery is bounded by MAX_NURSERY_ENTRIES.
     ///
     /// Socket-budget invariant: gracefully rejecting a surplus inbound peer requires the transport
     /// to accept NURSERY_CAPACITY + 2 sockets (1 established + the nursery + the surplus peer,
@@ -436,12 +436,10 @@ private:
     mutable std::mutex conn_ptr_mutex_;               // Protects current_connection_, nursery_, and
                                                       // deferred_releases_
     std::vector<DeferredRelease> deferred_releases_;  // Queued releases; see DeferredRelease
-    // Unproven connections awaiting establishment; see MAX_NURSERY_ENTRIES
+    // Unproven connections awaiting establishment
     InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery_;
-    // One entry per nursery connection awaiting its hello, so bounded by the nursery. Holds because
-    // every nursery removal also calls remove_hello_retry() and initiate_hello() dedups per
-    // connection; on_new_connection() arms before its push, while the nursery is still below
-    // MAX_NURSERY_ENTRIES.
+    // At most one entry per nursery connection (see initiate_hello() and the invariant stated in
+    // loop()), so bounded like the nursery
     InlineVector<HelloRetryState, MAX_NURSERY_ENTRIES> hello_retries_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
