@@ -226,6 +226,7 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
         ASSERT_TRUE(client.start());
         EXPECT_TRUE(client.start());  // Already running: reports true, starts nothing twice
         EXPECT_TRUE(client.is_started());
+        client.loop();  // First tick binds the WS server
 
         const std::string server_id = "server-" + std::to_string(cycle);
         FakeServer server(server_url(RESTART_TEST_PORT), server_id);
@@ -263,6 +264,7 @@ TEST(ClientLifecycle, StopGoodbyesNurseryPeersToo) {
     SendspinClient client(make_config(NURSERY_GOODBYE_TEST_PORT));
     client.set_network_provider(&network);
     ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     FakeServer established(server_url(NURSERY_GOODBYE_TEST_PORT), "server-established");
     pump_until(client, [&] { return client.is_connected(); });
@@ -292,6 +294,7 @@ TEST(ClientLifecycle, StopEndsTheStreamAndRestartPlaysAgain) {
 
     for (int cycle = 0; cycle < 2; ++cycle) {
         ASSERT_TRUE(client.start());
+        client.loop();  // First tick binds the WS server
         FakeServer server(server_url(STREAM_TEST_PORT), "server-" + std::to_string(cycle),
                           FakeServerOptions{.answer_time = true});
         pump_until(client, [&] { return client.is_connected(); });
@@ -325,6 +328,7 @@ TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
     ReentrantMetadataListener listener(client);
     client.add_metadata().set_listener(&listener);
     ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     {
         FakeServer server(server_url(CALLBACK_TEST_PORT), "server-a");
@@ -345,6 +349,7 @@ TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
 
     // The refused start() inside the callback left the client stopped; a real start() works.
     ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
     FakeServer server(server_url(CALLBACK_TEST_PORT), "server-b");
     pump_until(client, [&] { return client.is_connected(); });
     client.stop();
@@ -363,6 +368,7 @@ TEST(ClientLifecycle, DestructorGoodbyesPeersWithoutCallbacks) {
         client.set_network_provider(&network);
         client.add_metadata().set_listener(&listener);
         ASSERT_TRUE(client.start());
+        client.loop();  // First tick binds the WS server
 
         server = new FakeServer(server_url(DESTRUCTOR_TEST_PORT), "server-a");
         pump_until(client, [&] { return client.is_connected(); });
@@ -403,6 +409,7 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     client.add_visualizer(std::move(working));
 
     ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
     FakeServer server(server_url(ROLLBACK_TEST_PORT), "server-a",
                       FakeServerOptions{.answer_time = true});
     pump_until(client, [&] { return client.is_connected(); });
@@ -554,6 +561,7 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     client.add_visualizer(make_visualizer_config()).set_listener(&listener);
 
     ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
     {
         FakeServer server(server_url(VISUALIZER_TEST_PORT), "server-a",
                           FakeServerOptions{.answer_time = true});
@@ -571,6 +579,7 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     EXPECT_EQ(listener.loudness.load(), 0U);
 
     ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
     FakeServer server(server_url(VISUALIZER_TEST_PORT), "server-b",
                       FakeServerOptions{.answer_time = true});
     pump_until_synced(client);
@@ -606,6 +615,7 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
     CountingClientListener listener;
     client.set_listener(&listener);
     ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     auto server = std::make_unique<FakeServer>(server_url(HIGH_PERF_TEST_PORT), "server-a");
     pump_until(client, [&] { return client.is_connected(); });
@@ -637,6 +647,7 @@ TEST(ClientLifecycle, DestructorReleasesHighPerformanceHold) {
         client.set_network_provider(&network);
         client.set_listener(&listener);
         ASSERT_TRUE(client.start());
+        client.loop();  // First tick binds the WS server
 
         FakeServer server(server_url(DESTRUCTOR_HIGH_PERF_TEST_PORT), "server-a");
         pump_until(client, [&] { return client.is_connected() && listener.requests == 1; });
