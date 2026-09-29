@@ -21,13 +21,13 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `Inbox` / `InboxSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle/time events
 - `SendspinTimeFilter` (`time_filter.h`): 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator
-- `SendspinDecoder` (`decoder.h`): FLAC/Opus/PCM decoder wrapper
+- `SendspinDecoder` (`decoder.h`): FLAC/PCM decoder wrapper, plus Opus when built with `SENDSPIN_ENABLE_OPUS`
 
 ### Role composition
 
 Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role receives a `SendspinClient*` at construction time and uses it to access shared services (time sync, state publishing, message sending). The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers.
 
-Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options (host build) or Kconfig entries (ESP-IDF build). When a role is disabled, its source files are not compiled and its `add_*()` declaration, accessor, and `unique_ptr` member are removed from `client.h`. `#ifdef` guards live in exactly two places in the library: `cmake/sources.cmake` (source lists) and `include/sendspin/client.h` / `src/client.cpp` (dispatch points); examples guard their own role usage like any consumer. Audio codec dependencies (micro-flac, micro-opus) are only linked when the player role is enabled.
+Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options (host build) or Kconfig entries (ESP-IDF build). When a role is disabled, its source files are not compiled and its `add_*()` declaration, accessor, and `unique_ptr` member are removed from `client.h`. Role `#ifdef` guards live in exactly two places in the library: `cmake/sources.cmake` (source lists) and `include/sendspin/client.h` / `src/client.cpp` (dispatch points); the codec gate `SENDSPIN_ENABLE_OPUS` (cmake option / Kconfig entry, default on) lives only in `src/decoder.h`, `src/decoder.cpp`, and `src/player_role.cpp`. Examples and tests guard their own role and opus usage like any consumer. Audio codec dependencies (micro-flac, micro-opus) are only linked when the player role is enabled, micro-opus also only with `SENDSPIN_ENABLE_OPUS`.
 
 The consuming platform (e.g., ESPHome) supplies the listener implementations plus `SendspinNetworkProvider` and the optional `SendspinPersistenceProvider`/`SendspinClientListener` providers; `docs/integration-guide.md` has the full wiring, including a minimal working example.
 
@@ -77,11 +77,11 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 ## Build
 
 - **ESP-IDF**: Used as an IDF component via `idf_component.yml`. Sources defined in `cmake/sources.cmake`.
-- **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies (ArduinoJson, micro-flac, micro-opus, IXWebSocket) via FetchContent.
+- **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies via FetchContent: ArduinoJson, IXWebSocket, and, for the player role, micro-flac plus micro-opus when `SENDSPIN_ENABLE_OPUS` is on.
 - **Tests**: `cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tests --target sendspin_tests` and `ctest --test-dir build-tests --output-on-failure`.
 - **ThreadSanitizer tests**: `cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tsan --target sendspin_tests` and `TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure`. `ENABLE_TSAN` applies the thread sanitizer to every target, including the fetched dependencies, and cannot be combined with `ENABLE_SANITIZERS`.
-- **ESP dependencies**: ArduinoJson, esp_websocket_client, micro-flac, micro-opus, esp_http_server, mbedtls, pthread, esp_ringbuf
-- **Host dependencies**: ArduinoJson, micro-flac, micro-opus, IXWebSocket, pthreads
+- **ESP dependencies**: ArduinoJson, esp_websocket_client, micro-flac, micro-opus (with `SENDSPIN_ENABLE_OPUS`), esp_http_server, mbedtls, pthread, esp_ringbuf
+- **Host dependencies**: ArduinoJson, micro-flac, micro-opus (with `SENDSPIN_ENABLE_OPUS`), IXWebSocket, pthreads
 
 ## Coding conventions
 

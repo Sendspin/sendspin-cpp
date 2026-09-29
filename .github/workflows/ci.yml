@@ -80,6 +80,29 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build-tests --output-on-failure
 
+  test-no-opus:
+    name: Build and test without Opus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libavahi-compat-libdnssd-dev
+
+      - name: Configure CMake
+        # SENDSPIN_ENABLE_OPUS=OFF must build the library, the examples, and the tests without
+        # micro-opus. The player tests that only exist in this configuration run under ASan/UBSan
+        # here, like the default suite does in the test job.
+        run: cmake -B build-no-opus -DSENDSPIN_ENABLE_OPUS=OFF -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON .
+
+      - name: Build
+        run: cmake --build build-no-opus
+
+      - name: Run tests
+        run: ctest --test-dir build-no-opus --output-on-failure
+
   test-tsan:
     name: Unit tests (ThreadSanitizer)
     runs-on: ubuntu-latest
@@ -112,7 +135,7 @@ jobs:
 
   ci:
     name: CI
-    needs: [pre-commit, lint, build, test, test-tsan]
+    needs: [pre-commit, lint, build, test, test-no-opus, test-tsan]
     runs-on: ubuntu-latest
     if: always()
     steps:

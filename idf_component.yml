@@ -11,7 +11,8 @@ dependencies:
   esphome/micro-opus:
     version: ">=0.3.5"
     rules:
-      - if: "$CONFIG{SENDSPIN_ENABLE_PLAYER} == True"
+      # SENDSPIN_ENABLE_OPUS only exists while the player is enabled, so test the player first
+      - if: "$CONFIG{SENDSPIN_ENABLE_PLAYER} == True && $CONFIG{SENDSPIN_ENABLE_OPUS} == True"
 description: "Sendspin synchronized audio streaming client for ESP32"
 license: "Apache-2.0"
 maintainers:

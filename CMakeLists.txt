@@ -49,8 +49,12 @@ if(ESP_IDF_BUILD)
 
     if(CONFIG_SENDSPIN_ENABLE_PLAYER)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_PLAYER_SOURCES})
-        list(APPEND SENDSPIN_REQUIRES esphome__micro-flac esphome__micro-opus)
+        list(APPEND SENDSPIN_REQUIRES esphome__micro-flac)
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_PLAYER)
+        if(CONFIG_SENDSPIN_ENABLE_OPUS)
+            list(APPEND SENDSPIN_REQUIRES esphome__micro-opus)
+            list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_OPUS)
+        endif()
     endif()
 
     if(CONFIG_SENDSPIN_ENABLE_CONTROLLER)
@@ -110,6 +114,9 @@ else()
     option(SENDSPIN_ENABLE_ARTWORK "Enable artwork role" ON)
     option(SENDSPIN_ENABLE_VISUALIZER "Enable visualizer role" ON)
 
+    # Codec selection (player role only). Opus is patent-encumbered; see the player role spec.
+    option(SENDSPIN_ENABLE_OPUS "Enable the Opus decoder in the player role" ON)
+
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/host.cmake)
 
     # Get sources
@@ -143,6 +150,9 @@ else()
     # Add compile definitions for enabled roles
     if(SENDSPIN_ENABLE_PLAYER)
         target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_PLAYER)
+        if(SENDSPIN_ENABLE_OPUS)
+            target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_OPUS)
+        endif()
     endif()
     if(SENDSPIN_ENABLE_CONTROLLER)
         target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_CONTROLLER)

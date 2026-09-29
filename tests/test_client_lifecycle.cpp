@@ -64,6 +64,11 @@ constexpr uint16_t ROLLBACK_TEST_PORT = 18996;
 constexpr uint16_t HIGH_PERF_TEST_PORT = 18997;
 constexpr uint16_t VISUALIZER_TEST_PORT = 18998;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 18999;
+constexpr uint16_t FORMATS_TEST_PORT = 19000;
+constexpr uint16_t OPUS_TEST_PORT = 19001;
+#ifndef SENDSPIN_ENABLE_OPUS
+constexpr uint16_t OPUS_STREAM_TEST_PORT = 19002;
+#endif
 
 /// Reports whether anything is listening on the loopback port.
 bool port_accepts(uint16_t port) {
@@ -135,9 +140,13 @@ public:
     }
 };
 
+std::string stream_start_json(const char* codec) {
+    return std::string(R"({"type":"stream/start","payload":{"player":{"codec":")") + codec +
+           R"(","sample_rate":48000,"channels":2,"bit_depth":16}}})";
+}
+
 std::string stream_start_pcm_json() {
-    return R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
-           R"("channels":2,"bit_depth":16}}})";
+    return stream_start_json("pcm");
 }
 
 PlayerRoleConfig make_player_config() {
@@ -403,6 +412,83 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     client.stop();
     EXPECT_EQ(listener.stream_ends, 1);
 }
+
+// A player must list flac or pcm, the only codecs every server supports (roles/player/v1.md); with
+// neither, a server that lacks the listed codecs has no format it can stream. start() refuses such
+// a list and the client stays stopped. The refused player has no listener: the rule covers what the
+// hello advertises, not whether audio could play. Control: either baseline codec on its own starts.
+TEST(ClientLifecycle, PlayerWithoutFlacOrPcmRefusesToStart) {
+    TestNetworkProvider network;
+    CountingPlayerListener listener;
+    SendspinClient client(make_config(FORMATS_TEST_PORT));
+    client.set_network_provider(&network);
+
+    PlayerRoleConfig opus_only;
+    opus_only.audio_formats.push_back({SendspinCodecFormat::OPUS, 2, 48000, 16});
+    client.add_player(std::move(opus_only));
+    EXPECT_FALSE(client.start());
+    EXPECT_FALSE(client.is_started());
+
+    for (SendspinCodecFormat codec : {SendspinCodecFormat::FLAC, SendspinCodecFormat::PCM}) {
+        PlayerRoleConfig baseline;
+        baseline.audio_formats.push_back({codec, 2, 48000, 16});
+        client.add_player(std::move(baseline)).set_listener(&listener);
+        ASSERT_TRUE(client.start());
+        client.stop();
+    }
+}
+
+// An opus entry next to a baseline codec is accepted only in a build with the Opus decoder
+// (SENDSPIN_ENABLE_OPUS); otherwise start() refuses it, so the hello never advertises a codec this
+// build cannot decode.
+TEST(ClientLifecycle, OpusEntryRequiresTheOpusDecoder) {
+    TestNetworkProvider network;
+    CountingPlayerListener listener;
+    SendspinClient client(make_config(OPUS_TEST_PORT));
+    client.set_network_provider(&network);
+
+    PlayerRoleConfig config;
+    config.audio_formats.push_back({SendspinCodecFormat::OPUS, 2, 48000, 16});
+    config.audio_formats.push_back({SendspinCodecFormat::PCM, 2, 48000, 16});
+    client.add_player(std::move(config)).set_listener(&listener);
+#ifdef SENDSPIN_ENABLE_OPUS
+    ASSERT_TRUE(client.start());
+    client.stop();
+#else
+    EXPECT_FALSE(client.start());
+    EXPECT_FALSE(client.is_started());
+#endif
+}
+
+#ifndef SENDSPIN_ENABLE_OPUS
+// Without the Opus decoder, a stream/start naming opus (a server ignoring the advertised list)
+// takes the unsupported-codec path: no codec header reaches the sync task and no
+// on_stream_start() fires. The pcm stream/start sent right behind it starts normally; stream
+// events drain in arrival order, so once the pcm params are current an accepted opus start would
+// already have been counted.
+TEST(ClientLifecycle, OpusStreamStartIsRefusedWithoutTheOpusDecoder) {
+    TestNetworkProvider network;
+    CountingPlayerListener listener;
+    SendspinClient client(make_config(OPUS_STREAM_TEST_PORT));
+    client.set_network_provider(&network);
+    client.add_player(make_player_config()).set_listener(&listener);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
+
+    FakeServer server(server_url(OPUS_STREAM_TEST_PORT), "server-a");
+    pump_until(client, [&] { return client.is_connected(); });
+
+    server.send_text(stream_start_json("opus"));
+    server.send_text(stream_start_pcm_json());
+    pump_until(client, [&] {
+        return client.player()->get_current_stream_params().codec == SendspinCodecFormat::PCM;
+    });
+    EXPECT_EQ(listener.stream_starts, 1);
+
+    client.stop();
+    EXPECT_EQ(listener.stream_ends, 1);
+}
+#endif
 
 /// Counts loudness deliveries; they fire on the visualizer drain thread.
 class CountingVisualizerListener : public VisualizerRoleListener {

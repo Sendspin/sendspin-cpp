@@ -49,8 +49,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
   differences live in `src/platform/`, `src/esp/`, and `src/host/`. Within
   the library, role compile-gates (`#ifdef SENDSPIN_ENABLE_*`) live only in
   `cmake/sources.cmake` and the dispatch points in
-  `include/sendspin/client.h` / `src/client.cpp`; consumers, including the
-  examples, guard their own role usage (see Public API).
+  `include/sendspin/client.h` / `src/client.cpp`, and the codec gate
+  `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`, and
+  `src/player_role.cpp`; consumers, including the examples, guard their own
+  role and codec usage (see Public API).
 - Logging uses the `SS_LOG*` macros; allocation uses the `platform_malloc`
   family with an explicit `MemoryLocation` choice where it matters.
 - Code that only builds on one platform still keeps the other platform's build
