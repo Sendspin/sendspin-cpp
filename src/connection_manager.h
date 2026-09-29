@@ -19,6 +19,7 @@
 #pragma once
 
 #include "constants.h"
+#include "inline_vector.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 
@@ -297,7 +298,7 @@ private:
     /// conn_ptr_mutex_.
     /// @param conn The connection to look up.
     /// @return Iterator into nursery_, or nursery_.end() if the connection is not in the nursery.
-    std::vector<NurseryEntry>::iterator find_in_nursery(const SendspinConnection* conn);
+    NurseryEntry* find_in_nursery(const SendspinConnection* conn);
 
     /// @brief Appends an entry to the nursery and refreshes nursery_size_ in the same critical
     /// section, so the hint atomic can never drift from nursery_.size(). Caller must hold
@@ -339,8 +340,8 @@ private:
     /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
     ///        already gone so no goodbye should be attempted.
     /// @return Iterator to the entry after the erased one.
-    std::vector<NurseryEntry>::iterator release_nursery_entry(
-        std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason);
+    NurseryEntry* release_nursery_entry(NurseryEntry* it,
+                                        std::optional<SendspinGoodbyeReason> reason);
 
     /// @brief Appends a release to deferred_releases_ and refreshes deferred_size_ in the same
     /// critical section, so the hint atomic can never drift from deferred_releases_.size().
@@ -424,13 +425,24 @@ private:
     /// satisfies this; start() warns when a configured value does not.
     static constexpr size_t NURSERY_CAPACITY = 2;
 
+    /// @brief Bound on the whole nursery: NURSERY_CAPACITY inbound entries plus the one outbound.
+    static constexpr size_t MAX_NURSERY_ENTRIES = NURSERY_CAPACITY + 1;
+
+    /// @brief Maximum connections under management at once: the current one plus the nursery.
+    static constexpr size_t MAX_MANAGED_CONNECTIONS = MAX_NURSERY_ENTRIES + 1;
+
     // Struct fields
     std::mutex conn_mutex_;                           // Protects deferred lifecycle event queues
     mutable std::mutex conn_ptr_mutex_;               // Protects current_connection_, nursery_, and
                                                       // deferred_releases_
     std::vector<DeferredRelease> deferred_releases_;  // Queued releases; see DeferredRelease
-    std::vector<NurseryEntry> nursery_;               // Unproven connections awaiting establishment
-    std::vector<HelloRetryState> hello_retries_;      // One entry per connection awaiting its hello
+    // Unproven connections awaiting establishment; see MAX_NURSERY_ENTRIES
+    InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery_;
+    // One entry per nursery connection awaiting its hello, so bounded by the nursery. Holds because
+    // every nursery removal also calls remove_hello_retry() and initiate_hello() dedups per
+    // connection; on_new_connection() arms before its push, while the nursery is still below
+    // MAX_NURSERY_ENTRIES.
+    InlineVector<HelloRetryState, MAX_NURSERY_ENTRIES> hello_retries_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
 

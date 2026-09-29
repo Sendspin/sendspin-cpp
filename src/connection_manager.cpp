@@ -23,7 +23,6 @@
 #include "time_burst.h"
 #include "ws_server.h"
 
-#include <array>
 #include <utility>
 
 namespace sendspin {
@@ -97,14 +96,14 @@ ConnectionManager::~ConnectionManager() {
     this->take_pending_events(pending_connected, pending_disconnects);
 
     std::shared_ptr<SendspinConnection> current;
-    std::vector<NurseryEntry> nursery;
-    std::vector<HelloRetryState> retries;
+    InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery;
+    InlineVector<HelloRetryState, MAX_NURSERY_ENTRIES> retries;
     std::vector<DeferredRelease> releases;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         current = std::move(this->current_connection_);
-        nursery = std::move(this->nursery_);
-        retries = std::move(this->hello_retries_);
+        nursery.swap(this->nursery_);
+        retries.swap(this->hello_retries_);
         releases = std::move(this->deferred_releases_);
         // Keep the hint atomics in sync with the now-empty containers (has_pending_events_ was
         // handled above under its own mutex). Nothing reads them again after destruction, but
@@ -176,7 +175,7 @@ void ConnectionManager::connect_to(const std::string& url) {
         }
 
         // A user-initiated connect is admitted even against a full nursery: there is at most one
-        // outbound entry (replaced above), so the nursery is still bounded (NURSERY_CAPACITY + 1)
+        // outbound entry (replaced above), so the nursery is still bounded (MAX_NURSERY_ENTRIES)
         // and an explicit user request never fails against inbound peers.
         this->push_nursery_entry(NurseryEntry{client_conn, /*inbound=*/false});
         client_conn->start();
@@ -189,7 +188,7 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
     // host outbound it joins the transport thread), which must not stall other manager entry
     // points. The connections stay in their slots until their close events arrive (or the
     // manager is destroyed).
-    std::vector<std::shared_ptr<SendspinConnection>> to_disconnect;
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_MANAGED_CONNECTIONS> to_disconnect;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
@@ -467,12 +466,9 @@ void ConnectionManager::loop() {
         this->flush_deferred_releases();
     }
 
-    // Call loop on active connections using shared_ptr copies to avoid holding the lock. The
-    // nursery is bounded (NURSERY_CAPACITY inbound + 1 outbound), so a fixed array avoids a
-    // per-tick heap allocation while connections are being set up.
+    // Call loop on active connections using shared_ptr copies to avoid holding the lock.
     std::shared_ptr<SendspinConnection> current_copy;
-    std::array<std::shared_ptr<SendspinConnection>, NURSERY_CAPACITY + 1> nursery_copies;
-    size_t nursery_count = 0;
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_NURSERY_ENTRIES> nursery_copies;
     // Skip the copy (and thus every conn->loop() call below) when there is nothing to call it
     // on: no current connection and an empty nursery.
     if (this->nursery_size_.load(std::memory_order_acquire) > 0 ||
@@ -480,14 +476,14 @@ void ConnectionManager::loop() {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         current_copy = this->current_connection_;
         for (const auto& entry : this->nursery_) {
-            nursery_copies[nursery_count++] = entry.conn;
+            nursery_copies.push_back(entry.conn);
         }
     }
     if (current_copy) {
         current_copy->loop();
     }
-    for (size_t i = 0; i < nursery_count; ++i) {
-        nursery_copies[i]->loop();
+    for (auto& conn : nursery_copies) {
+        conn->loop();
     }
 
     // Hello retry timers and the nursery establish-deadline reap both operate purely on nursery
@@ -782,8 +778,7 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
 // Connection lifecycle
 // ============================================================================
 
-std::vector<NurseryEntry>::iterator ConnectionManager::find_in_nursery(
-    const SendspinConnection* conn) {
+NurseryEntry* ConnectionManager::find_in_nursery(const SendspinConnection* conn) {
     // Note: caller must hold conn_ptr_mutex_
     for (auto it = this->nursery_.begin(); it != this->nursery_.end(); ++it) {
         if (it->conn.get() == conn) {
@@ -817,8 +812,8 @@ void ConnectionManager::queue_pending_disconnect(std::shared_ptr<SendspinConnect
     this->has_pending_events_.store(true, std::memory_order_release);
 }
 
-std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(
-    std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason) {
+NurseryEntry* ConnectionManager::release_nursery_entry(
+    NurseryEntry* it, std::optional<SendspinGoodbyeReason> reason) {
     // Note: caller must hold conn_ptr_mutex_ and flush_deferred_releases() after dropping it
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
