@@ -258,19 +258,47 @@ TEST(Protocol, MetadataObjectReplacesEveryFieldItOmits) {
     EXPECT_FALSE(metadata.progress.has_value());
 }
 
-TEST(Protocol, MetadataMissingTimestampIsRejected) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(
-        parse(R"({"type":"server/state","payload":{"metadata":{"title":"X"}}})", doc, root));
+// roles/metadata/v1.md and roles/color/v1.md "server/state ... object": timestamp is a required
+// integer (server-clock microseconds, so wider than 32 bits). A missing or non-integer one rejects
+// the whole object, which is reported as absent rather than partially applied, and leaves the
+// caller's state untouched.
+TEST(Protocol, StateObjectTimestampMustBeAnInteger) {
+    struct Row {
+        const char* name;
+        const char* timestamp_field;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: 64-bit integer timestamp", R"("timestamp":1700000000000000,)", true},
+        {"missing timestamp", "", false},
+        {"numeric string timestamp", R"("timestamp":"7",)", false},
+        {"float timestamp", R"("timestamp":7.5,)", false},
+    };
 
-    // The malformed metadata section is reported as absent rather than partially applied.
-    ServerMetadataStateObject metadata;
-    metadata.title = "Kept";
-    EXPECT_FALSE(process_server_state_metadata(root, &metadata));
-    // A rejected object leaves the caller's state untouched.
-    ASSERT_TRUE(metadata.title.has_value());
-    EXPECT_EQ(metadata.title.value(), "Kept");
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+
+        ASSERT_TRUE(parse(std::string(R"({"type":"server/state","payload":{"metadata":{)") +
+                              row.timestamp_field + R"("title":"New"}}})",
+                          doc, root));
+        ServerMetadataStateObject metadata;
+        metadata.title = "Kept";
+        EXPECT_EQ(process_server_state_metadata(root, &metadata), row.accepted);
+        ASSERT_TRUE(metadata.title.has_value());
+        EXPECT_EQ(metadata.title.value(), row.accepted ? "New" : "Kept");
+
+        ASSERT_TRUE(parse(std::string(R"({"type":"server/state","payload":{"color":{)") +
+                              row.timestamp_field + R"("primary":[10,20,30]}}})",
+                          doc, root));
+        ServerColorStateObject color;
+        color.primary = RgbColor{1, 2, 3};
+        EXPECT_EQ(process_server_state_color(root, &color), row.accepted);
+        ASSERT_TRUE(color.primary.has_value());
+        const RgbColor expected_primary = row.accepted ? RgbColor{10, 20, 30} : RgbColor{1, 2, 3};
+        EXPECT_EQ(color.primary.value(), expected_primary);
+    }
 }
 
 // messaging.md "server/state color object": each component is an integer in [0, 255]. A component

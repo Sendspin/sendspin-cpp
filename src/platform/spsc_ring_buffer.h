@@ -134,6 +134,9 @@ public:
         // so a burst of sends collapses into one token; the non-blocking poll below (before
         // the wait, and again for every call while data remains) is what guarantees items
         // are never stranded behind a collapsed token.
+        if (this->handle_ == nullptr) {
+            return nullptr;  // Not created: reads as empty, as on host
+        }
         void* item = xRingbufferReceive(this->handle_, item_size, 0);
         if (item != nullptr || timeout_ms == 0) {
             return item;
@@ -407,6 +410,10 @@ private:
 
     /// @brief Attempts to read the next committed item; returns a pointer or nullptr if none ready
     void* try_read(size_t* item_size) {
+        if (this->storage_ == nullptr) {
+            // Not created: reads as empty (free_bytes_ == 0 would otherwise read as full).
+            return nullptr;
+        }
         while (this->read_offset_ != this->write_offset_ || this->free_bytes_ == 0) {
             if (this->read_offset_ >= this->storage_size_) {
                 this->read_offset_ = 0;

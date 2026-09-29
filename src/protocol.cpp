@@ -519,16 +519,17 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* m
     }
     const JsonObject metadata_object = root["payload"]["metadata"];
 
-    // timestamp is required (not optional)
-    if (!metadata_object["timestamp"].is<JsonVariant>()) {
-        SS_LOGE(TAG, "Invalid metadata state object: missing timestamp");
+    // roles/metadata/v1.md "server/state metadata object": timestamp is a required integer.
+    const JsonVariantConst timestamp = metadata_object["timestamp"];
+    if (!timestamp.is<int64_t>()) {
+        SS_LOGE(TAG, "Invalid metadata state object: missing or non-integer timestamp");
         return false;
     }
     // messaging.md "server/state": every message carries the full state of each role object it
     // includes, so an included metadata object is parsed into a fresh state rather than overlaid
     // on what came before.
     *metadata = ServerMetadataStateObject{};
-    metadata->timestamp = metadata_object["timestamp"].as<int64_t>();
+    metadata->timestamp = timestamp.as<int64_t>();
 
     parse_metadata_string_field(metadata_object["title"], "title", &metadata->title);
     parse_metadata_string_field(metadata_object["artist"], "artist", &metadata->artist);
@@ -573,14 +574,16 @@ bool process_server_state_color(JsonObject root, ServerColorStateObject* color) 
     }
     const JsonObject color_object = root["payload"]["color"];
 
-    if (!color_object["timestamp"].is<JsonVariant>()) {
-        SS_LOGE(TAG, "Invalid color state object: missing timestamp");
+    // roles/color/v1.md "server/state color object": timestamp is a required integer.
+    const JsonVariantConst timestamp = color_object["timestamp"];
+    if (!timestamp.is<int64_t>()) {
+        SS_LOGE(TAG, "Invalid color state object: missing or non-integer timestamp");
         return false;
     }
     // messaging.md "server/state": an included color object carries the full palette, so it is
     // parsed into a fresh state.
     *color = ServerColorStateObject{};
-    color->timestamp = color_object["timestamp"].as<int64_t>();
+    color->timestamp = timestamp.as<int64_t>();
 
     parse_color_field(color_object["background_dark"], "background_dark", &color->background_dark);
     parse_color_field(color_object["background_light"], "background_light",

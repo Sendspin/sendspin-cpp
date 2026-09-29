@@ -126,6 +126,12 @@ TEST(SpscRingBuffer, CreateRejectsTooSmallStorage) {
     EXPECT_TRUE(rb.create(16, storage.data()));
 }
 
+TEST(SpscRingBuffer, UncreatedBufferReadsAsEmpty) {
+    SpscRingBuffer rb;
+    size_t item_size = 0;
+    EXPECT_EQ(rb.receive(&item_size, 0), nullptr);
+}
+
 // wake_receiver() is the only way out of an infinite park, so a returning receive is itself
 // the proof the wake landed. The sleep only makes the consumer likely to be parked; a wake
 // before the park is held pending, so either ordering passes.
