@@ -37,6 +37,7 @@
 #include "ws_server.h"
 
 #include <array>
+#include <cassert>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -194,7 +195,7 @@ public:
     explicit ScopedIsk(std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk) : value_(isk) {
         if (isk.has_value()) {
             // The bytes were copied, so the argument still holds them.
-            secure_zero_container(isk.value());
+            secure_zero_container(*isk);
         }
     }
 
@@ -203,7 +204,7 @@ public:
 
     ~ScopedIsk() {
         if (this->value_.has_value()) {
-            secure_zero_container(this->value_.value());
+            secure_zero_container(*this->value_);
         }
     }
 
@@ -213,10 +214,12 @@ public:
         return this->value_.has_value();
     }
 
-    /// @brief The held ISK
+    /// @brief The held ISK; only valid when has_value()
     /// @return Reference to the held bytes, valid until this object goes out of scope.
     [[nodiscard]] const std::array<uint8_t, CPACE_ISK_SIZE>& value() const {
-        return this->value_.value();
+        assert(this->value_.has_value());
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access): callers check has_value() first
+        return *this->value_;
     }
 
 private:
@@ -263,19 +266,25 @@ static std::vector<uint8_t> pake_ad_server() {
     return std::vector<uint8_t>(PAKE_AD_SERVER, PAKE_AD_SERVER + sizeof(PAKE_AD_SERVER) - 1);
 }
 
-/// @brief Whether an applied server/activate selects the pairing flow: the PAIRING activity
-/// together with a pairing.method the client recognizes. Shared by every site that must route
-/// such an activate into ConnectionManager::handle_enter_pairing(). PLAYBACK may ride along
-/// (messaging.md "server/activate" allows ['playback', 'pairing']), and the connection then also
-/// takes the operational path (SendspinClient::on_handshake_complete()).
-static bool is_pairing_selection_activate(const std::vector<SendspinActivity>& activities,
-                                          const std::optional<SendspinPairMethod>& pairing_method) {
+/// @brief The pairing method an applied server/activate selects, if it selects the pairing flow:
+/// the PAIRING activity together with a pairing.method the client recognizes. Shared by every
+/// site that must route such an activate into ConnectionManager::handle_enter_pairing().
+/// PLAYBACK may ride along (messaging.md "server/activate" allows ['playback', 'pairing']), and
+/// the connection then also takes the operational path (SendspinClient::on_handshake_complete()).
+/// @return The selected method, or nullopt when the activate does not select pairing.
+static std::optional<SendspinPairMethod> selected_pairing_method(
+    const std::vector<SendspinActivity>& activities,
+    const std::optional<SendspinPairMethod>& pairing_method) {
     if (!contains_activity(activities, SendspinActivity::PAIRING) || !pairing_method.has_value()) {
-        return false;
+        return std::nullopt;
     }
-    return pairing_method.value() == SendspinPairMethod::PAIRING_PSK ||
-           pairing_method.value() == SendspinPairMethod::DYNAMIC_PAIRING_CODE ||
-           pairing_method.value() == SendspinPairMethod::STATIC_PAIRING_CODE;
+    const SendspinPairMethod method = pairing_method.value();
+    if (method == SendspinPairMethod::PAIRING_PSK ||
+        method == SendspinPairMethod::DYNAMIC_PAIRING_CODE ||
+        method == SendspinPairMethod::STATIC_PAIRING_CODE) {
+        return method;
+    }
+    return std::nullopt;
 }
 
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config) {
@@ -552,11 +561,14 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
             ui.window_was_shown |= current_ui.window_was_shown;
             this->current_connection_->disable_message_dispatch();
             // Vacate the admitted slot explicitly, as drop_connection() does: the connection is
-            // moved out below, so set_current_connection(nullptr) finds an empty slot and clears
-            // nothing, and the goodbye keeps the connection alive past this call.
+            // swapped out below (see drop_connection() for why not moved), so
+            // set_current_connection(nullptr) finds an empty slot and clears nothing, and the
+            // goodbye keeps the connection alive past this call.
             this->current_connection_->set_admitted(false);
-            to_goodbye.push_back(std::move(this->current_connection_));
+            std::shared_ptr<SendspinConnection> outgoing;
+            outgoing.swap(this->current_connection_);
             this->set_current_connection(nullptr);
+            to_goodbye.push_back(std::move(outgoing));
         }
         for (auto& entry : this->nursery_) {
             const PairingUiSnapshot entry_ui = snapshot_pairing_ui(entry.conn.get());
@@ -863,8 +875,9 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         this->note_playback_activity(event.conn.get());
 
         const auto& activities = event.conn->get_activities();
-        const auto& pairing_method = event.conn->get_pairing_method();
-        const bool selects_pairing = is_pairing_selection_activate(activities, pairing_method);
+        const std::optional<SendspinPairMethod> pairing_method =
+            selected_pairing_method(activities, event.conn->get_pairing_method());
+        const bool selects_pairing = pairing_method.has_value();
 
         // The pairing-selection check runs on every activate and takes priority over the plain
         // operational branch: a server rehandshaking an admitted connection onto the pairing PSK
@@ -1583,9 +1596,9 @@ void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnectio
     // never leaves two connections flagged as admitted, and skip the clear when the same
     // connection is being re-set.
     //
-    // This only covers an occupant still sitting in the slot. drop_connection() moves the
-    // outgoing connection out before calling here, so it clears the flag itself; keep the two
-    // in step if either changes.
+    // This only covers an occupant still sitting in the slot. drop_connection() and stop() swap
+    // the outgoing connection out before calling here, so they clear the flag themselves; keep
+    // them in step if any of them changes.
     if (this->current_connection_ != nullptr && this->current_connection_ != conn) {
         this->current_connection_->set_admitted(false);
     }
@@ -1765,7 +1778,7 @@ void ConnectionManager::flush_deferred_releases(bool on_main_loop) {
     }
     for (auto& release : releases) {
         if (release.goodbye.has_value()) {
-            this->disconnect_and_release(std::move(release.conn), release.goodbye.value());
+            disconnect_and_release(std::move(release.conn), release.goodbye.value());
         }
         // Without a goodbye the shared_ptr simply drops (below, when `releases` goes out of
         // scope): even bare destruction happens outside the lock, because a connection
@@ -1814,16 +1827,17 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         conn->disable_message_dispatch();
         // Vacate the admitted slot explicitly. set_current_connection(nullptr) below cannot do
-        // it: the outgoing connection is moved out of current_connection_ first, so the setter
+        // it: the outgoing connection is swapped out of current_connection_ first, so the setter
         // sees an already-null slot and has nothing to clear. The connection outlives this call
         // (queue_deferred_release keeps it alive through the goodbye window), so leaving the flag
         // set would leave a dropped connection claiming admission.
         conn->set_admitted(false);
         this->client_->cleanup_connection_state();
-        // set_current_connection(nullptr) reassigns the slot to a clean null (not a moved-from
-        // state) after we move the old connection out, so a later event in the same loop() pass
-        // that reads current_connection_ never trips the static analyzer.
-        auto dropped = std::move(this->current_connection_);
+        // Swapped out rather than moved out so the slot is null by construction when
+        // set_current_connection(nullptr) reads it. A moved-from shared_ptr is empty too, but the
+        // analyzer's use-after-move check does not model that.
+        std::shared_ptr<SendspinConnection> dropped;
+        dropped.swap(this->current_connection_);
         this->set_current_connection(nullptr);
         this->queue_deferred_release(std::move(dropped), goodbye);
         this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
@@ -1928,8 +1942,9 @@ std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nurs
     // leaving pairing" leaves active_roles and streams untouched and going operational is what
     // clears any stale pairing state before the new attempt.
     const auto& activities = this->current_connection_->get_activities();
-    const auto& pairing_method = this->current_connection_->get_pairing_method();
-    const bool selects_pairing = is_pairing_selection_activate(activities, pairing_method);
+    const std::optional<SendspinPairMethod> pairing_method =
+        selected_pairing_method(activities, this->current_connection_->get_pairing_method());
+    const bool selects_pairing = pairing_method.has_value();
 
     if (!selects_pairing || contains_activity(activities, SendspinActivity::PLAYBACK)) {
         this->client_->on_handshake_complete(this->current_connection_.get());
@@ -1996,16 +2011,18 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
                                                   SendspinPairMethod selected_method) {
     const bool is_dynamic = selected_method == SendspinPairMethod::DYNAMIC_PAIRING_CODE;
     const RecordStore& store = *this->client_->record_store_;
+    const auto& static_code = store.static_pairing_code();
+    const auto& pairing_format = conn->get_pairing_format();
 
     // Defensive: the client should not have advertised static_pairing_code without a configured
     // code, nor dynamic_pairing_code without an emission format the activation could name.
-    if (!is_dynamic && !store.static_pairing_code().has_value()) {
+    if (!is_dynamic && !static_code.has_value()) {
         SS_LOGE(TAG, "handle_enter_pairing: no static pairing code configured for server_id=%s",
                 server_id.c_str());
         this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
         return;
     }
-    if (is_dynamic && !conn->get_pairing_format().has_value()) {
+    if (is_dynamic && !pairing_format.has_value()) {
         SS_LOGE(TAG, "handle_enter_pairing: no emission format selected for server_id=%s",
                 server_id.c_str());
         this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
@@ -2031,12 +2048,12 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
     ps.pairing_index = pairing_index;
     if (is_dynamic) {
         // Checked against the advertised formats when the activation was admitted.
-        ps.format = conn->get_pairing_format().value();
+        ps.format = pairing_format.value();
     } else {
         // Capture the static code now, before any operator window wait, so a code change during
         // the open window cannot swap the CPace secret mid-attempt. The static code is what CPace
         // consumes as PRS directly; a dynamic one is only known once nonce_A arrives.
-        ps.prs = pairing_code_digits_prs(store.static_pairing_code().value());
+        ps.prs = pairing_code_digits_prs(static_code.value());
     }
 
     // Gesture gating: the static pairing code gates every attempt on an operator gesture

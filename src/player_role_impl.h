@@ -82,7 +82,7 @@ struct PlayerRole::Impl {
     void attach_inbox(Inbox& inbox);
     /// @brief Hands the sync task the connection manager it resolves its stream pin from and
     /// gives that pin back to. Called at role registration, before start().
-    void attach_connection_manager(ConnectionManager& manager);
+    void attach_connection_manager(ConnectionManager& manager) const;
     bool start();
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;

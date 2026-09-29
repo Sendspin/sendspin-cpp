@@ -122,7 +122,7 @@ struct VisualizerRole::Impl {
 
     void attach_inbox(Inbox& inbox);
     bool start();
-    void build_hello_fields(ClientHelloMessage& msg);
+    void build_hello_fields(ClientHelloMessage& msg) const;
     void build_state_fields(ClientStateMessage& msg) const;
     // Each handler takes the teardown generation the receive gate captured when it admitted the
     // message and re-checks it where it takes effect; see accepts(). handle_stream_end() skips

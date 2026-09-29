@@ -46,6 +46,9 @@ static constexpr Fp FP_P = {{
     0x7FFFFFFFFFFFFFFFULL,
 }};
 
+// 2^256 mod p = 38 (because 2^255 = p + 19): the multiplier that folds bits past 2^256 back in
+static constexpr uint64_t FP_2_256_MOD_P = 38;
+
 // p - 2 (for Fermat inverse: a^(p-2) mod p)
 static constexpr Fp FP_P_MINUS_2 = {{
     0xFFFFFFFFFFFFFFEBULL,
@@ -191,7 +194,8 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
         uint64_t carry = 0;
         for (int j = 0; j < 4; ++j) {
             // prod = a[i]*b[j] + lo[i+j] + carry, spread across (phi:plo).
-            uint64_t phi, plo;
+            uint64_t phi = 0;
+            uint64_t plo = 0;
             mul64_wide(a.limbs[i], b.limbs[j], phi, plo);
             uint64_t c1 = 0, c2 = 0;
             uint64_t t = adc64(plo, lo[i + j], 0, c1);
@@ -209,8 +213,9 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
         uint64_t carry = 0;
         for (int i = 0; i < 4; ++i) {
             // v = lo[i] + lo[i+4]*38 + carry, spread across (mhi:mlo) for the product.
-            uint64_t mhi, mlo;
-            mul64_wide(lo[i + 4], 38ULL, mhi, mlo);  // mhi <= 37
+            uint64_t mhi = 0;
+            uint64_t mlo = 0;
+            mul64_wide(lo[i + 4], FP_2_256_MOD_P, mhi, mlo);  // mhi <= 37
             uint64_t c1 = 0, c2 = 0;
             uint64_t t = adc64(lo[i], mlo, 0, c1);
             t = adc64(t, carry, 0, c2);
@@ -225,7 +230,7 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
         // (0 -> 1 -> 2 -> 3), not folded by 38 again. Only a carry that makes it all
         // the way out of limb 3 a second time has positional value 2^256 and is
         // legitimately foldable by 38.
-        uint64_t addend = carry * 38ULL;
+        uint64_t addend = carry * FP_2_256_MOD_P;
         uint64_t prop = 0;
         r.limbs[0] = adc64(r.limbs[0], addend, 0, prop);
         for (int i = 1; i < 4 && prop; ++i) {
@@ -235,7 +240,7 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
             // Carry made it out of limb 3: limbs[1..3] just wrapped to zero and limbs[0]
             // holds a value <= addend (a few thousand at most), so adding 38 more cannot
             // overflow limb 0 again. A single non-looping add is provably sufficient.
-            r.limbs[0] = r.limbs[0] + 38ULL;
+            r.limbs[0] = r.limbs[0] + FP_2_256_MOD_P;
         }
     }
 
@@ -273,8 +278,7 @@ inline Fp fp_sub(const Fp& a, const Fp& b) {
 inline Fp fp_pow(const Fp& base, const Fp& exp) {
     Fp result = {{1, 0, 0, 0}};
     Fp cur = base;
-    for (int limb = 0; limb < 4; ++limb) {
-        uint64_t e = exp.limbs[limb];
+    for (uint64_t e : exp.limbs) {
         for (int bit = 0; bit < 64; ++bit) {
             if ((e >> bit) & 1) {
                 result = fp_mul(result, cur);
@@ -306,7 +310,8 @@ inline Fp fp_scale(const Fp& a, uint64_t s) {
     Fp r;
     for (int i = 0; i < 4; ++i) {
         // prod = a[i]*s + carry, spread across (phi:plo).
-        uint64_t phi, plo;
+        uint64_t phi = 0;
+        uint64_t plo = 0;
         mul64_wide(a.limbs[i], s, phi, plo);
         uint64_t c1 = 0;
         r.limbs[i] = adc64(plo, carry, 0, c1);
@@ -315,14 +320,14 @@ inline Fp fp_scale(const Fp& a, uint64_t s) {
     // Same carry fold as fp_mul: positional value 2^256, folded by 38 into limb 0, then the
     // resulting 2^64-valued carry propagated limb-by-limb (the bound here is s < 2^26).
     {
-        uint64_t addend = carry * 38ULL;
+        uint64_t addend = carry * FP_2_256_MOD_P;
         uint64_t prop = 0;
         r.limbs[0] = adc64(r.limbs[0], addend, 0, prop);
         for (int i = 1; i < 4 && prop; ++i) {
             r.limbs[i] = adc64(r.limbs[i], prop, 0, prop);
         }
         if (prop) {
-            r.limbs[0] = r.limbs[0] + 38ULL;
+            r.limbs[0] = r.limbs[0] + FP_2_256_MOD_P;
         }
     }
     return fp_reduce_full(r);

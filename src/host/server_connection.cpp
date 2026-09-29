@@ -81,17 +81,17 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback on_complete,
                                                   bool /*allow_before_hello*/) {
     return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
-                               message.size(), std::move(on_complete));
+                               message.size(), on_complete);
 }
 
 SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
                                                     SendCompleteCallback on_complete,
                                                     bool /*allow_before_hello*/) {
-    return this->send_ws_frame(true, data, len, std::move(on_complete));
+    return this->send_ws_frame(true, data, len, on_complete);
 }
 
 SsErr SendspinServerConnection::send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
-                                              SendCompleteCallback on_complete) {
+                                              const SendCompleteCallback& on_complete) {
     if (!this->is_connected()) {
         if (on_complete) {
             on_complete(false);

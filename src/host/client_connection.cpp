@@ -120,17 +120,17 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback cb,
                                                   bool /*allow_before_hello*/) {
     return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
-                               message.size(), std::move(cb));
+                               message.size(), cb);
 }
 
 SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len,
                                                     SendCompleteCallback cb,
                                                     bool /*allow_before_hello*/) {
-    return this->send_ws_frame(true, data, len, std::move(cb));
+    return this->send_ws_frame(true, data, len, cb);
 }
 
 SsErr SendspinClientConnection::send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
-                                              SendCompleteCallback cb) {
+                                              const SendCompleteCallback& cb) {
     if (!this->is_connected()) {
         if (cb) {
             cb(false);

@@ -26,6 +26,10 @@ constexpr char BASE32_ALPHABET[32] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I
                                       'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V',
                                       'W', 'X', 'Y', 'Z', '2', '3', '4', '5', '6', '7'};
 
+/// @brief Bits one base32 character encodes, and the mask selecting them.
+constexpr int BASE32_BITS_PER_CHAR = 5;
+constexpr uint64_t BASE32_CHAR_MASK = 0x1F;
+
 /// @brief RFC 4648 base32-encode `data`, padded to a multiple of 8 characters with '='.
 std::string base32_encode(const uint8_t* data, size_t len) {
     std::string out;
@@ -47,8 +51,8 @@ std::string base32_encode(const uint8_t* data, size_t len) {
 
         char out_chars[8];
         for (int k = 0; k < 8; ++k) {
-            int shift = 35 - k * 5;
-            out_chars[k] = BASE32_ALPHABET[(buf >> shift) & 0x1F];
+            int shift = (7 - k) * BASE32_BITS_PER_CHAR;
+            out_chars[k] = BASE32_ALPHABET[(buf >> shift) & BASE32_CHAR_MASK];
         }
 
         // Number of meaningful output characters for this (possibly partial) chunk, per

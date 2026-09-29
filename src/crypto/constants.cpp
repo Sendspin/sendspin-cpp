@@ -24,9 +24,9 @@ namespace sendspin {
 // Sentinel PSK = SHA-256("sendspin-sentinel-psk-v1")
 // Pre-computed from the label string at startup so we never hard-code the raw
 // bytes; the test KAT verifies the hex matches the spec constant.
-// NOLINTNEXTLINE(cert-err58-cpp)
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
 const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK = []() {
-    static constexpr std::string_view label{"sendspin-sentinel-psk-v1"};
+    static constexpr std::string_view LABEL{"sendspin-sentinel-psk-v1"};
     Sha256 h;
     if (!h.ok()) {
         // SHA-256 is unavailable at process startup (noise-c allocation failure). There is no
@@ -36,7 +36,7 @@ const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK = []() {
         // the CSPRNG-failure abort() in platform_random_bytes()).
         abort();
     }
-    h.update(reinterpret_cast<const uint8_t*>(label.data()), label.size());
+    h.update(reinterpret_cast<const uint8_t*>(LABEL.data()), LABEL.size());
     auto digest = h.finalize();
     if (!h.ok()) {
         abort();
@@ -46,7 +46,7 @@ const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK = []() {
 
 // SENTINEL_PSK_ID = base64url(SHA-256(PSK_ID_LABEL || SENTINEL_PSK))
 // Computed once at startup from SENTINEL_PSK.
-// NOLINTNEXTLINE(cert-err58-cpp)
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
 const std::string SENTINEL_PSK_ID = psk_id_for(SENTINEL_PSK);
 
 }  // namespace sendspin

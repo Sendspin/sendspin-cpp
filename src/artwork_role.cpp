@@ -181,7 +181,7 @@ void ArtworkRole::Impl::release_idle_slot_buffers() const {
     // under this mutex, and it is released by the next call, once that decode has finished.
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     for (auto& sb : this->drain_task->slot_buffers) {
-        for (uint8_t i = 0; i < std::size(sb.buffers); ++i) {
+        for (size_t i = 0; i < std::size(sb.buffers); ++i) {
             if (sb.drain_active && sb.drain_buf_idx == i) {
                 continue;
             }

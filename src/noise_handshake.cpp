@@ -79,29 +79,29 @@ static std::string serialize_noise_handshake(const std::vector<uint8_t>& noise_b
 
 namespace {
 
-/// @brief Parse a JSON envelope and verify its "type" field, logging and returning nullopt on
+/// @brief Parse a JSON envelope and verify its "type" field, logging and returning false on
 /// any failure (parse error or type mismatch). Used by run_rehandshake_msg1, which receives the
 /// raw envelope text rather than a parsed document.
 /// @param text           Raw JSON envelope text.
 /// @param expected_type  Required value of the envelope's "type" field.
 /// @param log_context    Prefix used for the failure log line (caller's function name).
-/// @return The parsed document on success, or nullopt.
-std::optional<JsonDocument> parse_json_envelope(std::string_view text, const char* expected_type,
-                                                const char* log_context) {
-    JsonDocument doc = make_json_document();
-    DeserializationError err = deserializeJson(doc, text.data(), text.size());
-    if (err || doc.isNull()) {
+/// @param[out] doc       Receives the parsed envelope.
+/// @return true on success.
+bool parse_json_envelope(std::string_view text, const char* expected_type, const char* log_context,
+                         JsonDocument* doc) {
+    DeserializationError err = deserializeJson(*doc, text.data(), text.size());
+    if (err || doc->isNull()) {
         SS_LOGE(TAG, "%s: JSON parse failed", log_context);
-        return std::nullopt;
+        return false;
     }
 
-    const char* type = doc["type"] | "";
+    const char* type = (*doc)["type"] | "";
     if (std::strcmp(type, expected_type) != 0) {
         SS_LOGE(TAG, "%s: unexpected type '%s'", log_context, type);
-        return std::nullopt;
+        return false;
     }
 
-    return doc;
+    return true;
 }
 
 /// @brief Outcome of the shared read-msg1/resolve-psk/set-psk/write-msg2 core.
@@ -127,7 +127,7 @@ enum class HandshakeKind : uint8_t {
 };
 
 /// @brief Name used for this handshake in log lines.
-static const char* to_cstr(HandshakeKind kind) {
+const char* to_cstr(HandshakeKind kind) {
     return kind == HandshakeKind::INITIAL ? "handshake" : "re-handshake";
 }
 
@@ -441,12 +441,11 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(std::string_view msg1_j
     const uint8_t* prologue = prior_h.data();
     const size_t prologue_len = prior_h.size();
 
-    auto doc_opt =
-        parse_json_envelope(msg1_json, "noise/handshake", to_cstr(HandshakeKind::REHANDSHAKE));
-    if (!doc_opt.has_value()) {
+    JsonDocument doc = make_json_document();
+    if (!parse_json_envelope(msg1_json, "noise/handshake", to_cstr(HandshakeKind::REHANDSHAKE),
+                             &doc)) {
         return std::nullopt;
     }
-    JsonDocument doc = std::move(doc_opt.value());
 
     auto core = run_msg1_core(HandshakeKind::REHANDSHAKE, identity, record_store, suite_name,
                               server_id, prologue, prologue_len, doc.as<JsonObjectConst>());

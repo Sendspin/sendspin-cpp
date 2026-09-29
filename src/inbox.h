@@ -366,6 +366,7 @@ public:
     /// @param fn Callable that merges `delta` into the current slot value.
     /// @param delta The new partial value to merge in.
     template <typename MergeFn>
+    // NOLINTNEXTLINE(performance-unnecessary-value-param): delta is moved into fn, unseen by tidy
     void merge(MergeFn&& fn, T delta) {
         if (!this->check_bound()) {
             return;

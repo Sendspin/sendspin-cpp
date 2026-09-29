@@ -115,11 +115,14 @@ std::optional<std::array<uint8_t, 32>> pairing_code_digest(const uint8_t* handsh
 // pairing_code_digits / pairing_code_qr_bytes
 // ============================================================================
 
+/// @brief The radix of the decimal pairing code.
+static constexpr uint64_t DECIMAL_BASE = 10;
+
 std::string pairing_code_digits(const std::array<uint8_t, 32>& digest) {
     // The modulus fits in uint64_t: 10^6 = 1_000_000 < 2^20.
     uint64_t modulus = 1;
     for (int i = 0; i < DYNAMIC_PAIRING_CODE_DIGITS; ++i) {
-        modulus *= 10;
+        modulus *= DECIMAL_BASE;
     }
 
     // Reduce the big-endian 256-bit digest modulo 10^6 by Horner's method. acc stays below
@@ -133,8 +136,8 @@ std::string pairing_code_digits(const std::array<uint8_t, 32>& digest) {
 
     std::string code(static_cast<size_t>(DYNAMIC_PAIRING_CODE_DIGITS), '0');
     for (int i = DYNAMIC_PAIRING_CODE_DIGITS - 1; i >= 0; --i) {
-        code[static_cast<size_t>(i)] = static_cast<char>('0' + (acc % 10));
-        acc /= 10;
+        code[static_cast<size_t>(i)] = static_cast<char>('0' + (acc % DECIMAL_BASE));
+        acc /= DECIMAL_BASE;
     }
     return code;
 }

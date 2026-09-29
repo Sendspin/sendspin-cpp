@@ -193,8 +193,9 @@ public:
 
         // Append the 128-bit big-endian bit length (high 64 bits are zero) and flush.
         uint8_t len_block[16] = {0};
-        for (int i = 0; i < 8; ++i) {
-            len_block[15 - i] = static_cast<uint8_t>((bit_len >> (i * 8)) & 0xFF);
+        for (size_t i = 0; i < 8; ++i) {
+            len_block[sizeof(len_block) - 1 - i] =
+                static_cast<uint8_t>((bit_len >> (i * 8)) & 0xFF);
         }
         this->update(len_block, sizeof(len_block));
         // buf_len_ is now 0: that update completed the final block.
@@ -210,6 +211,11 @@ public:
 
 private:
     static constexpr size_t BLOCK = 128;
+    /// @brief FIPS 180-4 section 6.4.2: 80 rounds, over a message schedule kept as a rolling
+    /// 16-word window (see process_block()).
+    static constexpr int ROUNDS = 80;
+    static constexpr int SCHEDULE_WINDOW = 16;
+    static constexpr int SCHEDULE_MASK = SCHEDULE_WINDOW - 1;
 
     void reset() {
         static const uint64_t IV[8] = {
@@ -229,7 +235,7 @@ private:
     }
 
     void process_block(const uint8_t* p) {
-        static const uint64_t K[80] = {
+        static const uint64_t K[ROUNDS] = {
             0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL,
             0xe9b5dba58189dbbcULL, 0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
             0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL, 0xd807aa98a3030242ULL,
@@ -262,8 +268,8 @@ private:
         // FIPS 180-4 rolling message schedule: w[t] depends only on w[t-2], w[t-7], w[t-15]
         // and w[t-16], so a 16-word window updated in place stands in for the full 80-word
         // array and keeps 512 bytes off the frame of every SHA-512 on the pairing path.
-        uint64_t w[16];
-        for (int t = 0; t < 16; ++t) {
+        uint64_t w[SCHEDULE_WINDOW];
+        for (int t = 0; t < SCHEDULE_WINDOW; ++t) {
             uint64_t v = 0;
             for (int j = 0; j < 8; ++j) {
                 v = (v << 8) | p[t * 8 + j];
@@ -273,17 +279,17 @@ private:
 
         uint64_t a = this->h_[0], b = this->h_[1], c = this->h_[2], d = this->h_[3];
         uint64_t e = this->h_[4], f = this->h_[5], g = this->h_[6], h = this->h_[7];
-        for (int t = 0; t < 80; ++t) {
-            if (t >= 16) {
-                const uint64_t wm15 = w[(t + 1) & 15];
-                const uint64_t wm2 = w[(t + 14) & 15];
+        for (int t = 0; t < ROUNDS; ++t) {
+            if (t >= SCHEDULE_WINDOW) {
+                const uint64_t wm15 = w[(t - 15) & SCHEDULE_MASK];
+                const uint64_t wm2 = w[(t - 2) & SCHEDULE_MASK];
                 const uint64_t s0 = rotr(wm15, 1) ^ rotr(wm15, 8) ^ (wm15 >> 7);
                 const uint64_t s1 = rotr(wm2, 19) ^ rotr(wm2, 61) ^ (wm2 >> 6);
-                w[t & 15] += s0 + w[(t + 9) & 15] + s1;
+                w[t & SCHEDULE_MASK] += s0 + w[(t - 7) & SCHEDULE_MASK] + s1;
             }
             const uint64_t big_s1 = rotr(e, 14) ^ rotr(e, 18) ^ rotr(e, 41);
             const uint64_t ch = (e & f) ^ (~e & g);
-            const uint64_t t1 = h + big_s1 + ch + K[t] + w[t & 15];
+            const uint64_t t1 = h + big_s1 + ch + K[t] + w[t & SCHEDULE_MASK];
             const uint64_t big_s0 = rotr(a, 28) ^ rotr(a, 34) ^ rotr(a, 39);
             const uint64_t maj = (a & b) ^ (a & c) ^ (b & c);
             const uint64_t t2 = big_s0 + maj;
@@ -333,6 +339,8 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> sha512_oneshot(const uint8_t* dat
 inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, size_t key_len,
                                                            const uint8_t* data, size_t data_len) {
     static constexpr size_t BLOCK = 128;  // SHA-512 block size
+    static constexpr uint8_t IPAD = 0x36;
+    static constexpr uint8_t OPAD = 0x5C;
 
     // Derive the effective key (at most BLOCK bytes).
     std::array<uint8_t, BLOCK> k{};
@@ -358,7 +366,7 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
     {
         // Inner hash: SHA-512((k XOR ipad) || data)
         for (size_t i = 0; i < BLOCK; ++i) {
-            pad[i] = k[i] ^ 0x36u;
+            pad[i] = k[i] ^ IPAD;
         }
         Sha512 inner;
         inner.update(pad.data(), BLOCK);
@@ -368,7 +376,7 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
 
     // Outer hash: SHA-512((k XOR opad) || inner_hash)
     for (size_t i = 0; i < BLOCK; ++i) {
-        pad[i] = k[i] ^ 0x5Cu;
+        pad[i] = k[i] ^ OPAD;
     }
     Sha512 outer;
     outer.update(pad.data(), BLOCK);

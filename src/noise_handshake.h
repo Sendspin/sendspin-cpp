@@ -68,7 +68,7 @@ struct NoiseHandshakeResult {
 };
 
 /// @brief Result of processing one incoming WS frame during the handshake.
-enum class HandshakeFrameResult {
+enum class HandshakeFrameResult : uint8_t {
     NEED_MORE,  ///< Frame processed; waiting for the next frame.
     COMPLETE,   ///< Handshake complete; switch to transport mode.
     ABORT,      ///< Fatal error; caller must close the WebSocket silently.
@@ -164,7 +164,7 @@ public:
     }
 
 private:
-    enum class State {
+    enum class State : uint8_t {
         INIT,              ///< client/init not yet sent
         WAIT_SERVER_INIT,  ///< waiting for server/init
         WAIT_MSG1,         ///< waiting for noise/handshake msg1

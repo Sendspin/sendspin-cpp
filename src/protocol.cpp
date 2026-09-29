@@ -827,21 +827,24 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         JsonObject methods_obj = root["payload"]["supported_pair_methods"].to<JsonObject>();
         for (const auto& desc : msg->supported_pair_methods) {
             JsonObject method_obj = methods_obj[to_cstr(desc.method)].to<JsonObject>();
-            if (desc.out_channels.has_value() && !desc.out_channels->empty()) {
+            const auto& out_channels = desc.out_channels;
+            if (out_channels.has_value() && !out_channels->empty()) {
                 JsonArray ch_arr = method_obj["out_channels"].to<JsonArray>();
-                for (const auto& ch : desc.out_channels.value()) {
+                for (const auto& ch : out_channels.value()) {
                     ch_arr.add(to_cstr(ch));
                 }
             }
-            if (desc.formats.has_value() && !desc.formats->empty()) {
+            const auto& formats = desc.formats;
+            if (formats.has_value() && !formats->empty()) {
                 JsonArray fmt_arr = method_obj["formats"].to<JsonArray>();
-                for (const auto& fmt : desc.formats.value()) {
+                for (const auto& fmt : formats.value()) {
                     fmt_arr.add(to_cstr(fmt));
                 }
             }
-            if (desc.locations.has_value() && !desc.locations->empty()) {
+            const auto& locations = desc.locations;
+            if (locations.has_value() && !locations->empty()) {
                 JsonArray loc_arr = method_obj["locations"].to<JsonArray>();
-                for (const auto& loc : desc.locations.value()) {
+                for (const auto& loc : locations.value()) {
                     loc_arr.add(loc.c_str());
                 }
             }

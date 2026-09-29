@@ -103,7 +103,8 @@ protected:
     /// @param data      Payload bytes to send.
     /// @param len       Number of bytes in `data`.
     /// @param cb        Callback invoked after send completes.
-    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len, SendCompleteCallback cb);
+    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
+                        const SendCompleteCallback& cb);
 
     // ========================================
     // Member variables

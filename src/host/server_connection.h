@@ -97,7 +97,7 @@ protected:
     /// @param data      Payload bytes to send.
     /// @param len       Number of bytes in `data`.
     SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
-                        SendCompleteCallback on_complete);
+                        const SendCompleteCallback& on_complete);
 
     // Pointer fields
 

@@ -34,6 +34,9 @@ namespace sendspin {
 // LV encoding: draft-irtf-cfrg-cpace-21 prepend_len / lv_cat
 // ============================================================================
 
+/// @brief The seven value bits each byte of the base-128 length prefix carries.
+static constexpr size_t LENGTH_PREFIX_DIGIT_MASK = 0x7F;
+
 std::vector<uint8_t> cpace_prepend_len(const uint8_t* data, size_t len) {
     std::vector<uint8_t> out;
     // Variable-length little-endian base-128 length prefix.
@@ -42,7 +45,7 @@ std::vector<uint8_t> cpace_prepend_len(const uint8_t* data, size_t len) {
         if (length < 128) {
             out.push_back(static_cast<uint8_t>(length));
         } else {
-            out.push_back(static_cast<uint8_t>((length & 0x7F) | 0x80));
+            out.push_back(static_cast<uint8_t>((length & LENGTH_PREFIX_DIGIT_MASK) | 0x80));
         }
         length >>= 7;
     } while (length > 0);
@@ -94,12 +97,15 @@ std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, 
 // decode_u: clear the top bit per RFC 7748
 // ============================================================================
 
+/// @brief Masks the unused top bit out of the most significant byte of a field element.
+static constexpr uint8_t FIELD_TOP_BYTE_MASK = 0x7F;
+
 std::array<uint8_t, CPACE_FIELD_BYTES> cpace_decode_u(const uint8_t* value, size_t len) {
     assert(len == CPACE_FIELD_BYTES);  // caller must pass a 32-byte little-endian value
     (void)len;
     std::array<uint8_t, CPACE_FIELD_BYTES> u{};
     std::memcpy(u.data(), value, CPACE_FIELD_BYTES);
-    u[31] &= 0x7F;  // clear unused top bit (RFC 7748 Curve25519 encoding)
+    u[CPACE_FIELD_BYTES - 1] &= FIELD_TOP_BYTE_MASK;  // clear unused top bit (RFC 7748 encoding)
     return u;
 }
 
@@ -141,19 +147,19 @@ std::array<uint8_t, CPACE_FIELD_BYTES> cpace_elligator2(
 
     // v = -A * denom_inv mod p = (p - A*denom_inv) mod p
     // = p - scale(denom_inv, A) mod p
-    Fp A_fp = fp_scale(denom_inv, A_CONST);
-    // -A_fp mod p = p - A_fp
-    Fp v = fp_sub({{0, 0, 0, 0}}, A_fp);  // 0 - A_fp = p - A_fp mod p
+    Fp a_fp = fp_scale(denom_inv, A_CONST);
+    // -a_fp mod p = p - a_fp
+    Fp v = fp_sub({{0, 0, 0, 0}}, a_fp);  // 0 - a_fp = p - a_fp mod p
 
     // v^2, v^3
     Fp v2 = fp_mul(v, v);
     Fp v3 = fp_mul(v2, v);
 
     // A*v^2
-    Fp Av2 = fp_scale(v2, A_CONST);
+    Fp a_v2 = fp_scale(v2, A_CONST);
 
     // v^3 + A*v^2 + v
-    Fp poly = fp_add(fp_add(v3, Av2), v);
+    Fp poly = fp_add(fp_add(v3, a_v2), v);
 
     // eps = poly^((p-1)/2) mod p (Legendre symbol)
     Fp eps = fp_legendre_pow(poly);

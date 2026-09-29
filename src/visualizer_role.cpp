@@ -249,7 +249,7 @@ void VisualizerRole::Impl::stop() const {
     this->flush_ring_buffer();
 }
 
-void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
+void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
     msg.supported_roles.push_back(SendspinRole::VISUALIZER);
     // Advertise the effective wire-data capacity, not the raw RAM budget: the ring is sized at
     // buffer_capacity bytes but per-entry overhead leaves only ~1/3 for wire data (see

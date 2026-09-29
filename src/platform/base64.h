@@ -62,8 +62,6 @@ inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const
 
 #else  // Host
 
-#include <cstring>
-
 namespace sendspin {
 
 // clang-format off
@@ -131,6 +129,10 @@ static constexpr char BASE64_ENCODE_TABLE[65] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 // clang-format on
 
+/// @brief Bits one base64 character encodes, and the mask selecting them.
+static constexpr int BASE64_BITS_PER_CHAR = 6;
+static constexpr uint32_t BASE64_CHAR_MASK = 0x3F;
+
 /// @brief Encodes bytes to base64 (host implementation); same contract as the ESP one above.
 inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const uint8_t* src,
                                   size_t slen) {
@@ -151,10 +153,10 @@ inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const
     for (size_t i = 0; i < full; i += 3) {
         uint32_t v = (static_cast<uint32_t>(src[i]) << 16) |
                      (static_cast<uint32_t>(src[i + 1]) << 8) | static_cast<uint32_t>(src[i + 2]);
-        *p++ = BASE64_ENCODE_TABLE[(v >> 18) & 0x3F];
-        *p++ = BASE64_ENCODE_TABLE[(v >> 12) & 0x3F];
-        *p++ = BASE64_ENCODE_TABLE[(v >> 6) & 0x3F];
-        *p++ = BASE64_ENCODE_TABLE[v & 0x3F];
+        *p++ = BASE64_ENCODE_TABLE[(v >> (3 * BASE64_BITS_PER_CHAR)) & BASE64_CHAR_MASK];
+        *p++ = BASE64_ENCODE_TABLE[(v >> (2 * BASE64_BITS_PER_CHAR)) & BASE64_CHAR_MASK];
+        *p++ = BASE64_ENCODE_TABLE[(v >> BASE64_BITS_PER_CHAR) & BASE64_CHAR_MASK];
+        *p++ = BASE64_ENCODE_TABLE[v & BASE64_CHAR_MASK];
     }
 
     if (full < slen) {
@@ -163,9 +165,10 @@ inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const
         if (has_second) {
             v |= static_cast<uint32_t>(src[full + 1]) << 8;
         }
-        *p++ = BASE64_ENCODE_TABLE[(v >> 18) & 0x3F];
-        *p++ = BASE64_ENCODE_TABLE[(v >> 12) & 0x3F];
-        *p++ = has_second ? BASE64_ENCODE_TABLE[(v >> 6) & 0x3F] : '=';
+        *p++ = BASE64_ENCODE_TABLE[(v >> (3 * BASE64_BITS_PER_CHAR)) & BASE64_CHAR_MASK];
+        *p++ = BASE64_ENCODE_TABLE[(v >> (2 * BASE64_BITS_PER_CHAR)) & BASE64_CHAR_MASK];
+        *p++ =
+            has_second ? BASE64_ENCODE_TABLE[(v >> BASE64_BITS_PER_CHAR) & BASE64_CHAR_MASK] : '=';
         *p++ = '=';
     }
 
@@ -238,8 +241,12 @@ inline std::optional<std::vector<uint8_t>> b64url_decode(const char* s) {
             c = '+';
         } else if (c == '_') {
             c = '/';
-        } else if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
-            return std::nullopt;
+        } else {
+            const bool is_alnum =
+                (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+            if (!is_alnum) {
+                return std::nullopt;
+            }
         }
         std_b64 += c;
     }
