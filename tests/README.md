@@ -64,14 +64,24 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   offset round-trip, convergence).
 - `test_audio_stream_info.cpp`: byte/frame/sample/duration conversions.
 - `test_network_info.cpp`: local interface MAC lookup is well-formed or absent.
-- `test_spsc_ring_buffer.cpp`: ring buffer storage sizing and alignment.
+- `test_spsc_ring_buffer.cpp`: `SpscRingBuffer` wrap-around accounting with unaligned storage
+  sizes, and the `wake_receiver()` contract.
+- `test_thread_safe_queue.cpp`: `ThreadSafeQueue`'s `wake_receiver()` contract: a wake unblocks
+  a parked receive, is held pending, is consumed once, and never drops a queued item.
+- `test_inline_vector.cpp`: `InlineVector` order-preserving erase, element release at removal,
+  and swap.
 - `test_inbox.cpp`: `Inbox`/`InboxSlot` topic bits, event ring ordering, and slot binding.
 - `test_visualizer_role.cpp`: `decode_visualizer_message()` and the visualizer role's
   negotiation and dispatch.
 - `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: decode thread, slot
   gating, `frame_done()` acks, and stream restart/clear.
 - `test_connection_lifecycle.cpp`: the connection nursery (prove-then-admit) over real loopback
-  sockets: junk probes, slow peers, early server hello, and capacity.
+  sockets: junk probes, slow peers, early server hello, capacity, and the liveness timeout.
+- `test_client_lifecycle.cpp`: `SendspinClient` `start()`/`stop()`/restart over loopback: peers
+  are goodbyed, role state is reset before `stop()` returns, a restarted client is live again,
+  and the player's codec checks.
+- `test_client_teardown.cpp`: destroying a client that runs every threaded role joins the role
+  threads.
 
 These are white-box tests: they include private headers from `src/`, so the test target adds
 `src/` to its include path. To add a new test file, create `test_<unit>.cpp` here and add it to

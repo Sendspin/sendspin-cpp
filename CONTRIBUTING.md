@@ -39,8 +39,9 @@ source lists live in `cmake/sources.cmake`.
 
 - Install the pre-commit hooks (`pre-commit install`); they run clang-format,
   markdownlint, and whitespace fixers.
-- CI is the quality gate: it treats warnings as errors, runs clang-tidy
-  (`./script/clang-tidy.sh`), and runs the unit tests under sanitizers.
+- CI is the quality gate: it treats warnings in the library as errors, runs
+  clang-tidy (`./script/clang-tidy.sh`), and runs the unit tests under
+  sanitizers.
   Running these locally first saves a review round trip.
 - Keep each PR scoped to one logical change, with a concise description of
   what the change is now.
