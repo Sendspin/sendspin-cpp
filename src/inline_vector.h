@@ -21,6 +21,7 @@
 #include <array>
 #include <cassert>
 #include <cstddef>
+#include <type_traits>
 #include <utility>
 
 namespace sendspin {
@@ -29,12 +30,13 @@ namespace sendspin {
 ///
 /// For containers whose size has a proven bound, so the storage can be part of the owning object
 /// instead of a heap buffer. Slots past size() hold value-initialized T, and every path that
-/// shrinks the vector (erase(), clear()) resets the vacated slots, so a removed element's
-/// destructor runs at the removal, not whenever its slot is next overwritten. That matters for
-/// shared_ptr elements whose release has to happen at a known point (see DeferredRelease).
+/// shrinks the vector (erase(), clear()) resets the vacated slots to T{}, so whatever a removed
+/// element owns (a shared_ptr's reference) is released at the removal, not whenever its slot is
+/// next overwritten. That matters for shared_ptr elements whose release has to happen at a known
+/// point (see DeferredRelease).
 ///
-/// Requires T to be default-constructible and move-assignable. Not copyable or movable: transfer
-/// contents with swap(), which leaves both sides consistent.
+/// Requires T to be default-constructible, move-constructible, and move-assignable. Not copyable
+/// or movable: transfer contents with swap(), which leaves both sides consistent.
 template <typename T, size_t N>
 class InlineVector {
 public:
@@ -61,7 +63,7 @@ public:
         return pos;
     }
 
-    /// @brief Removes every element, destroying each one now.
+    /// @brief Removes every element, resetting each slot to T{} now.
     void clear() {
         for (auto& item : *this) {
             item = T{};
@@ -71,7 +73,7 @@ public:
 
     /// @brief Exchanges contents with `other`.
     /// @param other The vector to swap with.
-    void swap(InlineVector& other) noexcept {
+    void swap(InlineVector& other) noexcept(std::is_nothrow_swappable_v<T>) {
         this->items_.swap(other.items_);
         std::swap(this->count_, other.count_);
     }
