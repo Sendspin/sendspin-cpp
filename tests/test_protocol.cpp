@@ -179,13 +179,15 @@ TEST(Protocol, DetermineMessageType) {
 TEST(Protocol, ServerTimeOffsetAndError) {
     JsonDocument doc;
     JsonObject root;
-    ASSERT_TRUE(parse(R"({"payload":{"client_transmitted":1000,)"
-                      R"("server_received":1500,"server_transmitted":1600}})",
+    // Microsecond clock values sit above 2^32, so the arithmetic must be carried in 64 bits; the
+    // worked formulas below show only the low digits, which carry all the deltas.
+    ASSERT_TRUE(parse(R"({"payload":{"client_transmitted":5000000001000,)"
+                      R"("server_received":5000000001500,"server_transmitted":5000000001600}})",
                       doc, root));
 
     int64_t offset = 0;
     int64_t max_error = 0;
-    const int64_t client_received = 2000;
+    const int64_t client_received = 5000000002000;
     ASSERT_TRUE(process_server_time_message(root, client_received, &offset, &max_error));
 
     // offset = ((T2-T1) + (T3-T4)) / 2 = ((1500-1000) + (1600-2000)) / 2 = 50
@@ -194,14 +196,37 @@ TEST(Protocol, ServerTimeOffsetAndError) {
     EXPECT_EQ(max_error, 450);
 }
 
-TEST(Protocol, ServerTimeRejectsMissingFields) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"payload":{"client_transmitted":1000}})", doc, root));
+// messaging.md "server/time": client_transmitted, server_received and server_transmitted are
+// required integers. A missing or non-integer one rejects the message; each row puts its bad value
+// in a different field so every field's check is exercised. The 64-bit width is pinned by
+// ServerTimeOffsetAndError.
+TEST(Protocol, ServerTimeTimestampsMustBeIntegers) {
+    struct Row {
+        const char* name;
+        const char* payload;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: integer timestamps",
+         R"({"client_transmitted":1000,"server_received":1500,"server_transmitted":1600})", true},
+        {"numeric string client_transmitted",
+         R"({"client_transmitted":"1000","server_received":1500,"server_transmitted":1600})",
+         false},
+        {"float server_received",
+         R"({"client_transmitted":1000,"server_received":1500.5,"server_transmitted":1600})",
+         false},
+        {"missing server_transmitted", R"({"client_transmitted":1000,"server_received":1500})",
+         false},
+    };
 
-    int64_t offset = 0;
-    int64_t max_error = 0;
-    EXPECT_FALSE(process_server_time_message(root, 2000, &offset, &max_error));
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"server/time","payload":)") + row.payload + "}",
+                          doc, root));
+        EXPECT_EQ(process_server_time_message(root, 2000, nullptr, nullptr), row.accepted);
+    }
 }
 
 // ============================================================================

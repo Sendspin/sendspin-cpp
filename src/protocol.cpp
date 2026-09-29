@@ -409,16 +409,20 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
 
 bool process_server_time_message(JsonObject root, int64_t timestamp, int64_t* offset,
                                  int64_t* max_error) {
-    if (!root["payload"]["client_transmitted"].is<JsonVariant>() ||
-        !root["payload"]["server_received"].is<JsonVariant>() ||
-        !root["payload"]["server_transmitted"].is<JsonVariant>()) {
-        SS_LOGE(TAG, "Invalid server/time message");
+    // messaging.md "server/time": all three timestamps are required integers (microsecond clock
+    // values, so wider than 32 bits).
+    const JsonVariantConst client_transmitted_var = root["payload"]["client_transmitted"];
+    const JsonVariantConst server_received_var = root["payload"]["server_received"];
+    const JsonVariantConst server_transmitted_var = root["payload"]["server_transmitted"];
+    if (!client_transmitted_var.is<int64_t>() || !server_received_var.is<int64_t>() ||
+        !server_transmitted_var.is<int64_t>()) {
+        SS_LOGE(TAG, "Invalid server/time message: missing or non-integer timestamp");
         return false;
     }
 
-    const int64_t client_transmitted = root["payload"]["client_transmitted"];
-    const int64_t server_received = root["payload"]["server_received"];
-    const int64_t server_transmitted = root["payload"]["server_transmitted"];
+    const int64_t client_transmitted = client_transmitted_var.as<int64_t>();
+    const int64_t server_received = server_received_var.as<int64_t>();
+    const int64_t server_transmitted = server_transmitted_var.as<int64_t>();
     const int64_t client_received = timestamp;
 
     if (offset != nullptr) {
