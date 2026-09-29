@@ -315,18 +315,16 @@ ConnectionManager::~ConnectionManager() {
 
     std::shared_ptr<SendspinConnection> current;
     // cppcheck-suppress variableScope
-    std::vector<NurseryEntry> nursery;
+    InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery;
     // cppcheck-suppress variableScope
-    std::vector<HelloRetryState> retries;
+    InlineVector<HelloRetryState, MAX_NURSERY_ENTRIES> retries;
     // cppcheck-suppress variableScope
     std::vector<DeferredRelease> releases;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         current = std::move(this->current_connection_);
-        // cppcheck-suppress unreadVariable
-        nursery = std::move(this->nursery_);
-        // cppcheck-suppress unreadVariable
-        retries = std::move(this->hello_retries_);
+        nursery.swap(this->nursery_);
+        retries.swap(this->hello_retries_);
         // cppcheck-suppress unreadVariable
         releases = std::move(this->deferred_releases_);
         // Keep the hint atomics in sync with the now-empty containers (has_pending_events_ was
@@ -406,7 +404,7 @@ void ConnectionManager::connect_to(const std::string& url) {
         }
 
         // A user-initiated connect is admitted even against a full nursery: there is at most one
-        // outbound entry (replaced above), so the nursery is still bounded (NURSERY_CAPACITY + 1)
+        // outbound entry (replaced above), so the nursery is still bounded (MAX_NURSERY_ENTRIES)
         // and an explicit user request never fails against inbound peers.
         this->push_nursery_entry(NurseryEntry{client_conn, /*inbound=*/false});
         client_conn->start();
@@ -419,7 +417,7 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
     // host outbound it joins the transport thread), which must not stall other manager entry
     // points. The connections stay in their slots until their close events arrive (or the
     // manager is destroyed).
-    std::vector<std::shared_ptr<SendspinConnection>> to_disconnect;
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> to_disconnect;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
@@ -1018,14 +1016,9 @@ void ConnectionManager::drain_unpair_events(DrainedEvents& ev) {
 }
 
 void ConnectionManager::loop_managed_connections() {
-    // Call loop on active connections using shared_ptr copies to avoid holding the lock. The
-    // nursery holds at most NURSERY_CAPACITY inbound entries (on_new_connection() rejects an
-    // inbound peer at that count) plus one outbound (connect_to() releases any previous outbound
-    // entry before pushing its own), so NURSERY_CAPACITY + 1 covers every entry and a fixed array
-    // avoids a per-tick heap allocation while connections are being set up.
+    // Call loop on active connections using shared_ptr copies to avoid holding the lock.
     std::shared_ptr<SendspinConnection> current_copy;
-    std::array<std::shared_ptr<SendspinConnection>, NURSERY_CAPACITY + 1> nursery_copies;
-    size_t nursery_count = 0;
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_NURSERY_ENTRIES> nursery_copies;
     // Skip the copy (and thus every conn->loop() call below) when there is nothing to call it
     // on: no current connection and an empty nursery.
     if (this->nursery_size_.load(std::memory_order_acquire) > 0 ||
@@ -1033,14 +1026,14 @@ void ConnectionManager::loop_managed_connections() {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         current_copy = this->current_connection_;
         for (const auto& entry : this->nursery_) {
-            nursery_copies[nursery_count++] = entry.conn;
+            nursery_copies.push_back(entry.conn);
         }
     }
     if (current_copy) {
         current_copy->loop();
     }
-    for (size_t i = 0; i < nursery_count; ++i) {
-        nursery_copies[i]->loop();
+    for (auto& conn : nursery_copies) {
+        conn->loop();
     }
 }
 
@@ -1561,8 +1554,7 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
 // Connection lifecycle
 // ============================================================================
 
-std::vector<NurseryEntry>::iterator ConnectionManager::find_in_nursery(
-    const SendspinConnection* conn) {
+NurseryEntry* ConnectionManager::find_in_nursery(const SendspinConnection* conn) {
     for (auto it = this->nursery_.begin(); it != this->nursery_.end(); ++it) {
         if (it->conn.get() == conn) {
             return it;
@@ -1669,8 +1661,8 @@ void ConnectionManager::flush_pending_record_ops() {
     }
 }
 
-std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(
-    std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason) {
+NurseryEntry* ConnectionManager::release_nursery_entry(
+    NurseryEntry* it, std::optional<SendspinGoodbyeReason> reason) {
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
     this->refresh_nursery_size_hint();
@@ -1693,7 +1685,7 @@ void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
     //
     // get_psk_id() locks: a nursery member can be completing its Noise handshake on its own
     // network thread right now, and that write rewrites the very string being compared here.
-    std::vector<std::shared_ptr<SendspinConnection>> doomed;
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> doomed;
     if (this->current_connection_ != nullptr && this->current_connection_.get() != except &&
         this->current_connection_->get_psk_id() == psk_id) {
         doomed.push_back(this->current_connection_);
@@ -1899,8 +1891,7 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     SS_LOGD(TAG, "note_playback_activity: last_played_server_id updated to %s", server_id.c_str());
 }
 
-std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nursery_entry(
-    std::vector<NurseryEntry>::iterator it) {
+NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry* it) {
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
     this->refresh_nursery_size_hint();

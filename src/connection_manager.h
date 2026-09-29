@@ -19,6 +19,7 @@
 #pragma once
 
 #include "constants.h"
+#include "inline_vector.h"
 #include "protocol_messages.h"
 #include "record_store.h"
 #include "sendspin/client.h"
@@ -581,7 +582,7 @@ private:
 
     /// @brief Finds the nursery entry holding `conn`, or nursery_.end(). Caller must hold
     /// conn_ptr_mutex_.
-    std::vector<NurseryEntry>::iterator find_in_nursery(const SendspinConnection* conn);
+    NurseryEntry* find_in_nursery(const SendspinConnection* conn);
 
     // Each refresh_* helper below re-derives its hint atomic from the container's .size() in the
     // same critical section as the mutation, so the hint can never drift. Caller must hold
@@ -656,8 +657,8 @@ private:
     /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
     ///        already gone so no goodbye should be attempted.
     /// @return Iterator to the entry after the erased one.
-    std::vector<NurseryEntry>::iterator release_nursery_entry(
-        std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason);
+    NurseryEntry* release_nursery_entry(NurseryEntry* it,
+                                        std::optional<SendspinGoodbyeReason> reason);
 
     /// @brief Appends a release to deferred_releases_ and refreshes the hint. Caller must hold
     /// conn_ptr_mutex_ and call flush_deferred_releases() after dropping it.
@@ -733,8 +734,7 @@ private:
     /// hold conn_ptr_mutex_.
     /// @param it Valid iterator into nursery_ whose connection satisfies is_operational().
     /// @return Iterator to the entry after the erased one (for use in a scanning loop).
-    std::vector<NurseryEntry>::iterator promote_or_arbitrate_nursery_entry(
-        std::vector<NurseryEntry>::iterator it);
+    NurseryEntry* promote_or_arbitrate_nursery_entry(NurseryEntry* it);
     /// @brief Sends a goodbye and takes ownership of the caller's shared_ptr so it drops at
     /// function exit.
     /// @param conn The connection to disconnect and release. Caller's shared_ptr is left empty.
@@ -779,7 +779,7 @@ private:
     /// entries do not count against the capacity in either direction: a user-initiated connect_to()
     /// is admitted even against full inbound slots, and an in-flight connect_to() never causes an
     /// inbound peer to be rejected. An outbound entry always replaces any previous one, so the
-    /// bound on the whole nursery is NURSERY_CAPACITY + 1.
+    /// whole nursery is bounded by MAX_NURSERY_ENTRIES.
     ///
     /// Socket-budget invariant: gracefully rejecting a surplus inbound peer requires the transport
     /// to accept NURSERY_CAPACITY + 2 sockets (1 established + the nursery + the surplus peer,
@@ -787,8 +787,11 @@ private:
     /// satisfies this; start() warns when a configured value does not.
     static constexpr size_t NURSERY_CAPACITY = 2;
 
+    /// @brief Bound on the whole nursery: NURSERY_CAPACITY inbound entries plus the one outbound.
+    static constexpr size_t MAX_NURSERY_ENTRIES = NURSERY_CAPACITY + 1;
+
     /// @brief Maximum connections open at once: the admitted one plus the nursery bound.
-    static constexpr size_t MAX_OPEN_CONNECTIONS = NURSERY_CAPACITY + 2;
+    static constexpr size_t MAX_OPEN_CONNECTIONS = MAX_NURSERY_ENTRIES + 1;
 
     // pairing.md "Pairing Records" requires the client to cap its concurrently open paired
     // connections below its record capacity, so that a completed pairing at capacity always has
@@ -988,10 +991,12 @@ private:
     // flush_pending_record_ops() once conn_ptr_mutex_ is dropped; see PendingRecordOp. Written
     // and read only under conn_ptr_mutex_, and emptied within the tick that filled it.
     std::vector<PendingRecordOp> pending_record_ops_;
-    std::vector<NurseryEntry> nursery_;  // Unproven connections awaiting establishment
-    // One entry per nursery connection awaiting its hello, cleared when the hello is sent or
-    // the connection leaves the nursery.
-    std::vector<HelloRetryState> hello_retries_;
+    // Unproven connections awaiting establishment
+    InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery_;
+    // At most one entry per nursery connection (see initiate_hello() and the arming scan in
+    // scan_hello_and_nursery()), cleared when the hello is sent or the connection leaves the
+    // nursery, so bounded like the nursery
+    InlineVector<HelloRetryState, MAX_NURSERY_ENTRIES> hello_retries_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
     std::vector<ServerActivateEvent> pending_activate_events_;  // Deferred server/activate events

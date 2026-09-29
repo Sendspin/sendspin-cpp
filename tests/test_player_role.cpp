@@ -68,40 +68,41 @@ ClientPlayerStateObject build_player_state(PlayerRole& player) {
 // ============================================================================
 
 // roles/player/v1.md "client/hello player@v1 support object": supported_formats is non-empty and
-// a player MUST list either flac or pcm. A configuration that lists neither cannot be served by
-// every server, so start() refuses it rather than advertising it.
-TEST(PlayerRoleFormats, StartRejectsListWithoutFlacOrPcm) {
-    PlayerRoleConfig player_config;
-    player_config.audio_formats = {{SendspinCodecFormat::OPUS, 2, 48000, 16}};
-
-    SendspinClient client(make_client_config("player-formats-opus-only"));
-    client.add_player(std::move(player_config));
-
-    EXPECT_FALSE(client.start());
-}
-
-TEST(PlayerRoleFormats, StartRejectsEmptyList) {
-    SendspinClient client(make_client_config("player-formats-empty"));
-    client.add_player(PlayerRoleConfig{});
-
-    EXPECT_FALSE(client.start());
-}
-
-// Control: either of the two mandatory codecs is enough on its own, and extra opus entries do
-// not spoil an otherwise serveable list.
-TEST(PlayerRoleFormats, StartAcceptsFlacOrPcmAmongOthers) {
-    SendspinClient flac_client(make_client_config("player-formats-flac"));
-    flac_client.add_player(make_player_config());
-    EXPECT_TRUE(flac_client.start());
-    flac_client.stop();
-
-    PlayerRoleConfig pcm_config;
-    pcm_config.audio_formats = {{SendspinCodecFormat::OPUS, 2, 48000, 16},
-                                {SendspinCodecFormat::PCM, 2, 44100, 16}};
-    SendspinClient pcm_client(make_client_config("player-formats-pcm"));
-    pcm_client.add_player(std::move(pcm_config));
-    EXPECT_TRUE(pcm_client.start());
-    pcm_client.stop();
+// a player MUST list either flac or pcm, the codecs every server supports. start() refuses a list
+// that breaks the rule rather than advertising it, and refuses an opus entry in a build without the
+// Opus decoder (SENDSPIN_ENABLE_OPUS), so the hello never advertises a codec it cannot decode.
+TEST(PlayerRoleFormats, StartValidatesTheFormatList) {
+#ifdef SENDSPIN_ENABLE_OPUS
+    constexpr bool OPUS_DECODES = true;
+#else
+    constexpr bool OPUS_DECODES = false;
+#endif
+    const AudioSupportedFormatObject flac{SendspinCodecFormat::FLAC, 2, 44100, 16};
+    const AudioSupportedFormatObject pcm{SendspinCodecFormat::PCM, 2, 44100, 16};
+    const AudioSupportedFormatObject opus{SendspinCodecFormat::OPUS, 2, 48000, 16};
+    struct Row {
+        const char* name;
+        std::vector<AudioSupportedFormatObject> formats;
+        bool starts;
+    };
+    const Row rows[] = {
+        {"empty list", {}, false},
+        {"opus only", {opus}, false},
+        {"Control: flac alone", {flac}, true},
+        {"Control: pcm alone", {pcm}, true},
+        {"opus beside pcm", {opus, pcm}, OPUS_DECODES},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        PlayerRoleConfig config;
+        config.audio_formats = row.formats;
+        SendspinClient client(make_client_config(row.name));
+        client.add_player(std::move(config));
+        EXPECT_EQ(client.start(), row.starts);
+        if (client.is_started()) {
+            client.stop();
+        }
+    }
 }
 
 // ============================================================================

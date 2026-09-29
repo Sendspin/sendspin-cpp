@@ -84,6 +84,9 @@ constexpr uint16_t VISUALIZER_SPECTRUM_TEST_PORT = 19078;
 constexpr uint16_t VISUALIZER_STALE_TEST_PORT = 19084;
 constexpr uint16_t VISUALIZER_SHARED_TS_TEST_PORT = 19086;
 constexpr uint16_t VISUALIZER_OFFSET_TEST_PORT = 19088;
+#ifndef SENDSPIN_ENABLE_OPUS
+constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
+#endif
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
@@ -316,6 +319,34 @@ TEST(ClientLifecycle, StopEndsTheStreamAndRestartPlaysAgain) {
         EXPECT_EQ(server->goodbye_reason().value_or(""), "shutdown");
     }
 }
+
+#ifndef SENDSPIN_ENABLE_OPUS
+// Without the Opus decoder, a stream/start naming opus (a server ignoring the advertised list)
+// takes the unsupported-codec path: no codec header reaches the sync task and no
+// on_stream_start() fires. The pcm stream/start sent right behind it starts normally; stream
+// events drain in arrival order, so once the pcm params are current an accepted opus start would
+// already have been counted.
+TEST(ClientLifecycle, OpusStreamStartIsRefusedWithoutTheOpusDecoder) {
+    CountingPlayerListener listener;
+    PairedClientBundle bundle(make_config(OPUS_STREAM_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    auto server = connect_paired_server(bundle.peer, OPUS_STREAM_TEST_PORT);
+    pump_until(client, [&] { return client.is_connected(); });
+
+    ASSERT_TRUE(server->send_app_json(stream_start_json("opus")));
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    pump_until(client, [&] {
+        return client.player()->get_current_stream_params().codec == SendspinCodecFormat::PCM;
+    });
+    EXPECT_EQ(listener.stream_starts, 1);
+
+    client.stop();
+    EXPECT_EQ(listener.stream_ends, 1);
+}
+#endif
 
 // A listener callback fired from inside stop() cannot re-enter the lifecycle: start() reports
 // failure and starts nothing, stop()/disconnect()/connect_to() are ignored rather than recursing,

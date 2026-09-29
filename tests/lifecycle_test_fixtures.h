@@ -1214,9 +1214,13 @@ public:
 // Shared message and config builders
 // ============================================================================
 
+inline std::string stream_start_json(const char* codec) {
+    return std::string(R"({"type":"stream/start","payload":{"player":{"codec":")") + codec +
+           R"(","sample_rate":48000,"channels":2,"bit_depth":16}}})";
+}
+
 inline std::string stream_start_pcm_json() {
-    return R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
-           R"("channels":2,"bit_depth":16}}})";
+    return stream_start_json("pcm");
 }
 
 inline std::string stream_start_visualizer_json() {

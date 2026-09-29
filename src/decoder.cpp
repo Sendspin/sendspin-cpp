@@ -24,6 +24,7 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.decoder";
 
+#ifdef SENDSPIN_ENABLE_OPUS
 // The OpusDecoder state is what micro-opus's CONFIG_OPUS_STATE_MEMORY_PREFERENCE Kconfig governs
 // when opus_decoder_create() does the allocation. We use opus_decoder_init() and own the backing
 // buffer ourselves, so we mirror the same Kconfig here so consumers get one consistent placement
@@ -35,6 +36,7 @@ constexpr MemoryLocation OPUS_STATE_LOCATION = MemoryLocation::PREFER_INTERNAL;
 #else
 constexpr MemoryLocation OPUS_STATE_LOCATION = MemoryLocation::PREFER_EXTERNAL;
 #endif
+#endif  // SENDSPIN_ENABLE_OPUS
 
 void SendspinDecoder::reset_decoders() {
     if (this->flac_decoder_ != nullptr) {
@@ -42,7 +44,9 @@ void SendspinDecoder::reset_decoders() {
         this->flac_decoder_.reset();
     }
 
+#ifdef SENDSPIN_ENABLE_OPUS
     this->opus_decoder_buf_.reset();
+#endif
 
     this->current_codec_ = SendspinCodecFormat::UNSUPPORTED;
 }
@@ -87,6 +91,7 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
                                         static_cast<size_t>(info.bytes_per_sample());
             break;
         }
+#ifdef SENDSPIN_ENABLE_OPUS
         case CHUNK_TYPE_OPUS_DUMMY_HEADER: {
             if (!this->decode_dummy_header(data, data_size, stream_info)) {
                 return false;
@@ -117,6 +122,7 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
             this->current_codec_ = SendspinCodecFormat::OPUS;
             break;
         }
+#endif
         case CHUNK_TYPE_PCM_DUMMY_HEADER: {
             if (!this->decode_dummy_header(data, data_size, stream_info)) {
                 return false;
@@ -184,6 +190,7 @@ bool SendspinDecoder::decode_audio_chunk(const uint8_t* data, size_t data_size,
             *consumed += bytes_consumed;
             *decoded_size += this->current_stream_info_.samples_to_bytes(samples_decoded);
         }
+#ifdef SENDSPIN_ENABLE_OPUS
     } else if (this->opus_decoder_buf_ && (this->current_codec_ == SendspinCodecFormat::OPUS)) {
         int output_frames = opus_decode(
             this->opus_decoder_buf_.as<OpusDecoder>(), data, data_size, (int16_t*)output_buffer,
@@ -203,6 +210,7 @@ bool SendspinDecoder::decode_audio_chunk(const uint8_t* data, size_t data_size,
         }
         *consumed = data_size;
         *decoded_size = this->current_stream_info_.frames_to_bytes(output_frames);
+#endif
     } else {
         return false;
     }

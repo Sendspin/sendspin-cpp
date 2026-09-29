@@ -27,8 +27,11 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <opus.h>
 #include <vector>
+
+#ifdef SENDSPIN_ENABLE_OPUS
+#include <opus.h>
+#endif
 
 using sendspin::AudioStreamInfo;
 using sendspin::SendspinDecoder;
@@ -172,6 +175,7 @@ TEST(Decoder, PcmChunkAtTheSpecMaximumFitsOneCallAndPartialFramesAreRejected) {
 
 namespace {
 
+#ifdef SENDSPIN_ENABLE_OPUS
 constexpr int OPUS_FRAMES_40_MS = 1920;  // 40 ms at 48 kHz
 
 /// One 40 ms Opus packet of 48 kHz stereo silence, twice the 20 ms the decoder first sizes for.
@@ -191,6 +195,7 @@ std::vector<uint8_t> opus_packet_40_ms() {
     packet.resize(packet_size > 0 ? static_cast<size_t>(packet_size) : 0);
     return packet;
 }
+#endif
 
 /// The 48 kHz stereo header the PCM and Opus rows share.
 const sendspin::DummyHeader STEREO_48K_HEADER{
@@ -198,6 +203,7 @@ const sendspin::DummyHeader STEREO_48K_HEADER{
 
 }  // namespace
 
+#ifdef SENDSPIN_ENABLE_OPUS
 // An Opus packet longer than the 20 ms the decoder first sizes for consumes nothing and raises the
 // estimate; with that much room the same packet then decodes whole.
 TEST(Decoder, OpusPacketLongerThanTheEstimateRaisesItAndDecodesOnRetry) {
@@ -226,6 +232,7 @@ TEST(Decoder, OpusPacketLongerThanTheEstimateRaisesItAndDecodesOnRetry) {
     EXPECT_EQ(consumed, packet.size());
     EXPECT_EQ(decoded, info.frames_to_bytes(OPUS_FRAMES_40_MS));
 }
+#endif
 
 namespace {
 
@@ -263,8 +270,10 @@ TEST(SyncTaskDecodeWholeChunk, DecodesEveryFrameOrLeavesTheBufferEmpty) {
     const std::vector<uint8_t> stereo_48k_header(
         reinterpret_cast<const uint8_t*>(&STEREO_48K_HEADER),
         reinterpret_cast<const uint8_t*>(&STEREO_48K_HEADER) + sizeof(STEREO_48K_HEADER));
+#ifdef SENDSPIN_ENABLE_OPUS
     const std::vector<uint8_t> opus_packet = opus_packet_40_ms();
     ASSERT_FALSE(opus_packet.empty());
+#endif
     struct Row {
         const char* name;
         const std::vector<uint8_t>* header;
@@ -277,8 +286,10 @@ TEST(SyncTaskDecodeWholeChunk, DecodesEveryFrameOrLeavesTheBufferEmpty) {
          sendspin::CHUNK_TYPE_FLAC_HEADER, FLAC_FRAMES, 3 * FLAC_FRAME_PCM_BYTES},
         {"FLAC chunk ending mid-frame", &FLAC_HEADER, sendspin::CHUNK_TYPE_FLAC_HEADER,
          std::vector<uint8_t>(FLAC_FRAMES.begin(), FLAC_FRAMES.end() - 10), 0},
+#ifdef SENDSPIN_ENABLE_OPUS
         {"Control: 40 ms Opus packet grows the 20 ms buffer and retries", &stereo_48k_header,
          sendspin::CHUNK_TYPE_OPUS_DUMMY_HEADER, opus_packet, 7680},
+#endif
         {"Control: PCM chunk of 150 ms", &stereo_48k_header,
          sendspin::CHUNK_TYPE_PCM_DUMMY_HEADER, std::vector<uint8_t>(28800, 0x11), 28800},
         {"PCM chunk of 151 ms", &stereo_48k_header, sendspin::CHUNK_TYPE_PCM_DUMMY_HEADER,
