@@ -243,7 +243,7 @@ An image larger than `ArtworkRole::Impl::image_cap()` for its channel is not hel
    │  promotion handlers decided on (record slots, last-played), unlocked
    ├─ flush_pending_admission(): admit the connection the promotion scan installed, unlocked
    ├─ Call loop() on the current and nursery connections   (only when has_current_ or nursery_size_)
-   ├─ Check per-connection hello retry timers   (only when nursery_size_)
+   ├─ Hello scan: arm and send each nursery connection's hello   (only when nursery_size_)
    ├─ Reap nursery connections past the establish deadline
    ├─ Liveness: drop the current connection once inbound silence reaches liveness_timeout_us_
    │  (only when has_current_; stamped per complete inbound message at dispatch)
@@ -291,7 +291,7 @@ This ordering matters: connection lifecycle events are processed before role eve
 Each `loop()` section that would otherwise take a mutex first consults a lock-free atomic hint, so an idle tick pays only for the atomic loads it needs to decide there is nothing to do. `ConnectionManager` keeps five such hints, each refreshed under the owning mutex right after the container/pointer it mirrors changes (always re-derived from `.size()` or the assigned value, never incremented in place, so the hint cannot drift from ground truth):
 
 - `has_pending_events_` (under `conn_mutex_`): set at every push into any of the deferred `pending_*_events_` queues and by the two pairing-window gesture schedulers, cleared once `loop()` has swapped every queue and flag out. Lets `loop()` skip the `conn_mutex_` acquisition when nothing is pending.
-- `nursery_size_` (under `conn_ptr_mutex_`): mirrors `nursery_.size()`. Lets `loop()` skip the current/nursery copy-and-`loop()` block, the hello-retry scan, and the nursery reap scan when the nursery is empty, while keeping the lifecycle block running while any nursery connection exists (its promotion scan is level-triggered on connection flags, not on events).
+- `nursery_size_` (under `conn_ptr_mutex_`): mirrors `nursery_.size()`. Lets `loop()` skip the current/nursery copy-and-`loop()` block, the hello scan, and the nursery reap scan when the nursery is empty, while keeping the lifecycle block running while any nursery connection exists (its promotion scan is level-triggered on connection flags, not on events).
 - `has_current_` (under `conn_ptr_mutex_`): true whenever `current_connection_` is non-null. Lets `loop()` skip the copy-and-`loop()` block when there is no current connection and the nursery is empty.
 - `deferred_size_` (under `conn_ptr_mutex_`): mirrors `deferred_releases_.size()`. Lets `flush_deferred_releases()` early-return without locking when nothing is queued.
 - `pending_record_ops_size_` (under `conn_ptr_mutex_`): mirrors `pending_record_ops_.size()`. Lets `flush_pending_record_ops()` early-return without locking when nothing is staged.
@@ -619,7 +619,7 @@ All are `std::shared_ptr<SendspinConnection>`, and on the ESP server path they a
 
 1. A new connection (outbound or inbound) enters the nursery. Inbound connections are delivered by the platform ws_server only after their WebSocket upgrade is observed.
 2. The connection first runs the cleartext Noise handshake (`client/init` / `server/init` / `noise/handshake` msg1 / msg2) on the network thread before any application message is processed; see [Noise Encryption](#noise-encryption) below. No `client/hello` is sent until Noise transport is active.
-3. The connection sends `client/hello` (over the encrypted transport, once Noise is active). Retry with exponential backoff (100 ms base, 3 attempts). Each managed connection has its own retry entry in `ConnectionManager::hello_retries_`, so a handoff candidate arriving mid-handshake cannot clobber another connection's pending hello.
+3. The connection sends `client/hello` (over the encrypted transport, once Noise is active). Retry with exponential backoff (100 ms base, 3 attempts). The send state lives on the connection's own `NurseryEntry` (`HelloStep`), so a handoff candidate arriving mid-handshake cannot clobber another connection's pending hello. It is armed once, when the Noise handshake completes, and never re-armed: a hello the transport refused, or one whose attempts ran out, is not retried with a fresh set; the close event or the establish deadline reaps the connection.
 4. The handshake state lives on the connection as two atomic flags: `client_hello_sent_` (set by the hello send-completion callback) and `server_hello_received_` (set when `server/hello` is processed on the network thread, after the server info fields it publishes). `is_handshake_complete()` (`client_hello_sent_ && server_hello_received_`) therefore already implies the Noise handshake completed, since `client/hello` cannot be sent before transport is active.
 5. Establishment is level-triggered: each `loop()` tick, the promotion scan promotes any nursery connection whose `is_operational()` (`is_handshake_complete() && first_activate_received()`) is true, so it does not matter whether the hello handshake or the first `server/activate` completes first. `server/activate` trust enforcement (admissibility against the connection's PSK category) runs as soon as the activate event is processed, independent of promotion timing; a rejected activate closes the connection immediately. Admission arbitration against an incumbent (rank by highest activity: playback > pairing > none; equal non-zero rank admits the incoming connection; an in-flight pairing is not displaced by an incoming pairing or playback connection) happens inside the promotion scan itself. See [PSK Admission (trust gating)](#psk-admission-trust-gating) below.
 6. Handoff executes: disable the loser's message dispatch -> cleanup client state (winner only gets `on_handshake_complete`) -> send goodbye to the rejected connection via the deferred-release queue.
@@ -684,8 +684,8 @@ The gate reads an atomic mask on the connection rather than `active_roles_`, bec
 2. ConnectionManager::stop(SHUTDOWN)
    ├─ Under conn_ptr_mutex_: accepting_ = false; snapshot each connection's pairing-code / window
    │  display flags (PairingUiSnapshot); disable_message_dispatch() on every managed
-   │  connection; move the current slot, the nursery, and the deferred releases out; clear the
-   │  hello retries and close any standing pairing window
+   │  connection; move the current slot, the nursery, and the deferred releases out; close any
+   │  standing pairing window
    ├─ Outside the lock: conn->disconnect(SHUTDOWN, completion) on each, completion counted by a
    │  shared GoodbyeWait; wait up to GOODBYE_FLUSH_TIMEOUT_MS (50 ms) per goodbye for the count
    │  to reach zero (the ESP httpd worker hands the frames to lwIP one at a time)

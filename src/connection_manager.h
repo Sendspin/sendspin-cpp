@@ -127,13 +127,30 @@ struct GoodbyeWait {
     size_t pending{0};
 };
 
+/// @brief Progress of a nursery connection's client/hello
+enum class HelloStep : uint8_t {
+    AWAIT_NOISE,  ///< Not armed yet: the Noise handshake has not completed
+    SENDING,      ///< Armed: the next attempt is due at NurseryEntry::hello_due_us
+    /// Queued, refused by the transport, or out of attempts. Never re-armed: the close event or
+    /// the establish deadline reaps a connection whose hello never completed.
+    DONE,
+};
+
 /// @brief A connection that has not completed the hello handshake
 ///
-/// Inbound entries arrive WS-upgraded, so their hello is armed at admission; outbound entries arm
-/// theirs when the transport's connected event arrives.
+/// The hello is armed once the connection's Noise handshake completes (the hello scan in
+/// ConnectionManager::scan_hello_and_nursery()), so its send state lives here and leaves the
+/// nursery with the connection.
 struct NurseryEntry {
+    static constexpr uint32_t INITIAL_HELLO_RETRY_DELAY_MS = 100U;  ///< First backoff delay
+    static constexpr uint8_t MAX_HELLO_ATTEMPTS = 3;                ///< Sends before giving up
+
     std::shared_ptr<SendspinConnection> conn;  ///< Observer; the session slot / transport owns
+    int64_t hello_due_us{0};                   ///< Next hello attempt; read only while SENDING
+    uint32_t hello_retry_delay_ms{INITIAL_HELLO_RETRY_DELAY_MS};  ///< Current backoff delay
     bool inbound{false};  ///< true if accepted by the WS server, false for connect_to()
+    HelloStep hello_step{HelloStep::AWAIT_NOISE};
+    uint8_t hello_attempts_left{MAX_HELLO_ATTEMPTS};
 };
 
 /// @brief A connection release deferred until conn_ptr_mutex_ has been dropped
@@ -237,16 +254,6 @@ struct ServerPairingMessageEvent {
 
     // server/pair-confirm fields
     std::array<uint8_t, 64> server_kc{};  ///< Server CPace confirmation tag
-};
-
-/// @brief Hello retry state for exponential backoff
-struct HelloRetryState {
-    std::shared_ptr<SendspinConnection> conn;  ///< Connection awaiting hello
-    int64_t retry_time_us{0};  ///< Next retry time in microseconds (0 = no pending retry)
-    static constexpr uint32_t INITIAL_RETRY_DELAY_MS = 100U;  ///< Initial backoff delay in ms
-    static constexpr uint8_t MAX_ATTEMPTS = 3;                ///< Hello sends before giving up
-    uint32_t delay_ms{INITIAL_RETRY_DELAY_MS};                ///< Current backoff delay
-    uint8_t attempts{MAX_ATTEMPTS};                           ///< Remaining retry attempts
 };
 
 /// @brief Deferred server/activate event, processed in ConnectionManager::loop()
@@ -539,10 +546,10 @@ private:
     /// copy.
     void loop_managed_connections();
 
-    /// @brief Arms hellos for nursery connections whose Noise handshake just completed (level-
-    /// triggered noise-completion scan), checks hello retry timers, and reaps nursery connections
-    /// that miss the establish deadline. Acquires conn_ptr_mutex_ internally, and only when the
-    /// nursery_size_ hint says there is something to scan.
+    /// @brief Arms hellos for nursery connections whose Noise handshake just completed and sends
+    /// the ones that are due (the level-triggered hello scan), and reaps nursery
+    /// connections that miss the establish deadline. Acquires conn_ptr_mutex_ internally, and only
+    /// when the nursery_size_ hint says there is something to scan.
     void scan_hello_and_nursery();
 
     /// @brief Aborts a pairing attempt on the current connection that has stalled past
@@ -570,11 +577,10 @@ private:
     /// inbound slots are full (outbound entries do not count) the newcomer is rejected with a
     /// goodbye, which reaches the peer because its session is already upgraded.
     ///
-    /// When encryption is required, this installs the Noise handshake driver and sends
-    /// client/init immediately (the connection is already WS-upgraded, so there is no earlier
-    /// signal to wait for); the hello is armed later, once the Noise handshake completes (see
-    /// the noise-completion scan in scan_hello_and_nursery()). Otherwise the hello is armed right
-    /// away.
+    /// This installs the Noise handshake driver and sends client/init immediately (the
+    /// connection is already WS-upgraded, so there is no earlier signal to wait for); the hello
+    /// is armed later, once the Noise handshake completes (see the hello scan in
+    /// scan_hello_and_nursery()).
     /// @param conn The newly delivered server connection. The session slot keeps a parallel
     ///             refcount, so this observer can be reset at any time without freeing the conn
     ///             out from under in-flight httpd workers.
@@ -651,7 +657,7 @@ private:
         this->mark_pending();
     }
 
-    /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
+    /// @brief Releases a nursery entry: erases it and queues the
     /// goodbye+release on deferred_releases_. Caller must hold conn_ptr_mutex_ and call
     /// flush_deferred_releases() after dropping it.
     /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
@@ -674,28 +680,13 @@ private:
     // ========================================
     // Hello handshake
     // ========================================
-    /// @brief Arms the hello retry state so loop() will send the hello on its next tick. Caller
-    /// must hold conn_ptr_mutex_.
-    /// Only ever called for a nursery member: a connection sends exactly one client/hello, while
-    /// it is proving itself.
-    /// @param conn The connection to send the hello to.
-    void initiate_hello(SendspinConnection* conn);
     /// @brief Sends the hello message to a connection, returning true if no retry is needed.
+    /// Caller must hold conn_ptr_mutex_.
     /// @param remaining_attempts Number of send attempts remaining before giving up.
-    /// @param conn The connection to send the hello to.
+    /// @param conn The nursery connection to send the hello to.
     /// @return True if done (sent or connection invalid), false if the send failed and should
     /// retry.
     bool send_hello_message(uint8_t remaining_attempts, SendspinConnection* conn);
-    /// @brief Removes any pending hello-retry entry associated with the given connection. Caller
-    /// must hold conn_ptr_mutex_.
-    /// @param conn The connection whose retry state should be dropped.
-    void remove_hello_retry(const SendspinConnection* conn);
-    /// @brief Returns true if conn already has a pending hello-retry entry. Caller must hold
-    /// conn_ptr_mutex_. Used by the noise-completion scan in scan_hello_and_nursery() to arm a
-    /// connection's hello exactly once (idempotent re-arming would otherwise reset the backoff
-    /// every tick).
-    /// @param conn The connection to check.
-    bool has_hello_retry(const SendspinConnection* conn) const;
 
     // ========================================
     // Connection lifecycle
@@ -746,10 +737,9 @@ private:
     /// deferred_releases_. The current slot stays empty after a drop; the next nursery
     /// establishment promotes into it.
     ///
-    /// No-op if conn is null. If conn is not a managed connection (already released by an
-    /// earlier event in the same loop() pass), only its stale hello-retry entry, if any, is
-    /// pruned. Caller must hold conn_ptr_mutex_ and call flush_deferred_releases() after
-    /// dropping it.
+    /// No-op if conn is null or not a managed connection (already released by an earlier event
+    /// in the same loop() pass). Caller must hold conn_ptr_mutex_ and call
+    /// flush_deferred_releases() after dropping it.
     ///
     /// @param conn The connection to drop; must be current_connection_ or a nursery entry.
     /// @param goodbye Goodbye reason to send before closing, or nullopt when the transport is
@@ -991,12 +981,8 @@ private:
     // flush_pending_record_ops() once conn_ptr_mutex_ is dropped; see PendingRecordOp. Written
     // and read only under conn_ptr_mutex_, and emptied within the tick that filled it.
     std::vector<PendingRecordOp> pending_record_ops_;
-    // Unproven connections awaiting establishment
+    // Unproven connections awaiting establishment, each carrying its hello send state
     InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery_;
-    // At most one entry per nursery connection (see initiate_hello() and the arming scan in
-    // scan_hello_and_nursery()), cleared when the hello is sent or the connection leaves the
-    // nursery, so bounded like the nursery
-    InlineVector<HelloRetryState, MAX_NURSERY_ENTRIES> hello_retries_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
     std::vector<ServerActivateEvent> pending_activate_events_;  // Deferred server/activate events
@@ -1070,7 +1056,7 @@ private:
     /// conn_mutex_ acquisition entirely when nothing is pending.
     std::atomic<bool> has_pending_events_{false};
 
-    /// nursery_.size(). Lets loop() skip the connection-copy block, the hello-retry scan and the
+    /// nursery_.size(). Lets loop() skip the connection-copy block, the hello scan and the
     /// nursery reap when the nursery is empty, and keeps the lifecycle block running while any
     /// nursery connection exists (its promotion scan is level-triggered on connection flags).
     std::atomic<size_t> nursery_size_{0};

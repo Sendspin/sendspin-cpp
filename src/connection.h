@@ -739,9 +739,9 @@ public:
     /// @brief Callback invoked when the transport connection is ready for messaging
     /// @param conn Pointer to this connection.
     /// @note Fired by outbound (client) transports only, once the connect and WebSocket upgrade
-    ///       complete; the manager uses it to arm the hello. Inbound server connections are
-    ///       delivered to the manager already upgraded (their hello is armed at nursery
-    ///       admission) and never fire this.
+    ///       complete; the manager uses it to start the Noise handshake. Inbound server
+    ///       connections are delivered to the manager already upgraded (their handshake starts at
+    ///       nursery admission) and never fire this.
     std::function<void(SendspinConnection*)> on_connected_cb;
 
     /// @brief Callback invoked when the connection is closed or lost
@@ -1172,7 +1172,7 @@ protected:
 
     /// PSK category resolved by the Noise handshake (set at COMPLETE, or re-handshake).
     /// Atomic because get_psk_category() is read on the main loop (build_hello_message via the
-    /// hello-retry path) while the network thread writes it at COMPLETE / re-handshake.
+    /// hello scan) while the network thread writes it at COMPLETE / re-handshake.
     std::atomic<PskCategory> psk_category_{PskCategory::SENTINEL};
 
     /// Hello handshake state. Atomic because it is set from the send-completion callback (the httpd

@@ -84,6 +84,7 @@ constexpr uint16_t VISUALIZER_SPECTRUM_TEST_PORT = 19078;
 constexpr uint16_t VISUALIZER_STALE_TEST_PORT = 19084;
 constexpr uint16_t VISUALIZER_SHARED_TS_TEST_PORT = 19086;
 constexpr uint16_t VISUALIZER_OFFSET_TEST_PORT = 19088;
+constexpr uint16_t HELLO_TEST_PORT = 19090;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -930,6 +931,72 @@ TEST(ClientLifecycle, PublishStateOutlivesADropDuringTheSend) {
     EXPECT_EQ(rv.sent.size(), 1u) << "the client/state never reached the connection";
 
     client.stop();
+}
+
+/// Counts client/hello sends; `result` is what each send returns. The completion fires inline with
+/// the send's outcome, as the encrypted send_app_json() path reports it.
+class HelloCountingConnection : public StubConnection {
+public:
+    explicit HelloCountingConnection(SsErr result) : result_(result) {}
+
+    // No Noise session, so send_app_json() routes the hello here as raw text.
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb, bool) override {
+        if (msg.find("client/hello") != std::string::npos) {
+            ++this->hellos;
+        }
+        if (cb) {
+            cb(this->result_ == SsErr::OK);
+        }
+        return this->result_;
+    }
+
+    int hellos{0};
+
+private:
+    SsErr result_;
+};
+
+// A nursery connection's client/hello is armed once, when its Noise handshake completes, and never
+// again: a hello the transport refuses, or one whose attempts run out, is left for the close event
+// or the establish deadline rather than re-armed with a fresh set of attempts. Every tick forces
+// the next attempt due, so the backoff delays do not stretch the test (and are not pinned by it).
+TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
+    struct Row {
+        const char* name;
+        SsErr send_result;
+        int expected_hellos;
+    };
+    const Row rows[] = {
+        {"Control: queued", SsErr::OK, 1},
+        {"refused by the transport", SsErr::INVALID_STATE, 1},
+        {"every attempt fails", SsErr::FAIL, NurseryEntry::MAX_HELLO_ATTEMPTS},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(HELLO_TEST_PORT));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        ConnectionManager& manager = *client.connection_manager_;
+        auto conn = std::make_shared<HelloCountingConnection>(row.send_result);
+        conn->noise_handshake_complete_.store(true);
+        conn->set_provisional_time_us(platform_time_us());
+        {
+            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+            manager.push_nursery_entry(NurseryEntry{.conn = conn, .inbound = true});
+        }
+
+        for (int tick = 0; tick < NurseryEntry::MAX_HELLO_ATTEMPTS + 3; ++tick) {
+            manager.scan_hello_and_nursery();
+            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+            for (auto& entry : manager.nursery_) {
+                entry.hello_due_us = 0;
+            }
+        }
+        EXPECT_EQ(conn->hellos, row.expected_hellos);
+
+        client.stop();
+    }
 }
 
 // ============================================================================

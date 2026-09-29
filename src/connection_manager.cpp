@@ -317,14 +317,11 @@ ConnectionManager::~ConnectionManager() {
     // cppcheck-suppress variableScope
     InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery;
     // cppcheck-suppress variableScope
-    InlineVector<HelloRetryState, MAX_NURSERY_ENTRIES> retries;
-    // cppcheck-suppress variableScope
     std::vector<DeferredRelease> releases;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         current = std::move(this->current_connection_);
         nursery.swap(this->nursery_);
-        retries.swap(this->hello_retries_);
         // cppcheck-suppress unreadVariable
         releases = std::move(this->deferred_releases_);
         // Keep the hint atomics in sync with the now-empty containers (has_pending_events_ was
@@ -362,8 +359,8 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->on_connected_cb = [this](SendspinConnection* c) {
         // Only outbound transports fire this, so it is wired here rather than in
         // setup_connection_callbacks. The connect succeeded, so the WebSocket upgrade is complete;
-        // record it and defer the hello arming to loop() (this runs on the network thread).
-        // Inbound connections arrive already upgraded and arm their hello at admission.
+        // record it and defer starting the Noise handshake to loop() (this runs on the network
+        // thread). Inbound connections arrive already upgraded and start theirs at admission.
         c->mark_ws_upgraded();
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
         this->queue_pending(this->pending_connected_events_, c->shared_from_this());
@@ -406,7 +403,7 @@ void ConnectionManager::connect_to(const std::string& url) {
         // A user-initiated connect is admitted even against a full nursery: there is at most one
         // outbound entry (replaced above), so the nursery is still bounded (MAX_NURSERY_ENTRIES)
         // and an explicit user request never fails against inbound peers.
-        this->push_nursery_entry(NurseryEntry{client_conn, /*inbound=*/false});
+        this->push_nursery_entry(NurseryEntry{.conn = client_conn, .inbound = false});
         client_conn->start();
     }
     this->flush_deferred_releases();
@@ -577,7 +574,6 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
         }
         this->nursery_.clear();
         this->refresh_nursery_size_hint();
-        this->hello_retries_.clear();
         // A standing pairing window belongs to this run; a restart begins with it closed.
         this->close_pairing_window();
         // A queued release that carries a reason (a handoff loser, a reaped entry) had its
@@ -679,8 +675,8 @@ void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
     // This is where the outbound side starts the Noise handshake (client_init is sent
     // proactively; the client is always the Noise responder regardless of who opened the
     // socket, but it still sends client/init first as the Sendspin protocol client). The
-    // hello is armed later, once the Noise handshake completes (see the noise-completion
-    // scan in scan_hello_and_nursery()). (Inbound connections arrive already upgraded and
+    // hello is armed later, once the Noise handshake completes (see the hello scan in
+    // scan_hello_and_nursery()). (Inbound connections arrive already upgraded and
     // are handled the same way in on_new_connection().) Guarded by nursery membership: a
     // connection promoted or released by an earlier event is skipped.
     for (auto& conn : ev.connected) {
@@ -1039,71 +1035,53 @@ void ConnectionManager::loop_managed_connections() {
 
 void ConnectionManager::scan_hello_and_nursery() {
     // Both scans operate purely on nursery membership: a hello is only ever sent while its
-    // connection is proving itself. The nursery_size_ hint therefore covers the retry scan too,
-    // and the scan's own lazy erase covers a connection dropped by an earlier event this tick.
+    // connection is proving itself, so the nursery_size_ hint covers the hello scan too.
     if (this->nursery_size_.load(std::memory_order_acquire) > 0) {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
 
-        // Noise-completion scan: arm the hello for any nursery connection whose Noise
-        // handshake just completed. Level-triggered because noise_handshake_complete_ flips on
-        // the network thread (inside dispatch_completed_message/handle_noise_handshake_text)
-        // with no corresponding queued event, unlike the connected-events edge above. Skips
-        // connections whose hello is already sent or already has a pending retry, so a
-        // connection is armed exactly once.
-        for (const auto& entry : this->nursery_) {
-            SendspinConnection* c = entry.conn.get();
-            if (c->has_client_hello_sent() || this->has_hello_retry(c)) {
-                continue;
-            }
-            if (!c->is_noise_handshake_complete()) {
-                continue;
-            }
-            this->initiate_hello(c);
-        }
-
-        // One retry entry per managed connection, so a second connection arriving mid-handshake
-        // cannot clobber the first connection's pending hello.
+        // Hello scan. Arming is level-triggered because noise_handshake_complete_ flips on the
+        // network thread (inside dispatch_completed_message/handle_noise_handshake_text) with no
+        // corresponding queued event. Each entry arms once (AWAIT_NOISE -> SENDING) and, once its
+        // hello is queued, refused, or out of attempts, stays DONE (see HelloStep); the state
+        // lives on the entry, so a second connection arriving mid-handshake cannot clobber the
+        // first's.
         {
             const int64_t now_us = platform_time_us();
-            for (auto it = this->hello_retries_.begin(); it != this->hello_retries_.end();) {
-                HelloRetryState& retry = *it;
-                SendspinConnection* rc = retry.conn.get();
-
-                // Drop retries whose connection has left the nursery: it was promoted (its hello
-                // completed) or released.
-                if (this->find_in_nursery(rc) == this->nursery_.end()) {
-                    it = this->hello_retries_.erase(it);
+            for (auto& entry : this->nursery_) {
+                SendspinConnection* c = entry.conn.get();
+                if (entry.hello_step == HelloStep::AWAIT_NOISE) {
+                    if (!c->is_noise_handshake_complete()) {
+                        continue;
+                    }
+                    entry.hello_step = HelloStep::SENDING;
+                    entry.hello_due_us = now_us;
+                }
+                if (entry.hello_step != HelloStep::SENDING || now_us < entry.hello_due_us) {
                     continue;
                 }
 
-                if (retry.retry_time_us == 0 || now_us < retry.retry_time_us) {
-                    ++it;
+                if (this->send_hello_message(entry.hello_attempts_left - 1, c)) {
+                    entry.hello_step = HelloStep::DONE;
                     continue;
                 }
 
-                if (this->send_hello_message(retry.attempts - 1, rc)) {
-                    it = this->hello_retries_.erase(it);
+                if (entry.hello_attempts_left > 1) {
+                    entry.hello_retry_delay_ms *= 2;
+                    entry.hello_attempts_left--;
+                    entry.hello_due_us =
+                        now_us + static_cast<int64_t>(entry.hello_retry_delay_ms) * US_PER_MS;
                     continue;
                 }
 
-                if (retry.attempts > 1) {
-                    retry.delay_ms *= 2;
-                    retry.attempts--;
-                    retry.retry_time_us = now_us + static_cast<int64_t>(retry.delay_ms) * US_PER_MS;
-                    ++it;
-                    continue;
-                }
-
-                // Retries exhausted: the establish-deadline scan below reaps the entry itself.
-                it = this->hello_retries_.erase(it);
+                // Attempts exhausted: the establish-deadline scan below reaps the entry.
+                entry.hello_step = HelloStep::DONE;
             }
         }
 
         // Nursery tick: reap connections that miss the establish deadline. This is the only
         // release path for peers that connect and then stall without completing the hello, and
-        // for outbound sockets whose transport never delivers a close (host IXWebSocket). Hello
-        // arming is event-driven (admission for inbound, connected event for outbound), so the
-        // tick only ever reaps.
+        // for outbound sockets whose transport never delivers a close (host IXWebSocket), and so
+        // also for a connection whose hello never completed.
         {
             const int64_t now_us = platform_time_us();
             for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
@@ -1206,7 +1184,7 @@ void ConnectionManager::loop() {
     DrainedEvents& ev = this->drained_events_;
 
     // Also runs whenever the nursery is non-empty even with no swapped-out events: the
-    // noise-completion scan in scan_hello_and_nursery() (called further down) is
+    // hello scan in scan_hello_and_nursery() (called further down) is
     // level-triggered on handshake flags set by network threads with no corresponding event
     // push, so loop() must keep running every tick a nursery connection exists.
     if (ev.any() || this->nursery_size_.load(std::memory_order_acquire) > 0) {
@@ -1235,7 +1213,7 @@ void ConnectionManager::loop() {
     // Call loop() on active connections using shared_ptr copies to avoid holding the lock.
     this->loop_managed_connections();
 
-    // Noise-completion scan, hello retry timers, and the nursery establish-deadline reap.
+    // Hello scan (arming and sends) and the nursery establish-deadline reap.
     this->scan_hello_and_nursery();
 
     // Liveness tick: a blackholed socket (no FIN, RST, or close frame) never produces a transport
@@ -1445,11 +1423,11 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             SS_LOGD(TAG, "Admitting new connection into the nursery");
             // The connection arrives WS-upgraded, so client/init can be sent right away (there
             // is no earlier signal to wait for). The hello is armed later, once the Noise
-            // handshake completes (see the noise-completion scan in scan_hello_and_nursery()).
+            // handshake completes (see the hello scan in scan_hello_and_nursery()).
             conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
                                        std::string(NOISE_SUITE_CHACHAPOLY));
             conn->send_noise_client_init();
-            this->push_nursery_entry(NurseryEntry{std::move(conn), /*inbound=*/true});
+            this->push_nursery_entry(NurseryEntry{.conn = std::move(conn), .inbound = true});
         }
     }
     // On the network/httpd thread: a rejection queued just above leaves on this thread, and a
@@ -1461,55 +1439,7 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
 // Hello handshake
 // ============================================================================
 
-void ConnectionManager::initiate_hello(SendspinConnection* conn) {
-    // Arm a per-connection hello retry: send on the next tick, HelloRetryState::MAX_ATTEMPTS
-    // attempts. If an entry for this connection already exists (a duplicate connected event for
-    // the same connection would land here twice), re-arm it in place instead of pushing a second
-    // one, so a connection never gets two timers. The member initializers supply the delay and
-    // the attempt count on both paths.
-    auto conn_sp = conn->shared_from_this();
-    const int64_t retry_time_us = platform_time_us();
-
-    for (auto& retry : this->hello_retries_) {
-        if (retry.conn == conn_sp) {
-            retry = HelloRetryState{.conn = std::move(conn_sp), .retry_time_us = retry_time_us};
-            return;
-        }
-    }
-
-    this->hello_retries_.push_back(
-        HelloRetryState{.conn = std::move(conn_sp), .retry_time_us = retry_time_us});
-}
-
-void ConnectionManager::remove_hello_retry(const SendspinConnection* conn) {
-    // Safe to call unconditionally: a no-op if conn never had a retry entry (e.g. a connection
-    // rejected before initiate_hello, or one whose hello already sent and cleared its entry).
-    for (auto it = this->hello_retries_.begin(); it != this->hello_retries_.end();) {
-        if (it->conn.get() == conn) {
-            it = this->hello_retries_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-bool ConnectionManager::has_hello_retry(const SendspinConnection* conn) const {
-    for (const auto& retry : this->hello_retries_) {
-        if (retry.conn.get() == conn) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinConnection* conn) {
-    // Verify the connection is still managed: hellos are only ever sent to nursery members, so
-    // anything else (already released or promoted by an earlier event this tick) is stale.
-    if (this->find_in_nursery(conn) == this->nursery_.end()) {
-        SS_LOGW(TAG, "Connection no longer valid for hello message");
-        return true;
-    }
-
     if (!conn->is_connected()) {
         SS_LOGW(TAG, "Cannot send hello - not connected");
         return true;
@@ -1669,7 +1599,6 @@ NurseryEntry* ConnectionManager::release_nursery_entry(
     // Leaving the connection manager: block stale network-thread dispatch into role/state queues
     // during the goodbye window. Outgoing sends, including the goodbye itself, are unaffected.
     conn->disable_message_dispatch();
-    this->remove_hello_retry(conn.get());
     this->queue_deferred_release(std::move(conn), reason);
     return next;
 }
@@ -1799,8 +1728,6 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         return;
     }
 
-    this->remove_hello_retry(conn);
-
     // A pairing window admits attempts only on the connection carrying its first, so losing that
     // connection closes it (pairing.md "Pairing Window"). Done before the branches below, which
     // release the connection this address identifies.
@@ -1895,7 +1822,6 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
     this->refresh_nursery_size_hint();
-    this->remove_hello_retry(conn.get());
 
     if (this->current_connection_ == nullptr) {
         this->set_current_connection(std::move(conn));
