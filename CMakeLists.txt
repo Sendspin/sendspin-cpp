@@ -57,6 +57,12 @@ if(ESP_IDF_BUILD)
         endif()
     endif()
 
+    if(CONFIG_SENDSPIN_ENABLE_ANNOUNCEMENT)
+        # Kconfig enforces the player dependency (ring buffer + decoder sources)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_ANNOUNCEMENT_SOURCES})
+        list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_ANNOUNCEMENT)
+    endif()
+
     if(CONFIG_SENDSPIN_ENABLE_CONTROLLER)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_CONTROLLER_SOURCES})
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_CONTROLLER)
@@ -113,6 +119,12 @@ else()
     option(SENDSPIN_ENABLE_COLOR "Enable color role" ON)
     option(SENDSPIN_ENABLE_ARTWORK "Enable artwork role" ON)
     option(SENDSPIN_ENABLE_VISUALIZER "Enable visualizer role" ON)
+    option(SENDSPIN_ENABLE_ANNOUNCEMENT "Enable announcement role (requires player)" ON)
+
+    if(SENDSPIN_ENABLE_ANNOUNCEMENT AND NOT SENDSPIN_ENABLE_PLAYER)
+        # The announcement role reuses the player's ring buffer and decoder sources
+        message(FATAL_ERROR "SENDSPIN_ENABLE_ANNOUNCEMENT requires SENDSPIN_ENABLE_PLAYER")
+    endif()
 
     # Codec selection (player role only). Opus is patent-encumbered; see the player role spec.
     option(SENDSPIN_ENABLE_OPUS "Enable the Opus decoder in the player role" ON)
@@ -143,6 +155,9 @@ else()
     if(SENDSPIN_ENABLE_VISUALIZER)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_VISUALIZER_SOURCES})
     endif()
+    if(SENDSPIN_ENABLE_ANNOUNCEMENT)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_ANNOUNCEMENT_SOURCES})
+    endif()
 
     # Create the library — core sources + enabled role sources + host networking (added via host.cmake)
     add_library(sendspin STATIC ${SENDSPIN_ALL_SOURCES})
@@ -168,6 +183,9 @@ else()
     endif()
     if(SENDSPIN_ENABLE_VISUALIZER)
         target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_VISUALIZER)
+    endif()
+    if(SENDSPIN_ENABLE_ANNOUNCEMENT)
+        target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_ANNOUNCEMENT)
     endif()
 
     # Host build options

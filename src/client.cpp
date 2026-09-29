@@ -22,6 +22,9 @@
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/network_info.h"
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+#include "announcement_role_impl.h"
+#endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
 #endif
@@ -102,6 +105,9 @@ SendspinClient::~SendspinClient() {
 #ifdef SENDSPIN_ENABLE_PLAYER
     this->player_.reset();
 #endif
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+    this->announcement_.reset();
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     this->visualizer_.reset();
 #endif
@@ -152,6 +158,11 @@ bool SendspinClient::start() {
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (roles_started && this->player_) {
         roles_started = this->player_->impl_->start();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+    if (roles_started && this->announcement_) {
+        roles_started = this->announcement_->impl_->start();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
@@ -427,6 +438,17 @@ void SendspinClient::drain_inbox() {
 #endif
                         break;
                     }
+                    // ANNOUNCEMENT_STREAM: lifecycle from the network thread plus output
+                    // transitions from the announcement task, dispatched like PLAYER_STREAM.
+                    case InboxEventType::ANNOUNCEMENT_STREAM: {
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+                        if (this->announcement_) {
+                            this->announcement_->impl_->on_stream_ring_event(
+                                static_cast<AnnouncementStreamCallbackType>(event.code));
+                        }
+#endif
+                        break;
+                    }
                     default: {
                         // Every InboxEventType is dispatched above; this guards only against a
                         // corrupted enum value.
@@ -457,6 +479,11 @@ void SendspinClient::drain_inbox() {
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_ && this->player_->impl_->needs_drain(slot_bits)) {
         this->player_->impl_->drain_events();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+    if (this->announcement_ && this->announcement_->impl_->needs_drain(slot_bits)) {
+        this->announcement_->impl_->drain_events();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
@@ -583,6 +610,17 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
 }
 #endif
 
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+AnnouncementRole& SendspinClient::add_announcement(AnnouncementRoleConfig config) {
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
+        SS_LOGW(TAG, "add_announcement() called while started; role may not initialize correctly");
+    }
+    this->announcement_ = std::make_unique<AnnouncementRole>(std::move(config), this);
+    this->announcement_->impl_->attach_inbox(this->event_state_->inbox);
+    return *this->announcement_;
+}
+#endif
+
 // ============================================================================
 // Queries
 // ============================================================================
@@ -687,6 +725,11 @@ void SendspinClient::cleanup_connection_state() {
         this->player_->impl_->cleanup();
     }
 #endif
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+    if (this->announcement_) {
+        this->announcement_->impl_->cleanup();
+    }
+#endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     if (this->controller_) {
         this->controller_->impl_->cleanup();
@@ -777,6 +820,11 @@ std::string SendspinClient::build_hello_message() {
         this->visualizer_->impl_->build_hello_fields(msg);
     }
 #endif
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+    if (this->announcement_) {
+        this->announcement_->impl_->build_hello_fields(msg);
+    }
+#endif
 
     return format_client_hello_message(&msg);
 }
@@ -836,14 +884,25 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                 this->visualizer_->impl_->handle_stream_start(stream_msg.visualizer.value());
             }
 #endif
+
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+            if (this->announcement_ && stream_msg.announcement.has_value()) {
+                this->announcement_->impl_->handle_stream_start(stream_msg.announcement.value());
+            }
+#endif
             break;
         }
         case SendspinServerToClientMessageType::STREAM_END: {
             StreamEndMessage end_msg;
             if (process_stream_end_message(root, &end_msg)) {
+                // Omitted roles ends the media streams (player, artwork, visualizer). The
+                // announcement stream is independent: it ends only when the roles list explicitly
+                // names "announcement", mirroring how stream/clear excludes it. A bare stream/end
+                // therefore leaves an active announcement playing and its ducking intact.
                 bool end_player = !end_msg.roles.has_value();
                 bool end_artwork = !end_msg.roles.has_value();
                 bool end_visualizer = !end_msg.roles.has_value();
+                bool end_announcement = false;
 
                 if (end_msg.roles.has_value()) {
                     for (const auto& role : end_msg.roles.value()) {
@@ -853,12 +912,14 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                             end_artwork = true;
                         } else if (role == "visualizer") {
                             end_visualizer = true;
+                        } else if (role == "announcement") {
+                            end_announcement = true;
                         }
                     }
                 }
 
-                SS_LOGD(TAG, "Stream ended - player:%d artwork:%d visualizer:%d", end_player,
-                        end_artwork, end_visualizer);
+                SS_LOGD(TAG, "Stream ended - player:%d artwork:%d visualizer:%d announcement:%d",
+                        end_player, end_artwork, end_visualizer, end_announcement);
 
 #ifdef SENDSPIN_ENABLE_PLAYER
                 if (this->player_ && end_player) {
@@ -877,12 +938,21 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                     this->visualizer_->impl_->handle_stream_end();
                 }
 #endif
+
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+                if (this->announcement_ && end_announcement) {
+                    this->announcement_->impl_->handle_stream_end();
+                }
+#endif
             }
             break;
         }
         case SendspinServerToClientMessageType::STREAM_CLEAR: {
             StreamClearMessage clear_msg;
             if (process_stream_clear_message(root, &clear_msg)) {
+                // stream/clear is media-scoped and never lists the announcement role: an active
+                // announcement stream is unaffected. Omitted roles is a media seek that clears the
+                // player and visualizer streams.
                 bool clear_player = !clear_msg.roles.has_value();
                 bool clear_artwork = !clear_msg.roles.has_value();
                 bool clear_visualizer = !clear_msg.roles.has_value();
@@ -1067,6 +1137,18 @@ SS_HOT void SendspinClient::process_binary_message(const uint8_t* payload, size_
 #endif
             break;
         }
+        case SENDSPIN_ROLE_ANNOUNCEMENT: {
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+            if (this->announcement_) {
+                if (slot == 0) {
+                    this->announcement_->impl_->handle_binary(data, data_len);
+                } else {
+                    SS_LOGW(TAG, "Unknown announcement binary slot %d", slot);
+                }
+            }
+#endif
+            break;
+        }
         default: {
             SS_LOGW(TAG, "Unknown binary role %d (type %d)", role, binary_type);
             break;
@@ -1089,6 +1171,12 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         this->player_->impl_->build_state_fields(state_msg);
+    }
+#endif
+
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+    if (this->announcement_) {
+        this->announcement_->impl_->build_state_fields(state_msg);
     }
 #endif
 

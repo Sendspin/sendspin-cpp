@@ -34,6 +34,7 @@ add_executable(sendspin_tests
     test_artwork_role.cpp
     test_client_teardown.cpp
     test_client_lifecycle.cpp
+    test_announcement_role.cpp
 )
 
 # test_client_lifecycle.cpp checks what a role's stop() left in its ring, which nothing on the

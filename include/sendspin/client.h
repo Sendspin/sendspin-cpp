@@ -32,6 +32,9 @@
 namespace sendspin {
 
 // Forward declarations for enabled roles
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+class AnnouncementRole;
+#endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
 class ArtworkRole;
 #endif
@@ -312,10 +315,27 @@ public:
     VisualizerRole& add_visualizer(VisualizerRoleConfig config);
 #endif
 
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+    /// @brief Adds the announcement role. Returns a reference for setting callbacks
+    AnnouncementRole& add_announcement(AnnouncementRoleConfig config);
+#endif
+
     // ========================================
     // Role access (nullptr if not added)
     // ========================================
 
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+    /// @brief Returns the announcement role, or nullptr if not added
+    /// @return Pointer to the announcement role, or nullptr
+    AnnouncementRole* announcement() {
+        return this->announcement_.get();
+    }
+    /// @brief Returns the announcement role (const), or nullptr if not added
+    /// @return Const pointer to the announcement role, or nullptr
+    const AnnouncementRole* announcement() const {
+        return this->announcement_.get();
+    }
+#endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
     /// @brief Returns the artwork role, or nullptr if not added
     /// @return Pointer to the artwork role, or nullptr
@@ -538,6 +558,9 @@ private:
     GroupUpdateObject group_state_{};
 
     // Pointer fields
+#ifdef SENDSPIN_ENABLE_ANNOUNCEMENT
+    std::unique_ptr<AnnouncementRole> announcement_;
+#endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
     std::unique_ptr<ArtworkRole> artwork_;
 #endif
