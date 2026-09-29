@@ -18,6 +18,7 @@
 #pragma once
 
 #include "connection.h"
+#include "fixed_block_pool.h"
 #include "platform/types.h"
 #include "sendspin/types.h"
 #include <esp_err.h>
@@ -31,6 +32,21 @@
 
 namespace sendspin {
 
+/// @brief Bytes per outbound-send block: an AsyncRespArg header followed by the frame payload
+///
+/// Sized for the steady-state sends: an encrypted client/time (at most 93 B of payload), an
+/// encrypted player-only client/state (about 235 B), and controller commands. A client/state
+/// carrying artwork and visualizer config (about 600 B) takes a heap block; it is sent only on a
+/// state change.
+static constexpr size_t SEND_BLOCK_SIZE = 320;
+
+/// @brief Outbound-send blocks per server: the one or two sends normally in flight, plus a burst
+/// such as a state change during a time burst
+static constexpr size_t SEND_BLOCK_COUNT = 4;
+
+/// @brief Pool the ESP server's queued sends take their blocks from
+using SendBlockPool = FixedBlockPool<SEND_BLOCK_SIZE, SEND_BLOCK_COUNT>;
+
 /**
  * @brief ESP-IDF httpd WebSocket connection representing a single Sendspin server session
  *
@@ -40,9 +56,8 @@ namespace sendspin {
  */
 class SendspinServerConnection : public SendspinConnection {
 public:
-    /// @brief Constructs a server connection over an accepted httpd session; the handle is
-    /// owned by the server listener.
-    SendspinServerConnection(httpd_handle_t server, int sockfd);
+    /// @brief Constructs a server connection over an accepted httpd session
+    SendspinServerConnection(httpd_handle_t server, int sockfd, SendBlockPool& send_pool);
 
     ~SendspinServerConnection() override = default;
 
@@ -124,8 +139,8 @@ public:
     esp_err_t handle_data(httpd_req_t* req, int64_t receive_time);
 
 protected:
-    /// @brief Allocates an AsyncRespArg, copies the payload into it, and queues it on the httpd
-    /// worker to be sent as a text or binary frame by async_send_frame()
+    /// @brief Places an AsyncRespArg and a copy of the payload in one block (see AsyncRespArg) and
+    /// queues it on the httpd worker to be sent as a text or binary frame by async_send_frame()
     ///
     /// Shared by send_text_message() and send_binary_message(); `type` selects the WebSocket
     /// frame type and which of their (identical apart from wording) log messages is used.
@@ -156,6 +171,9 @@ protected:
 
     /// @brief The httpd server handle (owned by SendspinWsServer)
     httpd_handle_t server_;
+
+    /// @brief Blocks for queued sends (owned by SendspinWsServer)
+    SendBlockPool* send_pool_;
 
     // 32-bit fields
 

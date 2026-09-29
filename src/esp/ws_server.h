@@ -18,6 +18,7 @@
 #pragma once
 
 #include "sendspin/config.h"
+#include "server_connection.h"
 #include <esp_err.h>
 #include <esp_http_server.h>
 
@@ -34,7 +35,6 @@ namespace sendspin {
 // Forward declarations
 class SendspinClient;
 class SendspinConnection;
-class SendspinServerConnection;
 
 /// @brief An accepted httpd session whose WebSocket upgrade has not yet been observed.
 ///
@@ -176,6 +176,11 @@ protected:
     ConnectionClosedCallback connection_closed_callback_;
 
     NewConnectionCallback new_connection_callback_;
+
+    /// @brief Blocks for every accepted connection's queued sends. A member so it outlives each
+    /// queued send (the destructor stops the server first); it adds
+    /// SEND_BLOCK_SIZE * SEND_BLOCK_COUNT bytes to the server object.
+    SendBlockPool send_pool_;
 
     // Pointer fields
 

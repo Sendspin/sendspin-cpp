@@ -43,15 +43,15 @@ static const char* const TAG = "sendspin.server_connection";
 /// frame onto a different connection, and a destroyed connection yields a null lock (a clean
 /// no-op) rather than a use-after-free.
 ///
-/// Allocation layout: callers allocate a single block sized `sizeof(AsyncRespArg) + len`,
-/// placement-new the struct at the block start, and point `payload` at the byte immediately
-/// following it (`reinterpret_cast<uint8_t*>(this) + sizeof(AsyncRespArg)`). The struct is not
-/// POD (it holds a weak_ptr and a std::function), so the tail cannot be a flexible array member;
-/// `payload` stays a plain pointer into that same block instead. Freeing requires calling the
-/// destructor explicitly, then a single platform_free() of the block - never free(payload)
-/// separately.
+/// Block layout: one block of `sizeof(AsyncRespArg) + len` bytes, the struct placement-new'd at
+/// its start and `payload` pointing at the byte immediately following it. The struct is not POD
+/// (it holds a weak_ptr and a std::function), so the tail cannot be a flexible array member;
+/// `payload` stays a plain pointer into that same block instead. Release it only through
+/// release_async_resp_arg(), which also frees the payload.
 struct AsyncRespArg {
     std::weak_ptr<SendspinServerConnection> conn;
+    /// Pool the block came from, or nullptr for a heap block.
+    SendBlockPool* pool{nullptr};
     uint8_t* payload{nullptr};
     size_t len{0};
     /// Frame type (HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY) the worker sends this as.
@@ -70,12 +70,27 @@ struct SessionLookup {
     std::weak_ptr<SendspinServerConnection> conn;
 };
 
+static_assert(SEND_BLOCK_SIZE - sizeof(AsyncRespArg) >= 256,
+              "SEND_BLOCK_SIZE must leave room for the steady-state sends");
+
+/// @brief Destroys `resp_arg` and returns its block to the pool or heap it came from
+static void release_async_resp_arg(AsyncRespArg* resp_arg) {
+    SendBlockPool* pool = resp_arg->pool;
+    resp_arg->~AsyncRespArg();
+    if (pool != nullptr) {
+        pool->release(resp_arg);
+    } else {
+        platform_free(resp_arg);
+    }
+}
+
 // ============================================================================
 // SendspinConnection interface implementation
 // ============================================================================
 
-SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int sockfd)
-    : server_(server), sockfd_(sockfd) {
+SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int sockfd,
+                                                   SendBlockPool& send_pool)
+    : server_(server), send_pool_(&send_pool), sockfd_(sockfd) {
     // Disabling Nagle's algorithm significantly improves the time syncing accuracy
     int nodelay = 1;
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
@@ -166,8 +181,16 @@ SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len
         return SsErr::INVALID_STATE;
     }
 
-    // Single allocation: the AsyncRespArg header immediately followed by the payload bytes.
-    void* block = platform_malloc(sizeof(AsyncRespArg) + len);
+    const size_t block_size = sizeof(AsyncRespArg) + len;
+    SendBlockPool* pool = this->send_pool_;
+    void* block = pool->try_acquire(block_size);
+    if (block == nullptr) {
+        if (block_size <= SendBlockPool::block_size()) {
+            SS_LOGD(TAG, "Send pool exhausted, allocating %zu bytes", block_size);
+        }
+        pool = nullptr;
+        block = platform_malloc(block_size);
+    }
     if (block == nullptr) {
         if (is_text) {
             SS_LOGE(TAG, "Failed to allocate AsyncRespArg for message send");
@@ -184,6 +207,7 @@ SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len
     auto* resp_arg = new (block) AsyncRespArg();
 
     resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
+    resp_arg->pool = pool;
     resp_arg->allow_before_hello = allow_before_hello;
     resp_arg->payload = reinterpret_cast<uint8_t*>(block) + sizeof(AsyncRespArg);
     resp_arg->len = len;
@@ -207,8 +231,7 @@ SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len
         if (resp_arg->has_callback) {
             resp_arg->on_complete(false);
         }
-        resp_arg->~AsyncRespArg();
-        platform_free(block);
+        release_async_resp_arg(resp_arg);
         return SsErr::FAIL;
     }
     return SsErr::OK;
@@ -386,11 +409,8 @@ void SendspinServerConnection::async_send_frame(void* arg) {
         }
     }
 
-    // payload lives inline in the same allocation as resp_arg (see AsyncRespArg), so freeing
-    // resp_arg below also releases the payload bytes; there is no separate payload free.
-    // Properly destruct the AsyncRespArg (which includes the std::function) before freeing.
-    resp_arg->~AsyncRespArg();
-    platform_free(resp_arg);
+    // payload lives in resp_arg's own block (see AsyncRespArg), so this releases it too.
+    release_async_resp_arg(resp_arg);
 }
 
 }  // namespace sendspin

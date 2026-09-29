@@ -34,6 +34,7 @@ add_executable(sendspin_tests
     test_inbox.cpp
     test_player_role.cpp
     test_inline_vector.cpp
+    test_fixed_block_pool.cpp
     test_visualizer_role.cpp
     test_artwork_role.cpp
     test_crypto.cpp
