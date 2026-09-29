@@ -89,10 +89,13 @@ during this review.
 
 ## Validation tests
 
-- Tests for parsing/validation pair every malformed-input case with an
-  explicit control case (comment prefix `Control:`) proving the same parser
-  accepts valid input; without one, "rejects bad input" is indistinguishable
-  from "rejects everything".
+- A family of related rejection cases (one parser's malformed inputs, one
+  table's rows, one function's length guards) is one table-driven test whose
+  rows are the branches. Flag a family spelled out as one test per row, and
+  flag a control written as a separate test: the table carries at least one
+  accepting row marked `Control:` beside the rows it controls. A separate
+  test is warranted only for a branch with its own spec citation or its own
+  failure mode.
 - Cover the reject-the-whole-object rule: one bad sibling field must reject
   the enclosing object, and the test must show neighboring valid fields did
   not survive into the output.
@@ -102,6 +105,14 @@ during this review.
 - No tests that restate the implementation line by line, duplicate an
   existing case with cosmetic variation, or exist to inflate a count.
   Recommending deletion of a weak test is a valid review outcome.
+- No assertions on log wording unless the message is the documented
+  contract. A guard whose only observable is a log line is covered through
+  the behavior it protects; flag a test that would fail on a reworded
+  message.
+- Assertions target what a caller or peer observes. Flag a test that reads
+  private state, queue contents, or the identity of the thread that ran a
+  step when an observable outcome would distinguish the correct path; where
+  none would, the test states that.
 - Test names and comments describe the behavior under test, not the defect
   history ("rejects spectrum config missing n_disp_bins", not "regression
   test for the config bug"), closely enough that a red CI run identifies the

@@ -131,9 +131,22 @@ checklists in `.claude/skills/` apply these standards to a diff.
   clock.
 - A test defends a specific production line or branch and fails when that
   line is deleted or its condition inverted. A test that cannot fail that
-  way is filler and is deleted. Every malformed-input case in a validation
-  test is paired with a `Control:` case showing the same parser accepts
-  valid input.
+  way is filler and is deleted.
+- The unit of a test is a behavior, not a branch. A family of related guards
+  (the rejection cases of one parser, the rows of one admission table, the
+  length checks of one function) is one table-driven test whose rows are the
+  branches; a guard gets its own test only when it has its own spec citation
+  or its own failure mode. Each table carries at least one accepting row as
+  its control, marked `Control:`, so a rejection is distinguishable from
+  rejecting everything. Controls live beside what they control, not as
+  separate tests.
+- Tests assert on outcomes, not on log wording. A guard whose only
+  observable effect is a log line is covered by the test of the behavior it
+  protects or not at all; a log substring is asserted only where the message
+  is the documented contract.
+- Tests assert on what a caller or peer can observe. Private state, queue
+  contents, and which thread ran a step are reached only when no observable
+  outcome distinguishes the correct path, and the test says so.
 - Elapsed time is never a pass/fail condition. A blocked call is proven by
   waiting with no timeout, by a value only the correct path can produce, or
   by a structural failure; hangs are caught by the suite watchdog and the
