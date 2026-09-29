@@ -332,8 +332,6 @@ private:
 };
 #endif  // SENDSPIN_HAS_MDNS
 
-/// Parse an audio format string like "flac:48000:24:2" into an AudioSupportedFormatObject.
-/// Returns true on success.
 // Codecs the -f option accepts in this build
 #ifdef SENDSPIN_ENABLE_OPUS
 static constexpr const char* SUPPORTED_CODECS = "flac, opus, pcm";
@@ -341,6 +339,8 @@ static constexpr const char* SUPPORTED_CODECS = "flac, opus, pcm";
 static constexpr const char* SUPPORTED_CODECS = "flac, pcm";
 #endif
 
+/// Parse an audio format string like "flac:48000:24:2" into an AudioSupportedFormatObject.
+/// Returns true on success.
 static bool parse_audio_format(const std::string& str, sendspin::AudioSupportedFormatObject& fmt) {
     std::istringstream ss(str);
     std::string codec_str, rate_str, bits_str, channels_str;
