@@ -1,0 +1,3 @@
+dependencies:
+  sendspin-cpp:
+    path: ../../..
