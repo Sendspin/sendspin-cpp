@@ -142,6 +142,28 @@ public:
         return this->last_receive_time_us_.load(std::memory_order_relaxed);
     }
 
+    /// @brief Marks this connection as outbound (created by connect_to()) or inbound.
+    /// Set by the connection manager when the connection is created; read by the liveness
+    /// watchdog to decide whether a dropped connection should be reconnected. Main-thread only.
+    void set_outbound(bool outbound) {
+        this->outbound_ = outbound;
+    }
+
+    /// @brief Returns whether this connection was created by connect_to() (outbound).
+    bool is_outbound() const {
+        return this->outbound_;
+    }
+
+    /// @brief Sets the outbound target URL (only meaningful for outbound connections).
+    void set_target_url(std::string url) {
+        this->target_url_ = std::move(url);
+    }
+
+    /// @brief Returns the outbound target URL, or empty for inbound connections.
+    const std::string& get_target_url() const {
+        return this->target_url_;
+    }
+
     /// @brief Sends a text message to the server with a completion callback
     /// @param message The message string to send.
     /// @param cb Callback invoked with the send result. On asynchronous transports it is not
@@ -418,6 +440,16 @@ protected:
     /// Monotonic timestamp (platform_time_us()) of the last complete inbound message. Atomic
     /// because it is written on the network thread and read by the main-loop liveness check.
     std::atomic<int64_t> last_receive_time_us_{0};
+
+    /// True for outbound connections created by connect_to(); false for inbound ones. Set by the
+    /// connection manager at creation, read by the liveness watchdog to decide whether a dropped
+    /// connection should be reconnected. Main-thread only.
+    bool outbound_{false};
+
+    /// Outbound target URL for connections created by connect_to(); empty for inbound ones.
+    /// Read by the liveness watchdog to re-arm the reconnect backoff for the right target.
+    /// Main-thread only.
+    std::string target_url_;
 
     /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP
     /// server worker thread updates it while the hub thread reads it for logging.

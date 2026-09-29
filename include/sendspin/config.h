@@ -91,6 +91,13 @@ struct SendspinClientConfig {
     /// time messages (60000 with the defaults); 0 disables.
     std::optional<int64_t> liveness_timeout_ms{};
 
+    /// @brief Re-establish an outbound connection (`connect_to`) automatically after the liveness
+    /// watchdog drops it as dead, retrying with exponential backoff (1 s doubling up to 30 s)
+    /// until the server answers again. Inbound (discovery) connections are never reconnected:
+    /// their server is expected to reconnect on its own. Disable if the integration drives
+    /// reconnection itself.
+    bool reconnect_on_liveness_loss{true};
+
     /// @brief Memory placement for the per-connection WebSocket payload reassembly buffer
     /// (ESP-IDF only; ignored on host). Defaults to PREFER_EXTERNAL (SPIRAM).
     MemoryLocation websocket_payload_location{MemoryLocation::PREFER_EXTERNAL};

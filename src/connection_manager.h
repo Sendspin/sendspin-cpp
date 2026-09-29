@@ -59,6 +59,21 @@ static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ES
 /// @brief Consecutive unanswered client/time messages the derived liveness timeout tolerates.
 static constexpr int64_t LIVENESS_TOLERATED_MISSES = 2;
 
+/// @brief Reconnect backoff state for an outbound target whose connection was dropped by the
+/// liveness watchdog
+///
+/// The target URL is the identity key: the entry is armed when a dropped outbound connection
+/// reports that URL, and cleared once a connection to the same URL establishes (promotion), so a
+/// successful reconnect stops the retries. Backoff doubles per attempt and caps at
+/// MAX_RETRY_DELAY_MS.
+struct ReconnectState {
+    std::string url;             ///< The WebSocket URL to reconnect to (identity key)
+    int64_t next_attempt_us{0};  ///< Earliest time (us) to issue the next connect_to
+    static constexpr uint32_t INITIAL_RETRY_DELAY_MS = 1000U;  ///< First retry delay (ms)
+    static constexpr uint32_t MAX_RETRY_DELAY_MS = 30000U;     ///< Backoff ceiling (ms)
+    uint32_t delay_ms{INITIAL_RETRY_DELAY_MS};                 ///< Current backoff delay
+};
+
 /// @brief Returns config.liveness_timeout_ms if set, otherwise a timeout derived from the time
 /// burst settings that outlasts LIVENESS_TOLERATED_MISSES consecutive unanswered time messages by
 /// at least one response timeout.
@@ -377,6 +392,28 @@ private:
     void remove_hello_retry(SendspinConnection* conn);
 
     // ========================================
+    // Outbound reconnect after liveness loss
+    // ========================================
+    /// @brief Arms (or re-arms) the reconnect backoff for an outbound connection's target URL.
+    /// Re-arming an existing entry keeps its accumulated backoff and only refreshes the attempt
+    /// time. Caller must hold conn_ptr_mutex_.
+    /// @param url The WebSocket URL of the dropped connection's target.
+    void arm_reconnect(const std::string& url);
+
+    /// @brief Clears the reconnect state for a URL once a connection to it has been promoted, so
+    /// a successful reconnect stops the retries. Caller must hold conn_ptr_mutex_.
+    /// @param url The WebSocket URL of the promoted outbound connection.
+    void on_target_admitted(const std::string& url);
+
+    /// @brief Issues connect_to() for every reconnect entry whose backoff timer has elapsed,
+    /// growing each entry's delay for the next failure. Returns the URLs to connect to; the
+    /// actual connect_to() runs outside conn_ptr_mutex_ (it re-enters the manager).
+    /// Caller must hold conn_ptr_mutex_.
+    /// @param now_us Current platform time.
+    /// @return URLs whose retry timer elapsed this tick.
+    std::vector<std::string> collect_due_reconnects(int64_t now_us);
+
+    // ========================================
     // Connection lifecycle
     // ========================================
     /// @brief Tears down a lost connection (current or nursery). Caller must hold conn_ptr_mutex_.
@@ -431,6 +468,7 @@ private:
     std::vector<DeferredRelease> deferred_releases_;  // Queued releases; see DeferredRelease
     std::vector<NurseryEntry> nursery_;               // Unproven connections awaiting establishment
     std::vector<HelloRetryState> hello_retries_;      // One entry per connection awaiting its hello
+    std::vector<ReconnectState> reconnect_retries_;   // Outbound targets awaiting a reconnect
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
 
@@ -481,6 +519,12 @@ private:
     /// queue_deferred_release()) and after the drain swap in flush_deferred_releases(). Lets
     /// flush_deferred_releases() early-return without locking when nothing is queued.
     std::atomic<size_t> deferred_size_{0};
+
+    /// True whenever reconnect_retries_ is non-empty. Refreshed under conn_ptr_mutex_ at every
+    /// mutation. Lets loop() skip the reconnect scan (and its lock) when no outbound target awaits
+    /// a retry -- including the empty-nursery/no-current steady state after a liveness drop, where
+    /// the other hint atomics all read false and an ungated scan would lock every tick for nothing.
+    std::atomic<bool> reconnect_pending_{false};
 };
 
 }  // namespace sendspin
