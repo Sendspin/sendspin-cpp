@@ -91,6 +91,14 @@ static void touch_record(RecordStore& store, const std::string& psk_id) {
     }
 }
 
+/// The production playback sequence: the same flush, for a connection on the record taking
+/// playback.
+static void play_record(RecordStore& store, const std::string& psk_id) {
+    if (store.note_record_played(psk_id)) {
+        (void) store.persist_records();
+    }
+}
+
 /// The production revocation sequence: ConnectionManager::handle_server_unpair() erases under
 /// its own lock and the flush empties the slot.
 static bool remove_record(RecordStore& store, const std::string& psk_id) {
@@ -375,8 +383,8 @@ TEST(RecordStore, CapacityEvictsRatherThanRefusingANewPairing) {
 }
 
 // The recency order survives a reboot, but a reorder must cost only the record-order blob: it
-// runs on the first activate of every long-term session, so rewriting a record slot for it would
-// be an NVS erase cycle per connection for bookkeeping the record itself does not carry.
+// runs on every playback handoff, so rewriting a record slot for it would be an NVS erase cycle
+// per handoff for bookkeeping the record itself does not carry.
 TEST(RecordStore, RecencyReorderWritesOnlyTheOrderKey) {
     RejectingPersistenceProvider provider;
     provider.reject = false;
@@ -388,31 +396,29 @@ TEST(RecordStore, RecencyReorderWritesOnlyTheOrderKey) {
     ASSERT_TRUE(store.store_record_superseding(std::move(record_a), {}));
     ASSERT_TRUE(store.store_record_superseding(std::move(record_b), {}));
 
-    // Fill the store, then touch the fillers so A and B sit at the front, oldest first.
+    // Fill the store, so A and B sit at the front, oldest first.
     std::vector<std::string> filler_psk_ids;
     for (size_t i = 2; i < RecordStore::MIN_MAX_RECORDS; ++i) {
         auto record = make_client_record("filler-" + std::to_string(i));
         filler_psk_ids.push_back(record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(std::move(record), {}));
     }
-    touch_record(store, psk_a);
-    touch_record(store, psk_b);
-    for (const std::string& filler : filler_psk_ids) {
-        touch_record(store, filler);
-    }
-    const int slot_writes_after_first_touches = provider.slot_writes;
-    const int order_writes_after_first_touches = provider.order_writes;
+    ASSERT_TRUE(store.persist_records());
+    const int slot_writes_after_pairing = provider.slot_writes;
+    const int order_writes_after_pairing = provider.order_writes;
 
-    // Two servers taking turns: each activate moves the other's record off the back. Every
-    // record's `used` flag is already set, so no slot changes and only the order is rewritten.
+    // Two servers taking turns: each handoff moves the other's record off the back.
     for (int i = 0; i < 10; ++i) {
-        touch_record(store, psk_a);
-        touch_record(store, psk_b);
+        play_record(store, psk_a);
+        play_record(store, psk_b);
     }
-    EXPECT_EQ(provider.slot_writes, slot_writes_after_first_touches)
+    EXPECT_EQ(provider.slot_writes, slot_writes_after_pairing)
         << "a reorder alone must not rewrite a record slot";
-    EXPECT_EQ(provider.order_writes - order_writes_after_first_touches, 20)
+    EXPECT_EQ(provider.order_writes - order_writes_after_pairing, 20)
         << "each reorder must write the record-order blob once";
+    play_record(store, psk_b);
+    EXPECT_EQ(provider.order_writes - order_writes_after_pairing, 20)
+        << "playing the most recent record again moves nothing and must write nothing";
 
     // Control: the reorder still happened. A and B were the two oldest records when the
     // alternation began, so without the rotate A would be the victim here; with it, the oldest
@@ -485,10 +491,10 @@ TEST(RecordStore, EvictionAfterARebootFollowsThePersistedUseOrder) {
             ASSERT_TRUE(store.store_record_superseding(std::move(record), {}));
         }
         ASSERT_TRUE(store.persist_records());
-        // Sessions in reverse storage order: the record stored last is now the least recently
+        // Playback in reverse storage order: the record stored last is now the least recently
         // used one, so slot order and use order disagree.
         for (auto it = psk_ids.rbegin(); it != psk_ids.rend(); ++it) {
-            touch_record(store, *it);
+            play_record(store, *it);
         }
     }
 
@@ -592,28 +598,40 @@ TEST(RecordStore, ASupersedeReusesTheSlotItsRetireFreed) {
         << "the superseded PSK must stop resolving";
 }
 
-// note_record_used() reports what THIS call made dirty, not everything the store owes. A caller
-// that flushes only on true (ConnectionManager::flush_pending_record_ops()) would otherwise
-// carry away a pairing's or a revocation's pending slot write on a tick where nothing about the
-// activate changed.
-TEST(RecordStore, AMarkUsedThatChangesNothingReportsNoChangeWhileAWriteIsPending) {
-    InMemoryPersistenceProvider provider;
-    SendspinPairingRecord revoked = make_client_record("server-revoked");
-    SendspinPairingRecord other = make_client_record("server-other");
-    SendspinPairingRecord active = make_client_record("server-active");
-    seed_records(provider, {revoked, other, active});
-    RecordStore store(&provider);
+// note_record_used() and note_record_played() report what THIS call made dirty, not everything
+// the store owes. A caller that flushes only on true (ConnectionManager::flush_pending_record_ops())
+// would otherwise carry away a pairing's or a revocation's pending slot write on a tick where
+// nothing about the activate or the handoff changed.
+TEST(RecordStore, ARecordNoteThatChangesNothingReportsNoChangeWhileAWriteIsPending) {
+    using Note = bool (RecordStore::*)(const std::string&);
+    struct Row {
+        const char* name;
+        Note note;
+    };
+    const Row rows[] = {
+        {"used flag", &RecordStore::note_record_used},
+        {"playback recency", &RecordStore::note_record_played},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InMemoryPersistenceProvider provider;
+        SendspinPairingRecord revoked = make_client_record("server-revoked");
+        SendspinPairingRecord other = make_client_record("server-other");
+        SendspinPairingRecord active = make_client_record("server-active");
+        seed_records(provider, {revoked, other, active});
+        RecordStore store(&provider);
 
-    touch_record(store, active.psk_id);  // already last: flips its used flag and flushes it
-    ASSERT_TRUE(store.note_record_removed(revoked.psk_id));  // durable, not yet flushed
+        // Already the most recent, and its used flag is set and flushed.
+        touch_record(store, active.psk_id);
+        ASSERT_TRUE(store.note_record_removed(revoked.psk_id));  // durable, not yet flushed
 
-    EXPECT_FALSE(store.note_record_used(active.psk_id))
-        << "an activate that moves nothing and flips nothing must not report the pending "
-           "revocation as its own change";
+        EXPECT_FALSE((store.*row.note)(active.psk_id))
+            << "a note that changes nothing must not report the pending revocation as its own "
+               "change";
 
-    // Control: an activate that does change something reports it, pending write or not.
-    EXPECT_TRUE(store.note_record_used(other.psk_id))
-        << "an activate that reorders recency owes a write";
+        // Control: a note that does change something reports it, pending write or not.
+        EXPECT_TRUE((store.*row.note)(other.psk_id));
+    }
 }
 
 // A rejected write reports what it actually costs the next boot. The durability travels on the
@@ -622,9 +640,8 @@ TEST(RecordStore, AMarkUsedThatChangesNothingReportsNoChangeWhileAWriteIsPending
 // long-term session and which would otherwise warn once per connection against a full or
 // read-only store.
 TEST(RecordStore, ARejectedWriteWarnsOnlyWhenTheNextBootCannotRebuildIt) {
-    // Seeded least recently used first. The first two already carry the used flag, so activating
-    // one moves the recency order and nothing else; the third does not, so activating it (it is
-    // already the most recent) flips the flag and nothing else.
+    // Seeded least recently used first. Playing the first moves the recency order and nothing
+    // else; the third has no used flag yet, so activating it flips the flag and nothing else.
     auto seeded = [] {
         SendspinPairingRecord older = make_client_record("server-older");
         SendspinPairingRecord newer = make_client_record("server-newer");
@@ -652,7 +669,7 @@ TEST(RecordStore, ARejectedWriteWarnsOnlyWhenTheNextBootCannotRebuildIt) {
          nullptr, nullptr},
         {"order-only",
          [](RecordStore& store, const std::vector<SendspinPairingRecord>& records) {
-             ASSERT_TRUE(store.note_record_used(records[0].psk_id));
+             ASSERT_TRUE(store.note_record_played(records[0].psk_id));
              EXPECT_FALSE(store.persist_records());
          },
          nullptr, nullptr},
@@ -724,64 +741,95 @@ TEST(RecordStore, ADuplicatePskIdInASecondSlotDoesNotOutliveARevocation) {
     EXPECT_TRUE(rebooted.resolve_by_psk_id(keeper.psk_id, PskCategory::LONG_TERM).has_value());
 }
 
-// The mark-used path writes exactly what changed: the first flip of the durable `used` flag
-// writes that record's slot, a flip that also reorders adds the order key, and a repeat of the
-// activate that is already the most recent writes nothing at all. This runs on the first activate
-// of every long-term session, so an unconditional write here is one per connection.
-TEST(RecordStore, MarkingARecordUsedWritesOnlyWhatChanged) {
+// The mark-used path writes only the flagged record's slot, and only on the first flip: it runs
+// on the first activate of every long-term session, so an unconditional write here is one per
+// connection. It never touches the recency order, which moves on playback.
+TEST(RecordStore, MarkingARecordUsedWritesOnlyItsSlot) {
     InMemoryPersistenceProvider provider;
     SendspinPairingRecord older = make_client_record("server-older");
     SendspinPairingRecord newest = make_client_record("server-newest");
     seed_records(provider, {older, newest});
     RecordStore store(&provider);
 
-    // The most recently used record is already at the back, so only its own slot changes.
     touch_record(store, newest.psk_id);
     EXPECT_EQ(provider.save_attempts(persistence_keys::record_slot_key(1)), 1)
         << "the first flip of the used flag must write that record's slot";
     EXPECT_EQ(provider.save_attempts(persistence_keys::record_slot_key(0)), 0)
         << "the untouched record's slot must not be rewritten";
-    EXPECT_EQ(provider.save_attempts(persistence_keys::RECORD_ORDER), 0)
-        << "an activate that moves nothing must not rewrite the order";
 
     const size_t writes_after_first = record_writes(provider);
     EXPECT_FALSE(store.note_record_used(newest.psk_id))
-        << "a repeat activate of the most recently used record owes no write";
+        << "a repeat activate of a flagged record owes no write";
     touch_record(store, newest.psk_id);
     EXPECT_EQ(record_writes(provider), writes_after_first)
-        << "a repeat activate of the most recently used record must write nothing";
+        << "a repeat activate of a flagged record must write nothing";
 
-    // Control: an activate that does change something writes exactly those keys.
+    // Control: the other record's first flip writes its slot, and still not the order, although
+    // it is not the most recent record.
     touch_record(store, older.psk_id);
     EXPECT_EQ(provider.save_attempts(persistence_keys::record_slot_key(0)), 1)
         << "the other record's first flip must write its slot";
-    EXPECT_EQ(provider.save_attempts(persistence_keys::RECORD_ORDER), 1)
-        << "the reorder it caused must write the order once";
-    EXPECT_EQ(provider.save_attempts(persistence_keys::record_slot_key(1)), 1)
-        << "the record that merely lost its place must not be rewritten";
+    EXPECT_EQ(provider.save_attempts(persistence_keys::RECORD_ORDER), 0)
+        << "flagging a record used must not reorder recency";
 }
 
-// note_record_used() is the recency signal: a record touched by a session must outlive an
-// untouched one stored before it.
-TEST(RecordStore, EvictionFollowsUseRecency) {
-    RecordStore store(nullptr);
-    std::vector<std::string> psk_ids;
-    for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
+// Recency moves on playback, not on activation: a server that only holds an idle connection must
+// not outlive one the device is played from.
+TEST(RecordStore, EvictionFollowsPlaybackRecency) {
+    using Note = bool (RecordStore::*)(const std::string&);
+    struct Row {
+        const char* name;
+        Note note;
+        bool oldest_survives;
+    };
+    const Row rows[] = {
+        {"activated without playback", &RecordStore::note_record_used, false},
+        // Control: the same record, played.
+        {"played", &RecordStore::note_record_played, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordStore store(nullptr);
+        std::vector<std::string> psk_ids;
+        for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
+            auto outcome =
+                store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
+            psk_ids.push_back(outcome.record.psk_id);
+            ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
+        }
+
+        // The oldest record, which without a reorder is the next victim.
+        (void) (store.*row.note)(psk_ids.front());
+
+        auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
+        ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
+
+        EXPECT_EQ(store.record_by_server_id(test_peer_id("server-0")) != nullptr,
+                  row.oldest_survives);
+        EXPECT_EQ(store.record_by_server_id(test_peer_id("server-1")) != nullptr,
+                  !row.oldest_survives)
+            << "exactly one of the two oldest records is evicted";
+    }
+}
+
+// A freshly paired record joins as the most recent, so the next pairing cannot evict it before it
+// has been played.
+TEST(RecordStore, ANewRecordIsNotTheNextVictim) {
+    RecordStore store(nullptr, {.max_pairing_records = RecordStore::MIN_MAX_RECORDS});
+    for (size_t i = 0; i < RecordStore::MIN_MAX_RECORDS; ++i) {
         auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
-        psk_ids.push_back(outcome.record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
+    auto first_new = store.resolve_pairing_outcome(test_peer_id("server-new-1"));
+    ASSERT_TRUE(store.store_record_superseding(first_new.record, {}));
+    auto second_new = store.resolve_pairing_outcome(test_peer_id("server-new-2"));
+    ASSERT_TRUE(store.store_record_superseding(second_new.record, {}));
 
-    // Touch the oldest record, which without this would be the next victim.
-    (void) store.note_record_used(psk_ids.front());
-
-    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
-    ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
-
-    EXPECT_NE(store.record_by_server_id(test_peer_id("server-0")), nullptr)
-        << "a record used since it was stored is no longer the least recently used";
-    EXPECT_EQ(store.record_by_server_id(test_peer_id("server-1")), nullptr)
-        << "the next-oldest untouched record is evicted in its place";
+    EXPECT_NE(store.record_by_server_id(test_peer_id("server-new-1")), nullptr)
+        << "the record paired just before must survive the next pairing";
+    // Control: the pairings evicted the two oldest records instead.
+    EXPECT_EQ(store.record_by_server_id(test_peer_id("server-0")), nullptr);
+    EXPECT_EQ(store.record_by_server_id(test_peer_id("server-1")), nullptr);
 }
 
 // A record backing a currently-open connection must never be evicted, even when it is the
@@ -842,7 +890,7 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
 
     // records_ runs least-recently-used first, so without this the re-pairing server's own
     // record is the eviction victim and an eviction is indistinguishable from the supersede.
-    (void) store.note_record_used(first_psk_id);
+    (void) store.note_record_played(first_psk_id);
 
     auto outcome1 = store.resolve_pairing_outcome(existing_server);
     EXPECT_TRUE(store.store_record_superseding(outcome1.record, {}));
@@ -1068,17 +1116,22 @@ TEST(RecordStore, MarkRecordUsed) {
     EXPECT_TRUE(store.record_by_psk_id(rec.psk_id)->used);
 }
 
-// note_record_used()'s return is the persist trigger, so a true for a psk_id the store does not
-// hold costs a provider write (an NVS erase cycle on ESP) for nothing.
-TEST(RecordStore, MarkRecordUsedOnAbsentPskIdIsNoOp) {
-    RecordStore store(nullptr);
-    SendspinPairingRecord present = make_client_record("server-A");
-    ASSERT_TRUE(store.store_record_superseding(present, {}));
+// A record note's return is the persist trigger, so a true for a psk_id the store does not hold
+// costs a provider write (an NVS erase cycle on ESP) for nothing.
+TEST(RecordStore, ARecordNoteOnAnAbsentPskIdIsNoOp) {
+    using Note = bool (RecordStore::*)(const std::string&);
+    for (Note note : {&RecordStore::note_record_used, &RecordStore::note_record_played}) {
+        RecordStore store(nullptr);
+        SendspinPairingRecord present = make_client_record("server-A");
+        ASSERT_TRUE(store.store_record_superseding(present, {}));
+        ASSERT_TRUE(store.store_record_superseding(make_client_record("server-B"), {}));
 
-    EXPECT_FALSE(store.note_record_used("does-not-exist"))
-        << "an absent psk_id must not ask for a record write";
-    // Control: the first use of a psk_id the store does hold asks for one.
-    EXPECT_TRUE(store.note_record_used(present.psk_id));
+        EXPECT_FALSE((store.*note)("does-not-exist"))
+            << "an absent psk_id must not ask for a record write";
+        // Control: the first note of a psk_id the store does hold, and that is not already the
+        // most recent, asks for one.
+        EXPECT_TRUE((store.*note)(present.psk_id));
+    }
 }
 
 // ============================================================================

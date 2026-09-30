@@ -328,7 +328,7 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
 }
 
 bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_use) {
-    // records_ runs least-recently-used first (see note_record_used), so the first record no open
+    // records_ runs least-recently-used first (see note_record_played), so the first record no open
     // connection is resolving against is the victim pairing.md "Pairing Records" leaves to the
     // implementation. Evicting one that backs an open connection would strand a live session on a
     // PSK this store no longer holds.
@@ -438,8 +438,8 @@ bool RecordStore::persist_records() {
         // Nothing is retried, and RAM stays authoritative for this boot. What a rejection costs
         // depends on what the write carries, so the message does too. An advisory write (the
         // recency order, a flip of the `used` flag) is rebuilt from use by the next boot, and it
-        // happens on the first activate of every long-term session, so against a full or
-        // read-only store it stays quiet.
+        // happens on every playback handoff or first activate of a long-term session, so against
+        // a full or read-only store it stays quiet.
         if (!write.durable) {
             SS_LOGD(TAG,
                     "Provider rejected the \"%s\" write; the next boot rebuilds it from use, and "
@@ -476,34 +476,33 @@ bool RecordStore::note_record_removed(const std::string& psk_id) {
 bool RecordStore::note_record_used(const std::string& psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     const size_t idx = this->find_index(psk_id);
-    if (idx == NPOS) {
+    if (idx == NPOS || this->records_[idx].record.used) {
+        // What THIS call made dirty, not whatever else is owed: a caller that flushes only when
+        // this returns true must not be the one to carry away another path's pending write.
         return false;
     }
+    this->records_[idx].record.used = true;
+    // Advisory: the next boot sets the flag again on the first activate of the record, so a
+    // rejected write of it costs nothing the device cannot rebuild.
+    this->mark_slot_dirty_locked(this->records_[idx].slot, /*durable=*/false);
+    return true;
+}
 
+bool RecordStore::note_record_played(const std::string& psk_id) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    const size_t idx = this->find_index(psk_id);
+    // A record that is already the most recent moves nothing and writes nothing, which is every
+    // repeat activate of the server already playing.
+    if (idx == NPOS || idx == this->records_.size() - 1) {
+        return false;
+    }
     // Keeps records_ least-recently-used first for eviction (see evict_one_locked).
-    bool changed = false;
-    const size_t last = this->records_.size() - 1;
-    if (idx != last) {
-        std::rotate(this->records_.begin() + static_cast<ptrdiff_t>(idx),
-                    this->records_.begin() + static_cast<ptrdiff_t>(idx) + 1, this->records_.end());
-        // Only the order blob: a reorder moves no record between slots, and that blob is one
-        // byte per stored record, so persisting recency costs one small write per session rather
-        // than a rewrite of the records themselves. A re-activate of the record that is already
-        // most recent moves nothing and writes nothing.
-        this->order_dirty_ = true;
-        changed = true;
-    }
-
-    if (!this->records_.back().record.used) {
-        this->records_.back().record.used = true;
-        // Advisory: the next boot sets the flag again on the first activate of the record, so a
-        // rejected write of it costs nothing the device cannot rebuild.
-        this->mark_slot_dirty_locked(this->records_.back().slot, /*durable=*/false);
-        changed = true;
-    }
-    // What THIS call made dirty, not whatever else is owed: a caller that flushes only when this
-    // returns true must not be the one to carry away another path's pending write.
-    return changed;
+    std::rotate(this->records_.begin() + static_cast<ptrdiff_t>(idx),
+                this->records_.begin() + static_cast<ptrdiff_t>(idx) + 1, this->records_.end());
+    // Only the order blob: a reorder moves no record between slots, so persisting recency costs
+    // one small write per playback handoff rather than a rewrite of the records themselves.
+    this->order_dirty_ = true;
+    return true;
 }
 
 // ============================================================================

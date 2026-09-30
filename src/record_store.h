@@ -168,7 +168,8 @@ public:
     ///
     /// A pairing never fails for lack of storage (pairing.md "Pairing Records"): at capacity a
     /// net-new record evicts the least recently used one not in psk_ids_in_use (recency is the
-    /// order of `records_`; see note_record_used).
+    /// order of `records_`; see note_record_played). A net-new record joins as the most recently
+    /// used, so the next pairing cannot evict it before it has been played.
     /// @param record The freshly paired record to store.
     /// @param psk_ids_in_use psk_ids backing a currently-open connection, provisional or
     ///        admitted, none of which may be evicted. The connection budget keeps this list
@@ -180,7 +181,8 @@ public:
 
     /// @brief Save the record slots that changed since the last call, plus the record-order
     /// blob when the eviction order moved. Main loop only: it calls the provider. The deferred
-    /// flush half of store_record_superseding(), note_record_removed() and note_record_used();
+    /// flush half of store_record_superseding(), note_record_removed(), note_record_used() and
+    /// note_record_played();
     /// logs the durability warning itself on a rejected write, so callers may ignore the return
     /// value.
     ///
@@ -211,17 +213,25 @@ public:
     /// @return true when a record was erased, and the store therefore needs persisting.
     [[nodiscard]] bool note_record_removed(const std::string& psk_id);
 
-    /// @brief Flag the record at psk_id as used and make it the most recently used one in RAM,
-    /// leaving the durable half to a later persist_records(). No-op if absent.
+    /// @brief Flag the record at psk_id as used in RAM, leaving the durable half to a later
+    /// persist_records(). No-op if absent or already flagged, so the record's slot is rewritten
+    /// only on the first flip.
+    /// @param psk_id The record to flag.
+    /// @return true when the flag flipped, and the store therefore needs persisting.
+    [[nodiscard]] bool note_record_used(const std::string& psk_id);
+
+    /// @brief Make the record at psk_id the most recently used one in RAM, leaving the durable
+    /// half to a later persist_records(). No-op if absent or already the most recent.
     ///
     /// `records_` is kept least-recently-used first, the order eviction reads (see
-    /// store_record_superseding). A reorder dirties only persistence_keys::RECORD_ORDER, a blob
-    /// of one byte per slot, so recency survives a reboot at the cost of that one small write;
-    /// the record's own slot is rewritten only on the first flip of its `used` flag.
-    /// @param psk_id The record to flag.
-    /// @return true when the recency order moved or the durable `used` flag flipped, and the
-    ///         store therefore needs persisting.
-    [[nodiscard]] bool note_record_used(const std::string& psk_id);
+    /// store_record_superseding). The client calls this when a connection on the record takes
+    /// playback, not on every activate: a server holding an idle connection is present, not
+    /// used, and must not outrank one the device is actually played from. A reorder dirties only
+    /// persistence_keys::RECORD_ORDER, so recency survives a reboot at the cost of that one small
+    /// write.
+    /// @param psk_id The record to move.
+    /// @return true when the order moved, and the store therefore needs persisting.
+    [[nodiscard]] bool note_record_played(const std::string& psk_id);
 
     // ========================================
     // Pairing PSK (the one the client accepts to admit a new server)

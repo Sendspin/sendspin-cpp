@@ -30,8 +30,10 @@ item against the current code before acting on it; line numbers drift as phases 
   on (`pairing.md` "Unpaired Access"). The library never persists it; an application that keeps
   it across reboots restores it by calling the setter before `start()`.
 - Record eviction order is least recently used, which the spec leaves to the implementation.
-  Recency is the order of `RecordStore::records_`, which `note_record_used()` moves a touched
-  record to the back of; no new field or timestamp is stored.
+  Recency is the order of `RecordStore::records_`, which `note_record_played()` moves a record to
+  the back of when the admitted connection on it declares `playback` (the event that also names
+  the last-playback server), not on an idle activate; a new record joins at the back. No new
+  field or timestamp is stored.
 - Long-term records are persisted one per key (`persistence_keys::record_slot_key()`), with the
   recency order in `persistence_keys::RECORD_ORDER`, so a change writes only the slot it touched
   and eviction is correct across a reboot.

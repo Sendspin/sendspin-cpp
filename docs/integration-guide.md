@@ -523,8 +523,8 @@ the server's public key and a flags byte; a Pairing PSK blob is the bare PSK. Ne
 `psk_id`, which decoding derives from the PSK.
 
 Only the keys a change actually touches are written: a pairing writes one slot (and the order),
-a revocation zeroes one slot (and writes the order), and a session that reorders recency writes
-only the order.
+a revocation zeroes one slot (and writes the order), and a playback handoff that reorders
+recency writes only the order.
 
 #### Durability contract
 
@@ -556,8 +556,9 @@ The library's built-in `RecordStore` caps the number of long-term records it wil
 `SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). The cap is also the number of record
 slot keys the store may use, one per record. A pairing at the cap evicts the least recently used
 record that no open connection is resolving against, since a pairing never fails for lack of
-record storage; replacing a record already held for a given `psk_id` or `server_id` evicts
-nothing, because that never grows the store. Recency survives a reboot: it is what
+record storage. A record counts as used when a server takes playback on it, not when it merely
+connects, and a new record starts as the most recently used. Replacing a record already held for
+a given `psk_id` or `server_id` evicts nothing, because that never grows the store. Recency survives a reboot: it is what
 `persistence_keys::RECORD_ORDER` holds. An evicted server's next handshake lands in the Sentinel
 fallback, where it can offer its operator re-pairing. The protocol requires room for at least 5
 records, so a smaller configured cap is raised to that floor, and a cap above 255 is lowered to

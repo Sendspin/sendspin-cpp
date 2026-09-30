@@ -2590,6 +2590,66 @@ TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordKey) {
     client.stop();
 }
 
+// A record's recency moves when the admitted connection on it declares 'playback', the same event
+// that makes a server the last-playback one (connection.md "Multiple servers"), and not on an
+// idle activate: a server that only holds a connection must not outlive one the device is played
+// from. Driven through note_playback_activity(), which process_activate_event() and the promotion
+// scan both call.
+TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
+    struct Row {
+        const char* name;
+        std::vector<SendspinActivity> activities;
+        bool admitted;
+        std::vector<uint8_t> expected_order;
+    };
+    const Row rows[] = {
+        {"idle admitted connection", {}, true, {0, 1}},
+        {"playback on a connection that is not the admitted one", {SendspinActivity::PLAYBACK},
+         false, {0, 1}},
+        // Control: the least recently used record moves behind the other.
+        {"playback on the admitted connection", {SendspinActivity::PLAYBACK}, true, {1, 0}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Identity older_identity = Identity::generate().value();
+        Identity newer_identity = Identity::generate().value();
+        SendspinPairingRecord older = make_record_for(older_identity);
+        SendspinPairingRecord newer = make_record_for(newer_identity);
+
+        TestNetworkProvider network;
+        auto provider = make_record_store_provider({older, newer});
+        InMemoryPersistenceProvider& persistence = *provider;
+        SendspinClientConfig config;
+        config.name = "Playback Recency Test Client";
+        config.server_port = 0;
+
+        SendspinClient client(config);
+        client.set_network_provider(&network);
+        client.set_persistence_provider(&persistence);
+        ASSERT_TRUE(client.start());
+        ConnectionManager& manager = *client.connection_manager_;
+
+        auto conn = std::make_shared<HoldTestConnection>();
+        conn->set_noise_handshake_result(older.server_id, PskCategory::LONG_TERM, older.psk_id);
+        conn->apply_server_activate(row.activities, std::nullopt, std::nullopt, std::nullopt);
+        {
+            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+            if (row.admitted) {
+                manager.current_connection_ = conn;
+            }
+            manager.note_playback_activity(conn.get());
+        }
+        manager.flush_pending_record_ops();
+
+        EXPECT_EQ(stored_record_order(persistence), row.expected_order);
+        {
+            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+            manager.current_connection_.reset();
+        }
+        client.stop();
+    }
+}
+
 // A store that cannot take the writes does not undo the RAM decisions the locked handlers already
 // made: the revoked credential stays revoked for this boot (leaving it usable because flash is
 // full is strictly worse).

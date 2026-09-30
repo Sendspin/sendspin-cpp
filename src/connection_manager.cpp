@@ -829,11 +829,8 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                                       event.pairing_format);
     const bool roles_changed = roles_before != event.conn->get_active_roles();
 
-    // First activate on a long-term PSK: mark the record used, which is what keeps the store's
-    // least-recently-used order meaningful. Staged rather than applied here: the durable half is
-    // a provider write (see PendingRecordOp), and nothing between here and the flush reads the
-    // store's order. Eviction is the only reader of it, and it cannot take this record anyway
-    // while the connection that just activated is open (store_record_superseding()).
+    // First activate on a long-term PSK: flag the record used. Staged rather than applied here:
+    // the durable half is a provider write (see PendingRecordOp).
     //
     // Read the psk_id once into a local. is_first is true again after every in-band
     // re-handshake (see the comment below), and a server may start the next
@@ -1621,6 +1618,9 @@ void ConnectionManager::flush_pending_record_ops() {
             case PendingRecordOp::Kind::MARK_USED:
                 records_dirty |= this->client_->record_store_->note_record_used(op.value);
                 break;
+            case PendingRecordOp::Kind::MARK_PLAYED:
+                records_dirty |= this->client_->record_store_->note_record_played(op.value);
+                break;
             case PendingRecordOp::Kind::PERSIST_RECORDS:
                 records_dirty = true;
                 break;
@@ -1859,6 +1859,18 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     // staged.
     if (this->client_->note_last_played_server(server_id)) {
         this->stage_record_op(PendingRecordOp::Kind::LAST_PLAYED, server_id);
+    }
+    // The same event is the record store's recency signal: eviction spares the servers the
+    // device is played from, not the ones merely connected. Staged whole: nothing before the
+    // flush reads the store's
+    // order, since eviction is its only reader and cannot take the record of an open connection
+    // (store_record_superseding()). The psk_id is read once, for the reason the MARK_USED site in
+    // process_activate_event() gives.
+    if (conn->get_psk_category() == PskCategory::LONG_TERM) {
+        const std::string psk_id = conn->get_psk_id();
+        if (!psk_id.empty()) {
+            this->stage_record_op(PendingRecordOp::Kind::MARK_PLAYED, psk_id);
+        }
     }
     SS_LOGD(TAG, "note_playback_activity: last_played_server_id updated to %s", server_id.c_str());
 }
