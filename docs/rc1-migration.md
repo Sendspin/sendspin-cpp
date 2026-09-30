@@ -10,8 +10,8 @@ item against the current code before acting on it; line numbers drift as phases 
 
 ## Decisions
 
-- The persisted blob shapes stay as they are. The `static_delay` persistence key is NOT renamed
-  or migrated; only wire names and the public API move to `output_delay`.
+- The `static_delay` persistence key keeps its name; only wire names and the public API move to
+  `output_delay`.
 - `min_buffer_ms` is a fixed `PlayerRoleConfig` value; `required_lead_time_ms` is optional and
   defaults to the pipeline-derived lead. The `send_ahead` field is parsed past but not consumed.
   Measured values are later work.
@@ -353,8 +353,8 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
 - The persistence codec is binary: `encode_pairing_record()` returns a fixed-size byte array (or
   nullopt for a `server_id` that is not a canonical public key), `encode_pairing_psk()` the bare
   PSK, and both decoders take `(data, len)`. `label` is gone from `SendspinPairingRecord` and
-  `SendspinPairingPsk`; the library never set it. `SendspinPairingRecord::used` is gone too. A freed record slot is written as zeros, not as
-  an empty blob. Blobs in the earlier JSON and text formats read as absent.
+  `SendspinPairingPsk`; the library never set it. `SendspinPairingRecord::used` is gone too. A
+  freed record slot is written as zeros, not as an empty blob.
 - `SendspinClientConfig::pairing_psk` (`std::optional<SendspinPsk>`) supplies a
   factory-provisioned Pairing PSK. `SendspinPsk` is a new public type holding 32 bytes that it
   wipes on destruction. A configured PSK outranks a stored `PAIRING_PSK` blob and is never

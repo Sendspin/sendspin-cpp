@@ -88,7 +88,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider, const SendspinCl
 
 void RecordStore::load_records_from_provider() {
     // One record per slot key, so a slot that fails to decode (corrupt bytes, or a record the
-    // codec rejects) costs only that record: the others are separate keys. An absent or empty
+    // codec rejects) costs only that record: the others are separate keys. An absent or zeroed
     // blob is a free slot. Slots at or above the configured cap are not read, so lowering the cap
     // between boots orphans the records above it rather than loading them.
     //
@@ -111,7 +111,7 @@ void RecordStore::load_records_from_provider() {
         if (this->record_by_psk_id(decoded->psk_id) != nullptr) {
             SS_LOGW(TAG, "Clearing \"%s\": psk_id %s is already stored in a lower slot",
                     key.c_str(), decoded->psk_id.c_str());
-            // Owed an empty write, or the duplicate would come back at every boot and outlive a
+            // Owed a zeroed write, or the duplicate would come back at every boot and outlive a
             // revocation of the record it shadows. Constructor: no other thread holds the store.
             this->mark_slot_dirty_locked(static_cast<uint8_t>(slot));
             continue;
@@ -404,7 +404,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
 
     if (this->records_[idx].slot == UNASSIGNED_SLOT) {
         // A supersede takes the slot its own retire just freed, so re-pairing a server costs one
-        // record-sized write rather than a write of the new record plus an empty write of the old
+        // record-sized write rather than a write of the new record plus a zeroed write of the old
         // slot. Anything else takes the lowest free slot, which at capacity is the one the
         // eviction above freed.
         this->records_[idx].slot =

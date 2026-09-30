@@ -555,8 +555,8 @@ The library's built-in `RecordStore` caps the number of long-term records it wil
 `SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). The cap is also the number of record
 slot keys the store may use, one per record. A pairing at the cap evicts the least recently used
 record that no open connection is resolving against, since a pairing never fails for lack of
-record storage. A record counts as used when a server takes playback on it, not when it merely
-connects, and a new record starts as the most recently used. Replacing a record already held for
+record storage. A record counts as recently used when a server takes playback on it, not when
+it merely connects, and a new record starts as the most recently used. Replacing a record already held for
 a given `psk_id` or `server_id` evicts nothing, because that never grows the store. Recency survives a reboot: it is what
 `persistence_keys::RECORD_ORDER` holds. An evicted server's next handshake lands in the Sentinel
 fallback, where it can offer its operator re-pairing. The protocol requires room for at least 5

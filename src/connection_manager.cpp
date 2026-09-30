@@ -1845,11 +1845,10 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     }
     // The same event is the record store's recency signal: eviction spares the servers the
     // device is played from, not the ones merely connected. Staged whole: nothing before the
-    // flush reads the store's
-    // order, since eviction is its only reader and cannot take the record of an open connection
-    // (store_record_superseding()). The psk_id is read once: a server may start an in-band
-    // re-handshake while this runs, and a second read could straddle the network thread's
-    // rewrite of it and disagree with the first.
+    // flush reads the store's order, since eviction is its only reader and cannot take the
+    // record of an open connection (store_record_superseding()). The psk_id is read once: a
+    // server may start an in-band re-handshake while this runs, and a second read could straddle
+    // the network thread's rewrite of it and disagree with the first.
     if (conn->get_psk_category() == PskCategory::LONG_TERM) {
         const std::string psk_id = conn->get_psk_id();
         if (!psk_id.empty()) {

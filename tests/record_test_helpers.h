@@ -26,6 +26,8 @@
 #include "sendspin/config.h"
 #include "sendspin/persistence_codec.h"
 
+#include <gtest/gtest.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -90,11 +92,16 @@ inline std::vector<uint8_t> blob_bytes(const std::array<uint8_t, N>& a) {
     return std::vector<uint8_t>(a.begin(), a.end());
 }
 
-/// A record's storage blob. Empty when its server_id cannot be stored (see test_peer_id()),
-/// which the store loads as a free slot.
+/// A record's storage blob. A record whose server_id cannot be stored (see test_peer_id()) is a
+/// fixture mistake, and would otherwise load as a free slot and pass an absence check.
 inline std::vector<uint8_t> record_blob(const SendspinPairingRecord& record) {
     auto encoded = encode_pairing_record(record);
-    return encoded.has_value() ? blob_bytes(encoded.value()) : std::vector<uint8_t>{};
+    if (!encoded.has_value()) {
+        ADD_FAILURE() << "record " << record.psk_id << " has an unstorable server_id "
+                      << record.server_id;
+        return {};
+    }
+    return blob_bytes(encoded.value());
 }
 
 /// Answers a load_blob() for a store seeded with `records` laid out one per slot in index order,

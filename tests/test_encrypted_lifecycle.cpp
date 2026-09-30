@@ -2294,9 +2294,10 @@ TEST(EncryptedLifecycle, PairFinalizeDoesNotDeadlockAgainstAnAdmission) {
     // The peer whose pairing the server has just acked, with the record its handler commits.
     auto pairing = std::make_shared<HoldTestConnection>();
     SendspinPairingRecord record;
-    record.psk_id = "pair-finalize-deadlock-psk-id";
     record.psk.fill(0x5A);
-    record.server_id = "pair-finalize-deadlock-server";
+    record.psk_id = psk_id_for(record.psk);
+    record.server_id = test_peer_id("pair-finalize-deadlock-server");
+    const std::string paired_psk_id = record.psk_id;
     pairing->set_pending_pairing_record(std::move(record));
 
     std::unique_lock<std::mutex> conn_lock(manager.conn_ptr_mutex_);
@@ -2328,7 +2329,7 @@ TEST(EncryptedLifecycle, PairFinalizeDoesNotDeadlockAgainstAnAdmission) {
     EXPECT_TRUE(admitted->is_admitted());
     // The pairing half ran to completion rather than being skipped: its record is resolvable.
     EXPECT_TRUE(client.record_store_
-                    ->resolve_by_psk_id("pair-finalize-deadlock-psk-id", PskCategory::LONG_TERM)
+                    ->resolve_by_psk_id(paired_psk_id, PskCategory::LONG_TERM)
                     .has_value())
         << "the server/pair-finalize handler never committed its record";
 }
@@ -2708,9 +2709,9 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     ConnectionManager& manager = *client.connection_manager_;
 
     SendspinPairingRecord record;
-    record.psk_id = "unpair-window-psk-id";
     record.psk.fill(0x3C);
-    record.server_id = "unpair-window-server";
+    record.psk_id = psk_id_for(record.psk);
+    record.server_id = test_peer_id("unpair-window-server");
     ASSERT_TRUE(client.record_store_->store_record_superseding(record, {}));
 
     HoldTestConnection conn;

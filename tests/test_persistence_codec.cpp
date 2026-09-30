@@ -123,10 +123,10 @@ TEST(PersistenceCodec, RecordEncodeRequiresACanonicalServerId) {
         std::string server_id;
         bool expect_ok;
     };
+    // The spellings public_key_from_peer_id() refuses are pinned in test_crypto.cpp; one of them
+    // here shows the codec defers to it.
     const Row rows[] = {
-        {"not base64url", "server-abc", false},
         {"nonzero trailing bits", non_canonical_spelling(canonical), false},
-        {"padded", canonical + "=", false},
         // Control: the canonical spelling of the same key.
         {"canonical", canonical, true},
     };
