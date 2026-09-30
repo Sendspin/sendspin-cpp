@@ -132,9 +132,8 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 # none of which has a public surface to use instead. Reached:
 #   - SendspinClient::connection_manager_ and record_store_, the two owners the rest of the file
 #     works through: the store answers whether an unpaired record still resolves for this boot,
-#     which is what "revoked" means, and its record_by_psk_id() reports the last-used flip. (The
-#     persisted half of the same removal is observable through the test's persistence provider
-#     without the flag.)
+#     which is what "revoked" means. (The persisted half of the same removal is observable through
+#     the test's persistence provider.)
 #   - SendspinClient::process_json_message() and admit_connection(), to deliver traffic to a
 #     stand-in connection and admit it on the test thread, which is how the hold/replay tests
 #     place messages on either side of admission.

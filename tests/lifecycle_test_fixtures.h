@@ -91,8 +91,8 @@ public:
 // server_id that the rank-0 arbitration tiebreak keys on.
 //
 // save_blob/erase_blob are left at the base class's rejecting defaults: nothing here is meant to
-// observe writes, and a store that accepted them would let a test's own traffic (the mark-used
-// flush, the keypair save) mutate the seed mid-run. Tests that need to observe or shape a write
+// observe writes, and a store that accepted them would let a test's own traffic (a playback
+// recency flush, the keypair save) mutate the seed mid-run. Tests that need to observe or shape a write
 // bring their own provider.
 class TestPersistenceProvider : public SendspinPersistenceProvider {
 public:

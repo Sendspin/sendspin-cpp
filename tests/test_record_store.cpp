@@ -716,9 +716,9 @@ TEST(RecordStore, EvictionFollowsPlaybackRecency) {
         bool oldest_survives;
     };
     const Row rows[] = {
-        {"not played", false, false},
-        // Control: the same record, played.
         {"played", true, true},
+        // Control: the same record, not played, is the victim.
+        {"not played", false, false},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);

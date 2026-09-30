@@ -109,10 +109,11 @@ inline std::vector<uint8_t> record_blob(const SendspinPairingRecord& record) {
 inline std::optional<std::vector<uint8_t>> seeded_record_blob(
     const std::vector<SendspinPairingRecord>& records, const std::string& key) {
     if (key == persistence_keys::RECORD_ORDER) {
-        std::vector<uint8_t> order;
-        order.reserve(records.size());
+        // Padded like the blob the library writes for the default cap.
+        std::vector<uint8_t> order(
+            std::max(records.size(), SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS), 0xFF);
         for (size_t i = 0; i < records.size(); ++i) {
-            order.push_back(static_cast<uint8_t>(i));
+            order[i] = static_cast<uint8_t>(i);
         }
         return order;
     }

@@ -2411,17 +2411,19 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
 // and no other: on ESP each save is an NVS erase cycle, and flash wear is a budget
 // (docs/conventions.md, "Embedded resource discipline"). The two ops here are the pair a real tick
 // can carry, staged by a playback activate and the unpair drain in the same locked block, and both
-// move the recency order.
+// move the recency order. A third record keeps the played one from being the most recent once the
+// unpair has removed the other, so the playback move is a real one.
 TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteEachTouchedKeyOnce) {
     Identity played_identity = Identity::generate().value();
+    Identity other_identity = Identity::generate().value();
     Identity unpairing_identity = Identity::generate().value();
     SendspinPairingRecord played_record = make_record_for(played_identity);
+    SendspinPairingRecord other_record = make_record_for(other_identity);
     SendspinPairingRecord unpairing_record = make_record_for(unpairing_identity);
 
     TestNetworkProvider network;
-    // Slot 0 holds played_record, slot 1 unpairing_record (seed_records() lays them out in order,
-    // least recently used first).
-    auto provider = make_record_store_provider({played_record, unpairing_record});
+    // Slots 0-2 in order, least recently used first (seed_records() lays them out that way).
+    auto provider = make_record_store_provider({played_record, other_record, unpairing_record});
     InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Coalesced Record Write Test Client";
@@ -2449,19 +2451,20 @@ TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteEachTouchedKeyOnce) {
     manager.flush_pending_record_ops();
     manager.flush_deferred_releases();
 
-    // Slot 1 is zeroed and the order, which both ops moved, is written once.
+    // Slot 2 is zeroed and the order, which both ops moved, is written once.
     EXPECT_EQ(record_writes(persistence) - writes_before, 2u)
         << "the tick's record ops must write each touched key once";
     EXPECT_EQ(persistence.save_attempts(persistence_keys::RECORD_ORDER), 1)
         << "two ops that both move the order must write it once";
-    EXPECT_EQ(persistence.save_attempts(persistence_keys::record_slot_key(1)), 1)
+    EXPECT_EQ(persistence.save_attempts(persistence_keys::record_slot_key(2)), 1)
         << "the unpair must write its own slot once";
     EXPECT_EQ(persistence.save_attempts(persistence_keys::record_slot_key(0)), 0)
         << "a recency move must not rewrite the played record's slot";
     // Control: the writes carry both changes, so this is coalescing rather than a lost write.
-    EXPECT_EQ(persisted_psk_ids(persistence), std::vector<std::string>{played_record.psk_id})
-        << "the written slots must hold exactly the surviving record";
-    EXPECT_EQ(stored_record_order(persistence), std::vector<uint8_t>{0});
+    // Least recently used first, so the played record comes last.
+    EXPECT_EQ(persisted_psk_ids(persistence),
+              (std::vector<std::string>{other_record.psk_id, played_record.psk_id}))
+        << "the next boot must load exactly the surviving records, the played one most recent";
 
     client.stop();
 }
@@ -2653,12 +2656,15 @@ TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
 // full is strictly worse).
 TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     Identity played_identity = Identity::generate().value();
+    Identity other_identity = Identity::generate().value();
     Identity unpairing_identity = Identity::generate().value();
     SendspinPairingRecord played_record = make_record_for(played_identity);
+    SendspinPairingRecord other_record = make_record_for(other_identity);
     SendspinPairingRecord unpairing_record = make_record_for(unpairing_identity);
 
     TestNetworkProvider network;
-    auto provider = make_record_store_provider({played_record, unpairing_record});
+    // A third record keeps the playback move real once the unpair has removed a record.
+    auto provider = make_record_store_provider({played_record, other_record, unpairing_record});
     InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Rejected Coalesced Write Test Client";
@@ -2688,9 +2694,12 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
                      ->resolve_by_psk_id(unpairing_record.psk_id, PskCategory::LONG_TERM)
                      .has_value())
         << "a rejected write must not resurrect the revoked record for this boot";
+    EXPECT_EQ(client.record_store_->records_.back().record.psk_id, played_record.psk_id)
+        << "a rejected write must not undo the recency move for this boot";
     // ...and the provider still holds what it accepted last, which is what a reboot loads.
-    EXPECT_EQ(persisted_psk_ids(persistence).size(), 2u)
+    EXPECT_EQ(persisted_psk_ids(persistence).size(), 3u)
         << "a rejected write must not change what the next boot loads";
+    EXPECT_EQ(stored_record_order(persistence), (std::vector<uint8_t>{0, 1, 2}));
 
     client.stop();
 }
