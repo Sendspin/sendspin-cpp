@@ -15,7 +15,6 @@
 #include "server_connection.h"
 
 #include "platform/logging.h"
-#include "platform/time.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "sendspin/types.h"
@@ -117,23 +116,6 @@ SsErr SendspinServerConnection::send_ws_frame(bool is_binary, const uint8_t* dat
     }
 
     return SsErr::OK;
-}
-
-bool SendspinServerConnection::send_time_message() {
-    if (!this->is_connected()) {
-        return false;
-    }
-
-    char buf[TIME_MESSAGE_BUF_SIZE];
-    const int64_t client_transmitted = platform_time_us();
-    const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
-    if (len == 0) {
-        return false;
-    }
-    this->update_serialize_ema(platform_time_us() - client_transmitted);
-    // Route through send_app_json so the frame is encrypted when Noise is active;
-    // the pointer/length overload encrypts straight from the stack buffer.
-    return this->send_app_json(buf, len, nullptr) == SsErr::OK;
 }
 
 void SendspinServerConnection::trigger_close() {

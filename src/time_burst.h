@@ -56,7 +56,7 @@ struct TimeBurstResult {
  * }
  *
  * // When a SERVER_TIME response arrives:
- * burst.on_time_response(conn, offset, max_error, timestamp);
+ * burst.on_time_response(conn, offset, max_error, timestamp, embedded);
  * @endcode
  */
 class SendspinTimeBurst {
@@ -70,14 +70,16 @@ public:
     /// @return Result indicating whether a message was sent and/or the burst completed.
     TimeBurstResult loop(SendspinConnection* conn);
 
-    /// @brief Called when a SERVER_TIME response arrives
+    /// @brief Called when a SERVER_TIME response arrives; ignored unless it answers the time
+    /// message still pending
     /// @param conn The connection that received the response.
     /// @param offset Computed time offset from the NTP-style exchange.
     /// @param max_error Half the round-trip delay (RTT proxy).
     /// @param timestamp Client timestamp when measurement was taken.
+    /// @param embedded client_transmitted the response echoed (see TimeFrameStamp).
     /// @return true if this completed the burst (Kalman filter was updated).
     bool on_time_response(SendspinConnection* conn, int64_t offset, int64_t max_error,
-                          int64_t timestamp);
+                          int64_t timestamp, int64_t embedded);
 
     // ========================================
     // Lifecycle

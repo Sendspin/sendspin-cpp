@@ -1768,9 +1768,6 @@ public:
         }
         return SsErr::OK;
     }
-    bool send_time_message() override {
-        return true;
-    }
 };
 
 // A started client with a metadata role, and the one entry point the hold tests need: hand a JSON

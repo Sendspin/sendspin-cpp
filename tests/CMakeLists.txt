@@ -27,6 +27,7 @@ add_executable(sendspin_tests
     test_connection_lifecycle.cpp
     test_encrypted_lifecycle.cpp
     test_time_filter.cpp
+    test_time_burst.cpp
     test_protocol.cpp
     test_network_info.cpp
     test_spsc_ring_buffer.cpp

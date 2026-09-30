@@ -78,6 +78,10 @@ struct TimeResponsePayload {
     /// connection cannot ABA-match a later connection reusing its address; 0 never matches a live
     /// connection (ids start at 1).
     uint64_t source_id{0};
+    /// client_transmitted the reply echoed, which identifies the client/time it answers. Compared
+    /// against the connection's frame in flight at drain time, because the main loop may send the
+    /// next client/time after the network thread matched this reply to the previous one.
+    int64_t embedded{0};
 };
 
 /// @brief One entry in the shared event ring

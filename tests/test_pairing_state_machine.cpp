@@ -118,14 +118,6 @@ public:
         return SsErr::OK;
     }
 
-    // Records every call instead of just reporting success, so a test can assert that the
-    // time-burst gate in SendspinClient::loop() (see client.cpp) never reached this connection
-    // at all, not merely that no client/time frame text happens to appear in sent_text_.
-    bool send_time_message() override {
-        this->time_message_send_count_++;
-        return true;
-    }
-
     // Test-only seam: canned handshake hash without a Noise session
 
     /// Report a fixed 32-byte handshake hash while leaving noise_session_ (and therefore
@@ -146,7 +138,6 @@ public:
     std::vector<std::vector<uint8_t>> sent_binary_;
     int disconnect_count_{0};
     int close_transport_now_count_{0};
-    int time_message_send_count_{0};
     std::optional<SendspinGoodbyeReason> last_disconnect_reason_;
 
 private:
@@ -1317,10 +1308,14 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     // defaults to 0, so the inter-burst wait is trivially satisfied), so any tick that reaches
     // time_burst_->loop() sends. The connection still declares 'pairing', which must not stop it:
     // a player keeps its timeline across an attempt and can only do that with a converging filter.
+    //
+    // Without a Noise session the send itself fails, but send_time_message() records the frame in
+    // flight before sending, so a nonzero stamp shows the burst reached the send.
+    ASSERT_EQ(conn->get_time_frame_stamp().embedded, 0);
     for (int i = 0; i < 5; ++i) {
         this->client_->loop();
     }
-    EXPECT_GT(conn->time_message_send_count_, 0)
+    EXPECT_NE(conn->get_time_frame_stamp().embedded, 0)
         << "client/time must keep flowing while activities declare pairing";
 
     // Any change publishes.
@@ -1329,12 +1324,13 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
         << "client/state must keep flowing while activities declare pairing";
 
     // The activate that leaves pairing changes nothing about any of this.
-    const int before_leave = conn->time_message_send_count_;
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
     this->client_->loop();
     ASSERT_FALSE(conn->has_activity(SendspinActivity::PAIRING));
-    EXPECT_GE(conn->time_message_send_count_, before_leave)
-        << "time sync must not stall when the connection leaves pairing either";
+    conn->time_frame_ = TimeFrameStamp{};
+    this->client_->loop();
+    EXPECT_NE(conn->get_time_frame_stamp().embedded, 0)
+        << "client/time must keep flowing when the connection leaves pairing too";
 }
 
 // ============================================================================

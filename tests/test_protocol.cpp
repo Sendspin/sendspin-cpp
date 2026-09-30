@@ -188,19 +188,22 @@ TEST(Protocol, ServerTimeOffsetAndError) {
     int64_t offset = 0;
     int64_t max_error = 0;
     const int64_t client_received = 5000000002000;
-    ASSERT_TRUE(process_server_time_message(root, client_received, &offset, &max_error));
+    // The frame reached the socket 200 us after the time it carries; T1 is the socket time.
+    const TimeFrameStamp stamp{.embedded = 5000000001000, .sent = 5000000001200};
+    ASSERT_TRUE(process_server_time_message(root, client_received, stamp, &offset, &max_error));
 
-    // offset = ((T2-T1) + (T3-T4)) / 2 = ((1500-1000) + (1600-2000)) / 2 = 50
-    EXPECT_EQ(offset, 50);
-    // max_error = ((T4-T1) - (T3-T2)) / 2 = ((2000-1000) - (1600-1500)) / 2 = 450
-    EXPECT_EQ(max_error, 450);
+    // offset = ((T2-T1) + (T3-T4)) / 2 = ((1500-1200) + (1600-2000)) / 2 = -50
+    EXPECT_EQ(offset, -50);
+    // max_error = ((T4-T1) - (T3-T2)) / 2 = ((2000-1200) - (1600-1500)) / 2 = 350
+    EXPECT_EQ(max_error, 350);
 }
 
 // messaging.md "server/time": client_transmitted, server_received and server_transmitted are
 // required integers. A missing or non-integer one rejects the message; each row puts its bad value
-// in a different field so every field's check is exercised. The 64-bit width is pinned by
+// in a different field so every field's check is exercised. A reply echoing a client_transmitted
+// other than the frame in flight is rejected too. The 64-bit width is pinned by
 // ServerTimeOffsetAndError.
-TEST(Protocol, ServerTimeTimestampsMustBeIntegers) {
+TEST(Protocol, ServerTimeAcceptance) {
     struct Row {
         const char* name;
         const char* payload;
@@ -217,6 +220,8 @@ TEST(Protocol, ServerTimeTimestampsMustBeIntegers) {
          false},
         {"missing server_transmitted", R"({"client_transmitted":1000,"server_received":1500})",
          false},
+        {"echo of a frame no longer in flight",
+         R"({"client_transmitted":999,"server_received":1500,"server_transmitted":1600})", false},
     };
 
     for (const Row& row : rows) {
@@ -225,7 +230,8 @@ TEST(Protocol, ServerTimeTimestampsMustBeIntegers) {
         JsonObject root;
         ASSERT_TRUE(parse(std::string(R"({"type":"server/time","payload":)") + row.payload + "}",
                           doc, root));
-        EXPECT_EQ(process_server_time_message(root, 2000, nullptr, nullptr), row.accepted);
+        const TimeFrameStamp stamp{.embedded = 1000, .sent = 1000};
+        EXPECT_EQ(process_server_time_message(root, 2000, stamp, nullptr, nullptr), row.accepted);
     }
 }
 

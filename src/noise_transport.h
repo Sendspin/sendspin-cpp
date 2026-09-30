@@ -53,12 +53,17 @@ namespace sendspin {
 /// @brief Owns the Noise transport session and the wire framing around it.
 ///
 /// A SendspinConnection embeds one NoiseTransport and wires set_frame_sink() to its
-/// send_binary_message(). All post-handshake application traffic flows through send_json() /
+/// send_transport_frame(). All post-handshake application traffic flows through send_json() /
 /// send_binary() outbound and decrypt_in_place() + accept_plaintext() inbound.
 class NoiseTransport {
 public:
-    /// @brief Sink that writes one encrypted frame to the wire as a binary WS frame.
-    using FrameSink = std::function<SsErr(const uint8_t* data, size_t len)>;
+    /// @brief Run by the transport immediately before it writes a frame to the socket
+    using FrameWriteHook = std::function<void()>;
+
+    /// @brief Sink that writes one encrypted frame to the wire as a binary WS frame, running
+    /// `before_write` (if set) immediately before the write.
+    using FrameSink =
+        std::function<SsErr(const uint8_t* data, size_t len, FrameWriteHook before_write)>;
 
     /// @brief One complete (non-fragment, fully reassembled) plaintext transport message.
     /// data == nullptr means "no complete message yet" (mid-reassembly, or a dropped frame),
@@ -103,8 +108,11 @@ public:
     /// @brief Encrypt and send a JSON string as a Noise transport frame.
     /// Encodes as [MSG_TYPE_JSON_BODY | utf8(json)] -> encrypt -> frame sink.
     /// Fragments automatically when the plaintext exceeds MAX_TRANSPORT_PLAINTEXT.
+    /// @param before_write Goes to the frame sink with the message's last frame. A synchronous
+    ///                     transport runs it inside session_mutex_, so it must not block, send,
+    ///                     or take a lock that is held while acquiring session_mutex_.
     /// @return SsErr::OK on success, INVALID_STATE if the transport is not active.
-    SsErr send_json(const char* json, size_t len);
+    SsErr send_json(const char* json, size_t len, FrameWriteHook before_write = nullptr);
 
     /// @brief Convenience overload of send_json(const char*, size_t) for std::string callers.
     SsErr send_json(const std::string& json) {
@@ -158,7 +166,9 @@ private:
     /// @brief Encrypt one frame and emit it via the frame sink. Caller must hold session_mutex_,
     /// which excludes a concurrent re-handshake session swap from racing the encrypt.
     /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + 16 (AEAD tag).
-    SsErr encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity, size_t plaintext_len);
+    /// @param before_write  Passed to the frame sink with this frame.
+    SsErr encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity, size_t plaintext_len,
+                                        FrameWriteHook before_write);
 
     /// @brief Fragment a plaintext > MAX_TRANSPORT_PLAINTEXT into multiple frames and
     /// encrypt+send each one. Implements messaging.md "Fragmentation": every fragment is a
@@ -171,12 +181,14 @@ private:
     /// must reach the wire consecutively, since a peer that sees a non-fragment frame between
     /// them treats it as a messaging.md "Malformed sequences" error (see accept_plaintext()), and
     /// releasing the lock between frames would let a concurrent send interleave one.
-    SsErr fragment_and_send_locked(uint8_t orig_type, const uint8_t* data, size_t data_len);
+    /// @param before_write Passed to the frame sink with the last fragment.
+    SsErr fragment_and_send_locked(uint8_t orig_type, const uint8_t* data, size_t data_len,
+                                   FrameWriteHook before_write);
 
     /// @brief Fills send_buf_ with an optional prefix followed by data, then encrypts and
     /// sends it. Caller must hold session_mutex_ across the whole call, as send_buf_ requires.
     SsErr fill_and_encrypt_locked(const uint8_t* prefix, size_t prefix_len, const uint8_t* data,
-                                  size_t data_len);
+                                  size_t data_len, FrameWriteHook before_write);
 
     /// @brief Grows a PlatformBuffer to at least `needed` bytes (geometric growth, contents
     /// preserved, capacity retained across calls), optionally capped.

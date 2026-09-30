@@ -407,8 +407,8 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
     return true;
 }
 
-bool process_server_time_message(JsonObject root, int64_t timestamp, int64_t* offset,
-                                 int64_t* max_error) {
+bool process_server_time_message(JsonObject root, int64_t timestamp, TimeFrameStamp stamp,
+                                 int64_t* offset, int64_t* max_error) {
     // messaging.md "server/time": all three timestamps are required integers (microsecond clock
     // values, so wider than 32 bits).
     const JsonVariantConst client_transmitted_var = root["payload"]["client_transmitted"];
@@ -420,7 +420,12 @@ bool process_server_time_message(JsonObject root, int64_t timestamp, int64_t* of
         return false;
     }
 
-    const int64_t client_transmitted = client_transmitted_var.as<int64_t>();
+    if (client_transmitted_var.as<int64_t>() != stamp.embedded) {
+        SS_LOGD(TAG, "server/time answers a client/time no longer in flight; discarding");
+        return false;
+    }
+
+    const int64_t client_transmitted = stamp.sent;
     const int64_t server_received = server_received_var.as<int64_t>();
     const int64_t server_transmitted = server_transmitted_var.as<int64_t>();
     const int64_t client_received = timestamp;

@@ -77,8 +77,6 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
     }
 
     // State 3: Ready to send next message in burst.
-    // The transport stamps client_transmitted at the actual send point (e.g., inside the
-    // httpd worker on ESP server), so no post-send replacement is needed.
     bool queued = conn->send_time_message();
 
     if (queued) {
@@ -92,7 +90,15 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
 }
 
 bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, int64_t offset,
-                                         int64_t max_error, int64_t timestamp) {
+                                         int64_t max_error, int64_t timestamp, int64_t embedded) {
+    // Count only a reply to the message still pending. One that arrives after loop() timed its
+    // message out answers no pending message, and one matched to that message on the network thread
+    // can reach this drain after loop() has sent the next. Counting either would advance the burst
+    // for an exchange it already counted as a timeout.
+    if (!conn->is_pending_time_message() || embedded != conn->get_time_frame_stamp().embedded) {
+        return false;
+    }
+
     // Track the best (lowest RTT) measurement in this burst.
     // max_error is half the round-trip delay and must be strictly positive; zero or negative
     // values arise from clock skew or timestamp quantization in the time message and would

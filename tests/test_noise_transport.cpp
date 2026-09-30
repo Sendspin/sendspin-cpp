@@ -29,6 +29,7 @@
 #include "noise_test_helpers.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
+#include "platform/time.h"
 #include "platform/types.h"
 #include "record_store.h"
 #include "record_test_helpers.h"
@@ -107,8 +108,6 @@ public:
         }
         return SsErr::OK;
     }
-
-    bool send_time_message() override { return true; }
 
     // --- Test helpers ---
 
@@ -1738,9 +1737,9 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
 // "Malformed sequences" protocol error and closes the connection (accept_plaintext() sets
 // malformed, and connection.cpp turns that into close_silently()).
 //
-// Sends come from more than one thread in production: on ESP the periodic client/time message
-// is built and encrypted on the httpd worker task (async_send_time_text in
-// esp/server_connection.cpp), while pairing sends encrypt on the main loop.
+// Sends come from more than one thread in production: the main loop sends client/time,
+// client/state and pairing messages while the network thread sends, for example, the
+// re-handshake's msg2 (send_msg2_and_swap()).
 // fragment_and_send_locked() therefore has to hold session_mutex_ across every frame, not
 // re-acquire it per frame; otherwise a small concurrent send lands a complete frame in the gap.
 //
@@ -1814,4 +1813,117 @@ TEST(NoiseTransport, ConcurrentSendsDoNotInterleaveFragments) {
             ++frame_index;
         }
     }
+}
+
+// ============================================================================
+// client/time send stamps
+// ============================================================================
+
+/// TestConnection that holds each transport frame's write hook instead of running it, so a test
+/// can run it later, as a transport that queues its writes does.
+class DeferredWriteConnection : public TestConnection {
+public:
+    SsErr send_transport_frame(const uint8_t* data, size_t len,
+                               NoiseTransport::FrameWriteHook before_write) override {
+        this->sent_binary_.emplace_back(data, data + len);
+        this->hooks_.push_back(std::move(before_write));
+        return SsErr::OK;
+    }
+
+    /// Sends through NoiseTransport::send_json() with a write hook, which send_app_json() does
+    /// not expose.
+    SsErr send_json_with_hook(const std::string& json, NoiseTransport::FrameWriteHook hook) {
+        return this->noise_transport_.send_json(json.data(), json.size(), std::move(hook));
+    }
+
+    std::vector<NoiseTransport::FrameWriteHook> hooks_;
+};
+
+// The hook marks the moment the message goes to the socket, so only the last frame of a
+// fragmented message may carry it.
+TEST(NoiseTransport, SendJsonWriteHookRidesTheLastFrame) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    DeferredWriteConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
+    auto hook = []() {};
+
+    ASSERT_EQ(conn.send_json_with_hook("{}", hook), SsErr::OK);
+    ASSERT_EQ(conn.hooks_.size(), 1U);
+    EXPECT_TRUE(conn.hooks_[0]);
+
+    conn.hooks_.clear();
+    ASSERT_EQ(conn.send_json_with_hook(std::string(maxp, 'A'), hook), SsErr::OK);
+    ASSERT_EQ(conn.hooks_.size(), 2U);
+    EXPECT_FALSE(conn.hooks_[0]);
+    EXPECT_TRUE(conn.hooks_[1]);
+}
+
+// On a transport that writes synchronously, the default send_transport_frame() runs the hook
+// before the write, never after it.
+TEST(NoiseTransport, SendTransportFrameRunsTheHookBeforeTheWrite) {
+    class OrderRecordingConnection : public TestConnection {
+    public:
+        SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
+                                  bool allow_before_hello) override {
+            this->events_.emplace_back("write");
+            return TestConnection::send_binary_message(data, len, std::move(cb),
+                                                       allow_before_hello);
+        }
+        std::vector<std::string> events_;
+    };
+    OrderRecordingConnection conn;
+    const uint8_t frame[] = {0x00};
+
+    ASSERT_EQ(conn.send_transport_frame(frame, sizeof(frame),
+                                        [&conn]() { conn.events_.emplace_back("hook"); }),
+              SsErr::OK);
+    EXPECT_EQ(conn.events_, (std::vector<std::string>{"hook", "write"}));
+}
+
+// A client/time frame carries the time it was formatted; its write hook records when it went to
+// the socket. A hook from an earlier frame must not move the current frame's socket time.
+TEST(NoiseTransport, TimeFrameWriteHookStampsOnlyTheFrameInFlight) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    DeferredWriteConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    auto send_and_wait_past = [&conn]() {
+        EXPECT_TRUE(conn.send_time_message());
+        const TimeFrameStamp stamp = conn.get_time_frame_stamp();
+        // A hook that stamps must land on a later microsecond than the embedded time.
+        while (platform_time_us() <= stamp.embedded) {
+        }
+        return stamp;
+    };
+
+    const TimeFrameStamp first = send_and_wait_past();
+    ASSERT_EQ(conn.sent_binary_.size(), 1U);
+    auto pt = raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
+    ASSERT_GE(pt.size(), 1U);
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, reinterpret_cast<const char*>(pt.data() + 1), pt.size() - 1));
+    EXPECT_EQ(doc["payload"]["client_transmitted"].as<int64_t>(), first.embedded);
+
+    const TimeFrameStamp second = send_and_wait_past();
+    ASSERT_EQ(conn.hooks_.size(), 2U);
+    ASSERT_TRUE(conn.hooks_[0]);
+    ASSERT_TRUE(conn.hooks_[1]);
+
+    conn.hooks_[0]();
+    EXPECT_EQ(conn.get_time_frame_stamp().sent, second.embedded)
+        << "the first frame's hook must not stamp the second frame";
+
+    conn.hooks_[1]();
+    EXPECT_GT(conn.get_time_frame_stamp().sent, second.embedded);
+}
+
+// client/time is sent only over the Noise transport, which every operational connection has.
+TEST(NoiseTransport, TimeMessageNeedsTheNoiseTransport) {
+    DeferredWriteConnection conn;
+    EXPECT_FALSE(conn.send_time_message());
+    EXPECT_TRUE(conn.sent_text_.empty());
+    EXPECT_TRUE(conn.sent_binary_.empty());
 }

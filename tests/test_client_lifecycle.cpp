@@ -846,9 +846,6 @@ public:
     bool is_connected() const override {
         return true;
     }
-    bool send_time_message() override {
-        return true;
-    }
     SsErr send_binary_message(const uint8_t*, size_t, SendCompleteCallback cb, bool) override {
         if (cb) {
             cb(true);

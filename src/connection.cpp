@@ -18,6 +18,7 @@
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "platform/time.h"
+#include "protocol_messages.h"
 #include "sendspin/types.h"
 #include "time_filter.h"
 
@@ -37,14 +38,26 @@ static const char* const TAG = "sendspin.connection";
 // ============================================================================
 
 SendspinConnection::SendspinConnection() {
-    // The transport emits encrypted frames through this connection's binary send path.
-    // allow_before_hello=true: Noise frames are transport-level and precede the app hello.
-    this->noise_transport_.set_frame_sink([this](const uint8_t* data, size_t len) {
-        return this->send_binary_message(data, len, nullptr, /*allow_before_hello=*/true);
-    });
+    this->noise_transport_.set_frame_sink(
+        [this](const uint8_t* data, size_t len, NoiseTransport::FrameWriteHook before_write) {
+            return this->send_transport_frame(data, len, std::move(before_write));
+        });
 }
 
 SendspinConnection::~SendspinConnection() = default;
+
+// ============================================================================
+// Transport frames
+// ============================================================================
+
+SsErr SendspinConnection::send_transport_frame(const uint8_t* data, size_t len,
+                                               NoiseTransport::FrameWriteHook before_write) {
+    if (before_write) {
+        before_write();
+    }
+    // allow_before_hello=true: Noise frames are transport-level and precede the app hello.
+    return this->send_binary_message(data, len, nullptr, /*allow_before_hello=*/true);
+}
 
 // ============================================================================
 // Time filter
@@ -90,6 +103,42 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendComple
     }
     // Pre-handshake cold path: the text-frame API takes a std::string.
     return this->send_text_message(std::string(json, len), std::move(cb), allow_before_hello);
+}
+
+// ============================================================================
+// Time messages
+// ============================================================================
+
+bool SendspinConnection::send_time_message() {
+    if (!this->is_connected()) {
+        return false;
+    }
+
+    char buf[TIME_MESSAGE_BUF_SIZE];
+    const int64_t now = platform_time_us();
+    const size_t len = format_client_time_message(buf, sizeof(buf), now);
+    if (len == 0) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(this->time_frame_mutex_);
+        this->time_frame_ = TimeFrameStamp{.embedded = now, .sent = now};
+    }
+
+    // Capturing only this and a 32-bit tag keeps the closure within std::function's inline
+    // storage, so the send allocates nothing for it.
+    NoiseTransport::FrameWriteHook before_write = [this, tag = static_cast<uint32_t>(now)]() {
+        this->note_time_frame_sent(tag);
+    };
+    return this->noise_transport_.send_json(buf, len, std::move(before_write)) == SsErr::OK;
+}
+
+void SendspinConnection::note_time_frame_sent(uint32_t tag) {
+    const int64_t now = platform_time_us();
+    std::lock_guard<std::mutex> lock(this->time_frame_mutex_);
+    if (static_cast<uint32_t>(this->time_frame_.embedded) == tag) {
+        this->time_frame_.sent = now;
+    }
 }
 
 // ============================================================================

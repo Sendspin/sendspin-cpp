@@ -551,7 +551,7 @@ void SendspinClient::drain_inbox() {
     // --- Time sync events ---
     if (inbox_bits & INBOX_TOPIC_EVENTS) {
         // Drain in small batches to bound the stack cost on the shared main-loop task (the ring
-        // holds up to EVENT_CAPACITY entries of ~40 bytes each). A batch that comes back partial
+        // holds up to EVENT_CAPACITY entries of ~48 bytes each). A batch that comes back partial
         // means the ring is empty, ending the loop; events pushed mid-drain are still delivered
         // this tick as long as full batches keep arriving. Sized as a fraction of the ring so the
         // batch/ring ratio (and the stack cost above) tracks EVENT_CAPACITY automatically.
@@ -582,9 +582,9 @@ void SendspinClient::drain_inbox() {
                         // server's clock and would contaminate this connection's Kalman filter.
                         if (current != nullptr &&
                             current->get_instance_id() == event.time.source_id) {
-                            this->time_burst_->on_time_response(current, event.time.offset,
-                                                                event.time.max_error,
-                                                                event.time.timestamp);
+                            this->time_burst_->on_time_response(
+                                current, event.time.offset, event.time.max_error,
+                                event.time.timestamp, event.time.embedded);
                         }
                         break;
                     }
@@ -1559,11 +1559,12 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
 
             int64_t offset{0};
             int64_t max_error{0};
-            if (process_server_time_message(root, timestamp, &offset, &max_error)) {
+            const TimeFrameStamp stamp = conn->get_time_frame_stamp();
+            if (process_server_time_message(root, timestamp, stamp, &offset, &max_error)) {
                 InboxEvent event{};
                 event.type = InboxEventType::TIME_RESPONSE;
-                event.time =
-                    TimeResponsePayload{offset, max_error, timestamp, conn->get_instance_id()};
+                event.time = TimeResponsePayload{offset, max_error, timestamp,
+                                                 conn->get_instance_id(), stamp.embedded};
                 if (!this->event_state_->inbox.push_event(event)) {
                     SS_LOGW(TAG, "Inbox event ring full; dropping time response measurement");
                 }
