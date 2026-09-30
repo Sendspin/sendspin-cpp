@@ -829,20 +829,6 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                                       event.pairing_format);
     const bool roles_changed = roles_before != event.conn->get_active_roles();
 
-    // First activate on a long-term PSK: flag the record used. Staged rather than applied here:
-    // the durable half is a provider write (see PendingRecordOp).
-    //
-    // Read the psk_id once into a local. is_first is true again after every in-band
-    // re-handshake (see the comment below), and a server may start the next
-    // re-handshake while this activate is still queued, so a second read here could
-    // straddle a network-thread rewrite and disagree with the first.
-    if (is_first && event.conn->get_psk_category() == PskCategory::LONG_TERM) {
-        const std::string psk_id = event.conn->get_psk_id();
-        if (!psk_id.empty()) {
-            this->stage_record_op(PendingRecordOp::Kind::MARK_USED, psk_id);
-        }
-    }
-
     if (event.conn.get() == this->current_connection_.get()) {
         // messaging.md "server/activate": a role this activation took out of active_roles stops
         // its output and drops its state as part of applying the activation, so the teardown runs
@@ -1615,9 +1601,6 @@ void ConnectionManager::flush_pending_record_ops() {
     bool records_dirty = false;
     for (const auto& op : ops) {
         switch (op.kind) {
-            case PendingRecordOp::Kind::MARK_USED:
-                records_dirty |= this->client_->record_store_->note_record_used(op.value);
-                break;
             case PendingRecordOp::Kind::MARK_PLAYED:
                 records_dirty |= this->client_->record_store_->note_record_played(op.value);
                 break;
@@ -1864,8 +1847,9 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     // device is played from, not the ones merely connected. Staged whole: nothing before the
     // flush reads the store's
     // order, since eviction is its only reader and cannot take the record of an open connection
-    // (store_record_superseding()). The psk_id is read once, for the reason the MARK_USED site in
-    // process_activate_event() gives.
+    // (store_record_superseding()). The psk_id is read once: a server may start an in-band
+    // re-handshake while this runs, and a second read could straddle the network thread's
+    // rewrite of it and disagree with the first.
     if (conn->get_psk_category() == PskCategory::LONG_TERM) {
         const std::string psk_id = conn->get_psk_id();
         if (!psk_id.empty()) {

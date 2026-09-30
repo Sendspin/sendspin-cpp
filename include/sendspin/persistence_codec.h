@@ -28,10 +28,9 @@
 /// Both blobs have a fixed size, and neither stores `psk_id`: it is a pure function of the PSK
 /// (connection.md "Pre-Shared Key"), so decoding derives it.
 ///
-/// - Record, `persistence_keys::RECORD_SLOT_SIZE` (65) bytes: the 32-byte PSK, then the 32-byte
-///   X25519 public key the record's `server_id` encodes, then one flags byte. Bit 0 of the flags
-///   is `used`; the other bits are written as zero and ignored on read. A slot holding no record
-///   stores 65 zero bytes, which `decode_pairing_record()` rejects like any unusable record.
+/// - Record, `persistence_keys::RECORD_SLOT_SIZE` (64) bytes: the 32-byte PSK, then the 32-byte
+///   X25519 public key the record's `server_id` encodes. A slot holding no record stores 64 zero
+///   bytes, which `decode_pairing_record()` rejects like any unusable record.
 /// - Pairing PSK, `persistence_keys::PAIRING_PSK_SIZE` (32) bytes: the PSK.
 ///
 /// ## Decode semantics

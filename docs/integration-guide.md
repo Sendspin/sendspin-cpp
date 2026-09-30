@@ -510,7 +510,7 @@ order: a blob is only ever read back by the device that wrote it.
 | Key | Size | Contents |
 |---|---|---|
 | `persistence_keys::KEYPAIR` | `KEYPAIR_SIZE` (32) | The static X25519 private key. |
-| `persistence_keys::record_slot_key(n)` | `RECORD_SLOT_SIZE` (65) | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or 65 zero bytes when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
+| `persistence_keys::record_slot_key(n)` | `RECORD_SLOT_SIZE` (64) | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or 64 zero bytes when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
 | `persistence_keys::RECORD_ORDER` | `max_pairing_records` (12 by default) | The occupied slot numbers, least recently used first, one byte each, then `0xFF` in every remaining position. Decides which record a pairing at capacity evicts. |
 | `persistence_keys::PAIRING_PSK` | `PAIRING_PSK_SIZE` (32) | The stored `SendspinPairingPsk` as a codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). Never written while `SendspinClientConfig::pairing_psk` is set, which outranks a stored one. |
 | `persistence_keys::LAST_PLAYED` | `LAST_PLAYED_SIZE` (32) | The X25519 public key of the last-playback server, the key its base64url `server_id` encodes. |
@@ -518,8 +518,8 @@ order: a blob is only ever read back by the device that wrote it.
 
 `sendspin/persistence_codec.h` is public so a custom provider (or a test) can inspect or seed
 the record slot / `PAIRING_PSK` content in exactly the format the library itself
-produces -- it is not something a provider hand-rolls its own version of. A record is its PSK,
-the server's public key and a flags byte; a Pairing PSK blob is the bare PSK. Neither stores its
+produces -- it is not something a provider hand-rolls its own version of. A record is its PSK
+and the server's public key; a Pairing PSK blob is the bare PSK. Neither stores its
 `psk_id`, which decoding derives from the PSK.
 
 Only the keys a change actually touches are written: a pairing writes one slot (and the order),
@@ -532,8 +532,7 @@ recency writes only the order.
   a record slot. A `false` return is reported, not retried: the in-memory state
   stays authoritative for the current boot. What the rejection costs decides the level: a write
   that changes which records the next boot holds logs a warning naming the key and what will be lost (or come back) at the next reboot, while a
-  write the next boot rebuilds by itself (the recency order in `RECORD_ORDER`, a record's
-  `used` flag, which flips on the first activate of every long-term session) reports at debug.
+  write the next boot rebuilds by itself (the recency order in `RECORD_ORDER`) reports at debug.
   For a record slot specifically: a rejected
   write of a just-paired record leaves the pairing working for this boot only
   (`on_pairing_succeeded` still fires; the record is gone after a reboot), and a rejected write

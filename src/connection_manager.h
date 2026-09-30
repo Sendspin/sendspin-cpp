@@ -183,17 +183,15 @@ struct DeferredRelease {
 /// with no lock held.
 struct PendingRecordOp {
     enum class Kind : uint8_t {
-        MARK_USED,        ///< RecordStore::note_record_used(psk_id); its durable half joins
+        MARK_PLAYED,      ///< RecordStore::note_record_played(psk_id); its durable half joins
                           ///< the batch's persist_records()
-        MARK_PLAYED,      ///< RecordStore::note_record_played(psk_id); likewise
         PERSIST_RECORDS,  ///< RecordStore::persist_records(); the RAM half ran under the lock
                           ///< (see handle_server_unpair())
         LAST_PLAYED,      ///< SendspinClient::write_last_played_server(server_id); the RAM half
                           ///< ran under the lock (see note_playback_activity())
     };
-    Kind kind{Kind::MARK_USED};
-    std::string value;  ///< psk_id for MARK_USED and MARK_PLAYED, server_id for LAST_PLAYED,
-                        ///< unused otherwise
+    Kind kind{Kind::MARK_PLAYED};
+    std::string value;  ///< psk_id for MARK_PLAYED, server_id for LAST_PLAYED, unused otherwise
 };
 
 /// @brief Disposition for the connection once abort_pairing_attempt() ends a pairing attempt.
@@ -260,7 +258,7 @@ struct ServerPairingMessageEvent {
 /// @brief Deferred server/activate event, processed in ConnectionManager::loop()
 ///
 /// Pushed from SendspinClient::process_json_message() (network thread) so trust enforcement,
-/// RecordStore mutations (note_record_used), and admission arbitration all happen on the main
+/// RecordStore mutations (note_record_played), and admission arbitration all happen on the main
 /// loop, never on the network thread. Carries the parsed payload rather than requiring the main
 /// loop to re-read connection state that a concurrent event could have changed.
 struct ServerActivateEvent {

@@ -203,8 +203,8 @@ public:
     /// A rejected write is reported, not retried: the in-memory state stays authoritative for
     /// this boot and the library logs what will be lost at the next reboot. What a rejection
     /// costs decides the level: a write that changes which records the next boot holds warns;
-    /// one the next boot rebuilds by itself (the recency order in `RECORD_ORDER`, a record's
-    /// `used` flag) reports at debug. The case that matters is a rejected write of the zeroed
+    /// one the next boot rebuilds by itself (the recency order in `RECORD_ORDER`) reports at
+    /// debug. The case that matters is a rejected write of the zeroed
     /// blob that clears a revoked record's slot: the store still holds the old record and hands
     /// it back at the next boot, silently making the revoked PSK valid again (the record is dropped
     /// from RAM either way). A provider that queues writes should return true and surface its own
@@ -249,7 +249,7 @@ inline constexpr size_t KEYPAIR_SIZE = 32;
 /// Prefix of the per-slot record keys; see `record_slot_key()`.
 inline constexpr const char* RECORD_SLOT_PREFIX = "rec_";
 /// Size of a record slot blob: one `SendspinPairingRecord` as the codec encodes it.
-inline constexpr size_t RECORD_SLOT_SIZE = 65;
+inline constexpr size_t RECORD_SLOT_SIZE = 64;
 
 /// Raw bytes: the slot numbers of the occupied record slots, least recently used first, one byte
 /// per slot, then `0xFF` in every remaining position. The blob is exactly

@@ -42,12 +42,11 @@ std::array<uint8_t, 32> make_psk(uint8_t seed) {
     return psk;
 }
 
-SendspinPairingRecord make_record(uint8_t seed, bool used) {
+SendspinPairingRecord make_record(uint8_t seed) {
     SendspinPairingRecord r;
     r.psk = make_psk(seed);
     r.psk_id = psk_id_for(r.psk);
     r.server_id = test_peer_id("server-" + std::to_string(seed));
-    r.used = used;
     return r;
 }
 
@@ -60,56 +59,30 @@ SendspinPairingRecord make_record(uint8_t seed, bool used) {
 // The layout is storage ABI: a provider may size fixed-length storage against it, and a change
 // makes every stored record read as absent.
 TEST(PersistenceCodec, RecordEncodesToTheDocumentedLayout) {
-    for (bool used : {false, true}) {
-        SCOPED_TRACE(used ? "used" : "unused");
-        const SendspinPairingRecord r = make_record(0x10, used);
-        auto blob = encode_pairing_record(r);
-        ASSERT_TRUE(blob.has_value());
-        ASSERT_EQ(blob->size(), persistence_keys::RECORD_SLOT_SIZE);
+    const SendspinPairingRecord r = make_record(0x10);
+    auto blob = encode_pairing_record(r);
+    ASSERT_TRUE(blob.has_value());
+    ASSERT_EQ(blob->size(), 64u);
 
-        const auto server_key = public_key_from_peer_id(r.server_id).value();
-        EXPECT_TRUE(std::equal(r.psk.begin(), r.psk.end(), blob->begin()));
-        EXPECT_TRUE(std::equal(server_key.begin(), server_key.end(), blob->begin() + 32));
-        EXPECT_EQ((*blob)[64], used ? 0x01 : 0x00);
-    }
+    const auto server_key = public_key_from_peer_id(r.server_id).value();
+    EXPECT_TRUE(std::equal(r.psk.begin(), r.psk.end(), blob->begin()));
+    EXPECT_TRUE(std::equal(server_key.begin(), server_key.end(), blob->begin() + 32));
 }
 
 // psk_id is not stored, so decode must derive it: a record that came back without it could never
 // resolve the server's handshake.
 TEST(PersistenceCodec, RecordRoundTripsAndDerivesPskId) {
-    for (bool used : {false, true}) {
-        SCOPED_TRACE(used ? "used" : "unused");
-        const SendspinPairingRecord r = make_record(0x20, used);
-        auto blob = encode_pairing_record(r).value();
-        auto decoded = decode_pairing_record(blob.data(), blob.size());
-        ASSERT_TRUE(decoded.has_value());
-        EXPECT_EQ(decoded->psk, r.psk);
-        EXPECT_EQ(decoded->psk_id, psk_id_for(r.psk));
-        EXPECT_EQ(decoded->server_id, r.server_id);
-        EXPECT_EQ(decoded->used, used);
-    }
-}
-
-// Only bit 0 of the flags byte means anything; the rest are reserved for future flags, so a blob
-// that sets them must still read back the `used` it was written with.
-TEST(PersistenceCodec, RecordDecodeReadsOnlyTheUsedFlagBit) {
-    struct Row {
-        uint8_t flags;
-        bool expect_used;
-    };
-    const Row rows[] = {{0xFE, false}, {0x80, false}, {0xFF, true}, {0x01, true}};
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.flags);
-        auto blob = encode_pairing_record(make_record(0x30, false)).value();
-        blob[64] = row.flags;
-        auto decoded = decode_pairing_record(blob.data(), blob.size());
-        ASSERT_TRUE(decoded.has_value());
-        EXPECT_EQ(decoded->used, row.expect_used);
-    }
+    const SendspinPairingRecord r = make_record(0x20);
+    auto blob = encode_pairing_record(r).value();
+    auto decoded = decode_pairing_record(blob.data(), blob.size());
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->psk, r.psk);
+    EXPECT_EQ(decoded->psk_id, psk_id_for(r.psk));
+    EXPECT_EQ(decoded->server_id, r.server_id);
 }
 
 TEST(PersistenceCodec, RecordDecodeRejectsUnusableBlobs) {
-    const auto good = blob_bytes(encode_pairing_record(make_record(0x40, true)).value());
+    const auto good = blob_bytes(encode_pairing_record(make_record(0x40)).value());
     std::vector<uint8_t> zero_psk = good;
     std::fill(zero_psk.begin(), zero_psk.begin() + 32, uint8_t{0});
 
@@ -159,7 +132,7 @@ TEST(PersistenceCodec, RecordEncodeRequiresACanonicalServerId) {
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        SendspinPairingRecord r = make_record(0x50, false);
+        SendspinPairingRecord r = make_record(0x50);
         r.server_id = row.server_id;
         EXPECT_EQ(encode_pairing_record(r).has_value(), row.expect_ok);
     }

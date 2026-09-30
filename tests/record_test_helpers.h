@@ -214,16 +214,4 @@ inline std::vector<std::string> persisted_psk_ids(
     return ids;
 }
 
-/// Whether the record the next boot loads for psk_id carries the durable used flag. Pass the
-/// store's cap when it is not the default, or the slots above the default go unread.
-inline bool persisted_used(SendspinPersistenceProvider& provider, const std::string& psk_id,
-                           size_t max_records = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS) {
-    for (const auto& record : persisted_records(provider, max_records)) {
-        if (record.psk_id == psk_id) {
-            return record.used;
-        }
-    }
-    return false;
-}
-
 }  // namespace sendspin

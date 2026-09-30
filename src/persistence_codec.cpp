@@ -32,13 +32,10 @@ namespace {
 /// Offsets into a record blob; see the header's "Storage format".
 constexpr size_t RECORD_PSK_OFFSET = 0;
 constexpr size_t RECORD_SERVER_KEY_OFFSET = RECORD_PSK_OFFSET + NOISE_PSK_SIZE;
-constexpr size_t RECORD_FLAGS_OFFSET = RECORD_SERVER_KEY_OFFSET + X25519_KEY_SIZE;
-static_assert(RECORD_FLAGS_OFFSET + 1 == persistence_keys::RECORD_SLOT_SIZE,
+static_assert(RECORD_SERVER_KEY_OFFSET + X25519_KEY_SIZE == persistence_keys::RECORD_SLOT_SIZE,
               "the record layout must fill RECORD_SLOT_SIZE exactly");
 static_assert(persistence_keys::PAIRING_PSK_SIZE == NOISE_PSK_SIZE,
               "the Pairing PSK blob is the bare PSK");
-
-constexpr uint8_t RECORD_FLAG_USED = 0x01;
 
 /// @brief Copies a stored PSK out of a blob, rejecting the all-zero key a freed record slot holds.
 /// @return true when `out` holds a usable PSK.
@@ -63,7 +60,6 @@ std::optional<std::array<uint8_t, persistence_keys::RECORD_SLOT_SIZE>> encode_pa
     std::array<uint8_t, persistence_keys::RECORD_SLOT_SIZE> out{};
     std::memcpy(out.data() + RECORD_PSK_OFFSET, r.psk.data(), r.psk.size());
     std::memcpy(out.data() + RECORD_SERVER_KEY_OFFSET, server_key->data(), server_key->size());
-    out[RECORD_FLAGS_OFFSET] = r.used ? RECORD_FLAG_USED : 0;
     return out;
 }
 
@@ -77,7 +73,6 @@ std::optional<SendspinPairingRecord> decode_pairing_record(const uint8_t* data, 
     }
     rec.psk_id = psk_id_for(rec.psk);
     rec.server_id = b64url_encode(data + RECORD_SERVER_KEY_OFFSET, X25519_KEY_SIZE);
-    rec.used = (data[RECORD_FLAGS_OFFSET] & RECORD_FLAG_USED) != 0;
     return rec;
 }
 

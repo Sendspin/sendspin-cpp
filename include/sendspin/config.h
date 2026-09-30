@@ -57,7 +57,6 @@ struct SendspinPairingRecord {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};
     std::string server_id;
-    bool used{false};
 
     SendspinPairingRecord() = default;
     SendspinPairingRecord(const SendspinPairingRecord&) = default;

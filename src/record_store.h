@@ -181,8 +181,7 @@ public:
 
     /// @brief Save the record slots that changed since the last call, plus the record-order
     /// blob when the eviction order moved. Main loop only: it calls the provider. The deferred
-    /// flush half of store_record_superseding(), note_record_removed(), note_record_used() and
-    /// note_record_played();
+    /// flush half of store_record_superseding(), note_record_removed() and note_record_played();
     /// logs the durability warning itself on a rejected write, so callers may ignore the return
     /// value.
     ///
@@ -190,10 +189,9 @@ public:
     /// it holds at this call. A rejected write is not retried, so the slot leaves the dirty set
     /// either way and RAM stays authoritative for the boot.
     ///
-    /// A rejection is reported per write rather than per batch, and by what the write carries
-    /// rather than by its key: a write that decides which records the next boot holds warns;
-    /// one the next boot rebuilds from use (the recency order, the `used` flag) reports at
-    /// debug. The same slot key carries both kinds, so the durability travels on the write.
+    /// A rejection is reported per write rather than per batch: a record slot write decides which
+    /// records the next boot holds and warns; the recency order, which the next boot rebuilds
+    /// from use, reports at debug.
     /// @return true when every owed write was accepted (or when there is nothing to write, or no
     ///         provider); false when any write was rejected.
     bool persist_records();
@@ -212,13 +210,6 @@ public:
     /// @param psk_id The record to erase.
     /// @return true when a record was erased, and the store therefore needs persisting.
     [[nodiscard]] bool note_record_removed(const std::string& psk_id);
-
-    /// @brief Flag the record at psk_id as used in RAM, leaving the durable half to a later
-    /// persist_records(). No-op if absent or already flagged, so the record's slot is rewritten
-    /// only on the first flip.
-    /// @param psk_id The record to flag.
-    /// @return true when the flag flipped, and the store therefore needs persisting.
-    [[nodiscard]] bool note_record_used(const std::string& psk_id);
 
     /// @brief Make the record at psk_id the most recently used one in RAM, leaving the durable
     /// half to a later persist_records(). No-op if absent or already the most recent.
@@ -298,18 +289,10 @@ private:
     struct SlotWrite {
         std::string key;
         std::vector<uint8_t> blob;
-        /// Whether losing this write costs the next boot a record it must otherwise hold or drop.
-        /// Set from the change that dirtied the slot, not from the key: the same slot key carries
-        /// a pairing (durable) and a flip of the `used` flag the next boot rebuilds from use
-        /// (advisory). Decides whether a rejection warns or reports at debug.
+        /// Whether losing this write costs the next boot a record it must otherwise hold or drop:
+        /// true for a record slot, false for the recency order the next boot rebuilds from use.
+        /// Decides whether a rejection warns or reports at debug.
         bool durable{false};
-    };
-
-    /// @brief A slot owing a write, with the durability of the change that dirtied it. Two
-    /// mutations of one slot between flushes coalesce into one write, durable if either was.
-    struct DirtySlot {
-        uint8_t slot;
-        bool durable;
     };
 
     // ========================================
@@ -347,9 +330,7 @@ private:
     /// @brief Note that a slot's blob no longer matches records_, so the next persist_records()
     /// writes it. Idempotent within a batch. Call with mutex_ held.
     /// @param slot The slot to write.
-    /// @param durable Whether the change costs a record at the next boot if the write is
-    ///        rejected; see SlotWrite::durable. ORed in when the slot is already dirty.
-    void mark_slot_dirty_locked(uint8_t slot, bool durable);
+    void mark_slot_dirty_locked(uint8_t slot);
 
     /// @brief Body of resolve_by_psk_id(); call with mutex_ held.
     [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id_locked(const std::string& psk_id,
@@ -397,7 +378,7 @@ private:
     std::vector<StoredRecord> records_;
 
     /// Slots whose stored blob no longer matches records_, awaiting the next persist_records().
-    std::vector<DirtySlot> dirty_slots_;
+    std::vector<uint8_t> dirty_slots_;
 
     // Pointer fields
     SendspinPersistenceProvider* provider_{nullptr};
