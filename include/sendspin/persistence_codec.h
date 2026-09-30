@@ -17,37 +17,29 @@
 ///
 /// `SendspinPersistenceProvider` (sendspin/client.h) is a plain blob store. The library is the
 /// only caller of this codec: for the record slot keys (`persistence_keys::record_slot_key()`)
-/// and `PAIRING_PSK` it turns `SendspinPairingRecord` / `SendspinPairingPsk` into the JSON blob a
-/// provider stores, and back. A provider must not parse these blobs itself. It is public so a
+/// and `PAIRING_PSK` it turns `SendspinPairingRecord` / `SendspinPairingPsk` into the binary blob
+/// a provider stores, and back. A provider must not parse these blobs itself. It is public so a
 /// custom provider or a test can inspect or seed that content in the same format.
 ///
 /// This is a storage codec, independent of the Sendspin protocol wire format.
 ///
-/// ## Wire format
+/// ## Storage format
 ///
-/// Every encoded blob is a JSON object stamped with a "v" (version) field:
+/// Both blobs have a fixed size, and neither stores `psk_id`: it is a pure function of the PSK
+/// (connection.md "Pre-Shared Key"), so decoding derives it.
 ///
-/// - Record: `{"v":1,"psk_id":"...","psk":"<base64url>","server_id":"...","label":"...",
-///   "used":bool}`, with "label" omitted when absent.
-/// - Pairing PSK: `{"v":1,"psk_id":"...","psk":"<base64url>","label":"..."}`, with "label"
-///   omitted when absent.
-///
-/// `psk` is base64url (RFC 4648 section 5, no `=` padding) and always decodes to exactly 32
-/// bytes.
+/// - Record, `persistence_keys::RECORD_SLOT_SIZE` (65) bytes: the 32-byte PSK, then the 32-byte
+///   X25519 public key the record's `server_id` encodes, then one flags byte. Bit 0 of the flags
+///   is `used`; the other bits are written as zero and ignored on read. A slot holding no record
+///   stores 65 zero bytes, which `decode_pairing_record()` rejects like any unusable record.
+/// - Pairing PSK, `persistence_keys::PAIRING_PSK_SIZE` (32) bytes: the PSK.
 ///
 /// ## Decode semantics
 ///
-/// - A missing "v" is treated as version 1 (every blob written before "v" existed still
-///   decodes). A "v" greater than `RECORD_CODEC_VERSION` still decodes on a best-effort basis
-///   rather than being rejected.
-/// - Unknown/extra fields are ignored everywhere. Missing optional fields take the struct's
-///   default value.
-/// - `decode_pairing_record()` / `decode_pairing_psk()` return `std::nullopt` when: the JSON
-///   fails to parse, "psk_id" is missing or empty, "psk" is missing, or "psk" does not
-///   base64url-decode to exactly 32 bytes. A record additionally needs a non-empty "server_id",
-///   without which the PSK could never pass the post-match server check.
-/// - `base64url_decode()` follows RFC 4648 section 5: encode never pads, decode tolerates
-///   padding, and any character outside the base64url alphabet makes it return `std::nullopt`.
+/// `decode_pairing_record()` / `decode_pairing_psk()` return `std::nullopt` for a blob of the
+/// wrong size or an all-zero PSK. `base64url_decode()` follows RFC 4648 section 5: encode never
+/// pads, decode tolerates padding, and any character outside the base64url alphabet makes it
+/// return `std::nullopt`.
 ///
 /// ## Keyspace
 ///
@@ -56,20 +48,16 @@
 ///
 /// Long-term records are stored one per key, under the slot keys
 /// `persistence_keys::record_slot_key()` names, with `persistence_keys::RECORD_ORDER` holding
-/// their eviction order. A slot's blob is one record (`encode_pairing_record()` /
-/// `decode_pairing_record()`), or empty when the slot is free, so a pairing or a revocation
-/// rewrites one slot instead of every record, and a corrupt slot costs one record instead of the
-/// store. A record the library writes encodes to 185 bytes (three 43-character base64url fields
-/// plus fixed framing): that is the freshly paired `"used":false` form, which is the first blob
-/// every pairing writes and the larger of the two states a record reaches (the flag flipping to
-/// `true` costs one byte less). A label, which the library never sets itself, adds 11 bytes plus
-/// its JSON-escaped length. Slot numbers keep the keys short: `psk_id` (43 characters) would not
-/// fit an NVS key at all.
+/// their eviction order. A pairing or a revocation rewrites one slot instead of every record,
+/// and a corrupt slot costs one record instead of the store. Slot numbers keep the keys short:
+/// `psk_id` (43 characters) would not fit an NVS key at all.
 
 #pragma once
 
+#include "sendspin/client.h"
 #include "sendspin/config.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -79,22 +67,24 @@
 
 namespace sendspin {
 
-/// Storage-format version stamped into encoded blobs; see "Decode semantics" above.
-inline constexpr int RECORD_CODEC_VERSION = 1;
+/// @brief Encodes a pairing record to its storage format.
+/// @return The blob, or std::nullopt when `server_id` is not the base64url encoding of a 32-byte
+///         public key, the only form a record can store it in.
+std::optional<std::array<uint8_t, persistence_keys::RECORD_SLOT_SIZE>> encode_pairing_record(
+    const SendspinPairingRecord& r);
 
-/// @brief Encodes a pairing record to its JSON storage format.
-std::string encode_pairing_record(const SendspinPairingRecord& r);
+/// @brief Decodes a pairing record from its storage format, deriving its `psk_id`.
+/// @return The decoded record, or std::nullopt for a blob of the wrong size or an all-zero PSK.
+std::optional<SendspinPairingRecord> decode_pairing_record(const uint8_t* data, size_t len);
 
-/// @brief Decodes a pairing record from its JSON storage format.
-/// @return The decoded record, or std::nullopt on parse failure or an invalid psk_id/psk.
-std::optional<SendspinPairingRecord> decode_pairing_record(std::string_view bytes);
+/// @brief Encodes the accepted Pairing PSK to its storage format.
+std::array<uint8_t, persistence_keys::PAIRING_PSK_SIZE> encode_pairing_psk(
+    const SendspinPairingPsk& p);
 
-/// @brief Encodes the accepted Pairing PSK to its JSON storage format.
-std::string encode_pairing_psk(const SendspinPairingPsk& p);
-
-/// @brief Decodes the accepted Pairing PSK from its JSON storage format.
-/// @return The decoded Pairing PSK, or std::nullopt on parse failure or an invalid psk_id/psk.
-std::optional<SendspinPairingPsk> decode_pairing_psk(std::string_view bytes);
+/// @brief Decodes the accepted Pairing PSK from its storage format, deriving its `psk_id`.
+/// @return The decoded Pairing PSK, or std::nullopt for a blob of the wrong size or an all-zero
+///         PSK.
+std::optional<SendspinPairingPsk> decode_pairing_psk(const uint8_t* data, size_t len);
 
 /// @brief Encodes bytes to base64url, no `=` padding (RFC 4648 section 5).
 /// @return ASCII string using only `A-Z a-z 0-9 - _`.

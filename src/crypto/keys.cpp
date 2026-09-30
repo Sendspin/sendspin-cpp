@@ -18,6 +18,7 @@
 #include "platform/base64.h"
 #include "platform/crypto.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -65,6 +66,28 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
         abort();
     }
     return result.value();
+}
+
+// ============================================================================
+// Peer ids
+// ============================================================================
+
+std::optional<std::array<uint8_t, X25519_KEY_SIZE>> public_key_from_peer_id(
+    const std::string& peer_id) {
+    if (peer_id.size() != PEER_ID_SIZE) {
+        return std::nullopt;
+    }
+    auto decoded = b64url_decode(peer_id);
+    if (!decoded.has_value() || decoded->size() != X25519_KEY_SIZE) {
+        return std::nullopt;
+    }
+    // The last character carries 2 unused bits; a nonzero pair decodes to the same key.
+    if (b64url_encode(decoded->data(), decoded->size()) != peer_id) {
+        return std::nullopt;
+    }
+    std::array<uint8_t, X25519_KEY_SIZE> key{};
+    std::copy(decoded->begin(), decoded->end(), key.begin());
+    return key;
 }
 
 // ============================================================================

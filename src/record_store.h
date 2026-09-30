@@ -216,8 +216,8 @@ public:
     ///
     /// `records_` is kept least-recently-used first, the order eviction reads (see
     /// store_record_superseding). A reorder dirties only persistence_keys::RECORD_ORDER, a blob
-    /// of one byte per stored record, so recency survives a reboot at the cost of that one small
-    /// write; the record's own slot is rewritten only on the first flip of its `used` flag.
+    /// of one byte per slot, so recency survives a reboot at the cost of that one small write;
+    /// the record's own slot is rewritten only on the first flip of its `used` flag.
     /// @param psk_id The record to flag.
     /// @return true when the recency order moved or the durable `used` flag flipped, and the
     ///         store therefore needs persisting.
@@ -258,17 +258,16 @@ public:
     ///
     /// Minting cannot fail on a full store: store_record_superseding() supersedes a re-pair's
     /// existing record and evicts for a net-new one (pairing.md "Pairing Records").
-    [[nodiscard]] PairingOutcome resolve_pairing_outcome(
-        const std::string& server_id, const std::optional<std::string>& label = std::nullopt);
+    [[nodiscard]] PairingOutcome resolve_pairing_outcome(const std::string& server_id);
 
 private:
     // ========================================
     // Slotted storage
     // ========================================
 
-    /// @brief Slot number a record not yet assigned one carries, and the value first_free_slot()
-    /// returns when the store is full. Out of range of every real slot because max_records_ is
-    /// capped at MAX_MAX_RECORDS.
+    /// @brief Slot number a record not yet assigned one carries, the value first_free_slot()
+    /// returns when the store is full, and the padding of the RECORD_ORDER blob. Out of range of
+    /// every real slot because max_records_ is capped at MAX_MAX_RECORDS.
     static constexpr uint8_t UNASSIGNED_SLOT = 255;
     static_assert(MAX_MAX_RECORDS - 1 < UNASSIGNED_SLOT,
                   "the highest slot the ceiling allows must stay below the unassigned sentinel, "
@@ -285,10 +284,10 @@ private:
     };
 
     /// @brief One owed provider write: a slot key or persistence_keys::RECORD_ORDER, with the
-    /// bytes to store. An empty blob for a slot key frees that slot.
+    /// bytes to store. An all-zero blob for a slot key frees that slot.
     struct SlotWrite {
         std::string key;
-        std::string blob;
+        std::vector<uint8_t> blob;
         /// Whether losing this write costs the next boot a record it must otherwise hold or drop.
         /// Set from the change that dirtied the slot, not from the key: the same slot key carries
         /// a pairing (durable) and a flip of the `used` flag the next boot rebuilds from use
@@ -313,8 +312,7 @@ private:
     /// @brief Reorder the just-loaded records_ by the provider's RECORD_ORDER blob, if present.
     void load_record_order_from_provider();
 
-    /// @brief Load pairing_psk_ from the provider's PAIRING_PSK blob, if present, correcting its
-    /// psk_id if it disagrees with the loaded secret.
+    /// @brief Load pairing_psk_ from the provider's PAIRING_PSK blob, if present.
     void load_pairing_psk_from_provider();
 
     /// @brief Make the configured Pairing PSK the store's.

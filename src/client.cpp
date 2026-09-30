@@ -21,6 +21,7 @@
 #include "crypto/pairing_token.h"
 #include "inbox.h"
 #include "pairing_offers.h"
+#include "platform/base64.h"
 #include "platform/compiler.h"
 #include "platform/crypto.h"
 #include "platform/json_arena.h"
@@ -1913,9 +1914,9 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
 bool SendspinClient::load_or_generate_identity() {
     if (this->persistence_provider_ != nullptr) {
         auto saved_priv = this->persistence_provider_->load_blob(persistence_keys::KEYPAIR);
-        // No codec involved: the keypair blob is exactly 32 raw bytes, so the only validation
+        // No codec involved: the keypair blob is the raw private key, so the only validation
         // needed here is the exact-length check: anything else is corrupt or the wrong key.
-        if (saved_priv.has_value() && saved_priv->size() == 32) {
+        if (saved_priv.has_value() && saved_priv->size() == persistence_keys::KEYPAIR_SIZE) {
             std::array<uint8_t, 32> priv_bytes{};
             std::copy(saved_priv->begin(), saved_priv->end(), priv_bytes.begin());
             auto loaded = Identity::from_private_bytes(priv_bytes);
@@ -1973,9 +1974,9 @@ void SendspinClient::load_last_played_server() {
         return;
     }
 
-    auto server_id_blob = this->persistence_provider_->load_blob(persistence_keys::LAST_PLAYED);
-    if (server_id_blob.has_value() && !server_id_blob->empty()) {
-        std::string server_id(server_id_blob->begin(), server_id_blob->end());
+    auto key_blob = this->persistence_provider_->load_blob(persistence_keys::LAST_PLAYED);
+    if (key_blob.has_value() && key_blob->size() == persistence_keys::LAST_PLAYED_SIZE) {
+        std::string server_id = b64url_encode(key_blob->data(), key_blob->size());
         this->connection_manager_->set_last_played_server_id(server_id);
         SS_LOGI(TAG, "Loaded last played server: %s", server_id.c_str());
     }
@@ -2005,9 +2006,15 @@ bool SendspinClient::note_last_played_server(const std::string& server_id) {
 
 void SendspinClient::write_last_played_server(const std::string& server_id) {
     if (this->persistence_provider_) {
-        if (this->persistence_provider_->save_blob(
-                persistence_keys::LAST_PLAYED, reinterpret_cast<const uint8_t*>(server_id.data()),
-                server_id.size())) {
+        // The handshake admits only a server_id that is a canonical public key.
+        auto key = public_key_from_peer_id(server_id);
+        if (!key.has_value()) {
+            SS_LOGW(TAG, "Not persisting last played server %s: not a public key",
+                    server_id.c_str());
+            return;
+        }
+        if (this->persistence_provider_->save_blob(persistence_keys::LAST_PLAYED, key->data(),
+                                                   key->size())) {
             SS_LOGD(TAG, "Persisted last played server: %s", server_id.c_str());
         } else {
             SS_LOGW(TAG, "Failed to persist last played server");

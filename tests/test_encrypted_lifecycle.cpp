@@ -145,8 +145,7 @@ public:
 
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
         if (key == persistence_keys::PAIRING_PSK && this->stored_pairing_psk_.has_value()) {
-            std::string encoded = encode_pairing_psk(this->stored_pairing_psk_.value());
-            return std::vector<uint8_t>(encoded.begin(), encoded.end());
+            return blob_bytes(encode_pairing_psk(this->stored_pairing_psk_.value()));
         }
         if (is_record_key(key) && this->seeded_long_term_record_.has_value()) {
             return seeded_record_blob({this->seeded_long_term_record_.value()}, key);
@@ -158,9 +157,8 @@ public:
         if (!is_record_key(key) || key == persistence_keys::RECORD_ORDER) {
             return true;  // Keys other than the record slots are not under test here.
         }
-        // An empty slot write frees that slot and carries no record to capture.
-        auto decoded = decode_pairing_record(std::string_view(
-            reinterpret_cast<const char*>(data), len));
+        // A zeroed slot write frees that slot and carries no record to capture.
+        auto decoded = decode_pairing_record(data, len);
         if (!decoded.has_value()) {
             return true;
         }
@@ -2586,7 +2584,7 @@ TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordKey) {
     // Control: the op was performed rather than dropped.
     auto last_played = persistence.blob(persistence_keys::LAST_PLAYED);
     ASSERT_TRUE(last_played.has_value());
-    EXPECT_EQ(std::string(last_played->begin(), last_played->end()), paired_record.server_id)
+    EXPECT_EQ(*last_played, blob_bytes(paired_identity.public_bytes))
         << "the staged last-played write never reached the provider";
 
     client.stop();

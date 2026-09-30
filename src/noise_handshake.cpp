@@ -165,8 +165,8 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
         return std::nullopt;
     }
 
-    auto server_pub = b64url_decode(server_id);
-    if (!server_pub.has_value() || server_pub->size() != X25519_KEY_SIZE) {
+    auto server_pub = public_key_from_peer_id(server_id);
+    if (!server_pub.has_value()) {
         SS_LOGE(TAG, "%s: invalid server_id (cannot decode public key)", log_prefix);
         return std::nullopt;
     }
@@ -383,8 +383,10 @@ bool NoiseHandshake::handle_server_init(JsonObjectConst root, const std::string&
     }
 
     const char* server_id = root["payload"]["server_id"] | "";
-    if (std::strlen(server_id) != PEER_ID_SIZE) {
-        SS_LOGE(TAG, "handle_server_init: invalid server_id length %zu", std::strlen(server_id));
+    // Checked here rather than left to the handshake: records and the last-playback server store
+    // the key, not the text, so a non-canonical spelling would not match itself after a reboot.
+    if (!public_key_from_peer_id(server_id).has_value()) {
+        SS_LOGE(TAG, "handle_server_init: server_id is not a canonical base64url public key");
         return false;
     }
 

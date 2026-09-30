@@ -24,6 +24,7 @@
 #include "crypto/keys.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
+#include "record_test_helpers.h"
 
 #include <gtest/gtest.h>
 
@@ -322,6 +323,37 @@ TEST(Identity, FromPrivateBytesReproducesPubkeyAndPeerId) {
 TEST(Identity, FromPrivateBytesRejectsWrongSize) {
     std::array<uint8_t, 16> short_key{};
     EXPECT_FALSE(Identity::from_private_bytes(short_key.data(), short_key.size()).has_value());
+}
+
+// A peer id is accepted only in the one spelling Identity::peer_id() produces, since stored
+// records and the last-playback server keep the key and re-encode it.
+TEST(PeerId, PublicKeyFromPeerIdAcceptsOnlyTheCanonicalSpelling) {
+    const Identity id = Identity::generate().value();
+    const std::string canonical = id.peer_id();
+    std::string bad_char = canonical;
+    bad_char[0] = '+';
+
+    struct Row {
+        const char* name;
+        std::string peer_id;
+        bool expect_ok;
+    };
+    const Row rows[] = {
+        {"nonzero trailing bits", non_canonical_spelling(canonical), false},
+        {"padded", canonical + "=", false},
+        {"one character short", canonical.substr(1), false},
+        {"standard-alphabet character", bad_char, false},
+        // Control: the canonical spelling.
+        {"canonical", canonical, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto key = public_key_from_peer_id(row.peer_id);
+        ASSERT_EQ(key.has_value(), row.expect_ok);
+        if (key.has_value()) {
+            EXPECT_EQ(key.value(), id.public_bytes);
+        }
+    }
 }
 
 // The full Noise_KKpsk2 handshake is not exercised here. A noise-c-as-both-sides run tests only

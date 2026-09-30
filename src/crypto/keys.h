@@ -57,6 +57,17 @@ static constexpr size_t X25519_KEY_SIZE = 32;
 /// A 32-byte value encodes to ceil(32*8/6)=43 base64url characters.
 static constexpr size_t PEER_ID_SIZE = 43;
 
+/// @brief Decode a peer_id to the X25519 public key it names.
+///
+/// Accepts only the exact string `Identity::peer_id()` would produce for that key: 43 base64url
+/// characters whose unused trailing bits are zero. Base64url admits other spellings of the same
+/// 32 bytes, and a peer_id is compared as a string wherever it is stored, so a second spelling
+/// would name the same key under a different id.
+/// @param peer_id The base64url `client_id` / `server_id`.
+/// @return The public key, or nullopt when peer_id is not that canonical encoding.
+std::optional<std::array<uint8_t, X25519_KEY_SIZE>> public_key_from_peer_id(
+    const std::string& peer_id);
+
 /// @brief Sendspin static X25519 identity: a long-term keypair.
 ///
 /// See connection.md "Identities".

@@ -25,7 +25,6 @@
 #include <cstddef>
 #include <cstring>
 #include <string>
-#include <string_view>
 #include <utility>
 
 static const char* const TAG = "sendspin.record_store";
@@ -34,22 +33,25 @@ namespace sendspin {
 
 namespace {
 
-/// @brief Shared load -> string_view -> decode -> warn-on-failure -> secure_zero(blob) shape used
-/// by the record-slot and PAIRING_PSK loaders below.
+/// @brief Shared load -> decode -> warn-on-failure -> secure_zero(blob) shape used by the
+/// record-slot and PAIRING_PSK loaders below.
 /// @return The decoded value, or nullopt. The raw blob is wiped on both paths.
 template <typename T>
 std::optional<T> load_decode_wipe(SendspinPersistenceProvider& provider, const char* key,
-                                  std::optional<T> (*decode)(std::string_view),
+                                  std::optional<T> (*decode)(const uint8_t*, size_t),
                                   const char* decode_fail_suffix) {
     auto blob = provider.load_blob(key);
-    // An empty blob is "nothing stored here": it is how a freed record slot is written.
-    if (!blob.has_value() || blob->empty()) {
+    if (!blob.has_value()) {
         return std::nullopt;
     }
-    std::string_view text(reinterpret_cast<const char*>(blob->data()), blob->size());
-    auto decoded = decode(text);
-    if (!decoded.has_value()) {
-        SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; %s", key, decode_fail_suffix);
+    // An all-zero blob is "nothing stored here": it is how a freed record slot is written.
+    const bool all_zero = std::all_of(blob->begin(), blob->end(), [](uint8_t b) { return b == 0; });
+    std::optional<T> decoded;
+    if (!all_zero) {
+        decoded = decode(blob->data(), blob->size());
+        if (!decoded.has_value()) {
+            SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; %s", key, decode_fail_suffix);
+        }
     }
     secure_zero(blob->data(), blob->size());
     return decoded;
@@ -90,9 +92,8 @@ void RecordStore::load_records_from_provider() {
     // blob is a free slot. Slots at or above the configured cap are not read, so lowering the cap
     // between boots orphans the records above it rather than loading them.
     //
-    // load_decode_wipe() logs the warning and wipes the raw blob on both paths; the raw blob is
-    // base64 PSK text (even when it failed to decode), mirroring the save-path wipe in
-    // save_slot_write().
+    // load_decode_wipe() logs the warning and wipes the raw blob on both paths; the raw blob holds
+    // the PSK (even when it failed to decode), mirroring the save-path wipe in save_slot_write().
     for (size_t slot = 0; slot < this->max_records_; ++slot) {
         const std::string key = persistence_keys::record_slot_key(slot);
         auto decoded = load_decode_wipe<SendspinPairingRecord>(
@@ -149,28 +150,16 @@ void RecordStore::load_record_order_from_provider() {
 }
 
 void RecordStore::load_pairing_psk_from_provider() {
-    // Base64 PSK text like the record slots above; load_decode_wipe() wipes it on both paths.
+    // The raw PSK, like the record slots above; load_decode_wipe() wipes it on both paths.
     auto decoded = load_decode_wipe<SendspinPairingPsk>(
         *this->provider_, persistence_keys::PAIRING_PSK, decode_pairing_psk, "ignoring");
     // Treated as absent, like a blob that fails to decode, so a fresh one is generated and
     // persisted over it.
     if (decoded.has_value() && !is_usable_pairing_psk(decoded->psk)) {
-        SS_LOGW(TAG, "Stored Pairing PSK is all zero or the published Sentinel PSK; ignoring it");
+        SS_LOGW(TAG, "Stored Pairing PSK is the published Sentinel PSK; ignoring it");
         decoded.reset();
     }
-    if (decoded.has_value()) {
-        this->pairing_psk_ = std::move(decoded);
-        // psk_id is a pure function of the PSK, and the server derives it the same way to
-        // reference the key in its handshake. A stored id that disagrees with the secret
-        // (hand-provisioned by an application, or corrupted) would never resolve, so
-        // correct it here rather than advertising a method that cannot complete.
-        std::string derived = psk_id_for(this->pairing_psk_->psk);
-        if (this->pairing_psk_->psk_id != derived) {
-            SS_LOGW(TAG, "Stored Pairing PSK id %s does not match the PSK; using %s",
-                    this->pairing_psk_->psk_id.c_str(), derived.c_str());
-            this->pairing_psk_->psk_id = std::move(derived);
-        }
-    }
+    this->pairing_psk_ = std::move(decoded);
 }
 
 bool RecordStore::is_usable_pairing_psk(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
@@ -205,12 +194,11 @@ void RecordStore::provision_pairing_psk_if_needed() {
 
         bool psk_persisted = true;
         if (this->provider_ != nullptr) {
-            std::string encoded = encode_pairing_psk(provisioned);
-            psk_persisted = this->provider_->save_blob(
-                persistence_keys::PAIRING_PSK, reinterpret_cast<const uint8_t*>(encoded.data()),
-                encoded.size());
-            // The encoded blob is base64 PSK text; wipe it now that save_blob() has its own copy
-            // (or has failed), rather than leaving it for the string's destructor to free unwiped.
+            auto encoded = encode_pairing_psk(provisioned);
+            psk_persisted = this->provider_->save_blob(persistence_keys::PAIRING_PSK,
+                                                       encoded.data(), encoded.size());
+            // The encoded blob is the PSK; wipe it now that save_blob() has its own copy (or has
+            // failed).
             secure_zero(encoded.data(), encoded.size());
         }
         if (psk_persisted) {
@@ -522,8 +510,7 @@ bool RecordStore::note_record_used(const std::string& psk_id) {
 // Pairing outcome
 // ============================================================================
 
-RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(
-    const std::string& server_id, const std::optional<std::string>& label) {
+RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(const std::string& server_id) {
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     platform_random_bytes(psk.data(), psk.size());
 
@@ -531,7 +518,6 @@ RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(
     record.psk_id = psk_id_for(psk);
     record.psk = psk;
     record.server_id = server_id;
-    record.label = label;
 
     PairingOutcome outcome;
     outcome.psk = psk;
@@ -571,11 +557,22 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
         SlotWrite write;
         write.key = persistence_keys::record_slot_key(dirty.slot);
         write.durable = dirty.durable;
+        // A slot nothing occupies is written as zeros, which is how the store frees it: an
+        // evicted, revoked or superseded record must not come back at the next boot.
+        write.blob.assign(persistence_keys::RECORD_SLOT_SIZE, 0);
         const StoredRecord* held = this->record_in_slot(dirty.slot);
-        // A slot nothing occupies is written empty, which is how the store frees it: an evicted,
-        // revoked or superseded record must not come back at the next boot.
         if (held != nullptr) {
-            write.blob = encode_pairing_record(held->record);
+            auto encoded = encode_pairing_record(held->record);
+            if (encoded.has_value()) {
+                std::copy(encoded->begin(), encoded->end(), write.blob.begin());
+                secure_zero(encoded->data(), encoded->size());
+            } else {
+                // Unreachable for a paired server: the handshake refuses a server_id that is not
+                // a canonical public key. Freeing the slot keeps whatever it held before from
+                // coming back in its place.
+                SS_LOGE(TAG, "Record %s has an unstorable server_id; it will not survive a reboot",
+                        held->record.psk_id.c_str());
+            }
         }
         writes.push_back(std::move(write));
     }
@@ -587,9 +584,11 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
         // Advisory: recency is rebuilt from use, so the next boot costs at most one eviction of
         // the wrong record.
         order.durable = false;
-        order.blob.reserve(this->records_.size());
-        for (const auto& stored : this->records_) {
-            order.blob.push_back(static_cast<char>(stored.slot));
+        // Fixed at one byte per slot the store may use, whatever it holds now, padded with a
+        // value no slot takes.
+        order.blob.assign(this->max_records_, UNASSIGNED_SLOT);
+        for (size_t i = 0; i < this->records_.size(); ++i) {
+            order.blob[i] = this->records_[i].slot;
         }
         writes.push_back(std::move(order));
         this->order_dirty_ = false;
@@ -600,9 +599,8 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
 bool RecordStore::save_slot_write(SlotWrite& write) {
     // Only reached for a write take_dirty_writes_locked() produced, which it does only when a
     // provider is set.
-    const bool ok = this->provider_->save_blob(
-        write.key, reinterpret_cast<const uint8_t*>(write.blob.data()), write.blob.size());
-    // An encoded record is base64 PSK text; wipe it now that save_blob() has its own copy (or has
+    const bool ok = this->provider_->save_blob(write.key, write.blob.data(), write.blob.size());
+    // An encoded record holds the PSK; wipe it now that save_blob() has its own copy (or has
     // rejected it).
     secure_zero(write.blob.data(), write.blob.size());
     return ok;

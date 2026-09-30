@@ -57,7 +57,6 @@ struct SendspinPairingRecord {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};
     std::string server_id;
-    std::optional<std::string> label;
     bool used{false};
 
     SendspinPairingRecord() = default;
@@ -81,7 +80,6 @@ struct SendspinPairingRecord {
 struct SendspinPairingPsk {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};
-    std::optional<std::string> label;
 
     SendspinPairingPsk() = default;
     SendspinPairingPsk(const SendspinPairingPsk&) = default;
@@ -189,8 +187,8 @@ struct SendspinClientConfig {
     std::vector<std::string> static_pairing_code_locations{};
 
     /// @brief Default maximum number of long-term pairing records the store retains. Each record
-    /// occupies its own persistence key of at most 185 bytes plus a label, so the cap sets how
-    /// many keys the store may use rather than the size of any one of them (see
+    /// occupies its own persistence key of `persistence_keys::RECORD_SLOT_SIZE` bytes, so the cap
+    /// sets how many keys the store may use rather than the size of any one of them (see
     /// persistence_codec.h's keyspace doc). Pairing at the cap evicts the least recently used
     /// record rather than failing; replacing a record already held for a given psk_id or
     /// server_id evicts nothing, since that never grows the store.

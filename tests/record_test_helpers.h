@@ -20,6 +20,7 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "platform/base64.h"
 #include "platform/crypto.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
@@ -31,7 +32,6 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -44,15 +44,31 @@ inline std::array<uint8_t, NOISE_PSK_SIZE> make_random_psk() {
     return psk;
 }
 
-/// Build a stored-pubkey client record bound to server_id.
-inline SendspinPairingRecord make_client_record(const std::string& server_id,
-                                                 const std::optional<std::string>& label = {}) {
+/// A canonical peer id (base64url X25519 public key) standing in for the server `name`: the only
+/// server_id form a record can be stored under. Deterministic, so a test can spell the same
+/// server twice.
+inline std::string test_peer_id(const std::string& name) {
+    auto key = sha256_oneshot(reinterpret_cast<const uint8_t*>(name.data()), name.size());
+    return b64url_encode(key.data(), key.size());
+}
+
+/// `peer_id` spelled with a nonzero unused trailing bit: decodes to the same key, but is not the
+/// canonical encoding `Identity::peer_id()` produces.
+inline std::string non_canonical_spelling(const std::string& peer_id) {
+    static const std::string ALPHABET =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out = peer_id;
+    out.back() = ALPHABET[ALPHABET.find(out.back()) | 1U];
+    return out;
+}
+
+/// Build a stored-pubkey client record bound to the server `test_peer_id(server_name)` names.
+inline SendspinPairingRecord make_client_record(const std::string& server_name) {
     auto psk = make_random_psk();
     SendspinPairingRecord rec;
     rec.psk_id = psk_id_for(psk);
     rec.psk = psk;
-    rec.server_id = server_id;
-    rec.label = label;
+    rec.server_id = test_peer_id(server_name);
     return rec;
 }
 
@@ -66,6 +82,19 @@ inline bool is_record_key(const std::string& key) {
 /// Wraps a string's bytes as a blob for load_blob()/seed_blob()/save_blob() calls.
 inline std::vector<uint8_t> blob_bytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
+}
+
+/// Wraps an encoded blob as a vector for load_blob()/seed_blob()/save_blob() calls.
+template <size_t N>
+inline std::vector<uint8_t> blob_bytes(const std::array<uint8_t, N>& a) {
+    return std::vector<uint8_t>(a.begin(), a.end());
+}
+
+/// A record's storage blob. Empty when its server_id cannot be stored (see test_peer_id()),
+/// which the store loads as a free slot.
+inline std::vector<uint8_t> record_blob(const SendspinPairingRecord& record) {
+    auto encoded = encode_pairing_record(record);
+    return encoded.has_value() ? blob_bytes(encoded.value()) : std::vector<uint8_t>{};
 }
 
 /// Answers a load_blob() for a store seeded with `records` laid out one per slot in index order,
@@ -82,28 +111,29 @@ inline std::optional<std::vector<uint8_t>> seeded_record_blob(
     }
     for (size_t i = 0; i < records.size(); ++i) {
         if (key == persistence_keys::record_slot_key(i)) {
-            return blob_bytes(encode_pairing_record(records[i]));
+            return record_blob(records[i]);
         }
     }
     return std::nullopt;
 }
 
-/// The record stored in a slot, or nullopt when the blob is absent, empty (a free slot), or does
+/// The record stored in a slot, or nullopt when the blob is absent, zeroed (a free slot), or does
 /// not decode.
 inline std::optional<SendspinPairingRecord> stored_record_in_slot(
     SendspinPersistenceProvider& provider, size_t slot) {
     auto blob = provider.load_blob(persistence_keys::record_slot_key(slot));
-    if (!blob.has_value() || blob->empty()) {
+    if (!blob.has_value()) {
         return std::nullopt;
     }
-    return decode_pairing_record(
-        std::string_view(reinterpret_cast<const char*>(blob->data()), blob->size()));
+    return decode_pairing_record(blob->data(), blob->size());
 }
 
-/// The stored record-order blob as slot numbers, least recently used first; empty when absent.
+/// The stored record-order blob as slot numbers, least recently used first, without its padding;
+/// empty when absent.
 inline std::vector<uint8_t> stored_record_order(SendspinPersistenceProvider& provider) {
-    auto blob = provider.load_blob(persistence_keys::RECORD_ORDER);
-    return blob.value_or(std::vector<uint8_t>{});
+    auto blob = provider.load_blob(persistence_keys::RECORD_ORDER).value_or(std::vector<uint8_t>{});
+    blob.erase(std::remove(blob.begin(), blob.end(), uint8_t{0xFF}), blob.end());
+    return blob;
 }
 
 /// Lay `records` out in a blob store one per slot in index order, least recently used first,
@@ -112,7 +142,7 @@ template <typename TProvider>
 void seed_records(TProvider& provider, const std::vector<SendspinPairingRecord>& records) {
     for (size_t i = 0; i < records.size(); ++i) {
         provider.seed_blob(persistence_keys::record_slot_key(i),
-                           blob_bytes(encode_pairing_record(records[i])));
+                           record_blob(records[i]));
     }
     provider.seed_blob(persistence_keys::RECORD_ORDER,
                        seeded_record_blob(records, persistence_keys::RECORD_ORDER).value());

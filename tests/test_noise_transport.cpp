@@ -31,6 +31,7 @@
 #include "platform/crypto.h"
 #include "platform/types.h"
 #include "record_store.h"
+#include "record_test_helpers.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
 
@@ -788,22 +789,28 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
 // the server_id names the key and goes into the prologue, so both are checked before the
 // handshake reads a Noise byte (connection.md "Handshake").
 TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
+    enum class ServerId : uint8_t { REAL, TOO_LONG, NON_CANONICAL };
     struct Row {
         const char* name;
         const char* type;
-        bool long_server_id;  // PEER_ID_SIZE + 2 characters instead of a real peer id
+        ServerId server_id;
         int version;
         HandshakeFrameResult expected;
     };
     const Row rows[] = {
         // The payload is the control's, so only the type field can produce the abort: a frame
         // whose payload would pass must still be refused for arriving under another type.
-        {"another envelope type", "wrong/type", false, 1, HandshakeFrameResult::ABORT},
+        {"another envelope type", "wrong/type", ServerId::REAL, 1, HandshakeFrameResult::ABORT},
         // A peer id is PEER_ID_SIZE characters of base64url; anything else cannot name a key.
-        {"server_id of the wrong length", "server/init", true, 1, HandshakeFrameResult::ABORT},
-        {"unsupported version", "server/init", false, 99, HandshakeFrameResult::ABORT},
+        {"server_id of the wrong length", "server/init", ServerId::TOO_LONG, 1,
+         HandshakeFrameResult::ABORT},
+        // The right key under a second spelling: stored as the key, it would come back as a
+        // different server_id after a reboot.
+        {"non-canonical server_id", "server/init", ServerId::NON_CANONICAL, 1,
+         HandshakeFrameResult::ABORT},
+        {"unsupported version", "server/init", ServerId::REAL, 99, HandshakeFrameResult::ABORT},
         // Control: the driver accepts it and moves on to waiting for Noise message 1.
-        {"well formed", "server/init", false, 1, HandshakeFrameResult::NEED_MORE},
+        {"well formed", "server/init", ServerId::REAL, 1, HandshakeFrameResult::NEED_MORE},
     };
 
     for (const Row& row : rows) {
@@ -815,8 +822,12 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
         NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
         nh.build_client_init();
 
-        const std::string peer_id =
-            row.long_server_id ? std::string(PEER_ID_SIZE + 2, 'A') : server_id.peer_id();
+        std::string peer_id = server_id.peer_id();
+        if (row.server_id == ServerId::TOO_LONG) {
+            peer_id = std::string(PEER_ID_SIZE + 2, 'A');
+        } else if (row.server_id == ServerId::NON_CANONICAL) {
+            peer_id = non_canonical_spelling(peer_id);
+        }
         EXPECT_EQ(nh.on_text_frame(make_server_init(peer_id, row.version, row.type),
                                    [](const std::string&) { return true; }),
                   row.expected);

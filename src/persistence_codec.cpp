@@ -14,151 +14,38 @@
 
 #include "sendspin/persistence_codec.h"
 
+#include "crypto/constants.h"
+#include "crypto/keys.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
-#include "platform/logging.h"
-#include "platform/memory.h"
-#include <ArduinoJson.h>
 
 #include <array>
 #include <cstring>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace sendspin {
 
-static const char* const TAG = "sendspin.persistence_codec";
-
 namespace {
 
-/// @brief psk_id + the decoded 32-byte PSK, shared by SendspinPairingRecord and
-/// SendspinPairingPsk (the two structs that carry a "psk_id"/"psk" pair).
-struct PskIdAndBytes {
-    std::string psk_id;
-    std::array<uint8_t, 32> psk{};
+/// Offsets into a record blob; see the header's "Storage format".
+constexpr size_t RECORD_PSK_OFFSET = 0;
+constexpr size_t RECORD_SERVER_KEY_OFFSET = RECORD_PSK_OFFSET + NOISE_PSK_SIZE;
+constexpr size_t RECORD_FLAGS_OFFSET = RECORD_SERVER_KEY_OFFSET + X25519_KEY_SIZE;
+static_assert(RECORD_FLAGS_OFFSET + 1 == persistence_keys::RECORD_SLOT_SIZE,
+              "the record layout must fill RECORD_SLOT_SIZE exactly");
+static_assert(persistence_keys::PAIRING_PSK_SIZE == NOISE_PSK_SIZE,
+              "the Pairing PSK blob is the bare PSK");
 
-    /// @brief Wipes `psk` on destruction. This is a decode-side scratch copy distinct from the
-    /// SendspinPairingRecord/SendspinPairingPsk it flows into (those wipe themselves
-    /// independently; see config.h), so it needs the same discipline on its own account.
-    ~PskIdAndBytes() {
-        secure_zero(this->psk.data(), this->psk.size());
-    }
-};
+constexpr uint8_t RECORD_FLAG_USED = 0x01;
 
-/// @brief Parses and validates the "psk_id"/"psk" fields common to a record and a Pairing PSK.
-/// @param reason Set to the rejection reason when the parse fails; untouched on success. Every
-///        rejection path below sets it, for the callers that log it.
-/// @return nullopt if psk_id is missing/empty, psk is missing, or psk does not base64url-decode
-///         to exactly 32 bytes.
-std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj, const char** reason) {
-    if (!obj["psk_id"].is<const char*>()) {
-        *reason = "psk_id is missing or not a string";
-        return std::nullopt;
-    }
-    std::string psk_id = obj["psk_id"].as<const char*>();
-    if (psk_id.empty()) {
-        *reason = "psk_id is empty";
-        return std::nullopt;
-    }
-    if (!obj["psk"].is<const char*>()) {
-        *reason = "psk is missing or not a string";
-        return std::nullopt;
-    }
-    // Decode straight from the JSON pool's char*, not a std::string copy of it: that copy would
-    // be base64 PSK text living outside the document's (zeroizing) allocator, with nothing to
-    // wipe it on the way out.
-    auto decoded = b64url_decode(obj["psk"].as<const char*>());
-    if (!decoded.has_value() || decoded->size() != 32) {
-        *reason = "psk does not base64url-decode to 32 bytes";
-        return std::nullopt;
-    }
-    PskIdAndBytes out;
-    out.psk_id = std::move(psk_id);
-    std::memcpy(out.psk.data(), decoded->data(), 32);
-    secure_zero(decoded->data(), decoded->size());
-    return out;
-}
-
-/// @brief Parses a pairing record from a decoded record blob's root object.
-/// @return The record, or nullopt when the object is not a usable one.
-std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, const char** reason) {
-    auto core = parse_psk_id_and_psk(obj, reason);
-    if (!core.has_value()) {
-        return std::nullopt;
-    }
-    SendspinPairingRecord rec;
-    rec.psk_id = std::move(core->psk_id);
-    rec.psk = core->psk;
-    // A record whose PSK is not bound to a server can never satisfy the post-match server_id
-    // check (connection.md "Pre-Shared Key"), so it is not loaded.
-    if (!obj["server_id"].is<const char*>()) {
-        *reason = "server_id is missing or not a string";
-        return std::nullopt;
-    }
-    rec.server_id = obj["server_id"].as<const char*>();
-    if (rec.server_id.empty()) {
-        *reason = "server_id is empty";
-        return std::nullopt;
-    }
-    if (obj["label"].is<const char*>()) {
-        rec.label = obj["label"].as<const char*>();
-    } else if (!obj["label"].isUnbound() && !obj["label"].isNull()) {
-        SS_LOGW(TAG, "Ignoring stored pairing record field 'label': expected string");
-    }
-    // is<bool>() guard, like every other field: ArduinoJson's as<bool>() coerces any
-    // non-boolean variant (e.g. a corrupt "used":"false" string) to true, which would
-    // silently invert the single-use admission gate. A wrong-typed field keeps the
-    // struct default (false) instead.
-    if (obj["used"].is<bool>()) {
-        rec.used = obj["used"].as<bool>();
-    } else if (!obj["used"].isUnbound() && !obj["used"].isNull()) {
-        SS_LOGW(TAG, "Ignoring stored pairing record field 'used': expected boolean");
-    }
-    return rec;
-}
-
-/// @brief Writes the "psk_id"/"psk"/"server_id"/"label"/"used" fields of a record into the
-/// document root encode_pairing_record() serializes.
-void write_record_fields(JsonDocument& target, const SendspinPairingRecord& r) {
-    target["psk_id"] = r.psk_id;
-    std::string psk_b64 = base64url_encode(r.psk.data(), r.psk.size());
-    target["psk"] = psk_b64;
-    secure_zero(psk_b64.data(), psk_b64.size());
-    target["server_id"] = r.server_id;
-    if (r.label.has_value()) {
-        target["label"] = r.label.value();
-    }
-    target["used"] = r.used;
-}
-
-/// @brief Parses an accepted Pairing PSK from a JSON object.
-/// @return The Pairing PSK, or nullopt when the object does not carry a usable one.
-std::optional<SendspinPairingPsk> psk_from_object(JsonObjectConst obj, const char** reason) {
-    auto core = parse_psk_id_and_psk(obj, reason);
-    if (!core.has_value()) {
-        return std::nullopt;
-    }
-    SendspinPairingPsk psk;
-    psk.psk_id = std::move(core->psk_id);
-    psk.psk = core->psk;
-    if (obj["label"].is<const char*>()) {
-        psk.label = obj["label"].as<const char*>();
-    }
-    return psk;
-}
-
-/// @brief Parses `bytes` as JSON and returns its root as a JSON object, keeping the backing
-/// JsonDocument alive via @p doc (the returned view borrows from it). Returns a null (empty)
-/// JsonObjectConst on parse failure or a non-object root; callers treat that the same as "not
-/// found".
-JsonObjectConst parse_root_object(std::string_view bytes, JsonDocument& doc) {
-    DeserializationError err = deserializeJson(doc, bytes.data(), bytes.size());
-    if (err) {
-        return JsonObjectConst();
-    }
-    return doc.as<JsonObjectConst>();
+/// @brief Copies a stored PSK out of a blob, rejecting the all-zero key a freed record slot holds.
+/// @return true when `out` holds a usable PSK.
+bool read_psk(const uint8_t* data, std::array<uint8_t, NOISE_PSK_SIZE>& out) {
+    std::memcpy(out.data(), data, out.size());
+    const std::array<uint8_t, NOISE_PSK_SIZE> zero{};
+    return !constant_time_equal(out.data(), zero.data(), out.size());
 }
 
 }  // namespace
@@ -167,32 +54,30 @@ JsonObjectConst parse_root_object(std::string_view bytes, JsonDocument& doc) {
 // Pairing record
 // ============================================================================
 
-std::string encode_pairing_record(const SendspinPairingRecord& r) {
-    // Every JsonDocument here uses the zeroizing allocator (not make_json_document()'s plain
-    // PsramJsonAllocator): the pool holds base64 PSK text and must not be freed unwiped.
-    JsonDocument doc = make_zeroizing_json_document();
-    doc["v"] = RECORD_CODEC_VERSION;
-    write_record_fields(doc, r);
-    std::string out;
-    serializeJson(doc, out);
+std::optional<std::array<uint8_t, persistence_keys::RECORD_SLOT_SIZE>> encode_pairing_record(
+    const SendspinPairingRecord& r) {
+    auto server_key = public_key_from_peer_id(r.server_id);
+    if (!server_key.has_value()) {
+        return std::nullopt;
+    }
+    std::array<uint8_t, persistence_keys::RECORD_SLOT_SIZE> out{};
+    std::memcpy(out.data() + RECORD_PSK_OFFSET, r.psk.data(), r.psk.size());
+    std::memcpy(out.data() + RECORD_SERVER_KEY_OFFSET, server_key->data(), server_key->size());
+    out[RECORD_FLAGS_OFFSET] = r.used ? RECORD_FLAG_USED : 0;
     return out;
 }
 
-std::optional<SendspinPairingRecord> decode_pairing_record(std::string_view bytes) {
-    JsonDocument doc = make_zeroizing_json_document();
-    JsonObjectConst obj = parse_root_object(bytes, doc);
-    if (obj.isNull()) {
+std::optional<SendspinPairingRecord> decode_pairing_record(const uint8_t* data, size_t len) {
+    if (len != persistence_keys::RECORD_SLOT_SIZE) {
         return std::nullopt;
     }
-    const char* reason = "the codec cannot read it";
-    auto rec = record_from_object(obj, &reason);
-    if (!rec.has_value()) {
-        // Logged here because the server that holds this record has to pair again; the caller
-        // only knows which key failed, not why.
-        SS_LOGW(TAG, "Rejecting stored pairing record %s: %s",
-                obj["psk_id"].is<const char*>() ? obj["psk_id"].as<const char*>() : "(no psk_id)",
-                reason);
+    SendspinPairingRecord rec;
+    if (!read_psk(data + RECORD_PSK_OFFSET, rec.psk)) {
+        return std::nullopt;
     }
+    rec.psk_id = psk_id_for(rec.psk);
+    rec.server_id = b64url_encode(data + RECORD_SERVER_KEY_OFFSET, X25519_KEY_SIZE);
+    rec.used = (data[RECORD_FLAGS_OFFSET] & RECORD_FLAG_USED) != 0;
     return rec;
 }
 
@@ -200,32 +85,20 @@ std::optional<SendspinPairingRecord> decode_pairing_record(std::string_view byte
 // Pairing PSK
 // ============================================================================
 
-std::string encode_pairing_psk(const SendspinPairingPsk& p) {
-    JsonDocument doc = make_zeroizing_json_document();
-    doc["v"] = RECORD_CODEC_VERSION;
-    doc["psk_id"] = p.psk_id;
-    std::string psk_b64 = base64url_encode(p.psk.data(), p.psk.size());
-    doc["psk"] = psk_b64;
-    secure_zero(psk_b64.data(), psk_b64.size());
-    if (p.label.has_value()) {
-        doc["label"] = p.label.value();
-    }
-    std::string out;
-    serializeJson(doc, out);
-    return out;
+std::array<uint8_t, persistence_keys::PAIRING_PSK_SIZE> encode_pairing_psk(
+    const SendspinPairingPsk& p) {
+    return p.psk;
 }
 
-std::optional<SendspinPairingPsk> decode_pairing_psk(std::string_view bytes) {
-    JsonDocument doc = make_zeroizing_json_document();
-    JsonObjectConst obj = parse_root_object(bytes, doc);
-    if (obj.isNull()) {
+std::optional<SendspinPairingPsk> decode_pairing_psk(const uint8_t* data, size_t len) {
+    if (len != persistence_keys::PAIRING_PSK_SIZE) {
         return std::nullopt;
     }
-    const char* reason = "the codec cannot read it";
-    auto psk = psk_from_object(obj, &reason);
-    if (!psk.has_value()) {
-        SS_LOGW(TAG, "Rejecting stored pairing PSK: %s", reason);
+    SendspinPairingPsk psk;
+    if (!read_psk(data, psk.psk)) {
+        return std::nullopt;
     }
+    psk.psk_id = psk_id_for(psk.psk);
     return psk;
 }
 

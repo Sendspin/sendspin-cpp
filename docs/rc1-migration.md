@@ -35,6 +35,10 @@ item against the current code before acting on it; line numbers drift as phases 
 - Long-term records are persisted one per key (`persistence_keys::record_slot_key()`), with the
   recency order in `persistence_keys::RECORD_ORDER`, so a change writes only the slot it touched
   and eviction is correct across a reboot.
+- Every persisted blob has a fixed size (`persistence_keys::*_SIZE`), so a provider on a store of
+  fixed-size values needs no length prefix or padding of its own. Records and the Pairing PSK are
+  binary rather than JSON and store no `psk_id`, which is derived from the PSK; `LAST_PLAYED` is
+  the server's public key and `OUTPUT_DELAY` a native `uint16_t`.
 - Operator cancellation of a pairing window arrives through a new
   `SendspinClient::cancel_pairing_window()`, the counterpart to the existing
   `confirm_pairing_window()`. It is a runtime action, not pairing configuration, so it does not
@@ -343,6 +347,11 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   `SendspinClientConfig::static_pairing_code` (`std::optional<std::string>`, exactly 8 decimal
   digits); it is offered only with `pairing_window_supported` and no dynamic code, and an invalid
   value makes `start()` return false.
+- The persistence codec is binary: `encode_pairing_record()` returns a fixed-size byte array (or
+  nullopt for a `server_id` that is not a canonical public key), `encode_pairing_psk()` the bare
+  PSK, and both decoders take `(data, len)`. `label` is gone from `SendspinPairingRecord` and
+  `SendspinPairingPsk`; the library never set it. A freed record slot is written as zeros, not as
+  an empty blob. Blobs in the earlier JSON and text formats read as absent.
 - `SendspinClientConfig::pairing_psk` (`std::optional<SendspinPsk>`) supplies a
   factory-provisioned Pairing PSK. `SendspinPsk` is a new public type holding 32 bytes that it
   wipes on destruction. A configured PSK outranks a stored `PAIRING_PSK` blob and is never

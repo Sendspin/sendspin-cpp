@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Unit tests for the public persistence codec (sendspin/persistence_codec.h): round-trip
-// encode/decode for each persistence struct, forward/backward-compatible decode semantics
-// (missing "v", unknown fields, best-effort future "v"), corrupt-input rejection, and the
-// base64url helpers.
+// Unit tests for the public persistence codec (sendspin/persistence_codec.h): the fixed binary
+// layout of each persistence struct, round trips, which blobs decode rejects, and the base64url
+// helpers.
 
 #include "sendspin/persistence_codec.h"
+
+#include "crypto/keys.h"
+#include "record_test_helpers.h"
 
 #include <gtest/gtest.h>
 
@@ -40,231 +42,171 @@ std::array<uint8_t, 32> make_psk(uint8_t seed) {
     return psk;
 }
 
+SendspinPairingRecord make_record(uint8_t seed, bool used) {
+    SendspinPairingRecord r;
+    r.psk = make_psk(seed);
+    r.psk_id = psk_id_for(r.psk);
+    r.server_id = test_peer_id("server-" + std::to_string(seed));
+    r.used = used;
+    return r;
+}
+
 }  // namespace
 
 // ============================================================================
-// SendspinPairingRecord round-trip
+// SendspinPairingRecord
 // ============================================================================
 
-TEST(PersistenceCodec, RecordRoundTripWithOptionalFields) {
-    SendspinPairingRecord r;
-    r.psk_id = "rec-1";
-    r.psk = make_psk(0x10);
-    r.server_id = "server-abc";
-    r.label = "kitchen";
-    r.used = true;
+// The layout is storage ABI: a provider may size fixed-length storage against it, and a change
+// makes every stored record read as absent.
+TEST(PersistenceCodec, RecordEncodesToTheDocumentedLayout) {
+    for (bool used : {false, true}) {
+        SCOPED_TRACE(used ? "used" : "unused");
+        const SendspinPairingRecord r = make_record(0x10, used);
+        auto blob = encode_pairing_record(r);
+        ASSERT_TRUE(blob.has_value());
+        ASSERT_EQ(blob->size(), persistence_keys::RECORD_SLOT_SIZE);
 
-    std::string blob = encode_pairing_record(r);
-    auto decoded = decode_pairing_record(blob);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->psk_id, r.psk_id);
-    EXPECT_EQ(decoded->psk, r.psk);
-    EXPECT_EQ(decoded->server_id, r.server_id);
-    ASSERT_TRUE(decoded->label.has_value());
-    EXPECT_EQ(decoded->label.value(), r.label.value());
-    EXPECT_TRUE(decoded->used);
+        const auto server_key = public_key_from_peer_id(r.server_id).value();
+        EXPECT_TRUE(std::equal(r.psk.begin(), r.psk.end(), blob->begin()));
+        EXPECT_TRUE(std::equal(server_key.begin(), server_key.end(), blob->begin() + 32));
+        EXPECT_EQ((*blob)[64], used ? 0x01 : 0x00);
+    }
 }
 
-TEST(PersistenceCodec, RecordRoundTripWithoutOptionalFields) {
-    SendspinPairingRecord r;
-    r.psk_id = "rec-2";
-    r.psk = make_psk(0x20);
-    r.server_id = "srv-2";
-    r.used = false;
-
-    std::string blob = encode_pairing_record(r);
-    EXPECT_EQ(blob.find("label"), std::string::npos);
-
-    auto decoded = decode_pairing_record(blob);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->psk_id, r.psk_id);
-    EXPECT_EQ(decoded->psk, r.psk);
-    EXPECT_EQ(decoded->server_id, r.server_id);
-    EXPECT_FALSE(decoded->label.has_value());
-    EXPECT_FALSE(decoded->used);
+// psk_id is not stored, so decode must derive it: a record that came back without it could never
+// resolve the server's handshake.
+TEST(PersistenceCodec, RecordRoundTripsAndDerivesPskId) {
+    for (bool used : {false, true}) {
+        SCOPED_TRACE(used ? "used" : "unused");
+        const SendspinPairingRecord r = make_record(0x20, used);
+        auto blob = encode_pairing_record(r).value();
+        auto decoded = decode_pairing_record(blob.data(), blob.size());
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->psk, r.psk);
+        EXPECT_EQ(decoded->psk_id, psk_id_for(r.psk));
+        EXPECT_EQ(decoded->server_id, r.server_id);
+        EXPECT_EQ(decoded->used, used);
+    }
 }
 
-// A record with no server_id could never satisfy the post-match server check, so it is not a
-// usable credential and the decoder rejects it (connection.md "Pre-Shared Key").
-TEST(PersistenceCodec, RecordDecodeRejectsMissingServerId) {
-    const std::string head = R"({"v":1,"psk_id":"rec-9","psk":")" +
-                             base64url_encode(make_psk(0x21).data(), 32);
-    EXPECT_FALSE(decode_pairing_record(head + R"("})").has_value());
-    EXPECT_FALSE(decode_pairing_record(head + R"(","server_id":""})").has_value());
-    // Control: the same record with a server_id decodes.
-    EXPECT_TRUE(decode_pairing_record(head + R"(","server_id":"srv-9"})").has_value());
+// Only bit 0 of the flags byte means anything; the rest are reserved for future flags, so a blob
+// that sets them must still read back the `used` it was written with.
+TEST(PersistenceCodec, RecordDecodeReadsOnlyTheUsedFlagBit) {
+    struct Row {
+        uint8_t flags;
+        bool expect_used;
+    };
+    const Row rows[] = {{0xFE, false}, {0x80, false}, {0xFF, true}, {0x01, true}};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.flags);
+        auto blob = encode_pairing_record(make_record(0x30, false)).value();
+        blob[64] = row.flags;
+        auto decoded = decode_pairing_record(blob.data(), blob.size());
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->used, row.expect_used);
+    }
 }
 
-TEST(PersistenceCodec, RecordDecodeAcceptsMissingVersion) {
-    std::string blob =
-        R"({"server_id":"srv-rec-3","psk_id":"rec-3","psk":")" +
-        base64url_encode(make_psk(0x30).data(), 32) + R"(","used":false})";
-    auto decoded = decode_pairing_record(blob);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->psk_id, "rec-3");
-}
-
-TEST(PersistenceCodec, RecordDecodeIgnoresUnknownFields) {
-    std::string blob = R"({"v":1,"server_id":"srv-rec-4","psk_id":"rec-4","psk":")" +
-                       base64url_encode(make_psk(0x40).data(), 32) +
-                       R"(","used":false,"totally_unknown":{"nested":[1,2,3]},"another":"x"})";
-    auto decoded = decode_pairing_record(blob);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->psk_id, "rec-4");
-}
-
-TEST(PersistenceCodec, RecordDecodeBestEffortOnFutureVersion) {
-    std::string blob = R"({"v":99,"server_id":"srv-rec-5","psk_id":"rec-5","psk":")" +
-                       base64url_encode(make_psk(0x50).data(), 32) + R"(","used":true})";
-    auto decoded = decode_pairing_record(blob);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->psk_id, "rec-5");
-    EXPECT_TRUE(decoded->used);
-}
-
-// The record decoder's malformed-blob family: each row malforms one required field of the
-// well-formed entry the Control row carries.
-TEST(PersistenceCodec, RecordDecodeRejectsMalformedBlobs) {
-    const std::string good_psk = base64url_encode(make_psk(0x60).data(), 32);
-    const std::array<uint8_t, 16> short_psk{};
-    const std::string short_b64 = base64url_encode(short_psk.data(), short_psk.size());
+TEST(PersistenceCodec, RecordDecodeRejectsUnusableBlobs) {
+    const auto good = blob_bytes(encode_pairing_record(make_record(0x40, true)).value());
+    std::vector<uint8_t> zero_psk = good;
+    std::fill(zero_psk.begin(), zero_psk.begin() + 32, uint8_t{0});
 
     struct Row {
         const char* name;
-        std::string blob;
+        std::vector<uint8_t> blob;
         bool expect_ok;
     };
     const Row rows[] = {
-        {"not-json", "not json", false},
-        {"missing-psk_id", R"({"v":1,"server_id":"srv","psk":")" + good_psk + R"("})", false},
-        {"empty-psk_id", R"({"v":1,"server_id":"srv","psk_id":"","psk":")" + good_psk + R"("})",
+        {"empty", {}, false},
+        {"one byte short", std::vector<uint8_t>(good.begin(), good.end() - 1), false},
+        {"one byte long", [&] {
+             auto b = good;
+             b.push_back(0);
+             return b;
+         }(),
          false},
-        {"missing-psk", R"({"v":1,"server_id":"srv","psk_id":"rec"})", false},
-        {"psk-not-base64", R"({"v":1,"server_id":"srv","psk_id":"rec","psk":"not!!base64!!"})",
-         false},
-        {"psk-wrong-length",
-         R"({"v":1,"server_id":"srv","psk_id":"rec","psk":")" + short_b64 + R"("})", false},
-        // Control: the same object with every required field well formed.
-        {"all-fields-present",
-         R"({"v":1,"server_id":"srv","psk_id":"rec","psk":")" + good_psk + R"("})", true},
+        // What a freed slot holds.
+        {"all zero", std::vector<uint8_t>(persistence_keys::RECORD_SLOT_SIZE, 0), false},
+        // A zero PSK is no credential, whatever the rest of the blob holds.
+        {"zero psk", zero_psk, false},
+        // Control: the well-formed blob the other rows are cut from.
+        {"well formed", good, true},
     };
-
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        EXPECT_EQ(decode_pairing_record(row.blob).has_value(), row.expect_ok);
+        EXPECT_EQ(decode_pairing_record(row.blob.data(), row.blob.size()).has_value(),
+                  row.expect_ok);
     }
 }
 
-TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
-    // ArduinoJson's as<bool>() coerces any non-boolean variant to true, so an unguarded read
-    // would turn a corrupt "used":"false" STRING into used == true and flip the single-use
-    // admission gate. A wrong-typed field must keep the struct default.
-    for (const char* corrupt_used : {R"("false")", R"("yes")", R"("")", "[1,2]", "{}"}) {
-        std::string blob = R"({"v":1,"server_id":"srv-u","psk_id":"rec-u","psk":")" +
-                           base64url_encode(make_psk(0x62).data(), 32) + R"(","used":)" +
-                           corrupt_used + "}";
-        auto decoded = decode_pairing_record(blob);
-        ASSERT_TRUE(decoded.has_value()) << blob;
-        EXPECT_FALSE(decoded->used) << blob;
-    }
-}
-
-// ============================================================================
-// Slot sizing
-// ============================================================================
-
-// Records are stored one per key, so the per-slot size is what a provider sizes fixed-length
-// storage against; persistence_codec.h and the integration guide quote it, and a field added to
-// the storage format moves it.
-TEST(PersistenceCodec, EncodedRecordMatchesTheDocumentedSlotSize) {
+// A record stores the key, not the text, so only a server_id that decodes back to itself can be
+// stored: anything else would come back as a different id after a reboot.
+TEST(PersistenceCodec, RecordEncodeRequiresACanonicalServerId) {
+    const std::string canonical = test_peer_id("server-canonical");
     struct Row {
         const char* name;
-        bool used;
-        size_t expected;
+        std::string server_id;
+        bool expect_ok;
     };
     const Row rows[] = {
-        // The documented figure: the freshly paired form, which every pairing writes first.
-        {"freshly-paired-used-false", false, 185u},
-        // Control: the only other state a record reaches. "true" is one byte shorter than
-        // "false", so this row is what the documented figure must NOT be sized against.
-        {"activated-used-true", true, 184u},
+        {"not base64url", "server-abc", false},
+        {"nonzero trailing bits", non_canonical_spelling(canonical), false},
+        {"padded", canonical + "=", false},
+        // Control: the canonical spelling of the same key.
+        {"canonical", canonical, true},
     };
-
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        SendspinPairingRecord r;
-        // The three 43-character base64url fields a real record carries: psk_id and server_id are
-        // 32-byte values encoded the same way as the psk.
-        r.psk = make_psk(0x80);
-        r.psk_id = base64url_encode(r.psk.data(), r.psk.size());
-        r.server_id = base64url_encode(make_psk(0x81).data(), 32);
-        r.used = row.used;
-
-        EXPECT_EQ(encode_pairing_record(r).size(), row.expected)
-            << "the documented per-slot size must match what the codec writes";
-
-        // A label costs its own length plus 11 bytes of framing, which is the other half of the
-        // documented figure.
-        r.label = "kitchen";
-        EXPECT_EQ(encode_pairing_record(r).size(), row.expected + 11u + r.label->size());
+        SendspinPairingRecord r = make_record(0x50, false);
+        r.server_id = row.server_id;
+        EXPECT_EQ(encode_pairing_record(r).has_value(), row.expect_ok);
     }
 }
 
 // ============================================================================
-// SendspinPairingPsk round-trip
+// SendspinPairingPsk
 // ============================================================================
 
-TEST(PersistenceCodec, PskRoundTripWithLabel) {
+TEST(PersistenceCodec, PskEncodesToTheBarePsk) {
     SendspinPairingPsk p;
-    p.psk_id = "psk-1";
-    p.psk = make_psk(0x70);
-    p.label = "operator";
+    p.psk = make_psk(0x60);
+    p.psk_id = psk_id_for(p.psk);
 
-    std::string blob = encode_pairing_psk(p);
-    auto decoded = decode_pairing_psk(blob);
+    auto blob = encode_pairing_psk(p);
+    EXPECT_EQ(blob, p.psk);
+
+    auto decoded = decode_pairing_psk(blob.data(), blob.size());
     ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->psk_id, p.psk_id);
     EXPECT_EQ(decoded->psk, p.psk);
-    ASSERT_TRUE(decoded->label.has_value());
-    EXPECT_EQ(decoded->label.value(), p.label.value());
+    EXPECT_EQ(decoded->psk_id, psk_id_for(p.psk));
 }
 
-TEST(PersistenceCodec, PskRoundTripWithoutLabel) {
-    SendspinPairingPsk p;
-    p.psk_id = "psk-2";
-    p.psk = make_psk(0x80);
-
-    std::string blob = encode_pairing_psk(p);
-    EXPECT_EQ(blob.find("label"), std::string::npos);
-
-    auto decoded = decode_pairing_psk(blob);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_FALSE(decoded->label.has_value());
-}
-
-// The pairing-PSK decoder's malformed-blob family, over the same required fields as a record
-// minus server_id.
-TEST(PersistenceCodec, PskDecodeRejectsMalformedBlobs) {
-    const std::string good_psk = base64url_encode(make_psk(0x73).data(), 32);
-    const std::array<uint8_t, 10> short_psk{};
-    const std::string short_b64 = base64url_encode(short_psk.data(), short_psk.size());
-
+TEST(PersistenceCodec, PskDecodeRejectsUnusableBlobs) {
+    const auto good = make_psk(0x70);
     struct Row {
         const char* name;
-        std::string blob;
+        std::vector<uint8_t> blob;
         bool expect_ok;
     };
     const Row rows[] = {
-        {"psk-not-base64", R"({"v":1,"psk_id":"psk","psk":"!!!not-base64!!!"})", false},
-        {"psk-wrong-length", R"({"v":1,"psk_id":"psk","psk":")" + short_b64 + R"("})", false},
-        {"missing-psk_id", R"({"v":1,"psk":")" + good_psk + R"("})", false},
-        // Control: the same object with both required fields well formed.
-        {"all-fields-present", R"({"v":1,"psk_id":"psk","psk":")" + good_psk + R"("})", true},
+        {"empty", {}, false},
+        {"one byte short", std::vector<uint8_t>(good.begin(), good.end() - 1), false},
+        {"one byte long", [&] {
+             std::vector<uint8_t> b(good.begin(), good.end());
+             b.push_back(0);
+             return b;
+         }(),
+         false},
+        {"all zero", std::vector<uint8_t>(persistence_keys::PAIRING_PSK_SIZE, 0), false},
+        // Control: a usable PSK of the right size.
+        {"well formed", std::vector<uint8_t>(good.begin(), good.end()), true},
     };
-
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        EXPECT_EQ(decode_pairing_psk(row.blob).has_value(), row.expect_ok);
+        EXPECT_EQ(decode_pairing_psk(row.blob.data(), row.blob.size()).has_value(),
+                  row.expect_ok);
     }
 }
 
@@ -307,28 +249,4 @@ TEST(PersistenceCodec, Base64UrlEmptyRoundTrip) {
     auto decoded = base64url_decode(encoded);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_TRUE(decoded->empty());
-}
-
-// ============================================================================
-// Compatibility fixture: the host example's existing on-disk record shape (no "v")
-// ============================================================================
-
-TEST(PersistenceCodec, DecodesHostExampleLegacyRecordShape) {
-    // Hand-written to match examples/common/file_persistence_provider.cpp's
-    // save_pairing_record() field mapping (psk_id, psk, server_id, label, used), predating the
-    // "v" field, so old on-disk records written by that example keep loading.
-    std::array<uint8_t, 32> psk = make_psk(0xC0);
-    std::string legacy_record = R"({"psk_id":"legacy-psk-id","psk":")" +
-                                base64url_encode(psk.data(), psk.size()) +
-                                R"(","server_id":"legacy-server","label":"living room",)"
-                                R"("used":true})";
-
-    auto decoded = decode_pairing_record(legacy_record);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->psk_id, "legacy-psk-id");
-    EXPECT_EQ(decoded->psk, psk);
-    EXPECT_EQ(decoded->server_id, "legacy-server");
-    ASSERT_TRUE(decoded->label.has_value());
-    EXPECT_EQ(decoded->label.value(), "living room");
-    EXPECT_TRUE(decoded->used);
 }

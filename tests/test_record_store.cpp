@@ -75,12 +75,11 @@ using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local c
 // ============================================================================
 
 /// Build an accepted Pairing PSK.
-static SendspinPairingPsk make_pairing_psk(const std::optional<std::string>& label = {}) {
+static SendspinPairingPsk make_pairing_psk() {
     auto psk = make_random_psk();
     SendspinPairingPsk p;
     p.psk_id = psk_id_for(psk);
     p.psk = psk;
-    p.label = label;
     return p;
 }
 
@@ -187,12 +186,11 @@ TEST(RecordStore, FirstBootProvisioningSurvivesPersistenceFailureForThisBoot) {
 TEST(RecordStore, BootsFromBlobStoreSeededViaCodec) {
     InMemoryPersistenceProvider provider;
 
-    SendspinPairingRecord paired = make_client_record("server-seeded", "Seeded Label");
+    SendspinPairingRecord paired = make_client_record("server-seeded");
     seed_records(provider, {paired});
 
-    SendspinPairingPsk psk = make_pairing_psk("Seeded PSK");
-    std::string psk_blob = encode_pairing_psk(psk);
-    provider.seed_blob(persistence_keys::PAIRING_PSK, blob_bytes(psk_blob));
+    SendspinPairingPsk psk = make_pairing_psk();
+    provider.seed_blob(persistence_keys::PAIRING_PSK, blob_bytes(encode_pairing_psk(psk)));
 
     RecordStore store(&provider);
 
@@ -212,15 +210,15 @@ TEST(RecordStore, BootsFromBlobStoreSeededViaCodec) {
 }
 
 // One record per key is what keeps a corrupt blob from costing the whole store: a slot that does
-// not decode (corrupt bytes, not valid JSON) drops that record and no other, and the store still
-// starts.
+// not decode (corrupt bytes of the wrong size) drops that record and no other, and the store
+// still starts.
 TEST(RecordStore, ACorruptSlotLosesOnlyThatRecord) {
     InMemoryPersistenceProvider provider;
     SendspinPairingRecord corrupted = make_client_record("server-corrupt");
     SendspinPairingRecord survivor = make_client_record("server-survivor");
     seed_records(provider, {corrupted, survivor});
     provider.seed_blob(persistence_keys::record_slot_key(0),
-                       blob_bytes("not valid json at all {{{"));
+                       blob_bytes("corrupt bytes"));
 
     RecordStore store(&provider);
 
@@ -241,7 +239,7 @@ TEST(RecordStore, ACorruptSlotLosesOnlyThatRecord) {
 // fresh record, then store_record_superseding() commits it.
 TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
     RecordStore store(nullptr);
-    const std::string server_id = "server-repair";
+    const std::string server_id = test_peer_id("server-repair");
 
     auto outcome1 = store.resolve_pairing_outcome(server_id);
     ASSERT_TRUE(store.store_record_superseding(outcome1.record, {}));
@@ -287,14 +285,14 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
     InMemoryPersistenceProvider provider;
     RecordStore store(&provider);
 
-    SendspinPairingRecord original = make_client_record("server-X", "original");
+    SendspinPairingRecord original = make_client_record("server-X");
     ASSERT_TRUE(store.store_record_superseding(original, {}));
     ASSERT_TRUE(store.persist_records());
 
     reject_record_saves(provider);
     const size_t attempts_before = record_writes(provider);
 
-    SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
+    SendspinPairingRecord replacement = make_client_record("server-X");
     EXPECT_TRUE(store.store_record_superseding(replacement, {}))
         << "the RAM-only supersede must not fail on a provider that would reject the write";
     EXPECT_EQ(record_writes(provider), attempts_before)
@@ -305,7 +303,7 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
     EXPECT_EQ(store.record_by_psk_id(original.psk_id), nullptr);
-    const auto* found = store.record_by_server_id("server-X");
+    const auto* found = store.record_by_server_id(test_peer_id("server-X"));
     ASSERT_NE(found, nullptr);
     EXPECT_EQ(found->psk_id, replacement.psk_id);
 
@@ -330,28 +328,25 @@ TEST(RecordStore, StoreRecordReplacesTheRecordHoldingTheSamePskId) {
     InMemoryPersistenceProvider provider;
     RecordStore store(&provider);
 
-    SendspinPairingRecord first = make_client_record("server-A", "first");
+    SendspinPairingRecord first = make_client_record("server-A");
     const std::string psk_id = first.psk_id;
     ASSERT_TRUE(store.store_record_superseding(first, {}));
 
     SendspinPairingRecord second = first;
-    second.server_id = "server-B";
-    second.label = "second";
+    second.server_id = test_peer_id("server-B");
     ASSERT_TRUE(store.store_record_superseding(second, {}));
     ASSERT_TRUE(store.persist_records());
 
     auto resolved = store.resolve_by_psk_id(psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved.has_value());
     ASSERT_TRUE(resolved->counterparty_id.has_value());
-    EXPECT_EQ(resolved->counterparty_id.value(), "server-B")
+    EXPECT_EQ(resolved->counterparty_id.value(), test_peer_id("server-B"))
         << "the psk_id must authenticate the server that paired with it last, not the one it "
            "replaced";
 
     auto stored = persisted_records(provider);
     ASSERT_EQ(stored.size(), 1u) << "one record per psk_id";
-    EXPECT_EQ(stored[0].server_id, "server-B");
-    ASSERT_TRUE(stored[0].label.has_value());
-    EXPECT_EQ(stored[0].label.value(), "second");
+    EXPECT_EQ(stored[0].server_id, test_peer_id("server-B"));
 }
 
 // ============================================================================
@@ -362,20 +357,20 @@ TEST(RecordStore, StoreRecordReplacesTheRecordHoldingTheSamePskId) {
 TEST(RecordStore, CapacityEvictsRatherThanRefusingANewPairing) {
     RecordStore store(nullptr);
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
     ASSERT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS);
 
-    auto overflow = store.resolve_pairing_outcome("server-overflow");
+    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
     EXPECT_TRUE(store.store_record_superseding(overflow.record, {}))
         << "a pairing never fails for lack of record storage";
-    EXPECT_NE(store.record_by_server_id("server-overflow"), nullptr);
+    EXPECT_NE(store.record_by_server_id(test_peer_id("server-overflow")), nullptr);
     EXPECT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS)
         << "eviction makes room rather than growing the store";
-    EXPECT_EQ(store.record_by_server_id("server-0"), nullptr)
+    EXPECT_EQ(store.record_by_server_id(test_peer_id("server-0")), nullptr)
         << "the least recently used record is the one evicted";
-    EXPECT_NE(store.record_by_server_id("server-1"), nullptr)
+    EXPECT_NE(store.record_by_server_id(test_peer_id("server-1")), nullptr)
         << "only one record is evicted per pairing";
 }
 
@@ -422,7 +417,7 @@ TEST(RecordStore, RecencyReorderWritesOnlyTheOrderKey) {
     // Control: the reorder still happened. A and B were the two oldest records when the
     // alternation began, so without the rotate A would be the victim here; with it, the oldest
     // filler is.
-    auto outcome = store.resolve_pairing_outcome("server-new");
+    auto outcome = store.resolve_pairing_outcome(test_peer_id("server-new"));
     ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     EXPECT_FALSE(store.resolve_by_psk_id(filler_psk_ids.front(), PskCategory::LONG_TERM).has_value())
         << "the RAM-only order must still drive eviction";
@@ -464,7 +459,7 @@ TEST(RecordStore, BootRestoresTheRecencyOrderFromTheOrderKey) {
         provider.seed_blob(persistence_keys::RECORD_ORDER, row.order);
 
         RecordStore store(&provider, {.max_pairing_records = RecordStore::MIN_MAX_RECORDS});
-        auto overflow = store.resolve_pairing_outcome("server-new");
+        auto overflow = store.resolve_pairing_outcome(test_peer_id("server-new"));
         ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
 
         for (size_t i = 0; i < seeded.size(); ++i) {
@@ -498,7 +493,7 @@ TEST(RecordStore, EvictionAfterARebootFollowsThePersistedUseOrder) {
     }
 
     RecordStore rebooted(&provider, {.max_pairing_records = RecordStore::MIN_MAX_RECORDS});
-    auto overflow = rebooted.resolve_pairing_outcome("server-new");
+    auto overflow = rebooted.resolve_pairing_outcome(test_peer_id("server-new"));
     ASSERT_TRUE(rebooted.store_record_superseding(overflow.record, {}));
 
     EXPECT_FALSE(rebooted.resolve_by_psk_id(psk_ids.back(), PskCategory::LONG_TERM).has_value())
@@ -530,6 +525,34 @@ TEST(RecordStore, RemovingARecordWritesOnlyItsSlotAndTheOrder) {
     EXPECT_EQ(persisted_psk_ids(provider), std::vector<std::string>{keeper.psk_id});
 }
 
+// A provider may store each key as a fixed-size value (persistence_keys), so every write the store
+// makes has its key's size: a record slot whether it holds a record or is being freed, and the
+// recency order however many records the store holds.
+TEST(RecordStore, EveryRecordWriteHasItsKeysFixedSize) {
+    InMemoryPersistenceProvider provider;
+    RecordStore store(&provider);
+    const size_t order_size = RecordStore::DEFAULT_MAX_RECORDS;
+
+    auto outcome = store.resolve_pairing_outcome(test_peer_id("server-sized"));
+    ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
+    ASSERT_TRUE(store.persist_records());
+
+    auto slot = provider.blob(persistence_keys::record_slot_key(0));
+    ASSERT_TRUE(slot.has_value());
+    EXPECT_EQ(slot->size(), persistence_keys::RECORD_SLOT_SIZE) << "an occupied slot";
+    std::vector<uint8_t> expected_order(order_size, 0xFF);
+    expected_order[0] = 0;
+    EXPECT_EQ(provider.blob(persistence_keys::RECORD_ORDER), expected_order)
+        << "one byte per slot the store may use, unused positions 0xFF";
+
+    ASSERT_TRUE(remove_record(store, outcome.record.psk_id));
+    EXPECT_EQ(provider.blob(persistence_keys::record_slot_key(0)),
+              std::vector<uint8_t>(persistence_keys::RECORD_SLOT_SIZE, 0))
+        << "a freed slot is written as zeros of the same size";
+    EXPECT_EQ(provider.blob(persistence_keys::RECORD_ORDER),
+              std::vector<uint8_t>(order_size, 0xFF));
+}
+
 // A supersede reuses the slot its own retire just freed, which is what makes "a pairing costs
 // one record-sized write" true. Taking the lowest free slot instead would put the new record in
 // a slot an earlier revocation freed and empty the superseded one as well: two record writes,
@@ -539,7 +562,7 @@ TEST(RecordStore, ASupersedeReusesTheSlotItsRetireFreed) {
     RecordStore store(&provider);
 
     auto pair_with = [&store](const std::string& server_id) {
-        auto outcome = store.resolve_pairing_outcome(server_id);
+        auto outcome = store.resolve_pairing_outcome(test_peer_id(server_id));
         EXPECT_TRUE(store.store_record_superseding(outcome.record, {}));
         EXPECT_TRUE(store.persist_records());
         return outcome.record.psk_id;
@@ -636,7 +659,7 @@ TEST(RecordStore, ARejectedWriteWarnsOnlyWhenTheNextBootCannotRebuildIt) {
         // Control: a write the next boot cannot reconstruct says so.
         {"pairing",
          [](RecordStore& store, const std::vector<SendspinPairingRecord>&) {
-             auto outcome = store.resolve_pairing_outcome("server-paired");
+             auto outcome = store.resolve_pairing_outcome(test_peer_id("server-paired"));
              ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
              EXPECT_FALSE(store.persist_records());
          },
@@ -685,7 +708,7 @@ TEST(RecordStore, ADuplicatePskIdInASecondSlotDoesNotOutliveARevocation) {
     SendspinPairingRecord duplicated = make_client_record("server-duplicated");
     seed_records(provider, {keeper, duplicated});
     provider.seed_blob(persistence_keys::record_slot_key(2),
-                       blob_bytes(encode_pairing_record(duplicated)));
+                       record_blob(duplicated));
 
     {
         RecordStore store(&provider);
@@ -744,7 +767,7 @@ TEST(RecordStore, EvictionFollowsUseRecency) {
     RecordStore store(nullptr);
     std::vector<std::string> psk_ids;
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
         psk_ids.push_back(outcome.record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
@@ -752,12 +775,12 @@ TEST(RecordStore, EvictionFollowsUseRecency) {
     // Touch the oldest record, which without this would be the next victim.
     (void) store.note_record_used(psk_ids.front());
 
-    auto overflow = store.resolve_pairing_outcome("server-overflow");
+    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
     ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
 
-    EXPECT_NE(store.record_by_server_id("server-0"), nullptr)
+    EXPECT_NE(store.record_by_server_id(test_peer_id("server-0")), nullptr)
         << "a record used since it was stored is no longer the least recently used";
-    EXPECT_EQ(store.record_by_server_id("server-1"), nullptr)
+    EXPECT_EQ(store.record_by_server_id(test_peer_id("server-1")), nullptr)
         << "the next-oldest untouched record is evicted in its place";
 }
 
@@ -767,17 +790,17 @@ TEST(RecordStore, EvictionSkipsRecordsBackingOpenConnections) {
     RecordStore store(nullptr);
     std::vector<std::string> psk_ids;
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
         psk_ids.push_back(outcome.record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
 
-    auto overflow = store.resolve_pairing_outcome("server-overflow");
+    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
     ASSERT_TRUE(store.store_record_superseding(overflow.record, {psk_ids.front()}));
 
-    EXPECT_NE(store.record_by_server_id("server-0"), nullptr)
+    EXPECT_NE(store.record_by_server_id(test_peer_id("server-0")), nullptr)
         << "the record an open connection resolves against must survive";
-    EXPECT_EQ(store.record_by_server_id("server-1"), nullptr)
+    EXPECT_EQ(store.record_by_server_id(test_peer_id("server-1")), nullptr)
         << "the next evictable record is taken instead";
 }
 
@@ -788,14 +811,14 @@ TEST(RecordStore, NothingEvictableRejectsTheRecord) {
     RecordStore store(nullptr);
     std::vector<std::string> psk_ids;
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
         psk_ids.push_back(outcome.record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
 
-    auto overflow = store.resolve_pairing_outcome("server-overflow");
+    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
     EXPECT_FALSE(store.store_record_superseding(overflow.record, psk_ids));
-    EXPECT_EQ(store.record_by_server_id("server-overflow"), nullptr);
+    EXPECT_EQ(store.record_by_server_id(test_peer_id("server-overflow")), nullptr);
     EXPECT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS);
 }
 
@@ -803,7 +826,7 @@ TEST(RecordStore, NothingEvictableRejectsTheRecord) {
 // store, so it must succeed at capacity without evicting anything.
 TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
     RecordStore store(nullptr);
-    const std::string existing_server = "server-existing";
+    const std::string existing_server = test_peer_id("server-existing");
 
     auto outcome0 = store.resolve_pairing_outcome(existing_server);
     ASSERT_TRUE(store.store_record_superseding(outcome0.record, {}));
@@ -812,7 +835,7 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
     // Fill every remaining slot with other servers' records.
     std::vector<std::string> other_psk_ids;
     for (size_t i = 1; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
         other_psk_ids.push_back(outcome.record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
@@ -866,7 +889,7 @@ TEST(RecordStore, ConfiguredCapacityIsHonouredAboveTheProtocolFloor) {
 
         std::vector<std::string> psk_ids;
         for (size_t i = 0; i < row.effective; ++i) {
-            auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+            auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
             psk_ids.push_back(outcome.record.psk_id);
             ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
         }
@@ -880,7 +903,7 @@ TEST(RecordStore, ConfiguredCapacityIsHonouredAboveTheProtocolFloor) {
         EXPECT_EQ(stored_record_in_slot(provider, row.effective - 1)->psk_id, psk_ids.back())
             << "the last record stored must be the one in the highest slot";
 
-        auto overflow = store.resolve_pairing_outcome("server-overflow");
+        auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
         ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
         ASSERT_TRUE(store.persist_records());
         EXPECT_FALSE(store.resolve_by_psk_id(psk_ids.front(), PskCategory::LONG_TERM).has_value())
@@ -945,7 +968,6 @@ TEST(RecordStore, DeclaredCategoryPicksBetweenTwoPsksWithTheSamePskId) {
     SendspinPairingPsk p;
     p.psk_id = rec.psk_id;
     p.psk = rec.psk;
-    p.label = "dup";
     provider.seed_blob(persistence_keys::PAIRING_PSK, blob_bytes(encode_pairing_psk(p)));
 
     RecordStore store(&provider);
@@ -1015,13 +1037,13 @@ TEST(RecordStore, RecordByServerIdFindsStoredPubkeyRecord) {
     SendspinPairingRecord rec = make_client_record("server-X");
     store.store_record_superseding(rec, {});
 
-    const auto* found = store.record_by_server_id("server-X");
+    const auto* found = store.record_by_server_id(test_peer_id("server-X"));
     ASSERT_NE(found, nullptr);
     EXPECT_EQ(found->psk_id, rec.psk_id);
     EXPECT_EQ(found->server_id, rec.server_id);
 
     // Unknown server returns null.
-    EXPECT_EQ(store.record_by_server_id("server-Y"), nullptr);
+    EXPECT_EQ(store.record_by_server_id(test_peer_id("server-Y")), nullptr);
 }
 
 // ============================================================================
@@ -1089,7 +1111,7 @@ TEST(RecordStore, RemoveRecordAndList) {
 /// currently holds, standing in for a store whose delete path fails on its own (full or
 /// read-only NVS, a torn write) while writes that only add or refresh a record still work.
 ///
-/// Dropping a record is either an empty blob over an occupied slot (a revocation) or a different
+/// Dropping a record is either a zeroed blob over an occupied slot (a revocation) or a different
 /// psk_id written into it (a supersede reusing the slot it just freed), so the fake reads the
 /// slot it is about to overwrite to decide.
 class RejectingDeleteProvider : public InMemoryPersistenceProvider {
@@ -1097,16 +1119,11 @@ public:
     bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
         if (is_record_key(key) && key != persistence_keys::RECORD_ORDER) {
             auto previous = this->blob(key);
-            auto held = previous.has_value() && !previous->empty()
-                            ? decode_pairing_record(std::string_view(
-                                  reinterpret_cast<const char*>(previous->data()),
-                                  previous->size()))
+            auto held = previous.has_value()
+                            ? decode_pairing_record(previous->data(), previous->size())
                             : std::nullopt;
             if (held.has_value()) {
-                auto incoming =
-                    len > 0 ? decode_pairing_record(
-                                  std::string_view(reinterpret_cast<const char*>(data), len))
-                            : std::nullopt;
+                auto incoming = decode_pairing_record(data, len);
                 if (!incoming.has_value() || incoming->psk_id != held->psk_id) {
                     this->remove_attempts.push_back(held->psk_id);
                     if (this->refuse_delete) {
@@ -1168,11 +1185,11 @@ TEST(RecordStore, SupersedeErasesFromMemoryAndTheFlushFailsWhenTheProviderRefuse
     RejectingDeleteProvider provider;
     RecordStore store(&provider);
 
-    SendspinPairingRecord original = make_client_record("server-X", "original");
+    SendspinPairingRecord original = make_client_record("server-X");
     ASSERT_TRUE(store.store_record_superseding(original, {}));
     ASSERT_TRUE(store.persist_records());
 
-    SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
+    SendspinPairingRecord replacement = make_client_record("server-X");
     ASSERT_TRUE(store.store_record_superseding(replacement, {}));
 
     // The RAM effect precedes any provider traffic: the supersede itself asked for nothing.
@@ -1194,11 +1211,11 @@ TEST(RecordStore, SupersedeIsDurableWhenTheProviderAcceptsTheFlush) {
     provider.refuse_delete = false;
     RecordStore store(&provider);
 
-    SendspinPairingRecord original = make_client_record("server-X", "original");
+    SendspinPairingRecord original = make_client_record("server-X");
     ASSERT_TRUE(store.store_record_superseding(original, {}));
     ASSERT_TRUE(store.persist_records());
 
-    SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
+    SendspinPairingRecord replacement = make_client_record("server-X");
     ASSERT_TRUE(store.store_record_superseding(replacement, {}));
     ASSERT_TRUE(store.persist_records());
 
@@ -1233,50 +1250,6 @@ TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
 // ============================================================================
 // Pairing PSK lifecycle
 // ============================================================================
-
-/// A persistence provider that hands back a Pairing PSK whose psk_id does not match its secret.
-class MismatchedPairingPskProvider : public SendspinPersistenceProvider {
-public:
-    explicit MismatchedPairingPskProvider(SendspinPairingPsk psk) : psk_(std::move(psk)) {}
-
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        if (key != persistence_keys::PAIRING_PSK) {
-            return std::nullopt;
-        }
-        std::string encoded = encode_pairing_psk(this->psk_);
-        return std::vector<uint8_t>(encoded.begin(), encoded.end());
-    }
-
-    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
-        if (key != persistence_keys::PAIRING_PSK) {
-            return false;
-        }
-        std::string_view text(reinterpret_cast<const char*>(data), len);
-        this->saved = decode_pairing_psk(text);
-        return this->saved.has_value();
-    }
-
-    std::optional<SendspinPairingPsk> saved;
-
-private:
-    SendspinPairingPsk psk_;
-};
-
-TEST(RecordStore, LoadedPairingPskIdIsCorrected) {
-    SendspinPairingPsk stored = make_pairing_psk();
-    const std::string correct_psk_id = stored.psk_id;
-    stored.psk_id = "stale-psk-id";
-    MismatchedPairingPskProvider provider(stored);
-
-    RecordStore store(&provider);
-
-    ASSERT_TRUE(store.pairing_psk().has_value());
-    EXPECT_EQ(store.pairing_psk()->psk_id, correct_psk_id);
-    EXPECT_EQ(store.pairing_psk()->psk, stored.psk) << "the secret itself must be preserved";
-    EXPECT_TRUE(store.resolve_by_psk_id(correct_psk_id, PskCategory::PAIRING).has_value());
-    EXPECT_FALSE(provider.saved.has_value())
-        << "a loaded Pairing PSK must not trigger re-provisioning";
-}
 
 // Where the Pairing PSK comes from: SendspinClientConfig::pairing_psk outranks a stored one, which
 // is then neither read nor written; with none configured the stored one is used; with neither, one
@@ -1357,9 +1330,7 @@ TEST(RecordStore, PairingPskSourcePrecedence) {
                 EXPECT_EQ(provider.save_attempts(persistence_keys::PAIRING_PSK), 1);
                 auto persisted = provider.blob(persistence_keys::PAIRING_PSK);
                 ASSERT_TRUE(persisted.has_value()) << "a generated Pairing PSK must be persisted";
-                auto decoded = decode_pairing_psk(
-                    std::string_view(reinterpret_cast<const char*>(persisted->data()),
-                                     persisted->size()));
+                auto decoded = decode_pairing_psk(persisted->data(), persisted->size());
                 ASSERT_TRUE(decoded.has_value());
                 EXPECT_EQ(decoded->psk, held);
                 break;
@@ -1501,38 +1472,17 @@ TEST(FilePersistenceProvider, PairingRecordRoundTrip) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());
 
-    SendspinPairingRecord rec = make_client_record("server-X", "My Label");
-    std::string encoded = encode_pairing_record(rec);
-    EXPECT_TRUE(provider.save_blob(persistence_keys::record_slot_key(0),
-                                   reinterpret_cast<const uint8_t*>(encoded.data()),
-                                   encoded.size()));
+    SendspinPairingRecord rec = make_client_record("server-X");
+    const std::vector<uint8_t> encoded = record_blob(rec);
+    EXPECT_TRUE(
+        provider.save_blob(persistence_keys::record_slot_key(0), encoded.data(), encoded.size()));
 
     auto decoded = stored_record_in_slot(provider, 0);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->psk_id, rec.psk_id);
     EXPECT_EQ(decoded->psk, rec.psk);
     EXPECT_EQ(decoded->server_id, rec.server_id);
-    EXPECT_EQ(decoded->label, rec.label);
     EXPECT_EQ(decoded->used, rec.used);
-}
-
-// A stored record with no server_id could never satisfy the post-match server check, so its slot
-// is dropped while the neighbouring slot still loads (connection.md "Pre-Shared Key").
-TEST(RecordStore, RecordWithoutServerIdIsSkipped) {
-    InMemoryPersistenceProvider provider;
-    SendspinPairingRecord bound = make_client_record("server-bound");
-    seed_records(provider, {bound, make_client_record("server-unbound")});
-    const std::string unbound =
-        R"({"psk_id":"unbound","psk":")" +
-        base64url_encode(make_random_psk().data(), NOISE_PSK_SIZE) + R"(","used":false})";
-    provider.seed_blob(persistence_keys::record_slot_key(1), blob_bytes(unbound));
-
-    RecordStore store(&provider);
-
-    EXPECT_FALSE(store.resolve_by_psk_id("unbound", PskCategory::LONG_TERM).has_value())
-        << "a record with no server_id must not resolve";
-    EXPECT_TRUE(store.resolve_by_psk_id(bound.psk_id, PskCategory::LONG_TERM).has_value())
-        << "the neighbouring slot must still load";
 }
 
 // erase_blob() reports success for an absent key as well as an erased one, so an application
@@ -1544,9 +1494,8 @@ TEST(FilePersistenceProvider, ClearPairingPskReportsSuccess) {
     SendspinPairingPsk psk;
     psk.psk_id = "pairing-psk-id";
     psk.psk.fill(0x42);
-    std::string psk_encoded = encode_pairing_psk(psk);
-    ASSERT_TRUE(provider.save_blob(persistence_keys::PAIRING_PSK,
-                                   reinterpret_cast<const uint8_t*>(psk_encoded.data()),
+    const auto psk_encoded = encode_pairing_psk(psk);
+    ASSERT_TRUE(provider.save_blob(persistence_keys::PAIRING_PSK, psk_encoded.data(),
                                    psk_encoded.size()));
     ASSERT_TRUE(provider.load_blob(persistence_keys::PAIRING_PSK).has_value());
     EXPECT_TRUE(provider.erase_blob(persistence_keys::PAIRING_PSK));
@@ -1663,12 +1612,12 @@ TEST(RecordStoreWithFile, RemoveRecordEmptiesThePersistedSlot) {
 // ============================================================================
 
 // Normal case: storage is available -> returns {psk, record=set}.
-// The record must be bound to the given server_id/label and carry a psk_id matching the PSK.
+// The record must be bound to the given server_id and carry a psk_id matching the PSK.
 TEST(RecordStore, ResolvePairingOutcomeNormal) {
     RecordStore store(nullptr);
 
-    const std::string server_id = "server-pair-test";
-    auto outcome = store.resolve_pairing_outcome(server_id, "My Hub");
+    const std::string server_id = test_peer_id("server-pair-test");
+    auto outcome = store.resolve_pairing_outcome(server_id);
 
     // PSK must be non-zero (randomly generated).
     bool all_zero = true;
@@ -1680,9 +1629,8 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
     }
     EXPECT_FALSE(all_zero) << "generated PSK should not be all-zero";
 
-    // The record's server_id and label must match what was passed in.
+    // The record's server_id must match what was passed in.
     EXPECT_EQ(outcome.record.server_id, server_id);
-    EXPECT_EQ(outcome.record.label, "My Hub");
 
     // psk_id must be set and match the PSK.
     EXPECT_EQ(outcome.psk, outcome.record.psk);
@@ -1698,11 +1646,11 @@ TEST(RecordStore, ResolvePairingOutcomeMintsOnAFullStore) {
             store.store_record_superseding(make_client_record("server-" + std::to_string(i)), {}));
     }
 
-    auto outcome = store.resolve_pairing_outcome("server-new");
+    auto outcome = store.resolve_pairing_outcome(test_peer_id("server-new"));
 
-    EXPECT_EQ(outcome.record.server_id, "server-new");
+    EXPECT_EQ(outcome.record.server_id, test_peer_id("server-new"));
     EXPECT_EQ(outcome.record.psk_id, psk_id_for(outcome.psk));
-    EXPECT_EQ(store.record_by_server_id("server-new"), nullptr)
+    EXPECT_EQ(store.record_by_server_id(test_peer_id("server-new")), nullptr)
         << "minting alone stores nothing";
 }
 
@@ -1711,7 +1659,7 @@ TEST(RecordStore, ResolvePairingOutcomeMintsOnAFullStore) {
 TEST(RecordStore, ResolvePairingOutcomeThenStore) {
     RecordStore store(nullptr);
 
-    const std::string server_id = "server-store-after";
+    const std::string server_id = test_peer_id("server-store-after");
     auto outcome = store.resolve_pairing_outcome(server_id);
 
     // Simulate the ack path: store the pending record.
@@ -1728,12 +1676,12 @@ TEST(RecordStore, ResolvePairingOutcomeThenStore) {
 }
 
 // ============================================================================
-// Player output delay: ASCII-decimal round-trip via persistence_keys::OUTPUT_DELAY
+// Player output delay: round-trip via persistence_keys::OUTPUT_DELAY
 // ============================================================================
 
-// update_output_delay() must persist an ASCII decimal string (not raw uint16_t bytes):
-// debuggable and endian-free, per persistence_keys::OUTPUT_DELAY's contract.
-TEST(PlayerRoleOutputDelay, PersistsAsAsciiDecimal) {
+// update_output_delay() persists the delay as a native uint16_t, per persistence_keys::OUTPUT_DELAY,
+// and a fresh player over the same provider loads it back.
+TEST(PlayerRoleOutputDelay, PersistsAsANativeUint16) {
     InMemoryPersistenceProvider provider;
     SendspinClientConfig config;
     config.name = "output-delay-round-trip-test";
@@ -1749,8 +1697,10 @@ TEST(PlayerRoleOutputDelay, PersistsAsAsciiDecimal) {
 
     auto blob = provider.blob(persistence_keys::OUTPUT_DELAY);
     ASSERT_TRUE(blob.has_value());
-    EXPECT_EQ(std::string(blob->begin(), blob->end()), "1234")
-        << "output_delay must persist as an ASCII decimal string";
+    ASSERT_EQ(blob->size(), persistence_keys::OUTPUT_DELAY_SIZE);
+    uint16_t stored = 0;
+    std::memcpy(&stored, blob->data(), sizeof(stored));
+    EXPECT_EQ(stored, 1234u);
 
     // And it must load back correctly on a fresh PlayerRole over the same provider.
     SendspinClientConfig config2;
@@ -1765,9 +1715,9 @@ TEST(PlayerRoleOutputDelay, PersistsAsAsciiDecimal) {
     EXPECT_EQ(player2.get_output_delay_ms(), 1234u);
 }
 
-// An unparseable persisted output_delay blob (corrupt bytes, not decimal digits) must be
-// treated as though nothing were saved, falling back to PlayerRoleConfig::initial_output_delay_ms
-// rather than crashing or reinterpreting garbage as a number.
+// A persisted output_delay blob of the wrong size (corrupt bytes) must be treated as though
+// nothing were saved, falling back to PlayerRoleConfig::initial_output_delay_ms rather than
+// reinterpreting garbage as a number.
 TEST(PlayerRoleOutputDelay, InvalidPersistedValueIsTreatedAsAbsent) {
     InMemoryPersistenceProvider provider;
     provider.seed_blob(persistence_keys::OUTPUT_DELAY, blob_bytes("not-a-number"));
@@ -1785,7 +1735,7 @@ TEST(PlayerRoleOutputDelay, InvalidPersistedValueIsTreatedAsAbsent) {
     player.set_output_delay_adjustable(true);
 
     EXPECT_EQ(player.get_output_delay_ms(), 77u)
-        << "an unparseable output_delay blob must be treated as absent, falling back to "
+        << "a wrong-size output_delay blob must be treated as absent, falling back to "
            "initial_output_delay_ms";
 }
 

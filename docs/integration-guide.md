@@ -502,35 +502,38 @@ Every key comes from the `persistence_keys` namespace (`sendspin/client.h`), at 
 characters (comfortably under a typical NVS key's 15-character limit). A provider must not invent its own keys; it only needs to
 store and return whatever bytes the library gives it for each of these:
 
-| Key | Contents |
-|---|---|
-| `persistence_keys::KEYPAIR` | 32 raw bytes: the static X25519 private key. No codec. |
-| `persistence_keys::record_slot_key(n)` | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or an EMPTY blob when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
-| `persistence_keys::RECORD_ORDER` | Raw bytes: the occupied slot numbers, least recently used first, one byte per slot. Decides which record a pairing at capacity evicts. |
-| `persistence_keys::PAIRING_PSK` | The stored `SendspinPairingPsk` as one codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). Never written while `SendspinClientConfig::pairing_psk` is set, which outranks a stored one. |
-| `persistence_keys::LAST_PLAYED` | Raw UTF-8 bytes: the `server_id` (base64url public key) of the last server that played audio. |
-| `persistence_keys::OUTPUT_DELAY` | ASCII decimal string (e.g. `"150"`): the player's output delay in milliseconds. Chosen over raw `uint16_t` bytes for debuggability and to avoid an endianness dependency. |
+Every blob has a fixed size, published beside its key as a `*_SIZE` constant. The library
+always writes exactly that many bytes and treats a stored blob of any other length as absent, so
+a provider can store each key as a fixed-size value. Integers are in the device's native byte
+order: a blob is only ever read back by the device that wrote it.
+
+| Key | Size | Contents |
+|---|---|---|
+| `persistence_keys::KEYPAIR` | `KEYPAIR_SIZE` (32) | The static X25519 private key. |
+| `persistence_keys::record_slot_key(n)` | `RECORD_SLOT_SIZE` (65) | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or 65 zero bytes when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
+| `persistence_keys::RECORD_ORDER` | `max_pairing_records` (12 by default) | The occupied slot numbers, least recently used first, one byte each, then `0xFF` in every remaining position. Decides which record a pairing at capacity evicts. |
+| `persistence_keys::PAIRING_PSK` | `PAIRING_PSK_SIZE` (32) | The stored `SendspinPairingPsk` as a codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). Never written while `SendspinClientConfig::pairing_psk` is set, which outranks a stored one. |
+| `persistence_keys::LAST_PLAYED` | `LAST_PLAYED_SIZE` (32) | The X25519 public key of the last-playback server, the key its base64url `server_id` encodes. |
+| `persistence_keys::OUTPUT_DELAY` | `OUTPUT_DELAY_SIZE` (2) | A `uint16_t`: the player's output delay in milliseconds. |
 
 `sendspin/persistence_codec.h` is public so a custom provider (or a test) can inspect or seed
 the record slot / `PAIRING_PSK` content in exactly the format the library itself
-produces -- it is not something a provider hand-rolls its own version of.
+produces -- it is not something a provider hand-rolls its own version of. A record is its PSK,
+the server's public key and a flags byte; a Pairing PSK blob is the bare PSK. Neither stores its
+`psk_id`, which decoding derives from the PSK.
 
 Only the keys a change actually touches are written: a pairing writes one slot (and the order),
-a revocation writes one slot empty (and the order), and a session that reorders recency writes
-only the order. A provider sizing fixed-length storage can size a slot at **185 bytes**, which
-is what a freshly paired record encodes to -- the first blob every pairing writes, and the larger
-of the two states a record reaches (once its `"used"` flag flips to `true` the blob is one byte
-shorter). A `label`, which only a provider seeding its own record sets, adds 11 bytes plus the
-label's length. The order blob is one byte per stored record.
+a revocation zeroes one slot (and writes the order), and a session that reorders recency writes
+only the order.
 
 #### Durability contract
 
-- `save_blob()` returning `true` means DURABLY stored, including for a zero-length write, which
-  is how a record slot is freed. A `false` return is reported, not retried: the in-memory state
+- `save_blob()` returning `true` means DURABLY stored, including for the zeroed write that frees
+  a record slot. A `false` return is reported, not retried: the in-memory state
   stays authoritative for the current boot. What the rejection costs decides the level: a write
   that changes which records the next boot holds logs a warning naming the key and what will be lost (or come back) at the next reboot, while a
   write the next boot rebuilds by itself (the recency order in `RECORD_ORDER`, a record's
-  `"used"` flag, which flips on the first activate of every long-term session) reports at debug.
+  `used` flag, which flips on the first activate of every long-term session) reports at debug.
   For a record slot specifically: a rejected
   write of a just-paired record leaves the pairing working for this boot only
   (`on_pairing_succeeded` still fires; the record is gone after a reboot), and a rejected write
@@ -541,7 +544,7 @@ label's length. The order blob is one byte per stored record.
   client is paired to the server it evicted, or holds the pre-supersede PSK for a server that has
   already discarded it, which then falls back to unpaired (Sentinel) access.
 - `erase_blob()` is for the application's own use; the library never calls it. Every blob the
-  library owns is rewritten in place or left alone (a removal writes its slot empty rather than
+  library owns is rewritten in place or left alone (a removal zeroes its slot rather than
   erasing the key). The hook is here so an application that wipes the library keyspace itself,
   for example on a factory reset, has a working delete over the same store. Absent counts as
   success.
@@ -589,7 +592,8 @@ struct MyPersistenceProvider : SendspinPersistenceProvider {
 
 A provider backed by a single flat NVS namespace (as above) can often implement the whole
 interface generically, since every key is already sized to fit and the library handles
-serialization; a provider that needs different backing per key (e.g. a plaintext-secrets file
+serialization. A provider on a store of fixed-size values (such as ESPHome's preferences) can
+size each key from its `*_SIZE` constant; a provider that needs different backing per key (e.g. a plaintext-secrets file
 plus separate flash-wear-optimized storage for `OUTPUT_DELAY`) can switch on `key` instead.
 
 ### SendspinClientListener (Optional)

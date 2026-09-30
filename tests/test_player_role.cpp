@@ -31,6 +31,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -465,8 +466,11 @@ namespace {
 // rather than read from the production constant, which is what the clamp is being checked against.
 constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000;
 
-std::vector<uint8_t> to_bytes(const std::string& text) {
-    return std::vector<uint8_t>(text.begin(), text.end());
+// The OUTPUT_DELAY blob holding `delay_ms`: a native uint16_t.
+std::vector<uint8_t> delay_blob(uint16_t delay_ms) {
+    std::vector<uint8_t> blob(sizeof(delay_ms));
+    std::memcpy(blob.data(), &delay_ms, sizeof(delay_ms));
+    return blob;
 }
 
 // A started client whose player persists through `provider`, with the delay knob adjustable so
@@ -490,9 +494,15 @@ struct DelayClient {
     PlayerRole* player{nullptr};
 };
 
-std::string persisted_delay(const InMemoryPersistenceProvider& provider) {
+// The stored delay, or nullopt when no blob of the OUTPUT_DELAY size is stored.
+std::optional<uint16_t> persisted_delay(const InMemoryPersistenceProvider& provider) {
     auto blob = provider.blob(persistence_keys::OUTPUT_DELAY);
-    return blob.has_value() ? std::string(blob->begin(), blob->end()) : std::string();
+    if (!blob.has_value() || blob->size() != sizeof(uint16_t)) {
+        return std::nullopt;
+    }
+    uint16_t delay_ms = 0;
+    std::memcpy(&delay_ms, blob->data(), sizeof(delay_ms));
+    return delay_ms;
 }
 
 }  // namespace
@@ -556,7 +566,8 @@ TEST(PlayerRoleOutputDelay, RequestOverTheSpecMaximumIsClamped) {
 
     fixture.player->update_output_delay(60000);
     EXPECT_EQ(fixture.player->get_output_delay_ms(), MAX_OUTPUT_DELAY_MS);
-    EXPECT_EQ(persisted_delay(provider), "5000") << "the clamped value must be what is stored";
+    EXPECT_EQ(persisted_delay(provider), MAX_OUTPUT_DELAY_MS)
+        << "the clamped value must be what is stored";
 
     // Control: a value inside the range reaches the player unchanged.
     fixture.player->update_output_delay(MAX_OUTPUT_DELAY_MS - 1);
@@ -582,24 +593,24 @@ TEST(PlayerRoleOutputDelay, SettingTheValueItAlreadyHasCostsNoWrite) {
     EXPECT_EQ(provider.save_attempts(persistence_keys::OUTPUT_DELAY), writes + 1);
 }
 
-// A stored blob that parses cleanly but names a delay above the spec maximum is discarded rather
+// A stored blob of the right size that names a delay above the spec maximum is discarded rather
 // than loaded and then reported to the server. The configured initial value is not a fallback
 // here: it applies only when nothing was stored, so a discarded blob leaves the delay at 0.
 TEST(PlayerRoleOutputDelay, PersistedValueIsLoadedOnlyWithinTheSpecRange) {
     struct Row {
         const char* name;
-        const char* stored;
+        uint16_t stored;
         uint16_t expected_delay_ms;
     };
     const Row rows[] = {
-        {"Control: at the spec maximum", "5000", MAX_OUTPUT_DELAY_MS},
-        {"above the spec maximum", "60000", 0},
+        {"Control: at the spec maximum", MAX_OUTPUT_DELAY_MS, MAX_OUTPUT_DELAY_MS},
+        {"above the spec maximum", 60000, 0},
     };
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         InMemoryPersistenceProvider provider;
-        provider.seed_blob(persistence_keys::OUTPUT_DELAY, to_bytes(row.stored));
+        provider.seed_blob(persistence_keys::OUTPUT_DELAY, delay_blob(row.stored));
 
         DelayClient fixture(provider, /*initial_delay_ms=*/77);
         EXPECT_EQ(fixture.player->get_output_delay_ms(), row.expected_delay_ms);

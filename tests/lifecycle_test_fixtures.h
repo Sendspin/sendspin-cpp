@@ -112,8 +112,8 @@ public:
             return seeded_record_blob(this->records_, key);
         }
         if (key == persistence_keys::LAST_PLAYED && !this->last_played_server_id_.empty()) {
-            return std::vector<uint8_t>(this->last_played_server_id_.begin(),
-                                        this->last_played_server_id_.end());
+            // Stored as the public key the id encodes.
+            return blob_bytes(public_key_from_peer_id(this->last_played_server_id_).value());
         }
         return std::nullopt;
     }

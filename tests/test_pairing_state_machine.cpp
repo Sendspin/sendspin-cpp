@@ -46,6 +46,7 @@
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "record_store.h"
+#include "record_test_helpers.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
@@ -2829,28 +2830,30 @@ TEST_F(PairingStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlayba
 // still go through. The provider's write count is the whole observable: what the guard is
 // protecting is the flash the consumer's provider would spend.
 TEST_F(PairingStateMachineTest, PersistLastPlayedServerSkipsDuplicateWrite) {
+    const std::string server_a = test_peer_id("server-a");
+    const std::string server_b = test_peer_id("server-b");
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 0);
 
-    this->persist_last_played_server("server-a");
+    this->persist_last_played_server(server_a);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 1);
 
     // Same server_id again (also covers the post-reboot case, where load_last_played_server()
     // already seeded this value via the same setter): no second write.
-    this->persist_last_played_server("server-a");
+    this->persist_last_played_server(server_a);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 1);
 
     // A different server_id must still go through, and must become the value later calls are
     // deduped against.
-    this->persist_last_played_server("server-b");
+    this->persist_last_played_server(server_b);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
-    this->persist_last_played_server("server-b");
+    this->persist_last_played_server(server_b);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
 
     // An empty server_id is not a handoff to anything: it must neither be written nor become the
     // state a later real handoff is deduped against.
     this->persist_last_played_server("");
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
-    this->persist_last_played_server("server-b");
+    this->persist_last_played_server(server_b);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2)
         << "an empty id must not have displaced the deduped value";
 }
