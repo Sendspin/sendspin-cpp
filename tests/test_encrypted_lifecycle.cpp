@@ -143,20 +143,7 @@ public:
         this->seeded_long_term_record_ = std::move(record);
     }
 
-    /// Sets the unpaired-access value of the pairing config load_blob() serves. A config blob is
-    /// always served, so SendspinClientConfig's first-boot unpaired-access seed never applies and
-    /// this is the way to turn unpaired access on. Must be called before start().
-    void set_unpaired_access_enabled(bool enabled) {
-        this->unpaired_access_enabled_ = enabled;
-    }
-
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        if (key == persistence_keys::PAIR_CONFIG) {
-            SendspinPairingConfig config;
-            config.unpaired_access_enabled = this->unpaired_access_enabled_;
-            std::string encoded = encode_pairing_config(config);
-            return std::vector<uint8_t>(encoded.begin(), encoded.end());
-        }
         if (key == persistence_keys::PAIRING_PSK && this->stored_pairing_psk_.has_value()) {
             std::string encoded = encode_pairing_psk(this->stored_pairing_psk_.value());
             return std::vector<uint8_t>(encoded.begin(), encoded.end());
@@ -169,7 +156,7 @@ public:
 
     bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
         if (!is_record_key(key) || key == persistence_keys::RECORD_ORDER) {
-            return true;  // pair_config and the recency order are not under test here.
+            return true;  // Keys other than the record slots are not under test here.
         }
         // An empty slot write frees that slot and carries no record to capture.
         auto decoded = decode_pairing_record(std::string_view(
@@ -213,7 +200,6 @@ private:
     bool reject_pairing_records_{false};
     std::optional<SendspinPairingPsk> stored_pairing_psk_;
     std::optional<SendspinPairingRecord> seeded_long_term_record_;
-    bool unpaired_access_enabled_{false};
 };
 
 // Records on_trust_changed / on_pairing_succeeded notifications so the pairing-flow test can
@@ -297,8 +283,9 @@ private:
 // Tests
 // ============================================================================
 
-// Seeds a client whose Pairing PSK is stored and whose unpaired access is on, which is what
-// messaging.md "server/activate" requires before a pairing-PSK connection may declare playback.
+// Seeds a stored Pairing PSK a fake server can connect on directly. A test whose pairing-PSK
+// connection declares playback also calls set_unpaired_access_enabled(true), which
+// messaging.md "server/activate" requires for that.
 SendspinPairingPsk seed_pairing_psk(PairingCapturePersistenceProvider& persistence, uint8_t base) {
     std::array<uint8_t, 32> psk_bytes{};
     for (size_t i = 0; i < psk_bytes.size(); ++i) {
@@ -308,7 +295,6 @@ SendspinPairingPsk seed_pairing_psk(PairingCapturePersistenceProvider& persisten
     psk.psk_id = psk_id_for(psk_bytes);
     psk.psk = psk_bytes;
     persistence.set_stored_pairing_psk(psk);
-    persistence.set_unpaired_access_enabled(true);
     return psk;
 }
 
@@ -1106,6 +1092,7 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
 
     CountingPlayerListener player_listener;
     SendspinClient client(config);
+    client.set_unpaired_access_enabled(true);
     client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     auto& controller = client.add_controller();
     client.set_network_provider(&network);
@@ -1451,6 +1438,7 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
     config.server_port = COMBINED_FIRST_TEST_PORT;
 
     SendspinClient client(config);
+    client.set_unpaired_access_enabled(true);
     auto& controller = client.add_controller();
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
@@ -1508,11 +1496,10 @@ TEST(EncryptedLifecycle, ActivateThatLosesPlaybackCapabilityRemovesTheRoles) {
     PairedPeer long_term_peer = make_paired_peer();
     long_term_peer.record.server_id = server_identity.peer_id();
     persistence.set_seeded_long_term_record(long_term_peer.record);
+    // With unpaired access off (its default), messaging.md "server/activate" allows a
+    // pairing-PSK connection no activity set that includes playback, so declaring pairing alone
+    // is what takes this connection's playback capability away.
     const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xC5);
-    // Without unpaired access, messaging.md "server/activate" allows a pairing-PSK connection no
-    // activity set that includes playback, so declaring pairing alone is what takes this
-    // connection's playback capability away.
-    persistence.set_unpaired_access_enabled(false);
 
     SendspinClientConfig config;
     config.name = "Lost Capability Test Client";
@@ -1584,6 +1571,7 @@ TEST(EncryptedLifecycle, CombinedActivateAfterARehandshakeGoesOperationalAndEnte
     config.server_port = COMBINED_REKEY_TEST_PORT;
 
     SendspinClient client(config);
+    client.set_unpaired_access_enabled(true);
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
@@ -2353,15 +2341,10 @@ TEST(EncryptedLifecycle, PairFinalizeDoesNotDeadlockAgainstAnAdmission) {
 // comment), so it cannot show what a removal persists; InMemoryPersistenceProvider accepts them
 // and counts the writes per key, which is what the coalescing tests below read.
 /// @param records The records to seed, least recently used first.
-/// @param unpaired_access_enabled Seeds the stored pairing config, which outranks
-///        SendspinClientConfig's first-boot unpaired-access seed.
 std::unique_ptr<InMemoryPersistenceProvider> make_record_store_provider(
-    const std::vector<SendspinPairingRecord>& records, bool unpaired_access_enabled = false) {
+    const std::vector<SendspinPairingRecord>& records) {
     auto provider = std::make_unique<InMemoryPersistenceProvider>();
     seed_records(*provider, records);
-    SendspinPairingConfig config;
-    config.unpaired_access_enabled = unpaired_access_enabled;
-    provider->seed_blob(persistence_keys::PAIR_CONFIG, blob_bytes(encode_pairing_config(config)));
     return provider;
 }
 
@@ -2710,13 +2693,14 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     SendspinPairingRecord paired_record = make_record_for(paired_identity);
 
     TestNetworkProvider network;
-    auto provider = make_record_store_provider({paired_record}, /*unpaired_access_enabled=*/true);
+    auto provider = make_record_store_provider({paired_record});
     InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
     config.name = "Unpair Sentinel Test Client";
     config.server_port = UNPAIR_SENTINEL_TEST_PORT;
 
     SendspinClient client(config);
+    client.set_unpaired_access_enabled(true);
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
@@ -2830,7 +2814,7 @@ public:
 
     bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
         if (!is_record_key(key)) {
-            return true;  // The keypair and pairing config must not park the tick.
+            return true;  // Keys other than the record slots must not park the tick.
         }
         std::unique_lock<std::mutex> lock(this->mutex_);
         this->entered_ = true;
@@ -2925,27 +2909,12 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     pump_for(client, 100);
 }
 
-/// The unpaired-access setting the client last persisted; nullopt when no config blob decodes.
-std::optional<bool> stored_unpaired_access(InMemoryPersistenceProvider& persistence) {
-    auto blob = persistence.load_blob(persistence_keys::PAIR_CONFIG);
-    if (!blob.has_value()) {
-        return std::nullopt;
-    }
-    auto config = decode_pairing_config(
-        std::string_view(reinterpret_cast<const char*>(blob->data()), blob->size()));
-    if (!config.has_value()) {
-        return std::nullopt;
-    }
-    return config->unpaired_access_enabled;
-}
-
 // pairing.md "Unpaired Access" on one live client. Turning the setting on restarts an idle
 // unpaired session so its server reconnects and reads the new value in the hello; turning it off
 // closes the session that came back with playback, since only the setting was admitting it.
 TEST(EncryptedLifecycle, TogglingUnpairedAccessBringsTheUnpairedSessionInLine) {
     TestNetworkProvider network;
-    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
-    InMemoryPersistenceProvider& persistence = *provider;
+    InMemoryPersistenceProvider persistence;
     SendspinClientConfig config;
     config.name = "Unpaired Toggle Test Client";
     config.server_port = UNPAIRED_TOGGLE_TEST_PORT;
@@ -2968,7 +2937,6 @@ TEST(EncryptedLifecycle, TogglingUnpairedAccessBringsTheUnpairedSessionInLine) {
 
     client.set_unpaired_access_enabled(true);
     EXPECT_TRUE(client.is_unpaired_access_enabled());
-    EXPECT_EQ(stored_unpaired_access(persistence), std::optional<bool>(true));
     pump_until(client, [&] { return held.closed(); });
     EXPECT_EQ(held.goodbye_reason(), std::optional<std::string>("restart"));
 
@@ -2978,9 +2946,14 @@ TEST(EncryptedLifecycle, TogglingUnpairedAccessBringsTheUnpairedSessionInLine) {
     pump_until(client, [&] { return client.is_connected(); });
     EXPECT_EQ(playing.hello_unpaired_access(), std::optional<bool>(true));
 
+    // Setting the current value is not a change. Must-not-happen window: a restart would close
+    // the session within a tick of the call.
+    client.set_unpaired_access_enabled(true);
+    pump_for(client, 300);
+    EXPECT_FALSE(playing.closed()) << "re-setting the current value restarted the session";
+
     client.set_unpaired_access_enabled(false);
     EXPECT_FALSE(client.is_unpaired_access_enabled());
-    EXPECT_EQ(stored_unpaired_access(persistence), std::optional<bool>(false));
     pump_until(client, [&] { return playing.closed(); });
     EXPECT_EQ(playing.goodbye_reason(), std::optional<std::string>("pairing_required"));
     EXPECT_FALSE(client.is_connected());
@@ -2998,7 +2971,6 @@ TEST(EncryptedLifecycle, UnpairedAccessChangesLeavePairedAndPairingSessionsAlone
     long_term_peer.record.server_id = server_identity.peer_id();
     persistence.set_seeded_long_term_record(long_term_peer.record);
     const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xD1);
-    persistence.set_unpaired_access_enabled(false);
 
     SendspinClientConfig config;
     config.name = "Unpaired Toggle Control Test Client";
@@ -3047,14 +3019,14 @@ TEST(EncryptedLifecycle, UnpairedAccessChangesLeavePairedAndPairingSessionsAlone
 // enabling unpaired access restarts it as it does an admitted one.
 TEST(EncryptedLifecycle, EnablingUnpairedAccessRestartsAnUnpairedSessionStillInTheNursery) {
     TestNetworkProvider network;
-    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
+    InMemoryPersistenceProvider persistence;
     SendspinClientConfig config;
     config.name = "Unpaired Toggle Nursery Test Client";
     config.server_port = UNPAIRED_TOGGLE_NURSERY_TEST_PORT;
 
     SendspinClient client(config);
     client.set_network_provider(&network);
-    client.set_persistence_provider(provider.get());
+    client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
     pump_for(client, 50);
 
@@ -3075,14 +3047,14 @@ TEST(EncryptedLifecycle, EnablingUnpairedAccessRestartsAnUnpairedSessionStillInT
 // Enabling unpaired access keeps a connect_to() session open.
 TEST(EncryptedLifecycle, EnablingUnpairedAccessKeepsAnOutboundUnpairedSession) {
     TestNetworkProvider network;
-    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
+    InMemoryPersistenceProvider persistence;
     SendspinClientConfig config;
     config.name = "Unpaired Toggle Outbound Test Client";
     config.server_port = UNPAIRED_TOGGLE_OUTBOUND_TEST_PORT;
 
     SendspinClient client(config);
     client.set_network_provider(&network);
-    client.set_persistence_provider(provider.get());
+    client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
     pump_for(client, 50);
 
@@ -3109,14 +3081,14 @@ TEST(EncryptedLifecycle, EnablingUnpairedAccessKeepsAnOutboundUnpairedSession) {
 // activation that follows it.
 TEST(EncryptedLifecycle, UnpairedAccessChangesWaitOutARehandshake) {
     TestNetworkProvider network;
-    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
+    InMemoryPersistenceProvider persistence;
     SendspinClientConfig config;
     config.name = "Unpaired Toggle Rekey Test Client";
     config.server_port = UNPAIRED_TOGGLE_REKEY_TEST_PORT;
 
     SendspinClient client(config);
     client.set_network_provider(&network);
-    client.set_persistence_provider(provider.get());
+    client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
     pump_for(client, 50);
 
@@ -3142,31 +3114,72 @@ TEST(EncryptedLifecycle, UnpairedAccessChangesWaitOutARehandshake) {
     pump_for(client, 100);
 }
 
-// The setting lives in the stored pairing config, so it can change only once a start() has
-// loaded that config, and a change made while stopped persists and survives the next start().
-TEST(EncryptedLifecycle, UnpairedAccessCanChangeWhileStoppedButNotBeforeTheFirstStart) {
+// pairing.md "Unpaired Access": the device decides the setting. It is off until
+// set_unpaired_access_enabled() turns it on, which works at any time, before the first start() and
+// while stopped included; the next start() advertises and admits against the current value. The
+// library persists none of it.
+TEST(EncryptedLifecycle, UnpairedAccessIsOffUntilSetAndIsNeverPersisted) {
     TestNetworkProvider network;
-    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
+    InMemoryPersistenceProvider persistence;
+    const Identity identity = Identity::generate().value();
+
+    // An unpaired server declaring playback: admitted only while unpaired access is on.
+    auto expect_unpaired_playback = [&](SendspinClient& client, bool admitted) {
+        pump_for(client, 50);
+        FakeEncryptedServer server(server_url(UNPAIRED_TOGGLE_STOPPED_TEST_PORT),
+                                   std::string(NOISE_SUITE_CHACHAPOLY), identity,
+                                   std::string(SENTINEL_PSK_ID), SENTINEL_PSK);
+        pump_until(client, [&] { return client.is_connected() || server.closed(); });
+        EXPECT_EQ(client.is_connected(), admitted);
+        if (!admitted) {
+            EXPECT_EQ(server.goodbye_reason(), std::optional<std::string>("pairing_required"));
+        }
+        EXPECT_EQ(server.hello_unpaired_access(), std::optional<bool>(admitted));
+        client.stop();
+    };
+
     SendspinClientConfig config;
-    config.name = "Unpaired Toggle Stopped Test Client";
+    config.name = "Unpaired Access Setter Test Client";
     config.server_port = UNPAIRED_TOGGLE_STOPPED_TEST_PORT;
 
     SendspinClient client(config);
     client.set_network_provider(&network);
-    client.set_persistence_provider(provider.get());
-
-    client.set_unpaired_access_enabled(true);
+    client.set_persistence_provider(&persistence);
     EXPECT_FALSE(client.is_unpaired_access_enabled());
     ASSERT_TRUE(client.start());
-    EXPECT_FALSE(client.is_unpaired_access_enabled())
-        << "a call before the first start() must not reach the loaded config";
-    EXPECT_EQ(stored_unpaired_access(*provider), std::optional<bool>(false));
+    {
+        SCOPED_TRACE("off with no call");
+        expect_unpaired_playback(client, false);
+    }
+    // Control: the provider does record the library's own writes.
+    EXPECT_GT(persistence.save_attempts(persistence_keys::KEYPAIR), 0);
 
-    client.stop();
+    size_t saves = persistence.saved_keys().size();
     client.set_unpaired_access_enabled(true);
-    EXPECT_EQ(stored_unpaired_access(*provider), std::optional<bool>(true));
+    EXPECT_EQ(persistence.saved_keys().size(), saves) << "the setter persisted something";
     ASSERT_TRUE(client.start());
-    EXPECT_TRUE(client.is_unpaired_access_enabled());
+    {
+        SCOPED_TRACE("the setter while stopped");
+        expect_unpaired_playback(client, true);
+    }
 
-    client.stop();
+    SendspinClient fresh(config);
+    fresh.set_network_provider(&network);
+    fresh.set_persistence_provider(&persistence);
+    saves = persistence.saved_keys().size();
+    fresh.set_unpaired_access_enabled(true);
+    EXPECT_EQ(persistence.saved_keys().size(), saves) << "the setter persisted something";
+    EXPECT_TRUE(fresh.is_unpaired_access_enabled());
+    ASSERT_TRUE(fresh.start());
+    {
+        SCOPED_TRACE("the setter before the first start()");
+        expect_unpaired_playback(fresh, true);
+    }
+
+    // Only state the library generates or learns reaches the provider.
+    for (const std::string& key : persistence.saved_keys()) {
+        EXPECT_TRUE(key == persistence_keys::KEYPAIR || key == persistence_keys::PAIRING_PSK ||
+                    key == persistence_keys::LAST_PLAYED || is_record_key(key))
+            << "unexpected persisted key " << key;
+    }
 }

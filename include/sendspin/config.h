@@ -95,14 +95,6 @@ struct SendspinPairingPsk {
     }
 };
 
-/// @brief Pairing policy the client persists under `persistence_keys::PAIR_CONFIG`, changed at
-/// runtime through SendspinClient::set_unpaired_access_enabled().
-struct SendspinPairingConfig {
-    /// @brief Whether servers with no pairing record may declare playback and active roles
-    /// (pairing.md "Unpaired Access").
-    bool unpaired_access_enabled{false};
-};
-
 // ============================================================================
 // Client config
 // ============================================================================
@@ -195,20 +187,6 @@ struct SendspinClientConfig {
     /// "device", "leaflet", "operator". Advertised as the informational `locations` hint on the
     /// static_pairing_code descriptor in client/hello; empty = omit the hint.
     std::vector<std::string> static_pairing_code_locations{};
-
-    /// @brief First-boot default for unpaired (Sentinel) access.
-    /// Seeds `SendspinPairingConfig::unpaired_access_enabled` only on a genuine first boot; the
-    /// seeded value is then written through the persistence provider. Once a config exists the
-    /// stored value always wins; SendspinClient::set_unpaired_access_enabled() changes it at
-    /// runtime. With no persistence provider there is no stored config, so this value applies on
-    /// every start.
-    /// A config that fails to load does not count as a first boot when any stored material (a
-    /// pairing record or a stored Pairing PSK) survived: the seed is skipped and unpaired access
-    /// stays disabled, so a damaged config fails closed. A `pairing_psk` set here is not stored
-    /// material and never vetoes the seed, so a device with one and no pairing records cannot
-    /// tell a lost config from a first boot and applies this value again. See the integration
-    /// guide.
-    bool initial_unpaired_access_enabled{false};
 
     /// @brief Default maximum number of long-term pairing records the store retains. Each record
     /// occupies its own persistence key of at most 185 bytes plus a label, so the cap sets how

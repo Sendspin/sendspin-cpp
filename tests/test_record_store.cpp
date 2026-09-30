@@ -22,7 +22,7 @@
 //
 // The persistence provider is a blob store (SendspinPersistenceProvider::load_blob /
 // save_blob / erase_blob); RecordStore and FilePersistenceProvider are pure byte stores for the
-// record slot / "pairing_psk" / "pair_config" keys, so tests that need to inspect or shape what
+// record slot / "pairing_psk" keys, so tests that need to inspect or shape what
 // is actually stored go through the codec in sendspin/persistence_codec.h and the slot helpers
 // in record_test_helpers.h, exactly like production code does. Most fakes here share
 // tests/fake_persistence.h's InMemoryPersistenceProvider; a handful of tests need bespoke
@@ -151,15 +151,12 @@ public:
             record_save_attempts++;
         } else if (key == persistence_keys::PAIRING_PSK) {
             psk_save_attempts++;
-        } else if (key == persistence_keys::PAIR_CONFIG) {
-            config_save_attempts++;
         }
         return false;
     }
 
     int record_save_attempts{0};
     int psk_save_attempts{0};
-    int config_save_attempts{0};
 };
 
 // A provider that rejects every write during first-boot provisioning must not be silently
@@ -170,7 +167,6 @@ TEST(RecordStore, FirstBootProvisioningSurvivesPersistenceFailureForThisBoot) {
     RecordStore store(&provider);
 
     EXPECT_EQ(provider.record_save_attempts, 0) << "a first boot has no record to persist";
-    EXPECT_GE(provider.config_save_attempts, 1) << "the pairing config write must be attempted";
     EXPECT_GE(provider.psk_save_attempts, 1) << "the Pairing PSK write must have been attempted";
 
     // Despite every write being rejected, the device remains usable for this boot: the Pairing
@@ -198,15 +194,11 @@ TEST(RecordStore, BootsFromBlobStoreSeededViaCodec) {
     std::string psk_blob = encode_pairing_psk(psk);
     provider.seed_blob(persistence_keys::PAIRING_PSK, blob_bytes(psk_blob));
 
-    SendspinPairingConfig cfg;
-    cfg.unpaired_access_enabled = true;
-    std::string cfg_blob = encode_pairing_config(cfg);
-    provider.seed_blob(persistence_keys::PAIR_CONFIG, blob_bytes(cfg_blob));
-
     RecordStore store(&provider);
 
-    EXPECT_TRUE(store.unpaired_access_enabled());
     EXPECT_EQ(provider.save_attempts(persistence_keys::record_slot_key(0)), 0)
+        << "a fully-seeded store must not trigger first-boot re-provisioning";
+    EXPECT_EQ(provider.save_attempts(persistence_keys::PAIRING_PSK), 0)
         << "a fully-seeded store must not trigger first-boot re-provisioning";
 
     auto resolved_paired = store.resolve_by_psk_id(paired.psk_id, PskCategory::LONG_TERM);
@@ -1286,8 +1278,8 @@ TEST(RecordStore, LoadedPairingPskIdIsCorrected) {
         << "a loaded Pairing PSK must not trigger re-provisioning";
 }
 
-// Where the Pairing PSK comes from: SendspinClientConfig::pairing_psk outranks a stored one and is
-// never written to the provider; with none configured the stored one is used; with neither, one
+// Where the Pairing PSK comes from: SendspinClientConfig::pairing_psk outranks a stored one, which
+// is then neither read nor written; with none configured the stored one is used; with neither, one
 // is generated and persisted (pairing.md "Pairing PSK Flow"). A stored key any peer could hold
 // (all zero, or the published Sentinel PSK) counts as none stored. Whatever the source, the store
 // derives its psk_id and resolves it as the PAIRING category.
@@ -1344,6 +1336,10 @@ TEST(RecordStore, PairingPskSourcePrecedence) {
                 EXPECT_EQ(held, configured.bytes);
                 EXPECT_EQ(provider.save_attempts(persistence_keys::PAIRING_PSK), 0)
                     << "a configured Pairing PSK must never reach the provider";
+                // Read on the fake: an unread stored blob and a read-then-outranked one leave
+                // the same observable store, so only the call itself tells them apart.
+                EXPECT_EQ(provider.load_attempts(persistence_keys::PAIRING_PSK), 0)
+                    << "a configured Pairing PSK makes the stored one irrelevant";
                 EXPECT_EQ(provider.blob(persistence_keys::PAIRING_PSK), stored_blob)
                     << "a stored Pairing PSK the configured one outranks is left as it was";
                 EXPECT_FALSE(
@@ -1578,26 +1574,6 @@ TEST(FilePersistenceProvider, LastPlayedServerIdRoundTrip) {
     EXPECT_EQ(std::string(loaded->begin(), loaded->end()), server_id);
 }
 
-TEST(FilePersistenceProvider, PairingConfigRoundTrip) {
-    TempFile tmp;
-    FilePersistenceProvider provider(tmp.path());
-
-    SendspinPairingConfig cfg;
-    cfg.unpaired_access_enabled = true;
-
-    std::string encoded = encode_pairing_config(cfg);
-    EXPECT_TRUE(provider.save_blob(persistence_keys::PAIR_CONFIG,
-                                   reinterpret_cast<const uint8_t*>(encoded.data()),
-                                   encoded.size()));
-
-    auto blob = provider.load_blob(persistence_keys::PAIR_CONFIG);
-    ASSERT_TRUE(blob.has_value());
-    std::string_view text(reinterpret_cast<const char*>(blob->data()), blob->size());
-    auto loaded = decode_pairing_config(text);
-    ASSERT_TRUE(loaded.has_value());
-    EXPECT_EQ(loaded->unpaired_access_enabled, true);
-}
-
 // The persistence file holds plaintext secrets (static private key, long-term PSKs, Pairing PSK),
 // so it must never be group/world readable regardless of the process umask. This is host-only
 // POSIX, matching how examples/common/file_persistence_provider.cpp itself creates the file.
@@ -1680,153 +1656,6 @@ TEST(RecordStoreWithFile, RemoveRecordEmptiesThePersistedSlot) {
     }
     EXPECT_FALSE(found_a) << "a removed record must not survive in its persisted slot";
     EXPECT_TRUE(found_b);
-}
-
-// ============================================================================
-// Unpaired-access first-boot seed
-// ============================================================================
-
-/// A persistence provider that hands back a canned pairing config, so a test can present a
-/// stored config without a first boot ever having written one. FilePersistenceProvider cannot:
-/// it collapses an absent file into "nothing stored", which is the first-boot case itself.
-class CannedConfigProvider : public SendspinPersistenceProvider {
-public:
-    explicit CannedConfigProvider(SendspinPairingConfig config) : config_(std::move(config)) {}
-
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        if (key != persistence_keys::PAIR_CONFIG) {
-            return std::nullopt;
-        }
-        std::string encoded = encode_pairing_config(this->config_);
-        return std::vector<uint8_t>(encoded.begin(), encoded.end());
-    }
-
-    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
-        if (key != persistence_keys::PAIR_CONFIG) {
-            return false;
-        }
-        std::string_view text(reinterpret_cast<const char*>(data), len);
-        auto decoded = decode_pairing_config(text);
-        if (decoded.has_value()) {
-            this->config_ = decoded.value();
-        }
-        return decoded.has_value();
-    }
-
-private:
-    SendspinPairingConfig config_;
-};
-
-// No provider means no stored config to load, so the constructor seed is the whole answer and
-// it defaults off.
-TEST(RecordStore, UnpairedAccessSeedIsTheWholeAnswerWithoutAProvider) {
-    EXPECT_FALSE(RecordStore(nullptr).unpaired_access_enabled());
-    EXPECT_TRUE(RecordStore(nullptr, {.initial_unpaired_access_enabled = true})
-                    .unpaired_access_enabled());
-}
-
-TEST(RecordStore, UnpairedAccessSeedYieldsToLoadedConfig) {
-    SendspinPairingConfig stored;
-    stored.unpaired_access_enabled = false;
-    CannedConfigProvider provider(stored);
-
-    RecordStore store(&provider, {.initial_unpaired_access_enabled = true});
-
-    EXPECT_FALSE(store.unpaired_access_enabled())
-        << "a loaded config outranks the first-boot seed";
-}
-
-// A missing or undecodable pair_config blob is not proof of a first boot: the interface cannot
-// distinguish "never stored" from "could not be read back". Stored material that survived (a
-// record or a stored Pairing PSK) proves an earlier boot, so re-seeding unpaired access ON there
-// would reopen unauthenticated access on a device whose operator may have turned it off. A
-// configured Pairing PSK proves nothing: it is present on the first boot too, and neither does an
-// all-zero stored one, which the store treats as absent like a blob that fails to decode. No row
-// stores a pairing config, which is the shape of a config lost independently of the other keys.
-TEST(RecordStore, UnpairedAccessSeedAppliesOnlyWhenNoStoredMaterialSurvived) {
-    enum class StoredPsk : uint8_t { NONE, USABLE, ALL_ZERO };
-    struct Row {
-        const char* name;
-        bool record;
-        StoredPsk stored_psk;
-        bool configured_psk;
-        bool expect_seeded;
-    };
-    const Row rows[] = {
-        {"Control: nothing stored", false, StoredPsk::NONE, false, true},
-        {"only a configured Pairing PSK", false, StoredPsk::NONE, true, true},
-        {"a surviving record", true, StoredPsk::NONE, false, false},
-        {"a stored Pairing PSK", false, StoredPsk::USABLE, false, false},
-        {"a stored all-zero Pairing PSK", false, StoredPsk::ALL_ZERO, false, true},
-        {"a stored Pairing PSK beside a configured one", false, StoredPsk::USABLE, true, false},
-        {"a surviving record beside a configured Pairing PSK", true, StoredPsk::NONE, true, false},
-    };
-
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        InMemoryPersistenceProvider provider;
-        if (row.record) {
-            seed_records(provider, {make_client_record("server-1")});
-        }
-        if (row.stored_psk != StoredPsk::NONE) {
-            SendspinPairingPsk stored = make_pairing_psk();
-            if (row.stored_psk == StoredPsk::ALL_ZERO) {
-                stored.psk.fill(0);
-                stored.psk_id = psk_id_for(stored.psk);
-            }
-            provider.seed_blob(persistence_keys::PAIRING_PSK,
-                               blob_bytes(encode_pairing_psk(stored)));
-        }
-        const std::optional<SendspinPsk> configured =
-            row.configured_psk ? std::optional<SendspinPsk>(SendspinPsk(make_random_psk()))
-                               : std::nullopt;
-
-        RecordStore store(&provider,
-                          {.pairing_psk = configured, .initial_unpaired_access_enabled = true});
-
-        EXPECT_EQ(store.unpaired_access_enabled(), row.expect_seeded);
-    }
-}
-
-TEST(RecordStoreWithFile, UnpairedAccessSeedPersistsOnFirstBoot) {
-    TempFile tmp;
-
-    {
-        FilePersistenceProvider provider(tmp.path());
-        RecordStore store(&provider, {.initial_unpaired_access_enabled = true});
-        EXPECT_TRUE(store.unpaired_access_enabled());
-    }
-
-    // The seeded value must have been written through, so a later boot that passes no seed
-    // still comes up with unpaired access enabled.
-    {
-        FilePersistenceProvider provider(tmp.path());
-        RecordStore store(&provider);
-        EXPECT_TRUE(store.unpaired_access_enabled());
-    }
-}
-
-TEST(RecordStoreWithFile, UnpairedAccessSeedDoesNotOverrideStoredConfig) {
-    TempFile tmp;
-
-    // A device provisioned with unpaired access off already has a stored config saying so.
-    {
-        FilePersistenceProvider provider(tmp.path());
-        SendspinPairingConfig stored;
-        stored.unpaired_access_enabled = false;
-        std::string blob = encode_pairing_config(stored);
-        ASSERT_TRUE(provider.save_blob(persistence_keys::PAIR_CONFIG,
-                                       reinterpret_cast<const uint8_t*>(blob.data()),
-                                       blob.size()));
-    }
-
-    // Reboot with the same seed still configured: the stored decision wins.
-    {
-        FilePersistenceProvider provider(tmp.path());
-        RecordStore store(&provider, {.initial_unpaired_access_enabled = true});
-        EXPECT_FALSE(store.unpaired_access_enabled())
-            << "a persisted config must outrank the first-boot seed";
-    }
 }
 
 // ============================================================================
@@ -2009,8 +1838,7 @@ TEST(SendspinClientStart, RejectsUnusableConfiguredPairingSecrets) {
         EXPECT_EQ(client.is_started(), row.expect_started);
         if (!row.expect_started) {
             // Refused before anything is built, so nothing reached the provider.
-            for (const char* key : {persistence_keys::KEYPAIR, persistence_keys::PAIRING_PSK,
-                                    persistence_keys::PAIR_CONFIG}) {
+            for (const char* key : {persistence_keys::KEYPAIR, persistence_keys::PAIRING_PSK}) {
                 EXPECT_EQ(provider.save_attempts(key), 0) << key;
             }
             EXPECT_FALSE(client.start()) << "the config is fixed, so a retry is refused too";
@@ -2118,8 +1946,7 @@ TEST(PskZeroization, EveryPskCarryingStructWipesOnDestruction) {
 // the writer is doing to the rest of the array.
 TEST(RecordStoreConcurrency, ResolveByPskIdDoesNotRaceRecordStores) {
     InMemoryPersistenceProvider provider;
-    RecordStore store(&provider,
-                      {.initial_unpaired_access_enabled = true, .max_pairing_records = 64});
+    RecordStore store(&provider, {.max_pairing_records = 64});
 
     // Both threads work over an overlapping server_id space so the reader's scan and the
     // writer's supersede-erase touch the same entries.
@@ -2234,8 +2061,7 @@ private:
 
 TEST(RecordStoreConcurrency, ResolveRunsWhileARecordsWriteIsInFlight) {
     BlockingRecordsProvider provider;
-    RecordStore store(&provider,
-                      {.initial_unpaired_access_enabled = true, .max_pairing_records = 8});
+    RecordStore store(&provider, {.max_pairing_records = 8});
 
     SendspinPairingRecord record = make_client_record("blocking-write-server");
     const std::string psk_id = record.psk_id;

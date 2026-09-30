@@ -720,7 +720,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         return;
     }
 
-    const bool unpaired_access = this->client_->record_store_->unpaired_access_enabled();
+    const bool unpaired_access = this->client_->unpaired_access_enabled_;
 
     // Compute the effective active_roles (sticky: nullopt keeps the prior set), except
     // when this activate omits active_roles and its activities are no longer

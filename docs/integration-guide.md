@@ -491,11 +491,10 @@ from the next `loop()` tick.)
 No internal library lock is held across the call, so a slow write does not stall the audio path
 or a Noise handshake -- but it does stop the main loop for its duration, so the call must be one
 bounded storage operation, and it must not call back into the client.
-First-boot provisioning writes from inside `start()` rather than in response to a runtime
-event: `save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored,
+Provisioning writes from inside `start()` rather than in response to a runtime event:
+`save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored, and
 `save_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored and none is
-configured, and `save_blob(persistence_keys::PAIR_CONFIG, ...)` when no pairing config could be
-decoded.
+configured.
 
 #### Keyspace
 
@@ -509,12 +508,11 @@ store and return whatever bytes the library gives it for each of these:
 | `persistence_keys::record_slot_key(n)` | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or an EMPTY blob when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
 | `persistence_keys::RECORD_ORDER` | Raw bytes: the occupied slot numbers, least recently used first, one byte per slot. Decides which record a pairing at capacity evicts. |
 | `persistence_keys::PAIRING_PSK` | The stored `SendspinPairingPsk` as one codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). Never written while `SendspinClientConfig::pairing_psk` is set, which outranks a stored one. |
-| `persistence_keys::PAIR_CONFIG` | The `SendspinPairingConfig` (the unpaired-access flag) as one codec blob (`encode_pairing_config()` / `decode_pairing_config()`). |
 | `persistence_keys::LAST_PLAYED` | Raw UTF-8 bytes: the `server_id` (base64url public key) of the last server that played audio. |
 | `persistence_keys::OUTPUT_DELAY` | ASCII decimal string (e.g. `"150"`): the player's output delay in milliseconds. Chosen over raw `uint16_t` bytes for debuggability and to avoid an endianness dependency. |
 
 `sendspin/persistence_codec.h` is public so a custom provider (or a test) can inspect or seed
-the record slot / `PAIRING_PSK` / `PAIR_CONFIG` content in exactly the format the library itself
+the record slot / `PAIRING_PSK` content in exactly the format the library itself
 produces -- it is not something a provider hand-rolls its own version of.
 
 Only the keys a change actually touches are written: a pairing writes one slot (and the order),
@@ -914,41 +912,26 @@ unpaired access is disabled) do not fire this callback.
 
 By default only paired servers (long-term record) and servers holding the accepted Pairing
 PSK are admitted. Servers that only know the Sentinel PSK (no pairing required) are admitted
-when unpaired access is enabled, and the setting lives in the persisted
-`SendspinPairingConfig`.
-
-To ship a device that allows unpaired access out of the box, set the first-boot default in
-`SendspinClientConfig`:
+when unpaired access is enabled. `pairing.md` "Unpaired Access" makes the default the
+manufacturer's choice and a change a local action on the device, so the application owns the
+setting. It is off until `set_unpaired_access_enabled()` turns it on:
 
 ```cpp
-SendspinClientConfig config;
-config.initial_unpaired_access_enabled = true;
-```
-
-The seed applies only on a genuine first boot, and the seeded value is written through the
-persistence provider then. On every later start the stored config wins, so unpaired access stays
-off across reboots once it has been turned off. With no persistence provider there is no stored
-config, so the seed applies on every start.
-
-A config that fails to load is not treated as a first boot. The library's internal load of the
-`persistence_keys::PAIR_CONFIG` blob is treated as "nothing stored" both when the key is truly
-absent and when the stored blob fails to decode, and the interface gives a provider no way to
-tell the client which happened. If any stored material survives (a pairing record or a stored
-Pairing PSK), the seed is skipped and unpaired access stays disabled, so a damaged config on a
-paired device fails closed rather than silently reopening unauthenticated access. A Pairing PSK
-set in `SendspinClientConfig::pairing_psk` does not count, since it is present on the first boot
-too, so a device with one and no pairing records treats a lost config as a first boot and applies
-`initial_unpaired_access_enabled` again. A store that lost everything is indistinguishable from a
-factory-fresh device, so the seed does apply there.
-
-To change the setting at runtime, for example from an operator switch, call
-`set_unpaired_access_enabled()` on the main loop thread. It persists the new value and applies it
-to the live connections as `pairing.md` "Unpaired Access" describes:
-
-```cpp
-client.set_unpaired_access_enabled(false);
+client.set_unpaired_access_enabled(true);
 bool on = client.is_unpaired_access_enabled();
 ```
+
+The call is main-loop only and works at any time, before the first `start()` and while stopped
+included; the next `start()` advertises and admits against the value it left.
+
+The library never persists the setting. An application that keeps it across reboots stores it
+and restores it by calling `set_unpaired_access_enabled()` before `start()`, so the first
+`client/hello` and admission already use it. If that stored value is lost, restore off rather
+than the out-of-box default unless the application's own record shows the device has never been
+set up, or a damaged store reopens unauthenticated access an operator turned off.
+
+A call on a running client applies the new value to the live connections as `pairing.md`
+"Unpaired Access" describes:
 
 - Turning it off closes every connection that only unpaired access was admitting (an unpaired
   server with playback or active roles) with `client/goodbye` reason `pairing_required`. Paired
@@ -957,14 +940,6 @@ bool on = client.is_unpaired_access_enabled();
   with reason `restart`, so the server reconnects and reads the new value in the `client/hello`.
   Paired connections and `connect_to()` connections stay open; the latter keep advertising the
   old value until they are reopened.
-
-The call works while the client is stopped, taking effect at the next `start()` unless a
-different persistence provider is set before it. Before the first `start()` there is no loaded
-config to change, so the call is ignored with a warning; use the seed above for the out-of-box
-value.
-
-The stored `SendspinPairingConfig` holds only this setting, so change it through
-`set_unpaired_access_enabled()` rather than by writing `persistence_keys::PAIR_CONFIG`.
 
 Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
 unpaired access after the device is paired is the typical production configuration.
@@ -1269,7 +1244,6 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `static_pairing_code` | `std::optional<std::string>` | unset | The device's static pairing code, exactly 8 decimal digits. The `static_pairing_code` method is advertised only when this is set, `pairing_window_supported` is true, and `dynamic_pairing_code` is not advertised. An invalid value makes `start()` fail. |
 | `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
 | `static_pairing_code_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static pairing code the device shipped with, same values as above. Advertised on the `static_pairing_code` descriptor in `client/hello`; empty omits the hint. |
-| `initial_unpaired_access_enabled` | `bool` | `false` | First-boot default for unpaired (Sentinel) access. Applies only on a genuine first boot; see [Unpaired Access](#unpaired-access). |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the network task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
 
 ---

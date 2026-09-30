@@ -174,9 +174,9 @@ public:
 /// incrementally.
 ///
 /// Threading: every method is invoked on the main loop thread, for every key, so a provider needs
-/// no locking of its own. First-boot provisioning writes from inside `start()` rather than in
-/// response to a runtime event: `KEYPAIR` and `PAIR_CONFIG` when none is stored, and
-/// `PAIRING_PSK` when none is stored and `SendspinClientConfig::pairing_psk` is unset.
+/// no locking of its own. Provisioning writes from inside `start()` rather than in response to a
+/// runtime event: `KEYPAIR` when none is stored, and `PAIRING_PSK` when none is stored and
+/// `SendspinClientConfig::pairing_psk` is unset.
 ///
 /// Re-entrancy: implementations must not call back into the library from inside
 /// load_blob/save_blob/erase_blob. Every call is made from the middle of a library step that is
@@ -232,10 +232,9 @@ public:
 /// Every key is at most 12 characters, comfortably under the 15-character NVS key limit.
 /// Providers are pure byte stores: they must not parse or reinterpret these values.
 ///
-/// - A record slot key (`record_slot_key()`), `PAIRING_PSK`, and `PAIR_CONFIG` hold a versioned
-///   JSON blob produced by the codec in `sendspin/persistence_codec.h`
-///   (`encode_pairing_record()` / `decode_pairing_record()`, `encode_pairing_psk()` /
-///   `decode_pairing_psk()`, `encode_pairing_config()` / `decode_pairing_config()`
+/// - A record slot key (`record_slot_key()`) and `PAIRING_PSK` hold a versioned JSON blob
+///   produced by the codec in `sendspin/persistence_codec.h` (`encode_pairing_record()` /
+///   `decode_pairing_record()` and `encode_pairing_psk()` / `decode_pairing_psk()`
 ///   respectively).
 /// - `RECORD_ORDER`, `KEYPAIR`, and `LAST_PLAYED` hold raw bytes: see
 ///   each constant's comment.
@@ -273,9 +272,6 @@ inline std::string record_slot_key(size_t slot) {
 /// Codec blob: the accepted `SendspinPairingPsk` (`encode_pairing_psk()` / `decode_pairing_psk()`).
 /// `SendspinClientConfig::pairing_psk` outranks it.
 inline constexpr const char* PAIRING_PSK = "pairing_psk";
-
-/// Codec blob: the `SendspinPairingConfig` (`encode_pairing_config()` / `decode_pairing_config()`).
-inline constexpr const char* PAIR_CONFIG = "pair_config";
 
 /// Raw UTF-8 bytes: the server_id (base64url public key) of the last server that played audio.
 inline constexpr const char* LAST_PLAYED = "last_played";
@@ -655,20 +651,23 @@ public:
     /// way runs to its own end.
     void cancel_pairing_window();
 
-    /// @brief Turns unpaired access on or off, persisting the choice. Main loop only.
+    /// @brief Turns unpaired access on or off; it is off until this is called. Main loop only.
     ///
     /// pairing.md "Unpaired Access": servers with no pairing record may declare playback and
     /// activate roles only while it is on. Turning it off closes every connection that relies on
     /// it with client/goodbye reason pairing_required. Turning it on closes each unpaired
     /// connection a server opened that is not declaring pairing with reason restart, so the server
     /// reconnects and sees the new value in the client/hello; a connect_to() connection is kept.
-    /// Callable while stopped, but ignored, with a log, before the first start() has loaded the
-    /// stored pairing config.
+    /// Callable at any time, before the first start() and while stopped included.
+    ///
+    /// The library never persists the setting. An application that keeps it across reboots
+    /// stores it and restores it by calling this before start(), so the first client/hello and
+    /// admission already use it; a later call works too, but restarts the unpaired connections a
+    /// server opened that saw the old value.
     /// @param enabled Whether to admit unpaired access.
     void set_unpaired_access_enabled(bool enabled);
 
     /// @brief Whether unpaired access is on; see set_unpaired_access_enabled(). Main loop only.
-    /// @return The stored setting, or false before the first start() has loaded it.
     bool is_unpaired_access_enabled() const;
 
     // ========================================
@@ -959,7 +958,7 @@ private:
 #ifdef SENDSPIN_ENABLE_PLAYER
     std::unique_ptr<PlayerRole> player_;
 #endif
-    /// In-memory pairing record store (PSK resolution, trust config). Set in start();
+    /// In-memory pairing record store (PSK resolution). Set in start();
     /// outlives every connection the manager hands it out to.
     std::unique_ptr<RecordStore> record_store_;
     std::unique_ptr<SendspinTimeBurst> time_burst_;
@@ -970,6 +969,9 @@ private:
     // 8-bit fields
     /// Consumer-owned availability; see set_available(). Main loop only.
     bool available_{true};
+    /// The unpaired-access setting admission and the client/hello read; see
+    /// set_unpaired_access_enabled(). Main loop only.
+    bool unpaired_access_enabled_{false};
     /// A client/state held for clock sync, which loop() sends once synced. Main loop only.
     bool client_state_held_{false};
     /// Trust level of the active connection; written by on_handshake_complete() and reset by

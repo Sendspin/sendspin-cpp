@@ -43,6 +43,7 @@ class InMemoryPersistenceProvider : public SendspinPersistenceProvider {
 public:
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
         std::lock_guard<std::mutex> lock(this->mutex_);
+        this->load_attempts_[key]++;
         auto it = this->blobs_.find(key);
         if (it == this->blobs_.end()) {
             return std::nullopt;
@@ -53,6 +54,7 @@ public:
     bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->save_attempts_[key]++;
+        this->saved_keys_.push_back(key);
         if (this->reject_all_saves || this->reject_save_keys.count(key) > 0) {
             return false;
         }
@@ -96,6 +98,18 @@ public:
         return it == this->save_attempts_.end() ? 0 : it->second;
     }
 
+    [[nodiscard]] int load_attempts(const std::string& key) const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        auto it = this->load_attempts_.find(key);
+        return it == this->load_attempts_.end() ? 0 : it->second;
+    }
+
+    /// @brief Every key save_blob() was called with, in call order, rejected writes included.
+    [[nodiscard]] std::vector<std::string> saved_keys() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->saved_keys_;
+    }
+
     [[nodiscard]] int erase_attempts(const std::string& key) const {
         std::lock_guard<std::mutex> lock(this->mutex_);
         auto it = this->erase_attempts_.find(key);
@@ -114,7 +128,9 @@ public:
 private:
     mutable std::mutex mutex_;
     std::map<std::string, std::vector<uint8_t>> blobs_;
+    std::map<std::string, int> load_attempts_;
     std::map<std::string, int> save_attempts_;
+    std::vector<std::string> saved_keys_;
     std::map<std::string, int> erase_attempts_;
 };
 

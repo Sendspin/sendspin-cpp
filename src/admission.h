@@ -69,7 +69,7 @@ inline bool contains_activity(const std::vector<SendspinActivity>& activities,
 /// @param category       PSK category matched during the Noise handshake.
 /// @param has_playback   Whether the set contains 'playback'.
 /// @param has_pairing    Whether the set contains 'pairing'.
-/// @param unpaired_access  Whether unpaired (Sentinel) access is enabled in the record store.
+/// @param unpaired_access  Whether unpaired (Sentinel) access is enabled.
 /// @return true if the activity set is allowed for the given category/config.
 inline bool activity_set_allowed(PskCategory category, bool has_playback, bool has_pairing,
                                  bool unpaired_access) {

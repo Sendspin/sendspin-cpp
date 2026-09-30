@@ -451,7 +451,7 @@ public:
 
     /// @brief Closes the managed connections a changed unpaired-access setting no longer fits.
     ///
-    /// Main loop only, once the RecordStore holds the new value.
+    /// Main loop only, once the client holds the new value.
     void apply_unpaired_access_change(bool enabled);
 
     // ========================================

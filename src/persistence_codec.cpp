@@ -230,33 +230,6 @@ std::optional<SendspinPairingPsk> decode_pairing_psk(std::string_view bytes) {
 }
 
 // ============================================================================
-// Pairing config
-// ============================================================================
-
-std::string encode_pairing_config(const SendspinPairingConfig& c) {
-    JsonDocument doc = make_json_document();
-    doc["v"] = RECORD_CODEC_VERSION;
-    doc["unpaired_access_enabled"] = c.unpaired_access_enabled;
-    std::string out;
-    serializeJson(doc, out);
-    return out;
-}
-
-std::optional<SendspinPairingConfig> decode_pairing_config(std::string_view bytes) {
-    JsonDocument doc = make_json_document();
-    JsonObjectConst obj = parse_root_object(bytes, doc);
-    if (obj.isNull()) {
-        return std::nullopt;
-    }
-    SendspinPairingConfig cfg;
-    if (obj["unpaired_access_enabled"].is<bool>()) {
-        cfg.unpaired_access_enabled = obj["unpaired_access_enabled"].as<bool>();
-    }
-    // Keys this version does not define are ignored.
-    return cfg;
-}
-
-// ============================================================================
 // Base64url
 // ============================================================================
 

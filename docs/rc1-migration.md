@@ -21,13 +21,14 @@ item against the current code before acting on it; line numbers drift as phases 
   replacement.
 - The optional dual-connection hold (a pairing connection alongside a playback connection) is
   not implemented; the single-slot fallback the spec allows stays.
-- Pairing configuration is construction-time only and lives in `SendspinClientConfig`: the
-  offered methods follow from its pairing fields, the static code is `static_pairing_code`, and
-  the Pairing PSK is `pairing_psk` when set, otherwise the stored or a generated one. The only
-  persisted pairing policy is unpaired access, which is also the one runtime exception:
-  `SendspinClient::set_unpaired_access_enabled()` changes it, closing the connections that relied
-  on it with `pairing_required` when turned off and restarting idle inbound unpaired connections
-  when turned on (`pairing.md` "Unpaired Access").
+- Pairing configuration is not persisted as policy. The offered methods follow from
+  `SendspinClientConfig`'s pairing fields, the static code is `static_pairing_code`, and the
+  Pairing PSK is `pairing_psk` when set, otherwise the stored one or one the library generates
+  and persists. Unpaired access is off until `SendspinClient::set_unpaired_access_enabled()`
+  turns it on, which works at any time, closing the connections that relied on it with
+  `pairing_required` when turned off and restarting idle inbound unpaired connections when turned
+  on (`pairing.md` "Unpaired Access"). The library never persists it; an application that keeps
+  it across reboots restores it by calling the setter before `start()`.
 - Record eviction order is least recently used, which the spec leaves to the implementation.
   Recency is the order of `RecordStore::records_`, which `note_record_used()` moves a touched
   record to the back of; no new field or timestamp is stored.
@@ -329,17 +330,19 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
 - `PlayerRoleConfig::required_lead_time_ms` is `std::optional<uint16_t>`: unset reports the
   pipeline-derived lead, a value overrides it. A consumer that assigned a plain integer still
   compiles; one that read the field needs `value_or`.
-- `SendspinPairingConfig` holds only `unpaired_access_enabled`; `pairing_psk_enabled`,
-  `dynamic_pairing_code_enabled` and `static_pairing_code_enabled` are gone. `pairing_psk` is
-  always offered, `dynamic_pairing_code` whenever `pairing_code_out_channels` and
+- `SendspinPairingConfig`, `persistence_keys::PAIR_CONFIG` and `encode_pairing_config()` /
+  `decode_pairing_config()` are gone: no pairing policy is persisted. `pairing_psk` is always
+  offered, `dynamic_pairing_code` whenever `pairing_code_out_channels` and
   `pairing_code_formats` are both non-empty, and `static_pairing_code` as the next entry
-  describes. A stored `pair_config` blob that still carries the removed keys decodes with them
-  ignored, so a consumer that patched `PAIR_CONFIG` to turn a method on drops that step.
+  describes.
+- `SendspinClientConfig::initial_unpaired_access_enabled` is removed; unpaired access is off
+  until `SendspinClient::set_unpaired_access_enabled()` turns it on. The setter works at any
+  time, before the first `start()` included, and does not persist; a consumer that keeps the
+  setting across reboots stores it and calls the setter before `start()`.
 - `persistence_keys::STATIC_PAIRING_CODE` is gone. The static pairing code is
   `SendspinClientConfig::static_pairing_code` (`std::optional<std::string>`, exactly 8 decimal
   digits); it is offered only with `pairing_window_supported` and no dynamic code, and an invalid
-  value makes `start()` return false. A consumer that wrote the code to the provider sets the field
-  instead, and may erase the orphaned `static_pin` key.
+  value makes `start()` return false.
 - `SendspinClientConfig::pairing_psk` (`std::optional<SendspinPsk>`) supplies a
   factory-provisioned Pairing PSK. `SendspinPsk` is a new public type holding 32 bytes that it
   wipes on destruction. A configured PSK outranks a stored `PAIRING_PSK` blob and is never

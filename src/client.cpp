@@ -1175,7 +1175,7 @@ std::string SendspinClient::build_hello_message() {
         msg.supported_pair_methods.push_back(std::move(static_desc));
     }
 
-    msg.unpaired_access_enabled = this->record_store_->unpaired_access_enabled();
+    msg.unpaired_access_enabled = this->unpaired_access_enabled_;
 
     // Let each role add its fields to the hello message
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -2139,20 +2139,15 @@ void SendspinClient::cancel_pairing_window() {
 }
 
 void SendspinClient::set_unpaired_access_enabled(bool enabled) {
-    if (this->record_store_ == nullptr) {
-        SS_LOGW(TAG, "set_unpaired_access_enabled() ignored: call it after start()");
+    if (this->unpaired_access_enabled_ == enabled) {
         return;
     }
-    if (this->record_store_->unpaired_access_enabled() == enabled) {
-        return;
-    }
-    // A rejected write is logged by the store; the setting still applies for this boot.
-    this->record_store_->set_unpaired_access_enabled(enabled);
+    this->unpaired_access_enabled_ = enabled;
     this->connection_manager_->apply_unpaired_access_change(enabled);
 }
 
 bool SendspinClient::is_unpaired_access_enabled() const {
-    return this->record_store_ != nullptr && this->record_store_->unpaired_access_enabled();
+    return this->unpaired_access_enabled_;
 }
 
 }  // namespace sendspin

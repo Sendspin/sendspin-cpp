@@ -48,7 +48,6 @@
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
-#include "sendspin/persistence_codec.h"
 #include "sendspin/types.h"
 #include "wrap_test_helpers.h"
 
@@ -276,29 +275,15 @@ public:
     bool is_network_ready() override { return false; }
 };
 
-/// Persistence provider that serves only what a test seeded into it, which is how the pairing
-/// configuration reaches RecordStore at all (its constructor reads these blobs; there are no
-/// runtime setters). Counts save_blob() calls per key, still returning false like the base class
-/// default, so tests can assert on write counts (e.g. the persist_last_played_server() dedup
-/// guard) without disturbing the always-fails behavior the RECORDS-storage-failure tests rely on.
+/// Persistence provider that stores nothing. Counts save_blob() calls per key, still returning
+/// false like the base class default, so tests can assert on write counts (e.g. the
+/// persist_last_played_server() dedup guard) without disturbing the always-fails behavior the
+/// record-storage-failure tests rely on.
 class FakePersistenceProvider : public SendspinPersistenceProvider {
 public:
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        auto it = this->seeded_.find(key);
-        if (it == this->seeded_.end()) {
-            return std::nullopt;
-        }
-        return it->second;
-    }
-
     bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
         this->save_attempts_[key]++;
         return false;
-    }
-
-    /// @brief Place a blob in the store directly, as out-of-band provisioning would.
-    void seed_blob(const std::string& key, const std::string& bytes) {
-        this->seeded_[key] = std::vector<uint8_t>(bytes.begin(), bytes.end());
     }
 
     [[nodiscard]] int save_attempts(const std::string& key) const {
@@ -308,7 +293,6 @@ public:
 
 private:
     std::map<std::string, int> save_attempts_;
-    std::map<std::string, std::vector<uint8_t>> seeded_;
 };
 
 // ============================================================================
@@ -488,14 +472,8 @@ protected:
         this->build_client();
     }
 
-    /// Build the SendspinClient under test from the fixture's current configuration, seeding
-    /// the stored pairing config its RecordStore reads at construction.
+    /// Build the SendspinClient under test from the fixture's current configuration.
     void build_client() {
-        SendspinPairingConfig pairing_config;
-        pairing_config.unpaired_access_enabled = this->unpaired_access_enabled_;
-        this->persistence_provider_.seed_blob(persistence_keys::PAIR_CONFIG,
-                                              encode_pairing_config(pairing_config));
-
         SendspinClientConfig config;
         config.name = "PairingStateMachineTestDevice";
         if (this->pairing_code_emission_supported_) {
@@ -511,6 +489,7 @@ protected:
         this->client_->set_listener(&this->listener_);
         this->client_->set_network_provider(&this->network_provider_);
         this->client_->set_persistence_provider(&this->persistence_provider_);
+        this->client_->set_unpaired_access_enabled(this->unpaired_access_enabled_);
         ASSERT_TRUE(this->client_->start());
     }
 

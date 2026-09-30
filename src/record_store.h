@@ -102,15 +102,12 @@ struct ResolvedPsk {
 
 /// @brief In-memory client pairing record store.
 ///
-/// Thread-safety: `records_`, its dirty-slot bookkeeping and `pairing_psk_` are guarded by
-/// `mutex_`. Cross-thread access
-/// goes through `resolve_by_psk_id` (network thread, Noise handshake and re-handshake) or the
-/// one network-thread mutator, `store_record_superseding`, which is RAM-only and defers its
-/// provider flush, `persist_records`, to the main loop. The pairing config and `pairing_psk_`
-/// are seeded by the constructor, and only `set_unpaired_access_enabled()` writes the config
-/// afterwards, on the main loop where every config getter is called, so `pairing_psk()` and the
-/// config getters are the one exception: they read without the lock. No provider call is ever
-/// made under `mutex_`.
+/// Thread-safety: `records_` and its dirty-slot bookkeeping are guarded by `mutex_`. Cross-thread
+/// access goes through `resolve_by_psk_id` (network thread, Noise handshake and re-handshake) or
+/// the one network-thread mutator, `store_record_superseding`, which is RAM-only and defers its
+/// provider flush, `persist_records`, to the main loop. `pairing_psk_` is set by the constructor
+/// and never written afterwards, so it is read without the lock. No provider call is ever made
+/// under `mutex_`.
 class RecordStore {
 public:
     /// @brief Default cap on retained long-term records; mirrors
@@ -128,13 +125,12 @@ public:
     static constexpr size_t MIN_MAX_RECORDS = 5;
 
     /// @brief Construct and pre-provision the Pairing PSK.
-    /// If a persistence provider is supplied, attempts to load saved records
-    /// and pairing config first; generates fresh material only when absent.
+    /// If a persistence provider is supplied, loads the saved records, and the saved Pairing PSK
+    /// when none is configured; generates fresh material only when absent.
     /// @param provider Persistence provider, or nullptr for an in-memory-only store.
-    /// @param config The client config. The store reads three fields at construction and keeps
-    ///        no reference: `initial_unpaired_access_enabled` (applied only when no pairing
-    ///        config was loaded), `max_pairing_records` (also the number of persistence slots,
-    ///        raised to MIN_MAX_RECORDS and lowered to MAX_MAX_RECORDS), and `pairing_psk`.
+    /// @param config The client config. The store reads two fields at construction and keeps no
+    ///        reference: `max_pairing_records` (also the number of persistence slots, raised to
+    ///        MIN_MAX_RECORDS and lowered to MAX_MAX_RECORDS) and `pairing_psk`.
     explicit RecordStore(SendspinPersistenceProvider* provider,
                          const SendspinClientConfig& config = {});
 
@@ -236,18 +232,6 @@ public:
     }
 
     // ========================================
-    // Pairing config
-    // ========================================
-
-    [[nodiscard]] bool unpaired_access_enabled() const {
-        return this->unpaired_access_enabled_;
-    }
-
-    /// @brief Sets unpaired access and persists the pairing config.
-    /// @return false if the provider rejected the write; the RAM value changes either way.
-    bool set_unpaired_access_enabled(bool enabled);
-
-    // ========================================
     // Pairing outcome
     // ========================================
 
@@ -322,9 +306,6 @@ private:
     // ========================================
     // Construction helpers
     // ========================================
-    // Called in this order from the constructor; see the constructor definition in the .cpp for
-    // the full first-boot / damaged-config reasoning that ties the load and provisioning steps
-    // together.
 
     /// @brief Load records_ from the provider's record slots, then apply the stored order.
     void load_records_from_provider();
@@ -336,18 +317,7 @@ private:
     /// psk_id if it disagrees with the loaded secret.
     void load_pairing_psk_from_provider();
 
-    /// @brief Load the pairing config from the provider's PAIR_CONFIG blob, if present.
-    /// @return True if a valid config was loaded; the seeding helper below uses this (the
-    ///         "loaded_config" signal) to decide first-boot vs. damaged-config behavior.
-    bool load_pairing_config_from_provider();
-
-    /// @brief First-boot handling for the unpaired-access default: seeds
-    /// unpaired_access_enabled_ only on a genuine first boot, then persists the config.
-    /// @param loaded_config Whether load_pairing_config_from_provider() found a usable config.
-    /// @param initial_unpaired_access_enabled First-boot default for unpaired access.
-    void seed_first_boot_config(bool loaded_config, bool initial_unpaired_access_enabled);
-
-    /// @brief Make the configured Pairing PSK the store's, replacing any stored one.
+    /// @brief Make the configured Pairing PSK the store's.
     void adopt_configured_pairing_psk(const SendspinPsk& configured);
 
     /// @brief Generate and persist the Pairing PSK if the store has none.
@@ -397,11 +367,6 @@ private:
     /// @return true when a record was evicted.
     bool evict_one_locked(const std::vector<std::string>& psk_ids_in_use);
 
-    /// @brief Persist the current pairing config via the provider.
-    /// @return false only when a provider rejected the write; the change then stays RAM-only for
-    ///         the boot. The sole caller discards it.
-    bool persist_config();
-
     /// @brief Encode every owed write and clear the dirty bookkeeping. Call with mutex_ held, so
     /// each blob is exactly what is in memory at that moment.
     /// @return The writes to perform, in slot order with the order blob last; empty when nothing
@@ -435,7 +400,6 @@ private:
     // 8-bit fields
     /// Whether the record-order blob no longer matches records_'s order.
     bool order_dirty_{false};
-    bool unpaired_access_enabled_{false};
 };
 
 }  // namespace sendspin

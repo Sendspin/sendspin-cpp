@@ -16,11 +16,10 @@
 /// @brief Storage-format codec for the persistence structs in sendspin/config.h
 ///
 /// `SendspinPersistenceProvider` (sendspin/client.h) is a plain blob store. The library is the
-/// only caller of this codec: for the record slot keys (`persistence_keys::record_slot_key()`),
-/// `PAIRING_PSK` and `PAIR_CONFIG` it turns `SendspinPairingRecord` / `SendspinPairingPsk` /
-/// `SendspinPairingConfig` into the JSON blob a provider stores, and back. A provider must not
-/// parse these blobs itself. It is public so a custom provider or a test can inspect or seed that
-/// content in the same format.
+/// only caller of this codec: for the record slot keys (`persistence_keys::record_slot_key()`)
+/// and `PAIRING_PSK` it turns `SendspinPairingRecord` / `SendspinPairingPsk` into the JSON blob a
+/// provider stores, and back. A provider must not parse these blobs itself. It is public so a
+/// custom provider or a test can inspect or seed that content in the same format.
 ///
 /// This is a storage codec, independent of the Sendspin protocol wire format.
 ///
@@ -32,8 +31,6 @@
 ///   "used":bool}`, with "label" omitted when absent.
 /// - Pairing PSK: `{"v":1,"psk_id":"...","psk":"<base64url>","label":"..."}`, with "label"
 ///   omitted when absent.
-/// - Pairing config: `{"v":1,"unpaired_access_enabled":bool}`. Keys this version does not
-///   define are ignored on read.
 ///
 /// `psk` is base64url (RFC 4648 section 5, no `=` padding) and always decodes to exactly 32
 /// bytes.
@@ -49,8 +46,6 @@
 ///   fails to parse, "psk_id" is missing or empty, "psk" is missing, or "psk" does not
 ///   base64url-decode to exactly 32 bytes. A record additionally needs a non-empty "server_id",
 ///   without which the PSK could never pass the post-match server check.
-/// - `decode_pairing_config()` returns `std::nullopt` only when the JSON fails to parse or the
-///   root is not an object. Missing fields take the `SendspinPairingConfig` struct's defaults.
 /// - `base64url_decode()` follows RFC 4648 section 5: encode never pads, decode tolerates
 ///   padding, and any character outside the base64url alphabet makes it return `std::nullopt`.
 ///
@@ -100,14 +95,6 @@ std::string encode_pairing_psk(const SendspinPairingPsk& p);
 /// @brief Decodes the accepted Pairing PSK from its JSON storage format.
 /// @return The decoded Pairing PSK, or std::nullopt on parse failure or an invalid psk_id/psk.
 std::optional<SendspinPairingPsk> decode_pairing_psk(std::string_view bytes);
-
-/// @brief Encodes the pairing policy config to its JSON storage format.
-std::string encode_pairing_config(const SendspinPairingConfig& c);
-
-/// @brief Decodes the pairing policy config from its JSON storage format. Missing fields take
-/// the SendspinPairingConfig struct's defaults.
-/// @return The decoded config, or std::nullopt on parse failure or a non-object root.
-std::optional<SendspinPairingConfig> decode_pairing_config(std::string_view bytes);
 
 /// @brief Encodes bytes to base64url, no `=` padding (RFC 4648 section 5).
 /// @return ASCII string using only `A-Z a-z 0-9 - _`.

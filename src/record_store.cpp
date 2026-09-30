@@ -35,7 +35,7 @@ namespace sendspin {
 namespace {
 
 /// @brief Shared load -> string_view -> decode -> warn-on-failure -> secure_zero(blob) shape used
-/// by the record-slot and PAIRING_PSK loaders below. PAIR_CONFIG (no PSK bytes) stays direct.
+/// by the record-slot and PAIRING_PSK loaders below.
 /// @return The decoded value, or nullopt. The raw blob is wiped on both paths.
 template <typename T>
 std::optional<T> load_decode_wipe(SendspinPersistenceProvider& provider, const char* key,
@@ -66,17 +66,16 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider, const SendspinCl
       max_records_(std::clamp(config.max_pairing_records, MIN_MAX_RECORDS, MAX_MAX_RECORDS)) {
     // The provider is a pure byte store, so decoding happens entirely on this side of the
     // interface.
-    bool loaded_config = false;
     if (this->provider_ != nullptr) {
         this->load_records_from_provider();
-        this->load_pairing_psk_from_provider();
-        loaded_config = this->load_pairing_config_from_provider();
     }
 
-    this->seed_first_boot_config(loaded_config, config.initial_unpaired_access_enabled);
     if (config.pairing_psk.has_value()) {
         this->adopt_configured_pairing_psk(config.pairing_psk.value());
     } else {
+        if (this->provider_ != nullptr) {
+            this->load_pairing_psk_from_provider();
+        }
         this->provision_pairing_psk_if_needed();
     }
 }
@@ -174,59 +173,6 @@ void RecordStore::load_pairing_psk_from_provider() {
     }
 }
 
-bool RecordStore::load_pairing_config_from_provider() {
-    if (auto config_blob = this->provider_->load_blob(persistence_keys::PAIR_CONFIG)) {
-        std::string_view text(reinterpret_cast<const char*>(config_blob->data()),
-                              config_blob->size());
-        auto config = decode_pairing_config(text);
-        if (config.has_value()) {
-            this->unpaired_access_enabled_ = config->unpaired_access_enabled;
-            return true;
-        }
-        SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; ignoring",
-                persistence_keys::PAIR_CONFIG);
-    }
-    return false;
-}
-
-void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpaired_access_enabled) {
-    if (loaded_config) {
-        return;
-    }
-
-    // First-boot seed: the application's configured default for unpaired access applies only on
-    // a genuine first boot; a loaded config always wins.
-    //
-    // !loaded_config alone is not sufficient evidence of a first boot, and getting that wrong
-    // fails open. loaded_config stays false both when the persistence_keys::PAIR_CONFIG blob was
-    // never stored and when it was stored but failed to decode: the provider interface gives no
-    // way to distinguish "absent" from "present but unreadable" (load_blob() returns nullopt for
-    // the former; a decode failure on a non-nullopt blob is treated the same way, see
-    // load_pairing_config_from_provider()). Records and config are separate keys, so a provider
-    // that loses only the config blob (independent NVS keys, a torn write) would otherwise re-seed
-    // unpaired access ON for a device that is still paired and had it deliberately turned off.
-    // Any surviving stored material therefore vetoes the seed: this is a reboot with a damaged
-    // config, not a first boot, and the safe default is the restrictive one.
-    //
-    // Only stored material counts. pairing_psk_ holds nothing but a stored Pairing PSK at this
-    // point: a configured one is present on every boot, the first included, so it is adopted
-    // after this check and proves nothing about a previous boot. A stored one the loader
-    // rejected (undecodable, or unusable) is absent here too.
-    //
-    // A store that lost everything is indistinguishable from a factory-fresh device by
-    // construction, so the seed does apply there, as it does when there is no provider at all.
-    const bool previously_provisioned = !this->records_.empty() || this->pairing_psk_.has_value();
-    if (previously_provisioned) {
-        SS_LOGW(TAG, "No pairing config loaded but stored pairing material survived; ignoring the "
-                     "unpaired-access seed and leaving unpaired access disabled");
-    } else {
-        this->unpaired_access_enabled_ = initial_unpaired_access_enabled;
-    }
-    // No lock needed here: the constructor runs before this object is reachable by any other
-    // thread.
-    this->persist_config();
-}
-
 bool RecordStore::is_usable_pairing_psk(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
     const std::array<uint8_t, NOISE_PSK_SIZE> zero{};
     return !constant_time_equal(psk.data(), zero.data(), psk.size()) &&
@@ -234,7 +180,7 @@ bool RecordStore::is_usable_pairing_psk(const std::array<uint8_t, NOISE_PSK_SIZE
 }
 
 void RecordStore::adopt_configured_pairing_psk(const SendspinPsk& configured) {
-    // A stored Pairing PSK this replaces stays in the provider untouched.
+    // A stored Pairing PSK is neither read nor touched.
     SendspinPairingPsk adopted;
     adopted.psk = configured.bytes;
     adopted.psk_id = psk_id_for(adopted.psk);
@@ -573,15 +519,6 @@ bool RecordStore::note_record_used(const std::string& psk_id) {
 }
 
 // ============================================================================
-// Pairing config
-// ============================================================================
-
-bool RecordStore::set_unpaired_access_enabled(bool enabled) {
-    this->unpaired_access_enabled_ = enabled;
-    return this->persist_config();
-}
-
-// ============================================================================
 // Pairing outcome
 // ============================================================================
 
@@ -605,23 +542,6 @@ RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(
 // ============================================================================
 // Private helpers
 // ============================================================================
-
-bool RecordStore::persist_config() {
-    if (this->provider_ == nullptr) {
-        return true;
-    }
-    SendspinPairingConfig config;
-    config.unpaired_access_enabled = this->unpaired_access_enabled_;
-    std::string encoded = encode_pairing_config(config);
-    if (!this->provider_->save_blob(persistence_keys::PAIR_CONFIG,
-                                    reinterpret_cast<const uint8_t*>(encoded.data()),
-                                    encoded.size())) {
-        SS_LOGW(TAG, "Provider rejected pairing config write; the change is RAM-only for this "
-                     "boot and will not survive a reboot");
-        return false;
-    }
-    return true;
-}
 
 // ============================================================================
 // Locking discipline for records_ persistence
