@@ -128,24 +128,24 @@ public:
     // The record slots are not served beyond the base class's nullopt default: "starts with
     // no pairing records" above, so restating it here would be a no-op override.
 
-    // Optionally pre-seed an accepted Pairing PSK, so a fake server can connect on it directly
+    // Optionally pre-seed a stored Pairing PSK, so a fake server can connect on it directly
     // (matching PskCategory::PAIRING immediately) rather than on the Sentinel PSK. Must be set
     // before start() reads it into the RecordStore.
-    void set_configured_pairing_psk(SendspinPairingPsk psk) {
-        this->configured_pairing_psk_ = std::move(psk);
+    void set_stored_pairing_psk(SendspinPairingPsk psk) {
+        this->stored_pairing_psk_ = std::move(psk);
     }
 
     // Optionally pre-seed a LONG_TERM record so the fake server can connect to it directly
     // (bypassing pairing) before a test drives an in-band re-handshake onto the pairing PSK
     // above, on an already-admitted connection. Must be set before start() reads it into
-    // the RecordStore, like set_configured_pairing_psk() above.
+    // the RecordStore, like set_stored_pairing_psk() above.
     void set_seeded_long_term_record(SendspinPairingRecord record) {
         this->seeded_long_term_record_ = std::move(record);
     }
 
-    /// Seeds the stored pairing config. A configured Pairing PSK counts as provisioned material,
-    /// so SendspinClientConfig's first-boot unpaired-access seed no longer applies and the stored
-    /// config is the only way to turn unpaired access on. Must be called before start().
+    /// Sets the unpaired-access value of the pairing config load_blob() serves. A config blob is
+    /// always served, so SendspinClientConfig's first-boot unpaired-access seed never applies and
+    /// this is the way to turn unpaired access on. Must be called before start().
     void set_unpaired_access_enabled(bool enabled) {
         this->unpaired_access_enabled_ = enabled;
     }
@@ -157,8 +157,8 @@ public:
             std::string encoded = encode_pairing_config(config);
             return std::vector<uint8_t>(encoded.begin(), encoded.end());
         }
-        if (key == persistence_keys::PAIRING_PSK && this->configured_pairing_psk_.has_value()) {
-            std::string encoded = encode_pairing_psk(this->configured_pairing_psk_.value());
+        if (key == persistence_keys::PAIRING_PSK && this->stored_pairing_psk_.has_value()) {
+            std::string encoded = encode_pairing_psk(this->stored_pairing_psk_.value());
             return std::vector<uint8_t>(encoded.begin(), encoded.end());
         }
         if (is_record_key(key) && this->seeded_long_term_record_.has_value()) {
@@ -211,7 +211,7 @@ private:
     std::optional<SendspinPairingRecord> captured_;
     int rejected_record_saves_{0};
     bool reject_pairing_records_{false};
-    std::optional<SendspinPairingPsk> configured_pairing_psk_;
+    std::optional<SendspinPairingPsk> stored_pairing_psk_;
     std::optional<SendspinPairingRecord> seeded_long_term_record_;
     bool unpaired_access_enabled_{false};
 };
@@ -297,7 +297,7 @@ private:
 // Tests
 // ============================================================================
 
-// Seeds a client whose Pairing PSK is configured and whose unpaired access is on, which is what
+// Seeds a client whose Pairing PSK is stored and whose unpaired access is on, which is what
 // messaging.md "server/activate" requires before a pairing-PSK connection may declare playback.
 SendspinPairingPsk seed_pairing_psk(PairingCapturePersistenceProvider& persistence, uint8_t base) {
     std::array<uint8_t, 32> psk_bytes{};
@@ -307,7 +307,7 @@ SendspinPairingPsk seed_pairing_psk(PairingCapturePersistenceProvider& persisten
     SendspinPairingPsk psk;
     psk.psk_id = psk_id_for(psk_bytes);
     psk.psk = psk_bytes;
-    persistence.set_configured_pairing_psk(psk);
+    persistence.set_stored_pairing_psk(psk);
     persistence.set_unpaired_access_enabled(true);
     return psk;
 }
@@ -518,19 +518,18 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     PairingCapturePersistenceProvider persistence;
     // The Pairing PSK the operator "typed in" (e.g. via a pairing token): known to both the
     // client (so its RecordStore resolves the fake server's handshake to PskCategory::PAIRING)
-    // and the fake server (so it can perform that handshake).
+    // and the fake server (so it can perform that handshake). Supplied through
+    // SendspinClientConfig::pairing_psk, the provisioning path that bypasses the provider.
     std::array<uint8_t, 32> pairing_psk_bytes{};
     for (size_t i = 0; i < pairing_psk_bytes.size(); ++i) {
         pairing_psk_bytes[i] = static_cast<uint8_t>(0xD0 + i);
     }
-    SendspinPairingPsk configured_pairing_psk;
-    configured_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
-    configured_pairing_psk.psk = pairing_psk_bytes;
-    persistence.set_configured_pairing_psk(configured_pairing_psk);
+    const std::string pairing_psk_id = psk_id_for(pairing_psk_bytes);
 
     SendspinClientConfig config;
     config.name = "Pairing Flow Test Client";
     config.server_port = PAIRING_TEST_PORT;
+    config.pairing_psk = SendspinPsk(pairing_psk_bytes);
 
     RecordingClientListener listener;
     SendspinClient client(config);
@@ -553,8 +552,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     // (messaging.md "noise/handshake").
     options.psk_category = "pr";
     FakeEncryptedServer server(server_url(PAIRING_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-                               server_identity, configured_pairing_psk.psk_id, pairing_psk_bytes,
-                               options);
+                               server_identity, pairing_psk_id, pairing_psk_bytes, options);
 
     // handle_enter_pairing (PAIRING_PSK branch) fires as soon as the pairing activate is admitted
     // and sends client/pair-finalize; the fake server acks it immediately in handle_binary().
@@ -655,10 +653,10 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     for (size_t i = 0; i < pairing_psk_bytes.size(); ++i) {
         pairing_psk_bytes[i] = static_cast<uint8_t>(0xC0 + i);
     }
-    SendspinPairingPsk configured_pairing_psk;
-    configured_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
-    configured_pairing_psk.psk = pairing_psk_bytes;
-    persistence.set_configured_pairing_psk(configured_pairing_psk);
+    SendspinPairingPsk stored_pairing_psk;
+    stored_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
+    stored_pairing_psk.psk = pairing_psk_bytes;
+    persistence.set_stored_pairing_psk(stored_pairing_psk);
 
     SendspinClientConfig config;
     config.name = "Reactivate Pairing Test Client";
@@ -699,7 +697,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     // Re-handshake the LIVE, admitted connection onto the pairing PSK, exactly like the server
     // re-pairing an already-connected client (e.g. Music Assistant token-pairing a device that
     // is already streaming).
-    ASSERT_TRUE(server.trigger_rehandshake(configured_pairing_psk.psk_id, pairing_psk_bytes, "pr"))
+    ASSERT_TRUE(server.trigger_rehandshake(stored_pairing_psk.psk_id, pairing_psk_bytes, "pr"))
         << "Failed to start the in-band re-handshake onto the pairing PSK";
 
     // The fixed client must reply with client/pair-finalize instead of hard-stalling; the
@@ -760,10 +758,10 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     for (size_t i = 0; i < pairing_psk_bytes.size(); ++i) {
         pairing_psk_bytes[i] = static_cast<uint8_t>(0xE0 + i);
     }
-    SendspinPairingPsk configured_pairing_psk;
-    configured_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
-    configured_pairing_psk.psk = pairing_psk_bytes;
-    persistence.set_configured_pairing_psk(configured_pairing_psk);
+    SendspinPairingPsk stored_pairing_psk;
+    stored_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
+    stored_pairing_psk.psk = pairing_psk_bytes;
+    persistence.set_stored_pairing_psk(stored_pairing_psk);
 
     SendspinClientConfig config;
     config.name = "Pairing Flow Persist-Failure Test Client";
@@ -787,7 +785,7 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     options.psk_category = "pr";
     FakeEncryptedServer server(server_url(PAIRING_PERSIST_FAILURE_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                               configured_pairing_psk.psk_id, pairing_psk_bytes, options);
+                               stored_pairing_psk.psk_id, pairing_psk_bytes, options);
 
     pump_until(client, [&] { return server.learned_psk_id().has_value(); });
 
@@ -2355,9 +2353,8 @@ TEST(EncryptedLifecycle, PairFinalizeDoesNotDeadlockAgainstAnAdmission) {
 // comment), so it cannot show what a removal persists; InMemoryPersistenceProvider accepts them
 // and counts the writes per key, which is what the coalescing tests below read.
 /// @param records The records to seed, least recently used first.
-/// @param unpaired_access_enabled Seeds the stored pairing config: a client that already holds
-///        records is not on its first boot, so SendspinClientConfig's unpaired-access seed no
-///        longer applies and the stored config is the only way in.
+/// @param unpaired_access_enabled Seeds the stored pairing config, which outranks
+///        SendspinClientConfig's first-boot unpaired-access seed.
 std::unique_ptr<InMemoryPersistenceProvider> make_record_store_provider(
     const std::vector<SendspinPairingRecord>& records, bool unpaired_access_enabled = false) {
     auto provider = std::make_unique<InMemoryPersistenceProvider>();

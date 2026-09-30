@@ -493,8 +493,9 @@ or a Noise handshake -- but it does stop the main loop for its duration, so the 
 bounded storage operation, and it must not call back into the client.
 First-boot provisioning writes from inside `start()` rather than in response to a runtime
 event: `save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored,
-`save_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored, and
-`save_blob(persistence_keys::PAIR_CONFIG, ...)` when no pairing config could be decoded.
+`save_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored and none is
+configured, and `save_blob(persistence_keys::PAIR_CONFIG, ...)` when no pairing config could be
+decoded.
 
 #### Keyspace
 
@@ -507,9 +508,8 @@ store and return whatever bytes the library gives it for each of these:
 | `persistence_keys::KEYPAIR` | 32 raw bytes: the static X25519 private key. No codec. |
 | `persistence_keys::record_slot_key(n)` | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or an EMPTY blob when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
 | `persistence_keys::RECORD_ORDER` | Raw bytes: the occupied slot numbers, least recently used first, one byte per slot. Decides which record a pairing at capacity evicts. |
-| `persistence_keys::PAIRING_PSK` | The accepted `SendspinPairingPsk` as one codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). |
-| `persistence_keys::STATIC_PAIRING_CODE` | Raw UTF-8 bytes: the configured static pairing code (8 decimal digits). |
-| `persistence_keys::PAIR_CONFIG` | The `SendspinPairingConfig` as one codec blob (`encode_pairing_config()` / `decode_pairing_config()`). |
+| `persistence_keys::PAIRING_PSK` | The stored `SendspinPairingPsk` as one codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). Never written while `SendspinClientConfig::pairing_psk` is set, which outranks a stored one. |
+| `persistence_keys::PAIR_CONFIG` | The `SendspinPairingConfig` (the unpaired-access flag) as one codec blob (`encode_pairing_config()` / `decode_pairing_config()`). |
 | `persistence_keys::LAST_PLAYED` | Raw UTF-8 bytes: the `server_id` (base64url public key) of the last server that played audio. |
 | `persistence_keys::OUTPUT_DELAY` | ASCII decimal string (e.g. `"150"`): the player's output delay in milliseconds. Chosen over raw `uint16_t` bytes for debuggability and to avoid an endianness dependency. |
 
@@ -800,9 +800,11 @@ observes pairing via `SendspinClientListener` callbacks:
 
 #### Pairing PSK
 
-`pairing_psk` is the pairing method every client must implement, so the library provisions a
-random Pairing PSK on first boot and persists it as a `persistence_keys::PAIRING_PSK` blob.
-Nothing is required of the application to enable the method.
+`pairing_psk` is the pairing method every client must implement, so it is always offered and a
+Pairing PSK always backs it. Unless the application supplies one, the library generates a random
+Pairing PSK on first boot and persists it as a `persistence_keys::PAIRING_PSK` blob. A stored blob
+holding an all-zero key or the Sentinel PSK is ignored and replaced the same way. Nothing is
+required of the application to enable the method.
 
 To pair, the server must learn that PSK out of band. Surface it as a **pairing token** -- one
 `"SP:"`-prefixed string carrying the `client_id` and the PSK together, for the operator to
@@ -812,29 +814,26 @@ paste (or scan) into the server:
 auto token = client.pairing_token();  // e.g. "SP:0AAAQ..." (107 chars), nullopt before start()
 ```
 
-The token is stable for the lifetime of the stored PSK, so it can be printed at startup, shown
-in a UI, or rendered as a QR code.
+The token is stable for the lifetime of the PSK, so it can be printed at startup, shown in a UI,
+or rendered as a QR code.
 
-To pin a specific PSK instead (for factory provisioning, where the same key is baked into a
-setup tool), write one through the persistence provider before `start()`, encoded with
-the codec so it round-trips through the library's own loader:
+To ship a device with a factory-provisioned Pairing PSK instead (for example one read from a
+factory partition, with its token printed on a label), set it in the config. `pairing.md`
+"Pairing PSK Flow" requires it to be drawn from a CSPRNG per device, never shared across devices:
 
 ```cpp
-SendspinPairingPsk psk;
-// 32 raw bytes distributed out-of-band during provisioning
-psk.psk = { /* ... */ };
-// psk_id must be non-empty: the codec writes it verbatim and the loader rejects a blob whose
-// psk_id is empty, discarding the pinned key and provisioning a random one in its place. The
-// value need not be correct (the library recomputes it from the PSK and logs a warning on a
-// mismatch), but a placeholder must be present.
-psk.psk_id = "provisioned";
-std::string blob = encode_pairing_psk(psk);  // sendspin/persistence_codec.h
-persistence_provider.save_blob(persistence_keys::PAIRING_PSK,
-                                reinterpret_cast<const uint8_t*>(blob.data()), blob.size());
+std::array<uint8_t, 32> factory_psk = read_factory_psk();  // the device's own 32 random bytes
+config.pairing_psk = SendspinPsk(factory_psk);
 ```
 
-`client.format_pairing_token(psk.psk)` builds the token for any 32-byte PSK rather than the
-stored one, which is what a provisioning tool needs to print the token for the key it pinned.
+A configured Pairing PSK outranks a stored one and is never written to the persistence provider;
+the library derives its `psk_id`. An all-zero key or the published Sentinel PSK is rejected:
+`start()` logs an error and returns `false`, so a factory partition that was never written cannot
+ship a key every peer knows. `SendspinPsk` wipes its bytes when destroyed, and so does every copy
+the client makes; a source buffer such as `factory_psk` above is the application's to wipe.
+
+`client.format_pairing_token(factory_psk)` builds the token for any 32-byte PSK rather than the
+one in use, which is what a provisioning tool needs to print the token for a key it provisions.
 It returns `nullopt` before `start()`, since the token also carries the client's identity.
 
 After pairing completes, `on_pairing_succeeded` fires and the long-term record is stored
@@ -848,8 +847,8 @@ The library also supports the two pairing-code methods, gated by
 `pairing_window_supported` and the `SendspinClientListener::on_display_pairing_code` /
 `on_clear_pairing_code` / `on_open_pairing_window` / `on_close_pairing_window` callbacks
 documented in Step 3 above. A method is advertised only when the platform can carry it: a client
-that names no out-channel and no format never offers `dynamic_pairing_code`, whatever the stored
-pairing config says, and the server is then limited to the remaining methods.
+that names no out-channel and no format never offers `dynamic_pairing_code`, and the server is
+then limited to the remaining methods.
 
 A client offers at most one pairing-code method, and one with an out-channel offers the dynamic
 code, so a device that means to offer `static_pairing_code` leaves `pairing_code_out_channels`
@@ -862,15 +861,17 @@ operator types a code the device did not emit, the client asks for another round
 (`client/pair-retry`) and keeps the same code on screen. After 20 rounds without a successful
 verification the attempt ends and further attempts are held back until an operator gesture.
 
-A **static pairing code** is the fixed 8-digit value the device shipped with, and every attempt
-is **gesture-gated**: the client answers the pairing activation with `client/pair-pending` and
-withholds `client/pair-init` until a pairing window is open. The window opens on the operator
-gesture (`confirm_pairing_window()`) and lives for 5 minutes. It keeps admitting attempts on the
-connection that carried its first, and closes on a completed pairing (the server's
-`server/pair-finalize` ack, the point at which the record is stored), on the fifth attempt whose
-verification failed, when that connection drops, on `cancel_pairing_window()`, or on expiry. A
-gesture performed before the activation arrives leaves the window standing open, so the next
-attempt within its lifetime proceeds without a prompt.
+A **static pairing code** is the fixed 8-digit value the device shipped with, set in
+`SendspinClientConfig::static_pairing_code` and drawn from a CSPRNG per device (`pairing.md` "Static
+Pairing Code Flow"). A value that is not exactly 8 decimal digits makes `start()` log an error and
+return `false`. Every attempt is **gesture-gated**: the client answers the pairing activation with
+`client/pair-pending` and withholds `client/pair-init` until a pairing window is open. The window
+opens on the operator gesture (`confirm_pairing_window()`) and lives for 5 minutes. It keeps
+admitting attempts on the connection that carried its first, and closes on a completed pairing (the
+server's `server/pair-finalize` ack, the point at which the record is stored), on the fifth attempt
+whose verification failed, when that connection drops, on `cancel_pairing_window()`, or on expiry. A
+gesture performed before the activation arrives leaves the window standing open, so the next attempt
+within its lifetime proceeds without a prompt.
 
 A device that leaves `pairing_window_supported` false cannot show the `on_open_pairing_window`
 prompt, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for the
@@ -889,9 +890,9 @@ knows where its secrets were published, so an empty value omits the hint rather 
 a code on the device label is `{"device"}`, a pairing token in the box is `{"leaflet"}`, and a
 secret an operator provisioned out of band is `{"operator"}`.
 
-The secrets themselves come from the persistence provider (`persistence_keys::PAIRING_PSK` and
-`STATIC_PAIRING_CODE`), read once at `start()`, so a provisioning tool that replaces one also
-updates these config values in the same pass.
+The secrets themselves are `pairing_psk` (or the generated Pairing PSK) and
+`static_pairing_code` in the same config, so an application that sets one sets its hint beside
+it.
 
 ### Trust Levels
 
@@ -932,10 +933,13 @@ config, so the seed applies on every start.
 A config that fails to load is not treated as a first boot. The library's internal load of the
 `persistence_keys::PAIR_CONFIG` blob is treated as "nothing stored" both when the key is truly
 absent and when the stored blob fails to decode, and the interface gives a provider no way to
-tell the client which happened. If any provisioned material survives -- a pairing record or the
-Pairing PSK -- the seed is skipped and unpaired access stays disabled, so a damaged config on a
-paired device fails closed rather than silently reopening unauthenticated access. A store that
-lost everything is indistinguishable from a factory-fresh device, so the seed does apply there.
+tell the client which happened. If any stored material survives (a pairing record or a stored
+Pairing PSK), the seed is skipped and unpaired access stays disabled, so a damaged config on a
+paired device fails closed rather than silently reopening unauthenticated access. A Pairing PSK
+set in `SendspinClientConfig::pairing_psk` does not count, since it is present on the first boot
+too, so a device with one and no pairing records treats a lost config as a first boot and applies
+`initial_unpaired_access_enabled` again. A store that lost everything is indistinguishable from a
+factory-fresh device, so the seed does apply there.
 
 To change the setting at runtime, for example from an operator switch, call
 `set_unpaired_access_enabled()` on the main loop thread. It persists the new value and applies it
@@ -959,32 +963,8 @@ different persistence provider is set before it. Before the first `start()` ther
 config to change, so the call is ignored with a warning; use the seed above for the out-of-box
 value.
 
-The other `SendspinPairingConfig` fields have no runtime setter. An application that manages
-them writes the stored blob, which takes effect on the next boot, and it must read-modify-write
-the blob rather than save a fresh one:
-
-```cpp
-auto blob = persistence_provider.load_blob(persistence_keys::PAIR_CONFIG);
-if (blob.has_value()) {
-    std::string text(blob->begin(), blob->end());
-    auto cfg = decode_pairing_config(text);  // sendspin/persistence_codec.h
-    if (cfg.has_value()) {
-        cfg->static_pairing_code_enabled = true;
-        std::string encoded = encode_pairing_config(*cfg);
-        persistence_provider.save_blob(persistence_keys::PAIR_CONFIG,
-                                        reinterpret_cast<const uint8_t*>(encoded.data()),
-                                        encoded.size());
-    }
-}
-```
-
-This is why the read-modify-write step matters: the provider is a byte store and does not
-validate what it is handed, so saving a bare, default-constructed `SendspinPairingConfig`
-*will* be written and *will* take effect on the next boot -- silently resetting every policy
-field (`pairing_psk_enabled`, `dynamic_pairing_code_enabled`, `static_pairing_code_enabled`)
-to the struct's compiled-in defaults, `unpaired_access_enabled` included, rather than only the
-field the application meant to change. A bare write also does not count as a first boot (the
-config blob still decodes), so `initial_unpaired_access_enabled` is not reapplied either.
+The stored `SendspinPairingConfig` holds only this setting, so change it through
+`set_unpaired_access_enabled()` rather than by writing `persistence_keys::PAIR_CONFIG`.
 
 Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
 unpaired access after the device is paired is the typical production configuration.
@@ -1267,9 +1247,9 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `manufacturer` | `std::optional<std::string>` | unset | Manufacturer name (e.g., `"ESPHome"`); sent in `client/hello` only when set |
 | `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
-| `pairing_code_out_channels` | `std::vector<SendspinPairingCodeChannel>` | `{}` | Where the device can emit a dynamic pairing code: `DISPLAY`, `SPEAKER`. Advertised as the descriptor's `out_channels`. Empty (or an empty `pairing_code_formats`) means the device cannot emit one, so `dynamic_pairing_code` is not advertised even if enabled in `SendspinPairingConfig`. |
+| `pairing_code_out_channels` | `std::vector<SendspinPairingCodeChannel>` | `{}` | Where the device can emit a dynamic pairing code: `DISPLAY`, `SPEAKER`. Advertised as the descriptor's `out_channels`. Empty (or an empty `pairing_code_formats`) means the device cannot emit one, so `dynamic_pairing_code` is not advertised. |
 | `pairing_code_formats` | `std::vector<SendspinPairingCodeFormat>` | `{}` | How the device can render a dynamic pairing code: `DIGITS` (six decimal digits), `QR_CODE` (a pairing token to render). Advertised as the descriptor's `formats`; the server picks one from this list. |
-| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, `static_pairing_code` is not advertised even if a static pairing code is configured. Dynamic-pairing-code devices should also set it: an attempt held back by the round limit is gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
+| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, the `static_pairing_code` method is not advertised even if `static_pairing_code` is set. Dynamic-pairing-code devices should also set it: an attempt held back by the round limit is gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
 | `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains. See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
@@ -1285,6 +1265,8 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `liveness_timeout_ms` | `std::optional<int64_t>` | unset (`60000` with default burst settings) | Milliseconds of inbound silence before the established connection is dropped as dead, with a `restart` goodbye so a server that was only slow reconnects. Unset derives it from the time burst settings, tolerating two consecutive unanswered time messages. An explicit value below `time_burst_interval_ms + time_burst_response_timeout_ms` drops healthy connections. `0` disables the check. |
 | `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
 | `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `websocket_payload_location` (which covers the raw WebSocket frame buffer). ESP-IDF only; ignored on host. |
+| `pairing_psk` | `std::optional<SendspinPsk>` | unset | A factory-provisioned Pairing PSK (32 bytes). Outranks a stored one and is never persisted; an all-zero key or the Sentinel PSK makes `start()` fail. Unset loads the stored one or generates and persists one on first boot. See [Pairing PSK](#pairing-psk). |
+| `static_pairing_code` | `std::optional<std::string>` | unset | The device's static pairing code, exactly 8 decimal digits. The `static_pairing_code` method is advertised only when this is set, `pairing_window_supported` is true, and `dynamic_pairing_code` is not advertised. An invalid value makes `start()` fail. |
 | `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
 | `static_pairing_code_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static pairing code the device shipped with, same values as above. Advertised on the `static_pairing_code` descriptor in `client/hello`; empty omits the hint. |
 | `initial_unpaired_access_enabled` | `bool` | `false` | First-boot default for unpaired (Sentinel) access. Applies only on a genuine first boot; see [Unpaired Access](#unpaired-access). |

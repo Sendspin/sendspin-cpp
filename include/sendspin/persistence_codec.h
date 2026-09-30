@@ -32,11 +32,8 @@
 ///   "used":bool}`, with "label" omitted when absent.
 /// - Pairing PSK: `{"v":1,"psk_id":"...","psk":"<base64url>","label":"..."}`, with "label"
 ///   omitted when absent.
-/// - Pairing config: `{"v":1,"pairing_psk_enabled":bool,"unpaired_access_enabled":bool,
-///   "dynamic_pin_enabled":bool,"static_pin_enabled":bool}`. The last two keys carry
-///   `SendspinPairingConfig::dynamic_pairing_code_enabled` and `static_pairing_code_enabled`:
-///   the stored names are part of the storage format, which is fixed independently of the
-///   protocol's field names. Keys this version does not define are ignored on read.
+/// - Pairing config: `{"v":1,"unpaired_access_enabled":bool}`. Keys this version does not
+///   define are ignored on read.
 ///
 /// `psk` is base64url (RFC 4648 section 5, no `=` padding) and always decodes to exactly 32
 /// bytes.

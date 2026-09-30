@@ -236,12 +236,7 @@ std::optional<SendspinPairingPsk> decode_pairing_psk(std::string_view bytes) {
 std::string encode_pairing_config(const SendspinPairingConfig& c) {
     JsonDocument doc = make_json_document();
     doc["v"] = RECORD_CODEC_VERSION;
-    doc["pairing_psk_enabled"] = c.pairing_psk_enabled;
     doc["unpaired_access_enabled"] = c.unpaired_access_enabled;
-    // The stored key strings are "dynamic_pin_enabled" / "static_pin_enabled": this blob is a
-    // storage format in its own right, fixed independently of the protocol's field names.
-    doc["dynamic_pin_enabled"] = c.dynamic_pairing_code_enabled;
-    doc["static_pin_enabled"] = c.static_pairing_code_enabled;
     std::string out;
     serializeJson(doc, out);
     return out;
@@ -254,17 +249,8 @@ std::optional<SendspinPairingConfig> decode_pairing_config(std::string_view byte
         return std::nullopt;
     }
     SendspinPairingConfig cfg;
-    if (obj["pairing_psk_enabled"].is<bool>()) {
-        cfg.pairing_psk_enabled = obj["pairing_psk_enabled"].as<bool>();
-    }
     if (obj["unpaired_access_enabled"].is<bool>()) {
         cfg.unpaired_access_enabled = obj["unpaired_access_enabled"].as<bool>();
-    }
-    if (obj["dynamic_pin_enabled"].is<bool>()) {
-        cfg.dynamic_pairing_code_enabled = obj["dynamic_pin_enabled"].as<bool>();
-    }
-    if (obj["static_pin_enabled"].is<bool>()) {
-        cfg.static_pairing_code_enabled = obj["static_pin_enabled"].as<bool>();
     }
     // Keys this version does not define are ignored.
     return cfg;

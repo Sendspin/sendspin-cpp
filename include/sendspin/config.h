@@ -95,23 +95,35 @@ struct SendspinPairingPsk {
     }
 };
 
-/// @brief Pairing policy persisted by the client.
+/// @brief Pairing policy the client persists under `persistence_keys::PAIR_CONFIG`, changed at
+/// runtime through SendspinClient::set_unpaired_access_enabled().
 struct SendspinPairingConfig {
-    bool pairing_psk_enabled{true};
+    /// @brief Whether servers with no pairing record may declare playback and active roles
+    /// (pairing.md "Unpaired Access").
     bool unpaired_access_enabled{false};
-    /// @brief When true, the client advertises dynamic_pairing_code as a supported pair method
-    /// (also requires a configured out-channel and emission format).
-    bool dynamic_pairing_code_enabled{true};
-    /// @brief When true, the client advertises static_pairing_code as a supported pair method
-    /// (also requires a configured static pairing code and platform pairing-window support).
-    /// A client that offers dynamic_pairing_code offers that method instead: messaging.md
-    /// "client/hello" permits at most one pairing-code method in supported_pair_methods.
-    bool static_pairing_code_enabled{false};
 };
 
 // ============================================================================
 // Client config
 // ============================================================================
+
+/// @brief A 32-byte pre-shared key supplied through configuration.
+/// Copies like the array it holds; every copy wipes its bytes on destruction, the same
+/// discipline as SendspinPairingPsk.
+struct SendspinPsk {
+    std::array<uint8_t, 32> bytes{};
+
+    SendspinPsk() = default;
+    explicit SendspinPsk(const std::array<uint8_t, 32>& key_bytes) : bytes(key_bytes) {}
+    SendspinPsk(const SendspinPsk&) = default;
+    SendspinPsk(SendspinPsk&&) = default;
+    SendspinPsk& operator=(const SendspinPsk&) = default;
+    SendspinPsk& operator=(SendspinPsk&&) = default;
+
+    ~SendspinPsk() {
+        detail::secure_zero_psk(this->bytes);
+    }
+};
 
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start()
@@ -140,7 +152,7 @@ struct SendspinClientConfig {
     /// (pairing.md "client/hello pair-method descriptor"). Set this alongside
     /// `pairing_code_formats` when the application implements the on_display_pairing_code /
     /// on_clear_pairing_code callbacks on its SendspinClientListener. Empty leaves
-    /// dynamic_pairing_code unadvertised even when the pairing config enables it.
+    /// dynamic_pairing_code unadvertised.
     std::vector<SendspinPairingCodeChannel> pairing_code_out_channels{};
 
     /// @brief Emission formats this device can render a dynamic pairing code in, in the order
@@ -152,9 +164,27 @@ struct SendspinClientConfig {
     /// @brief When true, the platform implements the operator pairing-window gesture.
     /// Set this to true when the application implements on_open_pairing_window /
     /// on_close_pairing_window callbacks on its SendspinClientListener. When false,
-    /// static_pairing_code is not advertised even if a static pairing code is configured and
-    /// enabled, and a dynamic attempt held back by the round limit has no way to resume.
+    /// static_pairing_code is not advertised even if `static_pairing_code` is set, and a dynamic
+    /// attempt held back by the round limit has no way to resume.
     bool pairing_window_supported{false};
+
+    /// @brief The Pairing PSK the device shipped with, for an application that provisions one
+    /// itself (for example from a factory partition). pairing.md "Pairing PSK Flow" requires it
+    /// to be drawn from a CSPRNG per device, never shared across devices. When set, it is the
+    /// Pairing PSK on every start() and is never written to the persistence provider; the library
+    /// derives its psk_id. An all-zero key or the published Sentinel PSK is rejected: start()
+    /// logs an error and returns false. When unset, the library loads the one stored under
+    /// `persistence_keys::PAIRING_PSK`, or generates one on first boot and stores it there.
+    /// SendspinClient::pairing_token() carries whichever is in use.
+    std::optional<SendspinPsk> pairing_psk{};
+
+    /// @brief The static pairing code the device shipped with: exactly 8 decimal digits, drawn
+    /// from a CSPRNG per device (pairing.md "Static Pairing Code Flow"). static_pairing_code is
+    /// advertised only when this is set, `pairing_window_supported` is true, and
+    /// dynamic_pairing_code is not advertised (messaging.md "client/hello" permits at most one
+    /// pairing-code method). A value that is not 8 decimal digits is rejected: start() logs an
+    /// error and returns false.
+    std::optional<std::string> static_pairing_code{};
 
     /// @brief Where the operator can find the Pairing PSK the device shipped with (as a pairing
     /// token): any of "device", "leaflet", "operator". Advertised as the informational
@@ -172,9 +202,12 @@ struct SendspinClientConfig {
     /// stored value always wins; SendspinClient::set_unpaired_access_enabled() changes it at
     /// runtime. With no persistence provider there is no stored config, so this value applies on
     /// every start.
-    /// A config that fails to load does not count as a first boot when any provisioned material
-    /// (a pairing record or the Pairing PSK) survived: the seed is skipped and unpaired access
-    /// stays disabled, so a damaged config fails closed. See the integration guide.
+    /// A config that fails to load does not count as a first boot when any stored material (a
+    /// pairing record or a stored Pairing PSK) survived: the seed is skipped and unpaired access
+    /// stays disabled, so a damaged config fails closed. A `pairing_psk` set here is not stored
+    /// material and never vetoes the seed, so a device with one and no pairing records cannot
+    /// tell a lost config from a first boot and applies this value again. See the integration
+    /// guide.
     bool initial_unpaired_access_enabled{false};
 
     /// @brief Default maximum number of long-term pairing records the store retains. Each record

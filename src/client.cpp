@@ -17,6 +17,7 @@
 #include "connection.h"
 #include "connection_manager.h"
 #include "crypto/keys.h"
+#include "crypto/pairing_code.h"
 #include "crypto/pairing_token.h"
 #include "inbox.h"
 #include "pairing_offers.h"
@@ -278,6 +279,22 @@ bool SendspinClient::start() {
             break;
     }
 
+    // Fail closed, like a failed identity: a Pairing PSK any peer could hold admits every server
+    // as a pairing peer, and a malformed static pairing code (pairing.md "Static Pairing Code
+    // Flow") fails every attempt with a code mismatch.
+    if (this->config_.pairing_psk.has_value() &&
+        !RecordStore::is_usable_pairing_psk(this->config_.pairing_psk->bytes)) {
+        SS_LOGE(TAG, "Configured Pairing PSK is all zero or the published Sentinel PSK; cannot "
+                     "start");
+        return false;
+    }
+    if (this->config_.static_pairing_code.has_value() &&
+        !is_valid_static_pairing_code(this->config_.static_pairing_code.value())) {
+        SS_LOGE(TAG, "Configured static pairing code is not %d decimal digits; cannot start",
+                STATIC_PAIRING_CODE_DIGITS);
+        return false;
+    }
+
     // lifecycle_ stays STOPPED until every step below has succeeded. Marking the client running
     // up front would report it started even when this function returns false (e.g. identity
     // generation failed and identity_ is left null), which is precisely the state connect_to()
@@ -295,9 +312,8 @@ bool SendspinClient::start() {
     if (this->record_store_ == nullptr || this->identity_ == nullptr ||
         this->identity_provider_ != this->persistence_provider_) {
         this->identity_.reset();
-        this->record_store_ = std::make_unique<RecordStore>(
-            this->persistence_provider_, this->config_.initial_unpaired_access_enabled,
-            this->config_.max_pairing_records);
+        this->record_store_ =
+            std::make_unique<RecordStore>(this->persistence_provider_, this->config_);
         if (!this->load_or_generate_identity()) {
             // identity_ is left null: there is no safe key to fall back to (see
             // load_or_generate_identity()'s doc comment), so the client must not start.
@@ -891,8 +907,8 @@ std::optional<std::string> SendspinClient::format_pairing_token(
 }
 
 std::optional<std::string> SendspinClient::pairing_token() const {
-    // Main-loop-only, like the other record-store config reads: the Pairing PSK is mutated only
-    // from the main loop (first-boot provisioning).
+    // Main-loop-only, like the other record-store config reads: the Pairing PSK is set when the
+    // store is built, inside start().
     if (this->record_store_ == nullptr || !this->record_store_->pairing_psk().has_value()) {
         return std::nullopt;
     }
@@ -1134,8 +1150,8 @@ std::string SendspinClient::build_hello_message() {
 
     // pairing.md "client/hello pair-method descriptor". offers_*() is the single source both this
     // and the server/activate admissibility check read, so a method advertised here is one an
-    // activation can select.
-    if (offers_pairing_psk(this->config_, *this->record_store_)) {
+    // activation can select. pairing_psk is always advertised (see pairing_offers.h).
+    {
         PairMethodDescriptor psk_desc;
         psk_desc.method = SendspinPairMethod::PAIRING_PSK;
         psk_desc.locations = locations_hint(this->config_.pairing_psk_locations);
@@ -1143,7 +1159,7 @@ std::string SendspinClient::build_hello_message() {
     }
     // out_channels and formats are both required and non-empty. No `locations`: a per-session code
     // has no resting place for the operator to look it up in.
-    if (offers_dynamic_pairing_code(this->config_, *this->record_store_)) {
+    if (offers_dynamic_pairing_code(this->config_)) {
         PairMethodDescriptor dynamic_desc;
         dynamic_desc.method = SendspinPairMethod::DYNAMIC_PAIRING_CODE;
         dynamic_desc.out_channels = this->config_.pairing_code_out_channels;
@@ -1152,7 +1168,7 @@ std::string SendspinClient::build_hello_message() {
     }
     // Offered only when the dynamic code is not: messaging.md "client/hello" permits at most one
     // pairing-code method.
-    if (offers_static_pairing_code(this->config_, *this->record_store_)) {
+    if (offers_static_pairing_code(this->config_)) {
         PairMethodDescriptor static_desc;
         static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
         static_desc.locations = locations_hint(this->config_.static_pairing_code_locations);

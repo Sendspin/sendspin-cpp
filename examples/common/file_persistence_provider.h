@@ -23,8 +23,8 @@
 /// into a downstream project as a starting point. On a real device the platform (e.g. ESPHome)
 /// implements the provider against NVS/Preferences instead.
 ///
-/// The file holds plaintext secrets (the static private key, long-term PSKs, the Pairing PSK,
-/// and the static pairing code), so it is written owner-only (0600) via POSIX open()/fchmod and
+/// The file holds plaintext secrets (the static private key, long-term PSKs, and the Pairing
+/// PSK), so it is written owner-only (0600) via POSIX open()/fchmod and
 /// fsync'd before the rename that makes it visible, with the containing directory fsync'd
 /// after: see write_file() in the .cpp. If this is copied elsewhere, keep that behavior or swap
 /// in an equivalent for the target platform; do not fall back to a bare std::ofstream. Two

@@ -19,7 +19,6 @@
 
 #include "sendspin/persistence_codec.h"
 
-#include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -274,93 +273,77 @@ TEST(PersistenceCodec, PskDecodeRejectsMalformedBlobs) {
 // ============================================================================
 
 TEST(PersistenceCodec, ConfigRoundTrip) {
+    for (bool enabled : {true, false}) {
+        SendspinPairingConfig c;
+        c.unpaired_access_enabled = enabled;
+        auto decoded = decode_pairing_config(encode_pairing_config(c));
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->unpaired_access_enabled, enabled);
+    }
+}
+
+// The stored blob holds the version and the one policy flag, nothing else (see
+// persistence_codec.h).
+TEST(PersistenceCodec, ConfigEncodesOnlyTheUnpairedAccessFlag) {
     SendspinPairingConfig c;
-    c.pairing_psk_enabled = false;
     c.unpaired_access_enabled = true;
-    c.dynamic_pairing_code_enabled = false;
-    c.static_pairing_code_enabled = true;
-
-    std::string blob = encode_pairing_config(c);
-    auto decoded = decode_pairing_config(blob);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->pairing_psk_enabled, c.pairing_psk_enabled);
-    EXPECT_EQ(decoded->unpaired_access_enabled, c.unpaired_access_enabled);
-    EXPECT_EQ(decoded->dynamic_pairing_code_enabled, c.dynamic_pairing_code_enabled);
-    EXPECT_EQ(decoded->static_pairing_code_enabled, c.static_pairing_code_enabled);
+    EXPECT_EQ(encode_pairing_config(c), R"({"v":1,"unpaired_access_enabled":true})");
 }
 
-// The two pairing-code flags are stored under the key strings the blob format froze them at,
-// which are independent of the protocol's field names (see persistence_codec.h).
-TEST(PersistenceCodec, ConfigUsesTheStoredKeyNames) {
-    SendspinPairingConfig c;
-    c.dynamic_pairing_code_enabled = false;
-    c.static_pairing_code_enabled = true;
+// A stored blob may carry keys this codec does not define ("pairing_psk_enabled",
+// "dynamic_pin_enabled", "static_pin_enabled", or any other). They are ignored, and
+// unpaired_access_enabled beside them still decodes.
+TEST(PersistenceCodec, ConfigDecodeIgnoresUndefinedKeys) {
+    struct Row {
+        const char* name;
+        std::string blob;
+        bool expect_unpaired;
+    };
+    const Row rows[] = {
+        {"four-field blob, unpaired on",
+         R"({"v":1,"pairing_psk_enabled":false,"unpaired_access_enabled":true,)"
+         R"("dynamic_pin_enabled":false,"static_pin_enabled":true})",
+         true},
+        {"four-field blob, unpaired off",
+         R"({"v":1,"pairing_psk_enabled":true,"unpaired_access_enabled":false,)"
+         R"("dynamic_pin_enabled":true,"static_pin_enabled":true})",
+         false},
+        {"unknown keys", R"({"v":1,"unpaired_access_enabled":true,"whatever":[1,2]})", true},
+    };
 
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, encode_pairing_config(c)));
-    ASSERT_TRUE(doc["dynamic_pin_enabled"].is<bool>());
-    ASSERT_TRUE(doc["static_pin_enabled"].is<bool>());
-    EXPECT_FALSE(doc["dynamic_pin_enabled"].as<bool>());
-    EXPECT_TRUE(doc["static_pin_enabled"].as<bool>());
-}
-
-// A config blob written by an older build carries keys this codec no longer knows. They are
-// ignored like any other unknown field.
-TEST(PersistenceCodec, ConfigDecodeIgnoresUnknownFields) {
-    auto decoded = decode_pairing_config(
-        R"({"v":1,"static_pin_enabled":true,"dynamic_pin_enabled":false,)"
-        R"("dynamic_pin_min_length":8,"pairing_psk_rotated":true,"whatever":[1,2]})");
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_TRUE(decoded->static_pairing_code_enabled);
-    // Control: a key this codec does know still comes through from the same blob.
-    EXPECT_FALSE(decoded->dynamic_pairing_code_enabled);
-}
-
-TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
-    SendspinPairingConfig defaults;
-    auto decoded = decode_pairing_config(R"({"v":1})");
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->pairing_psk_enabled, defaults.pairing_psk_enabled);
-    EXPECT_EQ(decoded->unpaired_access_enabled, defaults.unpaired_access_enabled);
-    EXPECT_EQ(decoded->dynamic_pairing_code_enabled, defaults.dynamic_pairing_code_enabled);
-    EXPECT_EQ(decoded->static_pairing_code_enabled, defaults.static_pairing_code_enabled);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto decoded = decode_pairing_config(row.blob);
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->unpaired_access_enabled, row.expect_unpaired);
+    }
 }
 
 // ArduinoJson's as<bool>() coerces any non-boolean variant to true, a "false" STRING included,
-// so an unguarded read of a corrupt config blob would turn a disabled pairing method back on -
-// including unpaired_access_enabled, which defaults to false and so is invisible to
-// ConfigDecodeMissingFieldsTakeDefaults. Every wrong-typed field must keep its struct default.
-TEST(PersistenceCodec, ConfigDecodeWrongTypedFieldsTakeDefaults) {
+// so an unguarded read of a corrupt config blob would turn unpaired access on. A missing or
+// wrong-typed field keeps the struct default (off).
+TEST(PersistenceCodec, ConfigDecodeMissingOrWrongTypedFieldTakesTheDefault) {
     const SendspinPairingConfig defaults;
-    for (const char* key : {"pairing_psk_enabled", "unpaired_access_enabled", "dynamic_pin_enabled",
-                            "static_pin_enabled"}) {
-        for (const char* corrupt : {R"("false")", R"("yes")", R"("")", "[1,2]", "{}", "1"}) {
-            std::string blob = std::string(R"({"v":1,")") + key + R"(":)" + corrupt + "}";
-            auto decoded = decode_pairing_config(blob);
-            ASSERT_TRUE(decoded.has_value()) << blob;
-            EXPECT_EQ(decoded->pairing_psk_enabled, defaults.pairing_psk_enabled) << blob;
-            EXPECT_EQ(decoded->unpaired_access_enabled, defaults.unpaired_access_enabled) << blob;
-            EXPECT_EQ(decoded->dynamic_pairing_code_enabled, defaults.dynamic_pairing_code_enabled)
-                << blob;
-            EXPECT_EQ(decoded->static_pairing_code_enabled, defaults.static_pairing_code_enabled)
-                << blob;
-        }
+    for (const char* corrupt : {R"("false")", R"("yes")", R"("")", "[1,2]", "{}", "1"}) {
+        std::string blob = std::string(R"({"v":1,"unpaired_access_enabled":)") + corrupt + "}";
+        auto decoded = decode_pairing_config(blob);
+        ASSERT_TRUE(decoded.has_value()) << blob;
+        EXPECT_EQ(decoded->unpaired_access_enabled, defaults.unpaired_access_enabled) << blob;
     }
 
-    // Control: a real boolean on each of the same four keys comes through.
-    auto decoded = decode_pairing_config(
-        R"({"v":1,"pairing_psk_enabled":false,"unpaired_access_enabled":true,)"
-        R"("dynamic_pin_enabled":false,"static_pin_enabled":true})");
+    auto missing = decode_pairing_config(R"({"v":1})");
+    ASSERT_TRUE(missing.has_value());
+    EXPECT_EQ(missing->unpaired_access_enabled, defaults.unpaired_access_enabled);
+
+    // Control: a real boolean on the same key comes through.
+    auto decoded = decode_pairing_config(R"({"v":1,"unpaired_access_enabled":true})");
     ASSERT_TRUE(decoded.has_value());
-    EXPECT_FALSE(decoded->pairing_psk_enabled);
     EXPECT_TRUE(decoded->unpaired_access_enabled);
-    EXPECT_FALSE(decoded->dynamic_pairing_code_enabled);
-    EXPECT_TRUE(decoded->static_pairing_code_enabled);
 }
 
 // The config decoder's malformed-root family. Field-level corruption is a different rule
-// (ConfigDecodeWrongTypedFieldsTakeDefaults): a bad root loses the blob, a bad field takes its
-// struct default.
+// (ConfigDecodeMissingOrWrongTypedFieldTakesTheDefault): a bad root loses the blob, a bad field
+// takes its struct default.
 TEST(PersistenceCodec, ConfigDecodeRejectsMalformedRoot) {
     struct Row {
         const char* name;

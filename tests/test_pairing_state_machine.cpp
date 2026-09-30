@@ -480,9 +480,8 @@ protected:
     /// Shape the device as a static-pairing-code device: the code it was provisioned with, and
     /// no out-channel, since messaging.md "client/hello" permits at most one pairing-code method
     /// in supported_pair_methods and pairing.md "Methods" prefers the dynamic code wherever an
-    /// out-channel exists. Rebuilds the client: the pairing configuration is construction-time
-    /// state (RecordStore reads it from the persistence provider and never writes it again), so
-    /// it is seeded and the client rebuilt rather than set on a live store.
+    /// out-channel exists. Rebuilds the client, since SendspinClientConfig is fixed at
+    /// construction.
     void configure_static_pairing_code(const std::string& code) {
         this->pairing_code_emission_supported_ = false;
         this->static_pairing_code_ = code;
@@ -490,21 +489,12 @@ protected:
     }
 
     /// Build the SendspinClient under test from the fixture's current configuration, seeding
-    /// the pairing blobs its RecordStore reads at construction.
+    /// the stored pairing config its RecordStore reads at construction.
     void build_client() {
         SendspinPairingConfig pairing_config;
-        // A device that implements static_pairing_code enables it in its pairing config,
-        // independent of whether a code is currently configured. Needed since the
-        // pairing-method admissibility check (see ConnectionManager::process_activate_event())
-        // gates entry on RecordStore::static_pairing_code_enabled().
-        pairing_config.static_pairing_code_enabled = true;
         pairing_config.unpaired_access_enabled = this->unpaired_access_enabled_;
         this->persistence_provider_.seed_blob(persistence_keys::PAIR_CONFIG,
                                               encode_pairing_config(pairing_config));
-        if (this->static_pairing_code_.has_value()) {
-            this->persistence_provider_.seed_blob(persistence_keys::STATIC_PAIRING_CODE,
-                                                  this->static_pairing_code_.value());
-        }
 
         SendspinClientConfig config;
         config.name = "PairingStateMachineTestDevice";
@@ -516,6 +506,7 @@ protected:
         config.pairing_window_supported = this->pairing_window_supported_;
         config.pairing_psk_locations = this->pairing_psk_locations_;
         config.static_pairing_code_locations = this->static_pairing_code_locations_;
+        config.static_pairing_code = this->static_pairing_code_;
         this->client_ = std::make_unique<SendspinClient>(config);
         this->client_->set_listener(&this->listener_);
         this->client_->set_network_provider(&this->network_provider_);
@@ -2590,9 +2581,8 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
 
     // Third activate: [pairing] + dynamic_pairing_code, admissible this time (category_ok: the
     // dynamic method does not require a Pairing-category PSK; offered: an out-channel and a
-    // format are configured and dynamic_pairing_code_enabled_ defaults true). Must proceed into
-    // pairing and its client/pair-init must carry pairing_index == 2: BOTH the rejected and the
-    // accepted activate counted.
+    // format are configured). Must proceed into pairing and its client/pair-init must carry
+    // pairing_index == 2: BOTH the rejected and the accepted activate counted.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                         SendspinPairingCodeFormat::DIGITS);

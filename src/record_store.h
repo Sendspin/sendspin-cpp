@@ -18,8 +18,8 @@
 /// the Noise handshake.
 ///
 /// Resolution is scoped to the `psk_category` the server declared: a long-term record, the
-/// accepted Pairing PSK (when Pairing PSK access is enabled), or the Sentinel PSK. A psk_id
-/// held only under another category is a miss.
+/// accepted Pairing PSK, or the Sentinel PSK. A psk_id held only under another category is a
+/// miss.
 ///
 /// The record types are the public ones from `sendspin/config.h`, so the persistence provider
 /// can pass them through without conversion.
@@ -27,7 +27,6 @@
 #pragma once
 
 #include "crypto/constants.h"
-#include "crypto/pairing_code.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 
@@ -132,15 +131,16 @@ public:
     /// If a persistence provider is supplied, attempts to load saved records
     /// and pairing config first; generates fresh material only when absent.
     /// @param provider Persistence provider, or nullptr for an in-memory-only store.
-    /// @param initial_unpaired_access_enabled First-boot default for unpaired (Sentinel) access.
-    ///        Applied only when no pairing config was loaded; a loaded config always wins.
-    /// @param max_records Cap on the number of long-term records retained, which is also the
-    ///        number of persistence slots. Defaults to DEFAULT_MAX_RECORDS, is raised to
-    ///        MIN_MAX_RECORDS when a caller asks for less, and lowered to MAX_MAX_RECORDS when a
-    ///        caller asks for more.
+    /// @param config The client config. The store reads three fields at construction and keeps
+    ///        no reference: `initial_unpaired_access_enabled` (applied only when no pairing
+    ///        config was loaded), `max_pairing_records` (also the number of persistence slots,
+    ///        raised to MIN_MAX_RECORDS and lowered to MAX_MAX_RECORDS), and `pairing_psk`.
     explicit RecordStore(SendspinPersistenceProvider* provider,
-                         bool initial_unpaired_access_enabled = false,
-                         size_t max_records = DEFAULT_MAX_RECORDS);
+                         const SendspinClientConfig& config = {});
+
+    /// @brief Whether a configured Pairing PSK may be used. An all-zero key and the published
+    /// Sentinel PSK are rejected: any peer could hold either.
+    [[nodiscard]] static bool is_usable_pairing_psk(const std::array<uint8_t, NOISE_PSK_SIZE>& psk);
 
     // ========================================
     // PSK resolution (used by the Noise handshake)
@@ -239,10 +239,6 @@ public:
     // Pairing config
     // ========================================
 
-    [[nodiscard]] bool pairing_psk_enabled() const {
-        return this->pairing_psk_enabled_;
-    }
-
     [[nodiscard]] bool unpaired_access_enabled() const {
         return this->unpaired_access_enabled_;
     }
@@ -250,22 +246,6 @@ public:
     /// @brief Sets unpaired access and persists the pairing config.
     /// @return false if the provider rejected the write; the RAM value changes either way.
     bool set_unpaired_access_enabled(bool enabled);
-
-    [[nodiscard]] bool dynamic_pairing_code_enabled() const {
-        return this->dynamic_pairing_code_enabled_;
-    }
-
-    // ========================================
-    // Static pairing code
-    // ========================================
-
-    [[nodiscard]] const std::optional<std::string>& static_pairing_code() const {
-        return this->static_pairing_code_;
-    }
-
-    [[nodiscard]] bool static_pairing_code_enabled() const {
-        return this->static_pairing_code_enabled_;
-    }
 
     // ========================================
     // Pairing outcome
@@ -356,11 +336,7 @@ private:
     /// psk_id if it disagrees with the loaded secret.
     void load_pairing_psk_from_provider();
 
-    /// @brief Load static_pairing_code_ from the provider's STATIC_PAIRING_CODE blob, if
-    /// present and valid.
-    void load_static_pairing_code_from_provider();
-
-    /// @brief Load the pairing config fields from the provider's PAIR_CONFIG blob, if present.
+    /// @brief Load the pairing config from the provider's PAIR_CONFIG blob, if present.
     /// @return True if a valid config was loaded; the seeding helper below uses this (the
     ///         "loaded_config" signal) to decide first-boot vs. damaged-config behavior.
     bool load_pairing_config_from_provider();
@@ -370,6 +346,9 @@ private:
     /// @param loaded_config Whether load_pairing_config_from_provider() found a usable config.
     /// @param initial_unpaired_access_enabled First-boot default for unpaired access.
     void seed_first_boot_config(bool loaded_config, bool initial_unpaired_access_enabled);
+
+    /// @brief Make the configured Pairing PSK the store's, replacing any stored one.
+    void adopt_configured_pairing_psk(const SendspinPsk& configured);
 
     /// @brief Generate and persist the Pairing PSK if the store has none.
     void provision_pairing_psk_if_needed();
@@ -447,9 +426,6 @@ private:
     /// Slots whose stored blob no longer matches records_, awaiting the next persist_records().
     std::vector<DirtySlot> dirty_slots_;
 
-    /// Configured static pairing code (8 decimal digits).
-    std::optional<std::string> static_pairing_code_;
-
     // Pointer fields
     SendspinPersistenceProvider* provider_{nullptr};
 
@@ -459,9 +435,6 @@ private:
     // 8-bit fields
     /// Whether the record-order blob no longer matches records_'s order.
     bool order_dirty_{false};
-    bool dynamic_pairing_code_enabled_{true};
-    bool pairing_psk_enabled_{true};
-    bool static_pairing_code_enabled_{false};
     bool unpaired_access_enabled_{false};
 };
 

@@ -21,10 +21,12 @@
 /// `pair/abort(method_not_supported)` for anything they leave out (messaging.md
 /// "server/activate"). A method the hello advertises but the activation path rejects would
 /// strand a server with nothing left to try.
+///
+/// pairing_psk needs no predicate: every client implements it (pairing.md "Pairing") and the
+/// record store holds a Pairing PSK from construction on, so it is always offered.
 
 #pragma once
 
-#include "record_store.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
 
@@ -33,38 +35,26 @@
 
 namespace sendspin {
 
-// Each predicate below reads the client config and the record store's pairing-config flags, and
-// returns true when the method may be advertised and accepted.
-
-/// @brief Whether the client offers the Pairing PSK method.
-/// `config` is unused; it is taken for call-site symmetry, since the store alone configures this
-/// method.
-/// The method needs an actual Pairing PSK behind it (normally auto-provisioned on first boot):
-/// advertising it without one offers a server a flow whose handshake could only miss.
-inline bool offers_pairing_psk(const SendspinClientConfig& /*config*/, const RecordStore& store) {
-    return store.pairing_psk_enabled() && store.pairing_psk().has_value();
-}
+// Each offers_*() predicate below reads only the client config and returns true when the method
+// may be advertised and accepted.
 
 /// @brief Whether the client offers the dynamic pairing code.
 /// pairing.md "client/hello pair-method descriptor" makes `out_channels` and `formats` required,
 /// and a descriptor with no recognized channel or format is ignored outright, so a device that
 /// lists neither cannot offer the method.
-inline bool offers_dynamic_pairing_code(const SendspinClientConfig& config,
-                                        const RecordStore& store) {
-    return store.dynamic_pairing_code_enabled() && !config.pairing_code_out_channels.empty() &&
-           !config.pairing_code_formats.empty();
+inline bool offers_dynamic_pairing_code(const SendspinClientConfig& config) {
+    return !config.pairing_code_out_channels.empty() && !config.pairing_code_formats.empty();
 }
 
 /// @brief Whether the client offers the static pairing code.
-/// Needs the configured code and the operator gesture the flow is gated on (pairing.md "Pairing
-/// Window"). A client that offers the dynamic pairing code offers that one instead:
-/// messaging.md "client/hello" permits at most one pairing-code method in
+/// Needs a configured code (start() refuses a malformed one) and the operator gesture the flow is
+/// gated on (pairing.md "Pairing Window"). A client that offers the dynamic pairing code offers
+/// that one instead: messaging.md "client/hello" permits at most one pairing-code method in
 /// `supported_pair_methods`, and pairing.md "Methods" prefers the dynamic code wherever an
 /// out-channel exists.
-inline bool offers_static_pairing_code(const SendspinClientConfig& config,
-                                       const RecordStore& store) {
-    return config.pairing_window_supported && store.static_pairing_code_enabled() &&
-           store.static_pairing_code().has_value() && !offers_dynamic_pairing_code(config, store);
+inline bool offers_static_pairing_code(const SendspinClientConfig& config) {
+    return config.pairing_window_supported && config.static_pairing_code.has_value() &&
+           !offers_dynamic_pairing_code(config);
 }
 
 /// @brief Whether `format` is one the client advertises in its `formats` list.

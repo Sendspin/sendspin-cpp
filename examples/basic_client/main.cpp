@@ -34,7 +34,6 @@
 
 #include "sendspin/client.h"
 #include "sendspin/config.h"
-#include "sendspin/persistence_codec.h"
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
@@ -69,7 +68,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -275,6 +273,7 @@ int main(int argc, char* argv[]) {
         // the out-channel unset. Every static_pairing_code attempt is gesture-gated
         // (pairing.md "Pairing Window"), which SIGUSR1 stands in for here.
         config.pairing_window_supported = true;
+        config.static_pairing_code = static_pairing_code;
         config.static_pairing_code_locations = {"device"};
     }
 
@@ -287,27 +286,6 @@ int main(int argc, char* argv[]) {
     // restarts. Path: $HOME/.sendspin.json (regenerated if the file is absent).
     const std::string persistence_path = FilePersistenceProvider::default_path(".sendspin.json");
     FilePersistenceProvider persistence_provider(persistence_path);
-
-    // The static pairing code and the pairing config are provisioned state the store reads once
-    // at start(), so they are written before the client is built.
-    if (!static_pairing_code.empty()) {
-        persistence_provider.save_blob(
-            persistence_keys::STATIC_PAIRING_CODE,
-            reinterpret_cast<const uint8_t*>(static_pairing_code.data()),
-            static_pairing_code.size());
-        SendspinPairingConfig pairing_config;
-        if (auto blob = persistence_provider.load_blob(persistence_keys::PAIR_CONFIG)) {
-            std::string_view text(reinterpret_cast<const char*>(blob->data()), blob->size());
-            if (auto decoded = decode_pairing_config(text)) {
-                pairing_config = decoded.value();
-            }
-        }
-        pairing_config.static_pairing_code_enabled = true;
-        const std::string encoded = encode_pairing_config(pairing_config);
-        persistence_provider.save_blob(persistence_keys::PAIR_CONFIG,
-                                       reinterpret_cast<const uint8_t*>(encoded.data()),
-                                       encoded.size());
-    }
 
     SendspinClient client(std::move(config));
     client.set_persistence_provider(&persistence_provider);

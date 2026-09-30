@@ -826,7 +826,7 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
     // pairing.md "client/hello pair-method descriptor": supported_pair_methods is an object keyed
     // by pairing method identifier, each value the method's descriptor. It is REQUIRED (every
     // client implements at least pairing_psk, messaging.md "client/hello"), so the object is
-    // emitted even when every method is disabled.
+    // emitted even for an empty list.
     {
         JsonObject methods_obj = root["payload"]["supported_pair_methods"].to<JsonObject>();
         for (const auto& desc : msg->supported_pair_methods) {

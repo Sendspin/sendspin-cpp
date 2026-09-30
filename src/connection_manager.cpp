@@ -766,9 +766,8 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // Structurally admissible already (the activity set passed the table above),
     // but a pairing activate additionally carries a pairing object whose method must
     // (a) match the matched PSK's category (pairing_psk iff the matched PSK IS the
-    // Pairing PSK) and (b) currently be offered per the LIVE pairing config, which
-    // may have drifted from the supported_pair_methods advertised at hello time. When
-    // it is not, reply pair/abort(method_not_supported) and leave the connection open
+    // Pairing PSK) and (b) be one the client/hello advertised in supported_pair_methods.
+    // When it is not, reply pair/abort(method_not_supported) and leave the connection open
     // (unlike the reasons above, this does not close the connection).
     // A pairing activate that names no usable method (pairing object absent, or a
     // method string this client does not recognize; process_server_activate_message
@@ -783,23 +782,18 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         const SendspinPairMethod method = event.pairing_method.value();
         const bool category_ok = (method == SendspinPairMethod::PAIRING_PSK) ==
                                  (event.conn->get_psk_category() == PskCategory::PAIRING);
-        // "Currently offered" mirrors exactly what build_hello_message() advertises
-        // in supported_pair_methods (client.cpp): the RecordStore's live enabled
-        // flags and the platform-capability configuration (a device that lists no
-        // out-channel or emission format never offers dynamic_pairing_code,
-        // regardless of the enabled flag).
-        const RecordStore& rs = *this->client_->record_store_;
+        // The same predicates build_hello_message() advertises from (pairing_offers.h).
         const auto& cfg = this->client_->config_;
         bool offered = true;
         switch (method) {
             case SendspinPairMethod::PAIRING_PSK:
-                offered = offers_pairing_psk(cfg, rs);
+                offered = true;  // Always advertised; see pairing_offers.h.
                 break;
             case SendspinPairMethod::DYNAMIC_PAIRING_CODE:
-                offered = offers_dynamic_pairing_code(cfg, rs);
+                offered = offers_dynamic_pairing_code(cfg);
                 break;
             case SendspinPairMethod::STATIC_PAIRING_CODE:
-                offered = offers_static_pairing_code(cfg, rs);
+                offered = offers_static_pairing_code(cfg);
                 break;
         }
         if (!category_ok || !offered) {
@@ -1978,8 +1972,7 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
                                                   const std::string& server_id,
                                                   SendspinPairMethod selected_method) {
     const bool is_dynamic = selected_method == SendspinPairMethod::DYNAMIC_PAIRING_CODE;
-    const RecordStore& store = *this->client_->record_store_;
-    const auto& static_code = store.static_pairing_code();
+    const auto& static_code = this->client_->config_.static_pairing_code;
     const auto& pairing_format = conn->get_pairing_format();
 
     // Defensive: the client should not have advertised static_pairing_code without a configured
@@ -2018,9 +2011,8 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
         // Checked against the advertised formats when the activation was admitted.
         ps.format = pairing_format.value();
     } else {
-        // Capture the static code now, before any operator window wait, so a code change during
-        // the open window cannot swap the CPace secret mid-attempt. The static code is what CPace
-        // consumes as PRS directly; a dynamic one is only known once nonce_A arrives.
+        // CPace consumes the static code as PRS directly, so it is known here; a dynamic code
+        // is only known once nonce_A arrives.
         ps.prs = pairing_code_digits_prs(static_code.value());
     }
 
@@ -2046,10 +2038,10 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
 
         // Surface the pairing-window prompt to the operator, but only when the platform
         // implements the gesture UI (on_open_pairing_window's contract is that it fires only
-        // when pairing_window_supported is true). A device that never offers
-        // static_pairing_code without that flag (see offers_static_pairing_code()) cannot reach
-        // this branch, but a stored config that outlives a capability change could; the attempt
-        // then has no way to proceed and waits for the server's own timeout to cancel it.
+        // when pairing_window_supported is true). A static_pairing_code attempt never gets here
+        // without that flag (see offers_static_pairing_code()); a dynamic attempt held back by
+        // the round limit does, and then has no way to proceed and waits for the server's own
+        // timeout to cancel it.
         if (this->client_->config_.pairing_window_supported) {
             this->client_->note_open_pairing_window();
             ps.window_shown = true;
@@ -2573,10 +2565,8 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
         return;
     }
 
-    // Static pairing code. Use the PRS captured at pairing start (see handle_enter_pairing),
-    // not a fresh store read, so a code change during the operator's window cannot swap the
-    // CPace secret. Empty means it was never captured (defensive; the enter-pairing path always
-    // captures a configured code).
+    // Static pairing code: the PRS handle_enter_pairing_code() set. Empty means it was never set
+    // (defensive; that path always sets it for a static attempt).
     if (ps.prs.empty()) {
         SS_LOGE(TAG, "start_pairing_attempt: no static pairing code captured for server_id=%s",
                 server_id.c_str());

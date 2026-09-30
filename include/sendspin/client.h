@@ -175,7 +175,8 @@ public:
 ///
 /// Threading: every method is invoked on the main loop thread, for every key, so a provider needs
 /// no locking of its own. First-boot provisioning writes from inside `start()` rather than in
-/// response to a runtime event: `KEYPAIR`, `PAIRING_PSK`, and `PAIR_CONFIG` when none is stored.
+/// response to a runtime event: `KEYPAIR` and `PAIR_CONFIG` when none is stored, and
+/// `PAIRING_PSK` when none is stored and `SendspinClientConfig::pairing_psk` is unset.
 ///
 /// Re-entrancy: implementations must not call back into the library from inside
 /// load_blob/save_blob/erase_blob. Every call is made from the middle of a library step that is
@@ -236,7 +237,7 @@ public:
 ///   (`encode_pairing_record()` / `decode_pairing_record()`, `encode_pairing_psk()` /
 ///   `decode_pairing_psk()`, `encode_pairing_config()` / `decode_pairing_config()`
 ///   respectively).
-/// - `RECORD_ORDER`, `KEYPAIR`, `STATIC_PAIRING_CODE`, and `LAST_PLAYED` hold raw bytes: see
+/// - `RECORD_ORDER`, `KEYPAIR`, and `LAST_PLAYED` hold raw bytes: see
 ///   each constant's comment.
 /// - `OUTPUT_DELAY` holds an ASCII decimal string rather than raw uint16_t bytes, for
 ///   debuggability and to avoid an endianness dependency; decode it with a bounds check and
@@ -270,11 +271,8 @@ inline std::string record_slot_key(size_t slot) {
 }
 
 /// Codec blob: the accepted `SendspinPairingPsk` (`encode_pairing_psk()` / `decode_pairing_psk()`).
+/// `SendspinClientConfig::pairing_psk` outranks it.
 inline constexpr const char* PAIRING_PSK = "pairing_psk";
-
-/// Raw UTF-8 bytes: the configured static pairing code (8 decimal digits). The stored key string
-/// is part of the storage format, fixed independently of the protocol field names.
-inline constexpr const char* STATIC_PAIRING_CODE = "static_pin";
 
 /// Codec blob: the `SendspinPairingConfig` (`encode_pairing_config()` / `decode_pairing_config()`).
 inline constexpr const char* PAIR_CONFIG = "pair_config";
@@ -370,7 +368,9 @@ public:
     ///
     /// The server itself comes up on the first loop() tick after the network provider reports
     /// ready. If a role fails to start, the roles that did start are stopped again so a corrected
-    /// retry begins from the stopped state. Main-loop thread only.
+    /// retry begins from the stopped state. A rejected configured pairing secret
+    /// (SendspinClientConfig::pairing_psk or static_pairing_code) fails every start() of this
+    /// instance, since the config is fixed at construction. Main-loop thread only.
     /// @return true if the client is running (including when it already was), false on failure
     bool start();
 
@@ -566,12 +566,12 @@ public:
         const std::array<uint8_t, 32>& pairing_psk) const;
 
     /// @brief Builds the pairing token for the client's own Sendspin Pairing PSK.
-    /// The Pairing PSK is provisioned automatically on first boot and persisted, so this token
-    /// is stable for the lifetime of the stored key: display it (or its QR code) for the
-    /// operator to transfer into a server that is setting this client up.
+    /// The Pairing PSK is SendspinClientConfig::pairing_psk when set, otherwise the stored one,
+    /// generated and persisted on first boot when none is stored, so this token is stable for
+    /// the lifetime of that key: display it (or its QR code) for the operator to transfer into a
+    /// server that is setting this client up.
     /// Main loop only.
-    /// @return The 107-character token string, or nullopt before start() or when no
-    ///         Pairing PSK is configured.
+    /// @return The 107-character token string, or nullopt before start().
     [[nodiscard]] std::optional<std::string> pairing_token() const;
 
     /// @brief Returns true if there is an active connection whose handshake completed and whose
