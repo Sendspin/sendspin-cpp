@@ -21,14 +21,12 @@ item against the current code before acting on it; line numbers drift as phases 
   replacement.
 - The optional dual-connection hold (a pairing connection alongside a playback connection) is
   not implemented; the single-slot fallback the spec allows stays.
-- Pairing configuration (which methods are enabled, the static code, unpaired access, and the
-  secrets themselves) is construction-time only: `RecordStore` reads it from the persistence
-  provider at `start()` and never writes it back. With the management namespace gone the library
-  has no runtime mutators for any of it, so a device changes its pairing policy by writing the
-  blobs and restarting. A public runtime API for it is possible later work. Until one exists,
-  the `pairing.md` "Unpaired Access" rule that a client which stops admitting unpaired access
-  closes the connections relying on it with `client/goodbye` reason `pairing_required` cannot
-  fire, because the setting cannot change while the client runs.
+- Pairing configuration (which methods are enabled, the static code, and the secrets
+  themselves) is construction-time only: `RecordStore` reads it from the persistence provider when
+  it is built at the first `start()`, so a device changes it by writing the blobs and rebooting.
+  Unpaired access is the exception: `SendspinClient::set_unpaired_access_enabled()` changes it at
+  runtime, closing the connections that relied on it with `pairing_required` when turned off and
+  restarting idle inbound unpaired connections when turned on (`pairing.md` "Unpaired Access").
 - Record eviction order is least recently used, which the spec leaves to the implementation.
   Recency is the order of `RecordStore::records_`, which `note_record_used()` moves a touched
   record to the back of; no new field or timestamp is stored.

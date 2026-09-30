@@ -561,6 +561,13 @@ public:
         return this->hello_pair_methods_;
     }
 
+    /// payload.unpaired_access.enabled from the most recent client/hello; nullopt before one, or
+    /// when that hello omits it.
+    std::optional<bool> hello_unpaired_access() const {
+        std::lock_guard<std::mutex> lock(this->pair_methods_mutex_);
+        return this->hello_unpaired_access_;
+    }
+
     bool closed() const {
         return this->closed_.load();
     }
@@ -776,6 +783,9 @@ private:
                      doc["payload"]["supported_pair_methods"].as<JsonObjectConst>()) {
                     this->hello_pair_methods_.emplace_back(m.key().c_str());
                 }
+                JsonVariantConst enabled = doc["payload"]["unpaired_access"]["enabled"];
+                this->hello_unpaired_access_ =
+                    enabled.is<bool>() ? std::optional<bool>(enabled.as<bool>()) : std::nullopt;
             }
             if (this->options_.suppress_activate) {
                 return;
@@ -956,6 +966,7 @@ private:
     std::atomic<int> activate_count_{0};
     mutable std::mutex pair_methods_mutex_;
     std::vector<std::string> hello_pair_methods_;
+    std::optional<bool> hello_unpaired_access_;
     std::atomic<bool> closed_{false};
 
     mutable std::mutex pair_mutex_;
@@ -986,10 +997,14 @@ private:
 // test be the outbound connector, so a test can reach that code path.
 class FakeOutboundEncryptedServer : public NoiseInitiatorFixtureBase {
 public:
+    /// @param activate_payload The payload of the server/activate sent in answer to the hello.
     FakeOutboundEncryptedServer(uint16_t port, std::string suite_name, Identity server_identity,
-                                std::string psk_id, std::array<uint8_t, NOISE_PSK_SIZE> psk)
+                                std::string psk_id, std::array<uint8_t, NOISE_PSK_SIZE> psk,
+                                std::string activate_payload =
+                                    R"({"activities":["playback"],"active_roles":["player@v1"]})")
         : NoiseInitiatorFixtureBase(std::move(suite_name), server_identity, std::move(psk_id), psk,
                                     "Fake Outbound Encrypted Server"),
+          activate_payload_(std::move(activate_payload)),
           server_(port, "127.0.0.1") {
         this->server_.setOnConnectionCallback(
             [this](const std::weak_ptr<ix::WebSocket>& weak_ws,
@@ -1104,10 +1119,8 @@ private:
         const char* type = doc["type"] | "";
 
         if (std::strcmp(type, "client/hello") == 0) {
-            std::string activate =
-                R"({"type":"server/activate","payload":{"activities":["playback"],)"
-                R"("active_roles":["player@v1"]}})";
-            this->send_encrypted_locked(activate);
+            this->send_encrypted_locked(R"({"type":"server/activate","payload":)" +
+                                        this->activate_payload_ + "}");
             return;
         }
 
@@ -1118,6 +1131,7 @@ private:
         }
     }
 
+    std::string activate_payload_;
     ix::WebSocketServer server_;
 
     // ws_ itself is guarded by crypto_mutex_ (declared on the base class): on_message() /

@@ -655,6 +655,22 @@ public:
     /// way runs to its own end.
     void cancel_pairing_window();
 
+    /// @brief Turns unpaired access on or off, persisting the choice. Main loop only.
+    ///
+    /// pairing.md "Unpaired Access": servers with no pairing record may declare playback and
+    /// activate roles only while it is on. Turning it off closes every connection that relies on
+    /// it with client/goodbye reason pairing_required. Turning it on closes each unpaired
+    /// connection a server opened that is not declaring pairing with reason restart, so the server
+    /// reconnects and sees the new value in the client/hello; a connect_to() connection is kept.
+    /// Callable while stopped, but ignored, with a log, before the first start() has loaded the
+    /// stored pairing config.
+    /// @param enabled Whether to admit unpaired access.
+    void set_unpaired_access_enabled(bool enabled);
+
+    /// @brief Whether unpaired access is on; see set_unpaired_access_enabled(). Main loop only.
+    /// @return The stored setting, or false before the first start() has loaded it.
+    bool is_unpaired_access_enabled() const;
+
     // ========================================
     // Listener and provider setters
     // ========================================

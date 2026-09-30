@@ -107,6 +107,13 @@ constexpr uint16_t COLOR_SCHEDULE_TEST_PORT = 19043;
 constexpr uint16_t COLOR_PENDING_TEST_PORT = 19044;
 constexpr uint16_t COLOR_BOTH_DUE_TEST_PORT = 19045;
 constexpr uint16_t BLOCKING_RECORD_WRITE_TEST_PORT = 19046;
+constexpr uint16_t UNPAIRED_TOGGLE_TEST_PORT = 19091;
+constexpr uint16_t UNPAIRED_TOGGLE_CONTROL_TEST_PORT = 19092;
+constexpr uint16_t UNPAIRED_TOGGLE_NURSERY_TEST_PORT = 19093;
+constexpr uint16_t UNPAIRED_TOGGLE_OUTBOUND_PORT = 19094;
+constexpr uint16_t UNPAIRED_TOGGLE_OUTBOUND_TEST_PORT = 19095;
+constexpr uint16_t UNPAIRED_TOGGLE_REKEY_TEST_PORT = 19096;
+constexpr uint16_t UNPAIRED_TOGGLE_STOPPED_TEST_PORT = 19097;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob() to a record slot key, so the pairing-flow test below
@@ -2919,4 +2926,250 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+/// The unpaired-access setting the client last persisted; nullopt when no config blob decodes.
+std::optional<bool> stored_unpaired_access(InMemoryPersistenceProvider& persistence) {
+    auto blob = persistence.load_blob(persistence_keys::PAIR_CONFIG);
+    if (!blob.has_value()) {
+        return std::nullopt;
+    }
+    auto config = decode_pairing_config(
+        std::string_view(reinterpret_cast<const char*>(blob->data()), blob->size()));
+    if (!config.has_value()) {
+        return std::nullopt;
+    }
+    return config->unpaired_access_enabled;
+}
+
+// pairing.md "Unpaired Access" on one live client. Turning the setting on restarts an idle
+// unpaired session so its server reconnects and reads the new value in the hello; turning it off
+// closes the session that came back with playback, since only the setting was admitting it.
+TEST(EncryptedLifecycle, TogglingUnpairedAccessBringsTheUnpairedSessionInLine) {
+    TestNetworkProvider network;
+    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
+    InMemoryPersistenceProvider& persistence = *provider;
+    SendspinClientConfig config;
+    config.name = "Unpaired Toggle Test Client";
+    config.server_port = UNPAIRED_TOGGLE_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    Identity identity = Identity::generate().value();
+    FakeEncryptedServerOptions idle;
+    idle.first_activities_json = R"([])";
+    idle.first_roles_json = R"([])";
+    FakeEncryptedServer held(server_url(UNPAIRED_TOGGLE_TEST_PORT),
+                             std::string(NOISE_SUITE_CHACHAPOLY), identity,
+                             std::string(SENTINEL_PSK_ID), SENTINEL_PSK, idle);
+    pump_until(client, [&] { return client.is_connected(); });
+    ASSERT_EQ(held.hello_unpaired_access(), std::optional<bool>(false));
+
+    client.set_unpaired_access_enabled(true);
+    EXPECT_TRUE(client.is_unpaired_access_enabled());
+    EXPECT_EQ(stored_unpaired_access(persistence), std::optional<bool>(true));
+    pump_until(client, [&] { return held.closed(); });
+    EXPECT_EQ(held.goodbye_reason(), std::optional<std::string>("restart"));
+
+    FakeEncryptedServer playing(server_url(UNPAIRED_TOGGLE_TEST_PORT),
+                                std::string(NOISE_SUITE_CHACHAPOLY), identity,
+                                std::string(SENTINEL_PSK_ID), SENTINEL_PSK);
+    pump_until(client, [&] { return client.is_connected(); });
+    EXPECT_EQ(playing.hello_unpaired_access(), std::optional<bool>(true));
+
+    client.set_unpaired_access_enabled(false);
+    EXPECT_FALSE(client.is_unpaired_access_enabled());
+    EXPECT_EQ(stored_unpaired_access(persistence), std::optional<bool>(false));
+    pump_until(client, [&] { return playing.closed(); });
+    EXPECT_EQ(playing.goodbye_reason(), std::optional<std::string>("pairing_required"));
+    EXPECT_FALSE(client.is_connected());
+
+    pump_for(client, 100);
+}
+
+// Control for the test above: a paired session never depends on the setting, and a session in a
+// pairing attempt is left to finish it rather than restarted.
+TEST(EncryptedLifecycle, UnpairedAccessChangesLeavePairedAndPairingSessionsAlone) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+    Identity server_identity = Identity::generate().value();
+    PairedPeer long_term_peer = make_paired_peer();
+    long_term_peer.record.server_id = server_identity.peer_id();
+    persistence.set_seeded_long_term_record(long_term_peer.record);
+    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xD1);
+    persistence.set_unpaired_access_enabled(false);
+
+    SendspinClientConfig config;
+    config.name = "Unpaired Toggle Control Test Client";
+    config.server_port = UNPAIRED_TOGGLE_CONTROL_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    {
+        FakeEncryptedServer paired(server_url(UNPAIRED_TOGGLE_CONTROL_TEST_PORT),
+                                   std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                                   long_term_peer.record.psk_id, long_term_peer.psk);
+        pump_until(client, [&] { return client.is_connected(); });
+
+        client.set_unpaired_access_enabled(true);
+        client.set_unpaired_access_enabled(false);
+        // Must-not-happen window: a close would follow within a tick of either call.
+        pump_for(client, 300);
+        EXPECT_FALSE(paired.closed()) << "a paired session was closed by an unpaired-access change";
+    }
+    pump_until(client, [&] { return !client.is_connected(); });
+
+    FakeEncryptedServerOptions pairing_options;
+    pairing_options.first_activities_json = R"(["pairing"])";
+    pairing_options.first_roles_json = R"([])";
+    pairing_options.first_pairing_method = "pairing_psk";
+    pairing_options.psk_category = "pr";
+    pairing_options.withhold_pair_finalize_ack = true;
+    FakeEncryptedServer pairing(server_url(UNPAIRED_TOGGLE_CONTROL_TEST_PORT),
+                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                                pairing_psk.psk_id, pairing_psk.psk, pairing_options);
+    pump_until(client, [&] { return pairing.pair_init().has_value(); });
+
+    client.set_unpaired_access_enabled(true);
+    pump_for(client, 300);
+    EXPECT_FALSE(pairing.closed()) << "enabling unpaired access restarted a pairing attempt";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A session still proving itself has already sent the hello that carries the old value, so
+// enabling unpaired access restarts it as it does an admitted one.
+TEST(EncryptedLifecycle, EnablingUnpairedAccessRestartsAnUnpairedSessionStillInTheNursery) {
+    TestNetworkProvider network;
+    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
+    SendspinClientConfig config;
+    config.name = "Unpaired Toggle Nursery Test Client";
+    config.server_port = UNPAIRED_TOGGLE_NURSERY_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(provider.get());
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    FakeEncryptedServerOptions options;
+    options.suppress_activate = true;
+    FakeEncryptedServer server(server_url(UNPAIRED_TOGGLE_NURSERY_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), Identity::generate().value(),
+                               std::string(SENTINEL_PSK_ID), SENTINEL_PSK, options);
+    pump_until(client, [&] { return server.client_hello_count() == 1; });
+
+    client.set_unpaired_access_enabled(true);
+    pump_until(client, [&] { return server.closed(); });
+    EXPECT_EQ(server.goodbye_reason(), std::optional<std::string>("restart"));
+
+    pump_for(client, 100);
+}
+
+// Enabling unpaired access keeps a connect_to() session open.
+TEST(EncryptedLifecycle, EnablingUnpairedAccessKeepsAnOutboundUnpairedSession) {
+    TestNetworkProvider network;
+    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
+    SendspinClientConfig config;
+    config.name = "Unpaired Toggle Outbound Test Client";
+    config.server_port = UNPAIRED_TOGGLE_OUTBOUND_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(provider.get());
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    FakeOutboundEncryptedServer server(UNPAIRED_TOGGLE_OUTBOUND_PORT,
+                                       std::string(NOISE_SUITE_CHACHAPOLY),
+                                       Identity::generate().value(), std::string(SENTINEL_PSK_ID),
+                                       SENTINEL_PSK, R"({"activities":[],"active_roles":[]})");
+    ASSERT_TRUE(server.listen());
+    server.start();
+    client.connect_to(server_url(UNPAIRED_TOGGLE_OUTBOUND_PORT));
+    pump_until(client, [&] { return client.is_connected(); });
+
+    client.set_unpaired_access_enabled(true);
+    // Must-not-happen window: a restart would close the session within a tick of the call.
+    pump_for(client, 300);
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_FALSE(server.goodbye_reason().has_value());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Enabling unpaired access does not restart a connection between a re-handshake and the
+// activation that follows it.
+TEST(EncryptedLifecycle, UnpairedAccessChangesWaitOutARehandshake) {
+    TestNetworkProvider network;
+    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
+    SendspinClientConfig config;
+    config.name = "Unpaired Toggle Rekey Test Client";
+    config.server_port = UNPAIRED_TOGGLE_REKEY_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(provider.get());
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    FakeEncryptedServerOptions options;
+    options.suppress_activate = true;  // The post-rekey activate is the one that never comes.
+    FakeEncryptedServer server(server_url(UNPAIRED_TOGGLE_REKEY_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), Identity::generate().value(),
+                               std::string(SENTINEL_PSK_ID), SENTINEL_PSK, options);
+    pump_until(client, [&] { return server.client_hello_count() > 0; });
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/activate","payload":{"activities":[],"active_roles":[]}})"));
+    pump_until(client, [&] { return client.is_connected(); });
+
+    ASSERT_TRUE(server.trigger_rehandshake(std::string(SENTINEL_PSK_ID), SENTINEL_PSK));
+    pump_until(client, [&] { return !client.is_connected(); });
+
+    client.set_unpaired_access_enabled(true);
+    // Must-not-happen window: a restart would close the session within a tick of the call.
+    pump_for(client, 300);
+    EXPECT_FALSE(server.closed()) << "a connection awaiting its post-rekey activation was closed";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// The setting lives in the stored pairing config, so it can change only once a start() has
+// loaded that config, and a change made while stopped persists and survives the next start().
+TEST(EncryptedLifecycle, UnpairedAccessCanChangeWhileStoppedButNotBeforeTheFirstStart) {
+    TestNetworkProvider network;
+    auto provider = make_record_store_provider({}, /*unpaired_access_enabled=*/false);
+    SendspinClientConfig config;
+    config.name = "Unpaired Toggle Stopped Test Client";
+    config.server_port = UNPAIRED_TOGGLE_STOPPED_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(provider.get());
+
+    client.set_unpaired_access_enabled(true);
+    EXPECT_FALSE(client.is_unpaired_access_enabled());
+    ASSERT_TRUE(client.start());
+    EXPECT_FALSE(client.is_unpaired_access_enabled())
+        << "a call before the first start() must not reach the loaded config";
+    EXPECT_EQ(stored_unpaired_access(*provider), std::optional<bool>(false));
+
+    client.stop();
+    client.set_unpaired_access_enabled(true);
+    EXPECT_EQ(stored_unpaired_access(*provider), std::optional<bool>(true));
+    ASSERT_TRUE(client.start());
+    EXPECT_TRUE(client.is_unpaired_access_enabled());
+
+    client.stop();
 }

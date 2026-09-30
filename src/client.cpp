@@ -2122,4 +2122,21 @@ void SendspinClient::cancel_pairing_window() {
     this->connection_manager_->schedule_pairing_window_cancel();
 }
 
+void SendspinClient::set_unpaired_access_enabled(bool enabled) {
+    if (this->record_store_ == nullptr) {
+        SS_LOGW(TAG, "set_unpaired_access_enabled() ignored: call it after start()");
+        return;
+    }
+    if (this->record_store_->unpaired_access_enabled() == enabled) {
+        return;
+    }
+    // A rejected write is logged by the store; the setting still applies for this boot.
+    this->record_store_->set_unpaired_access_enabled(enabled);
+    this->connection_manager_->apply_unpaired_access_change(enabled);
+}
+
+bool SendspinClient::is_unpaired_access_enabled() const {
+    return this->record_store_ != nullptr && this->record_store_->unpaired_access_enabled();
+}
+
 }  // namespace sendspin

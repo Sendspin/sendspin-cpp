@@ -217,6 +217,36 @@ TEST(RejectReason, PairingRequiredOnlyWhereUnpairedAccessWouldHaveAdmitted) {
     }
 }
 
+// pairing.md "Unpaired Access": turning unpaired access off closes exactly the connections whose
+// applied activation it was admitting.
+TEST(ReliesOnUnpairedAccess, OnlyUnpairedPlaybackOrRolesRely) {
+    struct Row {
+        const char* name;
+        PskCategory category;
+        Acts activities;
+        bool has_roles;
+        bool relies;
+    };
+    const Row rows[] = {
+        {"Sentinel/[playback]", SENTINEL, Acts{PB}, false, true},
+        {"Sentinel/[]/roles", SENTINEL, Acts{}, true, true},
+        {"Pairing/[pairing,playback]", PAIRING_CAT, Acts{PR, PB}, false, true},
+        // Control: an unpaired connection held idle or pairing stands without unpaired access.
+        {"Sentinel/[]", SENTINEL, Acts{}, false, false},
+        {"Pairing/[pairing]", PAIRING_CAT, Acts{PR}, false, false},
+        // Control: a paired connection never depends on the setting, and one the setting cannot
+        // admit either way does not rely on it.
+        {"LongTerm/[playback]/roles", LONG_TERM, Acts{PB}, true, false},
+        {"LongTerm/[pairing]", LONG_TERM, Acts{PR}, false, false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(relies_on_unpaired_access(row.category, row.activities, row.has_roles),
+                  row.relies);
+    }
+}
+
 // ============================================================================
 // activity_rank
 // ============================================================================

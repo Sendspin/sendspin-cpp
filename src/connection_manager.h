@@ -148,7 +148,6 @@ struct NurseryEntry {
     std::shared_ptr<SendspinConnection> conn;  ///< Observer; the session slot / transport owns
     int64_t hello_due_us{0};                   ///< Next hello attempt; read only while SENDING
     uint32_t hello_retry_delay_ms{INITIAL_HELLO_RETRY_DELAY_MS};  ///< Current backoff delay
-    bool inbound{false};  ///< true if accepted by the WS server, false for connect_to()
     HelloStep hello_step{HelloStep::AWAIT_NOISE};
     uint8_t hello_attempts_left{MAX_HELLO_ATTEMPTS};
 };
@@ -449,6 +448,11 @@ public:
     /// @brief Schedules a pairing-window cancellation for deferred processing in
     /// loop(). Thread-safe; called from SendspinClient::cancel_pairing_window().
     void schedule_pairing_window_cancel();
+
+    /// @brief Closes the managed connections a changed unpaired-access setting no longer fits.
+    ///
+    /// Main loop only, once the RecordStore holds the new value.
+    void apply_unpaired_access_change(bool enabled);
 
     // ========================================
     // Handoff support

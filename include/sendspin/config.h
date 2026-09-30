@@ -169,8 +169,9 @@ struct SendspinClientConfig {
     /// @brief First-boot default for unpaired (Sentinel) access.
     /// Seeds `SendspinPairingConfig::unpaired_access_enabled` only on a genuine first boot; the
     /// seeded value is then written through the persistence provider. Once a config exists the
-    /// stored value always wins. With no persistence provider there is no stored config, so this
-    /// value applies on every start.
+    /// stored value always wins; SendspinClient::set_unpaired_access_enabled() changes it at
+    /// runtime. With no persistence provider there is no stored config, so this value applies on
+    /// every start.
     /// A config that fails to load does not count as a first boot when any provisioned material
     /// (a pairing record or the Pairing PSK) survived: the seed is skipped and unpaired access
     /// stays disabled, so a damaged config fails closed. See the integration guide.

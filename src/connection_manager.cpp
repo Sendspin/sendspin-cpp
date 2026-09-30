@@ -393,7 +393,7 @@ void ConnectionManager::connect_to(const std::string& url) {
         // the new one. Otherwise it would be dropped with no goodbye and, on ESP, leave its httpd
         // session pinned.
         for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
-            if (!it->inbound) {
+            if (it->conn->is_outbound()) {
                 it = this->release_nursery_entry(it, SendspinGoodbyeReason::ANOTHER_SERVER);
             } else {
                 ++it;
@@ -403,7 +403,7 @@ void ConnectionManager::connect_to(const std::string& url) {
         // A user-initiated connect is admitted even against a full nursery: there is at most one
         // outbound entry (replaced above), so the nursery is still bounded (MAX_NURSERY_ENTRIES)
         // and an explicit user request never fails against inbound peers.
-        this->push_nursery_entry(NurseryEntry{.conn = client_conn, .inbound = false});
+        this->push_nursery_entry(NurseryEntry{.conn = client_conn});
         client_conn->start();
     }
     this->flush_deferred_releases();
@@ -1358,6 +1358,57 @@ void ConnectionManager::schedule_pairing_window_cancel() {
     this->mark_pending();
 }
 
+void ConnectionManager::apply_unpaired_access_change(bool enabled) {
+    // pairing.md "Unpaired Access": disabling closes the connections relying on it with
+    // pairing_required; enabling restarts unpaired connections so their servers read the new value
+    // in the next client/hello.
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+
+        // Collect first: drop_connection() edits the nursery being walked.
+        InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> doomed;
+        auto consider = [&](const std::shared_ptr<SendspinConnection>& conn, bool hello_sent) {
+            if (!enabled) {
+                // A connection still awaiting its activation is judged against the new setting
+                // when that activation is applied.
+                if (conn->first_activate_received() &&
+                    relies_on_unpaired_access(conn->get_psk_category(), conn->get_activities(),
+                                              !conn->get_active_roles().empty())) {
+                    doomed.push_back(conn);
+                }
+                return;
+            }
+            // messaging.md "client/goodbye": restart on a connection the client opened promises
+            // that the client reopens it, and nothing reopens a connect_to() connection. A
+            // connection declaring pairing is left to finish.
+            if (hello_sent && !conn->is_outbound() &&
+                conn->get_psk_category() != PskCategory::LONG_TERM &&
+                !conn->has_activity(SendspinActivity::PAIRING)) {
+                doomed.push_back(conn);
+            }
+        };
+
+        // The admitted connection sent its hello to be admitted. One between a re-handshake and
+        // the activation that follows it is left alone: its server may be moving it into pairing.
+        if (this->current_connection_ != nullptr &&
+            this->current_connection_->first_activate_received()) {
+            consider(this->current_connection_, /*hello_sent=*/true);
+        }
+        for (const auto& entry : this->nursery_) {
+            consider(entry.conn, entry.hello_step == HelloStep::DONE);
+        }
+
+        const SendspinGoodbyeReason reason =
+            enabled ? SendspinGoodbyeReason::RESTART : SendspinGoodbyeReason::PAIRING_REQUIRED;
+        for (const auto& conn : doomed) {
+            SS_LOGI(TAG, "Unpaired access %s: closing the session with server_id=%s",
+                    enabled ? "enabled" : "disabled", conn->get_server_id().c_str());
+            this->drop_connection(conn.get(), reason);
+        }
+    }
+    this->flush_deferred_releases();
+}
+
 // ============================================================================
 // Connection setup
 // ============================================================================
@@ -1402,7 +1453,7 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
         // provided the transport had a socket to accept it on (the NURSERY_CAPACITY + 2 budget).
         size_t inbound_count = 0;
         for (const auto& entry : this->nursery_) {
-            if (entry.inbound) {
+            if (!entry.conn->is_outbound()) {
                 ++inbound_count;
             }
         }
@@ -1427,7 +1478,7 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
                                        std::string(NOISE_SUITE_CHACHAPOLY));
             conn->send_noise_client_init();
-            this->push_nursery_entry(NurseryEntry{.conn = std::move(conn), .inbound = true});
+            this->push_nursery_entry(NurseryEntry{.conn = std::move(conn)});
         }
     }
     // On the network/httpd thread: a rejection queued just above leaves on this thread, and a

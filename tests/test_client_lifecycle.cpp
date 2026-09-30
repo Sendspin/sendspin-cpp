@@ -983,7 +983,7 @@ TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
         conn->set_provisional_time_us(platform_time_us());
         {
             std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-            manager.push_nursery_entry(NurseryEntry{.conn = conn, .inbound = true});
+            manager.push_nursery_entry(NurseryEntry{.conn = conn});
         }
 
         for (int tick = 0; tick < NurseryEntry::MAX_HELLO_ATTEMPTS + 3; ++tick) {

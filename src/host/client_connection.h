@@ -93,6 +93,10 @@ public:
         return this->connected_;
     }
 
+    bool is_outbound() const override {
+        return true;
+    }
+
 protected:
     /// @brief Registers the IXWebSocket message callback to handle open, close, data, and error
     /// events

@@ -581,6 +581,15 @@ bool RecordStore::note_record_used(const std::string& psk_id) {
 }
 
 // ============================================================================
+// Pairing config
+// ============================================================================
+
+bool RecordStore::set_unpaired_access_enabled(bool enabled) {
+    this->unpaired_access_enabled_ = enabled;
+    return this->persist_config();
+}
+
+// ============================================================================
 // Pairing outcome
 // ============================================================================
 

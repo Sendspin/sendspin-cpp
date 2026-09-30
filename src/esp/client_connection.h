@@ -69,6 +69,10 @@ public:
     /// @brief Whether the websocket connection is established
     bool is_connected() const override;
 
+    bool is_outbound() const override {
+        return true;
+    }
+
     /// @brief Sends a text message to the server with a completion callback
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                             bool allow_before_hello) override;

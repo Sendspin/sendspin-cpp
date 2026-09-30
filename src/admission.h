@@ -125,6 +125,19 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
     return !has_roles || is_playback_capable(category, activities, unpaired_access);
 }
 
+/// @brief Whether an activation is admissible only while unpaired access is enabled.
+///
+/// pairing.md "Unpaired Access": the connections a client closes with pairing_required once it
+/// stops admitting unpaired access.
+///
+/// @param category, activities, has_roles  Same as admissible().
+inline bool relies_on_unpaired_access(PskCategory category,
+                                      const std::vector<SendspinActivity>& activities,
+                                      bool has_roles) {
+    return admissible(category, activities, has_roles, /*unpaired_access=*/true) &&
+           !admissible(category, activities, has_roles, /*unpaired_access=*/false);
+}
+
 /// @brief Goodbye reason to close an inadmissible server/activate with.
 ///
 /// Separates "you are not paired yet" from "you may never do this", by the first-rule-wins order
@@ -140,7 +153,7 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
 inline SendspinGoodbyeReason inadmissible_reject_reason(
     PskCategory category, const std::vector<SendspinActivity>& activities, bool has_roles,
     bool unpaired_access) {
-    if (!unpaired_access && admissible(category, activities, has_roles, /*unpaired_access=*/true)) {
+    if (!unpaired_access && relies_on_unpaired_access(category, activities, has_roles)) {
         return SendspinGoodbyeReason::PAIRING_REQUIRED;
     }
     return SendspinGoodbyeReason::UNAUTHORIZED;

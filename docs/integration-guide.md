@@ -937,8 +937,31 @@ Pairing PSK -- the seed is skipped and unpaired access stays disabled, so a dama
 paired device fails closed rather than silently reopening unauthenticated access. A store that
 lost everything is indistinguishable from a factory-fresh device, so the seed does apply there.
 
-An application that manages the persisted pairing config itself can write the flag directly,
-but it must read-modify-write the stored blob rather than save a fresh one:
+To change the setting at runtime, for example from an operator switch, call
+`set_unpaired_access_enabled()` on the main loop thread. It persists the new value and applies it
+to the live connections as `pairing.md` "Unpaired Access" describes:
+
+```cpp
+client.set_unpaired_access_enabled(false);
+bool on = client.is_unpaired_access_enabled();
+```
+
+- Turning it off closes every connection that only unpaired access was admitting (an unpaired
+  server with playback or active roles) with `client/goodbye` reason `pairing_required`. Paired
+  connections, and unpaired ones with neither playback nor active roles, stay open.
+- Turning it on closes each unpaired connection a server opened that is not declaring pairing
+  with reason `restart`, so the server reconnects and reads the new value in the `client/hello`.
+  Paired connections and `connect_to()` connections stay open; the latter keep advertising the
+  old value until they are reopened.
+
+The call works while the client is stopped, taking effect at the next `start()` unless a
+different persistence provider is set before it. Before the first `start()` there is no loaded
+config to change, so the call is ignored with a warning; use the seed above for the out-of-box
+value.
+
+The other `SendspinPairingConfig` fields have no runtime setter. An application that manages
+them writes the stored blob, which takes effect on the next boot, and it must read-modify-write
+the blob rather than save a fresh one:
 
 ```cpp
 auto blob = persistence_provider.load_blob(persistence_keys::PAIR_CONFIG);
@@ -946,7 +969,7 @@ if (blob.has_value()) {
     std::string text(blob->begin(), blob->end());
     auto cfg = decode_pairing_config(text);  // sendspin/persistence_codec.h
     if (cfg.has_value()) {
-        cfg->unpaired_access_enabled = true;
+        cfg->static_pairing_code_enabled = true;
         std::string encoded = encode_pairing_config(*cfg);
         persistence_provider.save_blob(persistence_keys::PAIR_CONFIG,
                                         reinterpret_cast<const uint8_t*>(encoded.data()),
@@ -959,10 +982,9 @@ This is why the read-modify-write step matters: the provider is a byte store and
 validate what it is handed, so saving a bare, default-constructed `SendspinPairingConfig`
 *will* be written and *will* take effect on the next boot -- silently resetting every policy
 field (`pairing_psk_enabled`, `dynamic_pairing_code_enabled`, `static_pairing_code_enabled`)
-to the struct's compiled-in defaults rather than merely failing to change `unpaired_access_enabled`. A bare write also does not count
-as a first boot (the config blob still decodes), so `initial_unpaired_access_enabled` is not
-reapplied either. Before the first `start()` there is no stored config to modify, so use the
-seed instead.
+to the struct's compiled-in defaults, `unpaired_access_enabled` included, rather than only the
+field the application meant to change. A bare write also does not count as a first boot (the
+config blob still decodes), so `initial_unpaired_access_enabled` is not reapplied either.
 
 Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
 unpaired access after the device is paired is the typical production configuration.

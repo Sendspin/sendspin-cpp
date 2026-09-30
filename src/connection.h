@@ -107,6 +107,11 @@ public:
     /// @return true if connected, false otherwise.
     virtual bool is_connected() const = 0;
 
+    /// @brief Whether this client opened the connection (connect_to()) rather than accepted it
+    virtual bool is_outbound() const {
+        return false;
+    }
+
     /// @brief Prevents any further message callbacks from firing on the network thread
     ///
     /// Called on the main thread before connection cleanup so that no stale events from a closing

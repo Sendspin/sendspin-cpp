@@ -108,9 +108,10 @@ struct ResolvedPsk {
 /// goes through `resolve_by_psk_id` (network thread, Noise handshake and re-handshake) or the
 /// one network-thread mutator, `store_record_superseding`, which is RAM-only and defers its
 /// provider flush, `persist_records`, to the main loop. The pairing config and `pairing_psk_`
-/// are seeded by the constructor and never written again, so `pairing_psk()` and the config
-/// getters are the one exception: they read without the lock. No provider call is ever made
-/// under `mutex_`.
+/// are seeded by the constructor, and only `set_unpaired_access_enabled()` writes the config
+/// afterwards, on the main loop where every config getter is called, so `pairing_psk()` and the
+/// config getters are the one exception: they read without the lock. No provider call is ever
+/// made under `mutex_`.
 class RecordStore {
 public:
     /// @brief Default cap on retained long-term records; mirrors
@@ -245,6 +246,10 @@ public:
     [[nodiscard]] bool unpaired_access_enabled() const {
         return this->unpaired_access_enabled_;
     }
+
+    /// @brief Sets unpaired access and persists the pairing config.
+    /// @return false if the provider rejected the write; the RAM value changes either way.
+    bool set_unpaired_access_enabled(bool enabled);
 
     [[nodiscard]] bool dynamic_pairing_code_enabled() const {
         return this->dynamic_pairing_code_enabled_;

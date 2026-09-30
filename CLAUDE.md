@@ -21,7 +21,7 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `NoiseHandshake` (`noise_handshake.h`): drives the Noise KKpsk2 handshake frames on the network thread and resolves the PSK through `RecordStore`
 - `NoiseSession` (`noise_session.h`): noise-c wrapper holding the KKpsk2 handshake and transport cipher states
 - `NoiseTransport` (`noise_transport.h`): per-connection encrypted framing, owns fragmentation and reassembly around the session
-- `RecordStore` (`record_store.h`): pairing records, the Pairing PSK and the construction-time pairing config, seeded from the persistence provider
+- `RecordStore` (`record_store.h`): pairing records, the Pairing PSK and the pairing config, seeded from the persistence provider (only unpaired access changes at runtime)
 - `Inbox` / `InboxSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle/time events
 - `SendspinTimeFilter` (`time_filter.h`): 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator
