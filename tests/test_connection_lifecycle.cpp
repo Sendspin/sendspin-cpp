@@ -24,7 +24,7 @@
 // pairing, in-band re-handshake) against the same fixtures.
 
 #include "crypto/constants.h"
-#include "connection_manager.h"  // resolve_liveness_timeout_ms
+#include "connection_manager.h"  // resolve_liveness_timeout_ms, liveness_expired
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/crypto.h"
@@ -503,7 +503,6 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
 namespace {
 
 constexpr uint16_t LIVENESS_TEST_PORT = 18983;
-constexpr uint16_t LIVENESS_CONTROL_PORT = 18984;
 constexpr uint16_t LIVENESS_DISABLED_PORT = 18985;
 
 SendspinClientConfig make_liveness_config(uint16_t port, int64_t liveness_timeout_ms) {
@@ -512,12 +511,6 @@ SendspinClientConfig make_liveness_config(uint16_t port, int64_t liveness_timeou
     config.time_burst_response_timeout_ms = 20;
     config.liveness_timeout_ms = liveness_timeout_ms;
     return config;
-}
-
-FakeEncryptedServerOptions time_answering_options(bool answer_time) {
-    FakeEncryptedServerOptions options;
-    options.answer_time = answer_time;
-    return options;
 }
 
 }  // namespace
@@ -554,8 +547,42 @@ TEST(LivenessTimeout, ResolvesFromConfig) {
     }
 }
 
+// liveness_expired() measures silence from the connection's last arrival, not from time zero, and
+// expires once it reaches the timeout; a disabled timeout never expires.
+TEST(LivenessTimeout, ExpiresOnceSilenceReachesTheTimeout) {
+    struct Row {
+        const char* name;
+        int64_t now_us;
+        int64_t last_receive_us;
+        int64_t timeout_us;
+        bool expected;
+    };
+    constexpr int64_t TIMEOUT_US = 60'000'000;
+    constexpr int64_t LAST_US = 5'000'000'000;
+    const Row rows[] = {
+        {"Control: just under the timeout", LAST_US + TIMEOUT_US - 1, LAST_US, TIMEOUT_US, false},
+        {"exactly at the timeout", LAST_US + TIMEOUT_US, LAST_US, TIMEOUT_US, true},
+        {"past the timeout", LAST_US + TIMEOUT_US + 1, LAST_US, TIMEOUT_US, true},
+        {"Control: last arrival ahead of now", LAST_US - 1, LAST_US, TIMEOUT_US, false},
+        {"zero timeout disables the check", LAST_US + 10 * TIMEOUT_US, LAST_US, 0, false},
+        {"negative timeout disables the check", LAST_US + 10 * TIMEOUT_US, LAST_US, -1, false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(liveness_expired(row.now_us, row.last_receive_us, row.timeout_us), row.expected);
+    }
+}
+
 // An established peer that stops answering without closing is dropped with a restart goodbye.
 // Waiting for client/time proves the peer was admitted, so the drop is not a nursery reap.
+//
+// Its controls are the "Control:" rows of the table above and of
+// LivenessTickDropsOnlyAStaleCurrentConnection (test_encrypted_lifecycle.cpp), which runs the same
+// check in loop() against a current connection whose last arrival is fresh, together with
+// AnInboundMessageAdvancesTheLivenessStamp there, which shows an answering peer's messages keep
+// that arrival fresh. A control here would have to outlast the timeout, so a scheduling stall
+// could fail it on a correct client.
 TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
     PairedClientBundle bundle(make_liveness_config(LIVENESS_TEST_PORT, 300));
     SendspinClient& client = bundle.client();
@@ -563,8 +590,7 @@ TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
 
     const Identity& identity = bundle.peer.server_identity;
     FakeEncryptedServer silent(server_url(LIVENESS_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-                               identity, bundle.peer.record.psk_id, bundle.peer.psk,
-                               time_answering_options(false));
+                               identity, bundle.peer.record.psk_id, bundle.peer.psk);
     pump_until(client, [&] { return client.is_connected(); });
     pump_until(client, [&] { return silent.got_client_time(); });
 
@@ -576,38 +602,9 @@ TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
         << "a dropped peer must not be left as the current connection";
 }
 
-// Control for the test above: a peer that answers time messages stays current past the timeout.
-//
-// The timeout is the drop test's, scaled up. A liveness window smaller than the scheduling stalls
-// of a loaded sanitizer build is the one thing that can turn this control red on a correct
-// client: the stamp only moves when an answer arrives, and no answer arrives while the loop that
-// sends the bursts is stalled. A second of slack is the margin; the window still has to outlast
-// the timeout for the test to mean anything, so it cannot be widened away entirely.
-TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
-    PairedClientBundle bundle(make_liveness_config(LIVENESS_CONTROL_PORT, 1000));
-    SendspinClient& client = bundle.client();
-    ASSERT_TRUE(bundle.start());
-
-    const Identity& identity = bundle.peer.server_identity;
-    FakeEncryptedServer live(server_url(LIVENESS_CONTROL_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-                             identity, bundle.peer.record.psk_id, bundle.peer.psk,
-                             time_answering_options(true));
-    pump_until(client, [&] { return client.is_connected(); });
-    pump_until(client, [&] { return live.got_client_time(); });
-
-    pump_for(client, 1500);  // Past the liveness window, with the answers still arriving
-    EXPECT_TRUE(client.is_connected())
-        << "an answering peer must stay current past its liveness timeout";
-    EXPECT_FALSE(live.closed()) << "an answering peer must not be closed";
-    EXPECT_FALSE(live.goodbye_reason().has_value())
-        << "an answering peer must not be sent a goodbye";
-
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-    pump_for(client, 100);
-}
-
 // liveness_timeout_ms = 0 disables the check: a peer that never answers stays current. Guards the
-// `liveness_timeout_us_ > 0` gate, without which a zero timeout drops every connection at once.
+// zero reaching the liveness tick as disabled, without which a zero timeout drops every
+// connection at once.
 TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
     PairedClientBundle bundle(make_liveness_config(LIVENESS_DISABLED_PORT, 0));
     SendspinClient& client = bundle.client();
@@ -616,8 +613,7 @@ TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
     const Identity& identity = bundle.peer.server_identity;
     FakeEncryptedServer silent(server_url(LIVENESS_DISABLED_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), identity,
-                               bundle.peer.record.psk_id, bundle.peer.psk,
-                               time_answering_options(false));
+                               bundle.peer.record.psk_id, bundle.peer.psk);
     pump_until(client, [&] { return client.is_connected(); });
     pump_until(client, [&] { return silent.got_client_time(); });
 

@@ -96,6 +96,7 @@ constexpr uint16_t PAIRING_REKEY_ROLE_TEST_PORT = 19014;
 constexpr uint16_t RECENCY_IDLE_TEST_PORT = 19021;
 constexpr uint16_t RECENCY_PLAYBACK_TEST_PORT = 19022;
 constexpr uint16_t RECENCY_LATER_PLAYBACK_TEST_PORT = 19023;
+constexpr uint16_t LIVENESS_STAMP_TEST_PORT = 19024;
 constexpr uint16_t AVAILABILITY_TEST_PORT = 19079;
 constexpr uint16_t CLOCK_GATE_SYNCED_TEST_PORT = 19080;
 constexpr uint16_t CLOCK_GATE_UNSYNCED_TEST_PORT = 19081;
@@ -2413,6 +2414,102 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
                 << "publishing the state ended the pairing attempt the activation started";
         }
     }
+}
+
+// A stand-in that records the goodbye a drop sends it.
+class GoodbyeRecordingConnection : public HoldTestConnection {
+public:
+    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
+        this->goodbye = reason;
+        HoldTestConnection::disconnect(reason, std::move(on_complete));
+    }
+
+    std::optional<SendspinGoodbyeReason> goodbye;
+};
+
+// loop()'s liveness tick reads the current connection's last-arrival stamp: a connection whose
+// last arrival is older than the timeout is dropped with a restart goodbye (messaging.md
+// "client/goodbye"), and one heard from just now stays current. The stamp is set directly rather
+// than aged by waiting, and the timeout is the manager's own, default-derived and tens of seconds,
+// so no scheduling stall can age the control row past it. The stand-in is promoted from the
+// nursery by a real tick, so it holds the slot the way an established connection does; as a
+// Sentinel-category playback connection it is admissible only with unpaired access on.
+TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
+    struct Row {
+        const char* label;
+        bool stale;
+    };
+    const Row rows[] = {
+        {"Control: last arrival at now", false},
+        {"last arrival older than the timeout", true},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.label);
+        HoldTestClient bundle("Liveness Tick Test Client");
+        bundle.client_ref().set_unpaired_access_enabled(true);
+        SendspinClient& client = bundle.client_ref();
+        ConnectionManager& manager = *client.connection_manager_;
+        // What the tick itself compares against.
+        const int64_t timeout_us = manager.liveness_timeout_us_;
+        ASSERT_GT(timeout_us, 0) << "the liveness check is disabled, so no row can be dropped";
+
+        auto conn = std::make_shared<GoodbyeRecordingConnection>();
+        conn->set_client_hello_sent(true);
+        conn->set_server_hello_received(true);
+        conn->set_provisional_time_us(platform_time_us());
+        conn->last_receive_time_us_.store(platform_time_us(), std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+            manager.push_nursery_entry(NurseryEntry{.conn = conn});
+        }
+        client.loop();
+        ASSERT_TRUE(client.is_connected()) << "the tick did not promote the connection";
+        ASSERT_TRUE(conn->is_admitted()) << "the tick did not admit the connection";
+
+        const int64_t now_us = platform_time_us();
+        conn->last_receive_time_us_.store(row.stale ? now_us - 2 * timeout_us : now_us,
+                                          std::memory_order_relaxed);
+        client.loop();
+
+        if (row.stale) {
+            EXPECT_FALSE(client.is_connected()) << "a stale connection was left current";
+            EXPECT_FALSE(conn->is_admitted()) << "a dropped connection still claims admission";
+            EXPECT_EQ(conn->goodbye, SendspinGoodbyeReason::RESTART)
+                << "a connection dropped for liveness must be told to restart";
+        } else {
+            EXPECT_TRUE(client.is_connected()) << "a connection heard from just now was dropped";
+            EXPECT_FALSE(conn->goodbye.has_value()) << "a live connection was sent a goodbye";
+        }
+    }
+}
+
+// A complete message from the peer advances the connection's last-arrival stamp, which is what
+// keeps an answering peer clear of the liveness tick above. The stamp is private and has no
+// observable of its own short of the drop; reading it is what lets the test wait for the advance
+// instead of for a timeout to pass.
+TEST(EncryptedLifecycle, AnInboundMessageAdvancesTheLivenessStamp) {
+    SendspinClientConfig config;
+    config.name = "Liveness Stamp Test Client";
+    config.server_port = LIVENESS_STAMP_TEST_PORT;
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServer server(server_url(LIVENESS_STAMP_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), bundle.peer.server_identity,
+                               bundle.peer.record.psk_id, bundle.peer.psk);
+    pump_until(client, [&] { return client.is_connected(); });
+    const std::shared_ptr<SendspinConnection> conn = client.connection_manager_->current_shared();
+    ASSERT_NE(conn, nullptr);
+
+    const int64_t before_us = conn->get_last_receive_time_us();
+    ASSERT_TRUE(server.send_app_json(metadata_state_json(1, "Liveness Stamp")));
+    // Unbounded: completion is the proof, and the suite watchdog catches a stamp that never moves.
+    pump_until(client, [&] { return conn->get_last_receive_time_us() > before_us; });
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
 }
 
 // A stand-in whose destructor raises one network-thread event about itself, as an outbound

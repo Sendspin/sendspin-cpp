@@ -297,6 +297,10 @@ int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config) {
            (config.time_burst_interval_ms + config.time_burst_response_timeout_ms);
 }
 
+bool liveness_expired(int64_t now_us, int64_t last_receive_us, int64_t timeout_us) {
+    return timeout_us > 0 && now_us - last_receive_us >= timeout_us;
+}
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -1213,12 +1217,13 @@ void ConnectionManager::loop() {
 
     // Liveness tick: a blackholed socket (no FIN, RST, or close frame) never produces a transport
     // close event, so drop the established connection once its inbound silence reaches the timeout.
+    // The outer timeout test is the cost gate: a disabled check takes no lock and reads no clock.
     if (this->liveness_timeout_us_ > 0 && this->has_current_.load(std::memory_order_acquire)) {
         const int64_t now_us = platform_time_us();
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         if (this->current_connection_ != nullptr &&
-            now_us - this->current_connection_->get_last_receive_time_us() >=
-                this->liveness_timeout_us_) {
+            liveness_expired(now_us, this->current_connection_->get_last_receive_time_us(),
+                             this->liveness_timeout_us_)) {
             SS_LOGW(TAG, "Current connection silent for >%" PRId64 " ms, dropping as lost",
                     this->liveness_timeout_us_ / US_PER_MS);
             // The goodbye actively closes the transport, which the silent peer never will; an

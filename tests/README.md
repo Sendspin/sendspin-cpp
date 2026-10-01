@@ -83,12 +83,14 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   transfers and the messages and sequences that close the connection, the per-channel image cap,
   decode thread, slot gating, `frame_done()` acks, and stream restart/clear.
 - `test_connection_lifecycle.cpp`: the connection nursery (prove-then-admit) over real loopback
-  sockets: junk probes, slow peers, capacity, and the liveness timeout.
+  sockets: junk probes, slow peers, capacity, and the liveness timeout (its derivation and
+  expiry predicate as tables, and a silent peer dropped, or kept with the check disabled, end
+  to end).
 - `test_encrypted_lifecycle.cpp`: the Noise transport end to end over loopback: re-handshake,
   pairing over the pairing PSK, `server/unpair`, pre-admission traffic and the held-message
   replay with its two budgets, the admission lock order, `client/leave` gating, the
-  `client/state` role-object rules, the combined `['playback','pairing']` activate, and the
-  re-prove watchdog.
+  `client/state` role-object rules, the combined `['playback','pairing']` activate, the
+  re-prove watchdog, and the liveness tick and the arrival stamp it reads.
 - `test_client_lifecycle.cpp`: `start()`/`stop()`/restart: goodbyes, clear callbacks delivered
   inside `stop()`, re-entrancy from callbacks, role start rollback, and the high-performance
   hold.

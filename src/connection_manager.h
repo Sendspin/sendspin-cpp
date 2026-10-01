@@ -83,6 +83,14 @@ static constexpr int64_t LIVENESS_TOLERATED_MISSES = 2;
 /// @return Timeout in milliseconds; 0 or negative disables the check.
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config);
 
+/// @brief Returns true if a connection last heard from at last_receive_us has been silent for at
+/// least timeout_us as of now_us.
+/// @param now_us Current time in microseconds.
+/// @param last_receive_us Arrival time of the connection's last complete inbound message.
+/// @param timeout_us Liveness timeout in microseconds; 0 or negative never expires.
+/// @return true if the connection should be dropped as lost.
+bool liveness_expired(int64_t now_us, int64_t last_receive_us, int64_t timeout_us);
+
 /// @brief Bound (milliseconds, per goodbye) on waiting for stop()'s goodbyes to be sent before
 /// the transports are torn down
 ///

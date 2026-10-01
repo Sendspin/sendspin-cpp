@@ -146,13 +146,16 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     staging half and its flush are separate steps on purpose, and only a test that takes them
 #     apart can show what one tick coalesces.
 #   - SendspinConnection::last_receive_time_us_, held_count_ and held_bytes_, the hold buffer's
-#     accounting and the liveness stamp a stand-in connection has no transport to set.
+#     accounting and the liveness stamp a stand-in connection has no transport to set (and, for
+#     the stamp, one the liveness tick test ages directly instead of waiting).
 #   - ConnectionManager::nursery_ (read under conn_ptr_mutex_), swap_out_pending_events() and
 #     DrainedEvents: the outbound open/close callbacks are reachable only through the connect_to()
 #     connection that carries them, and whether an event about an already-released connection was
 #     dropped or queued is visible only in the pending queues until loop() drains them.
 #   - ConnectionManager::push_nursery_entry(), to hand loop() a stand-in connection to promote:
-#     when the first client/state leaves relative to admission is decided inside one tick.
+#     when the first client/state leaves relative to admission, and whether the liveness tick
+#     drops the connection, are decided inside one tick. The liveness test also reads
+#     liveness_timeout_us_, the timeout that tick compares against.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
