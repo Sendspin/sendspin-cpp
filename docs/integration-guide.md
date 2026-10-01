@@ -505,8 +505,10 @@ store and return whatever bytes the library gives it for each of these:
 
 Every blob has a fixed size, published beside its key as a `*_SIZE` constant. The library
 always writes exactly that many bytes and treats a stored blob of any other length as absent, so
-a provider can store each key as a fixed-size value. Integers are in the device's native byte
-order: a blob is only ever read back by the device that wrote it.
+a provider can store each key as a fixed-size value. `RECORD_ORDER` is the exception: it has no
+size constant, is written as exactly `max_pairing_records` bytes, after the clamp to 5..255
+described under Record capacity, and is read at any length. Integers are in the device's native
+byte order: a blob is only ever read back by the device that wrote it.
 
 | Key | Size | Contents |
 |---|---|---|
@@ -562,8 +564,8 @@ a given `psk_id` or `server_id` evicts nothing, because that never grows the sto
 `persistence_keys::RECORD_ORDER` holds. An evicted server's next handshake lands in the Sentinel
 fallback, where it can offer its operator re-pairing. The protocol requires room for at least 5
 records, so a smaller configured cap is raised to that floor, and a cap above 255 is lowered to
-that ceiling (the largest slot number the order blob can name). Raise or lower the cap by setting
-`max_pairing_records` before calling `start()`:
+that ceiling (so the highest slot is 254, leaving byte value 255 free as the order blob's
+padding). Raise or lower the cap by setting `max_pairing_records` before calling `start()`:
 
 ```cpp
 SendspinClientConfig config;
@@ -594,8 +596,9 @@ struct MyPersistenceProvider : SendspinPersistenceProvider {
 A provider backed by a single flat NVS namespace (as above) can often implement the whole
 interface generically, since every key is already sized to fit and the library handles
 serialization. A provider on a store of fixed-size values (such as ESPHome's preferences) can
-size each key from its `*_SIZE` constant; a provider that needs different backing per key (e.g. a plaintext-secrets file
-plus separate flash-wear-optimized storage for `OUTPUT_DELAY`) can switch on `key` instead.
+size each key from its `*_SIZE` constant, and `RECORD_ORDER` from the clamped
+`max_pairing_records`; a provider that needs different backing per key (e.g. a plaintext-secrets
+file plus separate flash-wear-optimized storage for `OUTPUT_DELAY`) can switch on `key` instead.
 
 ### SendspinClientListener (Optional)
 
@@ -910,14 +913,16 @@ it.
 to current, and again after each successful in-band re-handshake on that same connection.
 Pairing an already-connected server therefore delivers the callback twice: once with
 `ConnectionTrust::NONE` at admission, then again with `ConnectionTrust::USER` once the
-post-pairing rekey completes. Connections that are rejected (e.g., missing record when
-unpaired access is disabled) do not fire this callback.
+post-pairing rekey completes. Connections that are rejected (e.g., an unpaired server
+declaring playback or active roles while unpaired access is disabled) do not fire this
+callback.
 
 ### Unpaired Access
 
-By default only paired servers (long-term record) and servers holding the accepted Pairing
-PSK are admitted. Servers that only know the Sentinel PSK (no pairing required) are admitted
-when unpaired access is enabled. `pairing.md` "Unpaired Access" makes the default the
+Paired servers (long-term record) may declare playback and activate roles at any time. Unpaired
+servers, those connecting with the Pairing PSK or the Sentinel PSK, are always admitted idle
+(activities `[]`) or declaring `pairing`, but may declare playback or activate roles only while
+unpaired access is enabled. `pairing.md` "Unpaired Access" makes the default the
 manufacturer's choice and a change a local action on the device, so the application owns the
 setting. It is off until `set_unpaired_access_enabled()` turns it on:
 

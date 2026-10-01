@@ -145,8 +145,9 @@ struct NurseryEntry {
     static constexpr uint32_t INITIAL_HELLO_RETRY_DELAY_MS = 100U;  ///< First backoff delay
     static constexpr uint8_t MAX_HELLO_ATTEMPTS = 3;                ///< Sends before giving up
 
-    std::shared_ptr<SendspinConnection> conn;  ///< Observer; the session slot / transport owns
-    int64_t hello_due_us{0};                   ///< Next hello attempt; read only while SENDING
+    /// The only long-term owner, except for an ESP inbound connection, which its httpd session owns
+    std::shared_ptr<SendspinConnection> conn;
+    int64_t hello_due_us{0};  ///< Next hello attempt; read only while SENDING
     uint32_t hello_retry_delay_ms{INITIAL_HELLO_RETRY_DELAY_MS};  ///< Current backoff delay
     HelloStep hello_step{HelloStep::AWAIT_NOISE};
     uint8_t hello_attempts_left{MAX_HELLO_ATTEMPTS};
@@ -529,9 +530,10 @@ private:
     /// pairing-method and emission-format admissibility, then applies the activate's state
     /// and dispatches (arbitration for a nursery entry, or the already-admitted-connection
     /// branches: leftover-pairing cleanup, first-activate handshake completion, or entering
-    /// pairing on a subsequent activate). No-op if event.conn is null, or if the connection is
-    /// neither in the nursery nor the current connection (already released by an earlier event
-    /// in the same loop() pass). Caller must hold conn_ptr_mutex_.
+    /// pairing on a subsequent activate). event.conn must be non-null: schedule_activate() drops
+    /// an event whose connection was already released. No-op if the connection is neither in the
+    /// nursery nor the current connection (already released by an earlier event in the same
+    /// loop() pass). Caller must hold conn_ptr_mutex_.
     /// @param event The server/activate event to process.
     void process_activate_event(ServerActivateEvent& event);
 

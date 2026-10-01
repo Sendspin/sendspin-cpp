@@ -329,6 +329,10 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   not linkage. Nothing observes a stack frame after it is dead in any case, so the wipe is
   asserted by reading. Moving the class to a private header would make its constructor half
   testable; the destructor half stays a gap either way.
+- The ESP server's send-pool routing has no host coverage: tagging each queued block as pool or
+  heap and returning it to the matching owner (`src/esp/server_connection.cpp`), and the pool
+  reset in `SendspinWsServer::stop()` (`src/esp/ws_server.cpp`), compile only for ESP-IDF. Only
+  the generic `FixedBlockPool` template is tested (`tests/test_fixed_block_pool.cpp`).
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.
@@ -355,7 +359,13 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   nullopt for a `server_id` that is not a canonical public key), `encode_pairing_psk()` the bare
   PSK, and both decoders take `(data, len)`. `label` is gone from `SendspinPairingRecord` and
   `SendspinPairingPsk`; the library never set it. `SendspinPairingRecord::used` is gone too. A
-  freed record slot is written as zeros, not as an empty blob.
+  freed record slot is written as zeros, not as an empty blob. State stored by earlier
+  encryption builds is not carried over: pairing records and the last-played server read as
+  absent, the output delay resets (a stored two-digit value fails the range check and leaves it
+  at 0; any other reads as absent), and the Pairing PSK is regenerated, invalidating printed
+  pairing tokens, unless `SendspinClientConfig::pairing_psk` supplies it. The identity keypair is
+  unaffected. The removed `"records"`, `"pair_config"` and `"static_pin"` keys are left in
+  storage; the application can erase them with `erase_blob()`.
 - `SendspinClientConfig::pairing_psk` (`std::optional<SendspinPsk>`) supplies a
   factory-provisioned Pairing PSK. `SendspinPsk` is a new public type holding 32 bytes that it
   wipes on destruction. A configured PSK outranks a stored `PAIRING_PSK` blob and is never

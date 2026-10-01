@@ -32,8 +32,8 @@
 /// allows.
 ///
 /// A file that is not this key-to-base64url-blob layout will not load; delete it and let the
-/// device re-provision. The blob contents themselves are the codec's concern, and it accepts
-/// record shapes that omit the "v" field.
+/// device re-provision. The provider stores each blob as opaque bytes; their contents are the
+/// library's concern.
 
 #pragma once
 

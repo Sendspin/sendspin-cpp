@@ -197,10 +197,10 @@ public:
         return std::nullopt;
     }
 
-    /// @brief Persist bytes under key. Returning true means durably stored (the library gates
-    /// revocation durability on it for a cleared record slot). Every blob the library writes has
-    /// the fixed size its key's `persistence_keys` comment gives, so a provider may store each key
-    /// as a fixed-size value.
+    /// @brief Persist bytes under key. Returning true means the write was accepted: stored, or
+    /// queued by a provider that surfaces its own failures. Every blob the library writes has the
+    /// fixed size its key's `persistence_keys` comment gives, so a provider may store each key as
+    /// a fixed-size value.
     ///
     /// A rejected write is reported, not retried: the in-memory state stays authoritative for
     /// this boot and the library logs what will be lost at the next reboot. What a rejection

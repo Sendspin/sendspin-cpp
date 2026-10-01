@@ -195,8 +195,9 @@ struct SendspinClientConfig {
 
     /// @brief Maximum number of long-term pairing records the store will retain. The protocol
     /// requires room for at least 5, so a smaller value is raised to that floor; a value above
-    /// 255 is lowered to that ceiling, which is the largest slot number the record-order blob
-    /// can name (`persistence_keys::RECORD_ORDER` in sendspin/persistence_keys.h).
+    /// 255 is lowered to that ceiling, so the highest slot is 254 and the record-order blob
+    /// (`persistence_keys::RECORD_ORDER` in sendspin/persistence_keys.h) keeps byte value 255
+    /// free as its padding.
     size_t max_pairing_records{DEFAULT_MAX_PAIRING_RECORDS};
 
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
