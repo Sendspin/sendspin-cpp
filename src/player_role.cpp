@@ -20,11 +20,33 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 
+#include <algorithm>
+#include <cstring>
+
 static const char* const TAG = "sendspin.player";
+
+/// @brief Reads the output-delay blob (persistence_keys::OUTPUT_DELAY): a native uint16_t.
+/// @return The stored value, or nullopt when the blob is not OUTPUT_DELAY_SIZE bytes.
+static std::optional<uint16_t> parse_output_delay_blob(const std::vector<uint8_t>& blob) {
+    static_assert(sendspin::persistence_keys::OUTPUT_DELAY_SIZE == sizeof(uint16_t));
+    if (blob.size() != sendspin::persistence_keys::OUTPUT_DELAY_SIZE) {
+        return std::nullopt;
+    }
+    uint16_t value = 0;
+    std::memcpy(&value, blob.data(), sizeof(value));
+    return value;
+}
 
 /// @brief Size of the big-endian 64-bit timestamp at the start of player binary messages.
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
-static constexpr uint16_t MAX_STATIC_DELAY_MS = 5000U;
+/// @brief Size of the big-endian 32-bit send_ahead that follows the timestamp in an audio chunk
+/// (roles/player/v1.md "Audio Chunks (Binary)")
+static constexpr size_t BINARY_SEND_AHEAD_SIZE = 4;
+/// @brief Bytes an audio chunk spends on its header, after the message type byte.
+static constexpr size_t AUDIO_CHUNK_HEADER_SIZE = BINARY_TIMESTAMP_SIZE + BINARY_SEND_AHEAD_SIZE;
+/// @brief Upper bound on the output delay, per roles/player/v1.md "Output delay": clients MUST
+/// clamp output_delay_ms to the range 0-5000.
+static constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000U;
 static constexpr uint32_t HEADER_SEND_TIMEOUT_MS = 100U;
 // Denominator for the advertised buffer capacity fraction: advertises (N-1)/N of capacity
 static constexpr size_t AUDIO_BUFFER_ADVERTISE_DENOMINATOR = 5;
@@ -70,9 +92,11 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
 }
 
 /// @brief Checks the configured formats against the codec rules of the player spec
-/// (roles/player/v1.md, client/hello player@v1 support object: "Servers MUST support the flac
-/// and pcm codecs"): the list must contain a flac or pcm entry, since a player is not told which
-/// other codecs a server has, and may list opus only when this build decodes it.
+///
+/// roles/player/v1.md "client/hello player@v1 support object" requires supported_formats to be a
+/// non-empty list in which the player lists either flac or pcm, since those are the two codecs
+/// every server supports and a player is not told which others a server has. Opus may be listed
+/// only when this build decodes it (SENDSPIN_ENABLE_OPUS).
 static bool audio_formats_valid(const std::vector<AudioSupportedFormatObject>& formats) {
     bool has_baseline = false;
     bool has_opus = false;
@@ -142,12 +166,12 @@ void PlayerRole::update_muted(bool muted) {
     this->impl_->update_muted(muted);
 }
 
-void PlayerRole::update_static_delay(uint16_t delay_ms) {
-    this->impl_->update_static_delay(delay_ms);
+void PlayerRole::update_output_delay(uint16_t delay_ms) {
+    this->impl_->update_output_delay(delay_ms);
 }
 
-void PlayerRole::set_static_delay_adjustable(bool adjustable) {
-    this->impl_->static_delay_adjustable.store(adjustable, std::memory_order_relaxed);
+void PlayerRole::set_output_delay_adjustable(bool adjustable) {
+    this->impl_->output_delay_adjustable.store(adjustable, std::memory_order_relaxed);
     this->impl_->client->publish_state();
 }
 
@@ -163,8 +187,8 @@ bool PlayerRole::get_muted() const {
     return this->impl_->muted;
 }
 
-uint16_t PlayerRole::get_static_delay_ms() const {
-    return this->impl_->get_effective_static_delay_ms();
+uint16_t PlayerRole::get_output_delay_ms() const {
+    return this->impl_->get_effective_output_delay_ms();
 }
 
 uint8_t PlayerRole::get_volume() const {
@@ -176,7 +200,7 @@ uint8_t PlayerRole::get_volume() const {
 // ============================================================================
 
 void PlayerRole::Impl::update_volume(uint8_t volume) {
-    this->volume = volume;
+    this->volume = std::min(volume, VOLUME_MAX);
     this->client->publish_state();
 }
 
@@ -185,12 +209,16 @@ void PlayerRole::Impl::update_muted(bool muted) {
     this->client->publish_state();
 }
 
-void PlayerRole::Impl::update_static_delay(uint16_t delay_ms) {
-    if (delay_ms > MAX_STATIC_DELAY_MS) {
-        delay_ms = MAX_STATIC_DELAY_MS;
+void PlayerRole::Impl::update_output_delay(uint16_t delay_ms) {
+    if (delay_ms > MAX_OUTPUT_DELAY_MS) {
+        delay_ms = MAX_OUTPUT_DELAY_MS;
     }
-    this->static_delay_ms.store(delay_ms, std::memory_order_relaxed);
-    this->persist_static_delay();
+    // A server that re-sends the delay it already set, or a consumer control that lands on the
+    // current value, must not cost a flash write.
+    bool changed = this->output_delay_ms.exchange(delay_ms, std::memory_order_relaxed) != delay_ms;
+    if (changed) {
+        this->persist_output_delay();
+    }
     this->client->publish_state();
 }
 
@@ -198,31 +226,35 @@ void PlayerRole::Impl::update_static_delay(uint16_t delay_ms) {
 // Impl: Internal integration methods
 // ============================================================================
 
+void PlayerRole::Impl::attach_connection_manager(ConnectionManager& manager) const {
+    this->sync_task->attach_connection_manager(manager);
+}
+
 void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
     this->inbox = &inbox;
     this->event_state->stream_params_slot.bind(inbox, INBOX_TOPIC_PLAYER_STREAM_PARAMS);
     this->event_state->command_slot.bind(inbox, INBOX_TOPIC_PLAYER_COMMAND);
-    this->event_state->state_slot.bind(inbox, INBOX_TOPIC_PLAYER_STATE);
 }
 
 bool PlayerRole::Impl::start() {
-    this->load_static_delay();
-
-    // An empty list leaves the player role out of the hello (see build_hello_fields()), so the
-    // codec rules do not apply to it.
-    if (this->config.audio_formats.empty()) {
-        return true;
-    }
     if (!audio_formats_valid(this->config.audio_formats)) {
         return false;
     }
+
+    this->load_output_delay();
+
+    // A player with no listener has nowhere to write audio, so the sync task is not started and
+    // the role reports state and takes commands without ever playing. Unlike a format list no
+    // server can serve, this is a legitimate intermediate state for a consumer that wires its
+    // output separately.
     if (!this->listener) {
+        SS_LOGW(TAG, "Player has no listener: no audio will be played");
         return true;
     }
     // Init once (event flags, ring buffer); the thread is created on every start(), including a
     // restart after stop(), which joined the previous one.
     if (!this->sync_task->is_initialized() &&
-        !this->sync_task->init(this, this->client, this->config.audio_buffer_capacity)) {
+        !this->sync_task->init(this, this->config.audio_buffer_capacity)) {
         SS_LOGE(TAG, "Failed to initialize sync task");
         return false;
     }
@@ -238,10 +270,6 @@ void PlayerRole::Impl::stop() const {
 }
 
 void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
-    if (this->config.audio_formats.empty()) {
-        return;
-    }
-
     msg.supported_roles.push_back(SendspinRole::PLAYER);
 
     // Advertise 80% of the buffer capacity to account for ring buffer metadata overhead
@@ -251,50 +279,72 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
         .buffer_capacity = this->config.audio_buffer_capacity *
                            (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
                            AUDIO_BUFFER_ADVERTISE_DENOMINATOR,
-        .supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE},
     };
-    msg.player_v1_support = player_support;
+    msg.player_v1_support = std::move(player_support);
 }
 
 void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
-    if (this->config.audio_formats.empty()) {
-        return;
-    }
-
     ClientPlayerStateObject player_state{};
     player_state.volume = this->volume;
     player_state.muted = this->muted;
-    bool adjustable = this->static_delay_adjustable.load(std::memory_order_relaxed);
-    player_state.static_delay_ms =
-        adjustable ? this->static_delay_ms.load(std::memory_order_relaxed) : 0;
+    bool adjustable = this->output_delay_adjustable.load(std::memory_order_relaxed);
+    player_state.output_delay_ms =
+        adjustable ? this->output_delay_ms.load(std::memory_order_relaxed) : 0;
+    // Never below what the pipeline itself spends: the server extends lead only toward the
+    // reported number, so a configured value under that floor would truncate the stream start
+    // (roles/player/v1.md "Server Audio Send Constraints").
+    player_state.required_lead_time_ms =
+        std::max(this->config.required_lead_time_ms.value_or(0),
+                 PlayerRoleConfig::pipeline_lead_time_ms(this->config.extra_startup_silence_ms));
+    player_state.min_buffer_ms = this->config.min_buffer_ms;
+    // roles/player/v1.md "client/state player object": the commands the server may send.
+    player_state.supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE};
     if (adjustable) {
-        player_state.supported_commands = {SendspinPlayerCommand::SET_STATIC_DELAY};
+        player_state.supported_commands.push_back(SendspinPlayerCommand::SET_OUTPUT_DELAY);
     }
-    msg.player = player_state;
+    msg.player = std::move(player_state);
 }
 
-SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) const {
-    if (this->config.audio_formats.empty()) {
+std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* data, size_t len) {
+    if (len < AUDIO_CHUNK_HEADER_SIZE) {
+        return std::nullopt;
+    }
+    return AudioChunk{.timestamp_us = be64_to_host(data),
+                      .audio = data + AUDIO_CHUNK_HEADER_SIZE,
+                      .audio_len = len - AUDIO_CHUNK_HEADER_SIZE};
+}
+
+SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len,
+                                            uint32_t generation) const {
+    if (!this->accepts(generation)) {
         return;
     }
-    if (len < BINARY_TIMESTAMP_SIZE) {
-        SS_LOGW(TAG, "Binary message too short for timestamp");
+    auto chunk = parse_audio_chunk(data, len);
+    if (!chunk.has_value()) {
+        SS_LOGW(TAG, "Binary message too short for the audio chunk header");
         return;
     }
-    int64_t timestamp = be64_to_host(data);
-    if (!this->send_audio_chunk(data + BINARY_TIMESTAMP_SIZE, len - BINARY_TIMESTAMP_SIZE,
-                                timestamp, CHUNK_TYPE_ENCODED_AUDIO, 0)) {
+    if (chunk->audio_len == 0) {
+        // A complete header carrying no frame is nothing to decode, and send_audio_chunk()
+        // would log it as an argument error rather than as the empty chunk it is. Verbose because
+        // this is the per-chunk network path.
+        SS_LOGV(TAG, "Audio chunk carries no encoded frame");
+        return;
+    }
+    // roles/player/v1.md "Audio Chunks (Binary)": an unavailable client discards otherwise
+    // valid audio.
+    if (this->discard_audio.load(std::memory_order_relaxed)) {
+        SS_LOGV(TAG, "Discarding audio chunk while unavailable");
+        return;
+    }
+    if (!this->send_audio_chunk(chunk->audio, chunk->audio_len, chunk->timestamp_us,
+                                CHUNK_TYPE_ENCODED_AUDIO, 0)) {
         SS_LOGW(TAG, "Failed to send audio chunk");
     }
 }
 
-void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) const {
-    if (this->config.audio_formats.empty()) {
-        // No audio formats, just defer stream start callback
-        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START);
-        return;
-    }
-
+void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj,
+                                           uint32_t generation) const {
     bool header_sent = false;
 
     if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
@@ -339,7 +389,15 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
 
     if (!header_sent) {
         this->sync_task->signal_stream_end();
-        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
+        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
+        return;
+    }
+
+    // The codec-header send above blocks for up to HEADER_SEND_TIMEOUT_MS, which is the widest
+    // window a teardown can land in between the receive gate and this publication. One that did
+    // land has already ended the stream and queued its own STREAM_END, so publishing here would
+    // re-arm the sync task on the header just written with nothing behind it.
+    if (!this->accepts(generation)) {
         return;
     }
 
@@ -348,20 +406,24 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     // high_performance_requested_for_playback main-thread-only. The params write and the event push
     // are two separate Inbox lock acquisitions, not one critical section: the mutex orders the
     // write before the push for visibility, but a concurrent main-thread cleanup() can slip its
-    // stream_params_slot.reset() between them. If that happens the drain takes START and finds the
-    // slot empty, so take() returns false and current_stream_params keeps its prior value (see
-    // stream_params_slot.take() in drain_events()). That window is benign: the same teardown
-    // enqueues a STREAM_END right behind this START.
+    // stream_params_slot.reset() between them. That teardown also bumped the generation this
+    // START is stamped with, so the drain discards the START and the stale params sit unread
+    // until the next stream replaces them; if instead the START wins the race, the drain takes
+    // it, finds the slot empty and keeps the prior params (see stream_params_slot.take() in
+    // drain_events()).
     this->event_state->stream_params_slot.write(player_obj);
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation);
 }
 
-void PlayerRole::Impl::handle_stream_end() const {
+void PlayerRole::Impl::handle_stream_end(uint32_t generation) const {
     this->sync_task->signal_stream_end();
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
 }
 
-void PlayerRole::Impl::handle_stream_clear() const {
+void PlayerRole::Impl::handle_stream_clear(uint32_t generation) const {
+    if (!this->accepts(generation)) {
+        return;
+    }
     // stream/clear is a seek within the active stream: the server flushes our buffered audio and
     // immediately resumes sending new audio with the same codec/params (no new stream/start). Tell
     // the sync task to discard buffered audio, then enqueue a marker so it knows exactly where the
@@ -378,7 +440,11 @@ void PlayerRole::Impl::handle_stream_clear() const {
     }
 }
 
-void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) const {
+void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
+                                             uint32_t generation) const {
+    if (!this->accepts(generation)) {
+        return;
+    }
     if (!cmd.player.has_value()) {
         SS_LOGV(TAG, "Server command has no player commands");
         return;
@@ -402,8 +468,8 @@ void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) co
             if (dp.mute.has_value()) {
                 cp.mute = dp.mute;
             }
-            if (dp.static_delay_ms.has_value()) {
-                cp.static_delay_ms = dp.static_delay_ms;
+            if (dp.output_delay_ms.has_value()) {
+                cp.output_delay_ms = dp.output_delay_ms;
             }
         },
         cmd);
@@ -414,13 +480,7 @@ void PlayerRole::Impl::on_stream_ring_event(PlayerStreamCallbackType event) {
 }
 
 void PlayerRole::Impl::drain_events() {
-    // --- Client state events (from the sync task, via the latest-wins state slot) ---
-    SendspinClientState state{};
-    if (this->event_state->state_slot.take(state)) {
-        this->client->update_state(state);
-    }
-
-    // --- Server command events (volume, mute, static delay) ---
+    // --- Server command events (volume, mute, output delay) ---
     // Check each field independently since multiple command types may have been
     // merged into one inbox slot between drain ticks.
     ServerCommandMessage cmd_msg{};
@@ -442,11 +502,17 @@ void PlayerRole::Impl::drain_events() {
                 }
             }
 
-            if (player_cmd.static_delay_ms.has_value()) {
-                this->update_static_delay(player_cmd.static_delay_ms.value());
+            // roles/player/v1.md "server/command player object": a command absent from the
+            // current supported_commands is ignored.
+            const bool delay_advertised =
+                this->output_delay_adjustable.load(std::memory_order_relaxed);
+            if (player_cmd.output_delay_ms.has_value() && !delay_advertised) {
+                SS_LOGD(TAG, "Ignoring set_output_delay: not in supported_commands");
+            } else if (player_cmd.output_delay_ms.has_value()) {
+                this->update_output_delay(player_cmd.output_delay_ms.value());
                 if (this->listener) {
-                    this->listener->on_static_delay_changed(
-                        this->static_delay_ms.load(std::memory_order_relaxed));
+                    this->listener->on_output_delay_changed(
+                        this->output_delay_ms.load(std::memory_order_relaxed));
                 }
             }
         }
@@ -455,7 +521,7 @@ void PlayerRole::Impl::drain_events() {
     // --- Process awaiting sync idle events ---
     // Stream lifecycle arrivals (STREAM_START/STREAM_END) are appended directly to
     // awaiting_sync_idle_events by on_stream_ring_event(), called from the ring drain in
-    // SendspinClient::loop() before role drain_events() runs each tick -- so every event pushed
+    // SendspinClient::loop() before role drain_events() runs each tick, so every event pushed
     // this tick is already in the vector below in FIFO arrival order.
     if (!this->awaiting_sync_idle_events.empty()) {
         bool sync_idle = !this->sync_task->is_running();
@@ -492,8 +558,7 @@ void PlayerRole::Impl::drain_events() {
                     // Request high-performance networking for playback (deferred from the
                     // network thread's handle_stream_start so the listener callback and the
                     // pairing flag stay on the main thread)
-                    if (!this->config.audio_formats.empty() &&
-                        !this->high_performance_requested_for_playback) {
+                    if (!this->high_performance_requested_for_playback) {
                         this->client->acquire_high_performance();
                         this->high_performance_requested_for_playback = true;
                     }
@@ -507,7 +572,8 @@ void PlayerRole::Impl::drain_events() {
                     // it first keeps start/end paired even when the batch is abandoned below.
                     this->stream_active = true;
                     if (this->listener) {
-                        const uint32_t generation = this->cleanup_generation;
+                        const uint32_t generation =
+                            this->cleanup_generation.load(std::memory_order_relaxed);
                         this->listener->on_stream_start();
                         // on_stream_start() may re-enter connection teardown, whose cleanup()
                         // already ended the stream, cleared this vector, and enqueued a fresh
@@ -515,7 +581,8 @@ void PlayerRole::Impl::drain_events() {
                         // stream, so abandon the batch instead (the clamp below then erases
                         // nothing from the already-cleared vector). stream_active stays true so the
                         // enqueued STREAM_END still delivers a paired on_stream_end().
-                        if (this->cleanup_generation != generation) {
+                        if (this->cleanup_generation.load(std::memory_order_relaxed) !=
+                            generation) {
                             teardown_reentered = true;
                             break;
                         }
@@ -548,31 +615,36 @@ void PlayerRole::Impl::drain_events() {
 }
 
 void PlayerRole::Impl::cleanup() {
-    // Flag the teardown for a drain_events() frame that may be on the call stack right now (a
-    // listener callback re-entering teardown); see the STREAM_START branch there.
-    this->cleanup_generation++;
+    // Flag the teardown before anything else: it tells a drain_events() frame that may be on the
+    // call stack right now (a listener callback re-entering teardown) that the stream is gone,
+    // and it stamps every event queued from here on, so the STREAM_END below is delivered while
+    // a START this teardown just invalidated is discarded (see cleanup_generation).
+    const uint32_t generation =
+        this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
     // End the current stream: the sync task drains and returns to idle. (Not signal_stream_clear():
     // that path is a seek within a live stream and expects a marker to follow.)
     this->sync_task->signal_stream_end();
 
-    // Discard stale slot content from the dead connection. Stale ring-borne events (an
-    // in-flight STREAM_START/STREAM_END queued before this cleanup) are already discarded by
-    // SendspinClient::cleanup_connection_state()'s inbox.reset_events() call, which runs before
-    // any role's cleanup() -- so there is no per-queue ring reset to do here.
+    // Discard stale slot content. Stale ring-borne events (an in-flight STREAM_START/STREAM_END
+    // queued before this teardown) need no per-queue ring reset either way: on the
+    // connection-loss path SendspinClient::cleanup_connection_state()'s inbox.reset_events() has
+    // already wiped them, and on the deactivation path, which leaves the ring alone for the roles
+    // that stay active, they carry the generation this teardown just left behind and the drain
+    // discards them (see event_is_current()).
     this->event_state->stream_params_slot.reset();
     this->event_state->command_slot.reset();
-    this->event_state->state_slot.reset();
 
-    // Enqueue a clean STREAM_END - drain_events() will fire the callback (the ring was just
-    // reset above us, so this push should not fail; enqueue_stream_event() logs if it somehow does)
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
+    // Enqueue a clean STREAM_END - drain_events() will fire the callback (enqueue_stream_event()
+    // logs if the ring is too full to take it)
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
 
     // Clear awaiting events too (main-thread only, no mutex needed)
     this->awaiting_sync_idle_events.clear();
 
+    // Deferred: cleanup() runs under ConnectionManager::conn_ptr_mutex_ on both paths.
     if (this->high_performance_requested_for_playback) {
-        this->client->release_high_performance();
+        this->client->release_high_performance_deferred();
         this->high_performance_requested_for_playback = false;
     }
 }
@@ -592,66 +664,63 @@ bool PlayerRole::Impl::send_audio_chunk(const uint8_t* data, size_t data_size, i
                                               static_cast<ChunkType>(chunk_type), timeout_ms);
 }
 
-void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) const {
-    // Latest-wins slot, never the shared event ring: consecutive transitions between drains
-    // collapse to the newest (matching the drain's semantics), and a sync task that keeps
-    // transitioning while the main loop stalls cannot fill the ring and starve the
-    // non-idempotent lifecycle events that live there.
-    this->event_state->state_slot.write(state);
-}
-
-void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) const {
+void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event,
+                                            uint32_t generation) const {
     // A dropped STREAM_START would leave the sync task waiting for its start signal forever;
     // a dropped STREAM_END would leave the consumer believing the stream is still active. Both
     // wedge the stream, so log the drop at ERROR (the helper defaults to WARN, which suits the
     // idempotent CLEARED events but understates a wedged player stream).
     push_event_or_log(
         this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
-        event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END",
+        event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END", generation,
         /*error_level=*/true);
 }
 
-void PlayerRole::Impl::load_static_delay() {
+void PlayerRole::Impl::load_output_delay() {
     if (!this->persistence) {
         // No persistence provider - use initial value from config
-        if (this->config.initial_static_delay_ms > 0) {
-            this->static_delay_ms.store(this->config.initial_static_delay_ms,
+        if (this->config.initial_output_delay_ms > 0) {
+            this->output_delay_ms.store(this->config.initial_output_delay_ms,
                                         std::memory_order_relaxed);
-            SS_LOGI(TAG, "Using initial static delay from config: %u ms",
-                    this->config.initial_static_delay_ms);
+            SS_LOGI(TAG, "Using initial output delay from config: %u ms",
+                    this->config.initial_output_delay_ms);
         }
         return;
     }
 
-    auto delay = this->persistence->load_static_delay();
+    std::optional<uint16_t> delay;
+    if (auto blob = this->persistence->load_blob(persistence_keys::OUTPUT_DELAY)) {
+        delay = parse_output_delay_blob(blob.value());
+    }
     if (delay.has_value()) {
-        if (delay.value() <= MAX_STATIC_DELAY_MS) {
-            this->static_delay_ms.store(delay.value(), std::memory_order_relaxed);
-            SS_LOGI(TAG, "Loaded static delay: %u ms", delay.value());
+        if (delay.value() <= MAX_OUTPUT_DELAY_MS) {
+            this->output_delay_ms.store(delay.value(), std::memory_order_relaxed);
+            SS_LOGI(TAG, "Loaded output delay: %u ms", delay.value());
         } else {
-            SS_LOGW(TAG, "Persisted static delay out of range (%u), ignoring", delay.value());
+            SS_LOGW(TAG, "Persisted output delay out of range (%u), ignoring", delay.value());
         }
-    } else if (this->config.initial_static_delay_ms > 0) {
-        this->static_delay_ms.store(this->config.initial_static_delay_ms,
+    } else if (this->config.initial_output_delay_ms > 0) {
+        this->output_delay_ms.store(this->config.initial_output_delay_ms,
                                     std::memory_order_relaxed);
-        SS_LOGI(TAG, "Using initial static delay from config: %u ms",
-                this->config.initial_static_delay_ms);
+        SS_LOGI(TAG, "Using initial output delay from config: %u ms",
+                this->config.initial_output_delay_ms);
     }
 }
 
-uint16_t PlayerRole::Impl::get_effective_static_delay_ms() const {
-    return this->static_delay_adjustable.load(std::memory_order_relaxed)
-               ? this->static_delay_ms.load(std::memory_order_relaxed)
+uint16_t PlayerRole::Impl::get_effective_output_delay_ms() const {
+    return this->output_delay_adjustable.load(std::memory_order_relaxed)
+               ? this->output_delay_ms.load(std::memory_order_relaxed)
                : 0;
 }
 
-void PlayerRole::Impl::persist_static_delay() const {
+void PlayerRole::Impl::persist_output_delay() const {
     if (this->persistence) {
-        uint16_t delay = this->static_delay_ms.load(std::memory_order_relaxed);
-        if (this->persistence->save_static_delay(delay)) {
-            SS_LOGD(TAG, "Persisted static delay: %u ms", delay);
+        uint16_t delay = this->output_delay_ms.load(std::memory_order_relaxed);
+        if (this->persistence->save_blob(persistence_keys::OUTPUT_DELAY,
+                                         reinterpret_cast<const uint8_t*>(&delay), sizeof(delay))) {
+            SS_LOGD(TAG, "Persisted output delay: %u ms", delay);
         } else {
-            SS_LOGW(TAG, "Failed to persist static delay");
+            SS_LOGW(TAG, "Failed to persist output delay");
         }
     }
 }

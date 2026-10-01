@@ -16,6 +16,7 @@
 
 #include "platform/logging.h"
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 
@@ -128,9 +129,8 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
             }
             this->current_stream_info_ = *stream_info;
             this->current_codec_ = SendspinCodecFormat::PCM;
-            static constexpr uint32_t PCM_MAX_CHUNK_MS = 120U;
-            this->decode_buffer_size_ =
-                stream_info->ms_to_bytes(PCM_MAX_CHUNK_MS);  // PCM max chunk size
+            // Room for any valid chunk, so one call decodes it.
+            this->decode_buffer_size_ = stream_info->ms_to_bytes(MAX_AUDIO_CHUNK_MS);
             break;
         }
         default: {
@@ -144,58 +144,71 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
 
 bool SendspinDecoder::decode_audio_chunk(const uint8_t* data, size_t data_size,
                                          uint8_t* output_buffer, size_t output_buffer_size,
-                                         size_t* decoded_size) {
-    if (data == nullptr || data_size == 0 || output_buffer == nullptr || decoded_size == nullptr) {
+                                         size_t* consumed, size_t* decoded_size) {
+    if (data == nullptr || data_size == 0 || output_buffer == nullptr || consumed == nullptr ||
+        decoded_size == nullptr) {
         SS_LOGE(TAG, "Invalid data passed to decode_audio_chunk");
         return false;
     }
+    *consumed = 0;
+    *decoded_size = 0;
 
     if (this->current_codec_ == SendspinCodecFormat::PCM) {
-        if (data_size > output_buffer_size) {
-            SS_LOGE(TAG, "PCM data size %zu exceeds output buffer size %zu", data_size,
-                    output_buffer_size);
+        // roles/player/v1.md "Codec framing": a PCM chunk is a whole number of frames.
+        const size_t frame_bytes = this->current_stream_info_.frames_to_bytes(1);
+        if (frame_bytes == 0 || data_size % frame_bytes != 0) {
+            SS_LOGE(TAG, "PCM chunk of %zu bytes is not whole frames", data_size);
             return false;
         }
-        std::memcpy(output_buffer, data, data_size);
-        *decoded_size = data_size;
+        size_t copy = std::min(data_size, output_buffer_size);
+        copy -= copy % frame_bytes;
+        std::memcpy(output_buffer, data, copy);
+        *consumed = copy;
+        *decoded_size = copy;
     } else if ((this->flac_decoder_ != nullptr) &&
                (this->current_codec_ == SendspinCodecFormat::FLAC)) {
-        size_t bytes_consumed = 0;
-        size_t samples_decoded = 0;
-        auto result = this->flac_decoder_->decode(
-            data, data_size, output_buffer, output_buffer_size, bytes_consumed, samples_decoded);
+        // roles/player/v1.md "Codec framing": a FLAC chunk carries one or more complete frames,
+        // and micro-flac decodes one per call.
+        while (*consumed < data_size) {
+            size_t bytes_consumed = 0;
+            size_t samples_decoded = 0;
+            auto result = this->flac_decoder_->decode(
+                data + *consumed, data_size - *consumed, output_buffer + *decoded_size,
+                output_buffer_size - *decoded_size, bytes_consumed, samples_decoded);
 
-        if (result == micro_flac::FLAC_DECODER_NEED_MORE_DATA) {
-            SS_LOGE(TAG, "FLAC decoder ran out of data");
-            return false;
+            if (result == micro_flac::FLAC_DECODER_ERROR_OUTPUT_TOO_SMALL) {
+                break;  // No room for another frame; the caller grows the buffer and resumes.
+            }
+            if (result == micro_flac::FLAC_DECODER_NEED_MORE_DATA) {
+                SS_LOGE(TAG, "FLAC chunk ends mid-frame");
+                return false;
+            }
+            if (result != micro_flac::FLAC_DECODER_SUCCESS || bytes_consumed == 0) {
+                SS_LOGE(TAG, "Error decoding FLAC frame: %d", static_cast<int>(result));
+                return false;
+            }
+            *consumed += bytes_consumed;
+            *decoded_size += this->current_stream_info_.samples_to_bytes(samples_decoded);
         }
-
-        if (result != micro_flac::FLAC_DECODER_SUCCESS) {
-            SS_LOGE(TAG, "Serious error decoding FLAC file");
-            return false;
-        }
-
-        *decoded_size = this->current_stream_info_.samples_to_bytes(samples_decoded);
 #ifdef SENDSPIN_ENABLE_OPUS
     } else if (this->opus_decoder_buf_ && (this->current_codec_ == SendspinCodecFormat::OPUS)) {
         int output_frames = opus_decode(
             this->opus_decoder_buf_.as<OpusDecoder>(), data, data_size, (int16_t*)output_buffer,
             this->current_stream_info_.bytes_to_frames(output_buffer_size), 0);
         if (output_frames == OPUS_BUFFER_TOO_SMALL) {
-            // The output buffer was sized for a typical 20ms frame but this packet decodes to
-            // more. Raise the estimate to the Opus spec maximum (120ms) so the caller can grow
-            // the buffer via get_decode_buffer_size() and call again.
+            // The buffer is sized for a typical 20ms frame. Raise the estimate to the Opus
+            // maximum (120ms) and consume nothing, so the caller grows the buffer and resumes.
             static constexpr uint32_t OPUS_MAX_FRAME_MS = 120U;
             this->decode_buffer_size_ = this->current_stream_info_.ms_to_bytes(OPUS_MAX_FRAME_MS);
             SS_LOGD(TAG, "Opus packet exceeds decode buffer; raising estimate to %zu bytes",
                     this->decode_buffer_size_);
-            return false;
+            return true;
         }
         if (output_frames < 0) {
             SS_LOGE(TAG, "Error decoding opus chunk: %d", output_frames);
             return false;
         }
-
+        *consumed = data_size;
         *decoded_size = this->current_stream_info_.frames_to_bytes(output_frames);
 #endif
     } else {

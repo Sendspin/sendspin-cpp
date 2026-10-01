@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// @file test_client_teardown.cpp
-/// @brief Construction and destruction of a client running every threaded role, covering the
-/// destruction-order chain that joins the role threads
+/// Destroying a running SendspinClient must join every threaded role (player sync task, artwork
+/// decode, visualizer drain) before the members those threads touch are destroyed.
 
+#include "sendspin/artwork_role.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/player_role.h"
+#include "sendspin/visualizer_role.h"
 
 #include <gtest/gtest.h>
 
@@ -59,7 +60,6 @@ TEST(ClientTeardown, JoinsEveryThreadedRoleOnDestruction) {
 
     for (int run = 0; run < 3; ++run) {
         SendspinClientConfig config;
-        config.client_id = "teardown-test-client";
         config.name = "Teardown Test Client";
 
         auto client = std::make_unique<SendspinClient>(config);
@@ -76,9 +76,9 @@ TEST(ClientTeardown, JoinsEveryThreadedRoleOnDestruction) {
         client->add_artwork(std::move(art_cfg));
 
         VisualizerRoleConfig vis_cfg;
-        vis_cfg.support.types.push_back(VisualizerDataType::LOUDNESS);
+        vis_cfg.stream.types.push_back(VisualizerDataType::LOUDNESS);
         vis_cfg.support.buffer_capacity = 4096;
-        vis_cfg.support.rate_max = 30;
+        vis_cfg.stream.rate_max = 30;
         client->add_visualizer(std::move(vis_cfg));
 
         ASSERT_TRUE(client->start());

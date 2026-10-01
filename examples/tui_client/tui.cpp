@@ -14,14 +14,20 @@
 
 #include "tui.h"
 
+#include "sendspin/config.h"
+#include "sendspin/types.h"
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/component_base.hpp>
 #include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/color.hpp>
 #include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <utility>
 
 namespace sendspin {
 
@@ -54,13 +60,19 @@ struct TuiSnapshot {
     std::optional<uint32_t> sample_rate;
     std::optional<uint8_t> bit_depth;
     std::optional<uint8_t> channels;
-    uint16_t static_delay_ms{0};
+    uint16_t output_delay_ms{0};
     bool connected{false};
     bool time_synced{false};
     std::string group_name;
     bool streaming{false};
     std::string connected_host;
     uint16_t connected_port{0};
+
+    // Identity and trust
+    std::string client_id;
+    ConnectionTrust trust{ConnectionTrust::NONE};
+    std::string pairing_status;
+    std::string pairing_token;
 
     // Server selector
     bool server_selector_active{false};
@@ -70,6 +82,13 @@ struct TuiSnapshot {
     // Shortcut highlight feedback
     std::string highlighted_label;
     bool highlight_active{false};
+
+    // Artwork and colors
+    std::vector<TuiState::ArtworkChannelStatus> artwork_channels;
+    bool color_received{false};
+    std::optional<std::array<uint8_t, 3>> color_primary;
+    std::optional<std::array<uint8_t, 3>> color_accent;
+    std::optional<std::array<uint8_t, 3>> color_background_dark;
 
     // Visualizer
     bool show_visualizer{false};
@@ -101,13 +120,17 @@ static TuiSnapshot take_snapshot(TuiState& state) {
     snap.sample_rate = state.sample_rate;
     snap.bit_depth = state.bit_depth;
     snap.channels = state.channels;
-    snap.static_delay_ms = state.static_delay_ms;
+    snap.output_delay_ms = state.output_delay_ms;
     snap.connected = state.connected;
     snap.time_synced = state.time_synced;
     snap.group_name = state.group_name;
     snap.streaming = state.streaming;
     snap.connected_host = state.connected_host;
     snap.connected_port = state.connected_port;
+    snap.client_id = state.client_id;
+    snap.trust = state.trust;
+    snap.pairing_status = state.pairing_status;
+    snap.pairing_token = state.pairing_token;
     snap.server_selector_active = state.server_selector_active;
     snap.server_selector_index = state.server_selector_index;
     snap.discovered_servers = state.discovered_servers;
@@ -116,6 +139,11 @@ static TuiSnapshot take_snapshot(TuiState& state) {
         snap.highlighted_label = state.highlighted_label;
         snap.highlight_active = true;
     }
+    snap.artwork_channels = state.artwork_channels;
+    snap.color_received = state.color_received;
+    snap.color_primary = state.color_primary;
+    snap.color_accent = state.color_accent;
+    snap.color_background_dark = state.color_background_dark;
     snap.show_visualizer = state.show_visualizer;
     snap.visualizer_active = state.visualizer_active;
     snap.vis_peak_freq = state.vis_peak_freq;
@@ -375,7 +403,7 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
         info_row("Rate:     ", rate_display, has_stream),
         info_row("Depth:    ", depth_display, has_stream),
         info_row("Channels: ", channels_display, has_stream),
-        info_row("Delay:    ", "+" + std::to_string(snap.static_delay_ms) + "ms", true),
+        info_row("Delay:    ", "+" + std::to_string(snap.output_delay_ms) + "ms", true),
         separator(),
         hbox({
             text("  "),
@@ -389,7 +417,7 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     auto host_display = snap.connected_host.empty() ? "\u2014" : snap.connected_host;
     auto port_display = snap.connected_port > 0 ? std::to_string(snap.connected_port) : "\u2014";
 
-    // Build server info rows — group only shown when set (matches reference)
+    // Build server info rows: group, trust, and identity shown when applicable
     Elements server_rows;
     server_rows.push_back(hbox({text("  Status: ") | color(Color::White) | dim, text(connection_str) | bold | color(connection_color)}));
     server_rows.push_back(info_row("Host:    ", host_display, !snap.connected_host.empty()));
@@ -398,6 +426,17 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     }
     if (!snap.group_name.empty()) {
         server_rows.push_back(info_row("Group:   ", snap.group_name, true));
+    }
+    if (snap.connected) {
+        std::string trust_str = (snap.trust == ConnectionTrust::USER) ? "user (paired)" : "none";
+        Color trust_color = (snap.trust == ConnectionTrust::USER) ? Color::Green : Color::GrayDark;
+        server_rows.push_back(hbox({
+            text("  Trust:  ") | color(Color::White) | dim,
+            text(trust_str) | color(trust_color),
+        }));
+    }
+    if (!snap.pairing_status.empty()) {
+        server_rows.push_back(info_row("Pair:    ", snap.pairing_status, true));
     }
     // Pad to match stream panel height (5 data rows + separator + shortcut = 7)
     while (server_rows.size() < 5) {
@@ -421,6 +460,61 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
         return vbox({playback_panel, stream_panel, server_panel});
     }
     return hbox({playback_panel | flex, stream_panel | flex, server_panel | flex});
+}
+
+// Artwork images are reported by size rather than drawn: a terminal has no pixels to put them
+// in, and the size plus the channel they arrived on is what tells an integrator the transfer
+// worked.
+static Element render_artwork_and_color(const TuiSnapshot& snap) {
+    Elements artwork_rows;
+    for (size_t channel = 0; channel < snap.artwork_channels.size(); ++channel) {
+        const auto& status = snap.artwork_channels[channel];
+        std::string value = status.wanted;
+        if (status.image_bytes > 0) {
+            value += "  " + std::to_string((status.image_bytes + 512) / 1024) + " kB";
+        }
+        artwork_rows.push_back(hbox({
+            text("  Ch " + std::to_string(channel) + ": ") | color(Color::White) | dim,
+            status.image_bytes > 0 ? text(value) | color(Color::Cyan)
+                                   : text(value) | color(Color::White) | dim,
+            text(status.images > 0 ? "  x" + std::to_string(status.images) : "") |
+                color(Color::White) | dim,
+        }));
+    }
+    if (artwork_rows.empty()) {
+        artwork_rows.push_back(text("  No channels configured") | color(Color::White) | dim);
+    }
+    auto artwork_panel =
+        window(text(" Artwork ") | bold, vbox(std::move(artwork_rows))) | color(Color::Yellow);
+
+    auto swatch = [](const std::string& label, const std::optional<std::array<uint8_t, 3>>& rgb) {
+        if (!rgb.has_value()) {
+            return hbox({text("  " + label) | color(Color::White) | dim,
+                         text("\u2014") | color(Color::White) | dim});
+        }
+        const auto& c = rgb.value();
+        std::string value = std::to_string(c[0]) + "," + std::to_string(c[1]) + "," +
+                            std::to_string(c[2]);
+        return hbox({
+            text("  " + label) | color(Color::White) | dim,
+            text("\u2588\u2588 ") | color(Color::RGB(c[0], c[1], c[2])),
+            text(value) | color(Color::Cyan),
+        });
+    };
+
+    Elements color_rows{
+        swatch("Primary:  ", snap.color_primary),
+        swatch("Accent:   ", snap.color_accent),
+        swatch("Backdrop: ", snap.color_background_dark),
+    };
+    if (!snap.color_received) {
+        color_rows.push_back(text("  Waiting for the server's palette") | color(Color::White) |
+                             dim);
+    }
+    auto color_panel =
+        window(text(" Colors ") | bold, vbox(std::move(color_rows))) | color(Color::Yellow);
+
+    return hbox({artwork_panel | flex, color_panel | flex});
 }
 
 static Color spectrum_color_for_bin(int bin, int total_bins) {
@@ -613,8 +707,27 @@ static Element render_server_selector(const TuiSnapshot& snap) {
     });
 }
 
+// Shown until the client is paired: the Pairing PSK token an operator pastes into a server
+// that only offers the mandatory pairing_psk method (dynamic_pairing_code needs nothing shown
+// here; the code itself appears in the Server panel's pairing status row instead). Wrapped across
+// the full terminal width since the token (107 chars) does not fit any of the three info panels
+// above.
+static Element render_pairing_token(const TuiSnapshot& snap) {
+    return window(text(" Pairing Token ") | bold,
+                  vbox({
+                      paragraph(snap.pairing_token) | color(Color::White),
+                      text("  Paste into a server pairing via pairing_psk") | color(Color::White) | dim,
+                  })) |
+          color(Color::Yellow);
+}
+
 static Element render_footer(const TuiSnapshot& snap) {
+    // Show truncated client_id (first 12 chars) on the left; shortcuts on the right.
+    std::string id_display = snap.client_id.empty()
+                                 ? "id: ..."
+                                 : "id: " + snap.client_id.substr(0, 12) + "...";
     return hbox({
+        text(id_display) | color(Color::GrayDark) | dim,
         filler(),
         shortcut_label(snap, "v", "v"),
         text(" visualizer  ") | dim,
@@ -649,13 +762,25 @@ static Element render_tui(TuiState& state) {
         });
     }
 
-    return vbox({
+    Elements sections{
         top_section,
         render_progress(snap),
         render_info_panels(snap, width),
-        filler(),
-        render_footer(snap),
-    });
+    };
+    // Only once one of the two roles is active: an idle pair of panels would push the rest of
+    // the screen down for nothing.
+    if (!snap.artwork_channels.empty() || snap.color_received) {
+        sections.push_back(render_artwork_and_color(snap));
+    }
+    // Show the Pairing PSK token only until this connection is paired: once trust is USER,
+    // the token has already served its purpose and the vertical space goes back to filler().
+    if (!snap.pairing_token.empty() && snap.trust != ConnectionTrust::USER) {
+        sections.push_back(render_pairing_token(snap));
+    }
+    sections.push_back(filler());
+    sections.push_back(render_footer(snap));
+
+    return vbox(std::move(sections));
 }
 
 static bool handle_selector_key(const Event& event, SendspinClient& client, TuiState& state) {
@@ -747,6 +872,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         return true;
     }
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     // Play/Pause
     if (event == Event::Character(' ')) {
         SendspinPlaybackState current;
@@ -783,8 +909,8 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         return true;
     }
 
-    // Seek backward (relative). Server clamps to the seekable range and ignores 'seek_relative' if
-    // it isn't in the controller's supported_commands.
+    // Seek backward (relative). The server clamps to the seekable range; the library drops
+    // 'seek_relative' itself if the server did not list it in supported_commands.
     if (event == kSeekBackEvent) {
         {
             std::lock_guard<std::mutex> lock(state.mutex);
@@ -805,31 +931,33 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             {.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = SEEK_STEP_MS});
         return true;
     }
+#endif
 
-    // Player volume up
+#ifdef SENDSPIN_ENABLE_PLAYER
+    // Player volume up. The setter is main loop only, so the new value is queued for the client
+    // thread; the base is the last queued value so held keys accumulate rather than collapsing
+    // onto a value the client thread has not applied yet. The fallback is the mirrored TuiState
+    // field rather than the role getter: the role's volume/muted are plain members written on
+    // the client thread, while these are refreshed there under state.mutex.
     if (event == Event::ArrowUp) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, "Up/Dn");
-        }
-        uint8_t vol = client.player()->get_volume();
-        uint8_t new_vol = static_cast<uint8_t>(std::min(100, vol + 5));
-        client.player()->update_volume(new_vol);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, "Up/Dn");
+        int vol = state.pending_player.volume.value_or(state.player_volume);
+        state.pending_player.volume = static_cast<uint8_t>(std::min(100, vol + 5));
         return true;
     }
 
     // Player volume down
     if (event == Event::ArrowDown) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, "Up/Dn");
-        }
-        uint8_t vol = client.player()->get_volume();
-        uint8_t new_vol = static_cast<uint8_t>(std::max(0, vol - 5));
-        client.player()->update_volume(new_vol);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, "Up/Dn");
+        int vol = state.pending_player.volume.value_or(state.player_volume);
+        state.pending_player.volume = static_cast<uint8_t>(std::max(0, vol - 5));
         return true;
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     // Group volume up
     if (event == Event::Character(']')) {
         {
@@ -855,17 +983,19 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             {.command = SendspinControllerCommand::VOLUME, .volume = new_vol});
         return true;
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     // Player mute toggle
     if (event == Event::Character('m')) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, "m");
-        }
-        client.player()->update_muted(!client.player()->get_muted());
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, "m");
+        state.pending_player.muted = !state.pending_player.muted.value_or(state.player_muted);
         return true;
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     // Group mute toggle
     if (event == Event::Character('M')) {
         {
@@ -926,28 +1056,27 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         client.controller()->send_command({.command = SendspinControllerCommand::SWITCH});
         return true;
     }
+#endif
 
-    // Static delay increase
+#ifdef SENDSPIN_ENABLE_PLAYER
+    // Output delay increase
     if (event == Event::Character('.')) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, ", / .");
-        }
-        uint16_t delay = client.player()->get_static_delay_ms();
-        client.player()->update_static_delay(delay + 10);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, ", / .");
+        uint16_t delay = state.pending_player.output_delay_ms.value_or(state.output_delay_ms);
+        state.pending_player.output_delay_ms = static_cast<uint16_t>(delay + 10);
         return true;
     }
 
-    // Static delay decrease
+    // Output delay decrease
     if (event == Event::Character(',')) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, ", / .");
-        }
-        uint16_t delay = client.player()->get_static_delay_ms();
-        client.player()->update_static_delay(delay >= 10 ? delay - 10 : 0);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, ", / .");
+        uint16_t delay = state.pending_player.output_delay_ms.value_or(state.output_delay_ms);
+        state.pending_player.output_delay_ms = static_cast<uint16_t>(delay >= 10 ? delay - 10 : 0);
         return true;
     }
+#endif
 
     // Quit
     if (event == Event::Character('q') || event == Event::Character('Q')) {
@@ -969,19 +1098,24 @@ Component create_tui_component(SendspinClient& client, TuiState& state,
 
 void update_polled_state(TuiState& state, SendspinClient& client) {
     std::lock_guard<std::mutex> lock(state.mutex);
+#ifdef SENDSPIN_ENABLE_METADATA
     uint32_t new_progress = client.metadata() ? client.metadata()->get_track_progress_ms() : 0;
     if (new_progress != state.track_progress_ms) {
         state.track_progress_ms = new_progress;
         state.progress_updated_at = std::chrono::steady_clock::now();
     }
     state.track_duration_ms = client.metadata() ? client.metadata()->get_track_duration_ms() : 0;
+#endif
     state.connected = client.is_connected();
     state.time_synced = client.is_time_synced();
-    state.static_delay_ms = client.player() ? client.player()->get_static_delay_ms() : 0;
+#ifdef SENDSPIN_ENABLE_PLAYER
+    state.output_delay_ms = client.player() ? client.player()->get_output_delay_ms() : 0;
     state.player_volume = client.player() ? client.player()->get_volume() : 0;
     state.player_muted = client.player() ? client.player()->get_muted() : false;
+#endif
     state.group_name = client.get_group_state().group_name.value_or("");
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     if (client.controller()) {
         auto& cs = client.controller()->get_controller_state();
         state.group_volume = cs.volume;
@@ -989,6 +1123,49 @@ void update_polled_state(TuiState& state, SendspinClient& client) {
         state.repeat_mode = cs.repeat;
         state.shuffle = cs.shuffle;
     }
+#endif
+}
+
+void apply_pending_player_commands(TuiState& state, SendspinClient& client) {
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (client.player() == nullptr) {
+        return;
+    }
+    PendingPlayerCommands pending;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        pending = state.pending_player;
+    }
+    if (pending.volume.has_value()) {
+        client.player()->update_volume(pending.volume.value());
+    }
+    if (pending.muted.has_value()) {
+        client.player()->update_muted(pending.muted.value());
+    }
+    if (pending.output_delay_ms.has_value()) {
+        client.player()->update_output_delay(pending.output_delay_ms.value());
+    }
+    // Clear only what the setters above applied, and refresh the mirrors they moved in the same
+    // critical section. A keypress that lands while the setters run leaves a newer value here;
+    // clearing it unseen would send the next keypress back to a base the role has not reached
+    // yet, which turns a second volume-up into a volume-down.
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.pending_player.volume == pending.volume) {
+        state.pending_player.volume.reset();
+    }
+    if (state.pending_player.muted == pending.muted) {
+        state.pending_player.muted.reset();
+    }
+    if (state.pending_player.output_delay_ms == pending.output_delay_ms) {
+        state.pending_player.output_delay_ms.reset();
+    }
+    state.player_volume = client.player()->get_volume();
+    state.player_muted = client.player()->get_muted();
+    state.output_delay_ms = client.player()->get_output_delay_ms();
+#else
+    (void)state;
+    (void)client;
+#endif
 }
 
 }  // namespace sendspin

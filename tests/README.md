@@ -58,7 +58,7 @@ a watchdog report rather than a flaky elapsed-time assertion.
 Each `test_*.cpp` file covers one unit of cross-platform logic:
 
 - `test_protocol.cpp`: wire-protocol parsing/formatting: enum round-trips, message dispatch, the
-  tri-state metadata/color deltas, and the hand-rolled `client/time` formatter checked against
+  full-state metadata/color objects, and the hand-rolled `client/time` formatter checked against
   `snprintf`.
 - `test_time_filter.cpp`: `SendspinTimeFilter` invariants (monotonic-timestamp rejection, reset,
   offset round-trip, convergence).
@@ -70,18 +70,48 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   a parked receive, is held pending, is consumed once, and never drops a queued item.
 - `test_inline_vector.cpp`: `InlineVector` order-preserving erase, element release at removal,
   and swap.
+- `test_fixed_block_pool.cpp`: `FixedBlockPool` claims each block once until released, also
+  under concurrent claims.
 - `test_inbox.cpp`: `Inbox`/`InboxSlot` topic bits, event ring ordering, and slot binding.
+- `test_player_role.cpp`: the player's `client/state` timing parameters and the
+  supported-format validation, driven through the role's `Impl` without a server.
+- `test_decoder.cpp`: `SendspinDecoder` chunk decoding per codec (multi-frame FLAC, PCM at the
+  spec maximum, an Opus packet longer than the estimate) and the sync task's whole-chunk decode.
 - `test_visualizer_role.cpp`: `decode_visualizer_message()` and the visualizer role's
   negotiation and dispatch.
-- `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: decode thread, slot
-  gating, `frame_done()` acks, and stream restart/clear.
+- `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: announce/part/cancel
+  transfers and the messages and sequences that close the connection, the per-channel image cap,
+  decode thread, slot gating, `frame_done()` acks, and stream restart/clear.
 - `test_connection_lifecycle.cpp`: the connection nursery (prove-then-admit) over real loopback
-  sockets: junk probes, slow peers, early server hello, capacity, and the liveness timeout.
-- `test_client_lifecycle.cpp`: `SendspinClient` `start()`/`stop()`/restart over loopback: peers
-  are goodbyed, role state is reset before `stop()` returns, a restarted client is live again,
-  and the player's codec checks.
-- `test_client_teardown.cpp`: destroying a client that runs every threaded role joins the role
-  threads.
+  sockets: junk probes, slow peers, capacity, and the liveness timeout (its derivation and
+  expiry predicate as tables, and a silent peer dropped, or kept with the check disabled, end
+  to end).
+- `test_encrypted_lifecycle.cpp`: the Noise transport end to end over loopback: re-handshake,
+  pairing over the pairing PSK, `server/unpair`, pre-admission traffic and the held-message
+  replay with its two budgets, the admission lock order, `client/leave` gating, the
+  `client/state` role-object rules, the combined `['playback','pairing']` activate, the
+  re-prove watchdog, and the liveness tick and the arrival stamp it reads.
+- `test_client_lifecycle.cpp`: `start()`/`stop()`/restart: goodbyes, clear callbacks delivered
+  inside `stop()`, re-entrancy from callbacks, role start rollback, and the high-performance
+  hold.
+- `test_client_teardown.cpp`: destroying a running client joins every threaded role.
+- `test_role_deactivation.cpp`: a later `server/activate` that removes a role: output stopped,
+  buffers and state dropped, the roles it keeps left alone, and a removed role added back.
+- `test_crypto.cpp`, `test_cpace.cpp`, `test_pairing_code.cpp`, `test_psk_wrap.cpp`,
+  `test_pairing_token.cpp`, `test_noise_transport.cpp`, `test_noise_rehandshake.cpp`,
+  `test_admission.cpp`, `test_record_store.cpp`, `test_dynamic_pairing_code.cpp`,
+  `test_pairing_state_machine.cpp`, `test_pairing_offers.cpp`, `test_persistence_codec.cpp`: the
+  encryption and pairing units, from the primitives up to the record store and the pairing
+  state machine.
+
+The loopback tests share `lifecycle_test_fixtures.h`: `FakeEncryptedServer` and
+`FakeOutboundEncryptedServer` play a Sendspin server as the Noise initiator over a real socket,
+and `PairedClientBundle` wires a client to a seeded record store. Every connection is encrypted,
+so there is no cleartext fake; the fake sends its `server/hello` as soon as the handshake
+completes, before any `client/hello`, so that ordering is exercised by every test.
+
+`tests/wrap_test_helpers.h` holds the server side of pairing.md "Wrapping", so a test can open
+what the client sealed without the library carrying an inverse it never calls.
 
 These are white-box tests: they include private headers from `src/`, so the test target adds
 `src/` to its include path. To add a new test file, create `test_<unit>.cpp` here and add it to

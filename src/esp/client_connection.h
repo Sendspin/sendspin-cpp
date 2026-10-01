@@ -18,46 +18,29 @@
 #pragma once
 
 #include "connection.h"
+#include "platform/types.h"
+#include "sendspin/config.h"
+#include "sendspin/types.h"
 #include <esp_websocket_client.h>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 
 namespace sendspin {
 
 /**
- * @brief A client-side WebSocket connection for Sendspin.
+ * @brief Outbound WebSocket connection to a Sendspin server (ESP-IDF, esp_websocket_client)
  *
- * This class represents an outgoing WebSocket connection to a Sendspin server.
- * It inherits from SendspinConnection and implements the SendspinConnection interface
- * for client-initiated connections (where the ESP device acts as a WebSocket client
- * and connects to a Sendspin server).
- *
- * Handles the full connection lifecycle, auto-reconnect on connection loss, and
- * satisfies the SendspinConnection interface for message send/receive.
- *
- * Usage:
- * 1. Construct with the server URL.
- * 2. Call start() to initialize the ESP-IDF WebSocket client and connect.
- * 3. Call loop() periodically to handle reconnection attempts.
- * 4. Call disconnect() to close the connection with a goodbye message.
- *
- * @code
- * SendspinClientConnection conn("ws://server.local:8927/sendspin");
- * conn.set_auto_reconnect(true);
- * conn.start();
- * // In your main loop:
- * conn.loop();
- * // When shutting down:
- * conn.disconnect(SendspinGoodbyeReason::SHUTDOWN, []() { // done
- * });
- * @endcode
+ * Implements SendspinConnection for the client role: the ESP device connects out to the server.
+ * Handles the full connection lifecycle and auto-reconnect on connection loss; loop() drives the
+ * reconnect timer.
  */
 class SendspinClientConnection : public SendspinConnection {
 public:
-    /// @brief Constructs a client connection with the given server URL
-    /// @param url The WebSocket server URL (e.g., "ws://server.local:8927/sendspin").
+    /// @brief Constructs a client connection to a URL such as "ws://server.local:8927/sendspin"
     explicit SendspinClientConnection(std::string url);
 
     ~SendspinClientConnection() override;
@@ -73,26 +56,34 @@ public:
     void loop() override;
 
     /// @brief Disconnects from the server with a goodbye message
-    /// @param reason The reason for disconnecting.
-    /// @param on_complete Optional callback invoked after goodbye send completes (or fails).
-    ///                    For client connections, goodbye is synchronous, so callback is invoked
-    ///                    immediately.
+    /// @param on_complete Optional; the goodbye is synchronous here, so it runs immediately.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
-    /// @brief Checks if the websocket connection is established
-    /// @return true if connected, false otherwise.
+    /// @brief Closes the transport immediately without blocking (see base class doc comment).
+    /// Reports the loss via handle_disconnected() without touching the transport; the actual
+    /// esp_websocket_client_stop() runs later in the destructor once the manager drops this
+    /// connection (off the websocket task), because esp_websocket_client_stop() cannot be called
+    /// from the websocket task's own event handler.
+    void close_transport_now() override;
+
+    /// @brief Whether the websocket connection is established
     bool is_connected() const override;
 
+    bool is_outbound() const override {
+        return true;
+    }
+
     /// @brief Sends a text message to the server with a completion callback
-    /// @param msg The message string to send.
-    /// @param cb Callback invoked after send completes.
-    /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                             bool allow_before_hello) override;
 
     /// @brief Sends a client/time message, capturing the timestamp just before send
-    /// @return true if the message was sent successfully, false otherwise.
     bool send_time_message() override;
+
+    /// @brief Sends a binary WebSocket frame to the server
+    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
+                              bool allow_before_hello) override;
 
     // ========================================
     // Client connection-specific configuration
@@ -106,8 +97,13 @@ public:
 
     /// @brief Configures the internal esp_websocket_client task
     /// @param priority FreeRTOS task priority for the WebSocket client task.
-    void set_task_config(unsigned priority) {
+    /// @param stack_size Task stack size in bytes. Values below
+    ///     SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE are clamped up to it in start()
+    ///     (see the rationale on that constant: the Noise handshake, including the in-band
+    ///     re-handshake, runs inline on this task).
+    void set_task_config(unsigned priority, size_t stack_size) {
         this->task_priority_ = priority;
+        this->task_stack_size_ = stack_size;
     }
 
 protected:
@@ -157,6 +153,9 @@ protected:
 
     /// @brief FreeRTOS task priority for the internal esp_websocket_client task
     unsigned task_priority_{5};
+
+    /// @brief Stack size in bytes for the internal esp_websocket_client task
+    size_t task_stack_size_{SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE};
 
     // 8-bit fields
 

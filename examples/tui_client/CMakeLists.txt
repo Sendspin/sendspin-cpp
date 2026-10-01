@@ -11,7 +11,7 @@ set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ftxui)
 
-add_executable(tui_client main.cpp tui.cpp)
+add_executable(tui_client main.cpp tui.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../common/file_persistence_provider.cpp)
 target_link_libraries(tui_client PRIVATE
     sendspin
     ftxui::screen
@@ -19,9 +19,10 @@ target_link_libraries(tui_client PRIVATE
     ftxui::component
 )
 target_compile_features(tui_client PRIVATE cxx_std_20)
+target_include_directories(tui_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
 
 # mDNS service advertisement and browsing via dns_sd.h (optional)
-# macOS: built-in (no extra link flags needed — dns_sd is in libSystem)
+# macOS: built-in (no extra link flags needed; dns_sd is in libSystem)
 # Linux: requires libavahi-compat-libdnssd-dev (provides dns_sd.h + libdns_sd)
 if(APPLE)
     target_compile_definitions(tui_client PRIVATE SENDSPIN_HAS_MDNS=1)
@@ -41,7 +42,7 @@ else()
     endif()
 endif()
 
-# PortAudio (optional — enables audio playback via PortAudioSink)
+# PortAudio (optional; enables audio playback via PortAudioSink)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(PORTAUDIO portaudio-2.0)
@@ -49,11 +50,11 @@ endif()
 
 if(PORTAUDIO_FOUND)
     target_sources(tui_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common/portaudio_sink.cpp)
-    target_include_directories(tui_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common ${PORTAUDIO_INCLUDE_DIRS})
+    target_include_directories(tui_client PRIVATE ${PORTAUDIO_INCLUDE_DIRS})
     target_link_directories(tui_client PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
     target_link_libraries(tui_client PRIVATE ${PORTAUDIO_LINK_LIBRARIES})
     target_compile_definitions(tui_client PRIVATE SENDSPIN_HAS_PORTAUDIO=1)
-    message(STATUS "PortAudio found — PortAudioSink enabled for TUI")
+    message(STATUS "PortAudio found - PortAudioSink enabled for TUI")
 else()
-    message(STATUS "PortAudio not found — TUI will not have audio playback")
+    message(STATUS "PortAudio not found - TUI will not have audio playback")
 endif()

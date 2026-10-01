@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Unit tests for the SendspinTimeFilter Kalman filter. We don't try to prove the filter is
-// "optimal" -- instead we pin down the behavioral invariants a refactor could silently break:
+// "optimal": instead we pin down the behavioral invariants a refactor could silently break:
 // monotonic-timestamp rejection, reset semantics, the offset/inverse round-trip, and convergence
 // toward a constant offset.
 
@@ -25,12 +25,26 @@
 
 using sendspin::SendspinTimeFilter;
 
-TEST(TimeFilter, HasUpdateStartsFalse) {
+// has_update() is what the client checks before trusting a converted timestamp, so it must be
+// false until a measurement lands and false again after reset().
+TEST(TimeFilter, HasUpdateTracksWhetherAnEstimateExists) {
     SendspinTimeFilter filter;
     EXPECT_FALSE(filter.has_update());
 
+    // One measurement is enough: the client trusts converted timestamps from the first reply on.
     filter.update(/*measurement=*/1000, /*max_error=*/100, /*time_added=*/5000);
     EXPECT_TRUE(filter.has_update());
+
+    filter.update(/*measurement=*/1000, /*max_error=*/100, /*time_added=*/6000);
+    EXPECT_TRUE(filter.has_update());
+
+    filter.reset();
+    EXPECT_FALSE(filter.has_update());
+
+    // Control: a reset filter is usable again and re-establishes its baseline from the next
+    // measurement rather than filtering it against the discarded estimate.
+    filter.update(/*measurement=*/2000, /*max_error=*/100, /*time_added=*/7000);
+    EXPECT_EQ(filter.compute_server_time(7000), 9000);
 }
 
 // The first measurement establishes the offset baseline, so server_time = client_time + offset.
@@ -56,16 +70,6 @@ TEST(TimeFilter, RejectsNonMonotonicTimestamps) {
     // Earlier timestamp -> also skipped.
     filter.update(/*measurement=*/-999999, /*max_error=*/100, /*time_added=*/4000);
     EXPECT_EQ(filter.compute_server_time(5000), before);
-}
-
-TEST(TimeFilter, ResetClearsState) {
-    SendspinTimeFilter filter;
-    filter.update(1000, 100, 5000);
-    filter.update(1000, 100, 6000);
-    ASSERT_TRUE(filter.has_update());
-
-    filter.reset();
-    EXPECT_FALSE(filter.has_update());
 }
 
 // Fed a constant true offset with low measurement noise, the filter should settle on that offset

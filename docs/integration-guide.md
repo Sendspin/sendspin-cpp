@@ -40,7 +40,6 @@ using namespace sendspin;
 SendspinClient::set_log_level(LogLevel::INFO);
 
 SendspinClientConfig config;
-config.client_id = "my-device-mac-addr";       // Unique identifier (e.g., MAC address)
 config.name = "Living Room Speaker";            // Friendly display name
 config.product_name = "My Speaker";             // Device product name (optional)
 config.manufacturer = "My Company";             // Manufacturer name (optional)
@@ -48,6 +47,16 @@ config.software_version = "1.0.0";              // Software version string (opti
 
 SendspinClient client(std::move(config));
 ```
+
+`client_id` is not a configuration field. The library derives it automatically from the
+static X25519 keypair (`base64url(public_key)`, 43 characters). The keypair is generated
+on first boot and, when a `SendspinPersistenceProvider` is set, persisted so that the same
+identity survives reboots. After `start()` the derived `client_id` is available
+via `client.client_id()`.
+
+The `client_id` uniquely identifies this device to Sendspin servers and must be stable
+across reboots for pairing and server-preference to work correctly. Without a persistence
+provider the keypair is regenerated on every boot (development use only).
 
 ## Step 2: Add Roles
 
@@ -70,15 +79,16 @@ player_config.audio_formats = {
 };
 player_config.audio_buffer_capacity = 1000000;   // Ring buffer size in bytes (default: 1000000)
 player_config.fixed_delay_us = 0;                // Fixed delay offset in microseconds
-player_config.initial_static_delay_ms = 0;       // Initial user-adjustable delay
+player_config.initial_output_delay_ms = 0;       // Initial user-adjustable delay
 player_config.extra_startup_silence_ms = 50;     // Extra startup silence for decode headroom (default: 50)
+// player_config.required_lead_time_ms = 150;   // Startup lead requested from the server;
+                                                 // unset derives it from the pipeline
+player_config.min_buffer_ms = 500;               // Ongoing buffer requested from the server (default: 500)
 
 auto& player = client.add_player(std::move(player_config));
 ```
 
-List at least one `FLAC` or `PCM` format. Those are the only codecs a server must support, and the server picks only among the formats it can produce, so a list with neither can leave the player with nothing to play; `start()` refuses it. `OPUS` is optional and needs a build with the Opus decoder (`SENDSPIN_ENABLE_OPUS`, on by default); `start()` refuses an `OPUS` entry otherwise.
-
-Each `AudioSupportedFormatObject` declares a codec/channels/sample_rate/bit_depth combination. The server selects from these when establishing an audio stream.
+Each `AudioSupportedFormatObject` declares a codec/channels/sample_rate/bit_depth combination. The server selects from these when establishing an audio stream. The list must include at least one `FLAC` or `PCM` entry, since those are the codecs every server supports; `client.start()` fails and logs if it does not. `OPUS` is optional and needs a build with the Opus decoder (`SENDSPIN_ENABLE_OPUS`, on by default); `client.start()` also fails on an `OPUS` entry without it.
 
 The stream parameters negotiated by the server are available via `get_current_stream_params()`, which returns a `ServerPlayerStreamObject` with these fields:
 
@@ -90,7 +100,9 @@ The stream parameters negotiated by the server are available via `get_current_st
 | `bit_depth` | `std::optional<uint8_t>` | Bits per sample |
 | `codec_header` | `std::optional<std::string>` | Codec-specific header data |
 
-Call `is_complete()` on the object to check if all fields have values.
+Call `is_complete()` on the object to check that `codec`, `sample_rate`, `channels`, and
+`bit_depth` all have values. `codec_header` is not part of that check, so it can still be
+`nullopt` when `is_complete()` returns true.
 
 ### Controller Role (Playback Commands)
 
@@ -121,7 +133,9 @@ artwork_config.preferred_formats = {
 auto& artwork = client.add_artwork(std::move(artwork_config));
 ```
 
-The slot/channel number for each entry is its position (index) in `preferred_formats`; the first entry is slot 0, the second slot 1, and so on. Up to `ARTWORK_MAX_SLOTS` (4) entries are supported.
+The slot/channel number for each entry is its position (index) in `preferred_formats`; the first entry is slot 0, the second slot 1, and so on. Up to `ARTWORK_MAX_SLOTS` (4) entries are supported. The client reports these channels to the server in its `client/state` artwork object, which is sent once the server activates the role.
+
+Each image arrives as several binary messages that the role reassembles, so `on_image_decode()` fires once per complete image, never per message. `ImageSlotPreference::max_image_bytes` is the channel's memory budget: the role refuses an image the server announces as larger than that (the channel keeps what it was showing and the refusal is logged) and holds two buffers per channel, so the role's image memory is bounded by twice that value per configured channel. The default, 128 KiB, suits the channel sizes a display client of this class asks for; raise it for a channel whose images are genuinely larger.
 
 ### Visualizer Role (Audio Visualization)
 
@@ -129,41 +143,31 @@ Receives real-time beat, loudness, dominant-frequency, onset, and spectrum data 
 
 ```cpp
 VisualizerSupportObject vis_support;
-vis_support.types = {
+vis_support.buffer_capacity = 32768;  // Total ring buffer bytes; ~1/3 holds wire data
+
+VisualizerStreamConfig vis_stream;
+vis_stream.types = {
     VisualizerDataType::BEAT,
     VisualizerDataType::LOUDNESS,
     VisualizerDataType::F_PEAK,
     VisualizerDataType::SPECTRUM,
     VisualizerDataType::PEAK,
 };
-vis_support.buffer_capacity = 32768;  // Total ring buffer bytes; ~1/3 holds wire data
-vis_support.rate_max = 30;  // Set to the display refresh rate
-vis_support.spectrum = VisualizerSpectrumConfig{
+vis_stream.rate_max = 30;  // Set to the display refresh rate
+vis_stream.spectrum = VisualizerSpectrumConfig{
     .n_disp_bins = 32,
     .scale = VisualizerSpectrumScale::MEL,
     .f_min = 40,
     .f_max = 16000,
 };
 
-auto& visualizer = client.add_visualizer({.support = vis_support});
+auto& visualizer = client.add_visualizer({.support = vis_support, .stream = vis_stream});
 ```
 
-The advertised support object is the starting format. To change it at runtime, call
-`request_format()` with only the fields you want to change; omitted fields keep their
-current value on the server:
-
-```cpp
-visualizer.request_format({.rate_max = 15});  // Halve the frame rate
-
-visualizer.request_format({
-    .types = {{VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS}},
-});
-```
-
-While a stream is active the server replies with a fresh `stream/start`, so
-`on_visualizer_stream_start()` fires again with the updated
-`ServerVisualizerStreamObject`. If no stream is active, the server remembers the request
-and applies it to the next stream.
+`support` is the capacity the client advertises once in `client/hello`; `stream` is the
+configuration it reports in `client/state`, from which the server derives the stream it
+sends. Both are set at construction time, so the stream configuration is reported as
+configured and does not change while the client runs.
 
 ### Color Role (Audio-Derived Color Palette)
 
@@ -175,9 +179,21 @@ auto& color = client.add_color();
 
 ## Step 3: Implement Listener Interfaces
 
+A role you add is configured and ready, but only the server decides which roles a session actually
+uses, and it may change that set at any time. When an activation removes a role, the library tears
+that role down on the spot: a stream role stops its output, drops its buffers, and reports the end
+(`on_stream_end()`, `on_visualizer_stream_end()`, `on_image_clear()` for every slot), and a state
+role drops its state and reports the clear (`on_metadata_clear()`, `on_color_clear()`,
+`on_controller_state_clear()`). The connection stays up and the other roles keep running. A clear
+callback is therefore not proof that the server is gone; treat it as "this role has nothing to
+show" and make it idempotent. Until the server adds the role back, anything it still sends for
+that role is ignored rather than acted on, so a removed role stays quiet; when it is added back,
+the role resumes normally.
+
 ### PlayerRoleListener (Required if Using Player Role)
 
-The `on_audio_write` method is the only pure virtual (required) method in the entire library.
+The `on_audio_write` method is one of only two pure virtual (required) methods in the library;
+the other is `SendspinNetworkProvider::is_network_ready()`.
 
 ```cpp
 struct MyPlayerListener : PlayerRoleListener {
@@ -210,8 +226,8 @@ struct MyPlayerListener : PlayerRoleListener {
         my_audio_output.set_muted(muted);
     }
 
-    // Optional: Called when the server changes the static delay.
-    void on_static_delay_changed(uint16_t delay_ms) override { }
+    // Optional: Called when the server changes the output delay.
+    void on_output_delay_changed(uint16_t delay_ms) override { }
 };
 ```
 
@@ -263,7 +279,7 @@ The `ServerMetadataStateObject` contains these fields (all optional except `time
 
 `MetadataProgressObject` contains `track_progress` (ms), `track_duration` (ms), and `playback_speed`.
 
-A field is `nullopt` when the server has not provided it or has explicitly cleared it. Listeners that mirror metadata into display state should overwrite the displayed value on every `on_metadata()` call (using e.g. `value_or("")`) so that server clears propagate.
+Every `on_metadata()` call carries the full state of the track being described, not a set of changes: a field the server left out of that update is `nullopt`, whatever an earlier update reported for it, and a state without `progress` means there is no position to show. Listeners that mirror metadata into display state should therefore overwrite every displayed value on each call (using e.g. `value_or("")`) rather than merging into what they already show.
 
 You can also poll track progress at any time:
 
@@ -318,20 +334,20 @@ struct MyArtworkListener : ArtworkRoleListener {
 };
 ```
 
-**Knowing when there is no artwork.** Artwork stays valid until the server replaces or clears it, and the artwork role is independent of the metadata role, so a track change alone sends nothing: the next track of the same album keeps showing the image already delivered. When an item genuinely has no artwork, the server clears that channel and `on_image_clear()` fires for that slot alone, scheduled to its server timestamp like a display (`display_offset_ms` included) so it lands on the item boundary. `on_image_clear()` also fires for every configured slot on stream end, stream clear, and disconnect.
+**Knowing when there is no artwork.** Artwork stays valid until the server replaces or clears it, and the artwork role is independent of the metadata role, so a track change alone sends nothing: the next track of the same album keeps showing the image already delivered. When an item genuinely has no artwork, the server clears that channel and `on_image_clear()` fires for that slot alone, scheduled to its server timestamp like a display (`display_offset_ms` included) so it lands on the item boundary. `on_image_clear()` also fires for every configured slot on stream end, disconnect, and a `server/activate` that takes the artwork role out of the session's active roles.
 
 | What happened | What the listener sees |
 | --- | --- |
 | Artwork unchanged (e.g. next track of the same album) | nothing; the current image stays valid |
 | Item has no artwork | `on_image_clear(slot)` for that slot |
-| Stream ended, cleared, or connection lost | `on_image_clear(slot)` for every configured slot |
+| Stream ended, connection lost, or the role deactivated | `on_image_clear(slot)` for every configured slot |
 
-**Cross-fades with back-pressure (opt-in).** By default the role decodes and displays every frame as it arrives. A slot can instead opt into a back-pressure gate by setting `ImageSlotPreference::require_frame_done`. With the gate on, the role keeps at most one un-acked *delivery* (a frame or a clear) in flight for that slot. Call `ArtworkRole::frame_done(slot)` from the main loop exactly once for every `on_image_display()` and `on_image_clear()` that slot receives -- e.g. once a cross-fade animation finishes. An extra call is a harmless no-op, but a missed one wedges the slot: there is no timeout, the acknowledgment is the contract.
+**Cross-fades with back-pressure (opt-in).** By default the role decodes and displays every frame as it arrives. A slot can instead opt into a back-pressure gate by setting `ImageSlotPreference::require_frame_done`. With the gate on, the role keeps at most one un-acked *delivery* (a frame or a clear) in flight for that slot. Call `ArtworkRole::frame_done(slot)` from the main loop exactly once for every `on_image_display()` and `on_image_clear()` that slot receives, e.g. once a cross-fade animation finishes. An extra call is a harmless no-op, but a missed one wedges the slot: there is no timeout, the acknowledgment is the contract.
 
-Payloads and stream-level clears reach the gate differently:
+Payloads and a stream end reach the gate differently:
 
-- A **frame or per-channel clear** arriving while a delivery is un-acked is buffered latest-wins and delivered only after `frame_done(slot)`, and then owes its own `frame_done()`. It waits behind the outstanding delivery rather than replacing it, so a consumer is never interrupted mid-fade.
-- A **stream end or stream clear** is a lifecycle event, not a payload, so it is never buffered: it fires `on_image_clear()` immediately for every configured slot, discards anything buffered, and replaces whatever delivery was outstanding. Exactly one `frame_done()` is owed afterward whatever was in flight.
+- A **frame or per-channel clear** arriving while a delivery is un-acked is buffered latest-wins and delivered only after `frame_done(slot)`, and then owes its own `frame_done()`. It waits behind the outstanding delivery rather than replacing it, so a consumer presenting a delivery is never interrupted. The exception is a delivery that has not reached `on_image_display()` yet: the server announcing a newer image for the slot replaces it outright, its display never fires, and the gate reopens for the buffered payload.
+- A **stream end** is a lifecycle event, not a payload, so it is never buffered: it fires `on_image_clear()` immediately for every configured slot, discards anything buffered, and replaces whatever delivery was outstanding. Exactly one `frame_done()` is owed afterward whatever was in flight.
 
 Pair the gate with `ImageSlotPreference::display_offset_ms` to start a fade before the track boundary (positive fires the display early, mirroring `PlayerRoleConfig::fixed_delay_us`), and use `lateness_ms` to shorten the fade so it still ends on schedule:
 
@@ -357,7 +373,9 @@ Call `frame_done()` from the main loop thread. It is a safe no-op when the slot 
 ```cpp
 struct MyVisualizerListener : VisualizerRoleListener {
     // THREAD SAFETY: Data callbacks fire on a dedicated drain thread at each
-    // frame's display timestamp. Copy data quickly and defer heavy processing.
+    // frame's display timestamp, less VisualizerRoleConfig::display_offset_ms.
+    // A frame that arrives after its display time is dropped, as is a backlog
+    // more than 20 ms behind, so copy data quickly and defer heavy processing.
     void on_loudness(int64_t client_timestamp, uint16_t loudness) override {
         update_vu_meter(loudness);
     }
@@ -398,7 +416,8 @@ struct MyColorListener : ColorRoleListener {
         // accent, on_dark, on_light...
     }
 
-    // Called when the connection is lost and cached colors are dropped.
+    // Called when the cached colors are dropped: the connection was lost, or a
+    // server/activate took the color role out of the session's active roles.
     // Reset any displayed colors to a neutral or default state.
     void on_color_clear() override {
         reset_to_defaults();
@@ -418,7 +437,7 @@ The `ServerColorStateObject` contains a `timestamp` and six optional `RgbColor` 
 | `on_dark` | Light foreground for use on dark backgrounds |
 | `on_light` | Dark foreground for use on light backgrounds |
 
-A field is `nullopt` when the server has not provided it or has explicitly cleared it; listeners do not need to distinguish those cases.
+Every `on_color()` call carries the full palette: a color the server left out of that update is `nullopt`, whatever an earlier update reported for it, so listeners render from the palette they are handed rather than merging it into the one they already hold.
 
 ## Step 4: Implement Providers
 
@@ -444,36 +463,146 @@ struct HostNetworkProvider : SendspinNetworkProvider {
 
 ### SendspinPersistenceProvider (Optional)
 
-Allows the library to persist and restore state across reboots. Useful on embedded devices.
+Allows the library to persist state across reboots. Required for stable identity and
+pairing. On host platforms `examples/common/file_persistence_provider.h` provides
+`FilePersistenceProvider`, which persists to a single JSON file (one document mapping each
+key below to `base64url(bytes)`) -- use it directly or as a reference implementation.
+
+The interface is a plain byte-blob store -- three methods, independent of what is being
+stored:
+
+```cpp
+class SendspinPersistenceProvider {
+public:
+    virtual std::optional<std::vector<uint8_t>> load_blob(const std::string& key);
+    virtual bool save_blob(const std::string& key, const uint8_t* data, size_t len);
+    virtual bool erase_blob(const std::string& key);
+};
+```
+
+The library owns all serialization. It calls these three methods with one of the fixed keys
+below; a provider never needs to parse or interpret the bytes, only store and return them
+byte-for-byte.
+
+Every method is invoked on the main loop thread, for every key, so a provider needs no locking
+of its own. (The one library write that originates on the network thread -- the pairing record
+committed when a pairing finalizes -- is staged internally and flushed to that record's slot key
+from the next `loop()` tick.)
+No internal library lock is held across the call, so a slow write does not stall the audio path
+or a Noise handshake -- but it does stop the main loop for its duration, so the call must be one
+bounded storage operation, and it must not call back into the client.
+Provisioning writes from inside `start()` rather than in response to a runtime event:
+`save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored, and
+`save_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored and none is
+configured.
+
+#### Keyspace
+
+Every key comes from the `persistence_keys` namespace (`sendspin/persistence_keys.h`, which
+`sendspin/client.h` includes), at most 12
+characters (comfortably under a typical NVS key's 15-character limit). A provider must not invent its own keys; it only needs to
+store and return whatever bytes the library gives it for each of these:
+
+Every blob has a fixed size, published beside its key as a `*_SIZE` constant. The library
+always writes exactly that many bytes and treats a stored blob of any other length as absent, so
+a provider can store each key as a fixed-size value. `RECORD_ORDER` is the exception: it has no
+size constant, is written as exactly `max_pairing_records` bytes, after the clamp to 5..255
+described under Record capacity, and is read at any length. Integers are in the device's native
+byte order: a blob is only ever read back by the device that wrote it.
+
+| Key | Size | Contents |
+|---|---|---|
+| `persistence_keys::KEYPAIR` | `KEYPAIR_SIZE` (32) | The static X25519 private key. |
+| `persistence_keys::record_slot_key(n)` | `RECORD_SLOT_SIZE` (64) | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or 64 zero bytes when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
+| `persistence_keys::RECORD_ORDER` | `max_pairing_records` (12 by default) | The occupied slot numbers, least recently used first, one byte each, then `0xFF` in every remaining position. Decides which record a pairing at capacity evicts. |
+| `persistence_keys::PAIRING_PSK` | `PAIRING_PSK_SIZE` (32) | The stored `SendspinPairingPsk` as a codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). Never written while `SendspinClientConfig::pairing_psk` is set, which outranks a stored one. |
+| `persistence_keys::LAST_PLAYED` | `LAST_PLAYED_SIZE` (32) | The X25519 public key of the last-playback server, the key its base64url `server_id` encodes. |
+| `persistence_keys::OUTPUT_DELAY` | `OUTPUT_DELAY_SIZE` (2) | A `uint16_t`: the player's output delay in milliseconds. |
+
+`sendspin/persistence_codec.h` is public so a custom provider (or a test) can inspect or seed
+the record slot / `PAIRING_PSK` content in exactly the format the library itself
+produces -- it is not something a provider hand-rolls its own version of. A record is its PSK
+and the server's public key; a Pairing PSK blob is the bare PSK. Neither stores its
+`psk_id`, which decoding derives from the PSK.
+
+Only the keys a change actually touches are written: a pairing writes one slot (and the order),
+a revocation zeroes one slot (and writes the order), and a playback handoff that reorders
+recency writes only the order.
+
+#### Durability contract
+
+- `save_blob()` returning `true` means DURABLY stored, including for the zeroed write that frees
+  a record slot. A `false` return is reported, not retried: the in-memory state
+  stays authoritative for the current boot. What the rejection costs decides the level: a write
+  that changes which records the next boot holds logs a warning naming the key and what will be lost (or come back) at the next reboot, while a
+  write the next boot rebuilds by itself (the recency order in `RECORD_ORDER`) reports at debug.
+  For a record slot specifically: a rejected
+  write of a just-paired record leaves the pairing working for this boot only
+  (`on_pairing_succeeded` still fires; the record is gone after a reboot), and a rejected write
+  of a removal means the store still holds the old record and will hand it back at the next boot,
+  silently making the revoked PSK valid again (the revoked record is always dropped from RAM
+  regardless of the return value). A supersede and an eviction both write the new record over the
+  old one's slot, so a rejected write there leaves the OLD record in storage: after a reboot the
+  client is paired to the server it evicted, or holds the pre-supersede PSK for a server that has
+  already discarded it, which then falls back to unpaired (Sentinel) access.
+- `erase_blob()` is for the application's own use; the library never calls it. Every blob the
+  library owns is rewritten in place or left alone (a removal zeroes its slot rather than
+  erasing the key). The hook is here so an application that wipes the library keyspace itself,
+  for example on a factory reset, has a working delete over the same store. Absent counts as
+  success.
+
+#### Record capacity
+
+The library's built-in `RecordStore` caps the number of long-term records it will hold at
+`SendspinClientConfig::max_pairing_records`, which defaults to
+`SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). The cap is also the number of record
+slot keys the store may use, one per record. A pairing at the cap evicts the least recently used
+record that no open connection is resolving against, since a pairing never fails for lack of
+record storage. A record counts as recently used when a server takes playback on it, not when
+it merely connects, and a new record starts as the most recently used. Replacing a record already held for
+a given `psk_id` or `server_id` evicts nothing, because that never grows the store. Recency survives a reboot: it is what
+`persistence_keys::RECORD_ORDER` holds. An evicted server's next handshake lands in the Sentinel
+fallback, where it can offer its operator re-pairing. The protocol requires room for at least 5
+records, so a smaller configured cap is raised to that floor, and a cap above 255 is lowered to
+that ceiling (so the highest slot is 254, leaving byte value 255 free as the order blob's
+padding). Raise or lower the cap by setting `max_pairing_records` before calling `start()`:
+
+```cpp
+SendspinClientConfig config;
+config.max_pairing_records = 32;
+```
+
+Every method has a default no-op / `nullopt` implementation, so you can implement only the
+keys your deployment actually needs. The minimum useful set for a deployed device is
+`persistence_keys::KEYPAIR` (for stable identity) and the record slot keys (for pairing to
+survive reboots).
 
 ```cpp
 struct MyPersistenceProvider : SendspinPersistenceProvider {
-    // Save/load the hash of the last server that was playing audio.
-    // Used to prioritize reconnection to the same server.
-    bool save_last_server_hash(uint32_t hash) override {
-        return nvs_write("last_server", hash);
-    }
-    std::optional<uint32_t> load_last_server_hash() override {
-        uint32_t hash;
-        if (nvs_read("last_server", &hash)) return hash;
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        std::vector<uint8_t> bytes;
+        if (nvs_read_bytes(key.c_str(), bytes)) return bytes;
         return std::nullopt;
     }
-
-    // Save/load the player's user-adjustable static delay.
-    bool save_static_delay(uint16_t delay_ms) override {
-        return nvs_write("static_delay", delay_ms);
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        return nvs_write_bytes(key.c_str(), data, len);
     }
-    std::optional<uint16_t> load_static_delay() override {
-        uint16_t delay;
-        if (nvs_read("static_delay", &delay)) return delay;
-        return std::nullopt;
+    bool erase_blob(const std::string& key) override {
+        return nvs_erase(key.c_str());  // Return true if the key is already absent, too.
     }
 };
 ```
 
+A provider backed by a single flat NVS namespace (as above) can often implement the whole
+interface generically, since every key is already sized to fit and the library handles
+serialization. A provider on a store of fixed-size values (such as ESPHome's preferences) can
+size each key from its `*_SIZE` constant, and `RECORD_ORDER` from the clamped
+`max_pairing_records`; a provider that needs different backing per key (e.g. a plaintext-secrets
+file plus separate flash-wear-optimized storage for `OUTPUT_DELAY`) can switch on `key` instead.
+
 ### SendspinClientListener (Optional)
 
-Receives client-level events.
+Receives client-level events. All callbacks fire on the main loop thread.
 
 ```cpp
 struct MyClientListener : SendspinClientListener {
@@ -497,6 +626,61 @@ struct MyClientListener : SendspinClientListener {
     // Called when the library no longer needs low-latency networking.
     void on_release_high_performance() override {
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    }
+
+    // Called when a server begins a pairing exchange, once per attempt and whatever
+    // the method (Pairing PSK, dynamic pairing code, or static pairing code).
+    // server_id is the base64url public key of the server initiating pairing.
+    void on_pairing_started(const std::string& server_id) override {
+        printf("Pairing started with server %s\n", server_id.c_str());
+    }
+
+    // Called when pairing completes successfully and the long-term record is stored.
+    // Subsequent connections from this server will report ConnectionTrust::USER.
+    void on_pairing_succeeded(const std::string& server_id) override {
+        printf("Pairing succeeded with server %s\n", server_id.c_str());
+    }
+
+    // Called when a pairing exchange is aborted. Most server-sent abort reasons leave the
+    // connection open so the server can retry or resume normal operation; CONCURRENT_ATTEMPT
+    // and protocol errors (reported as UNKNOWN) close it.
+    void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
+        printf("Pairing failed with server %s\n", server_id.c_str());
+    }
+
+    // Called after the Noise handshake completes, and again after each successful
+    // re-handshake (notably the post-pairing rekey).
+    // trust reflects the PSK category used:
+    //   ConnectionTrust::USER  -- long-term record: a paired server
+    //   ConnectionTrust::NONE  -- Sentinel or Pairing PSK (unpaired access)
+    void on_trust_changed(ConnectionTrust trust) override {
+        bool paired = (trust == ConnectionTrust::USER);
+        update_trust_indicator(paired);
+    }
+
+    // Dynamic pairing code: emit/withdraw the code the device derived. Only invoked when
+    // SendspinClientConfig::pairing_code_out_channels and pairing_code_formats are both
+    // non-empty. `format` says what `code` is: six decimal digits, or a pairing token to
+    // render as a QR code.
+    void on_display_pairing_code(const std::string& code,
+                                 SendspinPairingCodeFormat format) override {
+        show_pairing_code_on_display(code, format);
+    }
+    void on_clear_pairing_code() override {
+        clear_pairing_code_from_display();
+    }
+
+    // Prompt/dismiss the operator pairing-window gesture for a gesture-gated attempt (every
+    // static pairing code attempt, and a dynamic one held back by the round limit). Confirm the
+    // gesture by calling client.confirm_pairing_window() (thread-safe) once the operator
+    // performs it; calling it with no attempt waiting opens a standing 5-minute pairing window
+    // that admits the next attempt without a further gesture.
+    // client.cancel_pairing_window() closes an open window again.
+    void on_open_pairing_window() override {
+        prompt_pairing_button_press();
+    }
+    void on_close_pairing_window() override {
+        dismiss_pairing_prompt();
     }
 };
 ```
@@ -560,11 +744,218 @@ Restarting is `start()` again; start, stop, and start again can be repeated inde
 - An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`).
 - A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
 
+A pairing attempt in flight is cut short the same way: `on_clear_pairing_code()` and `on_close_pairing_window()` fire from inside `stop()` for a prompt that was still showing, and a long-term record a `server/pair-finalize` had staged is persisted before `stop()` returns. The identity and record store survive the stop, so a restarted client keeps its `client_id`, its pairing token, and every record.
+
 Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
 
-`on_request_high_performance()` and `on_release_high_performance()` can fire while the client holds an internal lock, so their bodies must only toggle the platform networking mode and must not call any client or role method.
+`on_request_high_performance()` and `on_release_high_performance()` fire from the main loop with no internal lock held, and their bodies should only toggle the platform networking mode rather than calling back into the client or a role.
 
-Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no teardown or clear callback. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
+Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no role teardown or clear callback; the only listener call is `on_release_high_performance()` for a hold still outstanding. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
+
+## Encryption and Pairing
+
+All connections are encrypted with Noise KKpsk2 (X25519 + ChaChaPoly). This
+requires no application-level configuration beyond providing a `SendspinPersistenceProvider`
+(so the static keypair survives reboots). Encryption is mandatory; there is no cleartext
+fallback.
+
+### Client Identity
+
+The library derives `client_id` from the static X25519 keypair: `base64url(public_key)`
+(43 characters, URL-safe, no padding). This string identifies the device to servers. It is
+fixed for the lifetime of the keypair.
+
+Without a persistence provider the keypair is regenerated on every boot. Pairing records
+and server preferences will not survive reboots in that case.
+
+```cpp
+client.start();
+printf("client_id: %s\n", client.client_id().c_str());
+```
+
+### Pairing
+
+Pairing creates a long-term trust record for a specific server. After pairing, connections
+from that server resolve via the long-term PSK and report `ConnectionTrust::USER`.
+
+Pairing is server-initiated. The server includes `pairing` in the `activities` of its
+`server/activate` message; the library handles the exchange automatically. The application
+observes pairing via `SendspinClientListener` callbacks:
+
+1. `on_pairing_started(server_id)` -- the exchange has begun.
+2. `on_pairing_succeeded(server_id)` -- the record is stored; the server will
+   re-handshake immediately on the new long-term PSK.
+3. `on_pairing_failed(server_id, reason)` -- the exchange failed. See
+   `SendspinPairAbortReason` below for the possible reasons.
+
+   Whether the connection survives depends on the reason. Most reasons the server sends in a
+   `pair/abort` leave it open, so the server can re-activate pairing or resume normal operation
+   on it. `CONCURRENT_ATTEMPT` closes it, as do protocol errors (a malformed pairing frame or a
+   bad CPace share), which are reported as `UNKNOWN` and close the transport without sending a
+   `client/goodbye`.
+
+   A persistence provider that rejects the durable write does not fail the pairing:
+   `on_pairing_succeeded` fires, the record is authoritative for the rest of this boot, and a
+   warning says it will not survive a reboot. Surface that failure from the provider itself if
+   the application needs to act on it. The record is dropped outright, with neither callback
+   firing, only when the store is at capacity with nothing evictable, which the connection budget
+   rules out (`MAX_OPEN_CONNECTIONS` is below the records floor).
+
+   Either way, do not treat this callback as a disconnect notification; poll `is_connected()`
+   if the application needs to track that.
+
+#### Pairing PSK
+
+`pairing_psk` is the pairing method every client must implement, so it is always offered and a
+Pairing PSK always backs it. Unless the application supplies one, the library generates a random
+Pairing PSK on first boot and persists it as a `persistence_keys::PAIRING_PSK` blob. A stored blob
+holding an all-zero key or the Sentinel PSK is ignored and replaced the same way. Nothing is
+required of the application to enable the method.
+
+To pair, the server must learn that PSK out of band. Surface it as a **pairing token** -- one
+`"SP:"`-prefixed string carrying the `client_id` and the PSK together, for the operator to
+paste (or scan) into the server:
+
+```cpp
+auto token = client.pairing_token();  // e.g. "SP:0AAAQ..." (107 chars), nullopt before start()
+```
+
+The token is stable for the lifetime of the PSK, so it can be printed at startup, shown in a UI,
+or rendered as a QR code.
+
+To ship a device with a factory-provisioned Pairing PSK instead (for example one read from a
+factory partition, with its token printed on a label), set it in the config. `pairing.md`
+"Pairing PSK Flow" requires it to be drawn from a CSPRNG per device, never shared across devices:
+
+```cpp
+std::array<uint8_t, 32> factory_psk = read_factory_psk();  // the device's own 32 random bytes
+config.pairing_psk = SendspinPsk(factory_psk);
+```
+
+A configured Pairing PSK outranks a stored one and is never written to the persistence provider;
+the library derives its `psk_id`. An all-zero key or the published Sentinel PSK is rejected:
+`start()` logs an error and returns `false`, so a factory partition that was never written cannot
+ship a key every peer knows. `SendspinPsk` wipes its bytes when destroyed, and so does every copy
+the client makes; a source buffer such as `factory_psk` above is the application's to wipe.
+
+`client.format_pairing_token(factory_psk)` builds the token for any 32-byte PSK rather than the
+one in use, which is what a provisioning tool needs to print the token for a key it provisions.
+It returns `nullopt` before `start()`, since the token also carries the client's identity.
+
+After pairing completes, `on_pairing_succeeded` fires and the long-term record is stored
+by the library in the first free record slot. Subsequent boots load that same slot; no further
+provisioning is needed.
+
+#### Pairing-code pairing
+
+The library also supports the two pairing-code methods, gated by
+`SendspinClientConfig::pairing_code_out_channels` / `pairing_code_formats` /
+`pairing_window_supported` and the `SendspinClientListener::on_display_pairing_code` /
+`on_clear_pairing_code` / `on_open_pairing_window` / `on_close_pairing_window` callbacks
+documented in Step 3 above. A method is advertised only when the platform can carry it: a client
+that names no out-channel and no format never offers `dynamic_pairing_code`, and the server is
+then limited to the remaining methods.
+
+A client offers at most one pairing-code method, and one with an out-channel offers the dynamic
+code, so a device that means to offer `static_pairing_code` leaves `pairing_code_out_channels`
+empty.
+
+A **dynamic pairing code** is derived per attempt from the Noise handshake hash and both sides'
+nonces, and emitted through `on_display_pairing_code` as either six decimal digits or a pairing
+token to render as a QR code, whichever format the server selected from those advertised. If the
+operator types a code the device did not emit, the client asks for another round
+(`client/pair-retry`) and keeps the same code on screen. After 20 rounds without a successful
+verification the attempt ends and further attempts are held back until an operator gesture.
+
+A **static pairing code** is the fixed 8-digit value the device shipped with, set in
+`SendspinClientConfig::static_pairing_code` and drawn from a CSPRNG per device (`pairing.md` "Static
+Pairing Code Flow"). A value that is not exactly 8 decimal digits makes `start()` log an error and
+return `false`. Every attempt is **gesture-gated**: the client answers the pairing activation with
+`client/pair-pending` and withholds `client/pair-init` until a pairing window is open. The window
+opens on the operator gesture (`confirm_pairing_window()`) and lives for 5 minutes. It keeps
+admitting attempts on the connection that carried its first, and closes on a completed pairing (the
+server's `server/pair-finalize` ack, the point at which the record is stored), on the fifth attempt
+whose verification failed, when that connection drops, on `cancel_pairing_window()`, or on expiry. A
+gesture performed before the activation arrives leaves the window standing open, so the next attempt
+within its lifetime proceeds without a prompt.
+
+A device that leaves `pairing_window_supported` false cannot show the `on_open_pairing_window`
+prompt, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for the
+server's own timeout to cancel it. For a `dynamic_pairing_code` device that also means a standing
+round limit can never be cleared: `pairing.md` "Rounds" has only a deliberate operator action
+clear it, and the gesture is that action, so every later attempt sits at `client/pair-pending`
+until the server gives up. A device that offers either pairing-code method should therefore set
+`pairing_window_supported` and implement the gesture callbacks.
+
+#### The locations hint
+
+`SendspinClientConfig::pairing_psk_locations` and `static_pairing_code_locations` tell a server
+where the operator can find each secret (`"device"`, `"leaflet"`, `"operator"`), and ride out as
+the `locations` hint on the matching `client/hello` pair-method descriptor. Only the application
+knows where its secrets were published, so an empty value omits the hint rather than guessing:
+a code on the device label is `{"device"}`, a pairing token in the box is `{"leaflet"}`, and a
+secret an operator provisioned out of band is `{"operator"}`.
+
+The secrets themselves are `pairing_psk` (or the generated Pairing PSK) and
+`static_pairing_code` in the same config, so an application that sets one sets its hint beside
+it.
+
+### Trust Levels
+
+`ConnectionTrust` reflects which PSK resolved during the Noise handshake:
+
+| Value | PSK used | Meaning |
+|-------|---------|---------|
+| `ConnectionTrust::USER` | Long-term record | Server holds a record minted for it during pairing |
+| `ConnectionTrust::NONE` | Sentinel or Pairing PSK | Unpaired access |
+
+`on_trust_changed` fires after `server/activate` is processed and the connection is promoted
+to current, and again after each successful in-band re-handshake on that same connection.
+Pairing an already-connected server therefore delivers the callback twice: once with
+`ConnectionTrust::NONE` at admission, then again with `ConnectionTrust::USER` once the
+post-pairing rekey completes. Connections that are rejected (e.g., an unpaired server
+declaring playback or active roles while unpaired access is disabled) do not fire this
+callback.
+
+### Unpaired Access
+
+Paired servers (long-term record) may declare playback and activate roles at any time. Unpaired
+servers, those connecting with the Pairing PSK or the Sentinel PSK, are always admitted idle
+(activities `[]`) or declaring `pairing`, but may declare playback or activate roles only while
+unpaired access is enabled. `pairing.md` "Unpaired Access" makes the default the
+manufacturer's choice and a change a local action on the device, so the application owns the
+setting. It is off until `set_unpaired_access_enabled()` turns it on:
+
+```cpp
+client.set_unpaired_access_enabled(true);
+bool on = client.is_unpaired_access_enabled();
+```
+
+The call is main-loop only and works at any time, before the first `start()` and while stopped
+included; the next `start()` advertises and admits against the value it left.
+
+The library never persists the setting. An application that keeps it across reboots stores it
+and restores it by calling `set_unpaired_access_enabled()` before `start()`, so the first
+`client/hello` and admission already use it. If that stored value is lost, restore off rather
+than the out-of-box default unless the application's own record shows the device has never been
+set up, or a damaged store reopens unauthenticated access an operator turned off.
+
+A call on a running client applies the new value to the live connections as `pairing.md`
+"Unpaired Access" describes:
+
+- Turning it off closes every connection that only unpaired access was admitting (an unpaired
+  server with playback or active roles) with `client/goodbye` reason `pairing_required`. Paired
+  connections, and unpaired ones with neither playback nor active roles, stay open.
+- Turning it on closes each unpaired connection a server opened that is not declaring pairing
+  with reason `restart`, so the server reconnects and reads the new value in the `client/hello`.
+  Paired connections and `connect_to()` connections stay open; the latter keep advertising the
+  old value until they are reopened. A connection on the Pairing PSK still awaiting its first
+  `server/activate` also stays open: it is most likely about to declare pairing, and a restart
+  would cost that pairing attempt. If it activates idle instead, it keeps the `client/hello` it
+  already read until it reconnects.
+
+Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
+unpaired access after the device is paired is the typical production configuration.
 
 ## Sending Commands
 
@@ -594,7 +985,9 @@ controller.send_command({.command = SendspinControllerCommand::SEEK, .position_m
 controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = -10000});
 ```
 
-Fields that do not match the command are ignored when the message is serialized. The server clamps seeks to the seekable range and ignores any command not present in the controller state's `supported_commands`.
+Fields that do not match the command are ignored when the message is serialized. The client drops, with a warning, a command missing from the latest controller state's `supported_commands`, and one without the field it requires (`volume` in 0-100, `muted`, `position_ms`, `offset_ms`); gate your UI on `supported_commands` so such calls are not made. The server clamps seeks to the seekable range.
+
+A command is sent only while the server has `controller@v1` among the connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. That gate lives in `SendspinClient::send_text()`, which every role-originated message goes through and which therefore takes the role family (`"controller"`) alongside the message; the client's own messages do not use it.
 
 ## Accessing Roles
 
@@ -626,22 +1019,51 @@ Report local state changes back to the server:
 ```cpp
 player.update_volume(75);
 player.update_muted(false);
-player.update_static_delay(50);  // User-adjustable delay in ms
+player.update_output_delay(50);  // User-adjustable delay in ms
 
-// Enable/disable static delay adjustment by the server. When disabled, the stored delay
+// Enable/disable output delay adjustment by the server. When disabled, the stored delay
 // is not applied to sync timing and is reported as 0 in client state.
-player.set_static_delay_adjustable(true);
+player.set_output_delay_adjustable(true);
 ```
 
-## Updating Client State
+## External Sources
 
-Report the client's overall state to the server. Use this when your device switches to an external audio source or encounters an error:
+A device can be taken over by something other than Sendspin: a local source, another protocol,
+an HDMI input. How it tells the server depends on whether Sendspin may take it back (messaging.md
+"External Source Handling").
+
+### Leaving the Group
+
+A device that plays a local source it can be interrupted out of stays available and leaves its
+group:
 
 ```cpp
-client.update_state(SendspinClientState::EXTERNAL_SOURCE);  // Playing from another source
-client.update_state(SendspinClientState::ERROR);             // Error condition
-client.update_state(SendspinClientState::SYNCHRONIZED);      // Back to normal
+client.leave();  // Sends client/leave
 ```
+
+The server treats this as it treats a client becoming unavailable: the client ends up alone in a
+stopped group and rejoins only when an operator switches it back. Availability is unchanged, so
+the server may still take the client over for new playback.
+
+Leaving is only meaningful while the group is playing; a client in a stopped group keeps its
+grouping by staying. The call needs an admitted connection that has received its first
+`server/activate`, and is ignored (with a log) otherwise. Call it from the main loop thread.
+
+### Reporting Unavailability
+
+A device that will not yield to Sendspin while the other activity runs reports itself
+unavailable, and available again as soon as it would yield:
+
+```cpp
+client.set_available(false);  // client/state with available: false
+client.set_available(true);   // Sendspin may take the device over again
+bool available = client.is_available();
+```
+
+The server moves an unavailable client into a stopped group of its own and does not take it over
+until it is available again. Until the server ends the stream, the player discards the audio
+that still arrives. Availability is kept across disconnects and `stop()`/`start()`, and only a
+change publishes a `client/state`. Call it from the main loop thread.
 
 ## Querying State
 
@@ -652,11 +1074,12 @@ The client and roles expose query methods for polling state in your main loop or
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
 const GroupUpdateObject& group = client.get_group_state();   // Group id, name, playback state (all optional)
+ConnectionTrust trust = client.get_current_trust();          // Active connection's trust; NONE when no connection is active or the handshake has not completed
 
 // Player state
 uint8_t vol = player.get_volume();
 bool muted = player.get_muted();
-uint16_t delay = player.get_static_delay_ms();
+uint16_t delay = player.get_output_delay_ms();
 int32_t fixed = player.get_fixed_delay_us();
 auto& stream = player.get_current_stream_params();
 
@@ -685,7 +1108,15 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 
 `PlayerRole::notify_audio_played()` is thread-safe and is designed to be called from an audio output callback thread.
 
+`ControllerRole::send_command()` is callable from any thread.
+
 `ArtworkRole::frame_done()` must be called from the main loop thread (typically from inside `on_image_display()`/`on_image_clear()` or when a cross-fade animation completes).
+
+`SendspinPersistenceProvider` calls are on the main loop thread for every key (see the
+`SendspinPersistenceProvider` section above).
+
+The pairing exchange (CPace and SHA-512) also runs on the thread that calls `loop()`, so that
+thread's stack has to carry the deepest crypto frame, not just the listener callbacks.
 
 ## Minimal Example
 
@@ -694,6 +1125,9 @@ A minimal integration that receives and discards audio:
 ```cpp
 #include "sendspin/client.h"
 #include "sendspin/player_role.h"
+
+#include <chrono>
+#include <thread>
 
 using namespace sendspin;
 
@@ -709,7 +1143,6 @@ struct AlwaysReady : SendspinNetworkProvider {
 
 int main() {
     SendspinClientConfig config;
-    config.client_id = "minimal-example";
     config.name = "Minimal Client";
 
     SendspinClient client(std::move(config));
@@ -792,17 +1225,25 @@ When a role is disabled, its `add_*()` method, accessor method, and backing memb
 
 Main client configuration passed to the `SendspinClient` constructor.
 
+`client_id` is not a field in `SendspinClientConfig`. It is derived from the static
+X25519 keypair and read back via `client.client_id()` after `start()`.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `client_id` | `std::string` | — | Unique client identifier (e.g., MAC address) |
-| `name` | `std::string` | — | Friendly display name shown in the Sendspin UI |
+| `name` | `std::string` | (none) | Friendly display name shown in the Sendspin UI |
 | `product_name` | `std::optional<std::string>` | unset | Device product name; sent in `client/hello` only when set |
 | `manufacturer` | `std::optional<std::string>` | unset | Manufacturer name (e.g., `"ESPHome"`); sent in `client/hello` only when set |
 | `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
+| `pairing_code_out_channels` | `std::vector<SendspinPairingCodeChannel>` | `{}` | Where the device can emit a dynamic pairing code: `DISPLAY`, `SPEAKER`. Advertised as the descriptor's `out_channels`. Empty (or an empty `pairing_code_formats`) means the device cannot emit one, so `dynamic_pairing_code` is not advertised. |
+| `pairing_code_formats` | `std::vector<SendspinPairingCodeFormat>` | `{}` | How the device can render a dynamic pairing code: `DIGITS` (six decimal digits), `QR_CODE` (a pairing token to render). Advertised as the descriptor's `formats`; the server picks one from this list. |
+| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, the `static_pairing_code` method is not advertised even if `static_pairing_code` is set. Dynamic-pairing-code devices should also set it: an attempt held back by the round limit is gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
+| `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains. See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
+| `httpd_stack_size` | `size_t` | `8192` | HTTP server task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
+| `websocket_stack_size` | `size_t` | `8192` | esp_websocket_client task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task for outbound connections; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
 | `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye) |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
@@ -811,6 +1252,11 @@ Main client configuration passed to the `SendspinClient` constructor.
 | `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
 | `liveness_timeout_ms` | `std::optional<int64_t>` | unset (`60000` with default burst settings) | Milliseconds of inbound silence before the established connection is dropped as dead, with a `restart` goodbye so a server that was only slow reconnects. Unset derives it from the time burst settings, tolerating two consecutive unanswered time messages. An explicit value below `time_burst_interval_ms + time_burst_response_timeout_ms` drops healthy connections. `0` disables the check. |
 | `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
+| `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `websocket_payload_location` (which covers the raw WebSocket frame buffer). ESP-IDF only; ignored on host. |
+| `pairing_psk` | `std::optional<SendspinPsk>` | unset | A factory-provisioned Pairing PSK (32 bytes). Outranks a stored one and is never persisted; an all-zero key or the Sentinel PSK makes `start()` fail. Unset loads the stored one or generates and persists one on first boot. See [Pairing PSK](#pairing-psk). |
+| `static_pairing_code` | `std::optional<std::string>` | unset | The device's static pairing code, exactly 8 decimal digits. The `static_pairing_code` method is advertised only when this is set, `pairing_window_supported` is true, and `dynamic_pairing_code` is not advertised. An invalid value makes `start()` fail. |
+| `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
+| `static_pairing_code_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static pairing code the device shipped with, same values as above. Advertised on the `static_pairing_code` descriptor in `client/hello`; empty omits the hint. |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the network task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
 
 ---
@@ -821,11 +1267,13 @@ Configuration passed to `client.add_player()`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports, in preference order; advertised to the server during the hello handshake. The server selects one when establishing a stream. Must include a `FLAC` or `PCM` entry, the only codecs every server supports; `start()` refuses a non-empty list without one. `OPUS` may be listed in addition when the build has the Opus decoder (`SENDSPIN_ENABLE_OPUS`). |
+| `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports, in priority order; advertised to the server during the hello handshake. The server selects one when establishing a stream. Must list at least one `FLAC` or `PCM` entry, the codecs every server supports; `OPUS` may be listed in addition when the build has the Opus decoder (`SENDSPIN_ENABLE_OPUS`). `start()` fails and logs otherwise. |
 | `audio_buffer_capacity` | `size_t` | `1000000` | Internal ring buffer size in bytes. Larger buffers absorb more jitter at the cost of memory. |
-| `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable static delay. |
-| `initial_static_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable static delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
+| `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable output delay. |
+| `initial_output_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable output delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
 | `extra_startup_silence_ms` | `uint16_t` | `50` | Extra silence inserted at stream start, after the first playback notification and before the first decoded chunk reaches the sink. Added on top of the initial-sync priming silence to give the decode pipeline more slack to stay ahead of the sink, preventing the initial-playback stutter caused by the decoder briefly falling behind. Larger values trade a longer startup delay for more underflow protection; set to `0` to disable. |
+| `required_lead_time_ms` | `std::optional<uint16_t>` | unset (`150` with the default startup silence) | Startup lead in milliseconds reported to the server as `required_lead_time_ms`, measured from the server's transmission of a `stream/start` or `stream/clear` to the playback timestamp of the first chunk that can be played in full. Unset reports what the pipeline itself spends: the sync task's 25 ms priming silence, the configured `extra_startup_silence_ms`, and a 75 ms allowance for codec init, the first decode and the audio backend. Set it for an output with more startup latency than that allowance; a value below what the pipeline spends is raised to it. The server treats it as a hint and may give less lead. |
+| `min_buffer_ms` | `uint16_t` | `500` | Ongoing buffer duration in milliseconds reported to the server as `min_buffer_ms`: how much audio the player wants held ahead of playback during a stream to absorb network jitter and decode timing variance. Mostly relevant for live streams. The audio it represents must fit `audio_buffer_capacity` at the highest-bitrate entry in `audio_formats`. |
 | `psram_stack` | `bool` | `false` | Allocate sync/decode task stack in PSRAM (ESP-IDF only) |
 | `priority` | `unsigned` | `6` | FreeRTOS priority for the sync/decode task (ESP-IDF only). The default value, `6`, is one above the default `httpd_priority` (`5`). If you customize priorities, keep this above `httpd_priority` so the HTTP server task cannot starve the decoder during the initial burst of encoded audio that fills the buffer at stream start. |
 | `decode_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement preference for the decode transfer buffer. `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. ESP-IDF only; ignored on host. |
@@ -856,11 +1304,12 @@ Each entry in `preferred_formats` is an `ImageSlotPreference`. The slot/channel 
 | Field | Type | Description |
 |---|---|---|
 | `source` | `SendspinImageSource` | Image source (`ALBUM` or `ARTIST`) |
-| `format` | `SendspinImageFormat` | Image format (`JPEG`, `PNG`, or `BMP`) |
+| `format` | `SendspinImageFormat` | Image format (`JPEG` or `PNG`) |
 | `width` | `uint16_t` | Desired image width in pixels |
 | `height` | `uint16_t` | Desired image height in pixels |
 | `require_frame_done` | `bool` | Opt-in back-pressure gate (default `false`). When set, the role delivers at most one un-acked frame or clear at a time for this slot; the consumer must call `ArtworkRole::frame_done(slot)` to release the gate. See [ArtworkRoleListener](#artworkrolelistener). |
 | `display_offset_ms` | `int32_t` | Shifts the display deadline (default `0`). Positive fires `on_image_display()` earlier (mirroring `PlayerRoleConfig::fixed_delay_us`), negative delays it; lets a cross-fade straddle the track boundary. |
+| `max_image_bytes` | `uint32_t` | Largest encoded image this channel holds, in bytes (default 128 KiB). A larger image is refused: the transfer is followed to its end with its bytes dropped and the channel keeps what it was showing. `0` holds nothing at all. |
 
 ---
 
@@ -871,17 +1320,24 @@ Configuration passed to `client.add_visualizer()`.
 | Field | Type | Default | Description |
 |---|---|--|---|
 | `support` | `VisualizerSupportObject` | - | Visualizer capabilities advertised to the server during the hello handshake |
+| `stream` | `VisualizerStreamConfig` | - | Stream configuration reported to the server in `client/state` |
 | `psram_stack` | `bool` | `false` | Allocate drain thread stack in PSRAM (ESP-IDF only) |
+| `display_offset_ms` | `int32_t` | `0` | Fires the data callbacks this far ahead of each frame's display time (negative delays them), for a consumer's own render latency. The callbacks' `client_timestamp` stays the display time. |
 | `priority` | `unsigned` | `2` | FreeRTOS priority for the drain thread (ESP-IDF only) |
 
 `VisualizerSupportObject` fields:
 
 | Field | Type | Description |
 |---|---|---|
-| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`) |
 | `buffer_capacity` | `size_t` | Total RAM budget in bytes for the internal ring buffer. Per-entry overhead means only ~1/3 holds wire data; the client advertises that effective capacity to the server |
-| `rate_max` | `uint16_t` | Maximum periodic frames per second; set to the display refresh rate |
-| `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types` |
+
+`VisualizerStreamConfig` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`); may be empty to request none |
+| `rate_max` | `uint16_t` | Maximum periodic frames per second; set to the display refresh rate. Must be positive when `types` is non-empty, or `SendspinClient::start()` fails |
+| `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types`, or `SendspinClient::start()` fails |
 
 `VisualizerSpectrumConfig` fields:
 
@@ -895,6 +1351,52 @@ Configuration passed to `client.add_visualizer()`.
 ---
 
 ## Enums Reference
+
+### ConnectionTrust
+
+| Value | Description |
+|---|---|
+| `NONE` | Sentinel or Pairing PSK was used; this server has not been paired |
+| `USER` | Long-term record matched; the server is paired |
+
+Reported via `SendspinClientListener::on_trust_changed` on admission and again after each
+successful in-band re-handshake. See [Trust Levels](#trust-levels).
+
+### SendspinPairAbortReason
+
+| Value | Description |
+|---|---|
+| `ATTEMPT_TIMEOUT` | Pairing timed out waiting for the next step |
+| `CONCURRENT_ATTEMPT` | The server rejected pairing because another pairing is in progress |
+| `METHOD_NOT_SUPPORTED` | The proposed pairing method is not supported by the client |
+| `PAIRING_CODE_MISMATCH` | The pairing code entered does not match the one this client emitted |
+| `USER_CANCELLED` | The pairing was cancelled by the user: by the server, or locally by `cancel_pairing_window()` while an attempt was waiting for the gesture |
+| `UNKNOWN` | Unrecognized abort reason from the server, or a client-local protocol error (which also closes the connection) |
+
+Delivered via `SendspinClientListener::on_pairing_failed`. An activation naming a pairing
+method or format the client does not offer is answered with a `pair/abort` carrying
+`method_not_supported` and no listener callback at all; the connection stays open.
+
+### SendspinPairingCodeChannel
+
+| Value | Description |
+|---|---|
+| `DISPLAY` | The code is shown on a display |
+| `SPEAKER` | The code is spoken, not tone-encoded |
+
+Listed in `SendspinClientConfig::pairing_code_out_channels` and advertised as the
+`dynamic_pairing_code` descriptor's `out_channels`.
+
+### SendspinPairingCodeFormat
+
+| Value | Description |
+|---|---|
+| `DIGITS` | Six decimal digits the operator types into the server |
+| `QR_CODE` | A pairing token the operator scans from a rendered QR code |
+
+Listed in `SendspinClientConfig::pairing_code_formats` and advertised as the
+`dynamic_pairing_code` descriptor's `formats`; the server picks one of them and the chosen
+format arrives as the `format` argument of `on_display_pairing_code`.
 
 ### SendspinCodecFormat
 
@@ -931,17 +1433,9 @@ Configuration passed to `client.add_visualizer()`.
 |---|---|
 | `VOLUME` | Volume adjustment from the server |
 | `MUTE` | Mute state change from the server |
-| `SET_STATIC_DELAY` | Static delay adjustment from the server |
+| `SET_OUTPUT_DELAY` | Output delay adjustment from the server |
 
-These represent commands the server can send to the player. The player advertises which commands it supports. Enable `SET_STATIC_DELAY` with `player.set_static_delay_adjustable(true)`.
-
-### SendspinClientState
-
-| Value | Description |
-|---|---|
-| `SYNCHRONIZED` | Normal synchronized state |
-| `ERROR` | Error state |
-| `EXTERNAL_SOURCE` | Playing from an external source |
+These represent commands the server can send to the player. The player advertises which commands it supports. Enable `SET_OUTPUT_DELAY` with `player.set_output_delay_adjustable(true)`.
 
 ### SendspinGoodbyeReason
 
@@ -951,6 +1445,10 @@ These represent commands the server can send to the player. The player advertise
 | `SHUTDOWN` | Device is shutting down |
 | `RESTART` | Device is restarting |
 | `USER_REQUEST` | User requested disconnect |
+| `UNAUTHORIZED` | Server requested an activity its trust level does not permit |
+| `PAIRING_REQUIRED` | Server requested playback but the client requires pairing first |
+| `CONCURRENT_ATTEMPT` | Incoming connection rejected because another is already admitted. Distinct from the same-named `SendspinPairAbortReason`, which is specific to pairing |
+| `UNPAIRED` | Server unpaired this device via `server/unpair` |
 
 ### SendspinPlaybackState
 
@@ -973,7 +1471,6 @@ These represent commands the server can send to the player. The player advertise
 |---|---|
 | `JPEG` | JPEG image |
 | `PNG` | PNG image |
-| `BMP` | BMP image |
 
 ### SendspinImageSource
 
@@ -1021,4 +1518,4 @@ Set with `SendspinClient::set_log_level()`. Only affects host builds; ESP-IDF bu
 | `PREFER_EXTERNAL` | Prefer SPIRAM, fall back to internal RAM (ESP-IDF only) |
 | `PREFER_INTERNAL` | Prefer internal RAM, fall back to SPIRAM (ESP-IDF only) |
 
-Used by `SendspinClientConfig::websocket_payload_location` to control where the per-connection WebSocket payload reassembly buffer is allocated, and by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated. Ignored on host platforms (no internal/external distinction).
+Used by `SendspinClientConfig::websocket_payload_location` to control where the per-connection WebSocket payload reassembly buffer is allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and fragmentation buffers are allocated, and by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated. Ignored on host platforms (no internal/external distinction).

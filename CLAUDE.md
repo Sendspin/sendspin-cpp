@@ -18,6 +18,10 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `SyncTask` (`sync_task.h`): decodes encoded audio, synchronizes to server timestamps, writes PCM via audio write callback
 - `SendspinConnection` (`connection.h`): abstract WebSocket connection base
 - `SendspinServerConnection` / `SendspinClientConnection`: platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
+- `NoiseHandshake` (`noise_handshake.h`): drives the Noise KKpsk2 handshake frames on the network thread and resolves the PSK through `RecordStore`
+- `NoiseSession` (`noise_session.h`): noise-c wrapper holding the KKpsk2 handshake and transport cipher states
+- `NoiseTransport` (`noise_transport.h`): per-connection encrypted framing, owns fragmentation and reassembly around the session
+- `RecordStore` (`record_store.h`): pairing records and the Pairing PSK (configured, stored, or generated), seeded from the client config and the persistence provider
 - `Inbox` / `InboxSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle/time events
 - `SendspinTimeFilter` (`time_filter.h`): 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator
@@ -34,13 +38,14 @@ The consuming platform (e.g., ESPHome) supplies the listener implementations plu
 ## Project layout
 
 ```text
-include/sendspin/     - Public API headers (client.h, config.h, types.h, *_role.h)
+include/sendspin/     - Public API headers (client.h, config.h, types.h, persistence_keys.h, persistence_codec.h, *_role.h)
 src/                        - Cross-platform source files (.cpp) and private headers (.h)
+src/crypto/                 - Crypto primitives and Noise/pairing constants (CPace, pairing codes and tokens, PSK wrapping)
 src/platform/               - Platform abstraction headers and host-only source files
 src/esp/                    - ESP-IDF networking implementations and headers
 src/host/                   - Host (IXWebSocket) networking implementations and headers
 cmake/                      - CMake modules (sources.cmake, host.cmake)
-examples/common/            - Shared PortAudio audio sink used by host examples
+examples/common/            - Shared host-example helpers (PortAudio sink, file-backed persistence provider)
 examples/basic_client/      - Standalone host example with PortAudio audio output
 examples/tui_client/        - Terminal UI host example with PortAudio audio output
 tests/                      - Host unit tests (GoogleTest)
@@ -51,7 +56,7 @@ docs/                       - integration-guide.md (consumer guide), internals.m
 
 ### Header visibility
 
-- **Public** (`include/sendspin/`): `client.h`, `config.h`, `types.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`, `color_role.h`). These are the consumer-facing API. `config.h` contains all configuration structs (`SendspinClientConfig` and role configs). Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles.
+- **Public** (`include/sendspin/`): `client.h`, `config.h`, `types.h`, `persistence_keys.h`, `persistence_codec.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`, `color_role.h`). These are the consumer-facing API. `config.h` contains all configuration structs (`SendspinClientConfig` and role configs). Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles. `persistence_keys.h` holds the fixed storage keys and blob sizes `SendspinPersistenceProvider` is called with (`client.h` includes it). `persistence_codec.h` provides the binary, fixed-size storage codec the library itself uses to turn the pairing structs into the blobs it hands to `SendspinPersistenceProvider::save_blob()`; it is public so a custom provider or test can inspect/seed that same content.
 - **Private** (`src/`): All internal headers (decoder, sync_task, time_filter, ring buffers, protocol_messages, etc.). Not exposed to consumers. `protocol_messages.h` contains message envelope structs, internal protocol enums, and protocol function declarations.
 - **Platform-specific** (`src/esp/`, `src/host/`): Networking headers with the same names (`client_connection.h`, `server_connection.h`, `ws_server.h`) but different implementations per platform.
 
@@ -65,24 +70,25 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `time.h`: time utilities
 - `base64.h`: base64 encoding/decoding
 - `compiler.h`: compiler hints and platform-specific macros
+- `crypto.h`: SHA-256/SHA-512, HMAC-SHA-512, X25519, one-shot ChaChaPoly AEAD, CSPRNG, constant-time compare and secure zero
 - `json_arena.h`: bounded internal-RAM bump-arena ArduinoJson allocator with PSRAM fallback
 - `network_info.h`: best-effort lookup of the local network interface MAC address
 - `types.h`: platform type abstractions
 - `spsc_ring_buffer.h`: single-producer/single-consumer ring buffer (ESP: FreeRTOS `xRingbuffer`, host: mutex/condition variable)
 - `thread_safe_queue.h`: thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
 - `event_flags.h`: event flag group (ESP: FreeRTOS event group, host: mutex/condition variable)
-- `shadow_slot.h`: mutex-protected slot for publishing state between two non-main-loop threads (e.g. the sync task's playback-progress slot); main-loop-bound traffic goes through the inbox (`inbox.h`) instead
+- `shadow_slot.h`: mutex-protected single-writer/single-reader slot between two threads (e.g. the sync task's playback-progress slot, the connection's pending-pairing slot); state the main loop reads goes through the inbox (`inbox.h`) instead
 
 Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform differences are isolated to the platform layer and the `src/esp/`/`src/host/` directories.
 
 ## Build
 
 - **ESP-IDF**: Used as an IDF component via `idf_component.yml`. Sources defined in `cmake/sources.cmake`.
-- **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies via FetchContent: ArduinoJson, IXWebSocket, and, for the player role, micro-flac plus micro-opus when `SENDSPIN_ENABLE_OPUS` is on.
+- **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies via FetchContent: ArduinoJson, noise-c, IXWebSocket, and, for the player role, micro-flac plus micro-opus when `SENDSPIN_ENABLE_OPUS` is on.
 - **Tests**: `cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tests --target sendspin_tests` and `ctest --test-dir build-tests --output-on-failure`.
 - **ThreadSanitizer tests**: `cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tsan --target sendspin_tests` and `TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure`. `ENABLE_TSAN` applies the thread sanitizer to every target, including the fetched dependencies, and cannot be combined with `ENABLE_SANITIZERS`.
-- **ESP dependencies**: ArduinoJson, esp_websocket_client, micro-flac, micro-opus (with `SENDSPIN_ENABLE_OPUS`), esp_http_server, mbedtls, pthread, esp_ringbuf
-- **Host dependencies**: ArduinoJson, micro-flac, micro-opus (with `SENDSPIN_ENABLE_OPUS`), IXWebSocket, pthreads
+- **ESP dependencies**: ArduinoJson, noise-c, esp_websocket_client, micro-flac, micro-opus (with `SENDSPIN_ENABLE_OPUS`), esp_http_server, mbedtls, pthread, esp_ringbuf, esp_hw_support
+- **Host dependencies**: ArduinoJson, noise-c, micro-flac, micro-opus (with `SENDSPIN_ENABLE_OPUS`), IXWebSocket, pthreads
 
 ## Coding conventions
 

@@ -12,16 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "platform/base64.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "platform/secure_zero.h"
 #include "protocol_messages.h"
+#include "sendspin/color_role.h"
+#include "sendspin/config.h"
+#include "sendspin/controller_role.h"
+#include "sendspin/metadata_role.h"
+#include "sendspin/player_role.h"
+#include "sendspin/types.h"
+#include "sendspin/visualizer_role.h"
 #include <ArduinoJson.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace sendspin {
 
@@ -30,9 +43,6 @@ static const char* const TAG = "sendspin.protocol";
 // ============================================================================
 // Static helpers
 // ============================================================================
-
-/// @brief Protocol maximum for volume fields (volume is 0-100 on the wire).
-static constexpr uint8_t VOLUME_MAX = 100;
 
 /// @brief Reads an optional unsigned-integer field with strict type and optional range validation.
 /// Absent or null returns nullopt silently (a legal state for an optional field). A present value
@@ -208,53 +218,32 @@ static bool process_server_player_command_object(const JsonObject player_object,
         player_cmd->mute = v;
     }
 
-    if (auto v = read_uint_field<uint16_t>(player_object["static_delay_ms"], "static_delay_ms")) {
-        player_cmd->static_delay_ms = v;
+    if (auto v = read_uint_field<uint16_t>(player_object["output_delay_ms"], "output_delay_ms")) {
+        player_cmd->output_delay_ms = v;
     }
 
     return true;
 }
 
-// Parses a single string field into a tri-state delta entry. Absent on the wire leaves `out`
-// untouched; explicit `null` writes outer-engaged + inner-`nullopt` (clear); a string writes
-// outer-engaged + inner-engaged. A present value that is neither a string nor null is logged and
-// skipped (treated as absent).
+// Parses a single string field of a server/state metadata object. A field the object does not
+// carry, or carries with the wrong type (logged), leaves `out` without a value.
 static void parse_metadata_string_field(JsonVariantConst var, const char* name,
-                                        std::optional<std::optional<std::string>>* out) {
+                                        std::optional<std::string>* out) {
     if (var.is<const char*>()) {
         *out = var.as<std::string>();
-    } else if (var.isNull() && !var.isUnbound()) {
-        *out = std::optional<std::string>{};
-    } else if (!var.isUnbound()) {
-        SS_LOGW(TAG, "Ignoring field '%s': expected string or null", name);
+    } else if (!var.isUnbound() && !var.isNull()) {
+        SS_LOGW(TAG, "Ignoring field '%s': expected string", name);
     }
 }
 
-// Parses a single uint16 field into a tri-state delta entry. Same semantics as above; a present
-// value that is neither a uint16 (0-65535) nor null is logged and skipped.
-static void parse_metadata_uint16_field(JsonVariantConst var, const char* name,
-                                        std::optional<std::optional<uint16_t>>* out) {
-    if (var.is<uint16_t>()) {
-        *out = var.as<uint16_t>();
-    } else if (var.isNull() && !var.isUnbound()) {
-        *out = std::optional<uint16_t>{};
-    } else if (!var.isUnbound()) {
-        SS_LOGW(TAG, "Ignoring field '%s': expected integer in [0, 65535] or null", name);
-    }
-}
-
-// Parses a single `[R, G, B]` color field into a tri-state delta entry. Absent leaves `out`
-// untouched (outer nullopt); explicit `null` writes outer-engaged + inner-nullopt (clear); a
-// 3-element array of 0-255 integers writes the color. Any malformed value is logged and skipped
-// (treated as absent). Each component is read as a uint8, so its type check is also its range
-// check.
+// Parses a single `[R, G, B]` color field of a server/state color object. A field the object does
+// not carry, or carries malformed (logged), leaves `out` without a value. Each component is read
+// as a uint8, so its type check is also its range check.
 static void parse_color_field(JsonVariantConst var, const char* name,
-                              std::optional<std::optional<RgbColor>>* out) {
-    if (var.isUnbound()) {
-        return;
-    }
-    if (var.isNull()) {
-        *out = std::optional<RgbColor>{};
+                              std::optional<RgbColor>* out) {
+    // An explicit null is treated as an absent field rather than a wrong-typed one:
+    // roles/color/v1.md defines no null form to log against.
+    if (var.isUnbound() || var.isNull()) {
         return;
     }
     if (!var.is<JsonArrayConst>()) {
@@ -274,6 +263,10 @@ static void parse_color_field(JsonVariantConst var, const char* name,
         }
         color[i] = *component;
     }
+    // cppcheck-suppress autoVariables
+    // False positive: RgbColor is std::array<uint8_t, 3> (include/sendspin/color_role.h), a
+    // plain value type. This assigns *out by value through std::optional's assignment operator;
+    // it does not take the address of the local `color`.
     *out = color;
 }
 
@@ -284,34 +277,60 @@ static void parse_color_field(JsonVariantConst var, const char* name,
 // Message type determination
 
 SendspinServerToClientMessageType determine_message_type(JsonObject root) {
-    if (!root["type"].is<const char*>()) {
+    // Compared in place against the arena's NUL-terminated string: extracting an
+    // std::string here would heap-allocate for every type name longer than the SSO limit.
+    const char* type_str = root["type"].as<const char*>();
+    if (type_str == nullptr) {
         return SendspinServerToClientMessageType::UNKNOWN;
     }
 
-    const std::string type_str = root["type"].as<std::string>();
-    if (type_str == "server/hello") {
+    if (std::strcmp(type_str, "server/hello") == 0) {
         return SendspinServerToClientMessageType::SERVER_HELLO;
     }
-    if (type_str == "server/time") {
+    if (std::strcmp(type_str, "server/activate") == 0) {
+        return SendspinServerToClientMessageType::SERVER_ACTIVATE;
+    }
+    if (std::strcmp(type_str, "server/time") == 0) {
         return SendspinServerToClientMessageType::SERVER_TIME;
     }
-    if (type_str == "server/state") {
+    if (std::strcmp(type_str, "server/state") == 0) {
         return SendspinServerToClientMessageType::SERVER_STATE;
     }
-    if (type_str == "server/command") {
+    if (std::strcmp(type_str, "server/command") == 0) {
         return SendspinServerToClientMessageType::SERVER_COMMAND;
     }
-    if (type_str == "stream/start") {
+    if (std::strcmp(type_str, "stream/start") == 0) {
         return SendspinServerToClientMessageType::STREAM_START;
     }
-    if (type_str == "stream/end") {
+    if (std::strcmp(type_str, "stream/end") == 0) {
         return SendspinServerToClientMessageType::STREAM_END;
     }
-    if (type_str == "stream/clear") {
+    if (std::strcmp(type_str, "stream/clear") == 0) {
         return SendspinServerToClientMessageType::STREAM_CLEAR;
     }
-    if (type_str == "group/update") {
+    if (std::strcmp(type_str, "group/update") == 0) {
         return SendspinServerToClientMessageType::GROUP_UPDATE;
+    }
+    if (std::strcmp(type_str, "noise/handshake") == 0) {
+        return SendspinServerToClientMessageType::NOISE_HANDSHAKE;
+    }
+    if (std::strcmp(type_str, "server/pair-finalize") == 0) {
+        return SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE;
+    }
+    if (std::strcmp(type_str, "pair/abort") == 0) {
+        return SendspinServerToClientMessageType::PAIR_ABORT;
+    }
+    if (std::strcmp(type_str, "server/unpair") == 0) {
+        return SendspinServerToClientMessageType::SERVER_UNPAIR;
+    }
+    if (std::strcmp(type_str, "server/pair-init") == 0) {
+        return SendspinServerToClientMessageType::SERVER_PAIR_INIT;
+    }
+    if (std::strcmp(type_str, "server/pair-auth") == 0) {
+        return SendspinServerToClientMessageType::SERVER_PAIR_AUTH;
+    }
+    if (std::strcmp(type_str, "server/pair-confirm") == 0) {
+        return SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM;
     }
 
     return SendspinServerToClientMessageType::UNKNOWN;
@@ -320,42 +339,69 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
 // Message processing
 
 bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg) {
-    if (!root["payload"]["server_id"].is<JsonVariant>() ||
-        !root["payload"]["name"].is<JsonVariant>() ||
-        !root["payload"]["version"].is<JsonVariant>() ||
-        !root["payload"]["active_roles"].is<JsonVariant>() ||
-        !root["payload"]["connection_reason"].is<const char*>()) {
-        SS_LOGE(TAG, "Invalid server/hello message");
+    // Under the encrypted protocol, server/hello carries only the server name.
+    // server_id is taken from the Noise handshake result, not parsed here.
+    if (!root["payload"]["name"].is<const char*>()) {
+        SS_LOGE(TAG, "Invalid server/hello message: missing name");
         return false;
     }
 
     if (hello_msg != nullptr) {
-        hello_msg->server.server_id = root["payload"]["server_id"].as<std::string>();
-        hello_msg->server.name = root["payload"]["name"].as<std::string>();
-        auto version = read_uint_field<uint16_t>(root["payload"]["version"], "version");
-        if (!version.has_value()) {
-            SS_LOGE(TAG, "Invalid version in server/hello message");
-            return false;
-        }
-        hello_msg->version = *version;
+        hello_msg->name = root["payload"]["name"].as<std::string>();
+    }
 
-        // Parse active_roles array
-        hello_msg->active_roles.clear();
-        JsonArrayConst active_roles_array = root["payload"]["active_roles"].as<JsonArrayConst>();
-        for (JsonVariantConst role_var : active_roles_array) {
-            if (role_var.is<const char*>()) {
-                hello_msg->active_roles.push_back(role_var.as<std::string>());
+    return true;
+}
+
+bool process_server_activate_message(JsonObject root, ServerActivateMessage* activate_msg) {
+    if (!root["payload"]["activities"].is<JsonArrayConst>()) {
+        SS_LOGE(TAG, "Invalid server/activate message: missing activities array");
+        return false;
+    }
+
+    if (activate_msg == nullptr) {
+        return true;
+    }
+
+    activate_msg->activities.clear();
+    JsonArrayConst activities_array = root["payload"]["activities"].as<JsonArrayConst>();
+    for (JsonVariantConst act_var : activities_array) {
+        if (act_var.is<const char*>()) {
+            auto act = activity_from_string(act_var.as<std::string>());
+            if (act.has_value()) {
+                activate_msg->activities.push_back(act.value());
             }
         }
+    }
 
-        auto reason =
-            connection_reason_from_string(root["payload"]["connection_reason"].as<std::string>());
-        if (!reason.has_value()) {
-            SS_LOGE(TAG, "Invalid connection_reason in server/hello message: %s",
-                    root["payload"]["connection_reason"].as<const char*>());
-            return false;
+    // active_roles is optional and sticky (omitted = keep prior set).
+    JsonVariantConst roles_var = root["payload"]["active_roles"];
+    if (roles_var.is<JsonArrayConst>()) {
+        activate_msg->active_roles = std::vector<std::string>{};
+        for (JsonVariantConst role_var : roles_var.as<JsonArrayConst>()) {
+            if (role_var.is<const char*>()) {
+                activate_msg->active_roles->push_back(role_var.as<std::string>());
+            }
         }
-        hello_msg->connection_reason = reason.value();
+    } else {
+        activate_msg->active_roles = std::nullopt;
+    }
+
+    // pairing object: required when 'pairing' is in activities, ignored otherwise (the
+    // activities check lives in apply_server_activate, which nulls the method outside pairing).
+    activate_msg->pairing_method = std::nullopt;
+    activate_msg->pairing_format = std::nullopt;
+    JsonVariantConst pairing_var = root["payload"]["pairing"];
+    if (pairing_var.is<JsonObjectConst>()) {
+        activate_msg->pairing_method =
+            read_enum_field(pairing_var["method"], "pairing.method", pair_method_from_string);
+        activate_msg->pairing_format = read_enum_field(pairing_var["format"], "pairing.format",
+                                                       pairing_code_format_from_string);
+        // The server's `languages` (BCP 47 tags, descending operator preference) hints at what
+        // the operator understands (messaging.md "server/hello"). Its only use here would be
+        // spoken pairing-code emission (pairing.md "Digits emission"), which this library does
+        // not implement, so it is not parsed; a client adding speaker emission should read it
+        // from server/hello and match per RFC 4647 Lookup.
     }
 
     return true;
@@ -363,16 +409,20 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
 
 bool process_server_time_message(JsonObject root, int64_t timestamp, int64_t* offset,
                                  int64_t* max_error) {
-    if (!root["payload"]["client_transmitted"].is<JsonVariant>() ||
-        !root["payload"]["server_received"].is<JsonVariant>() ||
-        !root["payload"]["server_transmitted"].is<JsonVariant>()) {
-        SS_LOGE(TAG, "Invalid server/time message");
+    // messaging.md "server/time": all three timestamps are required integers (microsecond clock
+    // values, so wider than 32 bits).
+    const JsonVariantConst client_transmitted_var = root["payload"]["client_transmitted"];
+    const JsonVariantConst server_received_var = root["payload"]["server_received"];
+    const JsonVariantConst server_transmitted_var = root["payload"]["server_transmitted"];
+    if (!client_transmitted_var.is<int64_t>() || !server_received_var.is<int64_t>() ||
+        !server_transmitted_var.is<int64_t>()) {
+        SS_LOGE(TAG, "Invalid server/time message: missing or non-integer timestamp");
         return false;
     }
 
-    const int64_t client_transmitted = root["payload"]["client_transmitted"];
-    const int64_t server_received = root["payload"]["server_received"];
-    const int64_t server_transmitted = root["payload"]["server_transmitted"];
+    const int64_t client_transmitted = client_transmitted_var.as<int64_t>();
+    const int64_t server_received = server_received_var.as<int64_t>();
+    const int64_t server_transmitted = server_transmitted_var.as<int64_t>();
     const int64_t client_received = timestamp;
 
     if (offset != nullptr) {
@@ -397,28 +447,28 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
     // Parse optional playback_state
     JsonVariantConst playback_state_var = root["payload"]["playback_state"];
     if (!playback_state_var.isUnbound() && playback_state_var.isNull()) {
-        // Field set to null - clear from state
+        // Field set to null: clear from state
         group_msg->group.playback_state = std::nullopt;
     } else if (auto state = read_enum_field(playback_state_var, "playback_state",
                                             playback_state_from_string)) {
         group_msg->group.playback_state = state;
     }
 
-    // Parse optional group_id - use empty string to signal clearing
+    // Parse optional group_id; use empty string to signal clearing
     JsonVariantConst group_id_var = root["payload"]["group_id"];
     if (group_id_var.is<const char*>()) {
         group_msg->group.group_id = group_id_var.as<std::string>();
     } else if (!group_id_var.isUnbound() && group_id_var.isNull()) {
-        // Field set to null - use empty string to clear
+        // Field set to null: use empty string to clear
         group_msg->group.group_id = "";
     }
 
-    // Parse optional group_name - use empty string to signal clearing
+    // Parse optional group_name; use empty string to signal clearing
     JsonVariantConst group_name_var = root["payload"]["group_name"];
     if (group_name_var.is<const char*>()) {
         group_msg->group.group_name = group_name_var.as<std::string>();
     } else if (!group_name_var.isUnbound() && group_name_var.isNull()) {
-        // Field set to null - use empty string to clear
+        // Field set to null: use empty string to clear
         group_msg->group.group_name = "";
     }
 
@@ -467,31 +517,40 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
 // function that fills a caller-owned struct directly, so only one section's storage is live at a
 // time and nothing is materialized twice.
 
-bool process_server_state_metadata(JsonObject root, ServerMetadataStateDelta* metadata_delta) {
-    if (metadata_delta == nullptr || !root["payload"]["metadata"].is<JsonObject>()) {
+bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* metadata) {
+    if (metadata == nullptr || !root["payload"]["metadata"].is<JsonObject>()) {
         return false;
     }
     const JsonObject metadata_object = root["payload"]["metadata"];
 
-    // timestamp is required (not optional)
-    if (!metadata_object["timestamp"].is<JsonVariant>()) {
-        SS_LOGE(TAG, "Invalid metadata state object: missing timestamp");
+    // roles/metadata/v1.md "server/state metadata object": timestamp is a required integer.
+    const JsonVariantConst timestamp = metadata_object["timestamp"];
+    if (!timestamp.is<int64_t>()) {
+        SS_LOGE(TAG, "Invalid metadata state object: missing or non-integer timestamp");
         return false;
     }
-    metadata_delta->timestamp = metadata_object["timestamp"].as<int64_t>();
+    // messaging.md "server/state": every message carries the full state of each role object it
+    // includes, so an included metadata object is parsed into a fresh state rather than overlaid
+    // on what came before.
+    *metadata = ServerMetadataStateObject{};
+    metadata->timestamp = timestamp.as<int64_t>();
 
-    parse_metadata_string_field(metadata_object["title"], "title", &metadata_delta->title);
-    parse_metadata_string_field(metadata_object["artist"], "artist", &metadata_delta->artist);
+    parse_metadata_string_field(metadata_object["title"], "title", &metadata->title);
+    parse_metadata_string_field(metadata_object["artist"], "artist", &metadata->artist);
     parse_metadata_string_field(metadata_object["album_artist"], "album_artist",
-                                &metadata_delta->album_artist);
-    parse_metadata_string_field(metadata_object["album"], "album", &metadata_delta->album);
+                                &metadata->album_artist);
+    parse_metadata_string_field(metadata_object["album"], "album", &metadata->album);
     parse_metadata_string_field(metadata_object["artwork_url"], "artwork_url",
-                                &metadata_delta->artwork_url);
-    parse_metadata_uint16_field(metadata_object["year"], "year", &metadata_delta->year);
-    parse_metadata_uint16_field(metadata_object["track"], "track", &metadata_delta->track);
+                                &metadata->artwork_url);
+    if (auto v = read_uint_field<uint16_t>(metadata_object["year"], "year")) {
+        metadata->year = v;
+    }
+    if (auto v = read_uint_field<uint16_t>(metadata_object["track"], "track")) {
+        metadata->track = v;
+    }
 
-    // Parse progress object - present object engages inner; explicit null clears; absent leaves
-    // outer nullopt.
+    // roles/metadata/v1.md "server/state metadata object": omitting progress clears the client's
+    // position, which the full-state reset above already did.
     if (metadata_object["progress"].is<JsonObject>()) {
         JsonObject progress_object = metadata_object["progress"];
         MetadataProgressObject progress{};
@@ -507,34 +566,36 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateDelta* me
                 read_uint_field<uint32_t>(progress_object["playback_speed"], "playback_speed")) {
             progress.playback_speed = *v;
         }
-        metadata_delta->progress = progress;
-    } else if (!metadata_object["progress"].isUnbound() && metadata_object["progress"].isNull()) {
-        metadata_delta->progress = std::optional<MetadataProgressObject>{};
+        metadata->progress = progress;
     }
 
     return true;
 }
 
-bool process_server_state_color(JsonObject root, ServerColorStateDelta* color_delta) {
-    if (color_delta == nullptr || !root["payload"]["color"].is<JsonObject>()) {
+bool process_server_state_color(JsonObject root, ServerColorStateObject* color) {
+    if (color == nullptr || !root["payload"]["color"].is<JsonObject>()) {
         return false;
     }
     const JsonObject color_object = root["payload"]["color"];
 
-    if (!color_object["timestamp"].is<JsonVariant>()) {
-        SS_LOGE(TAG, "Invalid color state object: missing timestamp");
+    // roles/color/v1.md "server/state color object": timestamp is a required integer.
+    const JsonVariantConst timestamp = color_object["timestamp"];
+    if (!timestamp.is<int64_t>()) {
+        SS_LOGE(TAG, "Invalid color state object: missing or non-integer timestamp");
         return false;
     }
-    color_delta->timestamp = color_object["timestamp"].as<int64_t>();
+    // messaging.md "server/state": an included color object carries the full palette, so it is
+    // parsed into a fresh state.
+    *color = ServerColorStateObject{};
+    color->timestamp = timestamp.as<int64_t>();
 
-    parse_color_field(color_object["background_dark"], "background_dark",
-                      &color_delta->background_dark);
+    parse_color_field(color_object["background_dark"], "background_dark", &color->background_dark);
     parse_color_field(color_object["background_light"], "background_light",
-                      &color_delta->background_light);
-    parse_color_field(color_object["primary"], "primary", &color_delta->primary);
-    parse_color_field(color_object["accent"], "accent", &color_delta->accent);
-    parse_color_field(color_object["on_dark"], "on_dark", &color_delta->on_dark);
-    parse_color_field(color_object["on_light"], "on_light", &color_delta->on_light);
+                      &color->background_light);
+    parse_color_field(color_object["primary"], "primary", &color->primary);
+    parse_color_field(color_object["accent"], "accent", &color->accent);
+    parse_color_field(color_object["on_dark"], "on_dark", &color->on_dark);
+    parse_color_field(color_object["on_light"], "on_light", &color->on_light);
 
     return true;
 }
@@ -545,6 +606,11 @@ bool process_server_state_controller(JsonObject root,
         return false;
     }
     const JsonObject controller_object = root["payload"]["controller"];
+
+    // messaging.md "server/state": every message carries the full state of each role object it
+    // includes, so an included controller object is parsed into a fresh state rather than
+    // overlaid on what came before (matching the metadata and color parsers).
+    *controller_state = ServerStateControllerObject{};
 
     // Parse supported_commands array. The controller role is frozen at v1, so an unrecognized
     // command is a non-compliant value rather than a forward-compatible one: drop and log it.
@@ -733,90 +799,14 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
     return true;
 }
 
-void apply_metadata_state_deltas(ServerMetadataStateObject* current,
-                                 const ServerMetadataStateDelta& delta) {
-    if (current == nullptr) {
-        return;
-    }
-
-    current->timestamp = delta.timestamp;
-
-    // For each field, an outer-engaged delta entry overwrites the merged optional with the inner
-    // optional verbatim, so an inner-`nullopt` (explicit `null` on the wire) clears the merged
-    // field.
-    if (delta.title.has_value()) {
-        current->title = *delta.title;
-    }
-    if (delta.artist.has_value()) {
-        current->artist = *delta.artist;
-    }
-    if (delta.album_artist.has_value()) {
-        current->album_artist = *delta.album_artist;
-    }
-    if (delta.album.has_value()) {
-        current->album = *delta.album;
-    }
-    if (delta.artwork_url.has_value()) {
-        current->artwork_url = *delta.artwork_url;
-    }
-    if (delta.year.has_value()) {
-        current->year = *delta.year;
-    }
-    if (delta.track.has_value()) {
-        current->track = *delta.track;
-    }
-    if (delta.progress.has_value()) {
-        current->progress = *delta.progress;
-    }
-}
-
-void apply_color_state_deltas(ServerColorStateObject* current, const ServerColorStateDelta& delta) {
-    if (current == nullptr) {
-        return;
-    }
-
-    current->timestamp = delta.timestamp;
-
-    // For each field, an outer-engaged delta entry overwrites the merged optional with the inner
-    // optional verbatim, so an inner-`nullopt` (explicit `null` on the wire) clears the merged
-    // field.
-    if (delta.background_dark.has_value()) {
-        current->background_dark = *delta.background_dark;
-    }
-    if (delta.background_light.has_value()) {
-        current->background_light = *delta.background_light;
-    }
-    if (delta.primary.has_value()) {
-        current->primary = *delta.primary;
-    }
-    if (delta.accent.has_value()) {
-        current->accent = *delta.accent;
-    }
-    if (delta.on_dark.has_value()) {
-        current->on_dark = *delta.on_dark;
-    }
-    if (delta.on_light.has_value()) {
-        current->on_light = *delta.on_light;
-    }
-}
-
 // Message formatting
-
-// Writes a spectrum config as the "spectrum" key of a visualizer JSON object. Shared between
-// client/hello and stream/request-format so the two serializations cannot silently diverge.
-static void write_visualizer_spectrum(JsonObject vis_json, const VisualizerSpectrumConfig& spec) {
-    vis_json["spectrum"]["n_disp_bins"] = spec.n_disp_bins;
-    vis_json["spectrum"]["scale"] = to_cstr(spec.scale);
-    vis_json["spectrum"]["f_min"] = spec.f_min;
-    vis_json["spectrum"]["f_max"] = spec.f_max;
-}
 
 std::string format_client_hello_message(const ClientHelloMessage* msg) {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/hello";
-    root["payload"]["client_id"] = msg->client_id;
+    // Under encryption: client_id and version are carried in client/init, not repeated here.
     root["payload"]["name"] = msg->name;
     if (msg->device_info.has_value()) {
         const auto& info = msg->device_info.value();
@@ -833,7 +823,38 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             root["payload"]["device_info"]["mac_address"] = info.mac_address.value();
         }
     }
-    root["payload"]["version"] = msg->version;
+    // pairing.md "client/hello pair-method descriptor": supported_pair_methods is an object keyed
+    // by pairing method identifier, each value the method's descriptor. It is REQUIRED (every
+    // client implements at least pairing_psk, messaging.md "client/hello"), so the object is
+    // emitted even for an empty list.
+    {
+        JsonObject methods_obj = root["payload"]["supported_pair_methods"].to<JsonObject>();
+        for (const auto& desc : msg->supported_pair_methods) {
+            JsonObject method_obj = methods_obj[to_cstr(desc.method)].to<JsonObject>();
+            const auto& out_channels = desc.out_channels;
+            if (out_channels.has_value() && !out_channels->empty()) {
+                JsonArray ch_arr = method_obj["out_channels"].to<JsonArray>();
+                for (const auto& ch : out_channels.value()) {
+                    ch_arr.add(to_cstr(ch));
+                }
+            }
+            const auto& formats = desc.formats;
+            if (formats.has_value() && !formats->empty()) {
+                JsonArray fmt_arr = method_obj["formats"].to<JsonArray>();
+                for (const auto& fmt : formats.value()) {
+                    fmt_arr.add(to_cstr(fmt));
+                }
+            }
+            const auto& locations = desc.locations;
+            if (locations.has_value() && !locations->empty()) {
+                JsonArray loc_arr = method_obj["locations"].to<JsonArray>();
+                for (const auto& loc : locations.value()) {
+                    loc_arr.add(loc.c_str());
+                }
+            }
+        }
+    }
+    root["payload"]["unpaired_access"]["enabled"] = msg->unpaired_access_enabled;
     JsonArray supported_roles_list = root["payload"]["supported_roles"].to<JsonArray>();
     for (const auto& role : msg->supported_roles) {
         supported_roles_list.add(to_cstr(role));
@@ -851,36 +872,14 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         }
         root["payload"]["player@v1_support"]["buffer_capacity"] =
             msg->player_v1_support.value().buffer_capacity;
-        JsonArray commands_list =
-            root["payload"]["player@v1_support"]["supported_commands"].to<JsonArray>();
-        for (const auto& cmd : msg->player_v1_support.value().supported_commands) {
-            commands_list.add(to_cstr(cmd));
-        }
-    }
-
-    if (msg->artwork_v1_support.has_value()) {
-        JsonArray channels_list = root["payload"]["artwork@v1_support"]["channels"].to<JsonArray>();
-        for (const auto& channel : msg->artwork_v1_support.value().channels) {
-            JsonObject channel_obj = channels_list.add<JsonObject>();
-            channel_obj["source"] = to_cstr(channel.source);
-            channel_obj["format"] = to_cstr(channel.format);
-            channel_obj["media_width"] = channel.media_width;
-            channel_obj["media_height"] = channel.media_height;
-        }
     }
 
     if (msg->visualizer_support.has_value()) {
-        const auto& vis = msg->visualizer_support.value();
-        JsonObject vis_json = root["payload"]["visualizer@v1_support"].to<JsonObject>();
-        JsonArray types_list = vis_json["types"].to<JsonArray>();
-        for (const auto& type : vis.types) {
-            types_list.add(to_cstr(type));
-        }
-        vis_json["buffer_capacity"] = vis.buffer_capacity;
-        vis_json["rate_max"] = vis.rate_max;
-        if (vis.spectrum.has_value()) {
-            write_visualizer_spectrum(vis_json, vis.spectrum.value());
-        }
+        // roles/visualizer/v1.md "client/hello visualizer@v1 support object": buffer_capacity is
+        // the object's only field; the data types, frame-rate cap and spectrum configuration are
+        // dynamic and reported in the client/state visualizer object.
+        root["payload"]["visualizer@v1_support"]["buffer_capacity"] =
+            msg->visualizer_support.value().buffer_capacity;
     }
 
     std::string output;
@@ -893,19 +892,55 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/state";
-    root["payload"]["state"] = to_cstr(msg->state);
+    // messaging.md "External Source Handling": false means the client will not yield to Sendspin.
+    root["payload"]["available"] = msg->available;
 
     if (msg->player.has_value()) {
         const ClientPlayerStateObject& player_state = msg->player.value();
         root["payload"]["player"]["volume"] = player_state.volume;
         root["payload"]["player"]["muted"] = player_state.muted;
-        root["payload"]["player"]["static_delay_ms"] = player_state.static_delay_ms;
-        if (!player_state.supported_commands.empty()) {
-            JsonArray commands_list =
-                root["payload"]["player"]["supported_commands"].to<JsonArray>();
-            for (const auto& cmd : player_state.supported_commands) {
-                commands_list.add(to_cstr(cmd));
+        root["payload"]["player"]["output_delay_ms"] = player_state.output_delay_ms;
+        root["payload"]["player"]["required_lead_time_ms"] = player_state.required_lead_time_ms;
+        root["payload"]["player"]["min_buffer_ms"] = player_state.min_buffer_ms;
+        // roles/player/v1.md "client/state player object": supported_commands is a required key
+        // that is empty when the player accepts no commands, so the array is emitted even then.
+        JsonArray commands_list = root["payload"]["player"]["supported_commands"].to<JsonArray>();
+        for (const auto& cmd : player_state.supported_commands) {
+            commands_list.add(to_cstr(cmd));
+        }
+    }
+
+    if (msg->artwork.has_value()) {
+        JsonArray channels_list = root["payload"]["artwork"]["channels"].to<JsonArray>();
+        for (const auto& channel : msg->artwork.value().channels) {
+            JsonObject channel_obj = channels_list.add<JsonObject>();
+            channel_obj["source"] = to_cstr(channel.source);
+            // roles/artwork/v1.md "client/state artwork object": format, width and height are
+            // required unless the channel's source is 'none'.
+            if (channel.source != SendspinImageSource::NONE) {
+                channel_obj["format"] = to_cstr(channel.format);
+                channel_obj["width"] = channel.width;
+                channel_obj["height"] = channel.height;
             }
+        }
+    }
+
+    if (msg->visualizer.has_value()) {
+        const auto& vis = msg->visualizer.value();
+        JsonObject vis_json = root["payload"]["visualizer"].to<JsonObject>();
+        // roles/visualizer/v1.md "client/state visualizer object": types and rate_max are always
+        // present (types may be empty to request no data), spectrum only with that type.
+        JsonArray types_list = vis_json["types"].to<JsonArray>();
+        for (const auto& type : vis.types) {
+            types_list.add(to_cstr(type));
+        }
+        vis_json["rate_max"] = vis.rate_max;
+        if (vis.spectrum.has_value()) {
+            const VisualizerSpectrumConfig& spec = vis.spectrum.value();
+            vis_json["spectrum"]["n_disp_bins"] = spec.n_disp_bins;
+            vis_json["spectrum"]["scale"] = to_cstr(spec.scale);
+            vis_json["spectrum"]["f_min"] = spec.f_min;
+            vis_json["spectrum"]["f_max"] = spec.f_max;
         }
     }
 
@@ -914,68 +949,14 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
     return output;
 }
 
-std::string format_stream_request_format_message(const StreamRequestFormatMessage* msg) {
-    (void)msg;
-
+std::string format_client_leave_message() {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
 
-    root["type"] = "stream/request-format";
-
-    if (msg->player.has_value()) {
-        const auto& player = msg->player.value();
-        if (player.codec.has_value()) {
-            root["payload"]["player"]["codec"] = to_cstr(player.codec.value());
-        }
-        if (player.sample_rate.has_value()) {
-            root["payload"]["player"]["sample_rate"] = player.sample_rate.value();
-        }
-        if (player.channels.has_value()) {
-            root["payload"]["player"]["channels"] = player.channels.value();
-        }
-        if (player.bit_depth.has_value()) {
-            root["payload"]["player"]["bit_depth"] = player.bit_depth.value();
-        }
-    }
-
-    if (msg->artwork.has_value()) {
-        const auto& artwork = msg->artwork.value();
-        root["payload"]["artwork"]["channel"] = artwork.channel;
-        if (artwork.source.has_value()) {
-            root["payload"]["artwork"]["source"] = to_cstr(artwork.source.value());
-        }
-        if (artwork.format.has_value()) {
-            root["payload"]["artwork"]["format"] = to_cstr(artwork.format.value());
-        }
-        if (artwork.media_width.has_value()) {
-            root["payload"]["artwork"]["media_width"] = artwork.media_width.value();
-        }
-        if (artwork.media_height.has_value()) {
-            root["payload"]["artwork"]["media_height"] = artwork.media_height.value();
-        }
-    }
-
-    if (msg->visualizer.has_value()) {
-        const auto& vis = msg->visualizer.value();
-        // Only create the "visualizer" key when at least one field is set: an all-empty request
-        // must emit no key at all, since a present-but-empty object could read as "reset to
-        // defaults" rather than "no change" on the server.
-        if (vis.types.has_value() || vis.rate_max.has_value() || vis.spectrum.has_value()) {
-            JsonObject vis_json = root["payload"]["visualizer"].to<JsonObject>();
-            if (vis.types.has_value()) {
-                JsonArray types_list = vis_json["types"].to<JsonArray>();
-                for (const auto& type : vis.types.value()) {
-                    types_list.add(to_cstr(type));
-                }
-            }
-            if (vis.rate_max.has_value()) {
-                vis_json["rate_max"] = vis.rate_max.value();
-            }
-            if (vis.spectrum.has_value()) {
-                write_visualizer_spectrum(vis_json, vis.spectrum.value());
-            }
-        }
-    }
+    root["type"] = "client/leave";
+    // messaging.md "client/leave": no payload fields, but the envelope carries a payload object
+    // like every other message.
+    root["payload"].to<JsonObject>();
 
     std::string output;
     serializeJson(doc, output);
@@ -1129,6 +1110,250 @@ std::string format_client_command_message(const ClientCommandControllerObject& c
     if (cmd.command == SendspinControllerCommand::SEEK_RELATIVE && cmd.offset_ms.has_value()) {
         controller["offset_ms"] = cmd.offset_ms.value();
     }
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+// ============================================================================
+// Pairing-PSK protocol messages
+// ============================================================================
+
+std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk) {
+    // Zeroizing document: the JSON pool holds the base64 long-term PSK, which admits a server
+    // permanently. The caller wipes the returned string once it has been sent (see
+    // handle_enter_pairing_psk()); everything staged on the way there is wiped here.
+    JsonDocument doc = make_zeroizing_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-finalize";
+    // Encode the 32-byte PSK as 43-char base64url (no padding).
+    std::string psk_b64 = b64url_encode(psk.data(), psk.size());
+    root["payload"]["long_term_psk"] = psk_b64;
+    secure_zero(psk_b64.data(), psk_b64.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_finalize_wrapped_message(
+    const std::array<uint8_t, 48>& wrapped_psk) {
+    // Zeroizing document to match format_client_pair_finalize_message(); see the note there.
+    JsonDocument doc = make_zeroizing_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-finalize";
+    // Pairing-code flows only (pairing.md "Wrapping"); exactly one of long_term_psk/wrapped_psk
+    // is present per message.
+    std::string wrapped_b64 = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
+    root["payload"]["wrapped_psk"] = wrapped_b64;
+    secure_zero(wrapped_b64.data(), wrapped_b64.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_pair_abort_message(PairAbortReason reason) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "pair/abort";
+    root["payload"]["reason"] = to_cstr(reason);
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
+    if (!root["payload"]["reason"].is<const char*>()) {
+        SS_LOGE(TAG, "Invalid pair/abort message: missing reason");
+        return false;
+    }
+
+    if (abort_msg == nullptr) {
+        return true;
+    }
+
+    const std::string reason_str = root["payload"]["reason"].as<std::string>();
+    auto reason = pair_abort_reason_from_string(reason_str);
+    if (!reason.has_value()) {
+        SS_LOGW(TAG, "pair/abort: unrecognized reason '%s'", reason_str.c_str());
+        return false;
+    }
+
+    abort_msg->reason = reason.value();
+    return true;
+}
+
+// ============================================================================
+// Pairing-code protocol functions
+// ============================================================================
+
+bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* payload) {
+    // nonce_A (base64url, 43 chars -> 32 bytes) is present in the attempt's first round only, so
+    // an absent field parses to an absent value; the state machine decides whether that is right
+    // for the round it is in (pairing.md "Rounds").
+    JsonVariantConst nonce_var = root["payload"]["nonce_A"];
+    if (nonce_var.isUnbound() || nonce_var.isNull()) {
+        if (payload != nullptr) {
+            payload->nonce_a = std::nullopt;
+        }
+        return true;
+    }
+    if (!nonce_var.is<const char*>()) {
+        SS_LOGE(TAG, "server/pair-init: nonce_A is not a string");
+        return false;
+    }
+    auto decoded = b64url_decode(nonce_var.as<std::string>());
+    if (!decoded.has_value() || decoded->size() != 32) {
+        SS_LOGE(TAG, "server/pair-init: nonce_A is not 32 base64url-encoded bytes");
+        return false;
+    }
+    if (payload == nullptr) {
+        return true;
+    }
+    std::array<uint8_t, 32> nonce_a{};
+    std::memcpy(nonce_a.data(), decoded->data(), nonce_a.size());
+    payload->nonce_a = nonce_a;
+    return true;
+}
+
+bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* payload) {
+    if (!root["payload"]["pake_msg_1"].is<const char*>()) {
+        SS_LOGE(TAG, "server/pair-auth: missing pake_msg_1");
+        return false;
+    }
+
+    if (payload == nullptr) {
+        return true;
+    }
+
+    const std::string msg1_b64 = root["payload"]["pake_msg_1"].as<std::string>();
+    auto msg1_bytes = b64url_decode(msg1_b64);
+    if (!msg1_bytes.has_value() || msg1_bytes->size() != 32) {
+        SS_LOGE(TAG, "server/pair-auth: pake_msg_1 is not 32 bytes");
+        return false;
+    }
+    std::memcpy(payload->pake_msg_1.data(), msg1_bytes->data(), 32);
+    return true;
+}
+
+bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload) {
+    if (!root["payload"]["server_kc"].is<const char*>()) {
+        SS_LOGE(TAG, "server/pair-confirm: missing server_kc");
+        return false;
+    }
+
+    if (payload == nullptr) {
+        return true;
+    }
+
+    const std::string kc_b64 = root["payload"]["server_kc"].as<std::string>();
+    auto kc_bytes = b64url_decode(kc_b64);
+    if (!kc_bytes.has_value() || kc_bytes->size() != 64) {
+        SS_LOGE(TAG, "server/pair-confirm: server_kc is not 64 bytes");
+        return false;
+    }
+    std::memcpy(payload->server_kc.data(), kc_bytes->data(), 64);
+    return true;
+}
+
+std::string format_client_pair_pending_message(uint32_t pairing_index) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-pending";
+    root["payload"]["pairing_index"] = pairing_index;
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
+                                            uint32_t pairing_index) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-init";
+    root["payload"]["commit_B"] = b64url_encode(commit_b.data(), commit_b.size());
+    root["payload"]["pairing_index"] = pairing_index;
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_init_message(uint32_t pairing_index) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-init";
+    // commit_B belongs to the dynamic pairing code flow only; pairing_index is required on
+    // every client/pair-init (pairing.md "client/pair-init").
+    root["payload"]["pairing_index"] = pairing_index;
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_retry_message() {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-retry";
+    // Empty payload, emitted explicitly so the message carries the object every other pairing
+    // message does (pairing.md "Client -> Server: client/pair-retry").
+    root["payload"].to<JsonObject>();
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-auth";
+    root["payload"]["pake_msg_2"] = b64url_encode(pake_msg_2.data(), pake_msg_2.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_confirm_message(
+    const std::array<uint8_t, 64>& client_kc,
+    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-confirm";
+    root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
+    // The commitment opening crosses the wire sealed under the CPace output, never in the clear
+    // (pairing.md "Wrapping"): an observer that cannot complete the PAKE cannot reconstruct the
+    // pairing code from the handshake it watched.
+    root["payload"]["wrapped_nonce_B"] =
+        b64url_encode(wrapped_nonce_b.data(), wrapped_nonce_b.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-confirm";
+    // The static flow sends no commit_B, so it has no opening to wrap.
+    root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
 
     std::string output;
     serializeJson(doc, output);

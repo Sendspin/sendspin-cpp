@@ -18,44 +18,46 @@
 #pragma once
 
 #include "connection.h"
+#include "fixed_block_pool.h"
+#include "platform/types.h"
+#include "sendspin/types.h"
+#include <esp_err.h>
 #include <esp_http_server.h>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <string>
 
 namespace sendspin {
 
+/// @brief Bytes per outbound-send block: an AsyncRespArg header followed by the frame payload
+///
+/// Sized for the steady-state sends: an encrypted client/time (at most 93 B of payload), an
+/// encrypted player-only client/state (about 235 B), and controller commands. A client/state
+/// carrying artwork and visualizer config (about 600 B) takes a heap block; it is sent only on a
+/// state change.
+static constexpr size_t SEND_BLOCK_SIZE = 320;
+
+/// @brief Outbound-send blocks per server: the one or two sends normally in flight, plus a burst
+/// such as a state change during a time burst
+static constexpr size_t SEND_BLOCK_COUNT = 4;
+
+/// @brief Pool the ESP server's queued sends take their blocks from
+using SendBlockPool = FixedBlockPool<SEND_BLOCK_SIZE, SEND_BLOCK_COUNT>;
+
 /**
- * @brief ESP-IDF HTTP server WebSocket connection representing a single Sendspin server session
+ * @brief ESP-IDF httpd WebSocket connection representing a single Sendspin server session
  *
- * Implements the SendspinConnection interface for the server role, where the ESP device
- * hosts an HTTP server and the Sendspin server connects to it as a WebSocket client.
- *
- * Manages:
- * - The socket file descriptor for the accepted connection
- * - Sending text messages (hello, state, time, goodbye, commands)
- * - The httpd handle reference (owned by SendspinWsServer)
- *
- * Usage:
- * 1. Created by SendspinWsServer when a new connection is accepted
- * 2. start() is called to begin message processing
- * 3. loop() is called periodically to handle time synchronization
- * 4. disconnect() is called to gracefully close with goodbye message
- *
- * @code
- * // Typical usage via SendspinWsServer (not constructed directly):
- * SendspinWsServer ws_server;
- * ws_server.start(port);
- * // SendspinWsServer creates SendspinServerConnection instances internally
- * // when incoming WebSocket connections are accepted.
- * @endcode
+ * Implements SendspinConnection for the server role, where the ESP device hosts the HTTP server
+ * and the Sendspin server connects to it as a WebSocket client. Instances are created by
+ * SendspinWsServer, never directly; the httpd session owns them (see ws_server.h).
  */
 class SendspinServerConnection : public SendspinConnection {
 public:
-    /// @brief Constructs a server connection with the given httpd handle and socket
-    /// @param server The httpd handle (owned by the server listener).
-    /// @param sockfd The socket file descriptor for this connection.
-    SendspinServerConnection(httpd_handle_t server, int sockfd);
+    /// @brief Constructs a server connection over an accepted httpd session
+    SendspinServerConnection(httpd_handle_t server, int sockfd, SendBlockPool& send_pool);
 
     ~SendspinServerConnection() override = default;
 
@@ -69,21 +71,17 @@ public:
     /// @brief Periodic loop processing (handles time message sending)
     void loop() override;
 
-    /// @brief Gracefully disconnects by sending a goodbye message, then closing
-    ///
-    /// This is the high-level API for disconnection. It:
-    /// 1. Sends a goodbye message with the specified reason
-    /// 2. Calls trigger_close() after the message is sent (via async completion callback)
-    /// 3. Invokes on_complete callback (if provided) after goodbye send completes
-    ///
-    /// @param reason The reason for disconnecting (sent in goodbye message).
-    /// @param on_complete Optional callback invoked after goodbye send completes (or fails).
-    ///                    Invoked from httpd worker thread - use defer() if main loop context is
-    ///                    needed.
+    /// @brief Sends a goodbye carrying @p reason, then calls trigger_close() from the send's
+    /// async completion callback.
+    /// @param on_complete Optional; invoked after the goodbye send completes or fails, on the
+    ///                    httpd worker thread. Use defer() if main-loop context is needed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
-    /// @brief Checks if the socket connection is valid
-    /// @return true if connected, false otherwise.
+    /// @brief Closes the transport immediately without blocking (see base class doc comment).
+    /// Delegates to trigger_close(), the same async primitive disconnect() already uses.
+    void close_transport_now() override;
+
+    /// @brief Whether the socket connection is valid
     bool is_connected() const override;
 
     /// @brief Marks the connection closed after the httpd session ends
@@ -97,9 +95,6 @@ public:
     }
 
     /// @brief Sends a text message to the server with a completion callback
-    /// @param message The message string to send.
-    /// @param on_complete Callback invoked after send completes.
-    /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
                             bool allow_before_hello) override;
 
@@ -111,10 +106,16 @@ public:
     /// @return true if the worker job was queued successfully, false otherwise.
     bool send_time_message() override;
 
+    /// @brief Sends a binary WebSocket frame to the connected client (async, via httpd worker)
+    /// @param on_complete Optional completion callback (best-effort; may be skipped on teardown).
+    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
+                              bool allow_before_hello) override;
+
     /// @brief Triggers the underlying socket to close
     ///
     /// This is a low-level method that directly triggers the httpd session to close.
-    /// It does NOT send a goodbye message first.
+    /// It does not send a goodbye message first.
     ///
     /// Relationship with disconnect():
     /// - disconnect() is the high-level API that sends a goodbye message, then calls
@@ -138,9 +139,23 @@ public:
     esp_err_t handle_data(httpd_req_t* req, int64_t receive_time);
 
 protected:
-    /// @brief httpd_queue_work callback that sends a queued text frame over the WebSocket
-    /// @param arg Pointer to the AsyncRespArg context allocated by send_text_message().
-    static void async_send_text(void* arg);
+    /// @brief Places an AsyncRespArg and a copy of the payload in one block (see AsyncRespArg) and
+    /// queues it on the httpd worker to be sent as a text or binary frame by async_send_frame()
+    ///
+    /// Shared by send_text_message() and send_binary_message(); `type` selects the WebSocket
+    /// frame type and which of their (identical apart from wording) log messages is used.
+    /// @param data              Payload bytes to copy and send.
+    /// @param len               Number of bytes in `data`.
+    /// @param type              HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY.
+    /// @param on_complete       Completion callback, if any.
+    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
+    SsErr queue_async_send(const uint8_t* data, size_t len, httpd_ws_type_t type,
+                           SendCompleteCallback on_complete, bool allow_before_hello);
+
+    /// @brief httpd_queue_work callback that sends a queued text or binary frame over the
+    /// WebSocket
+    /// @param arg Pointer to the AsyncRespArg context allocated by queue_async_send().
+    static void async_send_frame(void* arg);
 
     /// @brief httpd_queue_work callback that builds and sends a client/time frame
     ///
@@ -156,6 +171,9 @@ protected:
 
     /// @brief The httpd server handle (owned by SendspinWsServer)
     httpd_handle_t server_;
+
+    /// @brief Blocks for queued sends (owned by SendspinWsServer)
+    SendBlockPool* send_pool_;
 
     // 32-bit fields
 

@@ -16,9 +16,13 @@
 
 #include "platform/logging.h"
 #include "platform/time.h"
+#include "platform/types.h"
 #include "protocol_messages.h"
+#include "sendspin/types.h"
 
 #include <algorithm>
+#include <string>
+#include <utility>
 
 namespace sendspin {
 
@@ -59,6 +63,16 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
     });
 }
 
+void SendspinServerConnection::close_transport_now() {
+    // trigger_close() -> ws_->close() is already async/non-blocking (the same primitive
+    // disconnect() uses in its completion callback), so it is safe to call directly from the
+    // network thread here. on_disconnected_cb is intentionally not fired here: for inbound
+    // connections it is wired as a no-op (ConnectionManager::on_new_connection(); cleanup
+    // happens via the ws_server's own close notification instead), so the resulting Close event
+    // is what reports the loss.
+    this->trigger_close();
+}
+
 bool SendspinServerConnection::is_connected() const {
     return this->ws_ && this->ws_->getReadyState() == ix::ReadyState::Open;
 }
@@ -66,6 +80,18 @@ bool SendspinServerConnection::is_connected() const {
 SsErr SendspinServerConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback on_complete,
                                                   bool /*allow_before_hello*/) {
+    return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
+                               message.size(), on_complete);
+}
+
+SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
+                                                    SendCompleteCallback on_complete,
+                                                    bool /*allow_before_hello*/) {
+    return this->send_ws_frame(true, data, len, on_complete);
+}
+
+SsErr SendspinServerConnection::send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
+                                              const SendCompleteCallback& on_complete) {
     if (!this->is_connected()) {
         if (on_complete) {
             on_complete(false);
@@ -73,14 +99,24 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
         return SsErr::INVALID_STATE;
     }
 
-    auto info = this->ws_->send(message);
+    std::string buf(reinterpret_cast<const char*>(data), len);
+    auto info = is_binary ? this->ws_->sendBinary(buf) : this->ws_->send(buf);
     bool success = info.success;
 
     if (on_complete) {
         on_complete(success);
     }
 
-    return success ? SsErr::OK : SsErr::FAIL;
+    if (!success) {
+        if (is_binary) {
+            SS_LOGE(TAG, "Failed to send binary message");
+        } else {
+            SS_LOGE(TAG, "Failed to send text message");
+        }
+        return SsErr::FAIL;
+    }
+
+    return SsErr::OK;
 }
 
 bool SendspinServerConnection::send_time_message() {
@@ -95,7 +131,9 @@ bool SendspinServerConnection::send_time_message() {
         return false;
     }
     this->update_serialize_ema(platform_time_us() - client_transmitted);
-    return this->ws_->send(std::string(buf, len)).success;
+    // Route through send_app_json so the frame is encrypted when Noise is active;
+    // the pointer/length overload encrypts straight from the stack buffer.
+    return this->send_app_json(buf, len, nullptr) == SsErr::OK;
 }
 
 void SendspinServerConnection::trigger_close() {
@@ -110,7 +148,9 @@ void SendspinServerConnection::handle_message(const std::string& data, bool is_b
         uint8_t* dest = this->prepare_receive_buffer(data.size());
         if (dest == nullptr) {
             // Dispatching would hand a stale/partial buffer to the protocol layer. Drop the
-            // connection instead: the close event tears the slot down on the main loop.
+            // connection instead: the close event tears the slot down on the main loop. The
+            // payload is reset here because the ws_server close path does not do it, unlike the
+            // client connections' close handling.
             SS_LOGE(TAG, "Allocation failed, dropping connection");
             this->disable_message_dispatch();
             this->reset_websocket_payload();

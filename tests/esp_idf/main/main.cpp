@@ -36,7 +36,6 @@ struct AlwaysReady : SendspinNetworkProvider {
 
 extern "C" void app_main() {
     SendspinClientConfig config;
-    config.client_id = "esp-idf-build";
     config.name = "ESP-IDF Build";
 
     SendspinClient client(std::move(config));

@@ -34,6 +34,7 @@ namespace sendspin {
 
 class SendspinClient;
 struct ClientHelloMessage;
+struct ClientStateMessage;
 
 /// @brief Deferred visualizer event types (used internally in the visualizer role)
 enum class VisualizerEventType : uint8_t {
@@ -59,7 +60,6 @@ struct VisualizerDelivery {
 /// factored out so it can be unit tested independently of the client and drain thread.
 /// @param wire_type        SENDSPIN_BINARY_VISUALIZER_* type byte.
 /// @param payload          Bytes following the entry's wire-type byte and 8-byte timestamp.
-/// @param payload_len      Number of payload bytes available.
 /// @param configured_bins  Negotiated spectrum n_disp_bins (0 if SPECTRUM was not negotiated).
 /// @param tracks_downbeats Whether the active stream reports downbeats.
 /// @param spectrum_out     Scratch vector reused for SPECTRUM bins; resized to configured_bins.
@@ -68,6 +68,30 @@ VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* p
                                              size_t payload_len, uint8_t configured_bins,
                                              bool tracks_downbeats,
                                              std::vector<uint16_t>& spectrum_out);
+
+/// @brief How far behind its delivery time a frame that arrived in time may still be delivered. A
+/// frame only falls this far behind when the listener has held the drain thread; past it, the
+/// backlog is dropped rather than replayed late.
+static constexpr int64_t VISUALIZER_MAX_DELIVERY_LAG_US = 20000;
+
+/// @brief Recovers a frame's arrival time from the low 32 bits of platform_time_us() the network
+/// thread stored with it. Exact while the frame is younger than 2^32 us (about 71 minutes).
+int64_t visualizer_arrival_from_stamp(uint32_t stamp, int64_t now);
+
+/// @brief Decides when the drain thread delivers a frame. Pure, so the timing rules are unit
+/// tested with `now` as an argument.
+///
+/// roles/visualizer/v1.md "Visualization Data (Binary)": a frame already in the past on arrival
+/// is dropped. The rest are delivered display_offset_ms ahead of the display time (negative
+/// delays them), or on arrival when that is later, unless the drain thread has fallen more than
+/// VISUALIZER_MAX_DELIVERY_LAG_US behind that point.
+/// @param client_ts         Display time in client time.
+/// @param arrival_us        When the network thread received the frame.
+/// @param display_offset_ms VisualizerRoleConfig::display_offset_ms.
+/// @param now               The current platform_time_us().
+/// @return Microseconds to wait before delivering (0 to deliver now), or std::nullopt to drop.
+std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int64_t arrival_us,
+                                                   int32_t display_offset_ms, int64_t now);
 
 /// @brief Private implementation of the visualizer role
 struct VisualizerRole::Impl {
@@ -98,14 +122,35 @@ struct VisualizerRole::Impl {
 
     void attach_inbox(Inbox& inbox);
     bool start();
-    void build_hello_fields(ClientHelloMessage& msg);
-    void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
-    void handle_stream_start(const ServerVisualizerStreamObject& stream);
-    void handle_stream_end();
-    void handle_stream_clear() const;
+    void build_hello_fields(ClientHelloMessage& msg) const;
+    void build_state_fields(ClientStateMessage& msg) const;
+    // Each handler takes the teardown generation the receive gate captured when it admitted the
+    // message and re-checks it where it takes effect; see accepts(). handle_stream_end() skips
+    // the check: cleanup() performs everything it does.
+    void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len, uint32_t generation);
+    void handle_stream_start(const ServerVisualizerStreamObject& stream, uint32_t generation);
+    void handle_stream_end(uint32_t generation);
+    void handle_stream_clear(uint32_t generation) const;
     void handle_stream_ring_event(VisualizerEventType event) const;
+    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
+    ///
+    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
+    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
+    /// lost connection, never quiesces the network thread). Re-checking at each point of effect
+    /// invalidates the whole handler instead of only the part that ran before it.
+    /// @param generation The counter value captured when the message was admitted.
+    bool accepts(uint32_t generation) const {
+        return generation == this->cleanup_generation.load(std::memory_order_acquire);
+    }
+
+    /// @brief Stops the role and discards its state. Main loop only.
+    ///
+    /// Shared by the two paths that take the role out of service: a connection being torn down
+    /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
+    /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
+    /// the inbox rather than fired here, because both callers run under the connection manager's
+    /// conn_ptr_mutex_.
     void cleanup();
-    void request_format(const VisualizerFormatRequest& request) const;
 
     // ========================================
     // Internal helpers
@@ -119,7 +164,9 @@ struct VisualizerRole::Impl {
     void flush_ring_buffer() const;
     void signal_clear_marker() const;
     void discard_to_clear_marker() const;
-    void enqueue_stream_event(VisualizerEventType event) const;
+    /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
+    /// against the live counter before dispatching it.
+    void enqueue_stream_event(VisualizerEventType event, uint32_t generation) const;
 
     static void drain_thread_func(VisualizerRole::Impl* self);
 
@@ -129,7 +176,7 @@ struct VisualizerRole::Impl {
 
     // Struct fields
     VisualizerRoleConfig config;
-    std::optional<VisualizerSupportObject> visualizer_support;
+    VisualizerSupportObject visualizer_support;
 
     // Pointer fields
     SendspinClient* client;
@@ -139,6 +186,12 @@ struct VisualizerRole::Impl {
     VisualizerRoleListener* listener{nullptr};
 
     // Atomic fields (written by network thread, read by drain thread / cleanup)
+    /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event queued
+    /// afterwards. At the drain an event whose stamp no longer matches is discarded, so it cannot
+    /// act after the teardown (see event_is_current() in inbox.h). Atomic because the network
+    /// thread reads it (see accepts()).
+    std::atomic<uint32_t> cleanup_generation{0};
+
     std::atomic<uint8_t> spectrum_bin_count{0};
     std::atomic<bool> tracks_downbeats{false};
     std::atomic<bool> stream_active{false};

@@ -46,7 +46,7 @@ if(ESP_IDF_BUILD)
 
     # REQUIRES cannot depend on CONFIG_ values: ESP-IDF collects them before sdkconfig is loaded.
     # The codec components are required through the Kconfig rules in idf_component.yml instead.
-    set(SENDSPIN_REQUIRES esp_http_server esp_netif esp_timer esp_ringbuf pthread mbedtls bblanchon__arduinojson)
+    set(SENDSPIN_REQUIRES esp_http_server esp_netif esp_timer esp_ringbuf esp_hw_support pthread mbedtls bblanchon__arduinojson esphome__noise-c)
     set(SENDSPIN_COMPILE_DEFS "")
 
     if(CONFIG_SENDSPIN_ENABLE_PLAYER)
@@ -82,13 +82,21 @@ if(ESP_IDF_BUILD)
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_VISUALIZER)
     endif()
 
-    # Register the component — uses assembled source list
+    # Register the component using the assembled source list
+    # WHOLE_ARCHIVE: this component defines noise_rand_bytes() (src/esp/noise_rand.cpp), which the
+    # esphome__noise-c component references but does not define (it is built with
+    # NOISE_USE_CUSTOM_RAND=1). Because noise-c depends on sendspin-cpp and sendspin-cpp depends on
+    # noise-c, the link is circular; without --whole-archive the linker never pulls noise_rand.o
+    # from libsendspin-cpp.a (it is not referenced at the point that archive is scanned) and the
+    # link fails with "undefined reference to noise_rand_bytes". --gc-sections still strips genuinely
+    # unused sections, so this does not bloat the image.
     idf_component_register(
         SRCS ${SENDSPIN_ALL_SOURCES}
         INCLUDE_DIRS "include"
-        PRIV_INCLUDE_DIRS "src" "src/esp"
+        PRIV_INCLUDE_DIRS "src" "src/esp" "src/crypto"
         REQUIRES ${SENDSPIN_REQUIRES}
         PRIV_REQUIRES espressif__esp_websocket_client
+        WHOLE_ARCHIVE
     )
 
     # Apply compile definitions for enabled roles
@@ -99,12 +107,16 @@ if(ESP_IDF_BUILD)
     # Apply ESP-IDF configuration
     sendspin_configure_esp_idf(${COMPONENT_LIB} ${COMPONENT_DIR})
 
+    # Deferred to the end of configuration: noise-c and this component require each other, so its
+    # target may not exist yet when this file runs.
+    cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR} CALL sendspin_enable_noise_name_tables)
+
 # ==============================================================================
 # Host Build
 # ==============================================================================
 
 else()
-    project(sendspin VERSION 0.1.0 LANGUAGES CXX)
+    project(sendspin VERSION 0.1.0 LANGUAGES C CXX)
 
     # Role selection options
     option(SENDSPIN_ENABLE_PLAYER "Enable player role (audio decoding)" ON)
@@ -144,7 +156,7 @@ else()
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_VISUALIZER_SOURCES})
     endif()
 
-    # Create the library — core sources + enabled role sources + host networking (added via host.cmake)
+    # Create the library: core sources, enabled role sources, host networking (via host.cmake)
     add_library(sendspin STATIC ${SENDSPIN_ALL_SOURCES})
 
     # Add compile definitions for enabled roles
@@ -173,6 +185,8 @@ else()
     # Host build options
     option(ENABLE_WERROR "Treat warnings as errors" OFF)
     option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+    # ThreadSanitizer is a separate option because it cannot be combined with ASan/UBSan. The
+    # concurrency tests (e.g. RecordStoreConcurrency) only detect a data race when built this way.
     option(ENABLE_TSAN "Enable ThreadSanitizer (mutually exclusive with ENABLE_SANITIZERS)" OFF)
     if(ENABLE_TSAN AND ENABLE_SANITIZERS)
         message(FATAL_ERROR "ENABLE_TSAN and ENABLE_SANITIZERS are mutually exclusive")

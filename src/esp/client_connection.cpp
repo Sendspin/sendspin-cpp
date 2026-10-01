@@ -15,10 +15,17 @@
 #include "client_connection.h"
 
 #include "platform/logging.h"
+#include "platform/types.h"
 #include "protocol_messages.h"
+#include "sendspin/types.h"
+#include <esp_err.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <cstring>
+#include <limits>
+#include <utility>
 
 namespace sendspin {
 
@@ -60,6 +67,23 @@ void SendspinClientConnection::start() {
     config.uri = this->url_.c_str();
     config.disable_auto_reconnect = true;  // We handle reconnection ourselves
     config.task_prio = static_cast<int>(this->task_priority_);
+    // The Noise handshake (and especially the in-band re-handshake) runs its X25519 crypto on
+    // this task; the esp_websocket_client 4096-byte default overflows during the post-pairing
+    // re-handshake. Clamp to the documented minimum so a lowered config value cannot reintroduce
+    // that overflow.
+    size_t task_stack_size = this->task_stack_size_;
+    if (task_stack_size < SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE) {
+        SS_LOGW(TAG, "websocket_stack_size %u below minimum %u; clamping",
+                static_cast<unsigned>(task_stack_size),
+                static_cast<unsigned>(SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE));
+        task_stack_size = SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE;
+    }
+    // esp_websocket_client's task_stack field is int; bound the size_t config value so an
+    // absurd setting cannot wrap negative instead of just failing task creation.
+    if (task_stack_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        task_stack_size = static_cast<size_t>(std::numeric_limits<int>::max());
+    }
+    config.task_stack = static_cast<int>(task_stack_size);
 
     // Create the client
     this->client_ = esp_websocket_client_init(&config);
@@ -103,7 +127,7 @@ void SendspinClientConnection::loop() {
 void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
                                           std::function<void()> on_complete) {
     if (!this->is_connected()) {
-        // Not connected - invoke completion callback immediately if provided
+        // Not connected: invoke completion callback immediately if provided
         if (on_complete) {
             on_complete();
         }
@@ -123,6 +147,17 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
             on_complete();
         }
     });
+}
+
+void SendspinClientConnection::close_transport_now() {
+    // esp_websocket_client_stop() (used by disconnect() above) cannot be called from the
+    // websocket task's own event handler (see handle_data()'s allocation-failure precedent
+    // below, and esp_websocket_client.h's doc comment on esp_websocket_client_stop()): it blocks
+    // until that task exits, which deadlocks when called from within the task itself. Report the
+    // loss immediately via handle_disconnected() without touching the transport; the manager
+    // reacts by dropping this connection, whose destructor calls esp_websocket_client_stop() to
+    // actually stop it, running off the websocket task.
+    this->handle_disconnected();
 }
 
 bool SendspinClientConnection::is_connected() const {
@@ -157,6 +192,34 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     return SsErr::OK;
 }
 
+SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len,
+                                                    SendCompleteCallback cb,
+                                                    bool /*allow_before_hello*/) {
+    if (!this->is_connected()) {
+        if (cb) {
+            cb(false);
+        }
+        return SsErr::INVALID_STATE;
+    }
+
+    int sent = esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char*>(data),
+                                             static_cast<int>(len),
+                                             pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
+
+    bool success = (sent >= 0);
+
+    if (cb) {
+        cb(success);
+    }
+
+    if (!success) {
+        SS_LOGE(TAG, "Failed to send binary message (timeout or error): %d", sent);
+        return SsErr::FAIL;
+    }
+
+    return SsErr::OK;
+}
+
 bool SendspinClientConnection::send_time_message() {
     if (!this->is_connected()) {
         return false;
@@ -173,6 +236,13 @@ bool SendspinClientConnection::send_time_message() {
     }
     this->update_serialize_ema(esp_timer_get_time() - client_transmitted);
 
+    if (this->noise_transport_.is_active()) {
+        // Noise transport active: encrypt the JSON frame straight from the stack buffer.
+        // Atomic check, safe on this thread.
+        return this->send_app_json(buf, len, nullptr) == SsErr::OK;
+    }
+
+    // Pre-Noise: send as plain text.
     int sent = esp_websocket_client_send_text(this->client_, buf, len,
                                               pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
     if (sent < 0) {
@@ -237,16 +307,26 @@ void SendspinClientConnection::handle_disconnected() {
 
 void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* data,
                                            int64_t receive_time) {
+    // connected_ is written only by handle_connected() and handle_disconnected(), both reached
+    // exclusively through this same websocket task's event handler, so this same-task read races
+    // with nothing. close_transport_now() reports the disconnect via handle_disconnected()
+    // without stopping the transport, so already-buffered frames keep arriving as further DATA
+    // events until the manager drops the connection off this task; drop them here instead of
+    // reprocessing a cap trip or re-firing the disconnect callback.
+    if (!this->connected_) {
+        return;
+    }
+
     if (data == nullptr) {
         return;
     }
 
     // Determine frame type: text (0x01), binary (0x02), or continuation (0x00)
     if (data->op_code == WS_OP_TEXT || data->op_code == WS_OP_BINARY) {
-        // First frame of a new message - remember the type for continuation frames
+        // First frame of a new message: remember the type for continuation frames
         this->is_text_frame_ = (data->op_code == WS_OP_TEXT);
     } else if (data->op_code != WS_OP_CONTINUATION) {
-        // Control frames (ping, pong, close) - ignore
+        // Control frames (ping, pong, close): ignore
         return;
     }
 
@@ -258,12 +338,11 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
         uint8_t* dest = this->prepare_receive_buffer(prepare_len);
         if (dest == nullptr) {
             SS_LOGE(TAG, "Allocation failed, dropping connection");
-            // Stop processing frames that keep arriving on the still-open transport; the
-            // manager reacts to the disconnect callback by dropping the connection, whose
-            // destructor stops the transport (esp_websocket_client_stop cannot be called
-            // from the websocket task's own event handler).
+            // Stop processing frames that keep arriving on the still-open transport via
+            // close_transport_now() (esp_websocket_client_stop cannot be called from the
+            // websocket task's own event handler; see its doc comment).
             this->disable_message_dispatch();
-            this->handle_disconnected();
+            this->close_transport_now();
             return;
         }
         std::memcpy(dest, data->data_ptr, data->data_len);

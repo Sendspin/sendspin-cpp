@@ -14,13 +14,17 @@
 
 #include "ws_server.h"
 
-#include "connection.h"
 #include "lwip/sockets.h"  // for close()
 #include "platform/compiler.h"
 #include "platform/logging.h"
+#include "sendspin/config.h"
 #include "server_connection.h"
-#include <esp_idf_version.h>
+#include <esp_err.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
+
+#include <cstddef>
+#include <utility>
 
 namespace sendspin {
 
@@ -28,21 +32,17 @@ namespace sendspin {
 // SendspinWsServer
 // ============================================================================
 //
-// httpd server that accepts incoming WebSocket connections. open_callback() creates each
-// SendspinServerConnection and parks it in the pending table; it is delivered to the
-// SendspinClient only once its WebSocket upgrade is observed (see the delivery contract in
-// ws_server.h). close_callback() cleans up the socket and drops a still-pending entry; tick()
-// closes sessions still undelivered after WS_UPGRADE_TIMEOUT_US.
+// httpd server accepting incoming WebSocket connections. See the delivery contract in
+// ws_server.h.
 
 static const char* const TAG = "sendspin.ws_server";
 
 /// @brief Deadline for an accepted session to complete its WebSocket upgrade
 ///
 /// httpd has no handshake timeout of its own and max_open_sockets is small, so a raw TCP probe
-/// held open without ever speaking WebSocket would pin a socket slot indefinitely (the ESP variant
-/// of issue #75). Pre-upgrade sockets are a transport concern the manager never sees, so the bound
-/// lives here. The host build has no equivalent: IXWebSocket applies its own 3 s server-side
-/// handshake timeout.
+/// held open without ever speaking WebSocket would pin a socket slot indefinitely. Pre-upgrade
+/// sockets are a transport concern the manager never sees, so the bound lives here. The host build
+/// has no equivalent: IXWebSocket applies its own 3 s server-side handshake timeout.
 static constexpr int64_t WS_UPGRADE_TIMEOUT_US = 5LL * 1000 * 1000;
 
 SendspinWsServer::~SendspinWsServer() {
@@ -50,7 +50,7 @@ SendspinWsServer::~SendspinWsServer() {
 }
 
 bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
-                             unsigned task_priority) {
+                             unsigned task_priority, size_t task_stack_size) {
     if (this->server_ != nullptr) {
         SS_LOGW(TAG, "Server already started");
         return true;
@@ -64,6 +64,17 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
         config.task_caps = MALLOC_CAP_SPIRAM;
     }
     config.task_priority = task_priority;
+    // The Noise handshake (and especially the in-band re-handshake) runs its X25519 crypto on
+    // this task; the esp_http_server 4096-byte default overflows during the post-pairing
+    // re-handshake. Clamp to the documented minimum so a lowered config value cannot
+    // reintroduce that overflow.
+    if (task_stack_size < SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE) {
+        SS_LOGW(TAG, "httpd_stack_size %u below minimum %u; clamping",
+                static_cast<unsigned>(task_stack_size),
+                static_cast<unsigned>(SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE));
+        task_stack_size = SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE;
+    }
+    config.stack_size = task_stack_size;
     config.server_port = this->server_port_;
     config.max_open_sockets = this->max_connections_;
     config.open_fn = SendspinWsServer::open_callback;
@@ -88,8 +99,8 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
         return false;
     }
 
-    // Register the WebSocket handler. IDF >= 5.5.5 / 6.0.1 does not dispatch the upgrade GET to
-    // the handler (issue #70); registering the handler itself as the post-handshake callback
+    // IDF >= 5.5.5 / 6.0.1 does not dispatch the upgrade GET to
+    // the handler; registering the handler itself as the post-handshake callback
     // restores that dispatch, so httpd invokes it with the same GET request at the same lifecycle
     // position and the handler's HTTP_GET branch is the single upgrade signal on every IDF version.
     // There is no fallback path: no version fires both (skip-GET builds return before invoking the
@@ -98,7 +109,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
     const httpd_uri_t sendspin_ws_uri = {.uri = "/sendspin",
                                          .method = HTTP_GET,
                                          .handler = SendspinWsServer::websocket_handler,
-                                         .user_ctx = (void*)this,
+                                         .user_ctx = static_cast<void*>(this),
                                          .is_websocket = true,
                                          .handle_ws_control_frames = false,
                                          .supported_subprotocol = nullptr,
@@ -121,12 +132,20 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
 void SendspinWsServer::stop() {
     if (this->server_ != nullptr) {
         SS_LOGD(TAG, "Stopping server");
-        httpd_stop(this->server_);
+        const esp_err_t err = httpd_stop(this->server_);
         this->server_ = nullptr;
+        if (err == ESP_OK) {
+            // httpd discards work queued after its shutdown without running it, so the send blocks
+            // that work held are never released. Every session is closed, so nothing can claim a
+            // block now.
+            this->send_pool_.reset();
+        }
     }
 
-    // httpd_stop tore down every session (each close_callback dropped its pending entry), so
-    // this is normally already empty; clear defensively so a restart begins from a clean table.
+    // httpd_stop tore down every session, so this is normally already empty; clear defensively
+    // so a restart begins from a clean table. Declared above the lock so its shared_ptr entries
+    // release after pending_mutex_ is dropped.
+    // cppcheck-suppress variableScope
     std::vector<PendingUpgrade> stale;
     {
         std::lock_guard<std::mutex> lock(this->pending_mutex_);
@@ -139,13 +158,11 @@ void SendspinWsServer::tick() {
         return;
     }
 
-    // Pure age-based reap: any session still undelivered past the deadline is closed, whether it
-    // never spoke WebSocket (a raw probe) or its upgrade signal failed to fire (only possible if a
-    // future IDF breaks the post-handshake callback; see the tripwire in start()). Sparing
-    // "upgraded but undelivered" sessions here would turn that failure into a silent permanent
-    // wedge of httpd's small socket pool; closing them makes it a visible close-and-retry loop
-    // instead. Pop under the lock, close outside it; the pop also means a delivery racing this reap
-    // resolves exactly-once (the loser finds no entry and no-ops).
+    // Pure age-based reap: any session still undelivered past the deadline is closed. Sparing
+    // "upgraded but undelivered" sessions would turn a broken post-handshake callback into a
+    // silent wedge of httpd's small socket pool instead of a visible close-and-retry loop. Pop
+    // under the lock, close outside it; the pop also resolves a delivery racing this reap
+    // exactly-once (the loser finds no entry and no-ops).
     std::vector<std::shared_ptr<SendspinServerConnection>> to_reap;
     const int64_t now_us = esp_timer_get_time();
     {
@@ -203,7 +220,7 @@ std::shared_ptr<SendspinServerConnection> SendspinWsServer::pop_pending(int sock
 esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
     SS_LOGD(TAG, "New client connection on socket %d", sockfd);
 
-    SendspinWsServer* server = (SendspinWsServer*)httpd_get_global_user_ctx(handle);
+    SendspinWsServer* server = static_cast<SendspinWsServer*>(httpd_get_global_user_ctx(handle));
     if (server == nullptr) {
         SS_LOGE(TAG, "Server context is null in open_callback");
         return ESP_FAIL;
@@ -222,7 +239,7 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
     // the close_fn before the free_fn, so observers (ConnectionManager) get notified first and any
     // queued workers that have already started look up the same shared_ptr via httpd_sess_get_ctx
     // and run safely until the session is freed.
-    auto conn = std::make_shared<SendspinServerConnection>(handle, sockfd);
+    auto conn = std::make_shared<SendspinServerConnection>(handle, sockfd, server->send_pool_);
     auto* slot = new std::shared_ptr<SendspinServerConnection>(conn);
     httpd_sess_set_ctx(handle, sockfd, slot, [](void* p) {
         delete static_cast<std::shared_ptr<SendspinServerConnection>*>(p);
@@ -250,7 +267,7 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
         (*slot)->mark_closed();
     }
 
-    SendspinWsServer* server = (SendspinWsServer*)httpd_get_global_user_ctx(handle);
+    SendspinWsServer* server = static_cast<SendspinWsServer*>(httpd_get_global_user_ctx(handle));
 
     if (server != nullptr) {
         // Drop a still-pending entry: this session closed before its upgrade was ever observed,
@@ -260,11 +277,8 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
     }
 
     // Notify ConnectionManager so it can drop its observer shared_ptr. Passing the connection
-    // (from the session slot) rather than the sockfd keys the event on identity: by the time the
-    // manager drains it on the main loop the fd may already be recycled onto a new session. The
-    // slot keeps the connection alive until httpd invokes its free_fn next, so any in-flight
-    // workers still looking it up via httpd_sess_get_ctx see a valid object. For a never-delivered
-    // session the manager finds no managed match and no-ops.
+    // rather than the sockfd keys the event on identity (see the typedef). The session slot keeps
+    // it alive until httpd invokes the free_fn, so in-flight workers still see a valid object.
     if (server != nullptr && server->connection_closed_callback_ && slot != nullptr &&
         *slot != nullptr) {
         server->connection_closed_callback_(*slot);
@@ -287,7 +301,7 @@ SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     // is always valid. Copying the shared_ptr keeps the conn alive for the duration of dispatch
     // even if a teardown is racing on another thread.
     int sockfd = httpd_req_to_sockfd(req);
-    auto* slot = static_cast<std::shared_ptr<SendspinServerConnection>*>(
+    const auto* slot = static_cast<const std::shared_ptr<SendspinServerConnection>*>(
         httpd_sess_get_ctx(req->handle, sockfd));
     if (slot == nullptr || !*slot) {
         SS_LOGE(TAG, "No connection found for sockfd %d", sockfd);
@@ -299,11 +313,9 @@ SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     SendspinWsServer* server =
         static_cast<SendspinWsServer*>(httpd_get_global_user_ctx(req->handle));
 
-    // Upgrade GET: the sole upgrade signal, on every IDF version. Old IDF (<= 5.5.4 / 6.0.0)
-    // dispatches the initial GET here natively after completing the handshake; new IDF reaches
-    // this branch via ws_post_handshake_cb, which is registered as this same function and
-    // invoked with the same GET request. Frames are processed strictly after this request cycle
-    // on the same httpd task, so delivery always precedes the first frame.
+    // Upgrade GET: the sole upgrade signal on every IDF version (see start()). Frames are
+    // processed strictly after this request cycle on the same httpd task, so delivery always
+    // precedes the first frame.
     if (req->method == HTTP_GET) {
         if (server != nullptr) {
             server->deliver_upgraded(sockfd);

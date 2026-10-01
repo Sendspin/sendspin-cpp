@@ -151,7 +151,7 @@ size_t PortAudioSink::write(uint8_t* data, size_t length, uint32_t timeout_ms) {
             // so untracked remainder bytes would cause the PA callback to report
             // more frames_played than buffered_frames, triggering underflow
             // warnings.  When there is enough space for all remaining data we
-            // write it all — the caller always provides frame-aligned buffers.
+            // write it all - the caller always provides frame-aligned buffers.
             size_t remaining = length - total_written;
             size_t free = ring_buffer_.free_space();
             size_t to_write = std::min(remaining, free);

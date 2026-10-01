@@ -32,47 +32,20 @@ namespace sendspin {
  * @brief ArduinoJson allocator backed by a fixed internal-RAM byte buffer, falling back to the
  * PSRAM-preferring platform allocator when the buffer is exhausted
  *
- * ArduinoJson allocates a JsonDocument's variant pool(s) and every copied string out of its
- * Allocator. On ESP32 those allocations normally land in slow PSRAM (see PsramJsonAllocator). For
- * the short-lived documents used to parse incoming protocol messages on the CPU-hot network task,
- * routing them to internal RAM instead removes PSRAM traffic on every message.
+ * ArduinoJson allocates a document's variant pool and copied strings out of its Allocator; on
+ * ESP32 those land in slow PSRAM (see PsramJsonAllocator). Routing the short-lived
+ * protocol-parse documents to internal RAM removes that traffic on every message. Internal RAM
+ * is scarce, so the buffer is a hard budget: an allocation that does not fit falls back to
+ * platform_malloc, and an unexpectedly large message still parses, just slowly.
+ * deallocate()/reallocate() route each pointer back by checking whether it lies in the buffer.
  *
- * Internal RAM is scarce, so the buffer is a hard budget: an allocation that does not fit the
- * remaining space transparently falls back to platform_malloc (PSRAM-preferring), so an
- * unexpectedly large message still parses, just slowly. deallocate()/reallocate() route each
- * pointer back to the right place by checking whether it lies inside the buffer.
+ * Bump allocator: ArduinoJson frees in LIFO order, so a finished document drains the arena on its
+ * own. ArduinoJson::Allocator has no "document destroyed" hook, so the owner calls reset() between
+ * documents as a safety net for any non-LIFO leftover; it does not touch blocks that escaped to
+ * PSRAM. Not thread-safe: the parser's one instance is serialized by json_processing_mutex_.
  *
- * The arena is a bump allocator, which suits ArduinoJson's allocation pattern: during a parse the
- * variant pool is allocated once up front and every subsequent variant slot comes out of it (no
- * heap traffic), so the deserializer's string scratch buffer is always the most-recently-allocated
- * block while it is grown and shrunk - those reallocations happen in place. Document teardown frees
- * strings newest-first and the variant pool last, i.e. in the arena's LIFO order, so a finished
- * document drains the arena back to empty on its own. reset() is still called between messages as a
- * safety net for any block left behind by a non-LIFO free; it does not touch (or free) blocks that
- * escaped to PSRAM - those are released by deallocate() on document teardown like any other block.
- *
- * ArduinoJson::Allocator has no "document destroyed" hook, only per-block deallocate(), so reset()
- * is driven by the code that owns the JsonDocument. NOT thread-safe - use one instance per thread
- * (the protocol parser uses a single SendspinClient-owned instance on the network task).
- *
- * If the backing buffer cannot be allocated (out of internal RAM), the arena still works: every
- * allocation simply falls back to the PSRAM-preferring path, i.e. it behaves like
- * PsramJsonAllocator.
- *
- * Usage:
- * 1. Construct once with the desired internal-RAM budget in bytes
- * 2. Per document: call reset() (only after the previous JsonDocument has been destroyed), build or
- *    parse the document via make_json_document(arena), then consume it before the next reset()
- * 3. Optionally read high_water() to tune the budget
- *
- * @code
- * SendspinArenaAllocator arena(2048);
- * // ... later, on the owning thread, once per message:
- * arena.reset();
- * JsonDocument doc = make_json_document(arena);
- * deserializeJson(doc, data, len);
- * // ... read values out of doc; doc is destroyed at end of scope ...
- * @endcode
+ * If the backing buffer cannot be allocated, every request falls back to PSRAM, i.e. it behaves
+ * like PsramJsonAllocator.
  */
 class SendspinArenaAllocator final : public ArduinoJson::Allocator {
 public:
@@ -99,8 +72,6 @@ public:
     SendspinArenaAllocator& operator=(const SendspinArenaAllocator&) = delete;
 
     /// @brief Allocates @p size bytes from the arena, or via platform_malloc if it does not fit
-    /// @param size Number of bytes to allocate.
-    /// @return Pointer to the allocated memory, or nullptr on failure.
     void* allocate(size_t size) override {
         const size_t need = HEADER_SIZE + align_up(size);
         if (need <= this->cap_ - this->offset_) {  // cap_ - offset_ is 0 when cap_ == 0
@@ -113,8 +84,7 @@ public:
         return platform_malloc(size);
     }
 
-    /// @brief Frees a block previously returned by allocate() or reallocate()
-    /// @param ptr Pointer to the block to free, or nullptr.
+    /// @brief Frees a block previously returned by allocate() or reallocate(); null is a no-op
     void deallocate(void* ptr) override {
         if (ptr == nullptr) {
             return;
@@ -133,9 +103,6 @@ public:
     }
 
     /// @brief Reallocates a block to a new size, preserving its existing contents
-    /// @param ptr Pointer to the block to reallocate, or nullptr to allocate a new block.
-    /// @param new_size New size in bytes.
-    /// @return Pointer to the reallocated memory, or nullptr on failure.
     void* reallocate(void* ptr, size_t new_size) override {
         if (ptr == nullptr) {
             return this->allocate(new_size);
@@ -187,16 +154,13 @@ public:
         this->offset_ = 0;
     }
 
-    /// @brief Returns the usable arena capacity in bytes (0 if the backing buffer could not be
-    /// allocated)
-    /// @return The capacity in bytes.
+    /// @brief Usable arena capacity in bytes; 0 if the backing buffer could not be allocated
     size_t capacity() const {
         return this->cap_;
     }
 
-    /// @brief Returns the largest number of arena bytes in use at once since construction (for
-    /// tuning the budget; not reset by reset())
-    /// @return The high-water mark in bytes.
+    /// @brief Largest number of arena bytes in use at once since construction, for tuning the
+    /// budget; not cleared by reset()
     size_t high_water() const {
         return this->high_water_;
     }
@@ -209,21 +173,18 @@ private:
     static_assert(HEADER_SIZE >= sizeof(size_t), "block header must hold a size_t");
     static_assert((ALIGNMENT & (ALIGNMENT - 1)) == 0, "ALIGNMENT must be a power of two");
 
-    /// @brief Rounds a byte count up to a multiple of ALIGNMENT
     static constexpr size_t align_up(size_t n) {
         return (n + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1);
     }
-    /// @brief Writes a block's payload size into its header
     static void store_size(uint8_t* hdr, size_t value) {
         std::memcpy(hdr, &value, sizeof(value));
     }
-    /// @brief Reads a block's payload size from its header
     static size_t load_size(const uint8_t* hdr) {
         size_t value = 0;
         std::memcpy(&value, hdr, sizeof(value));
         return value;
     }
-    /// @brief Returns true if @p p points inside the backing buffer (i.e. was bump-allocated)
+    /// @brief Whether @p p was bump-allocated from the backing buffer
     bool in_arena(const void* p) const {
         if (this->cap_ == 0) {
             return false;
@@ -234,7 +195,6 @@ private:
         const auto begin = reinterpret_cast<uintptr_t>(this->base_);
         return addr >= begin && addr < begin + this->cap_;
     }
-    /// @brief Updates the high-water mark if the current usage exceeds it
     void note_high_water() {
         if (this->offset_ > this->high_water_) {
             this->high_water_ = this->offset_;
@@ -253,9 +213,7 @@ private:
     size_t offset_{0};
 };
 
-/// @brief Creates a JsonDocument that allocates from the given arena (internal RAM, PSRAM fallback)
-/// @param arena The arena allocator to use; must outlive the returned document.
-/// @return A JsonDocument configured to allocate from @p arena.
+/// @brief Creates a JsonDocument that allocates from the given arena, which must outlive it
 inline JsonDocument make_json_document(SendspinArenaAllocator& arena) {
     return JsonDocument(&arena);
 }

@@ -15,13 +15,15 @@
 #pragma once
 
 #include "sendspin/client.h"
+#include "sendspin/config.h"
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
+#include "sendspin/types.h"
 
-#include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -37,6 +39,17 @@ struct DiscoveredServer {
     std::string host;  ///< Resolved IP address or hostname
     uint16_t port{0};  ///< Server port
     std::string path;  ///< WebSocket path from TXT record (e.g., "/sendspin")
+};
+
+/// @brief PlayerRole setter calls the key handler hands to the client thread.
+///
+/// PlayerRole::update_volume(), update_muted() and update_output_delay() are main-loop only, and
+/// the key handler runs on the FTXUI thread. Each field is the value the client thread applies on
+/// its next iteration; latest keypress wins.
+struct PendingPlayerCommands {
+    std::optional<uint8_t> volume;
+    std::optional<bool> muted;
+    std::optional<uint16_t> output_delay_ms;
 };
 
 /// @brief Shared state between SendspinClient callbacks and the TUI render thread.
@@ -70,7 +83,7 @@ struct TuiState {
     std::optional<uint32_t> sample_rate;
     std::optional<uint8_t> bit_depth;
     std::optional<uint8_t> channels;
-    uint16_t static_delay_ms{0};
+    uint16_t output_delay_ms{0};
 
     // Connection
     bool connected{false};
@@ -79,6 +92,12 @@ struct TuiState {
     bool streaming{false};
     std::string connected_host;
     uint16_t connected_port{0};
+
+    // Identity and trust
+    std::string client_id;
+    ConnectionTrust trust{ConnectionTrust::NONE};
+    std::string pairing_status;  // brief human-readable pairing event description
+    std::string pairing_token;   // formatted Pairing PSK token (SP:...); empty if unavailable
 
     // Server selector
     bool server_selector_active{false};
@@ -101,8 +120,28 @@ struct TuiState {
     bool vis_peak{false};         // energy-onset (peak) blinker
     int64_t vis_peak_expire_us{0};
 
+    // Artwork: what the server last delivered per channel, in configuration order
+    struct ArtworkChannelStatus {
+        std::string wanted;       ///< The source, format and size this channel asks for
+        size_t image_bytes{0};    ///< Encoded size of the most recently delivered image, 0 after
+                                  ///< a clear
+        uint32_t images{0};       ///< Images delivered to this channel so far
+    };
+    std::vector<ArtworkChannelStatus> artwork_channels;
+
+    // Colors derived from the current audio, as [R, G, B]. Spelled out rather than using
+    // sendspin::RgbColor so this state depends on no role type and needs no
+    // SENDSPIN_ENABLE_COLOR guard.
+    bool color_received{false};
+    std::optional<std::array<uint8_t, 3>> color_primary;
+    std::optional<std::array<uint8_t, 3>> color_accent;
+    std::optional<std::array<uint8_t, 3>> color_background_dark;
+
     // Tab state
     bool show_visualizer{false};
+
+    // Player setters the key handler defers to the client thread
+    PendingPlayerCommands pending_player;
 };
 
 /// @brief Creates the FTXUI component tree with rendering and key handling.
@@ -116,5 +155,11 @@ ftxui::Component create_tui_component(SendspinClient& client, TuiState& state,
 /// @brief Polls client state that doesn't have callbacks (progress, controller state, etc.).
 /// Called periodically from the background thread.
 void update_polled_state(TuiState& state, SendspinClient& client);
+
+/// @brief Applies the PlayerRole setters the key handler deferred. Client thread only, before
+/// SendspinClient::loop().
+/// @param state Shared TUI state holding the pending values.
+/// @param client The SendspinClient owning the player role.
+void apply_pending_player_commands(TuiState& state, SendspinClient& client);
 
 }  // namespace sendspin

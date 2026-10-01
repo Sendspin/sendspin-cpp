@@ -87,7 +87,13 @@ bool is_routable_ip(const struct sockaddr* sa) {
     }
     if (sa->sa_family == AF_INET6) {
         const auto* in6 = reinterpret_cast<const struct sockaddr_in6*>(sa);
-        return !IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) && !IN6_IS_ADDR_LINKLOCAL(&in6->sin6_addr);
+        if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr)) {
+            return false;  // loopback ::1
+        }
+        if (IN6_IS_ADDR_LINKLOCAL(&in6->sin6_addr)) {
+            return false;  // link-local fe80::/10
+        }
+        return true;
     }
     return false;
 }

@@ -57,7 +57,7 @@ std::optional<std::string> format_mac(const uint8_t* mac) {
 std::optional<std::string> platform_get_interface_mac() {
     uint8_t mac[6] = {0};
 
-    // Prefer the MAC of the default network interface — the one outbound connections route over.
+    // Prefer the MAC of the default network interface - the one outbound connections route over.
     // This resolves to the correct address whether the device is on Wi-Fi or Ethernet.
     esp_netif_t* netif = esp_netif_get_default_netif();
     if (netif != nullptr && esp_netif_get_mac(netif, mac) == ESP_OK) {

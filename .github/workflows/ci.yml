@@ -115,7 +115,8 @@ jobs:
           sudo apt-get install -y libavahi-compat-libdnssd-dev
 
       - name: Configure CMake
-        # ENABLE_TSAN instead of ENABLE_SANITIZERS: the two sanitizers cannot be combined.
+        # ENABLE_TSAN instead of ENABLE_SANITIZERS: TSan cannot be combined with ASan/UBSan, and
+        # the concurrency tests only report a data race when built this way.
         run: cmake -B build-tsan -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .
 
       - name: Build tests

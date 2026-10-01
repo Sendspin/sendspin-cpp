@@ -27,35 +27,57 @@
 
 #include "tui.h"
 
+#include "sendspin/artwork_role.h"
 #include "sendspin/client.h"
+#include "sendspin/color_role.h"
+#include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
+#include "sendspin/types.h"
 #include "sendspin/visualizer_role.h"
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#include "file_persistence_provider.h"
+// The audio sink exists to feed the player, so it follows the player's compile gate as well as
+// PortAudio's availability.
+#if defined(SENDSPIN_HAS_PORTAUDIO) && defined(SENDSPIN_ENABLE_PLAYER)
+#define TUI_CLIENT_HAS_AUDIO_SINK
+#endif
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
 #include "portaudio_sink.h"
 #endif
 
+#include <ftxui/component/event.hpp>
+#include <ftxui/component/screen_interactive.hpp>
 #include <getopt.h>
 
 #ifdef SENDSPIN_HAS_MDNS
+// IWYU pragma: begin_keep
+// The include-what-you-use checker misattributes arpa/inet.h's htons/ntohs/htonl/ntohl and
+// sys/select.h's select()/fd_set to macOS libc++'s private headers when analyzed on a macOS
+// host toolchain; both are still the correct, portable headers on macOS and Linux CI.
 #include <arpa/inet.h>
+#include <sys/select.h>
+// IWYU pragma: end_keep
 #include <dns_sd.h>
 #include <netdb.h>
-#include <sys/select.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #endif
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace sendspin;
@@ -243,7 +265,7 @@ private:
         ServiceKey key{name, regtype, domain};
 
         if (flags & kDNSServiceFlagsAdd) {
-            // Service appeared -- resolve it
+            // Service appeared: resolve it
             auto* ctx = new ResolveContext{browser, key, name, 0, ""};
 
             DNSServiceRef resolve_ref = nullptr;
@@ -414,6 +436,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  -f FORMAT     Audio format as codec:rate:bits:channels (e.g. flac:48000:24:2)\n");
     fprintf(stderr, "                Can be specified multiple times. Codecs: %s\n",
             SUPPORTED_CODECS);
+    fprintf(stderr, "                At least one flac or pcm format is required\n");
     fprintf(stderr, "  -V            Disable visualizer\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
@@ -464,15 +487,20 @@ int main(int argc, char* argv[]) {
 
     // Configure the client
     SendspinClientConfig config;
-    config.client_id = "host-tui-example";
+    // client_id is derived from the static X25519 keypair; do not set it here.
     config.name = friendly_name;
     config.product_name = "sendspin-cpp host TUI";
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
     config.server_port = server_port;
+    // The TUI shows the pairing code in its pairing status line, so the client can advertise
+    // the dynamic_pairing_code method alongside the mandatory pairing_psk one. A text TUI
+    // cannot render a QR code, so only the digits format is offered.
+    config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+    config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
 
     // Create audio output
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
     PortAudioSink audio_sink;
 
     // Validate explicitly requested formats against PortAudio device capabilities
@@ -524,7 +552,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-#else
+#elif defined(SENDSPIN_ENABLE_PLAYER)
     if (audio_formats.empty()) {
         audio_formats = {
             {SendspinCodecFormat::FLAC, 2, 44100, 16},
@@ -538,36 +566,73 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    // Persist the static keypair (and pairing state) so client_id and pairing records survive
+    // restarts. Path: $HOME/.sendspin_tui.json (distinct from basic_client's
+    // .sendspin.json so the two examples do not share an identity/pairing file;
+    // regenerated if the file is absent).
+    const std::string persistence_path =
+        FilePersistenceProvider::default_path(".sendspin_tui.json");
+    FilePersistenceProvider persistence_provider(persistence_path);
+
     SendspinClient client(std::move(config));
+    client.set_persistence_provider(&persistence_provider);
 
     // Add roles
+#ifdef SENDSPIN_ENABLE_PLAYER
     PlayerRoleConfig player_config;
     player_config.audio_formats = std::move(audio_formats);
     auto& player = client.add_player(std::move(player_config));
-    player.set_static_delay_adjustable(true);
-    auto& controller = client.add_controller();
+    player.set_output_delay_adjustable(true);
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    // Added for its side effect: the client offers the role and accepts server/state for it.
+    (void)client.add_controller();
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     auto& metadata = client.add_metadata();
+#endif
 
-    // Suppress unused variable warning
-    (void)controller;
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    // Artwork channels: album art on channel 0, artist image on channel 1. The TUI reports what
+    // arrives rather than drawing it, so the sizes are the small ones a display of this kind asks
+    // for.
+    ArtworkRoleConfig artwork_config;
+    artwork_config.preferred_formats = {
+        {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 320},
+        {SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 64},
+    };
+    // What each channel asked for, in channel order, for the Artwork panel to label its rows.
+    const std::vector<std::string> artwork_channel_labels = {
+        "album jpeg 320x320",
+        "artist png 64x64",
+    };
+    auto& artwork = client.add_artwork(std::move(artwork_config));
+#endif
+
+#ifdef SENDSPIN_ENABLE_COLOR
+    auto& color = client.add_color();
+#endif
 
     // Visualizer support (disabled with -V flag)
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     VisualizerRole* vis_role = nullptr;
     if (enable_visualizer) {
-        VisualizerSupportObject vis;
-        vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
-                     VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
-                     VisualizerDataType::PEAK};
-        vis.buffer_capacity = 32768;
-        vis.rate_max = 30;
-        vis.spectrum = VisualizerSpectrumConfig{
+        VisualizerSupportObject vis_support;
+        vis_support.buffer_capacity = 32768;
+        VisualizerStreamConfig vis_stream;
+        vis_stream.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
+                            VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
+                            VisualizerDataType::PEAK};
+        vis_stream.rate_max = 30;
+        vis_stream.spectrum = VisualizerSpectrumConfig{
             .n_disp_bins = 32,
             .scale = VisualizerSpectrumScale::MEL,
             .f_min = 40,
             .f_max = 16000,
         };
-        vis_role = &client.add_visualizer(VisualizerRoleConfig{.support = vis});
+        // The UI redraws about every 30 ms, so a frame waits about 15 ms on average to be drawn.
+        vis_role = &client.add_visualizer(VisualizerRoleConfig{
+            .support = vis_support, .stream = vis_stream, .display_offset_ms = 15});
     }
 #else
     (void)enable_visualizer;
@@ -575,10 +640,11 @@ int main(int argc, char* argv[]) {
 
     // --- Listener implementations ---
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     struct TuiPlayerListener : PlayerRoleListener {
         TuiState& state;
         PlayerRole& player;
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
         PortAudioSink& sink;
         TuiPlayerListener(TuiState& s, PlayerRole& p, PortAudioSink& a)
             : state(s), player(p), sink(a) {}
@@ -587,7 +653,7 @@ int main(int argc, char* argv[]) {
 #endif
 
         size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             return sink.write(data, length, timeout_ms);
 #else
             return null_audio_write(data, length, timeout_ms);
@@ -604,7 +670,7 @@ int main(int argc, char* argv[]) {
                 state.channels = params.channels;
                 state.streaming = true;
             }
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             auto& params = player.get_current_stream_params();
             if (params.sample_rate.has_value() && params.channels.has_value() &&
                 params.bit_depth.has_value()) {
@@ -622,7 +688,7 @@ int main(int argc, char* argv[]) {
                 state.bit_depth = std::nullopt;
                 state.channels = std::nullopt;
             }
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             sink.clear();
 #endif
         }
@@ -632,7 +698,7 @@ int main(int argc, char* argv[]) {
                 std::lock_guard<std::mutex> lock(state.mutex);
                 state.player_volume = vol;
             }
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             sink.set_volume(vol);
 #endif
         }
@@ -642,17 +708,19 @@ int main(int argc, char* argv[]) {
                 std::lock_guard<std::mutex> lock(state.mutex);
                 state.player_muted = muted;
             }
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             sink.set_muted(muted);
 #endif
         }
 
-        void on_static_delay_changed(uint16_t delay) override {
+        void on_output_delay_changed(uint16_t delay) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.static_delay_ms = delay;
+            state.output_delay_ms = delay;
         }
     };
+#endif
 
+#ifdef SENDSPIN_ENABLE_METADATA
     struct TuiMetadataListener : MetadataRoleListener {
         TuiState& state;
         explicit TuiMetadataListener(TuiState& s) : state(s) {}
@@ -664,6 +732,7 @@ int main(int argc, char* argv[]) {
             state.album = md.album.value_or("");
         }
     };
+#endif
 
     struct TuiClientListener : SendspinClientListener {
         TuiState& state;
@@ -678,7 +747,103 @@ int main(int argc, char* argv[]) {
                 state.group_name = *group.group_name;
             }
         }
+
+        void on_trust_changed(ConnectionTrust trust) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.trust = trust;
+        }
+
+        void on_pairing_started(const std::string& /*server_id*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "Pairing...";
+        }
+
+        void on_pairing_succeeded(const std::string& /*server_id*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "Paired";
+        }
+
+        void on_pairing_failed(const std::string& /*server_id*/,
+                               SendspinPairAbortReason /*reason*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "Pairing failed";
+        }
+
+        void on_display_pairing_code(const std::string& code,
+                                     SendspinPairingCodeFormat format) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            // Only digits are offered above, so a code that arrives is six digits; pairing.md
+            // "Pairing Code Presentation" asks for the 3-3 grouping shown here, which is
+            // presentation only and never part of what the operator types.
+            state.pairing_status = format == SendspinPairingCodeFormat::DIGITS
+                                       ? "Code " + code.substr(0, 3) + "-" + code.substr(3)
+                                       : "Token " + code;
+        }
+
+        void on_clear_pairing_code() override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (state.pairing_status.rfind("Code ", 0) == 0 ||
+                state.pairing_status.rfind("Token ", 0) == 0) {
+                state.pairing_status = "Pairing...";
+            }
+        }
+
+        void on_open_pairing_window() override {
+            // The pairing-window gesture is not implemented in the tui_client example, so
+            // pairing_window_supported stays false and this never fires.
+        }
+
+        void on_close_pairing_window() override {
+            // See on_open_pairing_window().
+        }
     };
+
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    struct TuiArtworkListener : ArtworkRoleListener {
+        TuiState& state;
+        explicit TuiArtworkListener(TuiState& s) : state(s) {}
+
+        // Fires on the decode thread. A TUI has nothing to decode the image into.
+        void on_image_decode(uint8_t slot, const uint8_t* /*data*/, size_t length,
+                             SendspinImageFormat /*format*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot < state.artwork_channels.size()) {
+                state.artwork_channels[slot].image_bytes = length;
+                ++state.artwork_channels[slot].images;
+            }
+        }
+
+        void on_image_clear(uint8_t slot) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot < state.artwork_channels.size()) {
+                state.artwork_channels[slot].image_bytes = 0;
+            }
+        }
+    };
+#endif
+
+#ifdef SENDSPIN_ENABLE_COLOR
+    struct TuiColorListener : ColorRoleListener {
+        TuiState& state;
+        explicit TuiColorListener(TuiState& s) : state(s) {}
+
+        void on_color(const ServerColorStateObject& palette) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.color_received = true;
+            state.color_primary = palette.primary;
+            state.color_accent = palette.accent;
+            state.color_background_dark = palette.background_dark;
+        }
+
+        void on_color_clear() override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.color_received = false;
+            state.color_primary.reset();
+            state.color_accent.reset();
+            state.color_background_dark.reset();
+        }
+    };
+#endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     struct TuiVisualizerListener : VisualizerRoleListener {
@@ -757,27 +922,50 @@ int main(int argc, char* argv[]) {
 
     // Shared TUI state
     TuiState state;
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    for (const auto& label : artwork_channel_labels) {
+        state.artwork_channels.push_back({label, 0, 0});
+    }
+#endif
 
     // Create and wire listeners
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
     TuiPlayerListener player_listener(state, player, audio_sink);
     audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
         player.notify_audio_played(frames, timestamp);
     };
-#else
+#elif defined(SENDSPIN_ENABLE_PLAYER)
     TuiPlayerListener player_listener(state, player);
 #endif
+#ifdef SENDSPIN_ENABLE_METADATA
     TuiMetadataListener metadata_listener(state);
+#endif
     TuiClientListener client_listener(state);
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    TuiArtworkListener artwork_listener(state);
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    TuiColorListener color_listener(state);
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     TuiVisualizerListener visualizer_listener(state);
 #endif
     HostNetworkProvider network_provider;
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     player.set_listener(&player_listener);
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     metadata.set_listener(&metadata_listener);
+#endif
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    artwork.set_listener(&artwork_listener);
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    color.set_listener(&color_listener);
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     if (vis_role) {
         vis_role->set_listener(&visualizer_listener);
@@ -788,6 +976,23 @@ int main(int argc, char* argv[]) {
     if (!client.start()) {
         fprintf(stderr, "Failed to start server\n");
         return 1;
+    }
+
+    // Expose client_id in the TUI state for display.
+    // client_id is base64url(static X25519 public key), 43 chars.
+    //
+    // Also expose the formatted Pairing PSK token: a server that only offers the mandatory
+    // pairing_psk method (dynamic_pairing_code is optional) needs this pasted in by the operator,
+    // so without showing it here a user could not pair against such a server at all. The same
+    // thing basic_client prints in its startup banner, routed into TUI state instead of stderr
+    // since the TUI owns the terminal.
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.client_id = client.client_id();
+        auto token = client.pairing_token();
+        if (token.has_value()) {
+            state.pairing_token = std::move(*token);
+        }
     }
 
     // Advertise via mDNS and browse for other servers (when compiled in)
@@ -835,6 +1040,9 @@ int main(int argc, char* argv[]) {
         int tick = 0;
         int vis_refresh_counter = 0;
         while (running.load()) {
+            // The key handler runs on the FTXUI thread and cannot call the main-loop-only
+            // PlayerRole setters itself, so it queues them here instead.
+            apply_pending_player_commands(state, client);
             client.loop();
 
             bool vis_showing;
@@ -843,7 +1051,7 @@ int main(int argc, char* argv[]) {
                 vis_showing = state.show_visualizer;
             }
 
-            // Smooth visualizer display values every tick (10ms) — only when visible
+            // Smooth visualizer display values every tick (10ms), only when visible
             if (vis_showing) {
                 int64_t current_us = now_us();
                 std::lock_guard<std::mutex> lock(state.mutex);
@@ -893,6 +1101,9 @@ int main(int argc, char* argv[]) {
             }
 
             // Post UI refresh at ~30fps (every 3 ticks) when visualizer is showing
+            // cppcheck-suppress duplicateCondition
+            // Deliberate: an independent guard for a second, unrelated purpose (smoothing above
+            // vs. refresh throttling here), not a leftover duplicate of the same check.
             if (vis_showing) {
                 if (++vis_refresh_counter % 3 == 0) {
                     screen.PostEvent(ftxui::Event::Custom);
@@ -919,7 +1130,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 update_polled_state(state, client);
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
                 // Sync audio sink volume with client state every poll cycle.
                 // This catches all volume sources: key presses (update_volume),
                 // server commands (on_volume_changed), and polling updates.

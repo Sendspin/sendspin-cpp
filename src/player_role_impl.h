@@ -23,10 +23,12 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sendspin {
 
+class ConnectionManager;
 class SendspinClient;
 class SendspinPersistenceProvider;
 struct ClientHelloMessage;
@@ -38,10 +40,31 @@ enum class PlayerStreamCallbackType : uint8_t {
     STREAM_END,    // Stream ended normally
 };
 
+/// @brief One binary audio chunk, split into the parts roles/player/v1.md "Audio Chunks
+/// (Binary)" defines after the message type byte.
+struct AudioChunk {
+    /// Server clock time when the first sample should be output (spec bytes 1-8, big-endian
+    /// int64, i.e. the first eight bytes of `data`).
+    int64_t timestamp_us{0};
+    /// Encoded audio frame, starting at spec byte 13 (offset 12 in `data`). Points into the
+    /// caller's buffer.
+    const uint8_t* audio{nullptr};
+    size_t audio_len{0};
+};
+
 /// @brief Private implementation of the player role
 struct PlayerRole::Impl {
     Impl(PlayerRoleConfig config, SendspinClient* client, SendspinPersistenceProvider* persistence);
     ~Impl();
+
+    /// @brief Splits one audio chunk's bytes (after the message type byte) into its timestamp
+    /// and its encoded audio frame.
+    ///
+    /// Spec bytes 9-12 carry `send_ahead`, the lead the server had in hand when it transmitted;
+    /// it carries no scheduling meaning, so the chunk is parsed past it.
+    /// @param data Chunk bytes with the message type byte already stripped.
+    /// @return The split chunk, or nullopt when @p len is too short to hold the header.
+    static std::optional<AudioChunk> parse_audio_chunk(const uint8_t* data, size_t len);
 
     // ========================================
     // Event state
@@ -50,12 +73,6 @@ struct PlayerRole::Impl {
     struct EventState {
         InboxSlot<ServerPlayerStreamObject> stream_params_slot;
         InboxSlot<ServerCommandMessage> command_slot;
-        // Client state from the sync task. Latest-wins by design (the old ring events were
-        // collapsed to the newest at drain time anyway), and deliberately NOT on the event
-        // ring: the sync task is the one producer that can keep emitting while the main loop
-        // stalls, and un-coalesced state transitions must not be able to fill the shared ring
-        // and starve non-idempotent lifecycle events out of it.
-        InboxSlot<SendspinClientState> state_slot;
     };
 
     // ========================================
@@ -63,28 +80,50 @@ struct PlayerRole::Impl {
     // ========================================
 
     void attach_inbox(Inbox& inbox);
+    /// @brief Hands the sync task the connection manager it resolves its stream pin from and
+    /// gives that pin back to. Called at role registration, before start().
+    void attach_connection_manager(ConnectionManager& manager) const;
     bool start();
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
-    void handle_binary(const uint8_t* data, size_t len) const;
-    void handle_stream_start(const ServerPlayerStreamObject& player_obj) const;
-    void handle_stream_end() const;
-    void handle_stream_clear() const;
-    void handle_server_command(const ServerCommandMessage& cmd) const;
+    // Each handler takes the teardown generation the receive gate captured when it admitted the
+    // message and re-checks it where it takes effect; see accepts().
+    void handle_binary(const uint8_t* data, size_t len, uint32_t generation) const;
+    void handle_stream_start(const ServerPlayerStreamObject& player_obj, uint32_t generation) const;
+    void handle_stream_end(uint32_t generation) const;
+    void handle_stream_clear(uint32_t generation) const;
+    void handle_server_command(const ServerCommandMessage& cmd, uint32_t generation) const;
     void on_stream_ring_event(PlayerStreamCallbackType event);
     // True if this tick has drainable player work. The command-slot bit covers server
-    // volume/mute/static-delay commands; the state-slot bit covers client-state updates from
-    // the sync task; a non-empty awaiting_sync_idle_events is a main-thread-only flag set by
-    // on_stream_ring_event() above during this tick's ring dispatch, or carried over from a
-    // prior tick while a STREAM_END waits for the sync task to go idle. stream_params_slot's
-    // own topic bit (INBOX_TOPIC_PLAYER_STREAM_PARAMS) needs no separate term here: it is only
-    // ever consumed from the STREAM_START branch while that event sits in
+    // volume/mute/output-delay commands; a non-empty awaiting_sync_idle_events is a
+    // main-thread-only flag set by on_stream_ring_event() above during this tick's ring dispatch,
+    // or carried over from a prior tick while a STREAM_END waits for the sync task to go idle.
+    // stream_params_slot's own topic bit (INBOX_TOPIC_PLAYER_STREAM_PARAMS) needs no separate term
+    // here: it is only ever consumed from the STREAM_START branch while that event sits in
     // awaiting_sync_idle_events, which the awaiting_sync_idle_events term above already covers.
     bool needs_drain(uint32_t pending_bits) const {
-        return (pending_bits & (INBOX_TOPIC_PLAYER_COMMAND | INBOX_TOPIC_PLAYER_STATE)) != 0 ||
+        return (pending_bits & INBOX_TOPIC_PLAYER_COMMAND) != 0 ||
                !this->awaiting_sync_idle_events.empty();
     }
     void drain_events();
+    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
+    ///
+    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
+    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
+    /// lost connection, never quiesces the network thread). Re-checking at each point of effect
+    /// invalidates the whole handler instead of only the part that ran before it.
+    /// @param generation The counter value captured when the message was admitted.
+    bool accepts(uint32_t generation) const {
+        return generation == this->cleanup_generation.load(std::memory_order_acquire);
+    }
+
+    /// @brief Stops the role and discards its state. Main loop only.
+    ///
+    /// Shared by the two paths that take the role out of service: a connection being torn down
+    /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
+    /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
+    /// the inbox rather than fired here, because both callers run under the connection manager's
+    /// conn_ptr_mutex_.
     void cleanup();
     /// @brief Joins the sync task thread and discards its buffered audio; no-op if not started.
     void stop() const;
@@ -95,7 +134,7 @@ struct PlayerRole::Impl {
 
     void update_volume(uint8_t volume);
     void update_muted(bool muted);
-    void update_static_delay(uint16_t delay_ms);
+    void update_output_delay(uint16_t delay_ms);
 
     // ========================================
     // Helpers
@@ -103,11 +142,12 @@ struct PlayerRole::Impl {
 
     bool send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
                           uint8_t chunk_type, uint32_t timeout_ms) const;
-    void enqueue_state_update(SendspinClientState state) const;
-    void enqueue_stream_event(PlayerStreamCallbackType event) const;
-    void load_static_delay();
-    void persist_static_delay() const;
-    uint16_t get_effective_static_delay_ms() const;
+    /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
+    /// against the live counter before dispatching it.
+    void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation) const;
+    void load_output_delay();
+    void persist_output_delay() const;
+    uint16_t get_effective_output_delay_ms() const;
 
     // ========================================
     // Fields
@@ -127,13 +167,17 @@ struct PlayerRole::Impl {
     std::unique_ptr<SyncTask> sync_task;
 
     // 32-bit fields
-    // Bumped by cleanup() so a drain_events() listener callback that re-enters connection
-    // teardown is detected when control returns: the STREAM_START tail must not re-arm the
-    // sync task for a stream cleanup() just ended. Main-thread only.
-    uint32_t cleanup_generation{0};
+    // Bumped by cleanup() and stamped onto every stream event queued afterwards. At the drain it
+    // decides whether a ring event is still current: a STREAM_START queued before the teardown
+    // must not re-arm the sync task for a stream that is gone. Within drain_events() it also
+    // detects a listener callback that re-entered teardown while the STREAM_START tail was running.
+    // Atomic because the network thread reads it (see accepts()), which loads acquire to pair with
+    // the teardown's read-modify-write; the drain_events() reads are relaxed because they are
+    // same-thread.
+    std::atomic<uint32_t> cleanup_generation{0};
 
     // 16-bit fields
-    std::atomic<uint16_t> static_delay_ms{0};
+    std::atomic<uint16_t> output_delay_ms{0};
 
     // 8-bit fields
     bool high_performance_requested_for_playback{false};
@@ -141,7 +185,9 @@ struct PlayerRole::Impl {
     // True between the drained STREAM_START and STREAM_END callbacks (main-thread only); keeps
     // on_stream_end() from firing without a matching on_stream_start()
     bool stream_active{false};
-    std::atomic<bool> static_delay_adjustable{false};
+    std::atomic<bool> output_delay_adjustable{false};
+    // Set by the client while it is unavailable; read by handle_binary() on the network thread.
+    std::atomic<bool> discard_audio{false};
     uint8_t volume{0};
 };
 

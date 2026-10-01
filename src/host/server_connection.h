@@ -18,41 +18,31 @@
 #pragma once
 
 #include "connection.h"
+#include "platform/types.h"
+#include "sendspin/types.h"
 #include <ixwebsocket/IXWebSocket.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace sendspin {
 
 /**
- * @brief Inbound WebSocket connection from a client to the host server (host build, IXWebSocket)
+ * @brief Inbound WebSocket connection from a server to the host listener (host build, IXWebSocket)
  *
- * Wraps a shared IXWebSocket that is handed off by SendspinWsServer when a client connects.
- * Incoming messages are delivered by calling handle_message() from the server's callback thread.
- * start() and loop() are no-ops because the transport is already open on construction.
- *
- * Usage:
- * 1. Obtain an instance via the NewConnectionCallback set on SendspinWsServer
- * 2. Pass the unique_ptr to SendspinClient for ownership and routing
- * 3. Incoming data arrives via handle_message() called from the server thread
- * 4. Call disconnect() to send a goodbye and close the connection
- *
- * @code
- * ws_server.set_new_connection_callback([&](auto conn) {
- *     int fd = conn->get_sockfd();
- *     // store conn; incoming data arrives via handle_message() on the server thread
- * });
- * @endcode
+ * Wraps a shared IXWebSocket handed off by SendspinWsServer. Incoming messages arrive through
+ * handle_message() on the server's callback thread. start() and loop() are no-ops because the
+ * transport is already open on construction.
  */
 class SendspinServerConnection : public SendspinConnection {
 public:
     /// @brief Constructs a server connection wrapping an IXWebSocket
-    /// @param ws The IXWebSocket shared pointer from the server.
     /// @param sockfd Synthetic socket identifier for connection lookup.
     SendspinServerConnection(std::shared_ptr<ix::WebSocket> ws, int sockfd);
 
-    /// @brief Default destructor
     ~SendspinServerConnection() override = default;
 
     /// @brief No-op on server connections; the transport is already established when this is called
@@ -62,30 +52,34 @@ public:
     void loop() override;
 
     /// @brief Sends a goodbye message and closes the connection
-    /// @param reason Reason for disconnecting.
-    /// @param on_complete Callback invoked after the connection is closed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
-    /// @brief Returns true if the underlying WebSocket connection is open
-    /// @return true if connected, false otherwise.
+    /// @brief Closes the transport immediately without blocking (see base class doc comment).
+    /// Delegates to trigger_close(), the same async primitive disconnect() already uses.
+    void close_transport_now() override;
+
+    /// @brief Whether the underlying WebSocket connection is open
     bool is_connected() const override;
 
     /// @brief Sends a text message to the connected client
-    /// @param message The message string to send.
-    /// @param on_complete Callback invoked after send completes.
-    /// @return SsErr::OK if sent successfully, error code otherwise.
+    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
+    ///        pre-hello gate does not apply.
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
                             bool allow_before_hello) override;
 
     /// @brief Sends a client/time message, capturing the timestamp synchronously before send
-    /// @return true if the message was sent successfully, false otherwise.
     bool send_time_message() override;
+
+    /// @brief Sends a binary message to the connected client
+    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
+    ///        pre-hello gate does not apply.
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
+                              bool allow_before_hello) override;
 
     /// @brief Requests the WebSocket connection to close
     void trigger_close();
 
-    /// @brief Returns the underlying socket file descriptor for this connection
-    /// @return Socket file descriptor, or -1 if not connected.
+    /// @brief The underlying socket file descriptor, or -1 if not connected
     int get_sockfd() const override {
         return this->sockfd_;
     }
@@ -98,6 +92,13 @@ public:
     void handle_message(const std::string& data, bool is_binary, int64_t receive_time);
 
 protected:
+    /// @brief Shared implementation for send_text_message() and send_binary_message()
+    /// @param is_binary Sends as an IX binary frame when true, text frame when false.
+    /// @param data      Payload bytes to send.
+    /// @param len       Number of bytes in `data`.
+    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
+                        const SendCompleteCallback& on_complete);
+
     // Pointer fields
 
     /// @brief The IXWebSocket instance for this connection (shared with the server)

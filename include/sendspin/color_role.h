@@ -35,9 +35,8 @@ using RgbColor = std::array<uint8_t, 3>;
 
 /// @brief Audio-derived color palette received from the server
 ///
-/// Each color field is `nullopt` when the server has not provided that color,
-/// or has explicitly cleared it. The server guarantees WCAG contrast on the
-/// background_dark/background_light variants when present.
+/// Each color field is `nullopt` when the palette the server sent does not carry that color. The
+/// server guarantees WCAG contrast on the background_dark/background_light variants when present.
 struct ServerColorStateObject {
     int64_t timestamp{};
     /// @brief Background color suitable for dark mode; safe contrast with white text and on_dark
@@ -62,19 +61,23 @@ public:
     /// @brief Called when the color palette is updated by the server
     virtual void on_color(const ServerColorStateObject& /*color*/) {}
 
-    /// @brief Called when the connection to the server is lost and cached colors are dropped
+    /// @brief Called when the cached colors are dropped: the connection to the server was lost,
+    /// or a server/activate took the color role out of the session's active roles
     ///
-    /// Implementations should reset any displayed colors to a neutral or default state since the
-    /// previous server's palette is no longer valid.
+    /// Implementations should reset displayed colors to a neutral default. Idempotent by
+    /// contract: a second clear with nothing to clear must be a no-op. A role removed from an
+    /// active session can be added back by a later activation, which resumes with a fresh
+    /// on_color().
     virtual void on_color_clear() {}
 };
 
 /**
  * @brief Color role that receives audio-derived colors from the server
  *
- * Maintains a local shadow of the server's color palette. Incoming color deltas are merged into
- * the shadow and delivered to the listener on the main loop thread once the synchronized client
- * clock reaches the update's `timestamp` (or immediately if there is no active connection).
+ * Maintains a local shadow of the server's color palette. Each palette the server sends carries
+ * the full state, so it replaces the shadow outright. The
+ * palette is delivered to the listener on the main loop thread once the synchronized client clock
+ * reaches its `timestamp` (or immediately if there is no active connection).
  *
  * Usage:
  * 1. Implement ColorRoleListener to receive color updates
@@ -102,9 +105,7 @@ public:
     explicit ColorRole(SendspinClient* client);
     ~ColorRole();
 
-    /// @brief Sets the listener for color events
-    /// @note The listener must outlive this role
-    /// @param listener Pointer to the listener implementation
+    /// @brief Sets the listener for color events; it must outlive this role
     void set_listener(ColorRoleListener* listener);
 
 private:

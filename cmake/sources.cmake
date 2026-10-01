@@ -1,8 +1,22 @@
 # Source file definitions for sendspin-cpp
 
 function(sendspin_get_sources BASE_DIR)
-    # Core sources — always compiled on both ESP-IDF and host
+    # Core sources: always compiled on both ESP-IDF and host
     set(SENDSPIN_CORE_SOURCES
+        # Crypto primitives and Noise-protocol constants/keys (always on: encryption
+        # is not role-gated; see CLAUDE.md #ifdef discipline)
+        ${BASE_DIR}/src/crypto/constants.cpp
+        ${BASE_DIR}/src/crypto/keys.cpp
+        ${BASE_DIR}/src/crypto/cpace.cpp
+        ${BASE_DIR}/src/crypto/pairing_code.cpp
+        ${BASE_DIR}/src/crypto/psk_wrap.cpp
+        ${BASE_DIR}/src/crypto/pairing_token.cpp
+
+        # Noise KKpsk2 session wrapper and handshake state machine
+        ${BASE_DIR}/src/noise_session.cpp
+        ${BASE_DIR}/src/noise_handshake.cpp
+        ${BASE_DIR}/src/noise_transport.cpp
+
         # Audio utilities
         ${BASE_DIR}/src/audio_stream_info.cpp
         ${BASE_DIR}/src/transfer_buffer.cpp
@@ -20,13 +34,19 @@ function(sendspin_get_sources BASE_DIR)
         # Connection management
         ${BASE_DIR}/src/connection_manager.cpp
 
+        # Pairing record store
+        ${BASE_DIR}/src/record_store.cpp
+
+        # Public persistence codec (JSON storage format for the pairing structs)
+        ${BASE_DIR}/src/persistence_codec.cpp
+
         # Client orchestration
         ${BASE_DIR}/src/client.cpp
 
         PARENT_SCOPE
     )
 
-    # Per-role source sets — conditionally compiled based on SENDSPIN_ENABLE_* options
+    # Per-role source sets: conditionally compiled based on SENDSPIN_ENABLE_* options
     set(SENDSPIN_PLAYER_SOURCES
         ${BASE_DIR}/src/player_role.cpp
         ${BASE_DIR}/src/audio_ring_buffer.cpp
@@ -66,17 +86,20 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
-    # ESP-IDF only sources — networking layer deeply coupled to ESP-IDF APIs
+    # ESP-IDF only sources: networking layer deeply coupled to ESP-IDF APIs
     set(SENDSPIN_ESP_SOURCES
         ${BASE_DIR}/src/esp/server_connection.cpp
         ${BASE_DIR}/src/esp/client_connection.cpp
         ${BASE_DIR}/src/esp/ws_server.cpp
         ${BASE_DIR}/src/esp/network_info.cpp
 
+        # noise-c custom RNG hook (NOISE_USE_CUSTOM_RAND=1 on ESP; host uses rand_os.c instead)
+        ${BASE_DIR}/src/esp/noise_rand.cpp
+
         PARENT_SCOPE
     )
 
-    # Host only sources — IXWebSocket-based networking
+    # Host only sources: IXWebSocket-based networking
     set(SENDSPIN_HOST_SOURCES
         ${BASE_DIR}/src/host/ws_server.cpp
         ${BASE_DIR}/src/host/server_connection.cpp

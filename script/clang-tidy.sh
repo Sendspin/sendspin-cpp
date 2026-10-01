@@ -56,5 +56,18 @@ if [ "$1" = "--fix" ]; then
     FIX_FLAG="--fix"
 fi
 
+# A non-Apple clang-tidy (e.g. Homebrew LLVM) does not know where the macOS SDK keeps the
+# standard library headers, so point it there. If xcrun cannot report an SDK path, clang-tidy
+# runs without a sysroot
+EXTRA_ARGS=()
+if [ "$(uname)" = "Darwin" ] && command -v xcrun &> /dev/null; then
+    SDK_PATH="$(xcrun --show-sdk-path 2>/dev/null || true)"
+    if [ -n "$SDK_PATH" ]; then
+        EXTRA_ARGS=(--extra-arg=-isysroot "--extra-arg=$SDK_PATH")
+    else
+        echo "Note: no macOS SDK found (xcrun --show-sdk-path failed), running clang-tidy without a sysroot" >&2
+    fi
+fi
+
 echo "Running clang-tidy..."
-$CLANG_TIDY -p "$BUILD_DIR" $FIX_FLAG $SOURCES
+$CLANG_TIDY -p "$BUILD_DIR" $FIX_FLAG "${EXTRA_ARGS[@]}" $SOURCES

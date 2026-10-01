@@ -31,95 +31,33 @@ bool has_bit(uint32_t bits, uint32_t bit) {
     return (bits & bit) != 0;
 }
 
-// Simple two-field aggregate used to exercise InboxSlot::merge() with a non-scalar type.
-struct IntPair {
-    int a{0};
-    int b{0};
-};
-
-void merge_int_pair(IntPair& current, IntPair&& delta) {
-    current.a += delta.a;
-    current.b += delta.b;
-}
-
-TEST(InboxSlot, WriteTakeRoundtrip) {
+// One slot's whole lifecycle: a clean slot holds nothing and sets no bit, a write publishes the
+// value under this slot's topic bit alone, a take hands the value back and clears that bit, and
+// reset drops both. The steps are one behavior because each is only meaningful against the state
+// the previous one left.
+TEST(InboxSlot, SlotLifecycle) {
     Inbox inbox;
     InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
+    InboxSlot<int> other(inbox, INBOX_TOPIC_CONTROLLER);
+
+    int value = -1;
+    EXPECT_FALSE(slot.take(value)) << "a clean slot handed out content";
+    EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
 
     slot.write(42);
+    other.write(7);
+    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
 
-    int value = 0;
     ASSERT_TRUE(slot.take(value));
     EXPECT_EQ(value, 42);
-}
-
-TEST(InboxSlot, TakeOnCleanSlotReturnsFalseWithNoBitSet) {
-    Inbox inbox;
-    InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
-
-    int value = -1;
-    EXPECT_FALSE(slot.take(value));
     EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-}
-
-TEST(InboxSlot, WriteSetsTopicBitAndTakeClearsIt) {
-    Inbox inbox;
-    InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
-
-    slot.write(7);
-    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-
-    int value = 0;
-    ASSERT_TRUE(slot.take(value));
-    EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-}
-
-TEST(InboxSlot, ResetClearsContentAndBit) {
-    Inbox inbox;
-    InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
+    // Draining one slot leaves every other topic's bit standing, so the main loop still visits it.
+    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_CONTROLLER));
 
     slot.write(99);
-    ASSERT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-
     slot.reset();
     EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-
-    int value = -1;
-    EXPECT_FALSE(slot.take(value));
-}
-
-TEST(InboxSlot, MergeAccumulatesAcrossCalls) {
-    Inbox inbox;
-    InboxSlot<IntPair> slot(inbox, INBOX_TOPIC_METADATA);
-
-    slot.merge(merge_int_pair, IntPair{1, 10});
-    slot.merge(merge_int_pair, IntPair{2, 20});
-    slot.merge(merge_int_pair, IntPair{3, 30});
-
-    IntPair result{};
-    ASSERT_TRUE(slot.take(result));
-    EXPECT_EQ(result.a, 6);
-    EXPECT_EQ(result.b, 60);
-
-    // The merged value is delivered exactly once.
-    IntPair second{};
-    EXPECT_FALSE(slot.take(second));
-}
-
-TEST(InboxSlot, DrainingOneSlotLeavesOtherSlotBitSet) {
-    Inbox inbox;
-    InboxSlot<int> group_slot(inbox, INBOX_TOPIC_GROUP);
-    InboxSlot<int> controller_slot(inbox, INBOX_TOPIC_CONTROLLER);
-
-    group_slot.write(1);
-    controller_slot.write(2);
-    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_CONTROLLER));
-
-    int value = 0;
-    ASSERT_TRUE(group_slot.take(value));
-    EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_CONTROLLER));
+    EXPECT_FALSE(slot.take(value)) << "reset left content behind";
 }
 
 TEST(Inbox, RingPreservesFifoOrder) {
@@ -224,9 +162,53 @@ TEST(Inbox, TimeResponsePayloadRoundtrips) {
     EXPECT_EQ(out[0].time.source_id, 42u);
 }
 
+// The epoch a producer stamps must reach the consumer per event, not per ring: it is what
+// event_is_current() compares against, and an epoch that did not survive the round trip would
+// read as 0, which is the fail-open direction ("the role was never torn down").
+TEST(Inbox, EventEpochRoundtripsPerEvent) {
+    Inbox inbox;
+
+    for (uint32_t epoch : {7U, 0U, 8U}) {
+        InboxEvent event{};
+        event.type = InboxEventType::PLAYER_STREAM;
+        event.epoch = epoch;
+        ASSERT_TRUE(inbox.push_event(event)) << "epoch=" << epoch;
+    }
+
+    InboxEvent out[3];
+    ASSERT_EQ(inbox.take_events(out, 3), 3u);
+    EXPECT_EQ(out[0].epoch, 7u);
+    EXPECT_EQ(out[1].epoch, 0u);
+    EXPECT_EQ(out[2].epoch, 8u);
+}
+
+// push_event_or_log() stamps the epoch its caller passes, and event_is_current() admits only the
+// event whose epoch still matches the role's teardown generation. Together they are the discard
+// that keeps a lifecycle event queued before a teardown from acting after it; the dispatch that
+// acts on the predicate is covered by
+// RoleDeactivation.StreamStartQueuedBeforeARemovalNeverStarts.
+TEST(Inbox, OnlyTheEventStampedWithTheCurrentGenerationPassesTheCurrencyCheck) {
+    Inbox inbox;
+
+    push_event_or_log(&inbox, InboxEventType::PLAYER_STREAM, /*code=*/1, "test", "STREAM_START",
+                      /*epoch=*/4);
+    push_event_or_log(&inbox, InboxEventType::PLAYER_STREAM, /*code=*/2, "test", "STREAM_END",
+                      /*epoch=*/5);
+
+    InboxEvent out[2];
+    ASSERT_EQ(inbox.take_events(out, 2), 2u);
+    EXPECT_EQ(out[0].epoch, 4u);
+    EXPECT_EQ(out[1].epoch, 5u);
+
+    // The role has since been torn down once, so its generation is 5.
+    EXPECT_FALSE(event_is_current(out[0].epoch, /*role_epoch=*/5, "test", "STREAM_START"));
+    // Control: the event queued after that teardown is dispatched.
+    EXPECT_TRUE(event_is_current(out[1].epoch, /*role_epoch=*/5, "test", "STREAM_END"));
+}
+
 // Concurrency smoke test: one producer thread interleaves slot merges and event pushes while the
 // main thread polls and drains until it has observed everything the producer sent. Overflow
-// (drop-newest) is allowed to happen -- the producer only counts pushes that actually succeeded,
+// (drop-newest) is allowed to happen: the producer only counts pushes that actually succeeded,
 // so the assertions hold whether or not the ring ever fills up under scheduling pressure.
 TEST(Inbox, ConcurrentProducerDrainedWithoutLossOrDuplication) {
     constexpr int kIterations = 10000;
@@ -303,7 +285,7 @@ TEST(Inbox, ConcurrentProducerDrainedWithoutLossOrDuplication) {
             // producer_done == true here (acquire) synchronizes-with that store and makes all of
             // the producer's prior pending_ writes visible to the poll() sequenced after it. A
             // bit set right before the producer finished is therefore guaranteed to be seen by
-            // this re-poll -- release/acquire publishes every prior write, not just the flag.
+            // this re-poll: release/acquire publishes every prior write, not just the flag.
             if (producer_done.load(std::memory_order_acquire) && inbox.poll() == 0) {
                 break;
             }

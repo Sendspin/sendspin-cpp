@@ -18,8 +18,15 @@
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "server_connection.h"
+#include <ixwebsocket/IXConnectionState.h>
+#include <ixwebsocket/IXSocketServer.h>
+#include <ixwebsocket/IXWebSocket.h>
+#include <ixwebsocket/IXWebSocketMessage.h>
+#include <ixwebsocket/IXWebSocketMessageType.h>
 
 #include <atomic>
+#include <cstddef>
+#include <utility>
 
 namespace sendspin {
 
@@ -39,7 +46,7 @@ SendspinWsServer::~SendspinWsServer() {
 }
 
 bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*/,
-                             unsigned /*task_priority*/) {
+                             unsigned /*task_priority*/, size_t /*task_stack_size*/) {
     if (this->server_ != nullptr) {
         SS_LOGW(TAG, "Server already started");
         return true;

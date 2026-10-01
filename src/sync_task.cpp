@@ -15,6 +15,8 @@
 #include "sync_task.h"
 
 #include "audio_utils.h"
+#include "connection.h"
+#include "connection_manager.h"
 #include "constants.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
@@ -37,8 +39,6 @@ static constexpr int64_t HARD_SYNC_THRESHOLD_US = 5000;
 static constexpr int64_t HARD_SYNC_SETTLE_THRESHOLD_US =
     500;  // Tighter threshold used while settling after a hard sync
 static constexpr int64_t SOFT_SYNC_THRESHOLD_US = 100;
-
-static constexpr uint32_t INITIAL_SYNC_ZEROS_DURATION_MS = 25;
 
 static constexpr size_t SYNC_TASK_STACK_SIZE = 6192;  // Opus uses more stack than FLAC
 
@@ -92,9 +92,8 @@ SyncTask::~SyncTask() {
     this->stop();
 }
 
-bool SyncTask::init(PlayerRole::Impl* player_impl, SendspinClient* client, size_t buffer_size) {
+bool SyncTask::init(PlayerRole::Impl* player_impl, size_t buffer_size) {
     this->player_impl_ = player_impl;
-    this->client_ = client;
 
     if (!this->event_flags_.create()) {
         SS_LOGE(TAG, "Couldn't create event flags.");
@@ -209,7 +208,7 @@ SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
 
     if (sync_context.silence_remaining == 0) {
         sync_context.silence_remaining = frame_aligned_silence_bytes(
-            sync_context.current_stream_info, INITIAL_SYNC_ZEROS_DURATION_MS);
+            sync_context.current_stream_info, PlayerRoleConfig::INITIAL_SYNC_PRIMING_MS);
     }
     this->send_pending_silence(sync_context);
 
@@ -217,10 +216,11 @@ SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
 }
 
 SyncTaskState SyncTask::handle_load_chunk(SyncContext& sync_context) {
-    if (!this->client_->is_time_synced()) {
+    if (this->stream_connection_ == nullptr || !this->stream_connection_->is_time_synced()) {
         // Wait for the time filter to receive its first measurement before processing audio chunks.
         // Without a valid time offset, server timestamps can't be correctly converted to client
-        // timestamps.
+        // timestamps. A stream that began with no current connection has no filter to wait on and
+        // stays here until it ends; the next stream resolves the pin again.
         std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_FOR_TIME_SYNC_MS));
         return SyncTaskState::LOAD_CHUNK;
     }
@@ -261,13 +261,11 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
 
     if ((raw_error > active_threshold) || (raw_error < -active_threshold)) {
         // A hard sync is needed. While aligning (initial-sync priming/alignment or post-seek
-        // re-alignment) hard syncs are expected, so they do not report an error. Otherwise this is
-        // an unexpected loss of sync (e.g. buffer underrun): report ERROR once and keep filling
-        // with silence until we re-align, at which point SYNCHRONIZED is reported.
-        if (!sync_context.aligning && !sync_context.reported_error) {
-            sync_context.reported_error = true;
-            this->player_impl_->enqueue_state_update(SendspinClientState::ERROR);
-            SS_LOGW(TAG, "Lost sync (%" PRId64 "us off), reporting error", raw_error);
+        // re-alignment) hard syncs are expected. Otherwise this is an unexpected loss of sync
+        // (e.g. buffer underrun): log it once and keep filling with silence until we re-align.
+        if (!sync_context.aligning && !sync_context.sync_lost) {
+            sync_context.sync_lost = true;
+            SS_LOGW(TAG, "Lost sync (%" PRId64 "us off)", raw_error);
         }
     }
 
@@ -323,13 +321,11 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
         // corrections
         sync_context.hard_syncing = false;
 
-        // First in-tolerance alignment completes initial-sync/post-seek alignment. If we had
-        // reported a sync error, we have now recovered: report SYNCHRONIZED.
+        // First in-tolerance alignment completes alignment and ends a loss of sync.
         sync_context.aligning = false;
-        if (sync_context.reported_error) {
-            sync_context.reported_error = false;
-            this->player_impl_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
-            SS_LOGI(TAG, "Regained sync, reporting synchronized");
+        if (sync_context.sync_lost) {
+            sync_context.sync_lost = false;
+            SS_LOGI(TAG, "Regained sync");
         }
 
         if (raw_error > SOFT_SYNC_THRESHOLD_US) {
@@ -592,9 +588,11 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             }
         }
     } else if (sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) {
+        // An encoded-audio chunk only reaches here through handle_load_chunk(), which returns
+        // early unless the stream pin is live, so the pin is non-null.
         int64_t client_timestamp =
-            this->client_->get_client_time(sync_context.encoded_entry->timestamp) -
-            static_cast<int64_t>(this->player_impl_->get_effective_static_delay_ms()) * US_PER_MS -
+            this->stream_connection_->get_client_time(sync_context.encoded_entry->timestamp) -
+            static_cast<int64_t>(this->player_impl_->get_effective_output_delay_ms()) * US_PER_MS -
             this->player_impl_->config.fixed_delay_us;
 
         if (client_timestamp < sync_context.new_audio_client_playtime - HARD_SYNC_THRESHOLD_US) {
@@ -604,32 +602,11 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             return DecodeResult::SKIPPED;
         }
 
-        size_t decoded_size = 0;
-        bool decoded = sync_context.decoder->decode_audio_chunk(
-            sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
-            sync_context.decode_buffer->get_buffer_end(), sync_context.decode_buffer->free(),
-            &decoded_size);
-        if (!decoded) {
-            // The decoder raises its decoded-size estimate when it meets an unusually large chunk
-            // (e.g. a multi-frame Opus packet bigger than the typical 20ms buffer). Grow the
-            // buffer to the new estimate (plus the reserved spare frame) and retry once.
-            size_t needed =
-                sync_context.decoder->get_decode_buffer_size() + sync_context.bytes_per_frame;
-            if (needed > sync_context.decode_buffer->capacity() &&
-                sync_context.decode_buffer->reallocate(needed)) {
-                decoded = sync_context.decoder->decode_audio_chunk(
-                    sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
-                    sync_context.decode_buffer->get_buffer_end(),
-                    sync_context.decode_buffer->free(), &decoded_size);
-            }
-        }
-        if (!decoded) {
-            SS_LOGE(TAG, "Failed to decode audio chunk");
+        if (!decode_whole_chunk(sync_context)) {
             this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
             sync_context.encoded_entry = nullptr;
             return DecodeResult::FAILED;
         }
-        sync_context.decode_buffer->increase_buffer_length(decoded_size);
         sync_context.decoded_timestamp = client_timestamp;
     }
 
@@ -638,6 +615,57 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
     sync_context.encoded_entry = nullptr;
 
     return DecodeResult::SUCCESS;
+}
+
+bool SyncTask::decode_whole_chunk(SyncContext& sync_context) {
+    const uint8_t* input = sync_context.encoded_entry->data();
+    size_t remaining = sync_context.encoded_entry->data_size;
+    size_t produced = 0;
+    // roles/player/v1.md "Server Audio Send Constraints": no chunk is longer than 150 ms, which
+    // also caps the buffer at 150 ms plus one decoder unit.
+    const size_t max_produced = sync_context.current_stream_info.ms_to_bytes(MAX_AUDIO_CHUNK_MS);
+    while (remaining > 0 && produced <= max_produced) {
+        // Room for the decoder's next unit, plus the spare frame soft sync inserts into.
+        const size_t unit_size = sync_context.decoder->get_decode_buffer_size();
+        const size_t needed_free = unit_size + sync_context.bytes_per_frame;
+        if (sync_context.decode_buffer->free() < needed_free &&
+            !sync_context.decode_buffer->reallocate(sync_context.decode_buffer->available() +
+                                                    needed_free)) {
+            SS_LOGE(TAG, "Failed to grow decode buffer");
+            break;
+        }
+
+        size_t consumed = 0;
+        size_t decoded_size = 0;
+        if (!sync_context.decoder->decode_audio_chunk(
+                input, remaining, sync_context.decode_buffer->get_buffer_end(),
+                sync_context.decode_buffer->free() - sync_context.bytes_per_frame, &consumed,
+                &decoded_size)) {
+            break;
+        }
+        sync_context.decode_buffer->increase_buffer_length(decoded_size);
+        produced += decoded_size;
+        input += consumed;
+        remaining -= consumed;
+
+        // A call with the room it asked for that neither progressed nor raised its estimate
+        // would repeat forever.
+        if (consumed == 0 && sync_context.decoder->get_decode_buffer_size() == unit_size) {
+            break;
+        }
+    }
+
+    if (remaining == 0 && produced <= max_produced) {
+        return true;
+    }
+    // All or nothing. The buffer was empty on entry, so this drops just this chunk's output.
+    sync_context.decode_buffer->decrease_buffer_length(produced);
+    if (produced > max_produced) {
+        SS_LOGE(TAG, "Audio chunk decodes to more than %" PRIu32 " ms", MAX_AUDIO_CHUNK_MS);
+    } else {
+        SS_LOGE(TAG, "Failed to decode audio chunk");
+    }
+    return false;
 }
 
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
@@ -696,8 +724,8 @@ void SyncTask::apply_stream_clear(SyncContext& sync_context) {
     sync_context.silence_remaining = 0;
     sync_context.release_chunk = false;
     sync_context.hard_syncing = true;
-    // Post-seek re-alignment hard syncs are expected, not a loss of sync. Leave reported_error
-    // as-is so a pre-seek error still recovers to SYNCHRONIZED once we re-align.
+    // Post-seek re-alignment hard syncs are expected, not a loss of sync. Leave sync_lost as-is
+    // so a pre-seek loss of sync still logs its recovery once we re-align.
     sync_context.aligning = true;
     if (sync_context.decode_buffer != nullptr) {
         sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
@@ -732,7 +760,21 @@ void SyncTask::discard_to_clear_marker(SyncContext& sync_context) {
     this->apply_stream_clear(sync_context);
 }
 
+void SyncTask::release_stream_pin() {
+    if (this->stream_connection_ == nullptr) {
+        return;
+    }
+    // Hand it to the manager rather than dropping it here: the destructor must not run on the
+    // audio thread (see DeferredRelease). One lock take per stream.
+    this->conn_manager_->release_from_role_thread(std::move(this->stream_connection_));
+}
+
 void SyncTask::reset_context(SyncContext& sync_context) {
+    // Backstop only: an outer-loop path that skipped the release after the inner loop must not
+    // carry a pin into the next stream. This runs after TASK_IDLE is published, so it does not
+    // stand in for the ordered release in thread_entry().
+    this->release_stream_pin();
+
     // Reset SyncContext between streams without deallocating buffers.
     sync_context.encoded_entry = nullptr;
     sync_context.decoded_timestamp = 0;
@@ -744,7 +786,7 @@ void SyncTask::reset_context(SyncContext& sync_context) {
     sync_context.initial_decode = true;
     sync_context.hard_syncing = true;
     sync_context.aligning = true;
-    sync_context.reported_error = false;
+    sync_context.sync_lost = false;
     sync_context.silence_remaining = 0;
 
     // Empty the decode buffer without deallocating
@@ -889,9 +931,22 @@ void SyncTask::thread_entry(void* params) {
         // buffered_frames tracking.
         this_task->playback_progress_slot_.reset();
 
-        this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
+        // Pin the connection whose time filter converts this stream's timestamps. The filter is
+        // created once per connection (SendspinConnection::init_time_filter()) and never replaced,
+        // and the admitted slot cannot be handed to another server without ending this stream
+        // first: ConnectionManager::drop_connection() runs cleanup_connection_state() on the
+        // outgoing connection before a promotion installs the successor. An in-band re-handshake
+        // keeps the same connection object. Holding it for the stream keeps the per-chunk
+        // conversion off conn_ptr_mutex_, and keeping a dropped connection alive a little longer
+        // is what the deferred-release design already expects (see DeferredRelease). Resolved
+        // before TASK_RUNNING is published, so a reader that sees the task running sees a stream
+        // whose pin is settled. The lock wait therefore sits inside the window where the task
+        // reads neither idle nor running, which is safe because every STREAM_END producer sets
+        // COMMAND_STREAM_END before enqueuing the event, so the sync-idle gate that reads
+        // is_running() can only release an end the task is already commanded to honour.
+        this_task->stream_connection_ = this_task->conn_manager_->current_shared();
 
-        this_task->player_impl_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
+        this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
         // Decode the initial codec header
         if (sync_context.encoded_entry != nullptr) {
@@ -934,11 +989,22 @@ void SyncTask::thread_entry(void* params) {
             }
         }
 
-        // Return any borrowed ring buffer entry
+        // Return any borrowed ring buffer entry ahead of the pin hand-over below, which blocks
+        // on the manager lock: a network thread can be parked on ring space for as long as
+        // HEADER_SEND_TIMEOUT_MS and this task is its only drainer. The stream-start pin above
+        // takes the same lock with the codec header still borrowed; that is not a cycle either,
+        // since no path takes conn_ptr_mutex_ and then blocks on ring space.
         if (sync_context.encoded_entry != nullptr) {
             this_task->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
             sync_context.encoded_entry = nullptr;
         }
+
+        // Give the pin back before the task reports idle, so a connection dropped during the
+        // stream is freed on the next flush rather than outliving it. The position matters: the
+        // STREAM_END drain gate keys on is_running(), so the pin must be gone before the task
+        // reads idle. Every outer-loop exit below this point goes through here; reset_context()
+        // repeats the call at the top of the next iteration as a backstop.
+        this_task->release_stream_pin();
 
         if (this_task->event_flags_.get() & COMMAND_STOP) {
             break;

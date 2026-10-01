@@ -26,34 +26,50 @@
 /// Options:
 ///   -u URL    Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)
 ///   -p PORT   Listen on PORT (default: 8928)
+///   -s CODE   Offer the static pairing code CODE (8 digits) instead of the dynamic one
 ///   -l LEVEL  Set log level: none, error, warn, info (default), debug, verbose
 ///   -v        Verbose logging (same as -l verbose)
 ///   -q        Quiet logging (same as -l error)
 ///   -h        Show usage
 
 #include "sendspin/client.h"
+#include "sendspin/config.h"
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#include "sendspin/types.h"
+#include "file_persistence_provider.h"
+// The audio sink exists to feed the player, so it follows the player's compile gate as well as
+// PortAudio's availability.
+#if defined(SENDSPIN_HAS_PORTAUDIO) && defined(SENDSPIN_ENABLE_PLAYER)
+#define BASIC_CLIENT_HAS_AUDIO_SINK
+#endif
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
 #include "portaudio_sink.h"
 #endif
 
 #include <getopt.h>
 
 #ifdef SENDSPIN_HAS_MDNS
+// IWYU pragma: begin_keep
+// The include-what-you-use checker misattributes arpa/inet.h's htons/ntohs/htonl/ntohl to
+// macOS libc++'s private headers when analyzed on a macOS host toolchain; arpa/inet.h is
+// still the correct, portable header on both macOS and Linux CI.
 #include <arpa/inet.h>
+// IWYU pragma: end_keep
 #include <dns_sd.h>
 #endif
 
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <utility>
 
 using namespace sendspin;
 
@@ -61,7 +77,9 @@ static constexpr uint16_t DEFAULT_SENDSPIN_PORT = SendspinClientConfig::DEFAULT_
 static const char* SENDSPIN_PATH = "/sendspin";
 
 // Tracks total audio bytes received (used when PortAudio is unavailable)
+#if defined(SENDSPIN_ENABLE_PLAYER) && !defined(BASIC_CLIENT_HAS_AUDIO_SINK)
 static size_t null_audio_total_bytes = 0;
+#endif
 
 #ifdef SENDSPIN_HAS_MDNS
 // Manages mDNS service advertisement via dns_sd.h
@@ -120,8 +138,23 @@ private:
 
 static std::atomic<bool> running{true};
 
+/// The pairing-window gesture and its cancellation, relayed from a signal handler: SIGUSR1 opens
+/// the window pairing.md "Pairing Window" gates every static_pairing_code attempt on, SIGUSR2
+/// closes it. A headless example has no button to press, and a flag is the one thing a signal
+/// handler may safely set.
+static std::atomic<bool> window_gesture{false};
+static std::atomic<bool> window_cancel{false};
+
 static void signal_handler(int /*sig*/) {
     running.store(false);
+}
+
+static void window_signal_handler(int sig) {
+    if (sig == SIGUSR1) {
+        window_gesture.store(true);
+    } else {
+        window_cancel.store(true);
+    }
 }
 
 static void print_usage(const char* prog) {
@@ -130,6 +163,9 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -u URL        Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)\n");
     fprintf(stderr, "  -p PORT       Listen on PORT (default: %u)\n", DEFAULT_SENDSPIN_PORT);
+    fprintf(stderr, "  -s CODE       Offer the static pairing code CODE (8 digits) instead of\n");
+    fprintf(stderr, "                the dynamic one; SIGUSR1 is the pairing-window gesture and\n");
+    fprintf(stderr, "                SIGUSR2 cancels it\n");
     fprintf(stderr, "  -l LEVEL      Log level: none, error, warn, info (default), debug, verbose\n");
     fprintf(stderr, "  -v            Verbose logging (same as -l verbose)\n");
     fprintf(stderr, "  -q            Quiet logging (same as -l error)\n");
@@ -160,16 +196,28 @@ int main(int argc, char* argv[]) {
     // Set up signal handler for clean shutdown
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+    std::signal(SIGUSR1, window_signal_handler);
+    std::signal(SIGUSR2, window_signal_handler);
 
     // Parse command line options
     LogLevel log_level = LogLevel::INFO;
     std::string connect_url;
+    std::string static_pairing_code;
     uint16_t server_port = DEFAULT_SENDSPIN_PORT;
     int opt;
-    while ((opt = getopt(argc, argv, "u:p:l:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:s:l:vqh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
+                break;
+            case 's':
+                static_pairing_code = optarg;
+                if (static_pairing_code.size() != 8 ||
+                    static_pairing_code.find_first_not_of("0123456789") != std::string::npos) {
+                    fprintf(stderr, "Static pairing code must be exactly 8 digits: %s\n", optarg);
+                    print_usage(argv[0]);
+                    return 1;
+                }
                 break;
             case 'p':
                 if (!parse_port(optarg, server_port)) {
@@ -207,21 +255,43 @@ int main(int argc, char* argv[]) {
 
     // Configure the client
     SendspinClientConfig config;
-    config.client_id = "basic-client-example";
+    // client_id is derived from the static X25519 keypair; do not set it here.
     config.name = friendly_name;
     config.product_name = "sendspin-cpp host example";
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
     config.server_port = server_port;
+    if (static_pairing_code.empty()) {
+        // The example prints the pairing code to the terminal, so the client can advertise the
+        // dynamic_pairing_code method alongside the mandatory pairing_psk one. A terminal is a
+        // display but cannot render a QR code, so only the digits format is offered.
+        config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+        config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
+    } else {
+        // A device offers at most one pairing-code method (messaging.md "client/hello"), and one
+        // with an out-channel offers the dynamic code, so offering the static one means leaving
+        // the out-channel unset. Every static_pairing_code attempt is gesture-gated
+        // (pairing.md "Pairing Window"), which SIGUSR1 stands in for here.
+        config.pairing_window_supported = true;
+        config.static_pairing_code = static_pairing_code;
+        config.static_pairing_code_locations = {"device"};
+    }
 
     // Create audio output and client
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
     PortAudioSink audio_sink;
 #endif
 
+    // Persist the static keypair (and pairing state) so client_id and pairing records survive
+    // restarts. Path: $HOME/.sendspin.json (regenerated if the file is absent).
+    const std::string persistence_path = FilePersistenceProvider::default_path(".sendspin.json");
+    FilePersistenceProvider persistence_provider(persistence_path);
+
     SendspinClient client(std::move(config));
+    client.set_persistence_provider(&persistence_provider);
 
     // Add roles
+#ifdef SENDSPIN_ENABLE_PLAYER
     PlayerRoleConfig player_config;
     player_config.audio_formats = {
         {SendspinCodecFormat::FLAC, 2, 44100, 16},
@@ -233,24 +303,28 @@ int main(int argc, char* argv[]) {
         {SendspinCodecFormat::PCM, 2, 48000, 16},
     };
     auto& player = client.add_player(std::move(player_config));
-    player.set_static_delay_adjustable(true);
-    auto& controller = client.add_controller();
+    player.set_output_delay_adjustable(true);
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    // Added for its side effect: the client offers the role and accepts server/state for it.
+    (void)client.add_controller();
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     auto& metadata = client.add_metadata();
-
-    // Suppress unused variable warnings for roles used only for their side effects
-    (void)controller;
+#endif
 
     // --- Listener implementations ---
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     struct BasicPlayerListener : PlayerRoleListener {
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
         PortAudioSink& sink;
         PlayerRole& player;
         BasicPlayerListener(PortAudioSink& s, PlayerRole& p) : sink(s), player(p) {}
 #endif
 
         size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
             return sink.write(data, length, timeout_ms);
 #else
             (void)data;
@@ -262,7 +336,7 @@ int main(int argc, char* argv[]) {
 
         void on_stream_start() override {
             fprintf(stderr, ">>> Stream started\n");
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
             auto& params = player.get_current_stream_params();
             if (params.sample_rate.has_value() && params.channels.has_value() &&
                 params.bit_depth.has_value()) {
@@ -275,17 +349,19 @@ int main(int argc, char* argv[]) {
 
         void on_stream_end() override {
             fprintf(stderr, ">>> Stream ended\n");
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
             sink.clear();
 #endif
         }
 
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
         void on_volume_changed(uint8_t vol) override { sink.set_volume(vol); }
         void on_mute_changed(bool muted) override { sink.set_muted(muted); }
 #endif
     };
+#endif
 
+#ifdef SENDSPIN_ENABLE_METADATA
     struct BasicMetadataListener : MetadataRoleListener {
         void on_metadata(const ServerMetadataStateObject& md) override {
             if (md.title.has_value()) {
@@ -294,6 +370,7 @@ int main(int argc, char* argv[]) {
             }
         }
     };
+#endif
 
     struct BasicClientListener : SendspinClientListener {
         void on_time_sync_updated(float error) override {
@@ -301,26 +378,86 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, ">>> Time sync error: %.1f us\n", error);
             }
         }
+
+        void on_trust_changed(ConnectionTrust trust) override {
+            if (trust == ConnectionTrust::USER) {
+                fprintf(stderr, ">>> Trust: user (paired server)\n");
+            } else {
+                fprintf(stderr, ">>> Trust: none (unpaired)\n");
+            }
+        }
+
+        void on_pairing_started(const std::string& server_id) override {
+            fprintf(stderr, ">>> Pairing started with server: %s\n", server_id.c_str());
+        }
+
+        void on_pairing_succeeded(const std::string& server_id) override {
+            fprintf(stderr, ">>> Pairing succeeded with server: %s\n", server_id.c_str());
+            fprintf(stderr, "    Long-term record stored. Future connections from this server\n");
+            fprintf(stderr, "    will be trusted (ConnectionTrust::USER).\n");
+        }
+
+        void on_pairing_failed(const std::string& server_id,
+                               SendspinPairAbortReason reason) override {
+            fprintf(stderr, ">>> Pairing failed with server: %s (reason %d)\n", server_id.c_str(),
+                    static_cast<int>(reason));
+        }
+
+        void on_display_pairing_code(const std::string& code,
+                                     SendspinPairingCodeFormat format) override {
+            if (format == SendspinPairingCodeFormat::QR_CODE) {
+                // This example never offers qr_code (a terminal cannot render one), so a server
+                // can only select digits.
+                fprintf(stderr, "\n>>> Pairing token: %s\n", code.c_str());
+                fprintf(stderr, "    Scan or paste this into the server to finish pairing.\n\n");
+                return;
+            }
+            // pairing.md "Pairing Code Presentation" asks for a 3-3 grouping; the separator is
+            // presentation only and never part of the code the operator types.
+            fprintf(stderr, "\n>>> Pairing code: %s-%s\n", code.substr(0, 3).c_str(),
+                    code.substr(3).c_str());
+            fprintf(stderr, "    Enter this code on the server to finish pairing.\n\n");
+        }
+
+        void on_clear_pairing_code() override {
+            fprintf(stderr, ">>> Pairing code withdrawn\n");
+        }
+
+        void on_open_pairing_window() override {
+            fprintf(stderr,
+                    "\n>>> Pairing window gesture required: send SIGUSR1 to this process to "
+                    "allow the attempt (SIGUSR2 cancels it).\n\n");
+        }
+
+        void on_close_pairing_window() override {
+            fprintf(stderr, ">>> Pairing window prompt dismissed\n");
+        }
     };
 
     struct HostNetworkProvider : SendspinNetworkProvider {
         bool is_network_ready() override { return true; }
     };
 
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
     BasicPlayerListener player_listener(audio_sink, player);
     audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
         player.notify_audio_played(frames, timestamp);
     };
-#else
+#elif defined(SENDSPIN_ENABLE_PLAYER)
     BasicPlayerListener player_listener;
 #endif
+#ifdef SENDSPIN_ENABLE_METADATA
     BasicMetadataListener metadata_listener;
+#endif
     BasicClientListener client_listener;
     HostNetworkProvider network_provider;
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     player.set_listener(&player_listener);
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     metadata.set_listener(&metadata_listener);
+#endif
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
 
@@ -330,6 +467,20 @@ int main(int argc, char* argv[]) {
     if (!client.start()) {
         fprintf(stderr, "Failed to start server\n");
         return 1;
+    }
+
+    // client_id is base64url(static X25519 public key), 43 chars.
+    // The server uses this to identify the client. The keypair is persisted in
+    // ~/.sendspin.json and regenerated only if the file is absent.
+    fprintf(stderr, "client_id: %s\n", client.client_id().c_str());
+    fprintf(stderr, "Persistence: %s\n", persistence_path.c_str());
+
+    // The pairing token carries the client_id and the Pairing PSK together. Paste it into a
+    // server that asks for one to pair via the pairing_psk method; pairing with a code instead
+    // needs nothing from here (the code is printed when the server starts that flow).
+    auto token = client.pairing_token();
+    if (token.has_value()) {
+        fprintf(stderr, "Pairing token: %s\n", token->c_str());
     }
 
 #ifdef SENDSPIN_HAS_MDNS
@@ -358,8 +509,16 @@ int main(int argc, char* argv[]) {
     // Main loop
     int tick = 0;
     while (running.load()) {
+        if (window_gesture.exchange(false)) {
+            fprintf(stderr, ">>> Pairing window gesture received\n");
+            client.confirm_pairing_window();
+        }
+        if (window_cancel.exchange(false)) {
+            fprintf(stderr, ">>> Pairing window cancelled\n");
+            client.cancel_pairing_window();
+        }
         client.loop();
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
         // Sync audio sink volume periodically (catches all volume change sources)
         if (++tick % 25 == 0) {
             audio_sink.set_volume(player.get_volume());
@@ -377,7 +536,7 @@ int main(int argc, char* argv[]) {
 #endif
     client.stop();
 
-#ifndef SENDSPIN_HAS_PORTAUDIO
+#if defined(SENDSPIN_ENABLE_PLAYER) && !defined(BASIC_CLIENT_HAS_AUDIO_SINK)
     fprintf(stderr, "Total audio bytes received: %zu\n", null_audio_total_bytes);
 #endif
     return 0;

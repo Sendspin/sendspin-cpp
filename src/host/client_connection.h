@@ -18,9 +18,13 @@
 #pragma once
 
 #include "connection.h"
+#include "platform/types.h"
+#include "sendspin/types.h"
 #include <ixwebsocket/IXWebSocket.h>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -30,32 +34,14 @@ namespace sendspin {
 /**
  * @brief Outbound WebSocket connection to a Sendspin server (host build, IXWebSocket)
  *
- * Connects to a server URL, delivers incoming messages via the base class callbacks,
- * and automatically reconnects after connection loss. Call loop() periodically to
- * drive the reconnect timer.
- *
- * Usage:
- * 1. Construct with the server WebSocket URL
- * 2. Set the message and state callbacks on the base SendspinConnection
- * 3. Call start() to open the connection
- * 4. Call loop() from the client's periodic task
- * 5. Call disconnect() to close the connection cleanly
- *
- * @code
- * auto conn = std::make_unique<SendspinClientConnection>("ws://192.168.1.10:8928");
- * conn->on_json_message_cb = [](SendspinConnection*, const char* data, size_t len, int64_t) {
- * handle(data, len);
- * }; conn->start();
- * // periodically:
- * conn->loop();
- * @endcode
+ * Connects to a server URL, delivers incoming messages through the base class callbacks, and
+ * reconnects automatically after connection loss; loop() drives the reconnect timer.
  */
 class SendspinClientConnection : public SendspinConnection {
 public:
     /// @brief Constructs a client connection to the given WebSocket URL
-    /// @param url WebSocket URL of the Sendspin server to connect to.
     explicit SendspinClientConnection(std::string url);
-    /// @brief Stops the WebSocket connection and cleans up resources
+
     ~SendspinClientConnection() override;
 
     /// @brief Initiates the WebSocket connection to the server
@@ -65,40 +51,64 @@ public:
     void loop() override;
 
     /// @brief Sends a goodbye message and closes the connection
-    /// @param reason Reason for disconnecting.
-    /// @param on_complete Callback invoked after the connection is closed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
+    /// @brief Closes the transport immediately without blocking (see base class doc comment).
+    /// Safe to call from IX's own worker thread, unlike disconnect() -> ws_->stop().
+    void close_transport_now() override;
+
     /// @brief Sends a text message to the server
-    /// @param message The message string to send.
-    /// @param cb Callback invoked after send completes.
-    /// @return SsErr::OK if queued successfully, error code otherwise.
+    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
+    ///        pre-hello gate does not apply.
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                             bool allow_before_hello) override;
 
     /// @brief Sends a client/time message, capturing the timestamp synchronously before send
-    /// @return true if the message was sent successfully, false otherwise.
     bool send_time_message() override;
 
+    /// @brief Sends a binary message to the server
+    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
+    ///        pre-hello gate does not apply.
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
+                              bool allow_before_hello) override;
+
     /// @brief Enables or disables automatic reconnection after connection loss
-    /// @param enabled True to reconnect automatically, false to stay disconnected.
     void set_auto_reconnect(bool enabled) {
         this->auto_reconnect_ = enabled;
     }
 
-    /// @brief No-op on host builds; task configuration is an ESP-IDF concept
-    void set_task_config(unsigned /*priority*/) {}
+    /// @brief No-op on host builds; task configuration is an ESP-IDF concept. Both parameters are
+    /// accepted and ignored: the host build has no analogue of a FreeRTOS task priority or stack
+    /// size, since IXWebSocket's worker thread uses the OS default stack.
+    // cppcheck-suppress functionStatic
+    // Instance method by API design, matching the ESP build's set_task_config() (see
+    // src/esp/client_connection.h): both platforms expose the same shape so callers do not need
+    // to special-case one over the other. (The "missing override" half of cppcheck's message is
+    // also a false positive: the host and ESP SendspinClientConnection classes are separate,
+    // platform-selected-at-build-time types, not runtime polymorphic siblings.)
+    void set_task_config(unsigned /*priority*/, size_t /*stack_size*/) {}
 
     /// @brief Returns true if the WebSocket connection is currently open
-    /// @return true if connected, false otherwise.
     bool is_connected() const override {
         return this->connected_;
+    }
+
+    bool is_outbound() const override {
+        return true;
     }
 
 protected:
     /// @brief Registers the IXWebSocket message callback to handle open, close, data, and error
     /// events
     void setup_callbacks();
+
+    /// @brief Shared implementation for send_text_message() and send_binary_message()
+    /// @param is_binary Sends as an IX binary frame when true, text frame when false.
+    /// @param data      Payload bytes to send.
+    /// @param len       Number of bytes in `data`.
+    /// @param cb        Callback invoked after send completes.
+    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
+                        const SendCompleteCallback& cb);
 
     // ========================================
     // Member variables

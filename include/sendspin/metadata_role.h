@@ -58,10 +58,13 @@ public:
     /// @brief Called when metadata is updated by the server
     virtual void on_metadata(const ServerMetadataStateObject& /*metadata*/) {}
 
-    /// @brief Called when the connection to the server is lost and cached metadata is dropped
+    /// @brief Called when the cached metadata is dropped: the connection to the server was lost,
+    /// or a server/activate took the metadata role out of the session's active roles
     ///
-    /// Implementations should clear any displayed track metadata (title, artist, artwork URL,
-    /// progress, etc.) since the previous server's state is no longer valid.
+    /// Implementations should clear any displayed track metadata, since the previous state is no
+    /// longer valid. Idempotent by contract: a second clear with nothing to clear must be a
+    /// no-op. A role removed from an active session
+    /// can be added back by a later activation, which resumes with a fresh on_metadata().
     virtual void on_metadata_clear() {}
 };
 
@@ -69,11 +72,12 @@ public:
  * @brief Metadata role that receives track metadata and playback progress from the server
  *
  * Maintains a local shadow of the server's metadata state, including track title, artist,
- * album, artwork URL, and playback progress. Incoming metadata deltas
- * are merged into the shadow and delivered to the listener on the main loop thread once the
- * synchronized client clock reaches the update's `timestamp` (or immediately if there is no
- * active connection). Progress is interpolated locally using the server timestamp so callers
- * always get a current value.
+ * album, artwork URL, and playback progress. Each metadata state the server sends carries the
+ * full state, so it replaces the shadow outright: a field it leaves out has no value, and a
+ * state without `progress` clears the position. The state is delivered to the listener on the
+ * main loop thread once the synchronized client clock reaches its `timestamp` (or immediately if
+ * there is no active connection). Progress is interpolated locally using the server timestamp so
+ * callers always get a current value.
  *
  * Usage:
  * 1. Implement MetadataRoleListener to receive metadata updates
@@ -104,18 +108,13 @@ public:
     explicit MetadataRole(SendspinClient* client);
     ~MetadataRole();
 
-    /// @brief Sets the listener for metadata events
-    /// @note The listener must outlive this role
-    /// @param listener Pointer to the listener implementation
+    /// @brief Sets the listener for metadata events; it must outlive this role
     void set_listener(MetadataRoleListener* listener);
 
-    /// @brief Returns the track duration in milliseconds
-    /// @return Track duration in milliseconds, or 0 if unknown or the stream is live
+    /// @brief Returns the track duration in milliseconds, or 0 if unknown or the stream is live
     uint32_t get_track_duration_ms() const;
 
-    /// @brief Returns the interpolated track progress in milliseconds
-    /// @return Estimated playback position in milliseconds, interpolated from the last server
-    /// update
+    /// @brief Returns the track progress in milliseconds, interpolated from the last server update
     uint32_t get_track_progress_ms() const;
 
 private:

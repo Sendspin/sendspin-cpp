@@ -14,20 +14,50 @@ checklists in `.claude/skills/` apply these standards to a diff.
   roles establish.
 - All main-loop-bound cross-thread state goes through the `Inbox`
   (`src/inbox.h`). Do not add new mutex-protected endpoints polled by
-  `loop()`.
+  `loop()`. The one exemption is `ConnectionManager`'s `pending_*_events_`
+  queues, which predate the rule and carry payloads the POD ring cannot: one
+  mutex, one gate atomic, one swap. Do not add a second.
 - The Inbox event ring is for ordered lifecycle events only (stream start and
   end, cleared, connection events). Latest-wins state (player state, metadata,
   progress) belongs on a collapsing `InboxSlot`, never the ring: a flood of
   state updates must not be able to evict a lifecycle event.
-- State published between two non-main-loop threads uses a `ShadowSlot`
-  (`src/platform/shadow_slot.h`).
+- State published from one writer thread to one reader thread uses a
+  `ShadowSlot` (`src/platform/shadow_slot.h`), whichever side (if either) the
+  main loop is on. State the main loop *reads* goes through the Inbox instead.
 - Event producers push through `push_event_or_log()` rather than hand-rolling
   the build, push, and log-on-drop sequence.
 - A bounded queue or ring that drops an item never drops it silently: log at
   least a warning at the drop site.
+- An event whose delivery must not survive its producer being torn down
+  carries the producer's teardown generation and is checked against it at the
+  drain (`push_event_or_log()` / `event_is_current()`), rather than relying on
+  the ring being reset: a teardown that leaves other producers running cannot
+  reset it.
 - Callback dispatch must tolerate re-entrant teardown: a listener callback may
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.
+- A message handler on the receive path writes to Inbox slots, role buffers,
+  the connection it was handed, and the connection manager's deferred-event
+  queues, and nothing else. It does not reach back into the client for the
+  current connection or the clock, does not publish state, and does not call a
+  listener: those belong on the main-loop drain. That keeps the network thread
+  cheap and keeps the admission replay, which runs the same handlers, as short
+  as the live path. Two handlers go further and state why at their site:
+  `noise/handshake` runs the re-handshake and its `msg2` send inline because it
+  must stay ordered with decrypt on the same thread, and `server/pair-finalize`
+  commits the pairing record to RAM inline because the re-handshake that
+  follows it resolves that psk_id on this same thread.
+- The client holds exactly one lock order, and every site that takes two locks
+  cites it: `SendspinClient::json_processing_mutex_`, then
+  `ConnectionManager::conn_ptr_mutex_`, then the leaves
+  (`ConnectionManager::conn_mutex_`, `RecordStore::mutex_`, the Inbox mutex),
+  which nest under anything and under nothing. Taking a lock further left while
+  holding one further right is a defect, not a local trade-off. The receive path fixes this
+  order: a `server/pair-finalize` handler runs under the JSON lock and asks the
+  connection manager for the open connections' psk_ids, so work that needs the
+  JSON lock is pushed out from under `conn_ptr_mutex_` instead (see
+  `ConnectionManager::flush_pending_admission()`), the same way a blocking
+  release is (`flush_deferred_releases()`).
 
 ## Protocol validation
 
@@ -111,8 +141,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - A change that substantially rewrites a region conforms any drifted
   patterns inside the touched region in the same PR, rather than carrying
   them forward because the old code already had them.
-- Parallel code paths (stream start versus stream clear, hello versus
-  request-format) stay structurally identical so a reader can diff them
+- Parallel code paths (stream start versus stream clear, one role's
+  `client/state` object versus another's) stay structurally identical so a reader can diff them
   mentally. Deliberate asymmetry gets a comment at the asymmetric site
   explaining why, so nobody "fixes" it back.
 - When two things must stay in sync at every call site, do not rely on care:
