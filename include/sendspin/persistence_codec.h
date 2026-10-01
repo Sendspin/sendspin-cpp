@@ -42,7 +42,7 @@
 ///
 /// ## Keyspace
 ///
-/// Storage keys are the fixed constants in `persistence_keys` (sendspin/client.h), not a
+/// Storage keys are the fixed constants in `persistence_keys` (sendspin/persistence_keys.h), not a
 /// provider's choice.
 ///
 /// Long-term records are stored one per key, under the slot keys
@@ -53,8 +53,8 @@
 
 #pragma once
 
-#include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/persistence_keys.h"
 
 #include <array>
 #include <cstddef>

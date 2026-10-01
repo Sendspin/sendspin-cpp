@@ -18,6 +18,7 @@
 #pragma once
 
 #include "sendspin/config.h"
+#include "sendspin/persistence_keys.h"
 #include "sendspin/types.h"
 
 #include <array>
@@ -165,9 +166,10 @@ public:
 /// @brief Optional persistence provider for saving/loading client state as opaque byte blobs.
 ///
 /// The platform (e.g., ESPHome) provides a concrete implementation that stores blobs keyed by
-/// the fixed key constants in `persistence_keys` below, backed by NVS/Preferences (ESP) or a
-/// file (host). The library owns all serialization; see `persistence_keys` for each key's layout
-/// and fixed size. A provider is a pure byte store and must not parse the blobs.
+/// the fixed key constants in `persistence_keys` (sendspin/persistence_keys.h), backed by
+/// NVS/Preferences (ESP) or a file (host). The library owns all serialization; see
+/// `persistence_keys` for each key's layout and fixed size. A provider is a pure byte store and
+/// must not parse the blobs.
 ///
 /// Every method has a default no-op / nullopt implementation so a platform can opt in
 /// incrementally.
@@ -225,74 +227,6 @@ public:
         return false;
     }
 };
-
-/// @brief Fixed, library-owned keyspace for SendspinPersistenceProvider.
-///
-/// Every key is at most 12 characters, comfortably under the 15-character NVS key limit.
-/// Providers are pure byte stores: they must not parse or reinterpret these values.
-///
-/// Every blob has a fixed size, given by the `*_SIZE` constant beside its key (`RECORD_ORDER`'s
-/// depends on the configured record count). The library writes exactly that many bytes and
-/// treats a stored blob of any other length as absent. Multi-byte integers are in the device's
-/// native byte order: a blob is only ever read back by the device that wrote it.
-///
-/// A record slot key (`record_slot_key()`) and `PAIRING_PSK` hold the binary layouts of the
-/// codec in `sendspin/persistence_codec.h`; the other keys hold raw bytes, as each constant's
-/// comment describes.
-namespace persistence_keys {
-
-/// Raw bytes: the static X25519 private key.
-inline constexpr const char* KEYPAIR = "keypair";
-/// Size of the `KEYPAIR` blob.
-inline constexpr size_t KEYPAIR_SIZE = 32;
-
-/// Prefix of the per-slot record keys; see `record_slot_key()`.
-inline constexpr const char* RECORD_SLOT_PREFIX = "rec_";
-/// Size of a record slot blob: one `SendspinPairingRecord` as the codec encodes it.
-inline constexpr size_t RECORD_SLOT_SIZE = 64;
-
-/// Raw bytes: the slot numbers of the occupied record slots, least recently used first, one byte
-/// per slot, then `0xFF` in every remaining position. The blob is exactly
-/// `SendspinClientConfig::max_pairing_records` bytes, after the library raises that to at least 5
-/// and lowers it to at most 255. It decides which record is evicted when a pairing arrives at a
-/// full store, so it is rewritten whenever that order changes. A byte naming no stored record is
-/// ignored on load, and a stored record this blob does not name sorts after the ones it does.
-/// Being advisory, it is the one blob read at any length.
-inline constexpr const char* RECORD_ORDER = "rec_order";
-
-/// @brief Key of one long-term record slot: `RECORD_SLOT_PREFIX` followed by the decimal slot
-/// number, for example `rec_0`.
-///
-/// Each slot holds one `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` /
-/// `decode_pairing_record()`), or `RECORD_SLOT_SIZE` zero bytes when the slot is free. Only the
-/// slot that changed is written, so a pairing or a revocation costs one record-sized write rather
-/// than a rewrite of every record. Slot numbers run from 0 to
-/// `SendspinClientConfig::max_pairing_records - 1`; a slot key is absent until that slot is first
-/// filled.
-/// @param slot The slot number.
-/// @return The storage key for that slot.
-inline std::string record_slot_key(size_t slot) {
-    return std::string(RECORD_SLOT_PREFIX) + std::to_string(slot);
-}
-
-/// Codec blob: the accepted `SendspinPairingPsk` (`encode_pairing_psk()` / `decode_pairing_psk()`).
-/// `SendspinClientConfig::pairing_psk` outranks it.
-inline constexpr const char* PAIRING_PSK = "pairing_psk";
-/// Size of the `PAIRING_PSK` blob.
-inline constexpr size_t PAIRING_PSK_SIZE = 32;
-
-/// Raw bytes: the X25519 public key of the last-playback server (connection.md "Multiple
-/// servers"), the key its base64url `server_id` encodes.
-inline constexpr const char* LAST_PLAYED = "last_played";
-/// Size of the `LAST_PLAYED` blob.
-inline constexpr size_t LAST_PLAYED_SIZE = 32;
-
-/// Raw `uint16_t`: the player's output delay in milliseconds.
-inline constexpr const char* OUTPUT_DELAY = "static_delay";
-/// Size of the `OUTPUT_DELAY` blob.
-inline constexpr size_t OUTPUT_DELAY_SIZE = 2;
-
-}  // namespace persistence_keys
 
 /// @brief Log severity levels for host builds
 /// Has no effect on ESP-IDF builds

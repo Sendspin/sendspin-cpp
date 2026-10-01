@@ -498,7 +498,8 @@ configured.
 
 #### Keyspace
 
-Every key comes from the `persistence_keys` namespace (`sendspin/client.h`), at most 12
+Every key comes from the `persistence_keys` namespace (`sendspin/persistence_keys.h`, which
+`sendspin/client.h` includes), at most 12
 characters (comfortably under a typical NVS key's 15-character limit). A provider must not invent its own keys; it only needs to
 store and return whatever bytes the library gives it for each of these:
 
