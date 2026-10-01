@@ -811,6 +811,8 @@ TEST(ArtworkImageCap, AnUnsetBudgetIsTheDocumentedDefault) {
 }
 
 TEST(ArtworkImageCap, RoleWithNoListenerHoldsNothing) {
+    // Declared ahead of the Impl like every other test's, though only bound for the control below.
+    RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
@@ -826,7 +828,6 @@ TEST(ArtworkImageCap, RoleWithNoListenerHoldsNothing) {
     }
 
     // Control: with a listener the same image is held and delivered.
-    RecordingListener listener;
     impl->listener = &listener;
     EXPECT_TRUE(send_image(*impl, 0, make_image('B', 4096), /*parts=*/2));
     listener.wait_until([&] { return listener.decodes.size() >= 1; });

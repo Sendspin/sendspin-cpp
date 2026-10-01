@@ -50,6 +50,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -321,13 +322,17 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
     ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES / 2)));
-    pump_until(client, [&] { return client.artwork()->impl_->transfer.in_flight; });
+    // The network thread writes the transfer under slot_mutex, so it is read under the same lock.
+    auto transfer_in_flight = [&] {
+        std::lock_guard<std::mutex> lock(client.artwork()->impl_->drain_task->slot_mutex);
+        return client.artwork()->impl_->transfer.in_flight;
+    };
+    pump_until(client, transfer_in_flight);
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["metadata@v1"])")));
     pump_until(client, [&] { return artwork_listener.clears == 1; });
     EXPECT_EQ(artwork_listener.last_clear_slot, 0);
-    EXPECT_FALSE(client.artwork()->impl_->transfer.in_flight)
-        << "the in-flight transfer survived the removal";
+    EXPECT_FALSE(transfer_in_flight()) << "the in-flight transfer survived the removal";
     EXPECT_EQ(artwork_listener.decodes.load(), 0U);
     EXPECT_EQ(metadata_listener.clears, 0) << "a role the activation kept was torn down";
 
@@ -348,9 +353,12 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
     auto* drain = client.artwork()->impl_->drain_task.get();
     ASSERT_NE(drain, nullptr);
     bool holds_an_image = false;
-    for (auto& sb : drain->slot_buffers) {
-        for (const auto& buf : sb.buffers) {
-            holds_an_image = holds_an_image || buf.data() != nullptr;
+    {
+        std::lock_guard<std::mutex> lock(drain->slot_mutex);
+        for (auto& sb : drain->slot_buffers) {
+            for (const auto& buf : sb.buffers) {
+                holds_an_image = holds_an_image || buf.data() != nullptr;
+            }
         }
     }
     ASSERT_TRUE(holds_an_image) << "the decoded image left no buffer behind to release";
