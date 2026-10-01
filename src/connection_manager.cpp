@@ -2058,6 +2058,7 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
     } else {
         // CPace consumes the static code as PRS directly, so it is known here; a dynamic code
         // is only known once nonce_A arrives.
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access): checked above for the static method
         ps.prs = pairing_code_digits_prs(static_code.value());
     }
 

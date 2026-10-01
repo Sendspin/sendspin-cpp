@@ -910,10 +910,14 @@ std::optional<std::string> SendspinClient::format_pairing_token(
 std::optional<std::string> SendspinClient::pairing_token() const {
     // Main-loop-only, like the other record-store config reads: the Pairing PSK is set when the
     // store is built, inside start().
-    if (this->record_store_ == nullptr || !this->record_store_->pairing_psk().has_value()) {
+    if (this->record_store_ == nullptr) {
         return std::nullopt;
     }
-    return this->format_pairing_token(this->record_store_->pairing_psk()->psk);
+    const auto& pairing_psk = this->record_store_->pairing_psk();
+    if (!pairing_psk.has_value()) {
+        return std::nullopt;
+    }
+    return this->format_pairing_token(pairing_psk->psk);
 }
 
 bool SendspinClient::is_connected() const {
