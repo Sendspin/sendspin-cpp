@@ -44,15 +44,15 @@ if(ESP_IDF_BUILD)
     # Assemble source list from core + enabled roles (driven by Kconfig)
     set(SENDSPIN_ALL_SOURCES ${SENDSPIN_CORE_SOURCES} ${SENDSPIN_ESP_SOURCES})
 
+    # REQUIRES cannot depend on CONFIG_ values: ESP-IDF collects them before sdkconfig is loaded.
+    # The codec components are required through the Kconfig rules in idf_component.yml instead.
     set(SENDSPIN_REQUIRES esp_http_server esp_netif esp_timer esp_ringbuf esp_hw_support pthread mbedtls bblanchon__arduinojson esphome__noise-c)
     set(SENDSPIN_COMPILE_DEFS "")
 
     if(CONFIG_SENDSPIN_ENABLE_PLAYER)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_PLAYER_SOURCES})
-        list(APPEND SENDSPIN_REQUIRES esphome__micro-flac)
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_PLAYER)
         if(CONFIG_SENDSPIN_ENABLE_OPUS)
-            list(APPEND SENDSPIN_REQUIRES esphome__micro-opus)
             list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_OPUS)
         endif()
     endif()

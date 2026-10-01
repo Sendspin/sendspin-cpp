@@ -64,10 +64,19 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   offset round-trip, convergence).
 - `test_audio_stream_info.cpp`: byte/frame/sample/duration conversions.
 - `test_network_info.cpp`: local interface MAC lookup is well-formed or absent.
-- `test_spsc_ring_buffer.cpp`: ring buffer storage sizing and alignment.
+- `test_spsc_ring_buffer.cpp`: `SpscRingBuffer` wrap-around accounting with unaligned storage
+  sizes, and the `wake_receiver()` contract.
+- `test_thread_safe_queue.cpp`: `ThreadSafeQueue`'s `wake_receiver()` contract: a wake unblocks
+  a parked receive, is held pending, is consumed once, and never drops a queued item.
+- `test_inline_vector.cpp`: `InlineVector` order-preserving erase, element release at removal,
+  and swap.
+- `test_fixed_block_pool.cpp`: `FixedBlockPool` claims each block once until released, also
+  under concurrent claims.
 - `test_inbox.cpp`: `Inbox`/`InboxSlot` topic bits, event ring ordering, and slot binding.
 - `test_player_role.cpp`: the player's `client/state` timing parameters and the
   supported-format validation, driven through the role's `Impl` without a server.
+- `test_decoder.cpp`: `SendspinDecoder` chunk decoding per codec (multi-frame FLAC, PCM at the
+  spec maximum, an Opus packet longer than the estimate) and the sync task's whole-chunk decode.
 - `test_visualizer_role.cpp`: `decode_visualizer_message()` and the visualizer role's
   negotiation and dispatch.
 - `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: announce/part/cancel
@@ -89,8 +98,9 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_crypto.cpp`, `test_cpace.cpp`, `test_pairing_code.cpp`, `test_psk_wrap.cpp`,
   `test_pairing_token.cpp`, `test_noise_transport.cpp`, `test_noise_rehandshake.cpp`,
   `test_admission.cpp`, `test_record_store.cpp`, `test_dynamic_pairing_code.cpp`,
-  `test_pairing_state_machine.cpp`, `test_persistence_codec.cpp`: the encryption and pairing
-  units, from the primitives up to the record store and the pairing state machine.
+  `test_pairing_state_machine.cpp`, `test_pairing_offers.cpp`, `test_persistence_codec.cpp`: the
+  encryption and pairing units, from the primitives up to the record store and the pairing
+  state machine.
 
 The loopback tests share `lifecycle_test_fixtures.h`: `FakeEncryptedServer` and
 `FakeOutboundEncryptedServer` play a Sendspin server as the Noise initiator over a real socket,

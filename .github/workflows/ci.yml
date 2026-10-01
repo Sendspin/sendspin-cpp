@@ -53,7 +53,7 @@ jobs:
           sudo apt-get install -y libavahi-compat-libdnssd-dev
 
       - name: Configure CMake
-        run: cmake -B build .
+        run: cmake -B build -DENABLE_WERROR=ON .
 
       - name: Build
         run: cmake --build build
@@ -72,7 +72,7 @@ jobs:
       - name: Configure CMake
         # BUILD_EXAMPLES=OFF so the test job configures only sendspin + tests and skips the
         # example-only FetchContent deps (e.g. FTXUI).
-        run: cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .
+        run: cmake -B build-tests -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .
 
       - name: Build tests
         run: cmake --build build-tests --target sendspin_tests
@@ -95,7 +95,7 @@ jobs:
         # SENDSPIN_ENABLE_OPUS=OFF must build the library, the examples, and the tests without
         # micro-opus. The player tests that only exist in this configuration run under ASan/UBSan
         # here, like the default suite does in the test job.
-        run: cmake -B build-no-opus -DSENDSPIN_ENABLE_OPUS=OFF -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON .
+        run: cmake -B build-no-opus -DENABLE_WERROR=ON -DSENDSPIN_ENABLE_OPUS=OFF -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON .
 
       - name: Build
         run: cmake --build build-no-opus
@@ -117,7 +117,7 @@ jobs:
       - name: Configure CMake
         # ENABLE_TSAN instead of ENABLE_SANITIZERS: TSan cannot be combined with ASan/UBSan, and
         # the concurrency tests only report a data race when built this way.
-        run: cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .
+        run: cmake -B build-tsan -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .
 
       - name: Build tests
         run: cmake --build build-tsan --target sendspin_tests
@@ -134,9 +134,42 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1
         run: ctest --test-dir build-tsan --output-on-failure
 
+  esp-idf:
+    name: ESP-IDF ${{ matrix.idf }} build (${{ matrix.config.name }})
+    runs-on: ubuntu-latest
+    container: espressif/idf:${{ matrix.idf }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # v5.5 is the minimum declared in idf_component.yml
+        idf: [v5.5.5, v6.0.3]
+        config:
+          - name: default
+            sdkconfig_defaults: sdkconfig.defaults
+            opus: 'on'
+          - name: no-opus
+            sdkconfig_defaults: sdkconfig.defaults;sdkconfig.no_opus
+            opus: 'off'
+    defaults:
+      run:
+        shell: bash
+        working-directory: tests/esp_idf
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          idf.py -D SDKCONFIG_DEFAULTS="${{ matrix.config.sdkconfig_defaults }}" build
+
+      - name: Check codec dependencies
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          python check_build.py --opus ${{ matrix.config.opus }}
+
   ci:
     name: CI
-    needs: [pre-commit, lint, build, test, test-no-opus, test-tsan]
+    needs: [pre-commit, lint, build, test, test-no-opus, test-tsan, esp-idf]
     runs-on: ubuntu-latest
     if: always()
     steps:

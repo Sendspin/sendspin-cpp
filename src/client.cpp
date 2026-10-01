@@ -84,7 +84,7 @@ struct PairingNote {
     PairingNoteType type{};
     /// server_id for PAIRING_STARTED/SUCCEEDED/FAILED; the emitted code for
     /// DISPLAY_PAIRING_CODE; empty otherwise.
-    std::string text;
+    std::string text{};
     SendspinPairAbortReason reason{};  ///< Valid only for PAIRING_FAILED.
     ConnectionTrust trust{};           ///< Valid only for TRUST_CHANGED.
     /// Emission format of `text`; valid only for DISPLAY_PAIRING_CODE.

@@ -153,7 +153,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
 ## Testing
 
 - Tests are host-only, white-box, and live in `tests/`; they include private
-  headers from `src/` and run under ASan/UBSan in CI.
+  headers from `src/` and run under ASan/UBSan in CI. The ESP-IDF side is
+  covered by the build-only project in `tests/esp_idf/`.
 - Production code in `src/` and `include/` acquires nothing for the sake of
   tests: no friends, test-only hooks, widened visibility, extra template
   parameters, injectable clocks or transports, or fixture-aware naming.
