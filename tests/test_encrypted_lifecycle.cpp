@@ -527,7 +527,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // Initial handshake uses the accepted Pairing PSK directly (matching PskCategory::PAIRING),
     // not the Sentinel PSK: the Pairing PSK Flow's initial handshake IS the Pairing PSK (the
@@ -658,7 +658,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // The FIRST server/activate (default options) is a normal playback activate that brings the
     // connection operational exactly like InBandRehandshakeResumesOperational. The SECOND (sent
@@ -763,7 +763,7 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
@@ -823,7 +823,7 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
     SendspinClient client(config);
     client.set_network_provider(&network);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // A bare WebSocket peer: it completes the upgrade and then says nothing the protocol expects.
     std::atomic<bool> opened{false};
@@ -1102,7 +1102,7 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
@@ -1180,7 +1180,7 @@ TEST(EncryptedLifecycle, AnActivateThatReselectsPairingStartsTheNewAttempt) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
@@ -1447,7 +1447,7 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
@@ -1526,7 +1526,7 @@ TEST(EncryptedLifecycle, ActivateThatLosesPlaybackCapabilityRemovesTheRoles) {
     client.set_persistence_provider(&persistence);
     client.add_metadata().set_listener(&metadata_listener);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServerOptions options;
     options.first_roles_json = R"(["metadata@v1"])";
@@ -1579,7 +1579,7 @@ TEST(EncryptedLifecycle, CombinedActivateAfterARehandshakeGoesOperationalAndEnte
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServerOptions options;
     options.second_activities_json = R"(["playback","pairing"])";
@@ -1636,7 +1636,7 @@ TEST(EncryptedLifecycle, PairingActivateAfterARehandshakeThatAddsARoleSendsItsCl
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServerOptions options;
     // No player: an active player's state also waits for clock sync.
@@ -2735,7 +2735,7 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServer server(server_url(UNPAIR_RECORD_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), unpairing_identity,
@@ -3118,7 +3118,7 @@ TEST(EncryptedLifecycle, PersistedRecencyFollowsPlaybackActivates) {
         client.set_network_provider(&network);
         client.set_persistence_provider(&persistence);
         ASSERT_TRUE(client.start());
-        pump_for(client, 50);
+        client.loop();  // First tick binds the WS server
 
         FakeEncryptedServerOptions options;
         options.first_activities_json = row.first_activities;
@@ -3264,7 +3264,7 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // The Sentinel PSK admits an unpaired server (ConnectionTrust::NONE).
     FakeEncryptedServer server(server_url(UNPAIR_SENTINEL_TEST_PORT),
@@ -3323,7 +3323,7 @@ TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // A: admitted, so its server/unpair is honoured.
     FakeEncryptedServerOptions options_a;
@@ -3432,7 +3432,7 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // The main loop runs on its own thread from here: it is the thread that parks in the write,
     // so the probe below has to be a different one.
@@ -3483,7 +3483,7 @@ TEST(EncryptedLifecycle, TogglingUnpairedAccessBringsTheUnpairedSessionInLine) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     Identity identity = Identity::generate().value();
     FakeEncryptedServerOptions idle;
@@ -3540,7 +3540,7 @@ TEST(EncryptedLifecycle, UnpairedAccessChangesLeavePairedAndPairingSessionsAlone
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     {
         FakeEncryptedServer paired(server_url(UNPAIRED_TOGGLE_CONTROL_TEST_PORT),
@@ -3606,7 +3606,7 @@ TEST(EncryptedLifecycle, EnablingUnpairedAccessRestartsAnUnpairedSessionStillInT
         client.set_network_provider(&network);
         client.set_persistence_provider(&persistence);
         ASSERT_TRUE(client.start());
-        pump_for(client, 50);
+        client.loop();  // First tick binds the WS server
 
         FakeEncryptedServerOptions options;
         options.suppress_activate = true;
@@ -3648,7 +3648,6 @@ TEST(EncryptedLifecycle, EnablingUnpairedAccessKeepsAnOutboundUnpairedSession) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
 
     FakeOutboundEncryptedServer server(UNPAIRED_TOGGLE_OUTBOUND_PORT,
                                        std::string(NOISE_SUITE_CHACHAPOLY),
@@ -3682,7 +3681,7 @@ TEST(EncryptedLifecycle, UnpairedAccessChangesWaitOutARehandshake) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServerOptions options;
     options.suppress_activate = true;  // The post-rekey activate is the one that never comes.
@@ -3716,8 +3715,9 @@ TEST(EncryptedLifecycle, UnpairedAccessIsOffUntilSetAndIsNeverPersisted) {
     const Identity identity = Identity::generate().value();
 
     // An unpaired server declaring playback: admitted only while unpaired access is on.
+    // Every call follows a start().
     auto expect_unpaired_playback = [&](SendspinClient& client, bool admitted) {
-        pump_for(client, 50);
+        client.loop();  // First tick binds the WS server
         FakeEncryptedServer server(server_url(UNPAIRED_TOGGLE_STOPPED_TEST_PORT),
                                    std::string(NOISE_SUITE_CHACHAPOLY), identity,
                                    std::string(SENTINEL_PSK_ID), SENTINEL_PSK);
