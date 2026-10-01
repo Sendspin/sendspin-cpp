@@ -10,8 +10,9 @@ item against the current code before acting on it; line numbers drift as phases 
 
 ## Decisions
 
-- The `static_delay` persistence key keeps its name; only wire names and the public API move to
-  `output_delay`.
+- The output delay's persistence key is `output_delay`, like the wire names and the public API.
+  Releases through v0.8.0 had a typed provider interface and no library key, so a consumer that
+  stored the delay under its own name keeps that name in its provider.
 - `min_buffer_ms` is a fixed `PlayerRoleConfig` value; `required_lead_time_ms` is optional and
   defaults to the pipeline-derived lead. The `send_ahead` field is parsed past but not consumed.
   Measured values are later work.

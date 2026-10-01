@@ -86,7 +86,7 @@ inline constexpr const char* LAST_PLAYED = "last_played";
 inline constexpr size_t LAST_PLAYED_SIZE = 32;
 
 /// Raw `uint16_t`: the player's output delay in milliseconds.
-inline constexpr const char* OUTPUT_DELAY = "static_delay";
+inline constexpr const char* OUTPUT_DELAY = "output_delay";
 /// Size of the `OUTPUT_DELAY` blob.
 inline constexpr size_t OUTPUT_DELAY_SIZE = 2;
 
