@@ -44,6 +44,7 @@ examples/common/            - Shared PortAudio audio sink used by host examples
 examples/basic_client/      - Standalone host example with PortAudio audio output
 examples/tui_client/        - Terminal UI host example with PortAudio audio output
 tests/                      - Host unit tests (GoogleTest)
+tests/esp_idf/              - Build-only ESP-IDF project checking the component's codec dependencies
 docs/                       - integration-guide.md (consumer guide), internals.md (how the current code works), conventions.md (normative design standards)
 .claude/skills/             - Review checklists applying the standards to a diff (docs-sync, embedded-review, house-patterns, test-standards)
 ```
