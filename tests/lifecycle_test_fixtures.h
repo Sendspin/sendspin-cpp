@@ -213,13 +213,13 @@ public:
         return *this->client_;
     }
 
-    /// Starts the server and pumps for the 50 ms bring-up window every call site uses before its
-    /// first fake-server connection.
+    /// Starts the client and ticks loop() once, which binds the WS server synchronously, so a
+    /// fake server may connect as soon as this returns.
     bool start() {
         if (!this->client_->start()) {
             return false;
         }
-        pump_for(*this->client_, 50);
+        this->client_->loop();
         return true;
     }
 
