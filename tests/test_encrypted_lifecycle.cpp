@@ -92,6 +92,9 @@ constexpr uint16_t REKEY_ROLE_SEND_TEST_PORT = 19010;
 constexpr uint16_t REPROVE_REHANDSHAKE_TEST_PORT = 19011;
 constexpr uint16_t COMBINED_FIRST_TEST_PORT = 19012;
 constexpr uint16_t COMBINED_REKEY_TEST_PORT = 19013;
+constexpr uint16_t RECENCY_IDLE_TEST_PORT = 19021;
+constexpr uint16_t RECENCY_PLAYBACK_TEST_PORT = 19022;
+constexpr uint16_t RECENCY_LATER_PLAYBACK_TEST_PORT = 19023;
 constexpr uint16_t AVAILABILITY_TEST_PORT = 19079;
 constexpr uint16_t CLOCK_GATE_SYNCED_TEST_PORT = 19080;
 constexpr uint16_t CLOCK_GATE_UNSYNCED_TEST_PORT = 19081;
@@ -2761,6 +2764,75 @@ TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
             manager.current_connection_.reset();
         }
         client.stop();
+    }
+}
+
+// A record's recency moves when the admitted connection's server/activate declares 'playback',
+// either in the first activate that wins promotion or in a later one on that connection.
+// Admission with an idle activate moves nothing. The connecting server's record starts as the
+// least recent of three, so a move shows in the persisted order. Three loopback admissions make
+// this take about half a second.
+TEST(EncryptedLifecycle, PersistedRecencyFollowsPlaybackActivates) {
+    struct Row {
+        const char* name;
+        uint16_t port;
+        const char* first_activities;
+        bool later_playback;  // A second activate on the admitted connection declares 'playback'.
+        std::vector<uint8_t> expected_order;
+    };
+    const Row rows[] = {
+        {"idle first activate", RECENCY_IDLE_TEST_PORT, "[]", false, {0, 1, 2}},
+        {"Control: playback first activate", RECENCY_PLAYBACK_TEST_PORT, R"(["playback"])", false,
+         {1, 2, 0}},
+        {"idle first activate, later playback activate", RECENCY_LATER_PLAYBACK_TEST_PORT, "[]",
+         true, {1, 2, 0}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Identity server_identity = Identity::generate().value();
+        SendspinPairingRecord connecting = make_record_for(server_identity);
+        SendspinPairingRecord middle = make_record_for(Identity::generate().value());
+        SendspinPairingRecord newest = make_record_for(Identity::generate().value());
+
+        TestNetworkProvider network;
+        auto provider = make_record_store_provider({connecting, middle, newest});
+        InMemoryPersistenceProvider& persistence = *provider;
+        SendspinClientConfig config;
+        config.name = "Playback Recency Activate Test Client";
+        config.server_port = row.port;
+
+        SendspinClient client(config);
+        // The later activate adds this role, so the client/state it triggers marks it processed.
+        client.add_metadata();
+        client.set_network_provider(&network);
+        client.set_persistence_provider(&persistence);
+        ASSERT_TRUE(client.start());
+        pump_for(client, 50);
+
+        FakeEncryptedServerOptions options;
+        options.first_activities_json = row.first_activities;
+        options.first_roles_json = "[]";
+        FakeEncryptedServer server(server_url(row.port), std::string(NOISE_SUITE_CHACHAPOLY),
+                                   server_identity, connecting.psk_id, connecting.psk, options);
+        // Promotion and the record flush run in the same loop() pass.
+        pump_until(client, [&] { return client.is_connected(); });
+
+        if (row.later_playback) {
+            // The admission's client/state reaches the fake on its own thread; waiting for it
+            // leaves the count below to move only for the later activate.
+            pump_until(client, [&] { return server.client_state_count() > 0; });
+            const int states_before = server.client_state_count();
+            ASSERT_TRUE(server.send_app_json(
+                R"({"type":"server/activate","payload":{"activities":["playback"],)"
+                R"("active_roles":["metadata@v1"]}})"));
+            pump_until(client, [&] { return server.client_state_count() > states_before; });
+        }
+
+        EXPECT_EQ(stored_record_order(persistence), row.expected_order)
+            << "slot 0 is the connecting server's record, least recently used first";
+
+        client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+        pump_for(client, 100);
     }
 }
 
