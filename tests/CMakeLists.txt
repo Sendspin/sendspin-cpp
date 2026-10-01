@@ -151,6 +151,8 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     DrainedEvents: the outbound open/close callbacks are reachable only through the connect_to()
 #     connection that carries them, and whether an event about an already-released connection was
 #     dropped or queued is visible only in the pending queues until loop() drains them.
+#   - ConnectionManager::push_nursery_entry(), to hand loop() a stand-in connection to promote:
+#     when the first client/state leaves relative to admission is decided inside one tick.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

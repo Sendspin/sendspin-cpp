@@ -514,6 +514,10 @@ protected:
                                         ? std::optional<SendspinPairingCodeFormat>(format)
                                         : std::nullopt);
         conn->set_pairing_in_progress(false);
+        // The slot is assigned directly, bypassing set_current_connection() and the admission
+        // flush, so set the flag the way admission would: the current connection is the admitted
+        // one, and client/state among other things is gated on it.
+        conn->set_admitted(true);
         FakeConnection* raw = conn.get();
         this->injected_conn_ = conn;
         {
@@ -532,6 +536,10 @@ protected:
     FakeConnection* inject_provisional_current_connection(const std::string& server_id) {
         auto conn = std::make_shared<FakeConnection>();
         conn->set_noise_handshake_result(server_id, PskCategory::SENTINEL, /*psk_id=*/"");
+        // The slot is assigned directly, bypassing set_current_connection() and the admission
+        // flush, so set the flag the way admission would: the current connection is the admitted
+        // one, and client/state among other things is gated on it.
+        conn->set_admitted(true);
         FakeConnection* raw = conn.get();
         this->injected_conn_ = conn;
         {
@@ -2769,9 +2777,6 @@ TEST_F(PairingStateMachineTest, PairingAttemptTimeoutScanSuppressedDuringFinaliz
 TEST_F(PairingStateMachineTest, DropClearsTheAdmittedFlag) {
     FakeConnection* conn = this->inject_current_connection("server-drop-admitted",
                                                            SendspinPairMethod::PAIRING_PSK);
-    // inject_current_connection() assigns current_connection_ directly (bypassing
-    // set_current_connection), so set the flag the way promotion would.
-    conn->set_admitted(true);
     ASSERT_TRUE(conn->is_admitted());
 
     this->drop_connection(conn, SendspinGoodbyeReason::SHUTDOWN);

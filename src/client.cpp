@@ -1279,17 +1279,26 @@ void SendspinClient::admit_connection(SendspinConnection* conn) {
     // what makes the replay exact: a network thread that reaches the dispatch gate meanwhile
     // either blocks here and then sees an admitted connection (dispatching live, after everything
     // held), or already held its message and is drained below.
-    std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
-    conn->replay_pre_admission_messages(
-        [this, conn](const char* data, size_t len, int64_t arrival_us) {
-            SS_LOGD(TAG, "Replaying a role message held until admission (%zu bytes)", len);
-            this->dispatch_json_message(conn, data, len, arrival_us,
-                                        JsonMessageOrigin::ADMISSION_REPLAY);
-        });
-    // Last: the binary path reads this flag without the mutex, so audio chunks start being
-    // dispatched on the network thread only once the replay above has finished writing to the
-    // roles it feeds.
-    conn->set_admitted(true);
+    {
+        std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
+        conn->replay_pre_admission_messages(
+            [this, conn](const char* data, size_t len, int64_t arrival_us) {
+                SS_LOGD(TAG, "Replaying a role message held until admission (%zu bytes)", len);
+                this->dispatch_json_message(conn, data, len, arrival_us,
+                                            JsonMessageOrigin::ADMISSION_REPLAY);
+            });
+        // Last: the binary path reads this flag without the mutex, so audio chunks start being
+        // dispatched on the network thread only once the replay above has finished writing to the
+        // roles it feeds.
+        conn->set_admitted(true);
+    }
+
+    // The client/state promotion held (see publish_client_state()) goes out now that the binary
+    // data it opens can be dispatched. An active player's clock gate still applies, in which case
+    // it stays held for loop().
+    if (this->client_state_held_) {
+        this->publish_client_state(conn);
+    }
 }
 
 void SendspinClient::schedule_malformed_pairing_message(SendspinConnection* conn,
@@ -1876,8 +1885,12 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     waits_for_clock = this->available_ && this->player_ &&
                       conn->is_role_active(SendspinRole::PLAYER) && !conn->is_time_synced();
 #endif
-    this->client_state_held_ = waits_for_clock;
-    if (waits_for_clock) {
+    // messaging.md "client/state": this message is what lets the server start a role's stream and
+    // send its binary data, and binary from a connection that is not admitted yet is dropped (see
+    // process_binary_message()), so a state owed at promotion waits for admit_connection().
+    const bool waits_for_admission = !conn->is_admitted();
+    this->client_state_held_ = waits_for_clock || waits_for_admission;
+    if (this->client_state_held_) {
         return;
     }
 

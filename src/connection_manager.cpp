@@ -1917,7 +1917,9 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
         return next;
     }
 
-    // Notify the client, publish state, and record playback activity, only for the winner.
+    // Notify the client and record playback activity, only for the winner. The client/state
+    // on_handshake_complete() publishes below is held until flush_pending_admission() admits the
+    // connection (see SendspinClient::publish_client_state()).
     this->note_playback_activity(this->current_connection_.get());
 
     // The connection still occupies current_connection_ (so admission.h's "in-flight pairing is

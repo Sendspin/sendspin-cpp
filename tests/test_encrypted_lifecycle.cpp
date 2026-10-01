@@ -2273,6 +2273,59 @@ TEST(EncryptedLifecycle, EveryHeldMessageTypeReplaysThroughItsHandler) {
     EXPECT_EQ(*bundle.client_ref().get_group_state().group_name, "Kitchen");
 }
 
+// A stand-in that records, for each client/state it is asked to send, whether it held the
+// admitted slot at that moment.
+class StateRecordingConnection : public HoldTestConnection {
+public:
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb,
+                            bool allow_before_hello) override {
+        if (msg.find("client/state") != std::string::npos) {
+            this->state_sent_while_admitted.push_back(this->is_admitted());
+        }
+        return HoldTestConnection::send_text_message(msg, std::move(cb), allow_before_hello);
+    }
+
+    std::vector<bool> state_sent_while_admitted;
+};
+
+// messaging.md "client/state": the first client/state is what lets the server start a role's
+// stream and send its binary data, and the client drops binary from a connection that is not
+// admitted yet. The promotion tick installs the connection, performs the record writes it owes
+// and only then admits it, so a state sent at promotion invites an artwork announce into that
+// gap; the announce is dropped and the part behind it is a malformed sequence the role closes
+// the connection on.
+//
+// Driven through the manager's own loop() from the nursery, so the order under test is the one a
+// real promotion runs. The stand-in sends inline, which makes "was it admitted when the state
+// left" a plain read instead of a race against a socket.
+TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitted) {
+    HoldTestClient bundle("State After Admission Test Client");
+    ConnectionManager& manager = *bundle.client_ref().connection_manager_;
+
+    auto conn = std::make_shared<StateRecordingConnection>();
+    // No player in the active set: an active player's state also waits for clock sync, which
+    // lands after admission by itself and would hide the gate under test.
+    conn->apply_server_activate({SendspinActivity::PLAYBACK},
+                                std::vector<std::string>{"metadata@v1"}, std::nullopt,
+                                std::nullopt);
+    conn->set_client_hello_sent(true);
+    conn->set_server_hello_received(true);
+    conn->set_provisional_time_us(platform_time_us());
+    conn->last_receive_time_us_.store(platform_time_us(), std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.push_nursery_entry(NurseryEntry{.conn = conn});
+    }
+
+    bundle.client_ref().loop();
+
+    ASSERT_TRUE(conn->is_admitted()) << "the tick did not promote and admit the connection";
+    ASSERT_EQ(conn->state_sent_while_admitted.size(), 1u)
+        << "the promotion tick owes exactly one client/state";
+    EXPECT_TRUE(conn->state_sent_while_admitted.front())
+        << "client/state left before the connection could receive the binary data it opens";
+}
+
 // A stand-in whose destructor raises one network-thread event about itself, as an outbound
 // transport callback does during the destructor's join.
 class ExpiringTestConnection : public HoldTestConnection {

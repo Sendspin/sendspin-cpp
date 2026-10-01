@@ -758,7 +758,8 @@ private:
     /// Main loop only; ConnectionManager::flush_pending_admission() is the only caller. The
     /// replay and the flag happen under one hold of json_processing_mutex_ so the role traffic a
     /// server sent between its server/activate and this admission is applied exactly once, in
-    /// arrival order, ahead of anything that arrives afterwards.
+    /// arrival order, ahead of anything that arrives afterwards. A client/state held for this
+    /// admission (see client_state_held_) is sent once the flag is set.
     ///
     /// THREADING: takes json_processing_mutex_, so the caller must hold no ConnectionManager
     /// lock. That is the library-wide lock order (docs/conventions.md, "Threading and
@@ -776,7 +777,8 @@ private:
 
     /// @brief Publishes the current client state to the specified connection
     ///
-    /// Held while an available, active player has no clock sync yet (see client_state_held_).
+    /// Held while `conn` is not admitted yet, and while an available, active player has no clock
+    /// sync yet (see client_state_held_).
     /// Takes no lock of its own: its main-loop callers already hold conn_ptr_mutex_ or a
     /// shared_ptr, which is what keeps `conn` alive for the call.
     void publish_client_state(SendspinConnection* conn);
@@ -817,7 +819,8 @@ private:
     // Connection event handlers (called by ConnectionManager via friend access)
     // ========================================
 
-    /// @brief Publishes the initial client state after handshake completes
+    /// @brief Publishes the initial client state after handshake completes; on a connection the
+    /// promotion scan has not admitted yet the state is held for admit_connection() to send
     /// @param conn The connection that completed the handshake
     void on_handshake_complete(SendspinConnection* conn);
 
@@ -922,7 +925,8 @@ private:
     /// The unpaired-access setting admission and the client/hello read; see
     /// set_unpaired_access_enabled(). Main loop only.
     bool unpaired_access_enabled_{false};
-    /// A client/state held for clock sync, which loop() sends once synced. Main loop only.
+    /// A client/state held for admission, which admit_connection() sends, or for clock sync, which
+    /// loop() sends once synced. Main loop only.
     bool client_state_held_{false};
     /// Trust level of the active connection; written by on_handshake_complete() and reset by
     /// cleanup_connection_state(), both main loop only, so get_current_trust() needs no lock.

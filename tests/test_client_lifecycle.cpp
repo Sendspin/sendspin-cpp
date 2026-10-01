@@ -910,6 +910,8 @@ TEST(ClientLifecycle, PublishStateOutlivesADropDuringTheSend) {
         conn->set_server_hello_received(true);
         conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                     std::nullopt);
+        // Installed directly, so mark it the way admission would: client/state waits for it.
+        conn->set_admitted(true);
         std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
         client.connection_manager_->current_connection_ = std::move(conn);
     }
