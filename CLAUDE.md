@@ -49,7 +49,7 @@ examples/common/            - Shared host-example helpers (PortAudio sink, file-
 examples/basic_client/      - Standalone host example with PortAudio audio output
 examples/tui_client/        - Terminal UI host example with PortAudio audio output
 tests/                      - Host unit tests (GoogleTest)
-docs/                       - integration-guide.md (consumer guide), internals.md (how the current code works), conventions.md (normative design standards), rc1-migration.md (RC1 migration tracker)
+docs/                       - integration-guide.md (consumer guide), internals.md (how the current code works), conventions.md (normative design standards)
 .claude/skills/             - Review checklists applying the standards to a diff (docs-sync, embedded-review, house-patterns, test-standards)
 ```
 
