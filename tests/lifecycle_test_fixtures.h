@@ -1150,6 +1150,9 @@ private:
 // plain ints; those two are reached from a role thread and are atomic.
 
 /// Counts the player lifecycle callbacks and audio writes; the write itself is a sink.
+/// It never reports playback progress, so the sync task stays in initial-sync priming and the
+/// writes counted here are priming silence, not decoded chunks. A test of the per-chunk path
+/// needs a listener that calls PlayerRole::notify_audio_played() (VirtualSinkListener).
 class CountingPlayerListener : public PlayerRoleListener {
 public:
     /// The sync task's own thread writes here, unlike the callbacks below.
