@@ -648,7 +648,9 @@ When a connection is lost (`on_connection_lost`):
 4. The current slot stays empty; the next promotion scan fills it from the nursery
 ```
 
-`disable_message_dispatch()` is the first step because it's an atomic flag that the network thread checks before invoking any callback. This prevents stale messages from a dead connection from racing into freshly-reset role queues.
+`disable_message_dispatch()` is the first step because it's an atomic flag that the network thread checks before invoking a message callback. This prevents stale messages from a dead connection from racing into freshly-reset role queues.
+
+A dispatch already past the check, or a transport open/close callback (which never checks it), can still be running when the release lands. An outbound connection's destructor joins its transport thread, so that callback can run with no owner left, where `shared_from_this()` throws `std::bad_weak_ptr`. Network-thread events therefore name their connection with `weak_from_this().lock()`, and the `schedule_*` functions and outbound callbacks drop the event when it comes back null. Holding a reference across the callback instead could make it the last owner and run the destructor on the transport thread, which would then join itself. `EncryptedLifecycle::AnEventAboutAnAlreadyReleasedConnectionIsDropped` covers every such event.
 
 ### Role Removal on a Later Activation
 

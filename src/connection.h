@@ -747,6 +747,8 @@ public:
     ///       complete; the manager uses it to start the Noise handshake. Inbound server
     ///       connections are delivered to the manager already upgraded (their handshake starts at
     ///       nursery admission) and never fire this.
+    /// @note This and on_disconnected_cb can run during an outbound destructor's transport join
+    ///       (see "Event queuing" in connection_manager.h).
     std::function<void(SendspinConnection*)> on_connected_cb;
 
     /// @brief Callback invoked when the connection is closed or lost

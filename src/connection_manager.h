@@ -470,6 +470,10 @@ public:
     // ========================================
     // Event queuing (thread-safe)
     // ========================================
+    //
+    // A network thread names an event's connection with weak_from_this().lock(), never
+    // shared_from_this(), and the schedulers drop a null-connection event: an outbound connection
+    // can be mid-destruction (docs/internals.md, "Disconnection and Cleanup").
 
     /// @brief Schedules a server/activate event for deferred processing in loop().
     /// Called from SendspinClient::process_json_message() on the NETWORK thread; trust

@@ -1296,7 +1296,7 @@ void SendspinClient::schedule_malformed_pairing_message(SendspinConnection* conn
                                                         const char* type_name) {
     SS_LOGW(TAG, "Malformed %s; aborting any active code pairing", type_name);
     ServerPairingMessageEvent event;
-    event.conn = conn->shared_from_this();
+    event.conn = conn->weak_from_this().lock();
     event.kind = PairingMessageKind::MALFORMED;
     this->connection_manager_->schedule_pairing_message(std::move(event));
 }
@@ -1508,7 +1508,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                         conn->note_activated_roles(activate_msg.active_roles.value());
                     }
                     this->connection_manager_->schedule_activate(
-                        {conn->shared_from_this(), std::move(activate_msg.activities),
+                        {conn->weak_from_this().lock(), std::move(activate_msg.activities),
                          std::move(activate_msg.active_roles), activate_msg.pairing_method,
                          activate_msg.pairing_format});
                 }
@@ -1687,13 +1687,13 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 if (process_pair_abort_message(root, &abort_msg)) {
                     SS_LOGW(TAG, "pair/abort received: reason=%s", to_cstr(abort_msg.reason));
                     this->connection_manager_->schedule_pair_abort(
-                        {conn->shared_from_this(), abort_msg.reason});
+                        {conn->weak_from_this().lock(), abort_msg.reason});
                 } else {
                     // pair/abort must trigger cleanup even when the reason is unrecognized.
                     SS_LOGW(TAG, "Malformed pair/abort message; treating as abort with "
                                  "method_not_supported");
                     this->connection_manager_->schedule_pair_abort(
-                        {conn->shared_from_this(), PairAbortReason::METHOD_NOT_SUPPORTED});
+                        {conn->weak_from_this().lock(), PairAbortReason::METHOD_NOT_SUPPORTED});
                 }
             }
             break;
@@ -1703,7 +1703,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             // Trust gating (LONG_TERM only) happens in handle_server_unpair on the main loop.
             if (conn != nullptr) {
                 ServerUnpairEvent event;
-                event.conn = conn->shared_from_this();
+                event.conn = conn->weak_from_this().lock();
                 event.matched_psk_id = conn->get_psk_id();
                 event.psk_category = conn->get_psk_category();
                 SS_LOGI(TAG, "server/unpair received (psk_id=%s)", event.matched_psk_id.c_str());
@@ -1719,7 +1719,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 ServerPairInitPayload payload;
                 if (process_server_pair_init_message(root, &payload)) {
                     ServerPairingMessageEvent event;
-                    event.conn = conn->shared_from_this();
+                    event.conn = conn->weak_from_this().lock();
                     event.kind = PairingMessageKind::PAIR_INIT;
                     event.nonce_a = payload.nonce_a;
                     this->connection_manager_->schedule_pairing_message(std::move(event));
@@ -1735,7 +1735,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 ServerPairAuthPayload payload;
                 if (process_server_pair_auth_message(root, &payload)) {
                     ServerPairingMessageEvent event;
-                    event.conn = conn->shared_from_this();
+                    event.conn = conn->weak_from_this().lock();
                     event.kind = PairingMessageKind::PAIR_AUTH;
                     event.pake_msg_1 = payload.pake_msg_1;
                     this->connection_manager_->schedule_pairing_message(std::move(event));
@@ -1751,7 +1751,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 ServerPairConfirmPayload payload;
                 if (process_server_pair_confirm_message(root, &payload)) {
                     ServerPairingMessageEvent event;
-                    event.conn = conn->shared_from_this();
+                    event.conn = conn->weak_from_this().lock();
                     event.kind = PairingMessageKind::PAIR_CONFIRM;
                     event.server_kc = payload.server_kc;
                     this->connection_manager_->schedule_pairing_message(std::move(event));

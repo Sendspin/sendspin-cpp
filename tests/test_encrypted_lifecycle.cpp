@@ -2269,6 +2269,119 @@ TEST(EncryptedLifecycle, EveryHeldMessageTypeReplaysThroughItsHandler) {
     EXPECT_EQ(*bundle.client_ref().get_group_state().group_name, "Kitchen");
 }
 
+// A stand-in whose destructor raises one network-thread event about itself, as an outbound
+// transport callback does during the destructor's join.
+class ExpiringTestConnection : public HoldTestConnection {
+public:
+    ~ExpiringTestConnection() override {
+        try {
+            this->raise(this);
+        } catch (const std::bad_weak_ptr&) {
+            *this->threw = true;
+        }
+    }
+
+    std::function<void(SendspinConnection*)> raise;
+    bool* threw{nullptr};
+};
+
+// A network-thread event about a connection with no owner left is dropped without throwing. Read
+// from the pending queues: until loop() drains them, a dropped and a queued event look the same.
+TEST(EncryptedLifecycle, AnEventAboutAnAlreadyReleasedConnectionIsDropped) {
+    HoldTestClient bundle("Released Connection Event Test Client");
+    ConnectionManager& manager = *bundle.client_ref().connection_manager_;
+
+    // The outbound callbacks exist only on a connect_to() connection. Nothing listens on port 1;
+    // that connection's own close event is non-null, so the counts below ignore it.
+    bundle.client_ref().connect_to("ws://127.0.0.1:1");
+    std::function<void(SendspinConnection*)> outbound_connected;
+    std::function<void(SendspinConnection*)> outbound_disconnected;
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        for (const auto& entry : manager.nursery_) {
+            if (entry.conn->is_outbound()) {
+                outbound_connected = entry.conn->on_connected_cb;
+                outbound_disconnected = entry.conn->on_disconnected_cb;
+            }
+        }
+    }
+    ASSERT_TRUE(outbound_connected && outbound_disconnected);
+
+    const auto deliver = [&](const std::string& json) {
+        return [&bundle, json](SendspinConnection* conn) { bundle.deliver(*conn, json); };
+    };
+    const std::string b64_32_bytes(43, 'A');
+    const std::string b64_64_bytes(86, 'A');
+    struct Row {
+        const char* name;
+        std::function<void(SendspinConnection*)> raise;
+    };
+    const std::vector<Row> rows = {
+        {"outbound open", outbound_connected},
+        {"outbound close", outbound_disconnected},
+        {"server/activate",
+         deliver(R"({"type":"server/activate","payload":{"activities":["playback"]}})")},
+        {"pair/abort", deliver(R"({"type":"pair/abort","payload":{"reason":"user_cancelled"}})")},
+        {"malformed pair/abort", deliver(R"({"type":"pair/abort","payload":{}})")},
+        {"server/unpair", deliver(R"({"type":"server/unpair","payload":{}})")},
+        {"server/pair-init",
+         deliver(R"({"type":"server/pair-init","payload":{"nonce_A":")" + b64_32_bytes + R"("}})")},
+        {"server/pair-auth",
+         deliver(R"({"type":"server/pair-auth","payload":{"pake_msg_1":")" + b64_32_bytes +
+                 R"("}})")},
+        {"server/pair-confirm",
+         deliver(R"({"type":"server/pair-confirm","payload":{"server_kc":")" + b64_64_bytes +
+                 R"("}})")},
+        {"malformed pairing message",
+         deliver(R"({"type":"server/pair-auth","payload":{"pake_msg_1":"!!!not_valid!!!"}})")},
+    };
+
+    // Queued events naming `target`. The swap also empties the queues for the next row.
+    const auto take_events_naming = [&manager](const SendspinConnection* target) {
+        ConnectionManager::DrainedEvents drained;
+        manager.swap_out_pending_events(drained);
+        size_t count = 0;
+        const auto tally = [&count, target](const auto& conn) {
+            count += conn.get() == target ? 1 : 0;
+        };
+        for (const auto& conn : drained.connected) {
+            tally(conn);
+        }
+        for (const auto& conn : drained.disconnected) {
+            tally(conn);
+        }
+        for (const auto& event : drained.activates) {
+            tally(event.conn);
+        }
+        for (const auto& event : drained.pair_aborts) {
+            tally(event.conn);
+        }
+        for (const auto& event : drained.server_unpairs) {
+            tally(event.conn);
+        }
+        for (const auto& event : drained.pairing_messages) {
+            tally(event.conn);
+        }
+        return count;
+    };
+
+    for (const Row& row : rows) {
+        // Control: raised by a connection that still has an owner, the same event is queued.
+        auto live = std::make_shared<HoldTestConnection>();
+        row.raise(live.get());
+        EXPECT_EQ(take_events_naming(live.get()), 1U) << row.name;
+
+        bool threw = false;
+        auto expiring = std::make_shared<ExpiringTestConnection>();
+        expiring->raise = row.raise;
+        expiring->threw = &threw;
+        expiring.reset();
+        EXPECT_FALSE(threw) << row.name << ": shared_from_this() on an expired connection";
+        EXPECT_EQ(take_events_naming(nullptr), 0U)
+            << row.name << ": an event naming no connection was queued";
+    }
+}
+
 // The two locks the client holds are ordered json_processing_mutex_ then conn_ptr_mutex_
 // (docs/conventions.md, "Threading and cross-thread state"). The live receive path fixes that
 // order: a server/pair-finalize handler runs under the JSON lock and asks the manager for the

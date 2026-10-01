@@ -356,19 +356,29 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
 
     this->setup_connection_callbacks(client_conn.get());
+    // Either callback can run during the destructor's transport join, with no owner left (see
+    // "Event queuing" in connection_manager.h).
     client_conn->on_connected_cb = [this](SendspinConnection* c) {
         // Only outbound transports fire this, so it is wired here rather than in
         // setup_connection_callbacks. The connect succeeded, so the WebSocket upgrade is complete;
         // record it and defer starting the Noise handshake to loop() (this runs on the network
         // thread). Inbound connections arrive already upgraded and start theirs at admission.
-        c->mark_ws_upgraded();
+        std::shared_ptr<SendspinConnection> owned = c->weak_from_this().lock();
+        if (owned == nullptr) {
+            return;
+        }
+        owned->mark_ws_upgraded();
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->queue_pending(this->pending_connected_events_, c->shared_from_this());
+        this->queue_pending(this->pending_connected_events_, std::move(owned));
     };
     client_conn->on_disconnected_cb = [this](SendspinConnection* conn) {
-        // Defer to loop(); this callback runs on IXWebSocket's internal thread
+        // Defer to loop(); this callback runs on the transport's internal thread
+        std::shared_ptr<SendspinConnection> owned = conn->weak_from_this().lock();
+        if (owned == nullptr) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->queue_pending(this->pending_disconnect_events_, conn->shared_from_this());
+        this->queue_pending(this->pending_disconnect_events_, std::move(owned));
     };
 
     client_conn->init_time_filter();
@@ -1288,6 +1298,9 @@ void ConnectionManager::set_last_played_server_id(const std::string& server_id) 
 
 void ConnectionManager::schedule_activate(ServerActivateEvent event) {
     // Called from SendspinClient::process_json_message() on the network thread.
+    if (event.conn == nullptr) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->queue_pending(this->pending_activate_events_, std::move(event));
 }
@@ -1295,6 +1308,9 @@ void ConnectionManager::schedule_activate(ServerActivateEvent event) {
 void ConnectionManager::schedule_pair_abort(PairAbortEvent event) {
     // Called from SendspinClient::process_json_message() on the network thread when a pair/abort
     // message arrives (or a malformed pairing frame forces one).
+    if (event.conn == nullptr) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->queue_pending(this->pending_pair_abort_events_, std::move(event));
 }
@@ -1302,6 +1318,9 @@ void ConnectionManager::schedule_pair_abort(PairAbortEvent event) {
 void ConnectionManager::schedule_server_unpair(ServerUnpairEvent&& event) {
     // Called from SendspinClient::process_json_message() on the network thread when
     // server/unpair arrives.
+    if (event.conn == nullptr) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->queue_pending(this->pending_server_unpair_events_, std::move(event));
 }
@@ -1309,6 +1328,9 @@ void ConnectionManager::schedule_server_unpair(ServerUnpairEvent&& event) {
 void ConnectionManager::schedule_pairing_message(ServerPairingMessageEvent&& event) {
     // Called from SendspinClient::process_json_message() on the network thread when a
     // pairing message arrives (or a malformed pairing frame forces a MALFORMED event).
+    if (event.conn == nullptr) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->queue_pending(this->pending_pairing_message_events_, std::move(event));
 }
