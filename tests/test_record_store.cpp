@@ -590,10 +590,10 @@ TEST(RecordStore, ASupersedeReusesTheSlotItsRetireFreed) {
         << "the superseded PSK must stop resolving";
 }
 
-// note_record_played() reports what THIS call made dirty, not everything the store owes. A caller
-// that flushes only on true (ConnectionManager::flush_pending_record_ops()) would otherwise carry
-// away a pairing's or a revocation's pending slot write on a tick where the handoff moved nothing.
-TEST(RecordStore, AMarkPlayedThatMovesNothingReportsNoChangeWhileAWriteIsPending) {
+// note_record_played() reports what THIS call made dirty, not everything the store owes: a call
+// that moves nothing reports no change even while a pairing's or a revocation's slot write is
+// pending, so ConnectionManager::note_playback_activity() stages no flush for it.
+TEST(RecordStore, NoteRecordPlayedThatMovesNothingReportsNoChangeWhileAWriteIsPending) {
     InMemoryPersistenceProvider provider;
     SendspinPairingRecord revoked = make_client_record("server-revoked");
     SendspinPairingRecord other = make_client_record("server-other");
@@ -1035,7 +1035,7 @@ TEST(RecordStore, RecordByServerIdFindsStoredPubkeyRecord) {
 
 // note_record_played()'s return is the persist trigger, so a true for a psk_id the store does not
 // hold costs a provider write (an NVS erase cycle on ESP) for nothing.
-TEST(RecordStore, MarkPlayedOnAnAbsentPskIdIsNoOp) {
+TEST(RecordStore, NoteRecordPlayedOnAnAbsentPskIdIsNoOp) {
     RecordStore store(nullptr);
     SendspinPairingRecord present = make_client_record("server-A");
     ASSERT_TRUE(store.store_record_superseding(present, {}));

@@ -434,8 +434,9 @@ bool RecordStore::persist_records() {
         // Nothing is retried, and RAM stays authoritative for this boot. What a rejection costs
         // depends on what the write carries, so the message does too. The recency order is
         // advisory: the next boot rebuilds it from use, and it is written on every playback
-        // handoff, so against a full or read-only store it stays quiet.
-        if (!write.durable) {
+        // handoff, so against a full or read-only store it stays quiet. A record slot decides
+        // which records the next boot holds, so losing one warns.
+        if (write.key == persistence_keys::RECORD_ORDER) {
             SS_LOGD(TAG,
                     "Provider rejected the \"%s\" write; the next boot rebuilds it from use, and "
                     "no record is at stake",
@@ -535,7 +536,6 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
     for (uint8_t slot : this->dirty_slots_) {
         SlotWrite write;
         write.key = persistence_keys::record_slot_key(slot);
-        write.durable = true;
         // A slot nothing occupies is written as zeros, which is how the store frees it: an
         // evicted, revoked or superseded record must not come back at the next boot.
         write.blob.assign(persistence_keys::RECORD_SLOT_SIZE, 0);
@@ -562,7 +562,6 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
         order.key = persistence_keys::RECORD_ORDER;
         // Advisory: recency is rebuilt from use, so the next boot costs at most one eviction of
         // the wrong record.
-        order.durable = false;
         // Fixed at one byte per slot the store may use, whatever it holds now, padded with a
         // value no slot takes.
         order.blob.assign(this->max_records_, UNASSIGNED_SLOT);

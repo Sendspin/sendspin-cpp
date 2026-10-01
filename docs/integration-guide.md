@@ -944,7 +944,10 @@ A call on a running client applies the new value to the live connections as `pai
 - Turning it on closes each unpaired connection a server opened that is not declaring pairing
   with reason `restart`, so the server reconnects and reads the new value in the `client/hello`.
   Paired connections and `connect_to()` connections stay open; the latter keep advertising the
-  old value until they are reopened.
+  old value until they are reopened. A connection on the Pairing PSK still awaiting its first
+  `server/activate` also stays open: it is most likely about to declare pairing, and a restart
+  would cost that pairing attempt. If it activates idle instead, it keeps the `client/hello` it
+  already read until it reconnects.
 
 Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
 unpaired access after the device is paired is the typical production configuration.

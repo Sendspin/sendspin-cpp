@@ -220,6 +220,10 @@ public:
     /// used, and must not outrank one the device is actually played from. A reorder dirties only
     /// persistence_keys::RECORD_ORDER, so recency survives a reboot at the cost of that one small
     /// write.
+    ///
+    /// For a move that must take effect before the caller's own lock is dropped: this takes only
+    /// mutex_, the innermost lock, so a network-thread eviction sees the new order from here on
+    /// even though the order blob is written later.
     /// @param psk_id The record to move.
     /// @return true when the order moved, and the store therefore needs persisting.
     [[nodiscard]] bool note_record_played(const std::string& psk_id);
@@ -289,10 +293,6 @@ private:
     struct SlotWrite {
         std::string key;
         std::vector<uint8_t> blob;
-        /// Whether losing this write costs the next boot a record it must otherwise hold or drop:
-        /// true for a record slot, false for the recency order the next boot rebuilds from use.
-        /// Decides whether a rejection warns or reports at debug.
-        bool durable{false};
     };
 
     // ========================================

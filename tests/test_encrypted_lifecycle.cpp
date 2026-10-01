@@ -117,6 +117,7 @@ constexpr uint16_t UNPAIRED_TOGGLE_OUTBOUND_PORT = 19094;
 constexpr uint16_t UNPAIRED_TOGGLE_OUTBOUND_TEST_PORT = 19095;
 constexpr uint16_t UNPAIRED_TOGGLE_REKEY_TEST_PORT = 19096;
 constexpr uint16_t UNPAIRED_TOGGLE_STOPPED_TEST_PORT = 19097;
+constexpr uint16_t UNPAIRED_TOGGLE_NURSERY_PAIRING_TEST_PORT = 19098;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob() to a record slot key, so the pairing-flow test below
@@ -2525,7 +2526,8 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
 
 // A tick carrying more than one records op must write each key those ops touched exactly once,
 // and no other: on ESP each save is an NVS erase cycle, and flash wear is a budget
-// (docs/conventions.md, "Embedded resource discipline"). The two ops here are the pair a real tick
+// (docs/conventions.md, "Embedded resource discipline"). Once per key holds because the store's
+// dirty set holds each key once, whatever number of ops dirtied it. The two ops here are the pair a real tick
 // can carry, staged by a playback activate and the unpair drain in the same locked block, and both
 // move the recency order. A third record keeps the played one from being the most recent once the
 // unpair has removed the other, so the playback move is a real one.
@@ -2559,8 +2561,9 @@ TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteEachTouchedKeyOnce) {
     event.psk_category = PskCategory::LONG_TERM;
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        // What note_playback_activity() stages when a long-term connection takes playback.
-        manager.stage_record_op(PendingRecordOp::Kind::MARK_PLAYED, played_record.psk_id);
+        // What note_playback_activity() does when a long-term connection takes playback.
+        EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
+        manager.stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
         manager.handle_server_unpair(&conn, event);
     }
 
@@ -2585,10 +2588,9 @@ TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteEachTouchedKeyOnce) {
     client.stop();
 }
 
-// A MARK_PLAYED op for the record that is already the most recent moves nothing, so the flush
-// must not spend an NVS erase cycle on it: it is staged on every activate of the server already
-// playing.
-TEST(EncryptedLifecycle, AMarkPlayedOpThatMovesNothingWritesNothing) {
+// A playback activate on the record that is already the most recent moves nothing, so it must
+// not spend an NVS erase cycle: every activate of the server already playing takes this path.
+TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
     Identity older_identity = Identity::generate().value();
     Identity newer_identity = Identity::generate().value();
     SendspinPairingRecord older = make_record_for(older_identity);
@@ -2598,7 +2600,7 @@ TEST(EncryptedLifecycle, AMarkPlayedOpThatMovesNothingWritesNothing) {
     auto provider = make_record_store_provider({older, newer});
     InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
-    config.name = "Repeat Mark Played Test Client";
+    config.name = "Repeat Playback Test Client";
     // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
     config.server_port = 0;
 
@@ -2608,11 +2610,17 @@ TEST(EncryptedLifecycle, AMarkPlayedOpThatMovesNothingWritesNothing) {
     ASSERT_TRUE(client.start());
     ConnectionManager& manager = *client.connection_manager_;
 
-    // Control: moving the least recently used record does write the order.
+    auto conn = std::make_shared<HoldTestConnection>();
+    conn->set_noise_handshake_result(older.server_id, PskCategory::LONG_TERM, older.psk_id);
+    conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
+                                std::nullopt);
+
+    // Control: playback on the least recently used record does write the order.
     const size_t writes_before_first = record_writes(persistence);
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.stage_record_op(PendingRecordOp::Kind::MARK_PLAYED, older.psk_id);
+        manager.current_connection_ = conn;
+        manager.note_playback_activity(conn.get());
     }
     manager.flush_pending_record_ops();
     EXPECT_EQ(record_writes(persistence) - writes_before_first, 1u)
@@ -2621,13 +2629,75 @@ TEST(EncryptedLifecycle, AMarkPlayedOpThatMovesNothingWritesNothing) {
     const size_t writes_before_repeat = record_writes(persistence);
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.stage_record_op(PendingRecordOp::Kind::MARK_PLAYED, older.psk_id);
+        manager.note_playback_activity(conn.get());
     }
     manager.flush_pending_record_ops();
 
     EXPECT_EQ(record_writes(persistence), writes_before_repeat)
-        << "a mark-played op that moves nothing must not write a record key";
+        << "a playback that moves nothing must not write a record key";
 
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.current_connection_.reset();
+    }
+    client.stop();
+}
+
+// The recency move takes effect inside the locked block that applies the playback activate, not
+// at the flush after it. Eviction spares only the records of open connections, and a pairing at
+// capacity evicts on the network thread whenever its pair-finalize lands; a connection that
+// declares playback and closes in the same block must not leave its record looking least recently
+// used in the gap before the flush.
+TEST(EncryptedLifecycle, AnEvictionBeforeTheFlushSparesTheRecordJustPlayed) {
+    std::vector<SendspinPairingRecord> records;
+    for (size_t i = 0; i < RecordStore::MIN_MAX_RECORDS; ++i) {
+        records.push_back(make_record_for(Identity::generate().value()));
+    }
+    const SendspinPairingRecord& played = records[0];
+    const SendspinPairingRecord& next_oldest = records[1];
+
+    TestNetworkProvider network;
+    auto provider = make_record_store_provider(records);
+    InMemoryPersistenceProvider& persistence = *provider;
+    SendspinClientConfig config;
+    config.name = "Eviction Before Flush Test Client";
+    config.max_pairing_records = RecordStore::MIN_MAX_RECORDS;
+    // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
+    config.server_port = 0;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    ConnectionManager& manager = *client.connection_manager_;
+
+    auto conn = std::make_shared<HoldTestConnection>();
+    conn->set_noise_handshake_result(played.server_id, PskCategory::LONG_TERM, played.psk_id);
+    conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
+                                std::nullopt);
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.current_connection_ = conn;
+        manager.note_playback_activity(conn.get());
+        // The connection closes in the same block, so its record is no longer in use. Resetting
+        // the slot alone models the close: it is all open_connection_psk_ids() reads.
+        manager.current_connection_.reset();
+    }
+
+    // What a network-thread pair-finalize at capacity does, landing before the flush.
+    SendspinPairingRecord incoming = make_record_for(Identity::generate().value());
+    ASSERT_TRUE(client.record_store_->store_record_superseding(incoming,
+                                                               manager.open_connection_psk_ids()));
+
+    EXPECT_TRUE(
+        client.record_store_->resolve_by_psk_id(played.psk_id, PskCategory::LONG_TERM).has_value())
+        << "the record that just declared playback must not be the eviction victim";
+    // Control: the store was full, so something was evicted, and it was the next least recent.
+    EXPECT_FALSE(client.record_store_->resolve_by_psk_id(next_oldest.psk_id, PskCategory::LONG_TERM)
+                     .has_value())
+        << "the pairing at capacity must evict the least recently used record";
+
+    manager.flush_pending_record_ops();
     client.stop();
 }
 
@@ -2656,7 +2726,9 @@ TEST(EncryptedLifecycle, StopFlushesARecordOpStagedAfterTheLastTick) {
     const size_t writes_before = record_writes(persistence);
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.stage_record_op(PendingRecordOp::Kind::MARK_PLAYED, older.psk_id);
+        // What note_playback_activity() does when a long-term connection takes playback.
+        EXPECT_TRUE(client.record_store_->note_record_played(older.psk_id));
+        manager.stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
     }
     ASSERT_EQ(record_writes(persistence), writes_before)
         << "staging under the lock must not write on its own";
@@ -2868,7 +2940,9 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     event.psk_category = PskCategory::LONG_TERM;
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.stage_record_op(PendingRecordOp::Kind::MARK_PLAYED, played_record.psk_id);
+        // What note_playback_activity() does when a long-term connection takes playback.
+        EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
+        manager.stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
         manager.handle_server_unpair(&conn, event);
     }
 
@@ -3095,8 +3169,8 @@ private:
 
 }  // namespace
 
-// The lifecycle handlers decide which record a write covers under conn_ptr_mutex_ and perform the
-// write after dropping it (PendingRecordOp / flush_pending_record_ops()). What that buys is here:
+// The lifecycle handlers decide which write is owed under conn_ptr_mutex_ and perform it after
+// dropping the lock (PendingRecordOp / flush_pending_record_ops()). What that buys is here:
 // the sync task takes the same mutex for every decoded audio chunk through current_shared(), and
 // on ESP the write is an NVS commit that stalls code running from flash for tens of milliseconds,
 // so a write held under the lock is a stall of the audio path.
@@ -3263,32 +3337,64 @@ TEST(EncryptedLifecycle, UnpairedAccessChangesLeavePairedAndPairingSessionsAlone
 }
 
 // A session still proving itself has already sent the hello that carries the old value, so
-// enabling unpaired access restarts it as it does an admitted one.
+// enabling unpaired access restarts it as it does an admitted one, unless it connected on the
+// Pairing PSK: such a session is most likely about to declare pairing, and a restart would cost
+// that attempt. This pins the not-yet-activated half;
+// the activated case is the current-slot tests'.
 TEST(EncryptedLifecycle, EnablingUnpairedAccessRestartsAnUnpairedSessionStillInTheNursery) {
-    TestNetworkProvider network;
-    InMemoryPersistenceProvider persistence;
-    SendspinClientConfig config;
-    config.name = "Unpaired Toggle Nursery Test Client";
-    config.server_port = UNPAIRED_TOGGLE_NURSERY_TEST_PORT;
+    struct Row {
+        const char* name;
+        uint16_t port;
+        bool pairing_psk;  // Connect on the Pairing PSK rather than the Sentinel PSK.
+        bool expect_restart;
+    };
+    const Row rows[] = {
+        // Control: the setting's own target, a server that read the old value and has not
+        // activated yet.
+        {"Control: Sentinel PSK", UNPAIRED_TOGGLE_NURSERY_TEST_PORT, false, true},
+        {"Pairing PSK", UNPAIRED_TOGGLE_NURSERY_PAIRING_TEST_PORT, true, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        PairingCapturePersistenceProvider persistence;
+        const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xD2);
+        SendspinClientConfig config;
+        config.name = "Unpaired Toggle Nursery Test Client";
+        config.server_port = row.port;
 
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start());
-    pump_for(client, 50);
+        SendspinClient client(config);
+        client.set_network_provider(&network);
+        client.set_persistence_provider(&persistence);
+        ASSERT_TRUE(client.start());
+        pump_for(client, 50);
 
-    FakeEncryptedServerOptions options;
-    options.suppress_activate = true;
-    FakeEncryptedServer server(server_url(UNPAIRED_TOGGLE_NURSERY_TEST_PORT),
-                               std::string(NOISE_SUITE_CHACHAPOLY), Identity::generate().value(),
-                               std::string(SENTINEL_PSK_ID), SENTINEL_PSK, options);
-    pump_until(client, [&] { return server.client_hello_count() == 1; });
+        FakeEncryptedServerOptions options;
+        options.suppress_activate = true;
+        if (row.pairing_psk) {
+            options.psk_category = "pr";
+        }
+        FakeEncryptedServer server(
+            server_url(row.port), std::string(NOISE_SUITE_CHACHAPOLY), Identity::generate().value(),
+            row.pairing_psk ? pairing_psk.psk_id : std::string(SENTINEL_PSK_ID),
+            row.pairing_psk ? pairing_psk.psk : SENTINEL_PSK, options);
+        pump_until(client, [&] { return server.client_hello_count() == 1; });
 
-    client.set_unpaired_access_enabled(true);
-    pump_until(client, [&] { return server.closed(); });
-    EXPECT_EQ(server.goodbye_reason(), std::optional<std::string>("restart"));
+        client.set_unpaired_access_enabled(true);
+        if (row.expect_restart) {
+            pump_until(client, [&] { return server.closed(); });
+            EXPECT_EQ(server.goodbye_reason(), std::optional<std::string>("restart"));
+        } else {
+            // Must-not-happen window: a restart would close the session within a tick of the
+            // call.
+            pump_for(client, 300);
+            EXPECT_FALSE(server.closed())
+                << "enabling unpaired access restarted a pairing-PSK session awaiting activation";
+            client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+        }
 
-    pump_for(client, 100);
+        pump_for(client, 100);
+    }
 }
 
 // Enabling unpaired access keeps a connect_to() session open.

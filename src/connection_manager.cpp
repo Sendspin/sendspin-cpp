@@ -1379,10 +1379,17 @@ void ConnectionManager::apply_unpaired_access_change(bool enabled) {
             }
             // messaging.md "client/goodbye": restart on a connection the client opened promises
             // that the client reopens it, and nothing reopens a connect_to() connection. A
-            // connection declaring pairing is left to finish.
+            // connection declaring pairing is left to finish. A Pairing-PSK one that has not
+            // activated yet is most likely about to declare pairing, and a restart would cost that
+            // attempt, so it is left alone too; if it activates idle instead, it keeps the hello
+            // it already read until it reconnects. A Sentinel one awaiting its activation is
+            // restarted, since its server may be deciding that activation on the value its hello
+            // carried.
             if (hello_sent && !conn->is_outbound() &&
                 conn->get_psk_category() != PskCategory::LONG_TERM &&
-                !conn->has_activity(SendspinActivity::PAIRING)) {
+                !conn->has_activity(SendspinActivity::PAIRING) &&
+                (conn->first_activate_received() ||
+                 conn->get_psk_category() != PskCategory::PAIRING)) {
                 doomed.push_back(conn);
             }
         };
@@ -1617,15 +1624,13 @@ void ConnectionManager::flush_pending_record_ops() {
         ops.swap(this->pending_record_ops_);
         this->refresh_record_ops_size_hint();
     }
-    // Applying the RAM halves first and persisting once lets the store coalesce: a slot several
-    // ops touched is written once, carrying its final state. The last-played value is a different
-    // key and keeps its own write.
+    // A key several ops dirtied is written once, carrying its final state, because the store's
+    // dirty set holds it once; calling persist_records() once for all PERSIST_RECORDS ops only
+    // spares repeat passes over that set. The last-played value is a different key and keeps its
+    // own write.
     bool records_dirty = false;
     for (const auto& op : ops) {
         switch (op.kind) {
-            case PendingRecordOp::Kind::MARK_PLAYED:
-                records_dirty |= this->client_->record_store_->note_record_played(op.value);
-                break;
             case PendingRecordOp::Kind::PERSIST_RECORDS:
                 records_dirty = true;
                 break;
@@ -1865,16 +1870,17 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     if (this->client_->note_last_played_server(server_id)) {
         this->stage_record_op(PendingRecordOp::Kind::LAST_PLAYED, server_id);
     }
-    // The same event is the record store's recency signal: eviction spares the servers the
-    // device is played from, not the ones merely connected. Staged whole: nothing before the
-    // flush reads the store's order, since eviction is its only reader and cannot take the
-    // record of an open connection (store_record_superseding()). The psk_id is read once: a
-    // server may start an in-band re-handshake while this runs, and a second read could straddle
-    // the network thread's rewrite of it and disagree with the first.
+    // A network-thread pair-finalize at capacity evicts against the recency order and spares
+    // only the records of open connections, so a connection that closes later in this locked
+    // block must not leave its record looking least recent until a deferred move lands.
+    // RecordStore::mutex_ is the innermost lock (docs/conventions.md, "Threading and
+    // cross-thread state"), so taking it here is in order. The psk_id is read once: a server may
+    // start an in-band re-handshake while this runs, and a second read could straddle the network
+    // thread's rewrite of it and disagree with the first.
     if (conn->get_psk_category() == PskCategory::LONG_TERM) {
         const std::string psk_id = conn->get_psk_id();
-        if (!psk_id.empty()) {
-            this->stage_record_op(PendingRecordOp::Kind::MARK_PLAYED, psk_id);
+        if (!psk_id.empty() && this->client_->record_store_->note_record_played(psk_id)) {
+            this->stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
         }
     }
     SS_LOGD(TAG, "note_playback_activity: last_played_server_id updated to %s", server_id.c_str());

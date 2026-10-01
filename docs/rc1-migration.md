@@ -27,7 +27,8 @@ item against the current code before acting on it; line numbers drift as phases 
   and persists. Unpaired access is off until `SendspinClient::set_unpaired_access_enabled()`
   turns it on, which works at any time, closing the connections that relied on it with
   `pairing_required` when turned off and restarting idle inbound unpaired connections when turned
-  on (`pairing.md` "Unpaired Access"). The library never persists it; an application that keeps
+  on, except a Pairing-PSK connection still awaiting its first activate, which is left alone
+  (`pairing.md` "Unpaired Access"). The library never persists it; an application that keeps
   it across reboots restores it by calling the setter before `start()`.
 - Record eviction order is least recently used, which the spec leaves to the implementation.
   Recency is the order of `RecordStore::records_`, which `note_record_played()` moves a record to

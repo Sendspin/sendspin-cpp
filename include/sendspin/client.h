@@ -605,6 +605,9 @@ public:
     /// it with client/goodbye reason pairing_required. Turning it on closes each unpaired
     /// connection a server opened that is not declaring pairing with reason restart, so the server
     /// reconnects and sees the new value in the client/hello; a connect_to() connection is kept.
+    /// So is one on the Pairing PSK still awaiting its first server/activate: it is most likely
+    /// about to declare pairing, and a restart would cost that attempt. If it activates idle
+    /// instead, it keeps the hello it already read until it reconnects.
     /// Callable at any time, before the first start() and while stopped included.
     ///
     /// The library never persists the setting. An application that keeps it across reboots
