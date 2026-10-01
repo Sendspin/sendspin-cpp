@@ -903,6 +903,14 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                         "server_id=%s",
                         to_cstr(pairing_method.value()), event.conn->get_server_id().c_str());
                 this->handle_enter_pairing(event.conn.get());
+                // connection.md "Re-handshake" makes a post-re-handshake activation a subsequent
+                // one, so messaging.md "client/state" owes an update for a role it activates.
+                const bool adds_role = (active_role_mask(event.conn->get_active_roles()) &
+                                        ~active_role_mask(roles_before)) != 0;
+                if (is_first && adds_role &&
+                    !contains_activity(activities, SendspinActivity::PLAYBACK)) {
+                    this->client_->publish_client_state(event.conn.get());
+                }
             }
         } else if (is_first && event.conn->is_handshake_complete()) {
             this->client_->on_handshake_complete(event.conn.get());
@@ -910,8 +918,8 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
 
         // messaging.md "client/state": a role that becomes active in active_roles must be told
         // about in an update that includes that role's object, before the server may send its
-        // binary data. A first activate publishes through on_handshake_complete(); this covers
-        // every later one that moves the set.
+        // binary data. A first activate publishes through on_handshake_complete(), or above when
+        // it selects pairing alone and adds a role; this covers every later one that moves the set.
         if (roles_changed && !is_first && event.conn->is_operational()) {
             this->client_->publish_client_state(event.conn.get());
         }
@@ -1918,8 +1926,8 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
     }
 
     // Notify the client and record playback activity, only for the winner. The client/state
-    // on_handshake_complete() publishes below is held until flush_pending_admission() admits the
-    // connection (see SendspinClient::publish_client_state()).
+    // published below is held until flush_pending_admission() admits the connection (see
+    // SendspinClient::publish_client_state()).
     this->note_playback_activity(this->current_connection_.get());
 
     // The connection still occupies current_connection_ (so admission.h's "in-flight pairing is
@@ -1927,7 +1935,10 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
     // client as operational until pairing finishes and the post-finalize re-handshake completes;
     // one that also declares playback is announced first, because pairing.md "Entering and
     // leaving pairing" leaves active_roles and streams untouched and going operational is what
-    // clears any stale pairing state before the new attempt.
+    // clears any stale pairing state before the new attempt. A playback-capable connection may
+    // carry active roles with pairing alone (messaging.md "server/activate"), and those still
+    // owe the initial client/state (messaging.md "client/state"), published without going
+    // operational.
     const auto& activities = this->current_connection_->get_activities();
     const std::optional<SendspinPairMethod> pairing_method =
         selected_pairing_method(activities, this->current_connection_->get_pairing_method());
@@ -1941,6 +1952,10 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
                 to_cstr(pairing_method.value()),
                 this->current_connection_->get_server_id().c_str());
         this->handle_enter_pairing(this->current_connection_.get());
+        if (!contains_activity(activities, SendspinActivity::PLAYBACK) &&
+            !this->current_connection_->get_active_roles().empty()) {
+            this->client_->publish_client_state(this->current_connection_.get());
+        }
     }
 
     SS_LOGI(TAG, "Connection admitted: server_id=%s",

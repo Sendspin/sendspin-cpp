@@ -92,6 +92,7 @@ constexpr uint16_t REKEY_ROLE_SEND_TEST_PORT = 19010;
 constexpr uint16_t REPROVE_REHANDSHAKE_TEST_PORT = 19011;
 constexpr uint16_t COMBINED_FIRST_TEST_PORT = 19012;
 constexpr uint16_t COMBINED_REKEY_TEST_PORT = 19013;
+constexpr uint16_t PAIRING_REKEY_ROLE_TEST_PORT = 19014;
 constexpr uint16_t RECENCY_IDLE_TEST_PORT = 19021;
 constexpr uint16_t RECENCY_PLAYBACK_TEST_PORT = 19022;
 constexpr uint16_t RECENCY_LATER_PLAYBACK_TEST_PORT = 19023;
@@ -704,9 +705,9 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     EXPECT_FALSE(repair_init->has_commit_b);
 
     // The primary regression check: no client/state must have reached the server before (or
-    // instead of) client/pair-finalize. handle_enter_pairing() never publishes client/state;
-    // only the operational branch (on_handshake_complete) does, so any non-zero count here means
-    // the activate was misrouted into the operational path.
+    // instead of) client/pair-finalize. This pairing activate adds no role, so the pairing branch
+    // owes no client/state and only the operational branch (on_handshake_complete) would send
+    // one: any non-zero count here means the activate was misrouted into the operational path.
     EXPECT_EQ(server.client_state_count(), state_count_before_repair)
         << "client/state must not be sent while the server awaits client/pair-finalize";
 
@@ -1607,6 +1608,64 @@ TEST(EncryptedLifecycle, CombinedActivateAfterARehandshakeGoesOperationalAndEnte
     pump_for(client, 100);
 }
 
+// A pairing-only activate after the same re-handshake that adds a role with a state object.
+// connection.md "Re-handshake" makes it a subsequent activation, so messaging.md "client/state"
+// owes the added role's object even though the connection is entering pairing rather than going
+// operational. ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFinalize is the control: its
+// pairing-only activate adds no role and sends no state.
+TEST(EncryptedLifecycle, PairingActivateAfterARehandshakeThatAddsARoleSendsItsClientState) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+
+    Identity server_identity = Identity::generate().value();
+    PairedPeer long_term_peer = make_paired_peer();
+    long_term_peer.record.server_id = server_identity.peer_id();
+    persistence.set_seeded_long_term_record(long_term_peer.record);
+    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xD0);
+
+    SendspinClientConfig config;
+    config.name = "Pairing Rekey Role Test Client";
+    config.server_port = PAIRING_REKEY_ROLE_TEST_PORT;
+
+    SendspinClient client(config);
+    add_state_object_roles(client);
+    // Makes roles on a Pairing PSK session with pairing alone admissible (messaging.md
+    // "Playback-capable connections").
+    client.set_unpaired_access_enabled(true);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    FakeEncryptedServerOptions options;
+    // No player: an active player's state also waits for clock sync.
+    options.first_roles_json = R"(["controller@v1"])";
+    options.second_activities_json = R"(["pairing"])";
+    options.second_roles_json = R"(["controller@v1","artwork@v1"])";
+    options.second_pairing_method = "pairing_psk";
+    options.withhold_pair_finalize_ack = true;
+    FakeEncryptedServer server(server_url(PAIRING_REKEY_ROLE_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               long_term_peer.record.psk_id, long_term_peer.psk, options);
+
+    pump_until(client, [&] { return server.client_state_count() > 0; });
+    const int state_count_before_rekey = server.client_state_count();
+
+    ASSERT_TRUE(server.trigger_rehandshake(pairing_psk.psk_id, pairing_psk.psk, "pr"))
+        << "failed to start the in-band re-handshake onto the pairing PSK";
+
+    pump_until(client, [&] { return server.client_state_count() > state_count_before_rekey; });
+    EXPECT_TRUE(server.pair_init().has_value()) << "the activate did not enter pairing";
+
+    JsonDocument doc;
+    ASSERT_TRUE(parse_last_client_state(server, doc));
+    EXPECT_TRUE(doc["payload"]["artwork"].is<JsonObjectConst>())
+        << "the state did not carry the object of the role the activation added";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
 // scan_reprove_watchdog() is the only guard against a server that rekeys an admitted connection
 // and then never activates it: connection.md "Re-handshake" makes server/activate the server's
 // first message under the new keys, and nothing else re-proves the connection. The deadline is
@@ -2293,37 +2352,67 @@ public:
 // admitted yet. The promotion tick installs the connection, performs the record writes it owes
 // and only then admits it, so a state sent at promotion invites an artwork announce into that
 // gap; the announce is dropped and the part behind it is a malformed sequence the role closes
-// the connection on.
+// the connection on. A first activate that selects pairing alone still carries active roles on a
+// playback-capable connection (messaging.md "server/activate"), and those are owed the initial
+// state as well.
 //
 // Driven through the manager's own loop() from the nursery, so the order under test is the one a
 // real promotion runs. The stand-in sends inline, which makes "was it admitted when the state
-// left" a plain read instead of a race against a socket.
+// left" a plain read instead of a race against a socket. Every row runs with unpaired access, the
+// setting that makes its activation admissible on a Sentinel or Pairing PSK session. The pairing
+// row matches the Pairing PSK and selects pairing_psk, whose entry sends client/pair-init and
+// client/pair-finalize at once; those are not client/state, so the count below ignores them.
 TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitted) {
-    HoldTestClient bundle("State After Admission Test Client");
-    ConnectionManager& manager = *bundle.client_ref().connection_manager_;
+    struct Row {
+        const char* label;
+        std::vector<SendspinActivity> activities;
+        std::optional<SendspinPairMethod> pairing_method;
+    };
+    const Row rows[] = {
+        {"Control: playback", {SendspinActivity::PLAYBACK}, std::nullopt},
+        {"pairing alone", {SendspinActivity::PAIRING}, SendspinPairMethod::PAIRING_PSK},
+    };
 
-    auto conn = std::make_shared<StateRecordingConnection>();
-    // No player in the active set: an active player's state also waits for clock sync, which
-    // lands after admission by itself and would hide the gate under test.
-    conn->apply_server_activate({SendspinActivity::PLAYBACK},
-                                std::vector<std::string>{"metadata@v1"}, std::nullopt,
-                                std::nullopt);
-    conn->set_client_hello_sent(true);
-    conn->set_server_hello_received(true);
-    conn->set_provisional_time_us(platform_time_us());
-    conn->last_receive_time_us_.store(platform_time_us(), std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.push_nursery_entry(NurseryEntry{.conn = conn});
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.label);
+        HoldTestClient bundle("State After Admission Test Client");
+        bundle.client_ref().set_unpaired_access_enabled(true);
+        ConnectionManager& manager = *bundle.client_ref().connection_manager_;
+
+        auto conn = std::make_shared<StateRecordingConnection>();
+        if (row.pairing_method.has_value()) {
+            const auto& pairing_psk = bundle.client_ref().record_store_->pairing_psk();
+            ASSERT_TRUE(pairing_psk.has_value());
+            conn->set_noise_handshake_result(test_peer_id("state-after-admission-server"),
+                                             PskCategory::PAIRING, pairing_psk->psk_id);
+            // The count the activate-event drain takes for every pairing server/activate.
+            conn->bump_pairing_index();
+        }
+        // No player in the active set: an active player's state also waits for clock sync, which
+        // lands after admission by itself and would hide the gate under test.
+        conn->apply_server_activate(row.activities, std::vector<std::string>{"metadata@v1"},
+                                    row.pairing_method, std::nullopt);
+        conn->set_client_hello_sent(true);
+        conn->set_server_hello_received(true);
+        conn->set_provisional_time_us(platform_time_us());
+        conn->last_receive_time_us_.store(platform_time_us(), std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+            manager.push_nursery_entry(NurseryEntry{.conn = conn});
+        }
+
+        bundle.client_ref().loop();
+
+        ASSERT_TRUE(conn->is_admitted()) << "the tick did not promote and admit the connection";
+        ASSERT_EQ(conn->state_sent_while_admitted.size(), 1u)
+            << "the promotion tick owes exactly one client/state";
+        EXPECT_TRUE(conn->state_sent_while_admitted.front())
+            << "client/state left before the connection could receive the binary data it opens";
+        if (row.pairing_method.has_value()) {
+            EXPECT_TRUE(conn->is_pairing_in_progress())
+                << "publishing the state ended the pairing attempt the activation started";
+        }
     }
-
-    bundle.client_ref().loop();
-
-    ASSERT_TRUE(conn->is_admitted()) << "the tick did not promote and admit the connection";
-    ASSERT_EQ(conn->state_sent_while_admitted.size(), 1u)
-        << "the promotion tick owes exactly one client/state";
-    EXPECT_TRUE(conn->state_sent_while_admitted.front())
-        << "client/state left before the connection could receive the binary data it opens";
 }
 
 // A stand-in whose destructor raises one network-thread event about itself, as an outbound
