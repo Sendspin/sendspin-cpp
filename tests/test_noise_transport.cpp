@@ -1825,16 +1825,16 @@ TEST(NoiseTransport, ConcurrentSendsDoNotInterleaveFragments) {
 class DeferredWriteConnection : public TestConnection {
 public:
     SsErr send_transport_frame(const uint8_t* data, size_t len,
-                               NoiseTransport::FrameWriteHook before_write) override {
+                               const NoiseTransport::FrameWriteHook& before_write) override {
         this->sent_binary_.emplace_back(data, data + len);
-        this->hooks_.push_back(std::move(before_write));
+        this->hooks_.push_back(before_write);
         return SsErr::OK;
     }
 
     /// Sends through NoiseTransport::send_json() with a write hook, which send_app_json() does
     /// not expose.
-    SsErr send_json_with_hook(const std::string& json, NoiseTransport::FrameWriteHook hook) {
-        return this->noise_transport_.send_json(json.data(), json.size(), std::move(hook));
+    SsErr send_json_with_hook(const std::string& json, const NoiseTransport::FrameWriteHook& hook) {
+        return this->noise_transport_.send_json(json.data(), json.size(), hook);
     }
 
     std::vector<NoiseTransport::FrameWriteHook> hooks_;

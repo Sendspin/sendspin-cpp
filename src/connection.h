@@ -890,7 +890,7 @@ protected:
     /// that writes synchronously. A transport that queues its writes overrides this to run the
     /// hook where the write happens.
     virtual SsErr send_transport_frame(const uint8_t* data, size_t len,
-                                       NoiseTransport::FrameWriteHook before_write);
+                                       const NoiseTransport::FrameWriteHook& before_write);
 
     // ========================================
     // Active-role mask

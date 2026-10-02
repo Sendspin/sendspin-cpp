@@ -41,8 +41,9 @@ static const char* const TAG = "sendspin.connection";
 
 SendspinConnection::SendspinConnection() {
     this->noise_transport_.set_frame_sink(
-        [this](const uint8_t* data, size_t len, NoiseTransport::FrameWriteHook before_write) {
-            return this->send_transport_frame(data, len, std::move(before_write));
+        [this](const uint8_t* data, size_t len,
+               const NoiseTransport::FrameWriteHook& before_write) {
+            return this->send_transport_frame(data, len, before_write);
         });
 }
 
@@ -53,7 +54,7 @@ SendspinConnection::~SendspinConnection() = default;
 // ============================================================================
 
 SsErr SendspinConnection::send_transport_frame(const uint8_t* data, size_t len,
-                                               NoiseTransport::FrameWriteHook before_write) {
+                                               const NoiseTransport::FrameWriteHook& before_write) {
     if (before_write) {
         before_write();
     }
@@ -142,11 +143,11 @@ int64_t SendspinConnection::send_time_message() {
     // No tag check: a connection's time frames reach the socket in send order, so a hook left
     // over from an earlier frame stores a time no later than the current frame's write. Capturing
     // only this keeps the closure in std::function's inline storage.
-    NoiseTransport::FrameWriteHook before_write = [this]() {
+    const NoiseTransport::FrameWriteHook before_write = [this]() {
         this->time_frame_sent_us_.store(time_frame_tag(platform_time_us()),
                                         std::memory_order_release);
     };
-    if (this->noise_transport_.send_json(buf, len, std::move(before_write)) != SsErr::OK) {
+    if (this->noise_transport_.send_json(buf, len, before_write) != SsErr::OK) {
         return 0;
     }
     return now;

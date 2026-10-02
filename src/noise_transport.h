@@ -63,7 +63,7 @@ public:
     /// @brief Sink that writes one encrypted frame to the wire as a binary WS frame, running
     /// `before_write` (if set) immediately before the write.
     using FrameSink =
-        std::function<SsErr(const uint8_t* data, size_t len, FrameWriteHook before_write)>;
+        std::function<SsErr(const uint8_t* data, size_t len, const FrameWriteHook& before_write)>;
 
     /// @brief One complete (non-fragment, fully reassembled) plaintext transport message.
     /// data == nullptr means "no complete message yet" (mid-reassembly, or a dropped frame),
@@ -112,7 +112,7 @@ public:
     ///                     transport runs it inside session_mutex_, so it must not block, send,
     ///                     or take a lock that is held while acquiring session_mutex_.
     /// @return SsErr::OK on success, INVALID_STATE if the transport is not active.
-    SsErr send_json(const char* json, size_t len, FrameWriteHook before_write = nullptr);
+    SsErr send_json(const char* json, size_t len, const FrameWriteHook& before_write = nullptr);
 
     /// @brief Convenience overload of send_json(const char*, size_t) for std::string callers.
     SsErr send_json(const std::string& json) {
@@ -167,7 +167,7 @@ private:
     /// which excludes a concurrent re-handshake session swap from racing the encrypt.
     /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + 16 (AEAD tag).
     SsErr encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity, size_t plaintext_len,
-                                        FrameWriteHook before_write);
+                                        const FrameWriteHook& before_write);
 
     /// @brief Fragment a plaintext > MAX_TRANSPORT_PLAINTEXT into multiple frames and
     /// encrypt+send each one. Implements messaging.md "Fragmentation": every fragment is a
@@ -182,12 +182,12 @@ private:
     /// releasing the lock between frames would let a concurrent send interleave one.
     /// @param before_write Passed to the frame sink with the last fragment.
     SsErr fragment_and_send_locked(uint8_t orig_type, const uint8_t* data, size_t data_len,
-                                   FrameWriteHook before_write);
+                                   const FrameWriteHook& before_write);
 
     /// @brief Fills send_buf_ with an optional prefix followed by data, then encrypts and
     /// sends it. Caller must hold session_mutex_ across the whole call, as send_buf_ requires.
     SsErr fill_and_encrypt_locked(const uint8_t* prefix, size_t prefix_len, const uint8_t* data,
-                                  size_t data_len, FrameWriteHook before_write);
+                                  size_t data_len, const FrameWriteHook& before_write);
 
     /// @brief Grows a PlatformBuffer to at least `needed` bytes (geometric growth, contents
     /// preserved, capacity retained across calls), optionally capped.

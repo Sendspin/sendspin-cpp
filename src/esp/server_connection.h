@@ -134,7 +134,7 @@ protected:
     /// @brief Queues the frame like send_binary_message(), carrying `before_write` to the httpd
     /// worker, which runs it immediately before httpd_ws_send_frame_async()
     SsErr send_transport_frame(const uint8_t* data, size_t len,
-                               NoiseTransport::FrameWriteHook before_write) override;
+                               const NoiseTransport::FrameWriteHook& before_write) override;
 
     /// @brief Places an AsyncRespArg and a copy of the payload in one block (see AsyncRespArg) and
     /// queues it on the httpd worker to be sent as a text or binary frame by async_send_frame()
@@ -150,7 +150,7 @@ protected:
     /// @param before_write      Run by the worker immediately before the write, if set.
     SsErr queue_async_send(const uint8_t* data, size_t len, httpd_ws_type_t type,
                            SendCompleteCallback on_complete, bool allow_before_hello,
-                           NoiseTransport::FrameWriteHook before_write);
+                           const NoiseTransport::FrameWriteHook& before_write);
 
     /// @brief httpd_queue_work callback that sends a queued text or binary frame over the
     /// WebSocket

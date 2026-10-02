@@ -162,17 +162,15 @@ SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t 
                                   allow_before_hello, nullptr);
 }
 
-SsErr SendspinServerConnection::send_transport_frame(const uint8_t* data, size_t len,
-                                                     NoiseTransport::FrameWriteHook before_write) {
+SsErr SendspinServerConnection::send_transport_frame(
+    const uint8_t* data, size_t len, const NoiseTransport::FrameWriteHook& before_write) {
     return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, nullptr,
-                                  /*allow_before_hello=*/true, std::move(before_write));
+                                  /*allow_before_hello=*/true, before_write);
 }
 
-SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len,
-                                                 httpd_ws_type_t type,
-                                                 SendCompleteCallback on_complete,
-                                                 bool allow_before_hello,
-                                                 NoiseTransport::FrameWriteHook before_write) {
+SsErr SendspinServerConnection::queue_async_send(
+    const uint8_t* data, size_t len, httpd_ws_type_t type, SendCompleteCallback on_complete,
+    bool allow_before_hello, const NoiseTransport::FrameWriteHook& before_write) {
     const bool is_text = (type == HTTPD_WS_TYPE_TEXT);
 
     if (!this->is_connected()) {
@@ -220,7 +218,7 @@ SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len
         resp_arg->has_callback = true;
         resp_arg->on_complete = std::move(on_complete);
     }
-    resp_arg->before_write = std::move(before_write);
+    resp_arg->before_write = before_write;
 
     std::memcpy(static_cast<void*>(resp_arg->payload), static_cast<const void*>(data), len);
 
