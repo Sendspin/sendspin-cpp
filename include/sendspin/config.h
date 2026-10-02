@@ -256,9 +256,12 @@ struct SendspinClientConfig {
     int64_t time_burst_response_timeout_ms{
         DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
 
+    static constexpr int64_t MAX_LIVENESS_TIMEOUT_MS = 30LL * 60 * 1000;  ///< Liveness timeout cap
+
     /// @brief Milliseconds of inbound silence before the established connection is dropped as
     /// dead. Unset derives it from the time burst settings, tolerating two consecutive unanswered
-    /// time messages (60000 with the defaults); 0 disables.
+    /// time messages (60000 with the defaults); 0 disables. Set or derived, it is capped at
+    /// MAX_LIVENESS_TIMEOUT_MS.
     std::optional<int64_t> liveness_timeout_ms{};
 
     /// @brief Memory placement for the per-connection WebSocket payload reassembly buffer

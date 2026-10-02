@@ -336,8 +336,8 @@ public:
         return this->provisional_time_us_.load(std::memory_order_relaxed);
     }
 
-    /// @brief Returns the arrival timestamp of the last complete inbound message, or 0 if none.
-    int64_t get_last_receive_time_us() const {
+    /// @brief Returns the low 32 bits of the last complete inbound message's arrival time.
+    uint32_t get_last_receive_time_us() const {
         return this->last_receive_time_us_.load(std::memory_order_relaxed);
     }
 
@@ -1042,9 +1042,9 @@ protected:
     /// the main loop (provisional-connection timeout check). 0 = not yet set.
     std::atomic<int64_t> provisional_time_us_{0};
 
-    /// Monotonic timestamp (platform_time_us()) of the last complete inbound message. Atomic
-    /// because it is written on the network thread and read by the main-loop liveness check.
-    std::atomic<int64_t> last_receive_time_us_{0};
+    /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP
+    /// server worker thread updates it while the hub thread reads it for logging.
+    std::atomic<int64_t> serialize_ema_us_{0};
 
     /// Process-unique connection identity (see get_instance_id()). Assigned once at construction.
     const uint64_t instance_id{next_instance_id()};
@@ -1058,6 +1058,13 @@ protected:
     size_t held_count_{0};
 
     size_t websocket_write_offset_{0};
+
+    // 32-bit fields
+
+    /// Low 32 bits of platform_time_us() at the last complete inbound message. Atomic because it
+    /// is written on the network thread and read by the main-loop liveness check; 32 bits because
+    /// it is stored per message and a 64-bit atomic is not lock-free on the ESP32 family.
+    std::atomic<uint32_t> last_receive_time_us_{0};
 
     // String fields
 

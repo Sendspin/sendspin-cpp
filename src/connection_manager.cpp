@@ -287,18 +287,31 @@ static std::optional<SendspinPairMethod> selected_pairing_method(
     return std::nullopt;
 }
 
+// A cap under liveness_expired()'s 2^31 us range leaves the tick minutes in which to see an expiry.
+static_assert(SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS * US_PER_MS < INT32_MAX,
+              "liveness cap exceeds the 32-bit arrival stamp's range");
+
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config) {
-    if (config.liveness_timeout_ms.has_value()) {
-        return config.liveness_timeout_ms.value();
-    }
     // The next message goes out after at most one inter-burst interval, and an unanswered one
-    // times out after one response timeout.
-    return (LIVENESS_TOLERATED_MISSES + 1) *
-           (config.time_burst_interval_ms + config.time_burst_response_timeout_ms);
+    // times out after one response timeout. Not value_or(): it would evaluate the derivation,
+    // which can overflow, even when unused.
+    const int64_t timeout_ms =
+        config.liveness_timeout_ms.has_value()
+            ? config.liveness_timeout_ms.value()
+            : (LIVENESS_TOLERATED_MISSES + 1) *
+                  (config.time_burst_interval_ms + config.time_burst_response_timeout_ms);
+    if (timeout_ms > SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS) {
+        SS_LOGW(TAG, "Liveness timeout of %" PRId64 " ms exceeds the maximum, using %" PRId64 " ms",
+                timeout_ms, SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS);
+        return SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS;
+    }
+    return timeout_ms;
 }
 
-bool liveness_expired(int64_t now_us, int64_t last_receive_us, int64_t timeout_us) {
-    return timeout_us > 0 && now_us - last_receive_us >= timeout_us;
+bool liveness_expired(int64_t now_us, uint32_t last_receive_us, int64_t timeout_us) {
+    // Signed: an arrival stamped after now_us was read is a negative silence, not ~2^32 us.
+    const auto silence_us = static_cast<int32_t>(static_cast<uint32_t>(now_us) - last_receive_us);
+    return timeout_us > 0 && silence_us >= timeout_us;
 }
 
 // ============================================================================
