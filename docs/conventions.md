@@ -202,6 +202,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   | If the change touches...                  | Update...                                      |
   | ----------------------------------------- | ---------------------------------------------- |
   | Cross-file threading or lifecycle design  | `docs/internals.md`                            |
+  | Clock sync or audio alignment             | `docs/playback-sync.md`                        |
   | Public API, config, listener contracts    | `docs/integration-guide.md` and header docs    |
   | Architecture, layout, conventions         | `CLAUDE.md`                                    |
   | Anything shown in usage examples          | `@code` blocks in headers, `examples/`, README |
@@ -212,6 +213,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
   in a comment at that function or member, and protocol behavior is cited
   from the spec rather than restated. Do not add test names or numeric
   constants there; point to the declaration that owns the value.
+- `docs/playback-sync.md` explains the clock-sync and audio-alignment
+  method under the same limits as `docs/internals.md`: it names tuning
+  constants rather than quoting their values, adds no test names, cites the
+  spec rather than restating it, and leaves per-function detail to the code.
 - Numeric values quoted in docs (defaults, sizes, timeouts, filter constants)
   must match the code. Pruning stale text counts as much as adding new text,
   and inline comments elsewhere in the tree that describe the changed

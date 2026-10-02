@@ -1,6 +1,6 @@
 # Sendspin-cpp Internals
 
-This document maps how the library's parts work together: which threads exist, how state crosses between them, the order of one `loop()` tick, and the invariants that span several files. It covers only facts that span files. Why a single function or member behaves as it does is documented at that function or member, and the protocol itself is specified by the Sendspin spec, cited here by section. The design rules new code must follow are in `docs/conventions.md`.
+This document maps how the library's parts work together: which threads exist, how state crosses between them, the order of one `loop()` tick, and the invariants that span several files. It covers only facts that span files. Why a single function or member behaves as it does is documented at that function or member, and the protocol itself is specified by the Sendspin spec, cited here by section. The design rules new code must follow are in `docs/conventions.md`. How the library keeps audio in time with the server (clock sync and the sync task's alignment) is in `docs/playback-sync.md`.
 
 ## Code Organization
 
@@ -17,7 +17,7 @@ All state mutations and listener callbacks happen on the caller's main loop unle
 | Thread | Name | Created by | Purpose |
 |--------|------|-----------|---------|
 | **Main loop** | (caller's) | User code | Drives `SendspinClient::loop()`. All role event processing and listener callbacks run here. |
-| **Sync task** | `Sendspin` | `SyncTask::start()` | Decodes audio, synchronizes it to server timestamps, writes PCM via `on_audio_write`. |
+| **Sync task** | `Sendspin` | `SyncTask::start()` | Decodes audio, aligns it to server timestamps (`docs/playback-sync.md`), writes PCM via `on_audio_write`. |
 | **Visualizer drain** | `SsVis` | `VisualizerRole::Impl::start()` | Delivers visualization frames from a ring buffer at their playback time. |
 | **Artwork decode** | `SsArt` | `ArtworkRole::Impl::start()` | Calls `on_image_decode()` for completed images; hands the display deadline to the main loop. |
 | **Network** | (library-internal) | IXWebSocket (host); esp_http_server for inbound and esp_websocket_client for outbound connections (ESP) | WebSocket I/O. Handlers here hand work to the main loop or a role thread. |
@@ -37,6 +37,8 @@ The primitives other than the Inbox live in `src/platform/`, with FreeRTOS imple
 | `SpscRingBuffer` | Variable-size binary data from the network thread to a role thread (encoded audio, visualizer frames) |
 | `ShadowSlot` | Single-writer/single-reader state whose reader is not the main loop, latest-wins or merged (sync-task playback progress, a connection's pending pairing record) |
 | `Inbox` (`src/inbox.h`) | Cross-thread state bound for the main loop, apart from the exemption below |
+
+One lock sits outside these primitives: each connection's `SendspinTimeFilter` guards its state with its own `state_mutex_`, because the main loop updates it while the sync task and the visualizer drain thread convert timestamps through it (`docs/playback-sync.md`).
 
 ### Inbox
 
@@ -98,6 +100,8 @@ The nursery, promotion, and admission are described under [Connection Lifecycle]
 
 Connection lifecycle runs before role events and time sync before audio, so roles always see settled connection and clock state. Most `ConnectionManager` sections check a lock-free hint atomic before locking; the admission flush and the two watchdog scans take `conn_ptr_mutex_` unconditionally. The Inbox steps gate on two `poll()` snapshots: one before the ring drain (steps 3 and 4) and one after it (steps 6 and 7), which catches bits set while the ring was draining. Roles whose pending work waits on a deadline or on the sync task rather than on a new message (the player's held stream events, the metadata and color roles' future-dated state, artwork's held displays) add a carry-over term to `needs_drain()`, since no inbox bit tracks that wait.
 
+The role drains in step 6 are simple apart from the player's, which is the main loop's half of the stream end/start handshake (see [Stream End and Start](#stream-end-and-start)). Controller, metadata, and color take their slot and fire their state callback, metadata and color holding a future-dated state until its server-clock timestamp. Artwork holds each decoded image's display deadline and fires `on_image_display()` when it passes. Visualizer has no drain; it is driven entirely by its ring events.
+
 ## Ordering Guarantees
 
 ### Network Thread to Main Loop
@@ -112,9 +116,26 @@ Network-thread work bound for the main loop is deferred through the Inbox, `Conn
 2. The sync task finishes the stream and returns to IDLE, clearing `TASK_RUNNING`.
 3. The main loop moves the ring events into `awaiting_sync_idle_events`. It holds STREAM_END, and everything behind it, until `SyncTask::is_running()` reads false, then fires `on_stream_end()`.
 4. The main loop fires `on_stream_start()` and signals `COMMAND_START`.
-5. The sync task, which has been waiting for `COMMAND_START` since it saw the new codec header, goes ACTIVE.
+5. The sync task, which has been waiting for `COMMAND_START` since it saw the new codec header (WAIT FOR CLIENT ACK in `docs/playback-sync.md`), goes ACTIVE.
 
 Signalling before pushing is what lets the `is_running()` gate in step 3 release only an end the sync task has already been told to honour. Step 5's wait is what makes step 3 safe: without it the sync task could pass through IDLE and back to ACTIVE before the main loop ever observed it not running, and the held STREAM_END would wait forever. `stream/clear` does not use this path; it signals the sync task directly and enqueues a marker chunk into the encoded ring, and the sync task stays ACTIVE while it discards up to the marker.
+
+The hold in step 3, and step 4, run in `PlayerRole::Impl::drain_events()`, which first applies any server command (volume, mute, output delay), then walks `awaiting_sync_idle_events`:
+
+```api
+PLAYER_STREAM ring events → on_stream_ring_event() → awaiting_sync_idle_events
+                       │
+                       ▼
+         For each event in order:
+           ├─ STREAM_END:
+           │    Sync task still running → wait for next tick
+           │    Sync task idle → fire on_stream_end(), continue
+           │
+           └─ STREAM_START:
+                Take stream_params_slot
+                Mark stream active, fire on_stream_start()
+                Signal sync task COMMAND_START
+```
 
 ### Cleanup
 
@@ -168,97 +189,6 @@ Role dispatch points skip a role the server has not activated (`SendspinConnecti
 | Player audio (binary) | `PlayerRole::Impl::handle_binary()` writes the chunk to the encoded audio ring |
 | Artwork (binary) | `ArtworkRole::Impl::handle_binary()` accumulates the image and, when complete, notifies the decode thread |
 | Visualizer (binary) | `VisualizerRole::Impl::handle_binary()` writes the frame to the visualizer ring |
-
-## Stream Lifecycle
-
-### Player Drain
-
-`PlayerRole::Impl::drain_events()` first applies any server command (volume, mute, output delay), then walks `awaiting_sync_idle_events`:
-
-```api
-PLAYER_STREAM ring events → on_stream_ring_event() → awaiting_sync_idle_events
-                       │
-                       ▼
-         For each event in order:
-           ├─ STREAM_END:
-           │    Sync task still running → wait for next tick
-           │    Sync task idle → fire on_stream_end(), continue
-           │
-           └─ STREAM_START:
-                Take stream_params_slot
-                Mark stream active, fire on_stream_start()
-                Signal sync task COMMAND_START
-```
-
-The other roles are simpler. Controller, metadata, and color take their slot and fire their state callback, metadata and color holding a future-dated state until its server-clock timestamp. Artwork holds each decoded image's display deadline and fires `on_image_display()` when it passes. Visualizer has no drain; it is driven entirely by its ring events.
-
-### Sync Task
-
-The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) runs a two-level state machine.
-
-```api
-┌──────────────────────────────────────────────────────────┐
-│                    COMMAND_STOP?                          │
-│                    ┌─── yes ──→ exit thread               │
-│                    │                                      │
-│  ┌─────────────────┴──────────────────┐                  │
-│  │           IDLE STATE               │                  │
-│  │  • Clear TASK_RUNNING and the      │                  │
-│  │    stream COMMAND flags            │                  │
-│  │  • Set TASK_IDLE                   │                  │
-│  │  • Reset context + progress queue  │                  │
-│  │  • Wait for codec header (wake)    │◄──┐              │
-│  └────────────┬───────────────────────┘   │              │
-│               │ got header                │              │
-│               ▼                           │              │
-│  ┌────────────────────────────────────┐   │              │
-│  │     WAIT FOR CLIENT ACK            │   │              │
-│  │  • Wait on COMMAND_START or        │   │              │
-│  │    STOP/END/CLEAR                  │   │              │
-│  │  • If END/CLEAR arrives, return    │───┘              │
-│  │    header to buffer and loop back  │                  │
-│  └────────────┬───────────────────────┘                  │
-│               │ COMMAND_START                             │
-│               ▼                                          │
-│  ┌────────────────────────────────────┐                  │
-│  │         ACTIVE STATE               │                  │
-│  │  • Clear TASK_IDLE, COMMAND_START  │                  │
-│  │  • Drain stale playback progress   │                  │
-│  │  • Pin the current connection      │                  │
-│  │  • Set TASK_RUNNING                │                  │
-│  │  • Decode initial codec header     │                  │
-│  │  • Run inner state machine loop    │                  │
-│  └────────────┬───────────────────────┘                  │
-│               │ STOP/END                                 │
-│               ▼                                          │
-│  ┌────────────────────────────────────┐                  │
-│  │  Return the borrowed ring buffer   │──────→ loop back │
-│  │  entry, then release the pin       │                  │
-│  └────────────────────────────────────┘                  │
-└──────────────────────────────────────────────────────────┘
-```
-
-```api
-INITIAL_SYNC ──→ LOAD_CHUNK ──→ SYNCHRONIZE_AUDIO ──→ TRANSFER_AUDIO
-     │                ▲               │                       │
-     │                └───────────────┴───────────────────────┘
-     │                        (cycle per chunk)
-     └──→ LOAD_CHUNK (once first playback progress callback confirms frames were consumed)
-
-COMMAND_STREAM_CLEAR from any state → discard up to the clear marker → INITIAL_SYNC
-```
-
-INITIAL_SYNC primes the audio pipeline with silence. LOAD_CHUNK takes and decodes the next encoded chunk once the clock is synced. SYNCHRONIZE_AUDIO compares the chunk's playback time, converted to the client clock, with the time the next written audio will actually play, and corrects the difference by inserting silence or dropping late audio (large errors) or by adding or removing a single frame (small ones). TRANSFER_AUDIO writes the PCM through `on_audio_write`.
-
-The "will actually play" estimate comes from the audio sink: `notify_audio_played()` reports consumed frames into the sync task's playback-progress `ShadowSlot`, which the inner loop takes on every iteration without blocking the audio thread.
-
-### Stream Connection Pin
-
-Every timestamp a stream converts belongs to one connection's time filter, so the sync task pins that connection (`ConnectionManager::current_shared()`) as the stream goes active and holds it until the stream ends. The pin stays valid because a filter is never replaced and the admitted slot cannot change servers mid-stream: dropping a connection runs `cleanup_connection_state()`, which ends the stream, before a successor is installed. The pin is often the last reference to a dropped connection, and an outbound connection's destructor joins its transport thread, so the sync task never destroys it: `ConnectionManager::release_from_role_thread()` hands the reference to the main loop's next `flush_deferred_releases()`, or to `~ConnectionManager` when the client is destroyed without `stop()`.
-
-## Time Synchronization
-
-`SendspinTimeBurst` (`src/time_burst.h`) runs NTP-style bursts: a configurable number of `client/time` exchanges whose lowest-round-trip measurement goes to the filter, then a pause until the next burst. High-performance networking is held for the duration of each burst. `SendspinTimeFilter` (`src/time_filter.h`) is a two-state `[offset, drift]` Kalman filter with adaptive forgetting for step changes; its `state_mutex_` lets the sync task and the visualizer drain thread convert timestamps while the main loop updates it. The filter's first measurement gates playback and, while the player role is active, the client's `client/state` reporting `available: true` (messaging.md "client/state").
 
 ## Noise Encryption
 
@@ -329,6 +259,10 @@ Both hold `std::shared_ptr<SendspinConnection>`. On the ESP server path these ar
 A server sends role traffic right behind its `server/activate`, a tick before promotion admits the connection. The connection holds that JSON (bounded by `MAX_HELD_MESSAGES` / `MAX_HELD_BYTES`), and `SendspinClient::admit_connection()` replays it in arrival order. The first `client/state` is also held until admission, because it opens the server's binary traffic for the roles, and binary messages arriving before admission are dropped rather than held. Admission runs after `ConnectionManager` drops its lock, to keep the library's lock order (`docs/conventions.md`). The persistence writes the lifecycle handlers decide on run there too, so a slow flash commit never holds the lock the network threads need.
 
 A later `server/activate` can remove roles. Each removed role runs the same `cleanup()` a lost connection runs, but the inbox ring is not reset, since the roles that stay active keep their queued events; the `cleanup_generation` stamp drops the removed role's stale ones instead. Nothing is restarted when an activation adds the role back: its role thread never stopped, so it returns through the `client/state` that activation publishes and, for a stream role, the next `stream/start`.
+
+### Stream Connection Pin
+
+Every timestamp a stream converts belongs to one connection's time filter, so the sync task pins that connection (`ConnectionManager::current_shared()`) as the stream goes active and holds it until the stream ends. The pin stays valid because a filter is never replaced and the admitted slot cannot change servers mid-stream: dropping a connection runs `cleanup_connection_state()`, which ends the stream, before a successor is installed. The pin is often the last reference to a dropped connection, and an outbound connection's destructor joins its transport thread, so the sync task never destroys it: `ConnectionManager::release_from_role_thread()` hands the reference to the main loop's next `flush_deferred_releases()`, or to `~ConnectionManager` when the client is destroyed without `stop()`.
 
 ### Client Start and Stop
 

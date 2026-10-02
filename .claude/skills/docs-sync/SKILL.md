@@ -37,17 +37,20 @@ For every behavioral or API change in the diff, check each of these:
    explains a single function, restates the spec, names a test, or quotes a
    numeric constant is itself a finding: move it to a code comment or cite
    the source.
-2. **`docs/integration-guide.md`**: public API shape, listener contracts,
+2. **`docs/playback-sync.md`**: clock sync, the sync task's state machine,
+   and audio alignment. The same limits apply: it names tuning constants
+   rather than quoting values, and per-function detail belongs in the code.
+3. **`docs/integration-guide.md`**: public API shape, listener contracts,
    configuration reference, enums reference, and the thread-safety summary.
-3. **`CLAUDE.md`**: the key-class list, project layout, and conventions
+4. **`CLAUDE.md`**: the key-class list, project layout, and conventions
    sections, when the structure they describe changes.
-4. **`README.md`** and **`examples/`**: features and usage that the diff
+5. **`README.md`** and **`examples/`**: features and usage that the diff
    renames, removes, or reshapes.
-5. **Header doc-comments** in `include/sendspin/`: `@brief`/`@param`/`@return`
+6. **Header doc-comments** in `include/sendspin/`: `@brief`/`@param`/`@return`
    text, threading notes, and especially `@code` usage examples, which must
    construct current types with current fields in the current order.
-6. **`config.h` field docs**: defaults and semantics quoted in doc comments.
-7. **Inline comments anywhere in the tree**: grep for the names of functions,
+7. **`config.h` field docs**: defaults and semantics quoted in doc comments.
+8. **Inline comments anywhere in the tree**: grep for the names of functions,
    constants, messages, and fields the diff changes, and read the surrounding
    comments in files the diff does NOT touch. A comment describing the old
    behavior of a changed function is a finding even three files away.
