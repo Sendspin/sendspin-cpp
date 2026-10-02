@@ -1804,7 +1804,8 @@ public:
         // and loop()'s liveness tick reaps a current connection whose last arrival is older than
         // the timeout. Handing the JSON straight to the dispatch entry point skips the stamp, so
         // do it here rather than stubbing the tick out.
-        conn.last_receive_time_us_.store(platform_time_us(), std::memory_order_relaxed);
+        conn.last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
+                                         std::memory_order_relaxed);
         this->client_storage->process_json_message(&conn, json.data(), json.size(),
                                                    platform_time_us());
     }
@@ -2396,7 +2397,8 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
         conn->set_provisional_time_us(platform_time_us());
-        conn->last_receive_time_us_.store(platform_time_us(), std::memory_order_relaxed);
+        conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
+                                          std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
             manager.push_nursery_entry(NurseryEntry{.conn = conn});
@@ -2458,7 +2460,8 @@ TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
         conn->set_provisional_time_us(platform_time_us());
-        conn->last_receive_time_us_.store(platform_time_us(), std::memory_order_relaxed);
+        conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
+                                          std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
             manager.push_nursery_entry(NurseryEntry{.conn = conn});
@@ -2468,8 +2471,9 @@ TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
         ASSERT_TRUE(conn->is_admitted()) << "the tick did not admit the connection";
 
         const int64_t now_us = platform_time_us();
-        conn->last_receive_time_us_.store(row.stale ? now_us - 2 * timeout_us : now_us,
-                                          std::memory_order_relaxed);
+        conn->last_receive_time_us_.store(
+            static_cast<uint32_t>(row.stale ? now_us - 2 * timeout_us : now_us),
+            std::memory_order_relaxed);
         client.loop();
 
         if (row.stale) {
@@ -2503,10 +2507,11 @@ TEST(EncryptedLifecycle, AnInboundMessageAdvancesTheLivenessStamp) {
     const std::shared_ptr<SendspinConnection> conn = client.connection_manager_->current_shared();
     ASSERT_NE(conn, nullptr);
 
-    const int64_t before_us = conn->get_last_receive_time_us();
+    const uint32_t before_us = conn->get_last_receive_time_us();
     ASSERT_TRUE(server.send_app_json(metadata_state_json(1, "Liveness Stamp")));
     // Unbounded: completion is the proof, and the suite watchdog catches a stamp that never moves.
-    pump_until(client, [&] { return conn->get_last_receive_time_us() > before_us; });
+    // Inequality, since the 32-bit stamp can wrap.
+    pump_until(client, [&] { return conn->get_last_receive_time_us() != before_us; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
