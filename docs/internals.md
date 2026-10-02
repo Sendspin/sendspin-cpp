@@ -305,7 +305,7 @@ Client -> Server: noise/handshake msg2
 Server -> Client: server/activate (normal operational flow)
 ```
 
-The new long-term record must resolve for the re-handshake that immediately follows, so the `server/pair-finalize` handler commits it to `RecordStore` in RAM on the network thread. The persistence provider is main-loop-only, so the durable write is staged through `records_dirty_slot` and performed by the next `drain_inbox()`, before `on_pairing_succeeded` fires. The pairing-code methods (CPace) follow the same main-loop state-machine shape in `ConnectionManager`.
+The new long-term record must resolve for the re-handshake that immediately follows, so the `server/pair-finalize` handler commits it to `RecordStore` in RAM on the network thread. The persistence provider is main-loop-only, so the durable write is staged through `records_dirty_slot` and performed by the next `drain_inbox()`, or by the client destructor if it comes first, before `on_pairing_succeeded` fires. The pairing-code methods (CPace) follow the same main-loop state-machine shape in `ConnectionManager`.
 
 ## Connection Lifecycle
 
