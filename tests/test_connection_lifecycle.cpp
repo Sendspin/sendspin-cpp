@@ -516,7 +516,7 @@ SendspinClientConfig make_liveness_config(uint16_t port, int64_t liveness_timeou
 }  // namespace
 
 // resolve_liveness_timeout_ms() either derives the window from the configured burst settings or
-// hands back an explicitly configured one unchanged.
+// takes an explicitly configured one, and clamps either to the cap.
 TEST(LivenessTimeout, ResolvesFromConfig) {
     struct Row {
         const char* name;
@@ -531,6 +531,14 @@ TEST(LivenessTimeout, ResolvesFromConfig) {
         {"response timeout widens the window", 10000, 20000, std::nullopt, 90000},
         {"explicit value overrides the derivation", 60000, std::nullopt, 5000, 5000},
         {"explicit zero disables the check", 60000, std::nullopt, 0, 0},
+        {"Control: explicit value at the cap is kept", std::nullopt, std::nullopt,
+         SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS,
+         SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS},
+        {"explicit value above the cap is clamped", std::nullopt, std::nullopt,
+         SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS + 1,
+         SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS},
+        {"derived value above the cap is clamped", 900000, std::nullopt, std::nullopt,
+         SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS},
     };
 
     for (const Row& row : rows) {
@@ -548,24 +556,36 @@ TEST(LivenessTimeout, ResolvesFromConfig) {
 }
 
 // liveness_expired() measures silence from the connection's last arrival, not from time zero, and
-// expires once it reaches the timeout; a disabled timeout never expires.
+// expires once it reaches the timeout; a disabled timeout never expires. Only the low 32 bits
+// count: silence stays exact across their wrap, and an arrival just after now never expires.
 TEST(LivenessTimeout, ExpiresOnceSilenceReachesTheTimeout) {
     struct Row {
         const char* name;
         int64_t now_us;
-        int64_t last_receive_us;
+        uint32_t last_receive_us;
         int64_t timeout_us;
         bool expected;
     };
     constexpr int64_t TIMEOUT_US = 60'000'000;
-    constexpr int64_t LAST_US = 5'000'000'000;
+    // High bits set, so a row fails if they take part.
+    constexpr int64_t EPOCH_US = 5LL << 32;
+    constexpr uint32_t LAST = 1'000'000'000U;
+    constexpr int64_t LAST_US = EPOCH_US + LAST;
+    // Half a timeout before the 32-bit wrap.
+    constexpr auto PRE_WRAP = static_cast<uint32_t>((1LL << 32) - TIMEOUT_US / 2);
+    constexpr int64_t WRAP_US = EPOCH_US + (1LL << 32);
     const Row rows[] = {
-        {"Control: just under the timeout", LAST_US + TIMEOUT_US - 1, LAST_US, TIMEOUT_US, false},
-        {"exactly at the timeout", LAST_US + TIMEOUT_US, LAST_US, TIMEOUT_US, true},
-        {"past the timeout", LAST_US + TIMEOUT_US + 1, LAST_US, TIMEOUT_US, true},
-        {"Control: last arrival ahead of now", LAST_US - 1, LAST_US, TIMEOUT_US, false},
-        {"zero timeout disables the check", LAST_US + 10 * TIMEOUT_US, LAST_US, 0, false},
-        {"negative timeout disables the check", LAST_US + 10 * TIMEOUT_US, LAST_US, -1, false},
+        {"Control: just under the timeout", LAST_US + TIMEOUT_US - 1, LAST, TIMEOUT_US, false},
+        {"exactly at the timeout", LAST_US + TIMEOUT_US, LAST, TIMEOUT_US, true},
+        {"past the timeout", LAST_US + TIMEOUT_US + 1, LAST, TIMEOUT_US, true},
+        {"Control: just under the timeout across the wrap", WRAP_US + TIMEOUT_US / 2 - 1, PRE_WRAP,
+         TIMEOUT_US, false},
+        {"exactly at the timeout across the wrap", WRAP_US + TIMEOUT_US / 2, PRE_WRAP, TIMEOUT_US,
+         true},
+        {"Control: last arrival ahead of now", LAST_US - 1, LAST, TIMEOUT_US, false},
+        {"Control: last arrival ahead of now across the wrap", WRAP_US - 1, 0, TIMEOUT_US, false},
+        {"zero timeout disables the check", LAST_US + 10 * TIMEOUT_US, LAST, 0, false},
+        {"negative timeout disables the check", LAST_US + 10 * TIMEOUT_US, LAST, -1, false},
     };
 
     for (const Row& row : rows) {

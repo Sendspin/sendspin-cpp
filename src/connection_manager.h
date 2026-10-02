@@ -76,20 +76,21 @@ static constexpr int64_t REPROVE_TIMEOUT_US = seconds_to_us(REPROVE_TIMEOUT_S);
 /// @brief Consecutive unanswered client/time messages the derived liveness timeout tolerates.
 static constexpr int64_t LIVENESS_TOLERATED_MISSES = 2;
 
-/// @brief Returns config.liveness_timeout_ms if set, otherwise a timeout derived from the time
-/// burst settings that outlasts LIVENESS_TOLERATED_MISSES consecutive unanswered time messages by
-/// at least one response timeout.
+/// @brief Returns config.liveness_timeout_ms or, if unset, a timeout derived from the time burst
+/// settings that outlasts LIVENESS_TOLERATED_MISSES consecutive unanswered time messages by at
+/// least one response timeout; either is capped at SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS.
 /// @param config The client configuration.
 /// @return Timeout in milliseconds; 0 or negative disables the check.
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config);
 
 /// @brief Returns true if a connection last heard from at last_receive_us has been silent for at
-/// least timeout_us as of now_us.
+/// least timeout_us as of now_us. Only the low 32 bits of each time count, so a silence of 2^31 us
+/// (about 35.8 minutes) or more reads as none.
 /// @param now_us Current time in microseconds.
-/// @param last_receive_us Arrival time of the connection's last complete inbound message.
+/// @param last_receive_us SendspinConnection::get_last_receive_time_us().
 /// @param timeout_us Liveness timeout in microseconds; 0 or negative never expires.
 /// @return true if the connection should be dropped as lost.
-bool liveness_expired(int64_t now_us, int64_t last_receive_us, int64_t timeout_us);
+bool liveness_expired(int64_t now_us, uint32_t last_receive_us, int64_t timeout_us);
 
 /// @brief Bound (milliseconds, per goodbye) on waiting for stop()'s goodbyes to be sent before
 /// the transports are torn down
