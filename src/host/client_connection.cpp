@@ -158,23 +158,6 @@ SsErr SendspinClientConnection::send_ws_frame(bool is_binary, const uint8_t* dat
     return SsErr::OK;
 }
 
-bool SendspinClientConnection::send_time_message() {
-    if (!this->is_connected()) {
-        return false;
-    }
-
-    char buf[TIME_MESSAGE_BUF_SIZE];
-    const int64_t client_transmitted = platform_time_us();
-    const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
-    if (len == 0) {
-        return false;
-    }
-    this->update_serialize_ema(platform_time_us() - client_transmitted);
-    // Route through send_app_json so the frame is encrypted when Noise is active;
-    // the pointer/length overload encrypts straight from the stack buffer.
-    return this->send_app_json(buf, len, nullptr) == SsErr::OK;
-}
-
 // ============================================================================
 // Private helpers / callbacks
 // ============================================================================
@@ -197,7 +180,6 @@ void SendspinClientConnection::setup_callbacks() {
                 this->connected_ = false;
                 this->client_hello_sent_ = false;
                 this->server_hello_received_ = false;
-                this->pending_time_message_ = false;
                 this->reset_websocket_payload();
                 if (this->on_disconnected_cb) {
                     this->on_disconnected_cb(this);

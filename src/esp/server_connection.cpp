@@ -22,7 +22,6 @@
 #include "protocol_messages.h"
 #include "sendspin/types.h"
 #include <esp_err.h>
-#include <esp_timer.h>
 
 #include <cstring>
 #include <string>
@@ -61,13 +60,8 @@ struct AsyncRespArg {
     /// false the worker drops it unless the hello has already been sent on this connection.
     bool allow_before_hello{false};
     SendCompleteCallback on_complete;
-};
-
-/// @brief Heap struct used by the time-message worker to identify its originating connection
-///
-/// Holds a weak_ptr for the same identity-and-lifetime safety as AsyncRespArg.
-struct SessionLookup {
-    std::weak_ptr<SendspinServerConnection> conn;
+    /// Run immediately before the write, if set.
+    NoiseTransport::FrameWriteHook before_write;
 };
 
 static_assert(SEND_BLOCK_SIZE - sizeof(AsyncRespArg) >= 256,
@@ -157,20 +151,26 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback on_complete,
                                                   bool allow_before_hello) {
     return this->queue_async_send(reinterpret_cast<const uint8_t*>(message.data()), message.size(),
-                                  HTTPD_WS_TYPE_TEXT, std::move(on_complete), allow_before_hello);
+                                  HTTPD_WS_TYPE_TEXT, std::move(on_complete), allow_before_hello,
+                                  nullptr);
 }
 
 SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
                                                     SendCompleteCallback on_complete,
                                                     bool allow_before_hello) {
     return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, std::move(on_complete),
-                                  allow_before_hello);
+                                  allow_before_hello, nullptr);
 }
 
-SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len,
-                                                 httpd_ws_type_t type,
-                                                 SendCompleteCallback on_complete,
-                                                 bool allow_before_hello) {
+SsErr SendspinServerConnection::send_transport_frame(
+    const uint8_t* data, size_t len, const NoiseTransport::FrameWriteHook& before_write) {
+    return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, nullptr,
+                                  /*allow_before_hello=*/true, before_write);
+}
+
+SsErr SendspinServerConnection::queue_async_send(
+    const uint8_t* data, size_t len, httpd_ws_type_t type, SendCompleteCallback on_complete,
+    bool allow_before_hello, const NoiseTransport::FrameWriteHook& before_write) {
     const bool is_text = (type == HTTPD_WS_TYPE_TEXT);
 
     if (!this->is_connected()) {
@@ -218,6 +218,7 @@ SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len
         resp_arg->has_callback = true;
         resp_arg->on_complete = std::move(on_complete);
     }
+    resp_arg->before_write = before_write;
 
     std::memcpy(static_cast<void*>(resp_arg->payload), static_cast<const void*>(data), len);
 
@@ -311,77 +312,6 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
     return ESP_OK;
 }
 
-bool SendspinServerConnection::send_time_message() {
-    if (!this->is_connected()) {
-        return false;
-    }
-
-    // The worker resolves the originating connection via the weak_ptr below, so a recycled sockfd
-    // cannot redirect the frame and a destroyed connection yields a clean no-op. The JSON is built
-    // inside the worker so client_transmitted is captured as close to the wire send as possible.
-    // SessionLookup holds a weak_ptr, so it is constructed with placement new and explicitly
-    // destroyed before free (matching the AsyncRespArg convention).
-    auto* lookup = static_cast<SessionLookup*>(platform_malloc_internal(sizeof(SessionLookup)));
-    if (lookup == nullptr) {
-        SS_LOGE(TAG, "Failed to allocate SessionLookup for time message");
-        return false;
-    }
-    new (lookup) SessionLookup();
-    lookup->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
-    if (httpd_queue_work(this->server_, async_send_time_text, lookup) != ESP_OK) {
-        SS_LOGE(TAG, "httpd_queue_work failed for time message");
-        lookup->~SessionLookup();
-        platform_free(lookup);
-        return false;
-    }
-    return true;
-}
-
-void SendspinServerConnection::async_send_time_text(void* arg) {
-    auto* lookup = static_cast<SessionLookup*>(arg);
-    auto conn = lookup->conn.lock();
-    lookup->~SessionLookup();
-    platform_free(lookup);
-
-    // Drop the time frame unless client/hello has already been sent on this exact connection. The
-    // weak_ptr lock guarantees identity (never a recycled-sockfd peer); the hello gate guarantees
-    // a stale time frame can never jump ahead of a fresh connection's hello.
-    if (!conn || !conn->is_connected() || !conn->client_hello_sent_) {
-        return;
-    }
-
-    httpd_ws_frame_t ws_pkt;
-    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
-    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-
-    // Capture client_transmitted as close as possible to the actual send. The serialization
-    // happens between this capture and the wire send; track its duration so the bias is
-    // visible in the time_burst log. Stack buffer keeps serialization heap-free.
-    char buf[TIME_MESSAGE_BUF_SIZE];
-    const int64_t client_transmitted = esp_timer_get_time();
-    const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
-
-    if (len == 0) {
-        return;
-    }
-
-    conn->update_serialize_ema(esp_timer_get_time() - client_transmitted);
-
-    if (conn->noise_transport_.is_active()) {
-        // Noise transport active: encrypt the JSON frame straight from the stack buffer.
-        // send_app_json calls send_encrypted_text which calls send_binary_message which
-        // calls httpd_queue_work (async). This is safe to call from the httpd worker;
-        // is_active() is an atomic read.
-        conn->send_app_json(buf, len, nullptr);
-        return;
-    }
-
-    // Pre-Noise or no Noise: send as plain text frame directly.
-    ws_pkt.payload = reinterpret_cast<uint8_t*>(buf);
-    ws_pkt.len = len;
-    httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
-}
-
 void SendspinServerConnection::async_send_frame(void* arg) {
     auto* resp_arg = static_cast<AsyncRespArg*>(arg);
     httpd_ws_frame_t ws_pkt;
@@ -403,6 +333,9 @@ void SendspinServerConnection::async_send_frame(void* arg) {
     auto conn = resp_arg->conn.lock();
     if (conn && conn->is_connected() &&
         (resp_arg->allow_before_hello || conn->client_hello_sent_)) {
+        if (resp_arg->before_write) {
+            resp_arg->before_write();
+        }
         esp_err_t err = httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
         if (resp_arg->has_callback) {
             resp_arg->on_complete(err == ESP_OK);

@@ -18,12 +18,15 @@
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "platform/time.h"
+#include "protocol_messages.h"
 #include "sendspin/types.h"
 #include "time_filter.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,14 +40,27 @@ static const char* const TAG = "sendspin.connection";
 // ============================================================================
 
 SendspinConnection::SendspinConnection() {
-    // The transport emits encrypted frames through this connection's binary send path.
-    // allow_before_hello=true: Noise frames are transport-level and precede the app hello.
-    this->noise_transport_.set_frame_sink([this](const uint8_t* data, size_t len) {
-        return this->send_binary_message(data, len, nullptr, /*allow_before_hello=*/true);
-    });
+    this->noise_transport_.set_frame_sink(
+        [this](const uint8_t* data, size_t len,
+               const NoiseTransport::FrameWriteHook& before_write) {
+            return this->send_transport_frame(data, len, before_write);
+        });
 }
 
 SendspinConnection::~SendspinConnection() = default;
+
+// ============================================================================
+// Transport frames
+// ============================================================================
+
+SsErr SendspinConnection::send_transport_frame(const uint8_t* data, size_t len,
+                                               const NoiseTransport::FrameWriteHook& before_write) {
+    if (before_write) {
+        before_write();
+    }
+    // allow_before_hello=true: Noise frames are transport-level and precede the app hello.
+    return this->send_binary_message(data, len, nullptr, /*allow_before_hello=*/true);
+}
 
 // ============================================================================
 // Time filter
@@ -90,6 +106,66 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendComple
     }
     // Pre-handshake cold path: the text-frame API takes a std::string.
     return this->send_text_message(std::string(json, len), std::move(cb), allow_before_hello);
+}
+
+// ============================================================================
+// Time messages
+// ============================================================================
+
+namespace {
+
+/// The tag a client/time frame is known by (see time_frame_tag_).
+uint32_t time_frame_tag(int64_t client_transmitted) {
+    return static_cast<uint32_t>(client_transmitted);
+}
+
+}  // namespace
+
+int64_t SendspinConnection::send_time_message() {
+    if (!this->is_connected()) {
+        return 0;
+    }
+
+    int64_t now = platform_time_us();
+    // Tag 0 is reserved for "no frame in flight" (see time_frame_tag_).
+    if (time_frame_tag(now) == 0) {
+        ++now;
+    }
+    char buf[TIME_MESSAGE_BUF_SIZE];
+    const size_t len = format_client_time_message(buf, sizeof(buf), now);
+    if (len == 0) {
+        return 0;
+    }
+    // Release: a claim that observes this seed also observes the previous frame's retirement.
+    this->time_frame_sent_us_.store(time_frame_tag(now), std::memory_order_release);
+    this->time_frame_tag_.store(time_frame_tag(now), std::memory_order_release);
+
+    // No tag check: a connection's time frames reach the socket in send order, so a hook left
+    // over from an earlier frame stores a time no later than the current frame's write. Capturing
+    // only this keeps the closure in std::function's inline storage.
+    const NoiseTransport::FrameWriteHook before_write = [this]() {
+        this->time_frame_sent_us_.store(time_frame_tag(platform_time_us()),
+                                        std::memory_order_release);
+    };
+    if (this->noise_transport_.send_json(buf, len, before_write) != SsErr::OK) {
+        return 0;
+    }
+    return now;
+}
+
+std::optional<int64_t> SendspinConnection::claim_time_frame(int64_t client_transmitted) {
+    // Read before the exchange: a later frame's write time is published after this frame was
+    // retired, so observing it makes the exchange fail.
+    const uint32_t sent = this->time_frame_sent_us_.load(std::memory_order_acquire);
+    uint32_t tag = time_frame_tag(client_transmitted);
+    if (tag == 0 ||
+        !this->time_frame_tag_.compare_exchange_strong(tag, 0, std::memory_order_acq_rel)) {
+        return std::nullopt;
+    }
+    // Wrapping subtraction, read as signed: a leftover hook that sampled the clock before the seed
+    // reads as negative, and the frame then counts as written at the time it carries.
+    const auto delay = static_cast<int32_t>(sent - tag);
+    return client_transmitted + std::max<int32_t>(delay, 0);
 }
 
 // ============================================================================

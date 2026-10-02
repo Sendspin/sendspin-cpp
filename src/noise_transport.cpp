@@ -49,7 +49,8 @@ std::optional<std::array<uint8_t, 32>> NoiseTransport::handshake_hash() const {
 // ============================================================================
 
 SsErr NoiseTransport::encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity,
-                                                    size_t plaintext_len) {
+                                                    size_t plaintext_len,
+                                                    const FrameWriteHook& before_write) {
     if (!this->session_) {
         return SsErr::INVALID_STATE;
     }
@@ -70,11 +71,12 @@ SsErr NoiseTransport::encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_cap
     if (!this->frame_sink_) {
         return SsErr::INVALID_STATE;
     }
-    return this->frame_sink_(buf, ct_len);
+    return this->frame_sink_(buf, ct_len, before_write);
 }
 
 SsErr NoiseTransport::fragment_and_send_locked(uint8_t orig_type, const uint8_t* data,
-                                               size_t data_len) {
+                                               size_t data_len,
+                                               const FrameWriteHook& before_write) {
     const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_FIRST_HEADER_SIZE;
     const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_CONT_HEADER_SIZE;
 
@@ -94,8 +96,10 @@ SsErr NoiseTransport::fragment_and_send_locked(uint8_t orig_type, const uint8_t*
     std::memcpy(frame_buf.data() + FRAGMENT_FIRST_HEADER_SIZE, data, first_chunk);
     size_t first_frame_len = FRAGMENT_FIRST_HEADER_SIZE + first_chunk;
 
+    const bool first_is_last = (first_chunk == data_len);
     SsErr err =
-        this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), first_frame_len);
+        this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), first_frame_len,
+                                            first_is_last ? before_write : nullptr);
     if (err != SsErr::OK) {
         return err;
     }
@@ -111,8 +115,8 @@ SsErr NoiseTransport::fragment_and_send_locked(uint8_t orig_type, const uint8_t*
         std::memcpy(frame_buf.data() + FRAGMENT_CONT_HEADER_SIZE, data + offset, chunk);
         size_t cont_frame_len = FRAGMENT_CONT_HEADER_SIZE + chunk;
 
-        err =
-            this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), cont_frame_len);
+        err = this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(),
+                                                  cont_frame_len, is_last ? before_write : nullptr);
         if (err != SsErr::OK) {
             return err;
         }
@@ -123,7 +127,8 @@ SsErr NoiseTransport::fragment_and_send_locked(uint8_t orig_type, const uint8_t*
 }
 
 SsErr NoiseTransport::fill_and_encrypt_locked(const uint8_t* prefix, size_t prefix_len,
-                                              const uint8_t* data, size_t data_len) {
+                                              const uint8_t* data, size_t data_len,
+                                              const FrameWriteHook& before_write) {
     const size_t plaintext_len = prefix_len + data_len;
     if (!this->ensure_send_buf(plaintext_len + 16)) {
         return SsErr::FAIL;
@@ -133,10 +138,10 @@ SsErr NoiseTransport::fill_and_encrypt_locked(const uint8_t* prefix, size_t pref
     }
     std::memcpy(this->send_buf_.data() + prefix_len, data, data_len);
     return this->encrypt_and_send_frame_locked(this->send_buf_.data(), this->send_buf_.size(),
-                                               plaintext_len);
+                                               plaintext_len, before_write);
 }
 
-SsErr NoiseTransport::send_json(const char* json, size_t len) {
+SsErr NoiseTransport::send_json(const char* json, size_t len, const FrameWriteHook& before_write) {
     if (!this->is_active()) {
         return SsErr::INVALID_STATE;
     }
@@ -151,14 +156,14 @@ SsErr NoiseTransport::send_json(const char* json, size_t len) {
         std::lock_guard<std::mutex> lock(this->session_mutex_);
         const uint8_t prefix = MSG_TYPE_JSON_BODY;
         return this->fill_and_encrypt_locked(&prefix, 1, reinterpret_cast<const uint8_t*>(json),
-                                             len);
+                                             len, before_write);
     }
 
     // Need fragmentation. Rare (large messages only) and larger than send_buf_'s cap, so
     // fragment_and_send_locked() allocates its own frame buffer instead.
     std::lock_guard<std::mutex> lock(this->session_mutex_);
-    return this->fragment_and_send_locked(MSG_TYPE_JSON_BODY,
-                                          reinterpret_cast<const uint8_t*>(json), len);
+    return this->fragment_and_send_locked(
+        MSG_TYPE_JSON_BODY, reinterpret_cast<const uint8_t*>(json), len, before_write);
 }
 
 SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
@@ -177,11 +182,11 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
 
     if (len <= MAX_TRANSPORT_PLAINTEXT) {
         std::lock_guard<std::mutex> lock(this->session_mutex_);
-        return this->fill_and_encrypt_locked(nullptr, 0, data, len);
+        return this->fill_and_encrypt_locked(nullptr, 0, data, len, nullptr);
     }
 
     std::lock_guard<std::mutex> lock(this->session_mutex_);
-    return this->fragment_and_send_locked(data[0], data + 1, len - 1);
+    return this->fragment_and_send_locked(data[0], data + 1, len - 1, nullptr);
 }
 
 SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
@@ -201,7 +206,7 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
 
     const uint8_t prefix = MSG_TYPE_JSON_BODY;
     SsErr err = this->fill_and_encrypt_locked(
-        &prefix, 1, reinterpret_cast<const uint8_t*>(msg2_text.data()), msg2_text.size());
+        &prefix, 1, reinterpret_cast<const uint8_t*>(msg2_text.data()), msg2_text.size(), nullptr);
     if (err != SsErr::OK) {
         SS_LOGE(TAG, "send_msg2_and_swap: failed to send encrypted msg2 (err=%d)",
                 static_cast<int>(err));

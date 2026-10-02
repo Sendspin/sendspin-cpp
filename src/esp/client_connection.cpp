@@ -220,38 +220,6 @@ SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t 
     return SsErr::OK;
 }
 
-bool SendspinClientConnection::send_time_message() {
-    if (!this->is_connected()) {
-        return false;
-    }
-
-    // Capture client_transmitted as close to the actual send call as possible. Track the
-    // serialization duration as the bias subtracted from the embedded timestamp. Stack buffer
-    // keeps the path heap-free.
-    char buf[TIME_MESSAGE_BUF_SIZE];
-    const int64_t client_transmitted = esp_timer_get_time();
-    const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
-    if (len == 0) {
-        return false;
-    }
-    this->update_serialize_ema(esp_timer_get_time() - client_transmitted);
-
-    if (this->noise_transport_.is_active()) {
-        // Noise transport active: encrypt the JSON frame straight from the stack buffer.
-        // Atomic check, safe on this thread.
-        return this->send_app_json(buf, len, nullptr) == SsErr::OK;
-    }
-
-    // Pre-Noise: send as plain text.
-    int sent = esp_websocket_client_send_text(this->client_, buf, len,
-                                              pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
-    if (sent < 0) {
-        SS_LOGE(TAG, "Failed to send time message: %d", sent);
-        return false;
-    }
-    return true;
-}
-
 // ============================================================================
 // Private helpers / callbacks
 // ============================================================================
@@ -296,7 +264,6 @@ void SendspinClientConnection::handle_disconnected() {
     this->connected_ = false;
     this->client_hello_sent_ = false;
     this->server_hello_received_ = false;
-    this->pending_time_message_ = false;
     this->reset_websocket_payload();
 
     // Invoke the disconnected callback if set

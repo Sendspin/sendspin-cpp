@@ -407,8 +407,7 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
     return true;
 }
 
-bool process_server_time_message(JsonObject root, int64_t timestamp, int64_t* offset,
-                                 int64_t* max_error) {
+bool process_server_time_message(JsonObject root, ServerTimeMessage* time_msg) {
     // messaging.md "server/time": all three timestamps are required integers (microsecond clock
     // values, so wider than 32 bits).
     const JsonVariantConst client_transmitted_var = root["payload"]["client_transmitted"];
@@ -420,23 +419,27 @@ bool process_server_time_message(JsonObject root, int64_t timestamp, int64_t* of
         return false;
     }
 
-    const int64_t client_transmitted = client_transmitted_var.as<int64_t>();
-    const int64_t server_received = server_received_var.as<int64_t>();
-    const int64_t server_transmitted = server_transmitted_var.as<int64_t>();
-    const int64_t client_received = timestamp;
+    if (time_msg != nullptr) {
+        time_msg->client_transmitted = client_transmitted_var.as<int64_t>();
+        time_msg->server_received = server_received_var.as<int64_t>();
+        time_msg->server_transmitted = server_transmitted_var.as<int64_t>();
+    }
+    return true;
+}
 
+void compute_time_exchange(const ServerTimeMessage& time_msg, int64_t client_sent,
+                           int64_t client_received, int64_t* offset, int64_t* max_error) {
     if (offset != nullptr) {
-        *offset =
-            ((server_received - client_transmitted) + (server_transmitted - client_received)) / 2;
+        *offset = ((time_msg.server_received - client_sent) +
+                   (time_msg.server_transmitted - client_received)) /
+                  2;
     }
 
     if (max_error != nullptr) {
-        const int64_t delay =
-            (client_received - client_transmitted) - (server_transmitted - server_received);
+        const int64_t delay = (client_received - client_sent) -
+                              (time_msg.server_transmitted - time_msg.server_received);
         *max_error = delay / 2;
     }
-
-    return true;
 }
 
 bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg) {

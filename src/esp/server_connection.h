@@ -98,14 +98,6 @@ public:
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
                             bool allow_before_hello) override;
 
-    /// @brief Sends a client/time message, stamping the timestamp inside the httpd worker
-    ///
-    /// Schedules a worker job that captures `client_transmitted` and serializes the JSON
-    /// just before calling `httpd_ws_send_frame_async`, eliminating hub→worker queue latency
-    /// from the measured client timestamp.
-    /// @return true if the worker job was queued successfully, false otherwise.
-    bool send_time_message() override;
-
     /// @brief Sends a binary WebSocket frame to the connected client (async, via httpd worker)
     /// @param on_complete Optional completion callback (best-effort; may be skipped on teardown).
     /// @param allow_before_hello If true, bypasses the pre-hello send gate.
@@ -139,33 +131,31 @@ public:
     esp_err_t handle_data(httpd_req_t* req, int64_t receive_time);
 
 protected:
+    /// @brief Queues the frame like send_binary_message(), carrying `before_write` to the httpd
+    /// worker, which runs it immediately before httpd_ws_send_frame_async()
+    SsErr send_transport_frame(const uint8_t* data, size_t len,
+                               const NoiseTransport::FrameWriteHook& before_write) override;
+
     /// @brief Places an AsyncRespArg and a copy of the payload in one block (see AsyncRespArg) and
     /// queues it on the httpd worker to be sent as a text or binary frame by async_send_frame()
     ///
-    /// Shared by send_text_message() and send_binary_message(); `type` selects the WebSocket
-    /// frame type and which of their (identical apart from wording) log messages is used.
+    /// Shared by send_text_message(), send_binary_message() and send_transport_frame(); `type`
+    /// selects the WebSocket frame type and which of their (identical apart from wording) log
+    /// messages is used.
     /// @param data              Payload bytes to copy and send.
     /// @param len               Number of bytes in `data`.
     /// @param type              HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY.
     /// @param on_complete       Completion callback, if any.
     /// @param allow_before_hello If true, bypasses the pre-hello send gate.
+    /// @param before_write      Run by the worker immediately before the write, if set.
     SsErr queue_async_send(const uint8_t* data, size_t len, httpd_ws_type_t type,
-                           SendCompleteCallback on_complete, bool allow_before_hello);
+                           SendCompleteCallback on_complete, bool allow_before_hello,
+                           const NoiseTransport::FrameWriteHook& before_write);
 
     /// @brief httpd_queue_work callback that sends a queued text or binary frame over the
     /// WebSocket
     /// @param arg Pointer to the AsyncRespArg context allocated by queue_async_send().
     static void async_send_frame(void* arg);
-
-    /// @brief httpd_queue_work callback that builds and sends a client/time frame
-    ///
-    /// Captures the client_transmitted timestamp inside the worker (just before
-    /// `httpd_ws_send_frame_async`), serializes the JSON, then sends.
-    /// @param arg A heap-allocated `SessionLookup` holding a `weak_ptr` to the originating
-    ///            connection. The worker `lock()`s it: if the connection is still alive (and has
-    ///            sent its client/hello) it sends the frame, otherwise it no-ops. The arg is
-    ///            destroyed and freed before the worker returns.
-    static void async_send_time_text(void* arg);
 
     // Pointer fields
 

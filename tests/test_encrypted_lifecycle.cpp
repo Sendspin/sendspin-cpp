@@ -30,6 +30,7 @@
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "fake_persistence.h"
+#include "inbox.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
@@ -1768,9 +1769,6 @@ public:
         }
         return SsErr::OK;
     }
-    bool send_time_message() override {
-        return true;
-    }
 };
 
 // A started client with a metadata role, and the one entry point the hold tests need: hand a JSON
@@ -1876,6 +1874,54 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+// messaging.md "server/time" answers the client's own client/time, yet any peer that knows the
+// Sentinel PSK can sit in the nursery and send it unasked. Twice the event ring's capacity of such
+// replies between two loop() ticks must not crowd the admitted server's next stream/start off the
+// ring: server/time traffic stays off the lifecycle ring (docs/conventions.md "Threading and
+// cross-thread state").
+//
+// Control: the same handler takes the reply to a frame in flight, seeded the way
+// send_time_message() records one, since the stand-in has no transport to send it over.
+TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
+    SendspinClientConfig config;
+    config.name = "Unsolicited Time Test Client";
+    // Port 0: an ephemeral listener nothing connects to; every message is delivered directly.
+    config.server_port = 0;
+    SendspinClient client(config);
+    TestNetworkProvider network;
+    client.set_network_provider(&network);
+    CountingPlayerListener listener;
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
+    ASSERT_TRUE(client.start());
+
+    HoldTestConnection admitted;
+    client.admit_connection(&admitted);
+    HoldTestConnection unsolicited;
+
+    auto deliver = [&client](SendspinConnection& conn, const std::string& json) {
+        client.process_json_message(&conn, json.data(), json.size(), platform_time_us());
+    };
+    auto time_reply = [](int64_t echo) {
+        return R"({"type":"server/time","payload":{"client_transmitted":)" +
+               std::to_string(echo) + R"(,"server_received":2000,"server_transmitted":2001}})";
+    };
+    for (size_t i = 0; i < 2 * Inbox::EVENT_CAPACITY; ++i) {
+        deliver(unsolicited, time_reply(0));
+    }
+    deliver(admitted, stream_start_pcm_json());
+    pump_until(client, [&] { return listener.stream_starts == 1; });
+
+    constexpr uint32_t TAG = 5000;
+    admitted.time_frame_sent_us_.store(TAG);
+    admitted.time_frame_tag_.store(TAG);
+    deliver(admitted, time_reply(TAG + 1));
+    EXPECT_EQ(admitted.time_frame_tag_.load(), TAG) << "a reply to another frame must not take it";
+    deliver(admitted, time_reply(TAG));
+    EXPECT_EQ(admitted.time_frame_tag_.load(), 0U) << "the reply to the frame in flight takes it";
+
+    client.stop();
 }
 
 // messaging.md "server/state": each metadata object carries the role's full state, so what a

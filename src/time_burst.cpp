@@ -53,10 +53,11 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
     }
 
     // State 2: Waiting for response - check timeout
-    if (conn->is_pending_time_message()) {
+    if (this->pending_embedded_ != 0) {
         if (now_ms - this->current_message_sent_time_ > this->response_timeout_ms_) {
             SS_LOGW(TAG, "Time message %u/%u timed out", this->burst_index_ + 1, this->burst_size_);
-            conn->set_pending_time_message(false);
+            conn->cancel_time_frame();
+            this->pending_embedded_ = 0;
             this->burst_index_++;
 
             // If burst now complete, apply best measurement
@@ -77,12 +78,10 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
     }
 
     // State 3: Ready to send next message in burst.
-    // The transport stamps client_transmitted at the actual send point (e.g., inside the
-    // httpd worker on ESP server), so no post-send replacement is needed.
-    bool queued = conn->send_time_message();
+    const int64_t embedded = conn->send_time_message();
 
-    if (queued) {
-        conn->set_pending_time_message(true);
+    if (embedded != 0) {
+        this->pending_embedded_ = embedded;
         this->current_message_sent_time_ = now_ms;
         SS_LOGV(TAG, "Sent time message %u/%u", this->burst_index_ + 1, this->burst_size_);
         return {.sent = true, .burst_completed = burst_completed_by_response};
@@ -91,23 +90,29 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
     return {.sent = false, .burst_completed = burst_completed_by_response};
 }
 
-bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, int64_t offset,
-                                         int64_t max_error, int64_t timestamp) {
+bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeResponse& response) {
+    // Compare the whole echo (the claim matched only its low 32 bits): a claimed reply can still
+    // be drained after loop() timed its message out or sent the next. A claimed echo is never 0,
+    // so nothing matches while no message is pending.
+    if (response.client_transmitted != this->pending_embedded_) {
+        return false;
+    }
+
     // Track the best (lowest RTT) measurement in this burst.
     // max_error is half the round-trip delay and must be strictly positive; zero or negative
     // values arise from clock skew or timestamp quantization in the time message and would
     // yield zero/negative measurement variance in the Kalman filter (risking divide-by-zero
     // in the update step), so we skip updating the best_* tracking for those samples.
-    if (max_error > 0 && max_error < this->best_max_error_) {
-        this->best_max_error_ = max_error;
-        this->best_offset_ = offset;
-        this->best_timestamp_ = timestamp;
-    } else if (max_error <= 0) {
+    if (response.max_error > 0 && response.max_error < this->best_max_error_) {
+        this->best_max_error_ = response.max_error;
+        this->best_offset_ = response.offset;
+        this->best_timestamp_ = response.timestamp;
+    } else if (response.max_error <= 0) {
         SS_LOGW(TAG, "Dropping time response with non-positive max_error: %" PRId64 " us",
-                max_error);
+                response.max_error);
     }
 
-    conn->set_pending_time_message(false);
+    this->pending_embedded_ = 0;
     this->burst_index_++;
 
     // Check if burst is complete
@@ -142,6 +147,7 @@ void SendspinTimeBurst::reset() {
     this->last_burst_complete_time_ = 0;
     this->current_message_sent_time_ = 0;
     this->pending_burst_completed_ = false;
+    this->pending_embedded_ = 0;
     this->best_max_error_ = std::numeric_limits<int64_t>::max();
     this->best_offset_ = 0;
     this->best_timestamp_ = 0;

@@ -77,9 +77,6 @@ public:
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                             bool allow_before_hello) override;
 
-    /// @brief Sends a client/time message, capturing the timestamp just before send
-    bool send_time_message() override;
-
     /// @brief Sends a binary WebSocket frame to the server
     /// @param allow_before_hello If true, bypasses the pre-hello send gate.
     SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,

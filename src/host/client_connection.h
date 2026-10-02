@@ -63,9 +63,6 @@ public:
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                             bool allow_before_hello) override;
 
-    /// @brief Sends a client/time message, capturing the timestamp synchronously before send
-    bool send_time_message() override;
-
     /// @brief Sends a binary message to the server
     /// @param allow_before_hello Ignored: this transport sends synchronously, so the
     ///        pre-hello gate does not apply.

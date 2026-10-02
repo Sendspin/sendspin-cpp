@@ -63,7 +63,7 @@ using SendCompleteCallback = std::function<void(bool)>;
  */
 class SendspinConnection : public std::enable_shared_from_this<SendspinConnection> {
 public:
-    /// @brief Wires the NoiseTransport frame sink to this connection's send_binary_message().
+    /// @brief Wires the NoiseTransport frame sink to this connection's send_transport_frame().
     SendspinConnection();
 
     virtual ~SendspinConnection();
@@ -114,11 +114,14 @@ public:
 
     /// @brief Prevents any further message callbacks from firing on the network thread
     ///
-    /// Called on the main thread before connection cleanup so that no stale events from a closing
-    /// connection can reach role queues after they have been reset. Thread-safe: the flag is
-    /// checked atomically in dispatch_completed_message() which runs on the network thread.
+    /// Called before connection cleanup (on either thread) so that no stale events from a closing
+    /// connection can reach role queues after they have been reset; the flag is checked atomically
+    /// in dispatch_completed_message() on the network thread. Also retires the client/time frame
+    /// in flight, so a server/time already past that check cannot claim it and overwrite the next
+    /// connection's measurement.
     void disable_message_dispatch() {
         this->message_dispatch_enabled_.store(false, std::memory_order_release);
+        this->cancel_time_frame();
     }
 
     /// @brief Checks if the hello handshake has completed successfully
@@ -289,7 +292,7 @@ public:
     /// - If not yet encrypted (pre-handshake), routes through send_text_message().
     ///
     /// All role senders use this method. client/time is the one exception: send_time_message()
-    /// encrypts and sends directly, for the reasons on its own declaration.
+    /// calls NoiseTransport::send_json() directly to pass its write hook.
     /// @return SsErr::OK if queued/sent, error code otherwise.
     /// @note The encrypted path blocks on the Noise session mutex, which the network thread also
     ///       holds across its own sends. On an ESP outbound connection that send blocks for up to
@@ -299,10 +302,8 @@ public:
     SsErr send_app_json(const std::string& json, SendCompleteCallback cb = nullptr,
                         bool allow_before_hello = false);
 
-    /// @brief Pointer/length overload of send_app_json for stack-formatted JSON (e.g. the
-    /// periodic client/time messages): encrypts straight from the caller's buffer with no
-    /// std::string materialization on the hot encrypted path. The pre-handshake text fallback
-    /// (cold: only client/hello-era traffic) builds the string it needs.
+    /// @brief Pointer/length form of send_app_json(); encrypts straight from the caller's
+    /// buffer, and the pre-handshake text fallback builds the string it needs
     SsErr send_app_json(const char* json, size_t len, SendCompleteCallback cb = nullptr,
                         bool allow_before_hello = false);
 
@@ -353,16 +354,22 @@ public:
     virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                                     bool allow_before_hello = false) = 0;
 
-    /// @brief Sends a client/time synchronization message
-    ///
-    /// The transport implementation captures `client_transmitted` on the sending task and
-    /// serializes the JSON inline, which eliminates the queue latency variance that a hub-thread
-    /// timestamp would introduce. On the ESP server the stamp is taken in the httpd worker; a
-    /// cleartext frame then goes to the wire from that worker, while an encrypted one is posted
-    /// back to the same task, costing one more queue hop after the stamp.
-    ///
-    /// @return true if the message was queued/sent successfully, false otherwise.
-    virtual bool send_time_message() = 0;
+    /// @brief Sends a client/time message and records it as the frame in flight (see
+    /// time_frame_tag_). Needs the Noise transport, which is_operational() implies. Main loop only.
+    /// @return The client_transmitted the frame carries, or 0 if the message was not queued/sent.
+    int64_t send_time_message();
+
+    /// @brief Claims the client/time frame in flight for a server/time reply echoing
+    /// `client_transmitted`, matching on its low 32 bits; the claim retires the frame, so at most
+    /// one reply per frame succeeds. Network thread.
+    /// @return When the frame was handed to the socket, never earlier than the echo nor later
+    ///         than the write, or nullopt if no frame in flight carries that value.
+    std::optional<int64_t> claim_time_frame(int64_t client_transmitted);
+
+    /// @brief Retires the client/time frame in flight, so a late reply to it no longer matches
+    void cancel_time_frame() {
+        this->time_frame_tag_.store(0, std::memory_order_release);
+    }
 
     /// @brief Sends a binary WebSocket frame to the peer.
     /// @param data   Pointer to the binary payload bytes.
@@ -783,25 +790,6 @@ public:
     /// @brief Initializes the time filter with Kalman parameters
     void init_time_filter();
 
-    /// @brief Returns the EMA (microseconds) of how long format_client_time_message() takes
-    ///
-    /// Updated by `send_time_message()` on each call. The serialization happens between when
-    /// `client_transmitted` is captured and when the bytes hit the wire, so this EMA estimates
-    /// the constant bias subtracted from the embedded timestamp. Atomic so the httpd worker (ESP
-    /// server) can update it while the hub thread reads it.
-    // cppcheck-suppress unusedFunction
-    int64_t get_serialize_ema_us() const {
-        return this->serialize_ema_us_.load(std::memory_order_relaxed);
-    }
-
-    /// @brief Folds a new serialization-duration sample into the EMA (1/16 weight)
-    /// @param sample_us Measured duration in microseconds.
-    void update_serialize_ema(int64_t sample_us) {
-        int64_t prev = this->serialize_ema_us_.load(std::memory_order_relaxed);
-        const int64_t next = (prev == 0) ? sample_us : ((prev * 15 + sample_us) / 16);
-        this->serialize_ema_us_.store(next, std::memory_order_relaxed);
-    }
-
     // ========================================
     // Configuration setters (called by hub after receiving server/hello message)
     // ========================================
@@ -873,18 +861,6 @@ public:
     // Time message state accessors
     // ========================================
 
-    /// @brief Checks if a time message is pending (waiting for response)
-    /// @return True if a time message has been sent and a response is expected, false otherwise.
-    bool is_pending_time_message() const {
-        return this->pending_time_message_;
-    }
-
-    /// @brief Sets the pending time message flag
-    /// @param pending true if a time message is pending, false to clear the flag
-    void set_pending_time_message(bool pending) {
-        this->pending_time_message_ = pending;
-    }
-
     // ========================================
     // Initialization setters (called by hub before start)
     // ========================================
@@ -905,6 +881,19 @@ public:
     }
 
 protected:
+    // ========================================
+    // Transport frames
+    // ========================================
+
+    /// @brief Sends one Noise transport frame, running `before_write` (if set) immediately
+    /// before the frame is handed to the socket
+    ///
+    /// The default runs the hook and then calls send_binary_message(), which suits a transport
+    /// that writes synchronously. A transport that queues its writes overrides this to run the
+    /// hook where the write happens.
+    virtual SsErr send_transport_frame(const uint8_t* data, size_t len,
+                                       const NoiseTransport::FrameWriteHook& before_write);
+
     // ========================================
     // Active-role mask
     // ========================================
@@ -1053,10 +1042,6 @@ protected:
     /// the main loop (provisional-connection timeout check). 0 = not yet set.
     std::atomic<int64_t> provisional_time_us_{0};
 
-    /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP
-    /// server worker thread updates it while the hub thread reads it for logging.
-    std::atomic<int64_t> serialize_ema_us_{0};
-
     /// Process-unique connection identity (see get_instance_id()). Assigned once at construction.
     const uint64_t instance_id{next_instance_id()};
 
@@ -1159,6 +1144,16 @@ protected:
     /// that cross-thread reset.
     std::atomic<uint32_t> pairing_index_{0};
 
+    /// Tag of the client/time frame in flight: the low 32 bits of the client_transmitted it
+    /// carries, never 0 for a frame, and 0 once the frame is claimed or cancelled. A failed send
+    /// leaves its tag, which no reply can echo. 32 bits because a 64-bit atomic takes a lock on
+    /// the ESP32 family.
+    std::atomic<uint32_t> time_frame_tag_{0};
+
+    /// Low 32 bits of the client clock when the frame in flight was handed to the socket, seeded
+    /// with the tag until the write hook overwrites it on whichever thread performs the write.
+    std::atomic<uint32_t> time_frame_sent_us_{0};
+
     // 8-bit fields
 
     /// Lifecycle-flag axes.
@@ -1217,10 +1212,6 @@ protected:
     /// When false, dispatch_completed_message() silently drops incoming messages.
     /// Set to false on the main thread before cleanup; checked on the network thread.
     std::atomic<bool> message_dispatch_enabled_{true};
-
-    /// Time message state. Written by the main-loop time burst and cleared by the transport
-    /// thread's disconnect handler, hence atomic.
-    std::atomic<bool> pending_time_message_{false};
 
     /// Atomic for the same reason as client_hello_sent_: written on network threads, read from the
     /// main loop via is_handshake_complete().

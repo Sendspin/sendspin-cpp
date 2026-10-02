@@ -185,15 +185,24 @@ TEST(Protocol, ServerTimeOffsetAndError) {
                       R"("server_received":5000000001500,"server_transmitted":5000000001600}})",
                       doc, root));
 
+    ServerTimeMessage time_msg;
+    ASSERT_TRUE(process_server_time_message(root, &time_msg));
+    EXPECT_EQ(time_msg.client_transmitted, 5000000001000);
+    EXPECT_EQ(time_msg.server_received, 5000000001500);
+    EXPECT_EQ(time_msg.server_transmitted, 5000000001600);
+
     int64_t offset = 0;
     int64_t max_error = 0;
+    // The frame reached the socket 200 us after the time it carries; T1 is the socket time, not
+    // the echo.
+    const int64_t client_sent = 5000000001200;
     const int64_t client_received = 5000000002000;
-    ASSERT_TRUE(process_server_time_message(root, client_received, &offset, &max_error));
+    compute_time_exchange(time_msg, client_sent, client_received, &offset, &max_error);
 
-    // offset = ((T2-T1) + (T3-T4)) / 2 = ((1500-1000) + (1600-2000)) / 2 = 50
-    EXPECT_EQ(offset, 50);
-    // max_error = ((T4-T1) - (T3-T2)) / 2 = ((2000-1000) - (1600-1500)) / 2 = 450
-    EXPECT_EQ(max_error, 450);
+    // offset = ((T2-T1) + (T3-T4)) / 2 = ((1500-1200) + (1600-2000)) / 2 = -50
+    EXPECT_EQ(offset, -50);
+    // max_error = ((T4-T1) - (T3-T2)) / 2 = ((2000-1200) - (1600-1500)) / 2 = 350
+    EXPECT_EQ(max_error, 350);
 }
 
 // messaging.md "server/time": client_transmitted, server_received and server_transmitted are
@@ -225,7 +234,7 @@ TEST(Protocol, ServerTimeTimestampsMustBeIntegers) {
         JsonObject root;
         ASSERT_TRUE(parse(std::string(R"({"type":"server/time","payload":)") + row.payload + "}",
                           doc, root));
-        EXPECT_EQ(process_server_time_message(root, 2000, nullptr, nullptr), row.accepted);
+        EXPECT_EQ(process_server_time_message(root, nullptr), row.accepted);
     }
 }
 

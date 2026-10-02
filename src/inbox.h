@@ -48,6 +48,7 @@ static constexpr uint32_t INBOX_TOPIC_PLAYER_STREAM_PARAMS = 1U << 6;  // Player
 static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1U << 7;     // Visualizer config slot
 static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1U << 8;       // Artwork display slot
 static constexpr uint32_t INBOX_TOPIC_RECORDS = 1U << 9;  // Pairing-records persist slot
+static constexpr uint32_t INBOX_TOPIC_TIME = 1U << 10;    // Time-sync measurement slot
 
 // ============================================================================
 // Event ring types
@@ -58,26 +59,12 @@ static constexpr uint32_t INBOX_TOPIC_RECORDS = 1U << 9;  // Pairing-records per
 /// The `code` field on InboxEvent carries a role-local enum value (cast to/from uint8_t by the
 /// producer/consumer); the inbox does not interpret it.
 enum class InboxEventType : uint8_t {
-    TIME_RESPONSE,       // Time-sync measurement; payload in InboxEvent::time
     PLAYER_STREAM,       // Player stream lifecycle; code = PlayerStreamCallbackType
     CONTROLLER_CLEARED,  // Controller state cleared on disconnect; no payload
     METADATA_CLEARED,    // Metadata cleared on disconnect; no payload
     COLOR_CLEARED,       // Color state cleared on disconnect; no payload
     ARTWORK_STREAM,      // Artwork stream lifecycle; code = ArtworkEventType
     VISUALIZER_STREAM,   // Visualizer stream lifecycle; code = VisualizerEventType
-};
-
-/// @brief Payload for TIME_RESPONSE events
-struct TimeResponsePayload {
-    int64_t offset{0};
-    int64_t max_error{0};
-    int64_t timestamp{0};
-    /// Instance id of the connection the response arrived on, compared against the current
-    /// connection at drain time so a measurement from a displaced or pending server cannot
-    /// contaminate the current connection's time filter. An id (not a pointer) so a since-freed
-    /// connection cannot ABA-match a later connection reusing its address; 0 never matches a live
-    /// connection (ids start at 1).
-    uint64_t source_id{0};
 };
 
 /// @brief One entry in the shared event ring
@@ -88,9 +75,8 @@ struct InboxEvent {
     uint8_t code{0};  // Role-local enum value; 0 when unused
     /// Teardown generation of the producing role at push time, 0 for events that have none; the
     /// consumer drops a mismatch so an event queued before a teardown cannot act after it (see
-    /// event_is_current()). Occupies padding the struct already had, so the ring does not grow.
+    /// event_is_current()).
     uint32_t epoch{0};
-    TimeResponsePayload time;  // Valid only when type == InboxEventType::TIME_RESPONSE
 };
 
 // ============================================================================

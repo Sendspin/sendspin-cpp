@@ -29,11 +29,13 @@
 #include "noise_test_helpers.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
+#include "platform/time.h"
 #include "platform/types.h"
 #include "record_store.h"
 #include "record_test_helpers.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
+#include "time_burst.h"
 
 #include <gtest/gtest.h>
 
@@ -107,8 +109,6 @@ public:
         }
         return SsErr::OK;
     }
-
-    bool send_time_message() override { return true; }
 
     // --- Test helpers ---
 
@@ -1738,9 +1738,9 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
 // "Malformed sequences" protocol error and closes the connection (accept_plaintext() sets
 // malformed, and connection.cpp turns that into close_silently()).
 //
-// Sends come from more than one thread in production: on ESP the periodic client/time message
-// is built and encrypted on the httpd worker task (async_send_time_text in
-// esp/server_connection.cpp), while pairing sends encrypt on the main loop.
+// Sends come from more than one thread in production: the main loop sends client/time,
+// client/state and pairing messages while the network thread sends, for example, the
+// re-handshake's msg2 (send_msg2_and_swap()).
 // fragment_and_send_locked() therefore has to hold session_mutex_ across every frame, not
 // re-acquire it per frame; otherwise a small concurrent send lands a complete frame in the gap.
 //
@@ -1814,4 +1814,241 @@ TEST(NoiseTransport, ConcurrentSendsDoNotInterleaveFragments) {
             ++frame_index;
         }
     }
+}
+
+// ============================================================================
+// client/time send stamps
+// ============================================================================
+
+/// TestConnection that holds each transport frame's write hook instead of running it, so a test
+/// can run it later, as a transport that queues its writes does.
+class DeferredWriteConnection : public TestConnection {
+public:
+    SsErr send_transport_frame(const uint8_t* data, size_t len,
+                               const NoiseTransport::FrameWriteHook& before_write) override {
+        this->sent_binary_.emplace_back(data, data + len);
+        this->hooks_.push_back(before_write);
+        return SsErr::OK;
+    }
+
+    /// Sends through NoiseTransport::send_json() with a write hook, which send_app_json() does
+    /// not expose.
+    SsErr send_json_with_hook(const std::string& json, const NoiseTransport::FrameWriteHook& hook) {
+        return this->noise_transport_.send_json(json.data(), json.size(), hook);
+    }
+
+    std::vector<NoiseTransport::FrameWriteHook> hooks_;
+};
+
+// The hook marks the moment the message goes to the socket, so only the last frame of a
+// fragmented message may carry it.
+TEST(NoiseTransport, SendJsonWriteHookRidesTheLastFrame) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    DeferredWriteConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
+    auto hook = []() {};
+
+    ASSERT_EQ(conn.send_json_with_hook("{}", hook), SsErr::OK);
+    ASSERT_EQ(conn.hooks_.size(), 1U);
+    EXPECT_TRUE(conn.hooks_[0]);
+
+    conn.hooks_.clear();
+    ASSERT_EQ(conn.send_json_with_hook(std::string(maxp, 'A'), hook), SsErr::OK);
+    ASSERT_EQ(conn.hooks_.size(), 2U);
+    EXPECT_FALSE(conn.hooks_[0]);
+    EXPECT_TRUE(conn.hooks_[1]);
+}
+
+// On a transport that writes synchronously, the default send_transport_frame() runs the hook
+// before the write, never after it.
+TEST(NoiseTransport, SendTransportFrameRunsTheHookBeforeTheWrite) {
+    class OrderRecordingConnection : public TestConnection {
+    public:
+        SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
+                                  bool allow_before_hello) override {
+            this->events_.emplace_back("write");
+            return TestConnection::send_binary_message(data, len, std::move(cb),
+                                                       allow_before_hello);
+        }
+        std::vector<std::string> events_;
+    };
+    OrderRecordingConnection conn;
+    const uint8_t frame[] = {0x00};
+
+    ASSERT_EQ(conn.send_transport_frame(frame, sizeof(frame),
+                                        [&conn]() { conn.events_.emplace_back("hook"); }),
+              SsErr::OK);
+    EXPECT_EQ(conn.events_, (std::vector<std::string>{"hook", "write"}));
+}
+
+/// The client_transmitted carried by a client/time frame the connection sent, read back through
+/// the peer's receive cipher (frames must be decrypted in the order they were sent).
+static int64_t sent_client_transmitted(NoiseCipherState* recv_cs, const std::vector<uint8_t>& frame) {
+    auto pt = raw_decrypt(recv_cs, frame);
+    EXPECT_GE(pt.size(), 1U);
+    JsonDocument doc;
+    EXPECT_FALSE(deserializeJson(doc, reinterpret_cast<const char*>(pt.data() + 1), pt.size() - 1));
+    return doc["payload"]["client_transmitted"].as<int64_t>();
+}
+
+// A server/time reply is matched by its echo to the one client/time in flight, and only once. A
+// connection that never sent client/time (any nursery peer) has nothing in flight, including for
+// an echo whose low 32 bits are 0, the tag that means "none". Neither does a frame the burst gave
+// up on, nor one on a connection that has stopped dispatching (it is being dropped).
+TEST(NoiseTransport, OnlyTheTimeFrameInFlightIsClaimedAndOnlyOnce) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    DeferredWriteConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    EXPECT_FALSE(conn.claim_time_frame(int64_t{1} << 32).has_value());
+    EXPECT_FALSE(conn.claim_time_frame(1000).has_value());
+
+    const int64_t embedded = conn.send_time_message();
+    ASSERT_NE(embedded, 0);
+    ASSERT_EQ(conn.sent_binary_.size(), 1U);
+    const int64_t echo = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[0]);
+    EXPECT_EQ(echo, embedded) << "send_time_message() returns the time the frame carries";
+
+    EXPECT_FALSE(conn.claim_time_frame(echo - 1).has_value()) << "an echo of another frame";
+    const std::optional<int64_t> sent = conn.claim_time_frame(echo);
+    ASSERT_TRUE(sent.has_value());
+    EXPECT_EQ(*sent, echo) << "until its hook runs, a frame counts as written at the time it carries";
+    EXPECT_FALSE(conn.claim_time_frame(echo).has_value()) << "a frame is claimed once";
+
+    ASSERT_NE(conn.send_time_message(), 0);
+    ASSERT_EQ(conn.sent_binary_.size(), 2U);
+    const int64_t cancelled = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[1]);
+    conn.cancel_time_frame();
+    EXPECT_FALSE(conn.claim_time_frame(cancelled).has_value());
+
+    ASSERT_NE(conn.send_time_message(), 0);
+    ASSERT_EQ(conn.sent_binary_.size(), 3U);
+    const int64_t dropped = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[2]);
+    conn.disable_message_dispatch();
+    EXPECT_FALSE(conn.claim_time_frame(dropped).has_value());
+}
+
+// The claim reports when the write hook ran, and never a time before the one the frame carries,
+// even if a leftover hook that sampled the clock before the seed stored an earlier one.
+TEST(NoiseTransport, TimeFrameClaimReportsTheSocketWriteTime) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    DeferredWriteConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    ASSERT_NE(conn.send_time_message(), 0);
+    const int64_t echo = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[0]);
+    // The hook must sample a later microsecond than the time the frame carries.
+    while (platform_time_us() <= echo) {
+    }
+    ASSERT_EQ(conn.hooks_.size(), 1U);
+    ASSERT_TRUE(conn.hooks_[0]);
+    conn.hooks_[0]();
+    const int64_t after_hook = platform_time_us();
+    const std::optional<int64_t> sent = conn.claim_time_frame(echo);
+    ASSERT_TRUE(sent.has_value());
+    EXPECT_GT(*sent, echo);
+    EXPECT_LE(*sent, after_hook);
+
+    ASSERT_NE(conn.send_time_message(), 0);
+    const int64_t second = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[1]);
+    conn.time_frame_sent_us_.store(static_cast<uint32_t>(second) - 5);
+    EXPECT_EQ(conn.claim_time_frame(second), std::optional<int64_t>(second));
+}
+
+// Both halves of the frame in flight are low 32 bits of the microsecond clock, so a write that
+// lands just after they wrap is still a small delay on top of the full 64-bit echo.
+TEST(NoiseTransport, TimeFrameWriteDelaySurvivesTheLow32BitWrap) {
+    DeferredWriteConnection conn;
+    constexpr uint32_t TAG = 0xFFFFFF00U;
+    constexpr int64_t ECHO = (int64_t{5} << 32) | TAG;
+    conn.time_frame_sent_us_.store(0x100U);
+    conn.time_frame_tag_.store(TAG);
+    EXPECT_EQ(conn.claim_time_frame(ECHO), std::optional<int64_t>(ECHO + 0x200));
+}
+
+// A reply counts toward the burst only when its whole echo is that of the message still pending.
+// The network thread matches only the low 32 bits and claims at most one reply per message, but a
+// claimed reply can be drained after loop() sent the next message; counted, any of these would
+// complete a two-message burst on one real exchange.
+TEST(TimeBurst, CountsOnlyTheReplyToItsPendingMessage) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    DeferredWriteConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+    conn.init_time_filter();
+    conn.set_client_hello_sent(true);
+    conn.set_server_hello_received(true);
+    auto reply = [](int64_t echo) {
+        TimeResponse response;
+        response.offset = 10;
+        response.max_error = 50;
+        response.timestamp = 1;
+        response.client_transmitted = echo;
+        return response;
+    };
+    auto sent_echo = [&](size_t index) {
+        return sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_.at(index));
+    };
+
+    SendspinTimeBurst burst;
+    // Long enough that loop() never times a message out here.
+    burst.configure(/*burst_size=*/2, /*burst_interval_ms=*/0, /*response_timeout_ms=*/60000);
+    burst.loop(&conn);
+    const int64_t first = sent_echo(0);
+
+    EXPECT_FALSE(burst.on_time_response(&conn, reply(first + 1)));
+    EXPECT_FALSE(burst.on_time_response(&conn, reply(first)))
+        << "the real reply ends the burst only if a reply above was counted";
+    EXPECT_FALSE(burst.on_time_response(&conn, reply(first))) << "no message is pending";
+
+    burst.loop(&conn);
+    const int64_t second = sent_echo(1);
+    EXPECT_FALSE(burst.on_time_response(&conn, reply(first)))
+        << "a reply to the first message, drained after the second was sent";
+    EXPECT_FALSE(burst.on_time_response(&conn, reply(second + (int64_t{1} << 32))))
+        << "an echo matching the pending message only in its low 32 bits";
+    EXPECT_TRUE(burst.on_time_response(&conn, reply(second)))
+        << "the second real reply ends the burst";
+}
+
+// A message loop() times out is retired on the connection, so its late reply is not claimed, and
+// the burst does not count one claimed just before the timeout either.
+TEST(TimeBurst, TimedOutMessageIsRetired) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    DeferredWriteConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+    conn.init_time_filter();
+    conn.set_client_hello_sent(true);
+    conn.set_server_hello_received(true);
+
+    SendspinTimeBurst burst;
+    burst.configure(/*burst_size=*/2, /*burst_interval_ms=*/0, /*response_timeout_ms=*/0);
+    burst.loop(&conn);
+    ASSERT_EQ(conn.sent_binary_.size(), 1U);
+    const int64_t echo = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_.at(0));
+    // A zero timeout expires once the millisecond clock moves past the send.
+    const int64_t sent_ms = platform_time_us() / 1000;
+    while (platform_time_us() / 1000 <= sent_ms) {
+    }
+    burst.loop(&conn);
+
+    EXPECT_FALSE(conn.claim_time_frame(echo).has_value());
+    TimeResponse late;
+    late.max_error = 50;
+    late.client_transmitted = echo;
+    EXPECT_FALSE(burst.on_time_response(&conn, late))
+        << "counted, the late reply would complete the burst its timeout already counted toward";
+}
+
+// client/time is sent only over the Noise transport, which every operational connection has.
+TEST(NoiseTransport, TimeMessageNeedsTheNoiseTransport) {
+    DeferredWriteConnection conn;
+    EXPECT_EQ(conn.send_time_message(), 0);
+    EXPECT_TRUE(conn.sent_text_.empty());
+    EXPECT_TRUE(conn.sent_binary_.empty());
 }
