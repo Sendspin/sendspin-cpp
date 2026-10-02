@@ -163,7 +163,7 @@ public:
     /// re-pairs exhaust storage).
     ///
     /// Runs on the network thread, so it never calls the provider; the caller must schedule
-    /// persist_records() onto the main loop (the client uses INBOX_TOPIC_RECORDS). Until that
+    /// persist_records() onto the main loop (the client uses INBOX_TOPIC_PERSIST). Until that
     /// flush lands, the mutation is RAM-only.
     ///
     /// A pairing never fails for lack of storage (pairing.md "Pairing Records"): at capacity a
@@ -189,11 +189,14 @@ public:
     /// it holds at this call. A rejected write is not retried, so the slot leaves the dirty set
     /// either way and RAM stays authoritative for the boot.
     ///
+    /// A batch in which the provider accepted a record slot ends with one provider commit(); a
+    /// batch of the order blob alone does not, since the order is advisory.
+    ///
     /// A rejection is reported per write rather than per batch: a record slot write decides which
     /// records the next boot holds and warns; the recency order, which the next boot rebuilds
     /// from use, reports at debug.
-    /// @return true when every owed write was accepted (or when there is nothing to write, or no
-    ///         provider); false when any write was rejected.
+    /// @return true when every owed write was accepted and committed (or when there is nothing to
+    ///         write, or no provider); false when any write or the commit was rejected.
     bool persist_records();
 
     /// @brief Whether any write is owed to the next persist_records(). The caller uses it to

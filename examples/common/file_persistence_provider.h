@@ -62,7 +62,6 @@ public:
 
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override;
     bool save_blob(const std::string& key, const uint8_t* data, size_t len) override;
-    bool erase_blob(const std::string& key) override;
 
 private:
     // No locking: the provider contract guarantees every method is invoked on the main loop

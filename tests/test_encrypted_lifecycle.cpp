@@ -178,9 +178,22 @@ public:
         return true;
     }
 
+    bool commit() override {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->committed_ = this->captured_;
+        return true;
+    }
+
     std::optional<SendspinPairingRecord> captured_record() const {
         std::lock_guard<std::mutex> lock(this->mutex_);
         return this->captured_;
+    }
+
+    // The captured record as of the last commit(): what a provider that queues its writes would
+    // have on flash.
+    std::optional<SendspinPairingRecord> committed_record() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->committed_;
     }
 
     // When set, a slot write that carries a record is rejected (simulating a
@@ -201,6 +214,7 @@ public:
 private:
     mutable std::mutex mutex_;
     std::optional<SendspinPairingRecord> captured_;
+    std::optional<SendspinPairingRecord> committed_;
     int rejected_record_saves_{0};
     bool reject_pairing_records_{false};
     std::optional<SendspinPairingPsk> stored_pairing_psk_;
@@ -225,7 +239,13 @@ public:
     void on_pairing_succeeded(const std::string& server_id) override {
         this->pairing_succeeded_server_id_ = server_id;
         this->pairing_succeeded_seq_ = this->next_seq_++;
+        if (this->on_pairing_succeeded_hook) {
+            this->on_pairing_succeeded_hook();
+        }
     }
+
+    /// Runs inside on_pairing_succeeded(), for a test that reads state as of the callback.
+    std::function<void()> on_pairing_succeeded_hook;
 
     void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
         this->pairing_failed_server_id_ = server_id;
@@ -523,6 +543,10 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     config.pairing_psk = SendspinPsk(pairing_psk_bytes);
 
     RecordingClientListener listener;
+    std::optional<SendspinPairingRecord> committed_at_success;
+    listener.on_pairing_succeeded_hook = [&] {
+        committed_at_success = persistence.committed_record();
+    };
     SendspinClient client(config);
     client.set_listener(&listener);
     client.set_network_provider(&network);
@@ -578,6 +602,11 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 
     pump_until(client, [&] { return listener.pairing_succeeded_server_id().has_value(); });
     EXPECT_EQ(listener.pairing_succeeded_server_id().value(), server_identity.peer_id());
+
+    // An application that acts on the callback (a reboot, say) must find the record durable.
+    ASSERT_TRUE(committed_at_success.has_value())
+        << "on_pairing_succeeded fired before the record was committed to the provider";
+    EXPECT_EQ(committed_at_success->psk_id, server.learned_psk_id().value());
 
     // The application must see the exchange begin before it sees it end. The ordering is
     // structural (ConnectionManager::loop() swaps pending events out before draining lifecycle
@@ -2814,14 +2843,14 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
     pump_for(client, 100);
 }
 
-// A tick carrying more than one records op must write each key those ops touched exactly once,
-// and no other: on ESP each save is an NVS erase cycle, and flash wear is a budget
+// A tick carrying more than one record change must write each key those changes touched exactly
+// once, and no other: on ESP each save is an NVS erase cycle, and flash wear is a budget
 // (docs/conventions.md, "Embedded resource discipline"). Once per key holds because the store's
-// dirty set holds each key once, whatever number of ops dirtied it. The two ops here are the pair a real tick
-// can carry, staged by a playback activate and the unpair drain in the same locked block, and both
-// move the recency order. A third record keeps the played one from being the most recent once the
-// unpair has removed the other, so the playback move is a real one.
-TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteEachTouchedKeyOnce) {
+// dirty set holds each key once, whatever number of changes dirtied it. The two here are the pair
+// a real tick can carry, made by a playback activate and the unpair drain in the same locked
+// block, and both move the recency order. A third record keeps the played one from being the
+// most recent once the unpair has removed the other, so the playback move is a real one.
+TEST(EncryptedLifecycle, SeveralRecordChangesInOneTickWriteEachTouchedKeyOnce) {
     Identity played_identity = Identity::generate().value();
     Identity other_identity = Identity::generate().value();
     Identity unpairing_identity = Identity::generate().value();
@@ -2853,18 +2882,18 @@ TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteEachTouchedKeyOnce) {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         // What note_playback_activity() does when a long-term connection takes playback.
         EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
-        manager.stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
+        client.request_persist();
         manager.handle_server_unpair(&conn, event);
     }
 
-    manager.flush_pending_record_ops();
+    client.flush_pending_persistence();
     manager.flush_deferred_releases();
 
     // Slot 2 is zeroed and the order, which both ops moved, is written once.
     EXPECT_EQ(record_writes(persistence) - writes_before, 2u)
-        << "the tick's record ops must write each touched key once";
+        << "the tick's record changes must write each touched key once";
     EXPECT_EQ(persistence.save_attempts(persistence_keys::RECORD_ORDER), 1)
-        << "two ops that both move the order must write it once";
+        << "two changes that both move the order must write it once";
     EXPECT_EQ(persistence.save_attempts(persistence_keys::record_slot_key(2)), 1)
         << "the unpair must write its own slot once";
     EXPECT_EQ(persistence.save_attempts(persistence_keys::record_slot_key(0)), 0)
@@ -2912,7 +2941,7 @@ TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
         manager.current_connection_ = conn;
         manager.note_playback_activity(conn.get());
     }
-    manager.flush_pending_record_ops();
+    client.flush_pending_persistence();
     EXPECT_EQ(record_writes(persistence) - writes_before_first, 1u)
         << "a recency move must reach the provider";
 
@@ -2921,7 +2950,7 @@ TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         manager.note_playback_activity(conn.get());
     }
-    manager.flush_pending_record_ops();
+    client.flush_pending_persistence();
 
     EXPECT_EQ(record_writes(persistence), writes_before_repeat)
         << "a playback that moves nothing must not write a record key";
@@ -2987,13 +3016,13 @@ TEST(EncryptedLifecycle, AnEvictionBeforeTheFlushSparesTheRecordJustPlayed) {
                      .has_value())
         << "the pairing at capacity must evict the least recently used record";
 
-    manager.flush_pending_record_ops();
+    client.flush_pending_persistence();
     client.stop();
 }
 
-// A record op staged after the last tick has no tick left to carry it: stop() flushes once on
+// A record change made after the last tick has no tick left to carry it: stop() flushes once on
 // the way down, or the write is lost. What is asserted is the blob the next boot loads.
-TEST(EncryptedLifecycle, StopFlushesARecordOpStagedAfterTheLastTick) {
+TEST(EncryptedLifecycle, StopFlushesARecordChangeMadeAfterTheLastTick) {
     Identity older_identity = Identity::generate().value();
     Identity newer_identity = Identity::generate().value();
     SendspinPairingRecord older = make_record_for(older_identity);
@@ -3003,7 +3032,7 @@ TEST(EncryptedLifecycle, StopFlushesARecordOpStagedAfterTheLastTick) {
     auto provider = make_record_store_provider({older, newer});
     InMemoryPersistenceProvider& persistence = *provider;
     SendspinClientConfig config;
-    config.name = "Stop Flushes Staged Record Op Test Client";
+    config.name = "Stop Flushes Record Change Test Client";
     // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
     config.server_port = 0;
 
@@ -3018,22 +3047,22 @@ TEST(EncryptedLifecycle, StopFlushesARecordOpStagedAfterTheLastTick) {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         // What note_playback_activity() does when a long-term connection takes playback.
         EXPECT_TRUE(client.record_store_->note_record_played(older.psk_id));
-        manager.stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
+        client.request_persist();
     }
     ASSERT_EQ(record_writes(persistence), writes_before)
-        << "staging under the lock must not write on its own";
+        << "a change made under the lock must not write on its own";
 
     client.stop();
 
     EXPECT_EQ(record_writes(persistence) - writes_before, 1u)
-        << "the op staged after the last tick never reached the provider";
+        << "the change made after the last tick never reached the provider";
     EXPECT_EQ(stored_record_order(persistence), (std::vector<uint8_t>{1, 0}))
-        << "the order stop() wrote must carry the staged move";
+        << "the order stop() wrote must carry the move";
 }
 
-// The last-played server_id lives under its own key, so a tick that stages only that write must
-// leave every record key alone: the two are coalesced separately, and rewriting a record slot for
-// a handoff would be an NVS erase cycle nothing asked for.
+// The last-played server_id lives under its own key, so a flush that owes only that write must
+// leave every record key alone: rewriting a record slot for a handoff would be an NVS erase cycle
+// nothing asked for.
 TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordKey) {
     Identity paired_identity = Identity::generate().value();
     SendspinPairingRecord paired_record = make_record_for(paired_identity);
@@ -3054,18 +3083,80 @@ TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordKey) {
 
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.stage_record_op(PendingRecordOp::Kind::LAST_PLAYED, paired_record.server_id);
+        client.note_last_played_server(paired_record.server_id);
     }
-    manager.flush_pending_record_ops();
+    client.flush_pending_persistence();
 
     EXPECT_EQ(record_writes(persistence), writes_before)
         << "a last-played write must not drag a record key along";
-    // Control: the op was performed rather than dropped.
+    // Control: the write was performed rather than dropped.
     auto last_played = persistence.blob(persistence_keys::LAST_PLAYED);
     ASSERT_TRUE(last_played.has_value());
     EXPECT_EQ(*last_played, blob_bytes(paired_identity.public_bytes))
-        << "the staged last-played write never reached the provider";
+        << "the last-played write never reached the provider";
 
+    client.stop();
+}
+
+// connection.md "Multiple servers": the last-playback server is the one that held the admitted
+// connection while 'playback' was among its activities. A group that is playing says nothing
+// about the connection's activities, and every connection is sent group/update.
+TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne) {
+    Identity server_identity = Identity::generate().value();
+
+    TestNetworkProvider network;
+    InMemoryPersistenceProvider persistence;
+    SendspinClientConfig config;
+    config.name = "Idle Group Playing Test Client";
+    // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
+    config.server_port = 0;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    ConnectionManager& manager = *client.connection_manager_;
+
+    auto conn = std::make_shared<HoldTestConnection>();
+    conn->set_noise_handshake_result(server_identity.peer_id(), PskCategory::SENTINEL,
+                                     /*psk_id=*/"");
+    conn->apply_server_activate({}, std::nullopt, std::nullopt, std::nullopt);
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.set_current_connection(conn);
+        manager.note_playback_activity(conn.get());
+    }
+    manager.flush_pending_admission();
+
+    const std::string playing = R"({"type":"group/update","payload":{"playback_state":"playing"}})";
+    conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
+                                      std::memory_order_relaxed);
+    client.process_json_message(conn.get(), playing.data(), playing.size(), platform_time_us());
+    // Two ticks: a write requested by the group drain would land on the tick after it.
+    client.loop();
+    client.loop();
+
+    ASSERT_EQ(client.get_group_state().playback_state, SendspinPlaybackState::PLAYING)
+        << "the group/update never reached the client";
+    EXPECT_FALSE(persistence.blob(persistence_keys::LAST_PLAYED).has_value())
+        << "a server that never declared 'playback' became the last-playback server";
+
+    // Control: the same connection declaring 'playback' does.
+    conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
+                                std::nullopt);
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.note_playback_activity(conn.get());
+    }
+    client.loop();
+    auto last_played = persistence.blob(persistence_keys::LAST_PLAYED);
+    ASSERT_TRUE(last_played.has_value());
+    EXPECT_EQ(*last_played, blob_bytes(server_identity.public_bytes));
+
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.current_connection_.reset();
+    }
     client.stop();
 }
 
@@ -3118,7 +3209,7 @@ TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
             }
             manager.note_playback_activity(conn.get());
         }
-        manager.flush_pending_record_ops();
+        client.flush_pending_persistence();
 
         EXPECT_EQ(stored_record_order(persistence), row.expected_order);
         {
@@ -3232,11 +3323,11 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         // What note_playback_activity() does when a long-term connection takes playback.
         EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
-        manager.stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
+        client.request_persist();
         manager.handle_server_unpair(&conn, event);
     }
 
-    manager.flush_pending_record_ops();
+    client.flush_pending_persistence();
     manager.flush_deferred_releases();
 
     EXPECT_FALSE(client.record_store_
@@ -3259,8 +3350,7 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
 // the writes staged ahead of it take to commit (an NVS commit each, tens of milliseconds, on ESP).
 //
 // Driving the handler directly is what pins that: the resolve below runs inside the locked
-// section itself, which is where an erase deferred to flush_pending_record_ops() would still be
-// resolvable.
+// section itself, which is where an erase deferred to the flush would still be resolvable.
 TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     HoldTestClient bundle("Unpair Revocation Window Test Client");
     SendspinClient& client = bundle.client_ref();
@@ -3291,7 +3381,7 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     EXPECT_FALSE(resolved.has_value())
         << "the revoked record still resolved a handshake while the unpair handler held the lock";
 
-    manager.flush_pending_record_ops();
+    client.flush_pending_persistence();
     manager.flush_deferred_releases();
 }
 
@@ -3459,14 +3549,14 @@ private:
 
 }  // namespace
 
-// The lifecycle handlers decide which write is owed under conn_ptr_mutex_ and perform it after
-// dropping the lock (PendingRecordOp / flush_pending_record_ops()). What that buys is here:
+// The lifecycle handlers change RAM under conn_ptr_mutex_ and leave the provider write to
+// SendspinClient::flush_pending_persistence(), which holds no lock. What that buys is here:
 // the sync task takes the same mutex for every decoded audio chunk through current_shared(), and
 // on ESP the write is an NVS commit that stalls code running from flash for tens of milliseconds,
 // so a write held under the lock is a stall of the audio path.
 //
-// The provider above holds that whole window open inside the persist_records() the first
-// activate's flush_pending_record_ops() performs.
+// The provider above holds that whole window open inside the persist_records() the flush after
+// the first activate performs.
 // A current_shared() caller issued in the window must still return: is_time_synced() is exactly
 // the call the sync task makes (SendspinClient::is_time_synced() -> current_shared()). It is
 // waited on with no timeout, so a regression hangs rather than turning a loaded runner into a

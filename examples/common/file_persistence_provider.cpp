@@ -192,13 +192,4 @@ bool FilePersistenceProvider::save_blob(const std::string& key, const uint8_t* d
     return save_doc(this->path_, doc);
 }
 
-bool FilePersistenceProvider::erase_blob(const std::string& key) {
-    JsonDocument doc = load_doc(this->path_);
-    if (!doc[key].is<const char*>()) {
-        return true;  // Nothing stored: the key is already absent.
-    }
-    doc.remove(key);
-    return save_doc(this->path_, doc);
-}
-
 }  // namespace sendspin

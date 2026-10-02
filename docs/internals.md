@@ -49,7 +49,7 @@ The Inbox is a single-mutex mailbox with a lock-free dirty-topic bitmask. It off
 | Event ring | `INBOX_TOPIC_EVENTS` | Network thread (player/artwork/visualizer stream events); main loop (`*_CLEARED` and the synthetic stream events `cleanup()` pushes) |
 | `SendspinClient::EventState::time_slot` | `INBOX_TOPIC_TIME` | Network thread (`server/time` handler) |
 | `SendspinClient::EventState::group_slot` | `INBOX_TOPIC_GROUP` | Network thread |
-| `SendspinClient::EventState::records_dirty_slot` | `INBOX_TOPIC_RECORDS` | Network thread (`server/pair-finalize` handler); main loop (`start()`) |
+| `SendspinClient::EventState::persist_slot` | `INBOX_TOPIC_PERSIST` | Network thread (`server/pair-finalize` handler); main loop (`start()`, the unpair drain, a playback activate) |
 | `ControllerRole::Impl::EventState::slot` | `INBOX_TOPIC_CONTROLLER` | Network thread |
 | `MetadataRole::Impl::EventState::slot` | `INBOX_TOPIC_METADATA` | Network thread |
 | `ColorRole::Impl::EventState::slot` | `INBOX_TOPIC_COLOR` | Network thread |
@@ -72,7 +72,7 @@ The Inbox is a single-mutex mailbox with a lock-free dirty-topic bitmask. It off
    │  server/activate events (trust check, role removals)
    ├─ Promotion scan: establish operational nursery connections
    │  (admission arbitration against the incumbent); then pairing and unpair events
-   ├─ flush_pending_record_ops(), flush_pending_admission(), flush_deferred_releases(),
+   ├─ flush_pending_persistence(), flush_pending_admission(), flush_deferred_releases(),
    │  all unlocked, so the incoming connection drives the roles before the outgoing one
    │  is told to leave
    ├─ Call loop() on the current and nursery connections; send pending hellos
@@ -83,8 +83,9 @@ The Inbox is a single-mutex mailbox with a lock-free dirty-topic bitmask. It off
 2. time_burst_->loop(conn)   (only while the current connection is operational); send a
    client/state held for clock sync once synced
 
-3. Flush deferred high-performance releases; persist a staged pairing record; feed a
-   claimed time measurement from the current connection into time_burst_->on_time_response()
+3. Flush deferred high-performance releases; perform a provider write requested since step 1
+   (a pairing the network thread committed); feed a claimed time measurement from the current
+   connection into time_burst_->on_time_response()
 
 4. Drain the inbox event ring
    ├─ *_CLEARED → each role's handle_cleared_event()
@@ -236,7 +237,7 @@ Client -> Server: noise/handshake msg2
 Server -> Client: server/activate (normal operational flow)
 ```
 
-The new long-term record must resolve for the re-handshake that immediately follows, so the `server/pair-finalize` handler commits it to `RecordStore` in RAM on the network thread. The persistence provider is main-loop-only, so the durable write is staged through `records_dirty_slot` and performed by the next `drain_inbox()`, or by the client destructor if it comes first, before `on_pairing_succeeded` fires. The pairing-code methods (CPace) follow the same main-loop state-machine shape in `ConnectionManager`.
+The new long-term record must resolve for the re-handshake that immediately follows, so the `server/pair-finalize` handler commits it to `RecordStore` in RAM on the network thread. The persistence provider is main-loop-only, so the durable write is staged through `persist_slot` and performed by the next tick's `flush_pending_persistence()` (in `ConnectionManager::loop()` or `drain_inbox()`), or by the client destructor if it comes first, before `on_pairing_succeeded` fires. Every other change to persisted state (an unpair, a playback handoff) takes the same route: the RAM half runs where the change is decided, often under `conn_ptr_mutex_`, and `request_persist()` leaves the provider write to `flush_pending_persistence()`, which holds no lock and runs once `ConnectionManager::loop()` has dropped its own. The pairing-code methods (CPace) follow the same main-loop state-machine shape in `ConnectionManager`.
 
 ## Connection Lifecycle
 

@@ -15,7 +15,7 @@
 /// @file fake_persistence.h
 /// @brief Shared in-memory SendspinPersistenceProvider fake for tests.
 ///
-/// A std::map<key, blob> plus fail-injection switches for save_blob()/erase_blob(), since
+/// A std::map<key, blob> plus fail-injection switches for save_blob()/commit(), since
 /// several tests exercise persist-failure paths (a rejected pairing record,
 /// revocation-durability warnings). Prefer this over a bespoke per-file provider when a test
 /// only needs a generic blob store with optional failure injection; keep a bespoke fake when a
@@ -38,7 +38,7 @@
 namespace sendspin {
 
 /// @brief In-memory blob store: every key/value survives only for the life of the fake (no real
-/// file or NVS backing), with optional per-key or blanket save/erase rejection.
+/// file or NVS backing), with optional per-key or blanket save rejection and commit failure.
 class InMemoryPersistenceProvider : public SendspinPersistenceProvider {
 public:
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
@@ -62,13 +62,14 @@ public:
         return true;
     }
 
-    bool erase_blob(const std::string& key) override {
+    bool commit() override {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        this->erase_attempts_[key]++;
-        if (this->reject_all_erases || this->reject_erase_keys.count(key) > 0) {
+        this->commits_++;
+        if (this->fail_commits) {
             return false;
         }
-        this->blobs_.erase(key);
+        // What the commit covered: every save_blob() call so far.
+        this->saves_at_last_commit_ = this->saved_keys_.size();
         return true;
     }
 
@@ -110,10 +111,17 @@ public:
         return this->saved_keys_;
     }
 
-    [[nodiscard]] int erase_attempts(const std::string& key) const {
+    [[nodiscard]] int commits() const {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        auto it = this->erase_attempts_.find(key);
-        return it == this->erase_attempts_.end() ? 0 : it->second;
+        return this->commits_;
+    }
+
+    /// @brief Keys save_blob() was called with after the last successful commit(), in call
+    /// order: the writes a queueing provider would still be holding in RAM.
+    [[nodiscard]] std::vector<std::string> uncommitted_keys() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return {this->saved_keys_.begin() + static_cast<std::ptrdiff_t>(this->saves_at_last_commit_),
+                this->saved_keys_.end()};
     }
 
     // ========================================
@@ -121,9 +129,8 @@ public:
     // ========================================
 
     bool reject_all_saves{false};
-    bool reject_all_erases{false};
+    bool fail_commits{false};
     std::set<std::string> reject_save_keys;
-    std::set<std::string> reject_erase_keys;
 
 private:
     mutable std::mutex mutex_;
@@ -131,7 +138,8 @@ private:
     std::map<std::string, int> load_attempts_;
     std::map<std::string, int> save_attempts_;
     std::vector<std::string> saved_keys_;
-    std::map<std::string, int> erase_attempts_;
+    size_t saves_at_last_commit_{0};
+    int commits_{0};
 };
 
 }  // namespace sendspin

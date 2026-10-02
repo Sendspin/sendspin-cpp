@@ -128,7 +128,7 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
 # test_encrypted_lifecycle.cpp is a white-box integration harness: it drives the client's and the
-# manager's private lifecycle, record-op and dispatch entry points against a real loopback server,
+# manager's private lifecycle, persistence and dispatch entry points against a real loopback server,
 # none of which has a public surface to use instead. Reached:
 #   - SendspinClient::connection_manager_ and record_store_, the two owners the rest of the file
 #     works through: the store answers whether an unpaired record still resolves for this boot,
@@ -141,10 +141,11 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     probed directly by the lock-order test: holding the manager lock exactly where loop() holds
 #     it is what makes an admission that reaches for the JSON lock hang the test instead of a
 #     device.
-#   - ConnectionManager::stage_record_op(), pending_record_ops_ and flush_pending_record_ops(),
-#     plus set_current_connection()/flush_pending_admission() and handle_server_unpair(): the
-#     staging half and its flush are separate steps on purpose, and only a test that takes them
-#     apart can show what one tick coalesces.
+#   - SendspinClient::request_persist(), note_last_played_server() and
+#     flush_pending_persistence(), plus ConnectionManager::set_current_connection()/
+#     flush_pending_admission() and handle_server_unpair(): the RAM change and its flush are
+#     separate steps on purpose, and only a test that takes them apart can show what one tick
+#     coalesces.
 #   - SendspinConnection::last_receive_time_us_, held_count_ and held_bytes_, the hold buffer's
 #     accounting and the liveness stamp a stand-in connection has no transport to set (and, for
 #     the stamp, one the liveness tick test ages directly instead of waiting). Likewise

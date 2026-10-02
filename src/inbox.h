@@ -47,7 +47,7 @@ static constexpr uint32_t INBOX_TOPIC_PLAYER_COMMAND = 1U << 5;        // Player
 static constexpr uint32_t INBOX_TOPIC_PLAYER_STREAM_PARAMS = 1U << 6;  // Player stream params slot
 static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1U << 7;     // Visualizer config slot
 static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1U << 8;       // Artwork display slot
-static constexpr uint32_t INBOX_TOPIC_RECORDS = 1U << 9;  // Pairing-records persist slot
+static constexpr uint32_t INBOX_TOPIC_PERSIST = 1U << 9;  // Owed provider writes wakeup slot
 static constexpr uint32_t INBOX_TOPIC_TIME = 1U << 10;    // Time-sync measurement slot
 
 // ============================================================================

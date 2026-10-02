@@ -196,7 +196,8 @@ void RecordStore::provision_pairing_psk_if_needed() {
         if (this->provider_ != nullptr) {
             auto encoded = encode_pairing_psk(provisioned);
             psk_persisted = this->provider_->save_blob(persistence_keys::PAIRING_PSK,
-                                                       encoded.data(), encoded.size());
+                                                       encoded.data(), encoded.size()) &&
+                            this->provider_->commit();
             // The encoded blob is the PSK; wipe it now that save_blob() has its own copy (or has
             // failed).
             secure_zero(encoded.data(), encoded.size());
@@ -426,8 +427,10 @@ bool RecordStore::persist_records() {
         writes = this->take_dirty_writes_locked();
     }
     bool all_accepted = true;
+    bool slot_accepted = false;
     for (auto& write : writes) {
         if (this->save_slot_write(write)) {
+            slot_accepted |= write.key != persistence_keys::RECORD_ORDER;
             continue;
         }
         all_accepted = false;
@@ -448,6 +451,11 @@ bool RecordStore::persist_records() {
                 "a record stored since the last accepted write will not survive a reboot, and "
                 "a record dropped since it will be valid again after one",
                 write.key.c_str());
+    }
+    if (slot_accepted && !this->provider_->commit()) {
+        all_accepted = false;
+        SS_LOGW(TAG, "Provider failed to commit the record writes; a record stored or dropped "
+                     "since the last commit may not survive a reboot");
     }
     return all_accepted;
 }
@@ -522,7 +530,8 @@ RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(const std::stri
 //
 // The two halves need not be atomic: persist_records() is main-loop-only, so blobs cannot land
 // out of order, and the one writer that can slip into the gap (store_record_superseding, on the
-// network thread) is RAM-only and schedules its own flush, which redoes whatever slot it dirtied.
+// network thread) is RAM-only and its caller schedules a flush, which redoes whatever slot it
+// dirtied.
 // A resolve in the gap sees the new RAM state, which is the authority for the boot; the blobs
 // only decide what survives a reboot.
 std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {

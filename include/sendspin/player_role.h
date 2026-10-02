@@ -29,7 +29,6 @@
 namespace sendspin {
 
 class SendspinClient;
-class SendspinPersistenceProvider;
 
 // ============================================================================
 // Player types
@@ -145,8 +144,7 @@ class PlayerRole {
 public:
     struct Impl;
 
-    PlayerRole(PlayerRoleConfig config, SendspinClient* client,
-               SendspinPersistenceProvider* persistence);
+    PlayerRole(PlayerRoleConfig config, SendspinClient* client);
     ~PlayerRole();
 
     /// @brief Sets the listener for player events

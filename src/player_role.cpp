@@ -123,12 +123,10 @@ static bool audio_formats_valid(const std::vector<AudioSupportedFormatObject>& f
 // Impl constructor / destructor
 // ============================================================================
 
-PlayerRole::Impl::Impl(PlayerRoleConfig config, SendspinClient* client,
-                       SendspinPersistenceProvider* persistence)
+PlayerRole::Impl::Impl(PlayerRoleConfig config, SendspinClient* client)
     : config(std::move(config)),
       client(client),
       event_state(std::make_unique<EventState>()),
-      persistence(persistence),
       sync_task(std::make_unique<SyncTask>()) {}
 
 PlayerRole::Impl::~Impl() {
@@ -142,9 +140,8 @@ PlayerRole::Impl::~Impl() {
 // PlayerRole forwarding (public API → Impl)
 // ============================================================================
 
-PlayerRole::PlayerRole(PlayerRoleConfig config, SendspinClient* client,
-                       SendspinPersistenceProvider* persistence)
-    : impl_(std::make_unique<Impl>(std::move(config), client, persistence)) {}
+PlayerRole::PlayerRole(PlayerRoleConfig config, SendspinClient* client)
+    : impl_(std::make_unique<Impl>(std::move(config), client)) {}
 
 PlayerRole::~PlayerRole() = default;
 
@@ -236,11 +233,12 @@ void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
     this->event_state->command_slot.bind(inbox, INBOX_TOPIC_PLAYER_COMMAND);
 }
 
-bool PlayerRole::Impl::start() {
+bool PlayerRole::Impl::start(SendspinPersistenceProvider* persistence) {
     if (!audio_formats_valid(this->config.audio_formats)) {
         return false;
     }
 
+    this->persistence = persistence;
     this->load_output_delay();
 
     // A player with no listener has nowhere to write audio, so the sync task is not started and

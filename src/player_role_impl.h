@@ -54,7 +54,7 @@ struct AudioChunk {
 
 /// @brief Private implementation of the player role
 struct PlayerRole::Impl {
-    Impl(PlayerRoleConfig config, SendspinClient* client, SendspinPersistenceProvider* persistence);
+    Impl(PlayerRoleConfig config, SendspinClient* client);
     ~Impl();
 
     /// @brief Splits one audio chunk's bytes (after the message type byte) into its timestamp
@@ -83,7 +83,9 @@ struct PlayerRole::Impl {
     /// @brief Hands the sync task the connection manager it resolves its stream pin from and
     /// gives that pin back to. Called at role registration, before start().
     void attach_connection_manager(ConnectionManager& manager) const;
-    bool start();
+    /// @param persistence The client's provider at this start, or nullptr; replaces the one
+    ///        add_player() set.
+    bool start(SendspinPersistenceProvider* persistence);
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
     // Each handler takes the teardown generation the receive gate captured when it admitted the
@@ -163,7 +165,7 @@ struct PlayerRole::Impl {
     std::unique_ptr<EventState> event_state;
     Inbox* inbox{nullptr};
     PlayerRoleListener* listener{nullptr};
-    SendspinPersistenceProvider* persistence;
+    SendspinPersistenceProvider* persistence{nullptr};
     std::unique_ptr<SyncTask> sync_task;
 
     // 32-bit fields
