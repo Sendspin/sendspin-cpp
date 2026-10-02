@@ -293,10 +293,13 @@ static_assert(SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS * US_PER_MS < INT32_
 
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config) {
     // The next message goes out after at most one inter-burst interval, and an unanswered one
-    // times out after one response timeout.
-    const int64_t timeout_ms = config.liveness_timeout_ms.value_or(
-        (LIVENESS_TOLERATED_MISSES + 1) *
-        (config.time_burst_interval_ms + config.time_burst_response_timeout_ms));
+    // times out after one response timeout. Not value_or(): it would evaluate the derivation,
+    // which can overflow, even when unused.
+    const int64_t timeout_ms =
+        config.liveness_timeout_ms.has_value()
+            ? config.liveness_timeout_ms.value()
+            : (LIVENESS_TOLERATED_MISSES + 1) *
+                  (config.time_burst_interval_ms + config.time_burst_response_timeout_ms);
     if (timeout_ms > SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS) {
         SS_LOGW(TAG, "Liveness timeout of %" PRId64 " ms exceeds the maximum, using %" PRId64 " ms",
                 timeout_ms, SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS);
