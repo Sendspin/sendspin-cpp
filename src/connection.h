@@ -289,8 +289,7 @@ public:
     /// - If not yet encrypted (pre-handshake), routes through send_text_message().
     ///
     /// All role senders use this method. client/time is the one exception: send_time_message()
-    /// carries a hook the transport runs immediately before its frame's write, which this path
-    /// does not.
+    /// calls NoiseTransport::send_json() directly to pass its write hook.
     /// @return SsErr::OK if queued/sent, error code otherwise.
     /// @note The encrypted path blocks on the Noise session mutex, which the network thread also
     ///       holds across its own sends. On an ESP outbound connection that send blocks for up to
@@ -353,9 +352,22 @@ public:
                                     bool allow_before_hello = false) = 0;
 
     /// @brief Sends a client/time message and records it as the frame in flight (see
-    /// TimeFrameStamp). Needs the Noise transport, which is_operational() implies. Main loop only.
-    /// @return true if the message was queued/sent successfully, false otherwise.
-    bool send_time_message();
+    /// time_frame_tag_). Needs the Noise transport, which is_operational() implies. Main loop only.
+    /// @return The client_transmitted the frame carries, or 0 if the message was not queued/sent.
+    int64_t send_time_message();
+
+    /// @brief Claims the client/time frame in flight for a server/time reply echoing
+    /// `client_transmitted`, matching on its low 32 bits; the claim retires the frame, so at most
+    /// one reply per frame succeeds. Network thread.
+    /// @return When the frame was handed to the socket, never earlier than the echo nor later
+    ///         than the write, or nullopt if no frame in flight carries that value.
+    std::optional<int64_t> claim_time_frame(int64_t client_transmitted);
+
+    /// @brief Retires the client/time frame in flight, so a late reply to it no longer matches.
+    /// Main loop only.
+    void cancel_time_frame() {
+        this->time_frame_tag_.store(0, std::memory_order_release);
+    }
 
     /// @brief Sends a binary WebSocket frame to the peer.
     /// @param data   Pointer to the binary payload bytes.
@@ -847,24 +859,6 @@ public:
     // Time message state accessors
     // ========================================
 
-    /// @brief Returns the client/time frame in flight. Any thread.
-    TimeFrameStamp get_time_frame_stamp() const {
-        std::lock_guard<std::mutex> lock(this->time_frame_mutex_);
-        return this->time_frame_;
-    }
-
-    /// @brief Checks if a time message is pending (waiting for response)
-    /// @return True if a time message has been sent and a response is expected, false otherwise.
-    bool is_pending_time_message() const {
-        return this->pending_time_message_;
-    }
-
-    /// @brief Sets the pending time message flag
-    /// @param pending true if a time message is pending, false to clear the flag
-    void set_pending_time_message(bool pending) {
-        this->pending_time_message_ = pending;
-    }
-
     // ========================================
     // Initialization setters (called by hub before start)
     // ========================================
@@ -897,14 +891,6 @@ protected:
     /// hook where the write happens.
     virtual SsErr send_transport_frame(const uint8_t* data, size_t len,
                                        NoiseTransport::FrameWriteHook before_write);
-
-    // ========================================
-    // Time messages
-    // ========================================
-
-    /// @brief Stamps the frame in flight as sent now, if `tag` (the low 32 bits of its
-    /// client_transmitted) still identifies it
-    void note_time_frame_sent(uint32_t tag);
 
     // ========================================
     // Active-role mask
@@ -1031,13 +1017,6 @@ protected:
     /// (or re-handshake; unchanged across a re-handshake since it is the same server).
     ServerInformationObject server_information_{};
 
-    /// The client/time frame in flight: set by send_time_message() on the main loop, stamped by
-    /// the sending transport, read by the receive path. Guarded by time_frame_mutex_.
-    TimeFrameStamp time_frame_{};
-
-    /// Guards time_frame_. Held only around the copy or assignment.
-    mutable std::mutex time_frame_mutex_;
-
     // Pointer fields
 
     /// Time synchronization filter (Kalman-based).
@@ -1160,6 +1139,16 @@ protected:
     /// that cross-thread reset.
     std::atomic<uint32_t> pairing_index_{0};
 
+    /// Tag of the client/time frame in flight: the low 32 bits of the client_transmitted it
+    /// carries, never 0 for a frame, and 0 once the frame is claimed or cancelled. A failed send
+    /// leaves its tag, which no reply can echo. 32 bits because a 64-bit atomic takes a lock on
+    /// the ESP32 family.
+    std::atomic<uint32_t> time_frame_tag_{0};
+
+    /// Low 32 bits of the client clock when the frame in flight was handed to the socket, seeded
+    /// with the tag until the write hook overwrites it on whichever thread performs the write.
+    std::atomic<uint32_t> time_frame_sent_us_{0};
+
     // 8-bit fields
 
     /// Lifecycle-flag axes.
@@ -1218,10 +1207,6 @@ protected:
     /// When false, dispatch_completed_message() silently drops incoming messages.
     /// Set to false on the main thread before cleanup; checked on the network thread.
     std::atomic<bool> message_dispatch_enabled_{true};
-
-    /// Time message state. Written by the main-loop time burst and cleared by the transport
-    /// thread's disconnect handler, hence atomic.
-    std::atomic<bool> pending_time_message_{false};
 
     /// Atomic for the same reason as client_hello_sent_: written on network threads, read from the
     /// main loop via is_handshake_complete().

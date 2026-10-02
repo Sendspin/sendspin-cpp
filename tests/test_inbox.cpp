@@ -144,24 +144,6 @@ TEST(Inbox, ResetEventsEmptiesRingAndClearsBit) {
     EXPECT_EQ(inbox.take_events(out, 4), 0u);
 }
 
-TEST(Inbox, TimeResponsePayloadRoundtrips) {
-    Inbox inbox;
-
-    InboxEvent event{};
-    event.type = InboxEventType::TIME_RESPONSE;
-    event.time = TimeResponsePayload{/*offset=*/12345, /*max_error=*/678, /*timestamp=*/91011,
-                                     /*source_id=*/42};
-    ASSERT_TRUE(inbox.push_event(event));
-
-    InboxEvent out[1];
-    ASSERT_EQ(inbox.take_events(out, 1), 1u);
-    EXPECT_EQ(out[0].type, InboxEventType::TIME_RESPONSE);
-    EXPECT_EQ(out[0].time.offset, 12345);
-    EXPECT_EQ(out[0].time.max_error, 678);
-    EXPECT_EQ(out[0].time.timestamp, 91011);
-    EXPECT_EQ(out[0].time.source_id, 42u);
-}
-
 // The epoch a producer stamps must reach the consumer per event, not per ring: it is what
 // event_is_current() compares against, and an epoch that did not survive the round trip would
 // read as 0, which is the fail-open direction ("the role was never torn down").
@@ -222,15 +204,15 @@ TEST(Inbox, ConcurrentProducerDrainedWithoutLossOrDuplication) {
 
     std::thread producer([&] {
         auto sum_merge = [](int64_t& current, int64_t&& delta) { current += delta; };
-        uint64_t next_seq = 0;
+        uint32_t next_seq = 0;
         for (int i = 0; i < kIterations; ++i) {
             if ((i % 2) == 0) {
                 counter_slot.merge(sum_merge, int64_t{1});
                 produced_merges.fetch_add(1, std::memory_order_relaxed);
             } else {
                 InboxEvent event{};
-                event.type = InboxEventType::TIME_RESPONSE;
-                event.time = TimeResponsePayload{0, 0, 0, next_seq};
+                event.type = InboxEventType::PLAYER_STREAM;
+                event.epoch = next_seq;  // Carries the sequence number the drain checks
                 ++next_seq;
                 if (inbox.push_event(event)) {
                     produced_events.fetch_add(1, std::memory_order_relaxed);
@@ -243,7 +225,7 @@ TEST(Inbox, ConcurrentProducerDrainedWithoutLossOrDuplication) {
     int64_t drained_sum = 0;
     uint64_t drained_event_count = 0;
     bool have_last_seq = false;
-    uint64_t last_seq = 0;
+    uint32_t last_seq = 0;
 
     InboxEvent batch[Inbox::EVENT_CAPACITY];
     for (;;) {
@@ -261,8 +243,8 @@ TEST(Inbox, ConcurrentProducerDrainedWithoutLossOrDuplication) {
         if (has_bit(bits, INBOX_TOPIC_EVENTS)) {
             size_t n = inbox.take_events(batch, Inbox::EVENT_CAPACITY);
             for (size_t i = 0; i < n; ++i) {
-                ASSERT_EQ(batch[i].type, InboxEventType::TIME_RESPONSE);
-                const uint64_t seq = batch[i].time.source_id;
+                ASSERT_EQ(batch[i].type, InboxEventType::PLAYER_STREAM);
+                const uint32_t seq = batch[i].epoch;
                 if (have_last_seq) {
                     ASSERT_GT(seq, last_seq) << "ring must deliver events in FIFO order with no "
                                                  "duplicates";

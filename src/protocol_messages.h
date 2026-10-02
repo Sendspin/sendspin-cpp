@@ -891,23 +891,24 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
 /// @brief Parses a server/activate JSON message into the provided struct.
 bool process_server_activate_message(JsonObject root, ServerActivateMessage* activate_msg);
 
-/// @brief A connection's client/time frame in flight: the client_transmitted it carries and when
-/// the transport handed it to the socket (docs/playback-sync.md "Clock Synchronization")
-struct TimeFrameStamp {
-    int64_t embedded{0};  ///< client_transmitted carried by the frame (microseconds)
-    int64_t sent{0};      ///< When the frame was handed to the socket (microseconds)
+/// @brief A server/time reply (messaging.md "server/time"), every field in microseconds
+struct ServerTimeMessage {
+    int64_t client_transmitted{0};  ///< Echo of the client/time it answers (client clock)
+    int64_t server_received{0};     ///< When the server received that client/time (server clock)
+    int64_t server_transmitted{0};  ///< When the server sent this reply (server clock)
 };
 
-/// @brief Parses a server/time JSON message and computes the server-to-client clock offset and
-/// the round-trip error bound, both in microseconds
-///
-/// The echoed client_transmitted only identifies the frame being answered: a reply that does not
-/// echo `stamp.embedded` answers an earlier frame and is rejected, and the calculation
-/// uses `stamp.sent`.
-/// @param timestamp Client timestamp when the message was received (microseconds).
-/// @param stamp The connection's client/time frame in flight.
-bool process_server_time_message(JsonObject root, int64_t timestamp, TimeFrameStamp stamp,
-                                 int64_t* offset, int64_t* max_error);
+/// @brief Parses a server/time JSON message into the provided struct
+bool process_server_time_message(JsonObject root, ServerTimeMessage* time_msg);
+
+/// @brief Computes one time exchange's server-to-client clock offset and round-trip error bound,
+/// both in microseconds
+/// @param client_sent When the client/time was handed to the socket, on the client clock (see
+///                    SendspinConnection::claim_time_frame()); time_msg.client_transmitted is
+///                    not used.
+/// @param client_received When the reply arrived, on the client clock.
+void compute_time_exchange(const ServerTimeMessage& time_msg, int64_t client_sent,
+                           int64_t client_received, int64_t* offset, int64_t* max_error);
 
 /// @brief Parses a group/update JSON message into the provided struct
 bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg);
@@ -968,7 +969,7 @@ static constexpr size_t TIME_MESSAGE_BUF_SIZE = 96;
 /// Hot path on the time-sync send side: avoids any heap allocation by writing the fixed-shape
 /// message directly into the caller's stack buffer. A 96-byte buffer is always large enough.
 /// @param client_transmitted The client timestamp to embed (microseconds); the server/time reply
-///                           echoes it (see TimeFrameStamp).
+///                           echoes it (see SendspinConnection::claim_time_frame()).
 /// @return Number of bytes written (excluding any null terminator), or 0 on error.
 size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted);
 

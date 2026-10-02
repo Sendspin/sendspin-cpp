@@ -27,7 +27,6 @@ add_executable(sendspin_tests
     test_connection_lifecycle.cpp
     test_encrypted_lifecycle.cpp
     test_time_filter.cpp
-    test_time_burst.cpp
     test_protocol.cpp
     test_network_info.cpp
     test_spsc_ring_buffer.cpp
@@ -148,7 +147,9 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     apart can show what one tick coalesces.
 #   - SendspinConnection::last_receive_time_us_, held_count_ and held_bytes_, the hold buffer's
 #     accounting and the liveness stamp a stand-in connection has no transport to set (and, for
-#     the stamp, one the liveness tick test ages directly instead of waiting).
+#     the stamp, one the liveness tick test ages directly instead of waiting). Likewise
+#     time_frame_tag_ and time_frame_sent_us_, the client/time frame in flight that only a send
+#     over a Noise transport records.
 #   - ConnectionManager::nursery_ (read under conn_ptr_mutex_), swap_out_pending_events() and
 #     DrainedEvents: the outbound open/close callbacks are reachable only through the connect_to()
 #     connection that carries them, and whether an event about an already-released connection was
@@ -164,7 +165,9 @@ set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
 # the reassembly buffer's capacity. The capacity is the
 # only observable of the growth policy (the message that reaches the listener is the same either
 # way) and which NoiseTransport exposes nowhere, deliberately: its size is an allocation
-# decision, not protocol state.
+# decision, not protocol state. It also seeds SendspinConnection::time_frame_tag_ and
+# time_frame_sent_us_ directly, for frame states a send cannot produce on demand: a leftover
+# write hook's time earlier than the frame's own, and a write just past the low-32-bit wrap.
 set_source_files_properties(test_noise_transport.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

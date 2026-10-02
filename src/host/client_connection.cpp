@@ -180,7 +180,6 @@ void SendspinClientConnection::setup_callbacks() {
                 this->connected_ = false;
                 this->client_hello_sent_ = false;
                 this->server_hello_received_ = false;
-                this->pending_time_message_ = false;
                 this->reset_websocket_payload();
                 if (this->on_disconnected_cb) {
                     this->on_disconnected_cb(this);

@@ -155,6 +155,9 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
 struct SendspinClient::EventState {
     Inbox inbox;
     InboxSlot<GroupUpdateObject> group_slot{inbox, INBOX_TOPIC_GROUP};
+    /// Latest claimed server/time measurement. Latest-wins loses nothing: only the reply to the
+    /// one client/time in flight can be claimed.
+    InboxSlot<TimeResponse> time_slot{inbox, INBOX_TOPIC_TIME};
     /// Pure wakeup (the bool payload carries no information): set by the network-thread
     /// server/pair-finalize handler after RecordStore::store_record_superseding() mutates the
     /// store RAM-only (and by start(), for a store that came up owing a write), drained by loop()
@@ -533,9 +536,10 @@ void SendspinClient::drain_inbox() {
 
     // Process deferred events: all state mutations and user callbacks happen here, on the main
     // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
-    // inbox_bits (here) gates only the event-ring drain immediately following it; slot_bits
-    // (taken after that drain completes, below) gates the role drains and the group-update drain,
-    // since a role's InboxSlot can be written by a producer between this snapshot and that one.
+    // inbox_bits (here) gates the records persist, the time measurement and the event-ring drain
+    // immediately following it; slot_bits (taken after that drain completes, below) gates the
+    // role drains and the group-update drain, since a role's InboxSlot can be written by a
+    // producer between this snapshot and that one.
     const uint32_t inbox_bits = this->event_state_->inbox.poll();
 
     // --- Deferred pairing-record persist ---
@@ -548,13 +552,27 @@ void SendspinClient::drain_inbox() {
         this->flush_pending_records();
     }
 
-    // --- Time sync events ---
+    // --- Time sync measurement ---
+    if (inbox_bits & INBOX_TOPIC_TIME) {
+        TimeResponse response;
+        if (this->event_state_->time_slot.take(response)) {
+            auto* current = this->connection_manager_->current();
+            // Apply only measurements from the connection that is still current; a reply claimed
+            // by a since-displaced server carries that server's clock and would contaminate this
+            // connection's Kalman filter.
+            if (current != nullptr && current->get_instance_id() == response.source_id) {
+                this->time_burst_->on_time_response(current, response);
+            }
+        }
+    }
+
+    // --- Lifecycle events ---
     if (inbox_bits & INBOX_TOPIC_EVENTS) {
-        // Drain in small batches to bound the stack cost on the shared main-loop task (the ring
-        // holds up to EVENT_CAPACITY entries of ~48 bytes each). A batch that comes back partial
-        // means the ring is empty, ending the loop; events pushed mid-drain are still delivered
-        // this tick as long as full batches keep arriving. Sized as a fraction of the ring so the
-        // batch/ring ratio (and the stack cost above) tracks EVENT_CAPACITY automatically.
+        // Drain in small batches to bound the stack cost on the shared main-loop task. A batch that
+        // comes back partial means the ring is empty, ending the loop; events pushed mid-drain are
+        // still delivered this tick as long as full batches keep arriving. Sized as a fraction of
+        // the ring so the batch/ring ratio (and the stack cost above) tracks EVENT_CAPACITY
+        // automatically.
         constexpr size_t EVENT_DRAIN_BATCH_SIZE = Inbox::EVENT_CAPACITY / 4;
         InboxEvent events[EVENT_DRAIN_BATCH_SIZE];
         size_t event_count = 0;
@@ -575,19 +593,6 @@ void SendspinClient::drain_inbox() {
                 }
                 const InboxEvent& event = events[i];
                 switch (event.type) {
-                    case InboxEventType::TIME_RESPONSE: {
-                        auto* current = this->connection_manager_->current();
-                        // Apply only measurements from the connection that is still current; a
-                        // response queued by a since-displaced (or pending) server carries that
-                        // server's clock and would contaminate this connection's Kalman filter.
-                        if (current != nullptr &&
-                            current->get_instance_id() == event.time.source_id) {
-                            this->time_burst_->on_time_response(
-                                current, event.time.offset, event.time.max_error,
-                                event.time.timestamp, event.time.embedded);
-                        }
-                        break;
-                    }
                     // Stream lifecycle events from the player role. Dispatched to a
                     // main-thread-only Impl method that mirrors the arrival exactly as the old
                     // per-role queue delivered it: PLAYER_STREAM appends to
@@ -1084,6 +1089,7 @@ void SendspinClient::cleanup_connection_state() {
     this->event_state_->drain_generation++;
     this->event_state_->inbox.reset_events();
     this->event_state_->group_slot.reset();
+    this->event_state_->time_slot.reset();
 
     // Also wipes any not-yet-dispatched pairing listener notifications. Callers that need a
     // notification to survive teardown (e.g. handle_pair_abort's on_pairing_failed /
@@ -1235,9 +1241,10 @@ namespace {
 /// messages may touch a role.
 ///
 /// False for the establishment and trust-negotiation traffic a connection must be able to send
-/// before it is admitted (hello, activate, time, in-band re-handshake), and for the pairing
-/// messages, which carry their own gating on the main loop. The switch is exhaustive, so a
-/// message type added later must be listed here.
+/// before it is admitted (hello, activate, in-band re-handshake), for the pairing messages, which
+/// carry their own gating on the main loop, and for server/time, which is accepted only as the
+/// reply to the connection's own client/time in flight (SendspinConnection::claim_time_frame()).
+/// The switch is exhaustive, so a message type added later must be listed here.
 bool requires_admitted_connection(SendspinServerToClientMessageType type) {
     switch (type) {
         case SendspinServerToClientMessageType::SERVER_HELLO:
@@ -1557,18 +1564,25 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 break;
             }
 
-            int64_t offset{0};
-            int64_t max_error{0};
-            const TimeFrameStamp stamp = conn->get_time_frame_stamp();
-            if (process_server_time_message(root, timestamp, stamp, &offset, &max_error)) {
-                InboxEvent event{};
-                event.type = InboxEventType::TIME_RESPONSE;
-                event.time = TimeResponsePayload{offset, max_error, timestamp,
-                                                 conn->get_instance_id(), stamp.embedded};
-                if (!this->event_state_->inbox.push_event(event)) {
-                    SS_LOGW(TAG, "Inbox event ring full; dropping time response measurement");
-                }
+            ServerTimeMessage time_msg;
+            if (!process_server_time_message(root, &time_msg)) {
+                break;
             }
+            // Only the reply to this connection's frame in flight is taken, so no peer (a nursery
+            // one included) can overwrite time_slot with a measurement the burst did not ask for.
+            const std::optional<int64_t> client_sent =
+                conn->claim_time_frame(time_msg.client_transmitted);
+            if (!client_sent.has_value()) {
+                SS_LOGV(TAG, "server/time answers no client/time in flight; discarding");
+                break;
+            }
+            TimeResponse response;
+            compute_time_exchange(time_msg, client_sent.value(), timestamp, &response.offset,
+                                  &response.max_error);
+            response.timestamp = timestamp;
+            response.source_id = conn->get_instance_id();
+            response.client_transmitted = time_msg.client_transmitted;
+            this->event_state_->time_slot.write(response);
             break;
         }
         case SendspinServerToClientMessageType::SERVER_STATE: {

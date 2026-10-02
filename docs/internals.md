@@ -42,11 +42,12 @@ One lock sits outside these primitives: each connection's `SendspinTimeFilter` g
 
 ### Inbox
 
-The Inbox is a single-mutex mailbox with a lock-free dirty-topic bitmask. It offers two endpoint styles: a fixed-capacity event ring for ordered events (lifecycle events and time-sync measurements), and `InboxSlot<T>` latest-value slots for state, each owning one `INBOX_TOPIC_*` bit. The main loop calls `poll()` to read the bitmask without locking and only locks to drain topics whose bit is set; a bit set after the snapshot stays set, so the next tick sees it.
+The Inbox is a single-mutex mailbox with a lock-free dirty-topic bitmask. It offers two endpoint styles: a fixed-capacity event ring for ordered lifecycle events, and `InboxSlot<T>` latest-value slots for state, each owning one `INBOX_TOPIC_*` bit. The main loop calls `poll()` to read the bitmask without locking and only locks to drain topics whose bit is set; a bit set after the snapshot stays set, so the next tick sees it.
 
 | Endpoint | Topic bit | Producer |
 |----------|-----------|----------|
-| Event ring | `INBOX_TOPIC_EVENTS` | Network thread (time responses, player/artwork/visualizer stream events); main loop (`*_CLEARED` and the synthetic stream events `cleanup()` pushes) |
+| Event ring | `INBOX_TOPIC_EVENTS` | Network thread (player/artwork/visualizer stream events); main loop (`*_CLEARED` and the synthetic stream events `cleanup()` pushes) |
+| `SendspinClient::EventState::time_slot` | `INBOX_TOPIC_TIME` | Network thread (`server/time` handler) |
 | `SendspinClient::EventState::group_slot` | `INBOX_TOPIC_GROUP` | Network thread |
 | `SendspinClient::EventState::records_dirty_slot` | `INBOX_TOPIC_RECORDS` | Network thread (`server/pair-finalize` handler); main loop (`start()`) |
 | `ControllerRole::Impl::EventState::slot` | `INBOX_TOPIC_CONTROLLER` | Network thread |
@@ -82,10 +83,10 @@ The Inbox is a single-mutex mailbox with a lock-free dirty-topic bitmask. It off
 2. time_burst_->loop(conn)   (only while the current connection is operational); send a
    client/state held for clock sync once synced
 
-3. Flush deferred high-performance releases; persist a staged pairing record
+3. Flush deferred high-performance releases; persist a staged pairing record; feed a
+   claimed time measurement from the current connection into time_burst_->on_time_response()
 
 4. Drain the inbox event ring
-   ├─ TIME_RESPONSE → time_burst_->on_time_response()
    ├─ *_CLEARED → each role's handle_cleared_event()
    └─ PLAYER/ARTWORK/VISUALIZER_STREAM → each role's stream-event handler
 
@@ -179,7 +180,7 @@ Role dispatch points skip a role the server has not activated (`SendspinConnecti
 | Message | Action on the network thread |
 |---------|------------------------------|
 | `server/hello` | Records server info on the connection and sets `server_hello_received_` |
-| `server/time` | Pushes a `TIME_RESPONSE` event onto the inbox ring |
+| `server/time` | Claims the connection's `client/time` frame in flight, dropping a reply that answers none, and writes the measurement to `time_slot` |
 | `server/state` | Writes the controller, metadata, and color `InboxSlot`s |
 | `server/command` | Merges into the player's `command_slot` |
 | `group/update` | Merges into `group_slot` |

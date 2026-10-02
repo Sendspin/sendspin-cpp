@@ -22,9 +22,11 @@
 #include "sendspin/types.h"
 #include "time_filter.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -109,36 +111,60 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendComple
 // Time messages
 // ============================================================================
 
-bool SendspinConnection::send_time_message() {
-    if (!this->is_connected()) {
-        return false;
-    }
+namespace {
 
-    char buf[TIME_MESSAGE_BUF_SIZE];
-    const int64_t now = platform_time_us();
-    const size_t len = format_client_time_message(buf, sizeof(buf), now);
-    if (len == 0) {
-        return false;
-    }
-    {
-        std::lock_guard<std::mutex> lock(this->time_frame_mutex_);
-        this->time_frame_ = TimeFrameStamp{.embedded = now, .sent = now};
-    }
-
-    // Capturing only this and a 32-bit tag keeps the closure within std::function's inline
-    // storage, so the send allocates nothing for it.
-    NoiseTransport::FrameWriteHook before_write = [this, tag = static_cast<uint32_t>(now)]() {
-        this->note_time_frame_sent(tag);
-    };
-    return this->noise_transport_.send_json(buf, len, std::move(before_write)) == SsErr::OK;
+/// The tag a client/time frame is known by (see time_frame_tag_).
+uint32_t time_frame_tag(int64_t client_transmitted) {
+    return static_cast<uint32_t>(client_transmitted);
 }
 
-void SendspinConnection::note_time_frame_sent(uint32_t tag) {
-    const int64_t now = platform_time_us();
-    std::lock_guard<std::mutex> lock(this->time_frame_mutex_);
-    if (static_cast<uint32_t>(this->time_frame_.embedded) == tag) {
-        this->time_frame_.sent = now;
+}  // namespace
+
+int64_t SendspinConnection::send_time_message() {
+    if (!this->is_connected()) {
+        return 0;
     }
+
+    int64_t now = platform_time_us();
+    // Tag 0 is reserved for "no frame in flight" (see time_frame_tag_).
+    if (time_frame_tag(now) == 0) {
+        ++now;
+    }
+    char buf[TIME_MESSAGE_BUF_SIZE];
+    const size_t len = format_client_time_message(buf, sizeof(buf), now);
+    if (len == 0) {
+        return 0;
+    }
+    // Release: a claim that observes this seed also observes the previous frame's retirement.
+    this->time_frame_sent_us_.store(time_frame_tag(now), std::memory_order_release);
+    this->time_frame_tag_.store(time_frame_tag(now), std::memory_order_release);
+
+    // No tag check: a connection's time frames reach the socket in send order, so a hook left
+    // over from an earlier frame stores a time no later than the current frame's write. Capturing
+    // only this keeps the closure in std::function's inline storage.
+    NoiseTransport::FrameWriteHook before_write = [this]() {
+        this->time_frame_sent_us_.store(time_frame_tag(platform_time_us()),
+                                        std::memory_order_release);
+    };
+    if (this->noise_transport_.send_json(buf, len, std::move(before_write)) != SsErr::OK) {
+        return 0;
+    }
+    return now;
+}
+
+std::optional<int64_t> SendspinConnection::claim_time_frame(int64_t client_transmitted) {
+    // Read before the exchange: a later frame's write time is published after this frame was
+    // retired, so observing it makes the exchange fail.
+    const uint32_t sent = this->time_frame_sent_us_.load(std::memory_order_acquire);
+    uint32_t tag = time_frame_tag(client_transmitted);
+    if (tag == 0 ||
+        !this->time_frame_tag_.compare_exchange_strong(tag, 0, std::memory_order_acq_rel)) {
+        return std::nullopt;
+    }
+    // Wrapping subtraction, read as signed: a leftover hook that sampled the clock before the seed
+    // reads as negative, and the frame then counts as written at the time it carries.
+    const auto delay = static_cast<int32_t>(sent - tag);
+    return client_transmitted + std::max<int32_t>(delay, 0);
 }
 
 // ============================================================================

@@ -25,6 +25,18 @@ namespace sendspin {
 
 class SendspinConnection;
 
+/// @brief One server/time reply, measured on the network thread and handed to the main loop
+struct TimeResponse {
+    int64_t offset{0};     ///< Server clock minus client clock (microseconds).
+    int64_t max_error{0};  ///< Half the round-trip delay (microseconds).
+    int64_t timestamp{0};  ///< When the reply arrived, on the client clock (microseconds).
+    /// get_instance_id() of the connection the reply arrived on; an id, not a pointer, so a freed
+    /// connection cannot ABA-match.
+    uint64_t source_id{0};
+    /// The client_transmitted the reply echoed, identifying the client/time it answers.
+    int64_t client_transmitted{0};
+};
+
 /// @brief Result of a single SendspinTimeBurst::loop() call
 struct TimeBurstResult {
     bool sent;             ///< A time message was sent this call.
@@ -56,7 +68,7 @@ struct TimeBurstResult {
  * }
  *
  * // When a SERVER_TIME response arrives:
- * burst.on_time_response(conn, offset, max_error, timestamp, embedded);
+ * burst.on_time_response(conn, response);
  * @endcode
  */
 class SendspinTimeBurst {
@@ -73,13 +85,9 @@ public:
     /// @brief Called when a SERVER_TIME response arrives; ignored unless it answers the time
     /// message still pending
     /// @param conn The connection that received the response.
-    /// @param offset Computed time offset from the NTP-style exchange.
-    /// @param max_error Half the round-trip delay (RTT proxy).
-    /// @param timestamp Client timestamp when measurement was taken.
-    /// @param embedded client_transmitted the response echoed (see TimeFrameStamp).
+    /// @param response The measurement and the echo identifying the message it answers.
     /// @return true if this completed the burst (Kalman filter was updated).
-    bool on_time_response(SendspinConnection* conn, int64_t offset, int64_t max_error,
-                          int64_t timestamp, int64_t embedded);
+    bool on_time_response(SendspinConnection* conn, const TimeResponse& response);
 
     // ========================================
     // Lifecycle
@@ -107,6 +115,9 @@ protected:
     int64_t last_burst_complete_time_{0};
     int64_t burst_interval_ms_{DEFAULT_BURST_INTERVAL_MS};
     int64_t response_timeout_ms_{DEFAULT_RESPONSE_TIMEOUT_MS};
+    // client_transmitted of the time message awaiting a reply, 0 when none is (see
+    // on_time_response())
+    int64_t pending_embedded_{0};
 
     // 8-bit fields
     uint8_t burst_size_{8};

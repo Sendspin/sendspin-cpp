@@ -166,7 +166,6 @@ private:
     /// @brief Encrypt one frame and emit it via the frame sink. Caller must hold session_mutex_,
     /// which excludes a concurrent re-handshake session swap from racing the encrypt.
     /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + 16 (AEAD tag).
-    /// @param before_write  Passed to the frame sink with this frame.
     SsErr encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity, size_t plaintext_len,
                                         FrameWriteHook before_write);
 

@@ -185,12 +185,19 @@ TEST(Protocol, ServerTimeOffsetAndError) {
                       R"("server_received":5000000001500,"server_transmitted":5000000001600}})",
                       doc, root));
 
+    ServerTimeMessage time_msg;
+    ASSERT_TRUE(process_server_time_message(root, &time_msg));
+    EXPECT_EQ(time_msg.client_transmitted, 5000000001000);
+    EXPECT_EQ(time_msg.server_received, 5000000001500);
+    EXPECT_EQ(time_msg.server_transmitted, 5000000001600);
+
     int64_t offset = 0;
     int64_t max_error = 0;
+    // The frame reached the socket 200 us after the time it carries; T1 is the socket time, not
+    // the echo.
+    const int64_t client_sent = 5000000001200;
     const int64_t client_received = 5000000002000;
-    // The frame reached the socket 200 us after the time it carries; T1 is the socket time.
-    const TimeFrameStamp stamp{.embedded = 5000000001000, .sent = 5000000001200};
-    ASSERT_TRUE(process_server_time_message(root, client_received, stamp, &offset, &max_error));
+    compute_time_exchange(time_msg, client_sent, client_received, &offset, &max_error);
 
     // offset = ((T2-T1) + (T3-T4)) / 2 = ((1500-1200) + (1600-2000)) / 2 = -50
     EXPECT_EQ(offset, -50);
@@ -200,10 +207,9 @@ TEST(Protocol, ServerTimeOffsetAndError) {
 
 // messaging.md "server/time": client_transmitted, server_received and server_transmitted are
 // required integers. A missing or non-integer one rejects the message; each row puts its bad value
-// in a different field so every field's check is exercised. A reply echoing a client_transmitted
-// other than the frame in flight is rejected too. The 64-bit width is pinned by
+// in a different field so every field's check is exercised. The 64-bit width is pinned by
 // ServerTimeOffsetAndError.
-TEST(Protocol, ServerTimeAcceptance) {
+TEST(Protocol, ServerTimeTimestampsMustBeIntegers) {
     struct Row {
         const char* name;
         const char* payload;
@@ -220,8 +226,6 @@ TEST(Protocol, ServerTimeAcceptance) {
          false},
         {"missing server_transmitted", R"({"client_transmitted":1000,"server_received":1500})",
          false},
-        {"echo of a frame no longer in flight",
-         R"({"client_transmitted":999,"server_received":1500,"server_transmitted":1600})", false},
     };
 
     for (const Row& row : rows) {
@@ -230,8 +234,7 @@ TEST(Protocol, ServerTimeAcceptance) {
         JsonObject root;
         ASSERT_TRUE(parse(std::string(R"({"type":"server/time","payload":)") + row.payload + "}",
                           doc, root));
-        const TimeFrameStamp stamp{.embedded = 1000, .sent = 1000};
-        EXPECT_EQ(process_server_time_message(root, 2000, stamp, nullptr, nullptr), row.accepted);
+        EXPECT_EQ(process_server_time_message(root, nullptr), row.accepted);
     }
 }
 

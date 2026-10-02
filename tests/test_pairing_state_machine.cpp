@@ -1310,12 +1310,12 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     // a player keeps its timeline across an attempt and can only do that with a converging filter.
     //
     // Without a Noise session the send itself fails, but send_time_message() records the frame in
-    // flight before sending, so a nonzero stamp shows the burst reached the send.
-    ASSERT_EQ(conn->get_time_frame_stamp().embedded, 0);
+    // flight before sending, so a nonzero tag shows the burst reached the send.
+    ASSERT_EQ(conn->time_frame_tag_.load(), 0U);
     for (int i = 0; i < 5; ++i) {
         this->client_->loop();
     }
-    EXPECT_NE(conn->get_time_frame_stamp().embedded, 0)
+    EXPECT_NE(conn->time_frame_tag_.load(), 0U)
         << "client/time must keep flowing while activities declare pairing";
 
     // Any change publishes.
@@ -1327,9 +1327,9 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
     this->client_->loop();
     ASSERT_FALSE(conn->has_activity(SendspinActivity::PAIRING));
-    conn->time_frame_ = TimeFrameStamp{};
+    conn->time_frame_tag_.store(0);
     this->client_->loop();
-    EXPECT_NE(conn->get_time_frame_stamp().embedded, 0)
+    EXPECT_NE(conn->time_frame_tag_.load(), 0U)
         << "client/time must keep flowing when the connection leaves pairing too";
 }
 
