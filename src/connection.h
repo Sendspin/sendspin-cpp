@@ -114,11 +114,14 @@ public:
 
     /// @brief Prevents any further message callbacks from firing on the network thread
     ///
-    /// Called on the main thread before connection cleanup so that no stale events from a closing
-    /// connection can reach role queues after they have been reset. Thread-safe: the flag is
-    /// checked atomically in dispatch_completed_message() which runs on the network thread.
+    /// Called before connection cleanup (on either thread) so that no stale events from a closing
+    /// connection can reach role queues after they have been reset; the flag is checked atomically
+    /// in dispatch_completed_message() on the network thread. Also retires the client/time frame
+    /// in flight, so a server/time already past that check cannot claim it and overwrite the next
+    /// connection's measurement.
     void disable_message_dispatch() {
         this->message_dispatch_enabled_.store(false, std::memory_order_release);
+        this->cancel_time_frame();
     }
 
     /// @brief Checks if the hello handshake has completed successfully
@@ -363,8 +366,7 @@ public:
     ///         than the write, or nullopt if no frame in flight carries that value.
     std::optional<int64_t> claim_time_frame(int64_t client_transmitted);
 
-    /// @brief Retires the client/time frame in flight, so a late reply to it no longer matches.
-    /// Main loop only.
+    /// @brief Retires the client/time frame in flight, so a late reply to it no longer matches
     void cancel_time_frame() {
         this->time_frame_tag_.store(0, std::memory_order_release);
     }

@@ -1895,8 +1895,8 @@ static int64_t sent_client_transmitted(NoiseCipherState* recv_cs, const std::vec
 
 // A server/time reply is matched by its echo to the one client/time in flight, and only once. A
 // connection that never sent client/time (any nursery peer) has nothing in flight, including for
-// an echo whose low 32 bits are 0, the tag that means "none". A frame the burst gave up on matches
-// nothing either.
+// an echo whose low 32 bits are 0, the tag that means "none". Neither does a frame the burst gave
+// up on, nor one on a connection that has stopped dispatching (it is being dropped).
 TEST(NoiseTransport, OnlyTheTimeFrameInFlightIsClaimedAndOnlyOnce) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
@@ -1923,6 +1923,12 @@ TEST(NoiseTransport, OnlyTheTimeFrameInFlightIsClaimedAndOnlyOnce) {
     const int64_t cancelled = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[1]);
     conn.cancel_time_frame();
     EXPECT_FALSE(conn.claim_time_frame(cancelled).has_value());
+
+    ASSERT_NE(conn.send_time_message(), 0);
+    ASSERT_EQ(conn.sent_binary_.size(), 3U);
+    const int64_t dropped = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[2]);
+    conn.disable_message_dispatch();
+    EXPECT_FALSE(conn.claim_time_frame(dropped).has_value());
 }
 
 // The claim reports when the write hook ran, and never a time before the one the frame carries,
