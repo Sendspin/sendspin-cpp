@@ -687,7 +687,7 @@ struct MyClientListener : SendspinClientListener {
 
 ## Step 5: Wire Everything Together
 
-Listeners and providers are set as raw pointers. They must stay alive for as long as the client can call them: until `stop()` returns, or until the client is destroyed if `stop()` is never called. The destructor itself never invokes a listener (see [Stopping and Restarting](#stopping-and-restarting)).
+Listeners and providers are set as raw pointers. They must stay alive for as long as the client can call them: until `stop()` returns, or until the client is destroyed if `stop()` is never called. The destructor's only listener call is `on_release_high_performance()` for a hold still outstanding (see [Stopping and Restarting](#stopping-and-restarting)).
 
 ```cpp
 MyPlayerListener player_listener;
