@@ -1042,10 +1042,6 @@ protected:
     /// the main loop (provisional-connection timeout check). 0 = not yet set.
     std::atomic<int64_t> provisional_time_us_{0};
 
-    /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP
-    /// server worker thread updates it while the hub thread reads it for logging.
-    std::atomic<int64_t> serialize_ema_us_{0};
-
     /// Process-unique connection identity (see get_instance_id()). Assigned once at construction.
     const uint64_t instance_id{next_instance_id()};
 
