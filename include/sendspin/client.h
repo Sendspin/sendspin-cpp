@@ -180,7 +180,7 @@ public:
 /// `SendspinClientConfig::pairing_psk` is unset.
 ///
 /// Re-entrancy: implementations must not call back into the library from inside
-/// load_blob/save_blob/erase_blob. Every call is made from the middle of a library step that is
+/// load_blob/save_blob/commit. Every call is made from the middle of a library step that is
 /// part-way through updating the state the call is about. No internal lock is held across the
 /// call.
 ///
@@ -198,9 +198,8 @@ public:
     }
 
     /// @brief Persist bytes under key. Returning true means the write was accepted: stored, or
-    /// queued by a provider that surfaces its own failures. Every blob the library writes has the
-    /// fixed size its key's `persistence_keys` comment gives, so a provider may store each key as
-    /// a fixed-size value.
+    /// queued until the next commit(). Every blob the library writes has the fixed size its key's
+    /// `persistence_keys` comment gives, so a provider may store each key as a fixed-size value.
     ///
     /// A rejected write is reported, not retried: the in-memory state stays authoritative for
     /// this boot and the library logs what will be lost at the next reboot. What a rejection
@@ -209,22 +208,20 @@ public:
     /// debug. The case that matters is a rejected write of the zeroed
     /// blob that clears a revoked record's slot: the store still holds the old record and hands
     /// it back at the next boot, silently making the revoked PSK valid again (the record is dropped
-    /// from RAM either way). A provider that queues writes should return true and surface its own
-    /// failures.
+    /// from RAM either way).
     /// @return true on success, false on failure.
     virtual bool save_blob(const std::string& /*key*/, const uint8_t* /*data*/, size_t /*len*/) {
         return false;
     }
 
-    /// @brief Remove key. Absent counts as success. A false return means the value may
-    /// survive a reboot.
-    ///
-    /// The library never calls it: every blob it owns is rewritten in place or left alone. It is
-    /// here for an application that wipes the library keyspace itself, for example on a factory
-    /// reset.
-    /// @return true if the key is gone from the store, false if it may still be there.
-    virtual bool erase_blob(const std::string& /*key*/) {
-        return false;
+    /// @brief Make every write accepted so far durable. A provider that writes through in
+    /// save_blob() keeps the default. Called once after a batch of accepted writes that holds
+    /// pairing material (`KEYPAIR`, `PAIRING_PSK`, or a record slot) and never for the other
+    /// keys alone, so a queueing provider may batch those on its own schedule. A false return
+    /// is logged like a rejected save_blob(), not retried.
+    /// @return true when the accepted writes are durable.
+    virtual bool commit() {
+        return true;
     }
 };
 
@@ -324,7 +321,7 @@ public:
     /// threads, resets every role, and delivers the roles' clear callbacks (on_stream_end(),
     /// on_image_clear(), on_metadata_clear(), ...) before returning. A pairing prompt still
     /// showing is dismissed the same way (on_clear_pairing_code() / on_close_pairing_window()),
-    /// and a pairing record staged by a pair-finalize is persisted first. No-op when stopped.
+    /// and every provider write still owed is performed before returning. No-op when stopped.
     /// Calling start() afterwards restarts on the same identity and record store, unless the
     /// persistence provider changed in between. Start/stop cycles may be repeated indefinitely.
     ///
@@ -690,11 +687,17 @@ private:
     /// @brief Cleans up playback state when the active streaming connection is removed
     void cleanup_connection_state();
 
-    /// @brief Persists a pairing record the network thread staged, if one is pending.
+    /// @brief Wakes the main loop to run flush_pending_persistence(). Callable from any thread
+    /// and under any library lock: it takes only the Inbox mutex.
+    void request_persist();
+
+    /// @brief Performs the provider writes owed since the last call: the record store's dirty
+    /// keys and a changed last-played server. Main loop only, with no library lock held: on ESP
+    /// each write is a flash write.
     ///
     /// The store may be null here: the destructor calls this on a client whose start() never
     /// succeeded.
-    void flush_pending_records();
+    void flush_pending_persistence();
 
     /// @brief Drains the inbox: lifecycle events, role slots, and group updates, dispatching
     /// listener callbacks on the calling (main-loop) thread. Shared by loop() and stop().
@@ -799,20 +802,13 @@ private:
     /// @brief Loads the last played server_id from persistence
     void load_last_played_server();
 
-    /// @brief Persists the server_id as the last played server, RAM half and write together.
-    /// For a caller that holds no manager lock (the group-update drain); the connection manager
-    /// uses note_last_played_server() / write_last_played_server() separately.
-    void persist_last_played_server(const std::string& server_id);
+    /// @brief Makes server_id the last-played server in RAM; the provider write waits for
+    /// flush_pending_persistence(). Main loop only, and may run under
+    /// ConnectionManager::conn_ptr_mutex_, where arbitration reads the value later in the same
+    /// locked block. An empty or unchanged server_id is a no-op: one flash write per handoff.
+    void note_last_played_server(const std::string& server_id);
 
-    /// @brief Applies the handoff preference in RAM, the half a caller holding
-    /// ConnectionManager::conn_ptr_mutex_ may run: arbitration reads last_played_server_id_
-    /// later in that same locked block, so the RAM update must not be deferred with the write.
-    /// @return true when the value actually changed, so the caller owes a
-    ///         write_last_played_server() once its locks are dropped.
-    bool note_last_played_server(const std::string& server_id);
-
-    /// @brief Writes the last-played server_id through the persistence provider. No library lock
-    /// may be held: on ESP this is a flash write.
+    /// @brief Writes the last-played server_id through the persistence provider.
     void write_last_played_server(const std::string& server_id);
 
     // ========================================
@@ -876,6 +872,8 @@ private:
 
     // String fields
     std::string client_id_;  ///< Derived from the static keypair: base64url(public_key).
+    /// The last-played server_id the provider has not been handed. Main loop only.
+    std::optional<std::string> pending_last_played_;
 
     // Pointer fields
 #ifdef SENDSPIN_ENABLE_ARTWORK

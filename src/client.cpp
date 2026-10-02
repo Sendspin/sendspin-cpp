@@ -158,15 +158,11 @@ struct SendspinClient::EventState {
     /// Latest claimed server/time measurement. Latest-wins loses nothing: only the reply to the
     /// one client/time in flight can be claimed.
     InboxSlot<TimeResponse> time_slot{inbox, INBOX_TOPIC_TIME};
-    /// Pure wakeup (the bool payload carries no information): set by the network-thread
-    /// server/pair-finalize handler after RecordStore::store_record_superseding() mutates the
-    /// store RAM-only (and by start(), for a store that came up owing a write), drained by loop()
-    /// into RecordStore::persist_records(). Exists because the
-    /// persistence provider is main-loop-only, so the durable write cannot happen where the RAM
-    /// commit must (see that handler). Deliberately its own slot rather than a deferred
-    /// connection event: cleanup_connection_state() wipes those, and a staged write must not be
-    /// lost just because the connection died before the next tick.
-    InboxSlot<bool> records_dirty_slot{inbox, INBOX_TOPIC_RECORDS};
+    /// Pure wakeup (the bool payload carries no information): set through request_persist()
+    /// wherever persisted state changes in RAM, drained into flush_pending_persistence(). Its
+    /// own slot rather than a deferred connection event: cleanup_connection_state() wipes those,
+    /// and an owed write must survive the connection dying before the next tick.
+    InboxSlot<bool> persist_slot{inbox, INBOX_TOPIC_PERSIST};
     /// Bumped by cleanup_connection_state() so an in-progress ring drain abandons the rest of
     /// its already-copied batch. Main-thread only: the ring drain copies events out before
     /// dispatching, so a listener callback that re-enters connection teardown (e.g. connect_to()
@@ -249,10 +245,9 @@ SendspinClient::~SendspinClient() {
     this->color_.reset();
 #endif
     this->connection_manager_.reset();
-    // The network thread is gone with the connection manager, so no new pairing-record write can
-    // be staged; flush one still sitting in the slot (a pair-finalize that landed after the last
-    // loop() tick) before the store goes away, so an orderly shutdown does not lose the pairing.
-    this->flush_pending_records();
+    // No new write can be requested once the connection manager is gone; perform one still owed
+    // (a pair-finalize that landed after the last loop() tick) before the store goes away.
+    this->flush_pending_persistence();
     // Destroyed after the connection manager: every connection holds raw pointers into
     // identity_/record_store_ (see SendspinConnection::init_noise_handshake), so both must
     // outlive every connection the manager could still be tearing down.
@@ -330,7 +325,7 @@ bool SendspinClient::start() {
     // tick, through the same deferred path a pairing uses: the provider is main-loop-only and the
     // store never calls it itself outside that flush.
     if (this->record_store_->has_pending_writes()) {
-        this->event_state_->records_dirty_slot.write(true);
+        this->request_persist();
     }
 
     // Load persisted state
@@ -341,7 +336,7 @@ bool SendspinClient::start() {
     bool roles_started = true;
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (roles_started && this->player_) {
-        roles_started = this->player_->impl_->start();
+        roles_started = this->player_->impl_->start(this->persistence_provider_);
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
@@ -522,10 +517,27 @@ void SendspinClient::loop() {
     this->drain_inbox();
 }
 
-void SendspinClient::flush_pending_records() {
-    bool dirty = false;
-    if (this->event_state_->records_dirty_slot.take(dirty) && this->record_store_ != nullptr) {
+void SendspinClient::request_persist() {
+    this->event_state_->persist_slot.write(true);
+}
+
+void SendspinClient::flush_pending_persistence() {
+    // Lock-free when nothing is owed: ConnectionManager::loop() calls this every tick.
+    if ((this->event_state_->inbox.poll() & INBOX_TOPIC_PERSIST) == 0) {
+        return;
+    }
+    bool owed = false;
+    if (!this->event_state_->persist_slot.take(owed)) {
+        return;
+    }
+    // persist_records() logs the durability warning itself on a rejected write, so the return
+    // value is ignored.
+    if (this->record_store_ != nullptr) {
         this->record_store_->persist_records();
+    }
+    if (this->pending_last_played_.has_value()) {
+        this->write_last_played_server(this->pending_last_played_.value());
+        this->pending_last_played_.reset();
     }
 }
 
@@ -536,20 +548,18 @@ void SendspinClient::drain_inbox() {
 
     // Process deferred events: all state mutations and user callbacks happen here, on the main
     // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
-    // inbox_bits (here) gates the records persist, the time measurement and the event-ring drain
+    // inbox_bits (here) gates the provider writes, the time measurement and the event-ring drain
     // immediately following it; slot_bits (taken after that drain completes, below) gates the
     // role drains and the group-update drain, since a role's InboxSlot can be written by a
     // producer between this snapshot and that one.
     const uint32_t inbox_bits = this->event_state_->inbox.poll();
 
-    // --- Deferred pairing-record persist ---
-    // Staged by the network-thread server/pair-finalize handler (see records_dirty_slot): the
-    // persistence provider is main-loop-only, so the durable write happens here. Runs before the
-    // pairing-note dispatch below, so the write has been attempted by the time
-    // on_pairing_succeeded fires. persist_records() logs the durability warning itself on a
-    // rejected write, so the return value is ignored.
-    if (inbox_bits & INBOX_TOPIC_RECORDS) {
-        this->flush_pending_records();
+    // --- Deferred provider writes ---
+    // A request made since ConnectionManager::loop()'s flush (a pairing the network thread
+    // committed) or owed at the stop() drain. Ahead of the pairing-note dispatch below, so
+    // on_pairing_succeeded finds the record committed.
+    if (inbox_bits & INBOX_TOPIC_PERSIST) {
+        this->flush_pending_persistence();
     }
 
     // --- Time sync measurement ---
@@ -801,18 +811,6 @@ void SendspinClient::drain_inbox() {
                 this->listener_->on_group_update(group_delta);
             }
 
-            // Persist last played server when playback starts
-            if (group_delta.playback_state.has_value() &&
-                group_delta.playback_state.value() == SendspinPlaybackState::PLAYING) {
-                const auto* current = this->connection_manager_->current();
-                if (current != nullptr) {
-                    const std::string& server_id = current->get_server_id();
-                    if (!server_id.empty()) {
-                        this->persist_last_played_server(server_id);
-                    }
-                }
-            }
-
             SS_LOGD(TAG, "Group update - state: %s, id: %s, name: %s",
                     this->group_state_.playback_state.has_value()
                         ? to_cstr(this->group_state_.playback_state.value())
@@ -832,8 +830,9 @@ PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
     if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_player() called while started; role may not initialize correctly");
     }
-    this->player_ =
-        std::make_unique<PlayerRole>(std::move(config), this, this->persistence_provider_);
+    this->player_ = std::make_unique<PlayerRole>(std::move(config), this);
+    // start() refreshes it; set here so a delay the consumer sets before start() is saved.
+    this->player_->impl_->persistence = this->persistence_provider_;
     this->player_->impl_->attach_inbox(this->event_state_->inbox);
     this->player_->impl_->attach_connection_manager(*this->connection_manager_);
     this->player_->impl_->discard_audio.store(!this->available_, std::memory_order_relaxed);
@@ -1659,8 +1658,8 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             // resolves that PSK against the RecordStore. The record must therefore be resolvable
             // before this handler returns, else the re-handshake sees an unknown psk_id and
             // aborts. RecordStore is thread-safe (its mutators lock). Only the RAM commit is
-            // synchronous: the provider write is deferred to the main loop via the records-dirty
-            // slot below, because the persistence provider is main-loop-only.
+            // synchronous: the provider write is deferred to the main loop via request_persist()
+            // below, because the persistence provider is main-loop-only.
             // The payload is spec'd as empty; the message-type dispatch above is the only
             // validation this message needs.
             if (conn != nullptr) {
@@ -1691,11 +1690,9 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     SS_LOGI(TAG, "server/pair-finalize: no pending pairing record to store");
                 }
                 if (stored_record) {
-                    // Stage the durable write for the main loop, before schedule_pairing_succeeded
-                    // so the tick that fires on_pairing_succeeded has already observed the dirty
-                    // bit in its inbox poll (loop() takes that snapshot after ConnectionManager's
-                    // event drain collects the note).
-                    this->event_state_->records_dirty_slot.write(true);
+                    // Before schedule_pairing_succeeded, so the tick that fires
+                    // on_pairing_succeeded flushes the write first.
+                    this->request_persist();
                     // Defer on_pairing_succeeded to the main loop via the same pending_*_events_ /
                     // has_pending_events_ idiom every other cross-thread connection-state mutation
                     // in ConnectionManager uses. Not fired for the capacity-rejection case.
@@ -1987,7 +1984,8 @@ bool SendspinClient::load_or_generate_identity() {
     if (this->persistence_provider_ != nullptr) {
         if (this->persistence_provider_->save_blob(persistence_keys::KEYPAIR,
                                                    this->identity_->private_bytes.data(),
-                                                   this->identity_->private_bytes.size())) {
+                                                   this->identity_->private_bytes.size()) &&
+            this->persistence_provider_->commit()) {
             SS_LOGI(TAG, "Generated and persisted static keypair; client_id=%s",
                     this->client_id_.c_str());
         } else {
@@ -2014,26 +2012,14 @@ void SendspinClient::load_last_played_server() {
     }
 }
 
-void SendspinClient::persist_last_played_server(const std::string& server_id) {
-    if (this->note_last_played_server(server_id)) {
-        this->write_last_played_server(server_id);
+void SendspinClient::note_last_played_server(const std::string& server_id) {
+    if (server_id.empty() || server_id == this->connection_manager_->last_played_server_id()) {
+        return;
     }
-}
-
-bool SendspinClient::note_last_played_server(const std::string& server_id) {
-    if (server_id.empty()) {
-        return false;
-    }
-
-    // Skip the setter and the write when the server_id is unchanged (including the boot-time
-    // value seeded by load_last_played_server()), bounding flash writes to one per actual
-    // handoff instead of one per PLAYING transition.
-    if (server_id == this->connection_manager_->last_played_server_id()) {
-        return false;
-    }
-
+    SS_LOGD(TAG, "Last played server is now %s", server_id.c_str());
     this->connection_manager_->set_last_played_server_id(server_id);
-    return true;
+    this->pending_last_played_ = server_id;
+    this->request_persist();
 }
 
 void SendspinClient::write_last_played_server(const std::string& server_id) {

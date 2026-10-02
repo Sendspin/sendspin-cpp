@@ -285,7 +285,7 @@ std::unique_ptr<PlayerRole::Impl> make_impl() {
     PlayerRoleConfig config;
     config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
     clients.emplace_back(SendspinClientConfig{});
-    auto impl = std::make_unique<PlayerRole::Impl>(std::move(config), &clients.back(), nullptr);
+    auto impl = std::make_unique<PlayerRole::Impl>(std::move(config), &clients.back());
     inboxes.emplace_back();
     impl->attach_inbox(inboxes.back());
     EXPECT_TRUE(impl->sync_task->init(impl.get(), impl->config.audio_buffer_capacity));
@@ -591,6 +591,27 @@ TEST(PlayerRoleOutputDelay, SettingTheValueItAlreadyHasCostsNoWrite) {
     // Control: a different value is written.
     fixture.player->update_output_delay(1235);
     EXPECT_EQ(provider.save_attempts(persistence_keys::OUTPUT_DELAY), writes + 1);
+}
+
+// The player takes the provider the client holds when it starts, so the order of add_player() and
+// set_persistence_provider() does not decide whether the stored delay is used.
+TEST(PlayerRoleOutputDelay, AProviderSetAfterAddPlayerIsUsed) {
+    InMemoryPersistenceProvider provider;
+    provider.seed_blob(persistence_keys::OUTPUT_DELAY, delay_blob(120));
+
+    SendspinClient client(make_client_config("player-late-provider"));
+    PlayerRoleConfig config;
+    config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
+    PlayerRole& player = client.add_player(std::move(config));
+    client.set_persistence_provider(&provider);
+    ASSERT_TRUE(client.start());
+    player.set_output_delay_adjustable(true);
+
+    EXPECT_EQ(player.get_output_delay_ms(), 120) << "the stored delay was not loaded";
+    player.update_output_delay(130);
+    EXPECT_EQ(persisted_delay(provider), 130) << "the new delay was not written";
+
+    client.stop();
 }
 
 // A stored blob of the right size that names a delay above the spec maximum is discarded rather

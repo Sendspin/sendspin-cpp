@@ -468,15 +468,15 @@ pairing. On host platforms `examples/common/file_persistence_provider.h` provide
 `FilePersistenceProvider`, which persists to a single JSON file (one document mapping each
 key below to `base64url(bytes)`) -- use it directly or as a reference implementation.
 
-The interface is a plain byte-blob store -- three methods, independent of what is being
-stored:
+The interface is a plain byte-blob store: a load, a save, and a commit, independent of what is
+being stored:
 
 ```cpp
 class SendspinPersistenceProvider {
 public:
     virtual std::optional<std::vector<uint8_t>> load_blob(const std::string& key);
     virtual bool save_blob(const std::string& key, const uint8_t* data, size_t len);
-    virtual bool erase_blob(const std::string& key);
+    virtual bool commit();
 };
 ```
 
@@ -485,8 +485,8 @@ below; a provider never needs to parse or interpret the bytes, only store and re
 byte-for-byte.
 
 Every method is invoked on the main loop thread, for every key, so a provider needs no locking
-of its own. (The one library write that originates on the network thread -- the pairing record
-committed when a pairing finalizes -- is staged internally and flushed to that record's slot key
+of its own. (The one library write that originates on the network thread, the pairing record
+committed when a pairing finalizes, is staged internally and flushed to that record's slot key
 from the next `loop()` tick.)
 No internal library lock is held across the call, so a slow write does not stall the audio path
 or a Noise handshake -- but it does stop the main loop for its duration, so the call must be one
@@ -531,8 +531,9 @@ recency writes only the order.
 
 #### Durability contract
 
-- `save_blob()` returning `true` means DURABLY stored, including for the zeroed write that frees
-  a record slot. A `false` return is reported, not retried: the in-memory state
+- `save_blob()` returning `true` means the write was accepted: stored, or queued until the next
+  `commit()`. That includes the zeroed write that frees a record slot. A `false` return is
+  reported, not retried: the in-memory state
   stays authoritative for the current boot. What the rejection costs decides the level: a write
   that changes which records the next boot holds logs a warning naming the key and what will be lost (or come back) at the next reboot, while a
   write the next boot rebuilds by itself (the recency order in `RECORD_ORDER`) reports at debug.
@@ -545,11 +546,16 @@ recency writes only the order.
   old one's slot, so a rejected write there leaves the OLD record in storage: after a reboot the
   client is paired to the server it evicted, or holds the pre-supersede PSK for a server that has
   already discarded it, which then falls back to unpaired (Sentinel) access.
-- `erase_blob()` is for the application's own use; the library never calls it. Every blob the
-  library owns is rewritten in place or left alone (a removal zeroes its slot rather than
-  erasing the key). The hook is here so an application that wipes the library keyspace itself,
-  for example on a factory reset, has a working delete over the same store. Absent counts as
-  success.
+- `commit()` makes every accepted write durable. The library calls it once after a batch of
+  accepted writes that holds pairing material (`KEYPAIR`, `PAIRING_PSK`, or a record slot) and,
+  for a pairing, does so before `on_pairing_succeeded` fires. Writes to `RECORD_ORDER`,
+  `LAST_PLAYED` and `OUTPUT_DELAY` never trigger it, so a provider that queues its writes may
+  batch those on its own schedule. A provider that writes through in `save_blob()` keeps the
+  default, which returns `true`. A `false` return is logged like a rejected write and not
+  retried.
+- The library never erases a key: every blob it owns is rewritten in place or left alone (a
+  removal zeroes its slot). An application that wipes the keyspace, for example on a factory
+  reset, does so against its own store.
 
 #### Record capacity
 
@@ -586,9 +592,6 @@ struct MyPersistenceProvider : SendspinPersistenceProvider {
     }
     bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
         return nvs_write_bytes(key.c_str(), data, len);
-    }
-    bool erase_blob(const std::string& key) override {
-        return nvs_erase(key.c_str());  // Return true if the key is already absent, too.
     }
 };
 ```
@@ -744,7 +747,7 @@ Restarting is `start()` again; start, stop, and start again can be repeated inde
 - An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`).
 - A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
 
-A pairing attempt in flight is cut short the same way: `on_clear_pairing_code()` and `on_close_pairing_window()` fire from inside `stop()` for a prompt that was still showing, and a long-term record a `server/pair-finalize` had staged is persisted before `stop()` returns. The identity and record store survive the stop, so a restarted client keeps its `client_id`, its pairing token, and every record.
+A pairing attempt in flight is cut short the same way: `on_clear_pairing_code()` and `on_close_pairing_window()` fire from inside `stop()` for a prompt that was still showing, and every provider write still owed (a long-term record a `server/pair-finalize` had just committed, for example) is performed before `stop()` returns. The identity and record store survive the stop, so a restarted client keeps its `client_id`, its pairing token, and every record.
 
 Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
 

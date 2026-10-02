@@ -346,13 +346,6 @@ ConnectionManager::~ConnectionManager() {
         this->has_current_.store(false, std::memory_order_release);
         this->refresh_nursery_size_hint();
         this->refresh_deferred_size_hint();
-        // Reached only when the manager is destroyed without a stop(), which flushes: a staged
-        // revocation dropped here comes back at the next boot, so it does not go silently
-        // (docs/conventions.md, "Threading and cross-thread state").
-        if (!this->pending_record_ops_.empty()) {
-            SS_LOGW(TAG, "Dropping %zu staged persistence write(s) on destruction",
-                    this->pending_record_ops_.size());
-        }
     }
     // Locals and the swapped-out events release here, outside both locks. Queued goodbyes are
     // skipped on destruction; shutdown drops slots without a send.
@@ -558,10 +551,6 @@ void ConnectionManager::DrainedEvents::clear() {
 }
 
 PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
-    // Nothing calls loop() again after this, so a write staged late in the last tick is applied
-    // here or never.
-    this->flush_pending_record_ops();
-
     // Close admission and detach every managed connection under the lock. Nothing is sent or
     // released here (see DeferredRelease): the goodbyes below run outside the lock, and a
     // rejection for a peer delivered during the wait can take the lock meanwhile.
@@ -1206,12 +1195,9 @@ void ConnectionManager::loop() {
         this->drain_unpair_events(ev);
     }
 
-    // Perform the provider writes the locked handlers decided on, outside the lock: an NVS commit
-    // under it would stall every other manager entry point, during which no network thread could
-    // enter on_new_connection() and no off-main-loop caller could resolve the current connection
-    // through current_shared(). Ahead of the two flushes below so the blob is settled on flash
-    // before a session is told to leave or an admission replays.
-    this->flush_pending_record_ops();
+    // The provider writes the locked handlers left owed, ahead of the two flushes below so a
+    // revocation is on flash before its session is told to leave.
+    this->client_->flush_pending_persistence();
 
     // Admit the connection the promotion scan installed, outside the lock: the replay takes
     // SendspinClient's json_processing_mutex_, which is the outer lock of the pair. Ahead of the
@@ -1584,11 +1570,6 @@ void ConnectionManager::refresh_deferred_size_hint() {
     this->deferred_size_.store(this->deferred_releases_.size(), std::memory_order_release);
 }
 
-void ConnectionManager::refresh_record_ops_size_hint() {
-    this->pending_record_ops_size_.store(this->pending_record_ops_.size(),
-                                         std::memory_order_release);
-}
-
 void ConnectionManager::push_nursery_entry(NurseryEntry entry) {
     this->nursery_.push_back(std::move(entry));
     this->refresh_nursery_size_hint();
@@ -1628,47 +1609,6 @@ void ConnectionManager::flush_pending_admission() {
     }
     if (conn != nullptr) {
         this->client_->admit_connection(conn.get());
-    }
-}
-
-void ConnectionManager::stage_record_op(PendingRecordOp::Kind kind, std::string value) {
-    this->pending_record_ops_.push_back({kind, std::move(value)});
-    this->refresh_record_ops_size_hint();
-}
-
-void ConnectionManager::flush_pending_record_ops() {
-    // Lock-free early return on the same terms as flush_deferred_releases(): the hint mirrors
-    // pending_record_ops_.size() and is refreshed only under conn_ptr_mutex_, at every push and
-    // at the swap below, so observing 0 means the vector was empty as of that acquire-load. The
-    // swap takes ownership, so an op cannot be performed twice by loop()'s call and stop()'s.
-    if (this->pending_record_ops_size_.load(std::memory_order_acquire) == 0) {
-        return;
-    }
-    std::vector<PendingRecordOp> ops;
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        ops.swap(this->pending_record_ops_);
-        this->refresh_record_ops_size_hint();
-    }
-    // A key several ops dirtied is written once, carrying its final state, because the store's
-    // dirty set holds it once; calling persist_records() once for all PERSIST_RECORDS ops only
-    // spares repeat passes over that set. The last-played value is a different key and keeps its
-    // own write.
-    bool records_dirty = false;
-    for (const auto& op : ops) {
-        switch (op.kind) {
-            case PendingRecordOp::Kind::PERSIST_RECORDS:
-                records_dirty = true;
-                break;
-            case PendingRecordOp::Kind::LAST_PLAYED:
-                this->client_->write_last_played_server(op.value);
-                break;
-        }
-    }
-    if (records_dirty) {
-        // Whatever else is owed goes out with it: persist_records() decides per key whether a
-        // rejection is worth a warning, so carrying a pairing's slot write here loses nothing.
-        this->client_->record_store_->persist_records();
     }
 }
 
@@ -1891,11 +1831,9 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
         return;
     }
     // The RAM half updates here, because the promotion scan's should_switch_to_new_server()
-    // reads last_played_server_id_ later in this same locked block; only the durable write is
-    // staged.
-    if (this->client_->note_last_played_server(server_id)) {
-        this->stage_record_op(PendingRecordOp::Kind::LAST_PLAYED, server_id);
-    }
+    // reads last_played_server_id_ later in this same locked block; the provider writes for this
+    // and for the recency move below wait for SendspinClient::flush_pending_persistence().
+    this->client_->note_last_played_server(server_id);
     // A network-thread pair-finalize at capacity evicts against the recency order and spares
     // only the records of open connections, so a connection that closes later in this locked
     // block must not leave its record looking least recent until a deferred move lands.
@@ -1906,10 +1844,9 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     if (conn->get_psk_category() == PskCategory::LONG_TERM) {
         const std::string psk_id = conn->get_psk_id();
         if (!psk_id.empty() && this->client_->record_store_->note_record_played(psk_id)) {
-            this->stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
+            this->client_->request_persist();
         }
     }
-    SS_LOGD(TAG, "note_playback_activity: last_played_server_id updated to %s", server_id.c_str());
 }
 
 NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry* it) {
@@ -2784,11 +2721,11 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
     // Drop the matched pairing record (messaging.md "server/unpair"). The RAM erase runs here,
     // under this lock, because a re-handshake on the revoked psk_id resolves against the store on
     // the network thread and must miss it from this instant: deferring it would leave the
-    // credential usable for the length of the writes staged ahead of it. RecordStore::mutex_ is
+    // credential usable until the flush. RecordStore::mutex_ is
     // the innermost lock (docs/conventions.md, "Threading and cross-thread state"), so taking it
-    // here is in order. Only the slot write is staged (see PendingRecordOp).
+    // here is in order. The slot write is left to SendspinClient::flush_pending_persistence().
     if (this->client_->record_store_->note_record_removed(event.matched_psk_id)) {
-        this->stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
+        this->client_->request_persist();
     }
 
     // Any OTHER session running on the same record is no longer trusted either; see

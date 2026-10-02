@@ -182,25 +182,6 @@ struct DeferredRelease {
     bool main_loop_only{false};
 };
 
-/// @brief A persistence-provider write decided under conn_ptr_mutex_ and performed after it has
-/// been dropped
-///
-/// The provider write is an NVS commit on ESP: tens of milliseconds during which nothing else
-/// may enter the manager: no network thread in on_new_connection(), and no off-main-loop caller
-/// resolving the current connection through current_shared(). Locked sections therefore apply
-/// the RAM half and stage only which write is owed: a records flush, or the last-played
-/// server_id; flush_pending_record_ops() performs the writes with no lock held.
-struct PendingRecordOp {
-    enum class Kind : uint8_t {
-        PERSIST_RECORDS,  ///< RecordStore::persist_records(); the RAM half ran under the lock
-                          ///< (see handle_server_unpair() and note_playback_activity())
-        LAST_PLAYED,      ///< SendspinClient::write_last_played_server(server_id); the RAM half
-                          ///< ran under the lock (see note_playback_activity())
-    };
-    Kind kind{Kind::PERSIST_RECORDS};
-    std::string value;  ///< server_id for LAST_PLAYED, unused otherwise
-};
-
 /// @brief Disposition for the connection once abort_pairing_attempt() ends a pairing attempt.
 enum class PairingDropAction : uint8_t {
     KEEP_OPEN,           ///< Leave the connection open.
@@ -342,8 +323,8 @@ public:
     /// ready. Main-loop thread only.
     void start();
 
-    /// @brief Synchronous teardown: applies any staged persistence write, goodbyes every managed
-    /// connection, waits up to GOODBYE_FLUSH_TIMEOUT_MS per goodbye for the sends to complete,
+    /// @brief Synchronous teardown: goodbyes every managed connection, waits up to
+    /// GOODBYE_FLUSH_TIMEOUT_MS per goodbye for the sends to complete,
     /// then stops the WebSocket server and releases every connection regardless
     ///
     /// Closes admission first, so a peer delivered during the wait is rejected with a goodbye.
@@ -363,9 +344,8 @@ public:
     /// events, retries hello, calls loop() on active connections.
     ///
     /// Tick cost: most steps are gated on one of the atomic hints
-    /// (has_pending_events_, nursery_size_, has_current_, deferred_size_,
-    /// pending_record_ops_size_), so they pay only the atomic loads needed to decide there is
-    /// nothing to do. flush_pending_admission(),
+    /// (has_pending_events_, nursery_size_, has_current_, deferred_size_), so they pay only the
+    /// atomic loads needed to decide there is nothing to do. flush_pending_admission(),
     /// scan_pairing_attempt_timeout(), and scan_reprove_watchdog() take conn_ptr_mutex_
     /// unconditionally, so an idle tick costs three acquisitions while disconnected and five
     /// while connected (adding the current/nursery copy ahead of the conn->loop() calls and the
@@ -622,9 +602,6 @@ private:
     /// @brief Refreshes deferred_size_ from deferred_releases_.size().
     void refresh_deferred_size_hint();
 
-    /// @brief Refreshes pending_record_ops_size_ from pending_record_ops_.size().
-    void refresh_record_ops_size_hint();
-
     /// @brief Appends an entry to nursery_ and refreshes the hint. Caller must hold
     /// conn_ptr_mutex_.
     void push_nursery_entry(NurseryEntry entry);
@@ -641,21 +618,6 @@ private:
     /// ("Threading and cross-thread state") places outside conn_ptr_mutex_. Staging and flushing
     /// are both main-loop-only and happen in the same call, so the staged slot cannot go stale.
     void flush_pending_admission();
-
-    /// @brief Appends a persistence-provider write to pending_record_ops_. Caller must hold
-    /// conn_ptr_mutex_ and call flush_pending_record_ops() after dropping it.
-    /// @param kind Which write to perform.
-    /// @param value The server_id it covers for LAST_PLAYED; empty for PERSIST_RECORDS.
-    void stage_record_op(PendingRecordOp::Kind kind, std::string value);
-
-    /// @brief Performs the staged ops: the last-played writes in staging order, and one records
-    /// flush for all PERSIST_RECORDS ops, which writes every key the store owes (record slots
-    /// and the order blob). Caller must not hold conn_ptr_mutex_ (see PendingRecordOp).
-    ///
-    /// Called once per tick and again from stop(). An op staged later in loop() than this call
-    /// waits for the next tick or the stop; a manager destroyed without a stop() logs what it
-    /// drops. Early-returns without locking when pending_record_ops_size_ reads 0.
-    void flush_pending_record_ops();
 
     /// @brief Sets has_pending_events_, the lock-free gate loop() polls before acquiring
     /// conn_mutex_. It is the atomic's only writer outside swap_out_pending_events(), so nothing
@@ -727,7 +689,7 @@ private:
     /// On a long-term record, also moves that record to most recently used in the record store.
     /// Caller must hold conn_ptr_mutex_: both RAM updates run here, so arbitration later in the
     /// same locked block sees the last-played server and a network-thread eviction sees the new
-    /// recency; only the durable writes are staged for flush_pending_record_ops().
+    /// recency; the durable writes are left to SendspinClient::flush_pending_persistence().
     /// @param conn The connection to check (typically the connection an activate just applied to).
     void note_playback_activity(const SendspinConnection* conn);
 
@@ -995,10 +957,6 @@ private:
     mutable std::mutex conn_ptr_mutex_;               // Protects current_connection_, nursery_, and
                                                       // deferred_releases_
     std::vector<DeferredRelease> deferred_releases_;  // Queued releases; see DeferredRelease
-    // Provider writes decided by the locked lifecycle handlers, performed by
-    // flush_pending_record_ops() once conn_ptr_mutex_ is dropped; see PendingRecordOp. Written
-    // and read only under conn_ptr_mutex_, and emptied within the tick that filled it.
-    std::vector<PendingRecordOp> pending_record_ops_;
     // Unproven connections awaiting establishment, each carrying its hello send state
     InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
@@ -1085,9 +1043,6 @@ private:
 
     /// deferred_releases_.size(). Lets flush_deferred_releases() early-return without locking.
     std::atomic<size_t> deferred_size_{0};
-
-    /// pending_record_ops_.size(). Lets flush_pending_record_ops() early-return without locking.
-    std::atomic<size_t> pending_record_ops_size_{0};
 };
 
 }  // namespace sendspin

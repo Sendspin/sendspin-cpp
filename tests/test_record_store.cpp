@@ -21,7 +21,7 @@
 // the full SendspinClient::start() -> client_id() path.
 //
 // The persistence provider is a blob store (SendspinPersistenceProvider::load_blob /
-// save_blob / erase_blob); RecordStore and FilePersistenceProvider are pure byte stores for the
+// save_blob); RecordStore and FilePersistenceProvider are pure byte stores for the
 // record slot / "pairing_psk" keys, so tests that need to inspect or shape what
 // is actually stored go through the codec in sendspin/persistence_codec.h and the slot helpers
 // in record_test_helpers.h, exactly like production code does. Most fakes here share
@@ -83,8 +83,8 @@ static SendspinPairingPsk make_pairing_psk() {
     return p;
 }
 
-/// The production playback sequence: ConnectionManager::flush_pending_record_ops() calls
-/// note_record_played() and flushes only when that call moved the order.
+/// The production playback sequence: ConnectionManager::note_playback_activity() calls
+/// note_record_played() and requests a flush only when that call moved the order.
 static void play_record(RecordStore& store, const std::string& psk_id) {
     if (store.note_record_played(psk_id)) {
         (void) store.persist_records();
@@ -523,6 +523,36 @@ TEST(RecordStore, RemovingARecordWritesOnlyItsSlotAndTheOrder) {
     EXPECT_EQ(persisted_psk_ids(provider), std::vector<std::string>{keeper.psk_id});
 }
 
+// A provider that queues its writes makes them durable at commit(), so the store must commit
+// after writing pairing material and must not after the recency order alone: the order moves on
+// every playback handoff, and on ESP a commit is the flash write.
+TEST(RecordStore, CommitFollowsPairingMaterialButNotTheRecencyOrder) {
+    InMemoryPersistenceProvider provider;
+    RecordStore store(&provider, {.max_pairing_records = RecordStore::MIN_MAX_RECORDS});
+    EXPECT_EQ(provider.commits(), 1) << "the generated Pairing PSK must be committed";
+    EXPECT_TRUE(provider.uncommitted_keys().empty());
+
+    SendspinPairingRecord older = make_client_record("server-older");
+    SendspinPairingRecord newer = make_client_record("server-newer");
+    const std::string older_psk_id = older.psk_id;
+    ASSERT_TRUE(store.store_record_superseding(std::move(older), {}));
+    ASSERT_TRUE(store.store_record_superseding(std::move(newer), {}));
+    ASSERT_TRUE(store.persist_records());
+    EXPECT_EQ(provider.commits(), 2) << "one batch of record slots must commit once";
+    EXPECT_TRUE(provider.uncommitted_keys().empty())
+        << "the commit must follow every write of the batch";
+
+    play_record(store, older_psk_id);
+    EXPECT_EQ(provider.commits(), 2) << "a recency move alone must not commit";
+    // Control: the move was written, so the missing commit is a decision and not a missing write.
+    EXPECT_EQ(provider.uncommitted_keys(),
+              std::vector<std::string>{persistence_keys::RECORD_ORDER});
+
+    provider.fail_commits = true;
+    ASSERT_TRUE(store.store_record_superseding(make_client_record("server-uncommitted"), {}));
+    EXPECT_FALSE(store.persist_records()) << "a failed commit must be reported like a failed write";
+}
+
 // A provider may store each key as a fixed-size value (persistence_keys), so every write the store
 // makes has its key's size: a record slot whether it holds a record or is being freed, and the
 // recency order however many records the store holds.
@@ -592,7 +622,7 @@ TEST(RecordStore, ASupersedeReusesTheSlotItsRetireFreed) {
 
 // note_record_played() reports what THIS call made dirty, not everything the store owes: a call
 // that moves nothing reports no change even while a pairing's or a revocation's slot write is
-// pending, so ConnectionManager::note_playback_activity() stages no flush for it.
+// pending, so ConnectionManager::note_playback_activity() requests no flush for it.
 TEST(RecordStore, NoteRecordPlayedThatMovesNothingReportsNoChangeWhileAWriteIsPending) {
     InMemoryPersistenceProvider provider;
     SendspinPairingRecord revoked = make_client_record("server-revoked");
@@ -1434,6 +1464,22 @@ TEST(SendspinClientIdentity, WrongSizeKeypairBlobIsRejectedAndRegenerated) {
     EXPECT_NE(*persisted, wrong_size);
 }
 
+// The keypair is the device's identity: a provider that queues its writes must be told to make
+// it durable before start() returns, or a power cut gives the next boot a different client_id.
+TEST(SendspinClientIdentity, GeneratedKeypairIsCommitted) {
+    InMemoryPersistenceProvider provider;
+    SendspinClientConfig config;
+    config.name = "keypair-commit-test";
+    SendspinClient client(std::move(config));
+    client.set_persistence_provider(&provider);
+    ASSERT_TRUE(client.start());
+
+    // Control: the keypair was written, so an empty uncommitted list is not an absent write.
+    ASSERT_EQ(provider.save_attempts(persistence_keys::KEYPAIR), 1);
+    EXPECT_TRUE(provider.uncommitted_keys().empty())
+        << "the generated keypair was left queued when start() returned";
+}
+
 TEST(FilePersistenceProvider, PairingRecordRoundTrip) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());
@@ -1448,29 +1494,6 @@ TEST(FilePersistenceProvider, PairingRecordRoundTrip) {
     EXPECT_EQ(decoded->psk_id, rec.psk_id);
     EXPECT_EQ(decoded->psk, rec.psk);
     EXPECT_EQ(decoded->server_id, rec.server_id);
-}
-
-// erase_blob() reports success for an absent key as well as an erased one, so an application
-// wiping the library keyspace on a fresh device gets no spurious failure.
-TEST(FilePersistenceProvider, ClearPairingPskReportsSuccess) {
-    TempFile tmp;
-    FilePersistenceProvider provider(tmp.path());
-
-    SendspinPairingPsk psk;
-    psk.psk_id = "pairing-psk-id";
-    psk.psk.fill(0x42);
-    const auto psk_encoded = encode_pairing_psk(psk);
-    ASSERT_TRUE(provider.save_blob(persistence_keys::PAIRING_PSK, psk_encoded.data(),
-                                   psk_encoded.size()));
-    ASSERT_TRUE(provider.load_blob(persistence_keys::PAIRING_PSK).has_value());
-    EXPECT_TRUE(provider.erase_blob(persistence_keys::PAIRING_PSK));
-    EXPECT_FALSE(provider.load_blob(persistence_keys::PAIRING_PSK).has_value());
-
-    // Clearing what is already absent is still success.
-    EXPECT_TRUE(provider.erase_blob(persistence_keys::PAIRING_PSK));
-
-    // And a key that was NEVER touched at all is likewise a no-op success.
-    EXPECT_TRUE(provider.erase_blob("never-used-key"));
 }
 
 TEST(FilePersistenceProvider, LastPlayedServerIdRoundTrip) {

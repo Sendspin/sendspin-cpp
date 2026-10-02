@@ -269,7 +269,7 @@ public:
 
 /// Persistence provider that stores nothing. Counts save_blob() calls per key, still returning
 /// false like the base class default, so tests can assert on write counts (e.g. the
-/// persist_last_played_server() dedup guard) without disturbing the always-fails behavior the
+/// note_last_played_server() dedup guard) without disturbing the always-fails behavior the
 /// record-storage-failure tests rely on.
 class FakePersistenceProvider : public SendspinPersistenceProvider {
 public:
@@ -574,9 +574,11 @@ protected:
         return mgr.should_switch_to_new_server(current, incoming);
     }
 
-    /// Drives SendspinClient::persist_last_played_server(), private to SendspinClient.
-    void persist_last_played_server(const std::string& server_id) {
-        this->client_->persist_last_played_server(server_id);
+    /// Drives SendspinClient::note_last_played_server() and the flush that follows it in a
+    /// tick, both private to SendspinClient.
+    void note_and_flush_last_played_server(const std::string& server_id) {
+        this->client_->note_last_played_server(server_id);
+        this->client_->flush_pending_persistence();
     }
 
     /// Returns the shared_ptr backing the injected current connection, for building
@@ -2822,39 +2824,39 @@ TEST_F(PairingStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlayba
 }
 
 // ============================================================================
-// persist_last_played_server() same-value dedup guard
+// note_last_played_server() same-value dedup guard
 // ============================================================================
 
-// A single-server deployment repeats the same server_id on every PLAYING transition, so the
+// A single-server deployment repeats the same server_id on every playback activate, so the
 // guard must skip the write (not just rely on the storage backend to dedup) once the id already
 // matches ConnectionManager's last-played state; a genuine handoff to a different server_id must
 // still go through. The provider's write count is the whole observable: what the guard is
 // protecting is the flash the consumer's provider would spend.
-TEST_F(PairingStateMachineTest, PersistLastPlayedServerSkipsDuplicateWrite) {
+TEST_F(PairingStateMachineTest, NoteLastPlayedServerSkipsDuplicateWrite) {
     const std::string server_a = test_peer_id("server-a");
     const std::string server_b = test_peer_id("server-b");
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 0);
 
-    this->persist_last_played_server(server_a);
+    this->note_and_flush_last_played_server(server_a);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 1);
 
     // Same server_id again (also covers the post-reboot case, where load_last_played_server()
     // already seeded this value via the same setter): no second write.
-    this->persist_last_played_server(server_a);
+    this->note_and_flush_last_played_server(server_a);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 1);
 
     // A different server_id must still go through, and must become the value later calls are
     // deduped against.
-    this->persist_last_played_server(server_b);
+    this->note_and_flush_last_played_server(server_b);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
-    this->persist_last_played_server(server_b);
+    this->note_and_flush_last_played_server(server_b);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
 
     // An empty server_id is not a handoff to anything: it must neither be written nor become the
     // state a later real handoff is deduped against.
-    this->persist_last_played_server("");
+    this->note_and_flush_last_played_server("");
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
-    this->persist_last_played_server(server_b);
+    this->note_and_flush_last_played_server(server_b);
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2)
         << "an empty id must not have displaced the deduped value";
 }
