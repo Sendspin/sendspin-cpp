@@ -454,8 +454,10 @@ bool RecordStore::persist_records() {
     }
     if (slot_accepted && !this->provider_->commit()) {
         all_accepted = false;
-        SS_LOGW(TAG, "Provider failed to commit the record writes; a record stored or dropped "
-                     "since the last commit may not survive a reboot");
+        SS_LOGW(TAG,
+                "Provider failed to commit the record writes: a record stored since the last "
+                "commit will not survive a reboot, and a record dropped since it will be valid "
+                "again after one");
     }
     return all_accepted;
 }
