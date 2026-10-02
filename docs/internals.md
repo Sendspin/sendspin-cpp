@@ -139,7 +139,7 @@ PLAYER_STREAM ring events → on_stream_ring_event() → awaiting_sync_idle_even
 
 ### Cleanup
 
-When a connection is lost, `disable_message_dispatch()` runs first. It is an atomic flag the network thread checks before dispatching, so no message dispatched after the flip reaches the roles; a handler already past the check is caught by its role's teardown-generation re-check. `cleanup_connection_state()` then stops time sync, resets the inbox ring and every role's slots, and has each role push its synthetic STREAM_END or `*_CLEARED`, which the main loop delivers on its next drain. Cleanup can run under `ConnectionManager`'s lock, so it never calls a listener directly; even the high-performance release it owes is handed to the next `drain_inbox()`.
+When a connection is lost, `disable_message_dispatch()` runs first. It is an atomic flag the network thread checks before dispatching, so no message dispatched after the flip reaches the roles; a JSON role handler, or a player or visualizer binary handler, already past the check is caught by its role's teardown-generation re-check. `cleanup_connection_state()` then stops time sync, resets the inbox ring and every role's slots, and has each role push its synthetic STREAM_END or `*_CLEARED`, which the main loop delivers on its next drain. Cleanup can run under `ConnectionManager`'s lock, so it never calls a listener directly; even the high-performance release it owes is handed to the next `drain_inbox()`.
 
 ### Re-entrant Teardown During Callback Dispatch
 
@@ -207,7 +207,7 @@ Client -> Server: client/hello  (encrypted, device info, pair_methods)
 Server -> Client: server/activate (encrypted, activities, active_roles)
 ```
 
-`ConnectionManager` sends `client/init` as soon as the WebSocket upgrade completes, inbound or outbound. msg1 names the PSK to use by `psk_id` and category, and `RecordStore::resolve_by_psk_id()` resolves it on the network thread (connection.md "Pre-Shared Key"):
+`ConnectionManager` sends `client/init` once the WebSocket upgrade completes: at once for an inbound connection, on the next tick for an outbound one. msg1 names the PSK to use by `psk_id` and category, and `RecordStore::resolve_by_psk_id()` resolves it on the network thread (connection.md "Pre-Shared Key"):
 
 - `lt`: a long-term record from a completed pairing, bound to its `server_id`
 - `pr`: the Pairing PSK, from the config, persistence, or generated at first start
@@ -250,7 +250,7 @@ Both hold `std::shared_ptr<SendspinConnection>`. On the ESP server path these ar
 
 ### Handshake and Admission
 
-1. A new connection enters the nursery and runs the Noise handshake on the network thread.
+1. A new connection enters the nursery and sends `client/init`: from the network thread for an inbound connection, from the main loop's connected-event pass for an outbound one. The rest of the Noise handshake runs on the network thread as messages arrive.
 2. Once transport is active, the main loop's hello scan sends `client/hello`.
 3. The connection is operational once both hellos are exchanged and its first `server/activate` arrives, in either order. That activate is checked against the connection's trust when it is processed, and a rejected one closes the connection.
 4. The next promotion scan establishes the operational connection, arbitrating against the incumbent, mainly by highest activity (playback over pairing over none); `should_admit_connection()` in `src/admission.h` has the full rules.
