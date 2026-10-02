@@ -478,8 +478,10 @@ public:
     // ========================================
     //
     // A network thread names an event's connection with weak_from_this().lock(), never
-    // shared_from_this(), and the schedulers drop a null-connection event: an outbound connection
-    // can be mid-destruction (docs/internals.md, "Disconnection and Cleanup").
+    // shared_from_this(), and the schedulers drop a null-connection event: an outbound connection's
+    // destructor joins its transport thread, so a transport callback can run after the last owner
+    // let go, where shared_from_this() throws. Holding a reference across the callback instead
+    // could make the callback the last owner and have the transport thread join itself.
 
     /// @brief Schedules a server/activate event for deferred processing in loop().
     /// Called from SendspinClient::process_json_message() on the NETWORK thread; trust

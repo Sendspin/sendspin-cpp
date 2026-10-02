@@ -37,7 +37,7 @@ function(sendspin_get_sources BASE_DIR)
         # Pairing record store
         ${BASE_DIR}/src/record_store.cpp
 
-        # Public persistence codec (JSON storage format for the pairing structs)
+        # Public persistence codec (fixed-size binary storage format for the pairing structs)
         ${BASE_DIR}/src/persistence_codec.cpp
 
         # Client orchestration

@@ -19,6 +19,7 @@ Standalone C++ library implementing the [Sendspin synchronized audio streaming p
 
 - **[Integration Guide](docs/integration-guide.md)** -- How to integrate sendspin-cpp into your application, including required callbacks, role composition, and platform setup
 - **[Internals](docs/internals.md)** -- Internal architecture, threading model, and inter-class communication
+- **[Playback Sync](docs/playback-sync.md)** -- Clock synchronization and how decoded audio is aligned to server timestamps
 
 ## Build
 
