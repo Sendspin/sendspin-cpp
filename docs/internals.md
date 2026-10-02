@@ -28,7 +28,7 @@ The three role threads share one lifecycle shape. `start()` clears every event f
 
 ## Cross-Thread State
 
-The primitives live in `src/platform/` with FreeRTOS implementations on ESP and `std::mutex`/condition-variable implementations on host. `docs/conventions.md` ("Threading and cross-thread state") says which to use when.
+The primitives other than the Inbox live in `src/platform/`, with FreeRTOS implementations on ESP and `std::mutex`/condition-variable implementations on host. `docs/conventions.md` ("Threading and cross-thread state") says which to use when.
 
 | Primitive | Use |
 |-----------|-----|
@@ -40,7 +40,7 @@ The primitives live in `src/platform/` with FreeRTOS implementations on ESP and 
 
 ### Inbox
 
-The Inbox is a single-mutex mailbox with a lock-free dirty-topic bitmask. It offers two endpoint styles: a fixed-capacity event ring for ordered lifecycle events, and `InboxSlot<T>` latest-value slots for state, each owning one `INBOX_TOPIC_*` bit. The main loop calls `poll()` to read the bitmask without locking and only locks to drain topics whose bit is set; a bit set after the snapshot stays set, so the next tick sees it.
+The Inbox is a single-mutex mailbox with a lock-free dirty-topic bitmask. It offers two endpoint styles: a fixed-capacity event ring for ordered events (lifecycle events and time-sync measurements), and `InboxSlot<T>` latest-value slots for state, each owning one `INBOX_TOPIC_*` bit. The main loop calls `poll()` to read the bitmask without locking and only locks to drain topics whose bit is set; a bit set after the snapshot stays set, so the next tick sees it.
 
 | Endpoint | Topic bit | Producer |
 |----------|-----------|----------|
@@ -108,13 +108,13 @@ Network-thread work bound for the main loop is deferred through the Inbox, `Conn
 
 `stream/end` followed by `stream/start` crosses three threads, and a two-way handshake keeps them in order:
 
-1. The network thread pushes STREAM_END and STREAM_START as `PLAYER_STREAM` events onto the inbox ring and signals the sync task `COMMAND_STREAM_END`.
+1. On `stream/end` the network thread signals the sync task `COMMAND_STREAM_END`, then pushes STREAM_END as a `PLAYER_STREAM` event onto the inbox ring; on `stream/start` it writes the codec header into the encoded ring, then pushes STREAM_START.
 2. The sync task finishes the stream and returns to IDLE, clearing `TASK_RUNNING`.
 3. The main loop moves the ring events into `awaiting_sync_idle_events`. It holds STREAM_END, and everything behind it, until `SyncTask::is_running()` reads false, then fires `on_stream_end()`.
 4. The main loop fires `on_stream_start()` and signals `COMMAND_START`.
 5. The sync task, which has been waiting for `COMMAND_START` since it saw the new codec header, goes ACTIVE.
 
-Step 5's wait is what makes step 3 safe: without it the sync task could pass through IDLE and back to ACTIVE before the main loop ever observed it not running, and the held STREAM_END would wait forever. `stream/clear` does not use this path; it signals the sync task directly and enqueues a marker chunk into the encoded ring, and the sync task stays ACTIVE while it discards up to the marker.
+Signalling before pushing is what lets the `is_running()` gate in step 3 release only an end the sync task has already been told to honour. Step 5's wait is what makes step 3 safe: without it the sync task could pass through IDLE and back to ACTIVE before the main loop ever observed it not running, and the held STREAM_END would wait forever. `stream/clear` does not use this path; it signals the sync task directly and enqueues a marker chunk into the encoded ring, and the sync task stays ACTIVE while it discards up to the marker.
 
 ### Cleanup
 
@@ -254,7 +254,7 @@ The "will actually play" estimate comes from the audio sink: `notify_audio_playe
 
 ### Stream Connection Pin
 
-Every timestamp a stream converts belongs to one connection's time filter, so the sync task pins that connection (`ConnectionManager::current_shared()`) as the stream goes active and holds it until the stream ends. The pin stays valid because a filter is never replaced and the admitted slot cannot change servers mid-stream: dropping a connection runs `cleanup_connection_state()`, which ends the stream, before a successor is installed. The pin is often the last reference to a dropped connection, and an outbound connection's destructor joins its transport thread, so the sync task never destroys it: `ConnectionManager::release_from_role_thread()` hands the reference to the main loop's next `flush_deferred_releases()`.
+Every timestamp a stream converts belongs to one connection's time filter, so the sync task pins that connection (`ConnectionManager::current_shared()`) as the stream goes active and holds it until the stream ends. The pin stays valid because a filter is never replaced and the admitted slot cannot change servers mid-stream: dropping a connection runs `cleanup_connection_state()`, which ends the stream, before a successor is installed. The pin is often the last reference to a dropped connection, and an outbound connection's destructor joins its transport thread, so the sync task never destroys it: `ConnectionManager::release_from_role_thread()` hands the reference to the main loop's next `flush_deferred_releases()`, or to `~ConnectionManager` when the client is destroyed without `stop()`.
 
 ## Time Synchronization
 
@@ -287,7 +287,7 @@ A lookup miss in the initial handshake completes with the Sentinel PSK (connecti
 
 ### Transport
 
-Once active, every message travels through `NoiseTransport` as `[type byte][payload]`, encrypted into one binary WebSocket frame. `MSG_TYPE_JSON_BODY` marks JSON, `MSG_TYPE_FRAGMENT` a fragment of a message too large for one Noise frame (messaging.md "Fragmentation"), and every other type a binary role message.
+Once active, each Noise frame carries `[type byte][payload]` in one binary WebSocket frame, and a message too large for one frame is split into `MSG_TYPE_FRAGMENT` frames (messaging.md "Fragmentation"). `MSG_TYPE_JSON_BODY` marks JSON, and every other type is a binary role message.
 
 The server may start a new handshake inside the transport at any time (connection.md "Re-handshake"). The connection swaps its `NoiseSession` once msg2 is written, then goes non-operational until the next `server/activate`; until then the client sends no application message, and a watchdog drops a connection that is never re-activated.
 
