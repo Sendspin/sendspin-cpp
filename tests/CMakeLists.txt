@@ -31,6 +31,9 @@ add_executable(sendspin_tests
     test_network_info.cpp
     test_spsc_ring_buffer.cpp
     test_thread_safe_queue.cpp
+    test_shared_ring_buffer.cpp
+    test_inbound_ring.cpp
+    test_protocol_task.cpp
     test_inbox.cpp
     test_player_role.cpp
     test_inline_vector.cpp
@@ -91,6 +94,11 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # and event_state's latest-wins slots; SyncTask's encoded_ring_buffer_, which is what says a
 # refused handler buffered nothing.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
+
+# test_inbound_ring.cpp sets InboundGate's private CONSUMED bit directly to stage a consume bit
+# that lands after the transport has published its next message, an interleaving of two threads
+# no public call can produce on demand.
+set_source_files_properties(test_inbound_ring.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_record_store.cpp reads records_ directly and calls the store's private locked-context
 # lookups (record_by_psk_id, record_by_server_id); the store deliberately exposes no copying

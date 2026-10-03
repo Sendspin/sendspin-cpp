@@ -34,6 +34,10 @@ function(sendspin_get_sources BASE_DIR)
         # Connection management
         ${BASE_DIR}/src/connection_manager.cpp
 
+        # Protocol thread and its command queue; the shared inbound ring's per-consumer item list
+        ${BASE_DIR}/src/protocol_task.cpp
+        ${BASE_DIR}/src/inbound_ring.cpp
+
         # Pairing record store
         ${BASE_DIR}/src/record_store.cpp
 

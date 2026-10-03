@@ -20,6 +20,7 @@
 
 #include "crypto/cpace.h"
 #include "crypto/keys.h"
+#include "inbound_ring.h"
 #include "noise_handshake.h"
 #include "noise_transport.h"
 #include "platform/crypto.h"
@@ -148,11 +149,11 @@ public:
     /// activities (see admission.h), so anything that drives shared client state (the roles)
     /// must gate on this, not on the handshake having succeeded.
     ///
-    /// Written on the main loop only (see set_admitted()); atomic because the network thread
-    /// reads it on the message-dispatch path.
+    /// Written on the main loop only (see set_admitted()) into the inbound gate, which the
+    /// network thread reads on the message-dispatch path.
     /// @return true while this connection is the admitted one.
     bool is_admitted() const {
-        return this->admitted_.load(std::memory_order_acquire);
+        return this->inbound_gate_.is_admitted();
     }
 
     /// @brief Mark this connection as occupying (or vacating) the admitted slot.
@@ -167,7 +168,7 @@ public:
         if (admitted) {
             this->noise_transport_.set_admitted(true);
         }
-        this->admitted_.store(admitted, std::memory_order_release);
+        this->inbound_gate_.set_admitted(admitted);
         if (!admitted) {
             this->noise_transport_.set_admitted(false);
         }
@@ -857,6 +858,17 @@ public:
     }
 
     // ========================================
+    // Inbound ring gate
+    // ========================================
+
+    /// @brief The admitted flag, pre-admission hand-off, in-flight count and out-of-band close
+    /// flag this connection's transport shares with the protocol task (see InboundGate for each
+    /// member's threads)
+    InboundGate& inbound_gate() {
+        return this->inbound_gate_;
+    }
+
+    // ========================================
     // Time message state accessors
     // ========================================
 
@@ -997,6 +1009,10 @@ protected:
 
     /// Extents of the messages held in held_messages_, in arrival order.
     std::array<HeldMessageExtent, MAX_HELD_MESSAGES> held_extents_{};
+
+    /// Shared with the protocol task without a lock; InboundGate states each member's writer and
+    /// reader threads.
+    InboundGate inbound_gate_;
 
     /// Role messages received before admission, replayed in order when the connection is
     /// admitted. See hold_pre_admission_message().
@@ -1158,14 +1174,16 @@ protected:
 
     /// Lifecycle-flag axes.
     ///
-    /// The six atomic flags below are three independent axes, not one linear lifecycle:
+    /// The lifecycle flags below, with the admitted flag in inbound_gate_, are three independent
+    /// axes, not one linear lifecycle:
     ///  - Transport: ws_upgraded_.
     ///  - Proving: noise_handshake_complete_ (set once, never cleared, not even by an in-band
     ///    re-handshake, which keeps the transport active), client_hello_sent_ /
     ///    server_hello_received_ (once per connection; connection.md "Re-handshake" re-sends
     ///    neither hello), and first_activate_received_, which the server owes again after every
     ///    re-handshake.
-    ///  - Admission: admitted_, whether this connection occupies the manager's current slot.
+    ///  - Admission: inbound_gate_'s admitted flag, whether this connection occupies the
+    ///    manager's current slot.
     ///    Orthogonal to proving: an operational nursery loser is never admitted, and a
     ///    re-handshaking current connection is admitted but not operational.
     ///
@@ -1193,11 +1211,6 @@ protected:
     /// True once a server/activate from this connection reached the dispatch path. Written and
     /// read on the network thread only. See note_activate_delivered().
     std::atomic<bool> activate_delivered_{false};
-
-    /// True while this connection occupies the manager's admitted (current) slot. Written on the
-    /// main loop only (see set_admitted()); read on the network thread by the role-dispatch gate.
-    /// See is_admitted().
-    std::atomic<bool> admitted_{false};
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
     /// Written from the transport connected callback (network thread), read by the manager's
