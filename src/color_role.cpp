@@ -81,7 +81,7 @@ void ColorRole::Impl::handle_server_state(const ServerColorStateObject& color,
     // an overlay on the one before it (see coalesce_color_states).
     PendingColorStates arrival;
     arrival.oldest = color;
-    this->event_state->slot.merge(coalesce_color_states, arrival, generation);
+    this->event_state->slot.merge(coalesce_color_states, std::move(arrival), generation);
 }
 
 bool ColorRole::Impl::state_is_due(int64_t timestamp) const {

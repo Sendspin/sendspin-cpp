@@ -97,6 +97,11 @@ public:
         this->server_port_ = port;
     }
 
+    /// @brief No-op on host builds: IXWebSocket hands every frame over in its own buffer, so a
+    /// dropped one needs no scratch space. Kept for symmetry with the ESP build.
+    // cppcheck-suppress functionStatic
+    void set_discard_capacity(size_t /*bytes*/) {}
+
     /// @brief No-op on host builds; the control port is an ESP-IDF httpd concept. Kept as an
     /// instance method for symmetry with the ESP build.
     // cppcheck-suppress functionStatic

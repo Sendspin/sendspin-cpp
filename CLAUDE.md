@@ -54,6 +54,7 @@ examples/basic_client/      - Standalone host example with PortAudio audio outpu
 examples/tui_client/        - Terminal UI host example with PortAudio audio output
 tests/                      - Host unit tests (GoogleTest)
 tests/esp_idf/              - Build-only ESP-IDF project checking the component's codec dependencies
+tools/stack_usage/          - Script and indirect-call tables that derive the ESP task stack defaults from -fcallgraph-info
 docs/                       - integration-guide.md (consumer guide), internals.md (how the parts fit together: threads, cross-thread channels, tick order, cross-file invariants), playback-sync.md (clock sync and audio alignment), conventions.md (normative design standards)
 .claude/skills/             - Review checklists applying the standards to a diff (docs-sync, embedded-review, house-patterns, test-standards)
 ```

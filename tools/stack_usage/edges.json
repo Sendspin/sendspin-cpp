@@ -1,0 +1,261 @@
+{
+ "_comment": [
+  "Indirect-call edges the -fcallgraph-info graph cannot see (function pointers, virtual calls, std::function, ESP-IDF callbacks), and frames for precompiled newlib functions measured from their xtensa 'entry' instruction (objdump -d libc.a). A key or target is a demangled-name substring of at least 13 characters, an exact symbol, or 'sym:' followed by a regular expression over the mangled symbol."
+ ],
+ "synthetic": {
+  "__sfvwrite_r": 48,
+  "__sprint_r": 32,
+  "__swrite": 32,
+  "_vfprintf_r": 800,
+  "_write_r": 32,
+  "vprintf": 48
+ },
+ "edges": {
+  "_ZNKSt8functionIFmvEEclEv": [
+   "sym:SendspinClient5startEvEUlvE_E9_M_invoke"
+  ],
+  "__sfvwrite_r": [
+   "__swrite"
+  ],
+  "__sprint_r": [
+   "__sfvwrite_r"
+  ],
+  "__swrite": [
+   "_write_r"
+  ],
+  "_vfprintf_r": [
+   "__sprint_r"
+  ],
+  "_write_r": [
+   "esp_vfs_write"
+  ],
+  "console_write": [
+   "sym:^uart_write$"
+  ],
+  "crypto_scalarmult_curve25519": [
+   "crypto_scalarmult_curve25519_ref10$part$0"
+  ],
+  "esp_event_loop_run": [
+   "sym:SendspinClientConnection23websocket_event_handler"
+  ],
+  "esp_log": [
+   "vprintf"
+  ],
+  "esp_log_va": [
+   "vprintf"
+  ],
+  "esp_log_writev": [
+   "vprintf"
+  ],
+  "esp_transport_close": [
+   "sym:^ws_close$",
+   "sym:^base_close$"
+  ],
+  "esp_transport_connect": [
+   "ws_connect",
+   "tcp_connect"
+  ],
+  "esp_transport_poll_read": [
+   "ws_poll_read",
+   "base_poll_read"
+  ],
+  "esp_transport_poll_write": [
+   "ws_poll_write",
+   "base_poll_write"
+  ],
+  "esp_transport_read": [
+   "ws_read",
+   "tcp_read"
+  ],
+  "esp_transport_write": [
+   "ws_write",
+   "tcp_write"
+  ],
+  "esp_vfs_write": [
+   "console_write"
+  ],
+  "http_parser_execute": [
+   "sym:^cb_(url|header_field|header_value|headers_complete|on_body|no_body)$"
+  ],
+  "httpd_recv_with_opt": [
+   "httpd_default_recv"
+  ],
+  "httpd_req_new": [
+   "httpd_uri",
+   "httpd_parse_req",
+   "httpd_default_recv"
+  ],
+  "httpd_send": [
+   "httpd_default_send"
+  ],
+  "httpd_send_all$isra$0": [
+   "httpd_default_send"
+  ],
+  "httpd_sess_close_lru": [
+   "sym:SendspinWsServer14close_callback"
+  ],
+  "httpd_sess_delete": [
+   "sym:SendspinWsServer14close_callback"
+  ],
+  "httpd_sess_free_ctx": [
+   "sym:SendspinWsServer13open_callbackEPviENKUlPvE_"
+  ],
+  "httpd_sess_new": [
+   "sym:SendspinWsServer13open_callback"
+  ],
+  "httpd_socket_recv": [
+   "httpd_default_recv"
+  ],
+  "httpd_socket_send": [
+   "httpd_default_send"
+  ],
+  "httpd_thread": [
+   "sym:SendspinServerConnection16async_send_frame",
+   "sym:SendspinWsServer13open_callback",
+   "sym:SendspinWsServer14close_callback",
+   "httpd_process_session"
+  ],
+  "httpd_uri": [
+   "sym:SendspinWsServer17websocket_handler"
+  ],
+  "httpd_ws_get_frame_type": [
+   "httpd_default_recv"
+  ],
+  "httpd_ws_recv_frame": [
+   "httpd_default_recv"
+  ],
+  "httpd_ws_send_cb": [
+   "httpd_default_send"
+  ],
+  "httpd_ws_send_frame_async": [
+   "httpd_ws_send_frame_to",
+   "httpd_default_send"
+  ],
+  "int64_t sendspin::SendspinConnection::send_time_message()": [
+   "SendspinServerConnection::send_transport_frame(",
+   "SendspinClientConnection::send_transport_frame(",
+   "SendspinServerConnection::send_binary_message(",
+   "SendspinClientConnection::send_binary_message("
+  ],
+  "noise_cipherstate_decrypt_with_ad": [
+   "noise_chachapoly_decrypt"
+  ],
+  "noise_cipherstate_encrypt_with_ad": [
+   "noise_chachapoly_encrypt"
+  ],
+  "noise_cipherstate_init_key": [
+   "noise_chachapoly_init_key"
+  ],
+  "noise_dhstate_calculate": [
+   "noise_curve25519_calculate"
+  ],
+  "noise_dhstate_generate_dependent_keypair": [
+   "noise_curve25519_generate_keypair"
+  ],
+  "noise_dhstate_generate_keypair": [
+   "noise_curve25519_generate_keypair"
+  ],
+  "noise_dhstate_set_keypair": [
+   "noise_curve25519_set_keypair"
+  ],
+  "noise_dhstate_set_keypair_private": [
+   "noise_curve25519_set_keypair_private"
+  ],
+  "noise_dhstate_set_public_key": [
+   "noise_curve25519_validate_public_key"
+  ],
+  "noise_hashstate_finalize": [
+   "noise_sha256_finalize"
+  ],
+  "noise_hashstate_hash_one": [
+   "noise_sha256_update",
+   "noise_sha256_finalize",
+   "noise_sha256_reset"
+  ],
+  "noise_hashstate_hash_two": [
+   "noise_sha256_update",
+   "noise_sha256_finalize",
+   "noise_sha256_reset"
+  ],
+  "noise_hashstate_hmac": [
+   "noise_sha256_update",
+   "noise_sha256_finalize",
+   "noise_sha256_reset"
+  ],
+  "noise_hashstate_reset": [
+   "noise_sha256_reset"
+  ],
+  "noise_hashstate_update": [
+   "noise_sha256_update"
+  ],
+  "pthread_task_func": [
+   "sym:_State_impl.*ProtocolTask.*_M_runEv"
+  ],
+  "sendspin::HandshakeFrameResult sendspin::NoiseHandshake::on_text_frame(": [
+   "SendspinServerConnection::send_text_message(",
+   "SendspinClientConnection::send_text_message("
+  ],
+  "sendspin::NoiseTransport::encrypt_and_send_frame(": [
+   "SendspinServerConnection::send_transport_frame(",
+   "SendspinClientConnection::send_transport_frame("
+  ],
+  "sendspin::NoiseTransport::fragment_and_send(": [
+   "SendspinServerConnection::send_transport_frame(",
+   "SendspinClientConnection::send_transport_frame("
+  ],
+  "sendspin::SendspinConnection::send_app_json(const char*": [
+   "SendspinServerConnection::send_binary_message(",
+   "SendspinClientConnection::send_binary_message(",
+   "SendspinServerConnection::send_transport_frame(",
+   "SendspinClientConnection::send_transport_frame("
+  ],
+  "sendspin::TimeBurstResult sendspin::SendspinTimeBurst::loop(": [
+   "int64_t sendspin::SendspinConnection::send_time_message()"
+  ],
+  "static void sendspin::ConnectionManager::release_connection(": [
+   "SendspinServerConnection::disconnect(",
+   "SendspinClientConnection::disconnect(",
+   "SendspinClientConnection::~SendspinClientConnection()",
+   "SendspinServerConnection::~SendspinServerConnection()"
+  ],
+  "sym:ProtocolTask12thread_entry": [
+   "_ZNKSt8functionIFmvEEclEv"
+  ],
+  "sym:SendspinClient5startEv.*_M_invoke": [
+   "sym:SendspinClient13protocol_tickEv$"
+  ],
+  "sym:SendspinServerConnection16async_send_frame": [
+   "sym:_Function_handlerIFvbEZN8sendspin.*M_invoke",
+   "sym:_Function_handlerIFvvEZN8sendspin.*M_invoke"
+  ],
+  "sym:_State_impl.*ProtocolTask.*_M_runEv": [
+   "sym:ProtocolTask12thread_entry"
+  ],
+  "void sendspin::ConnectionManager::connect_to(": [
+   "virtual void sendspin::SendspinClientConnection::start()"
+  ],
+  "void sendspin::ConnectionManager::drop_connection(": [
+   "SendspinServerConnection::disconnect(",
+   "SendspinClientConnection::disconnect("
+  ],
+  "void sendspin::SendspinConnection::close_silently(": [
+   "SendspinServerConnection::disconnect(",
+   "SendspinClientConnection::disconnect(",
+   "SendspinServerConnection::close_transport_now(",
+   "SendspinClientConnection::close_transport_now("
+  ],
+  "void sendspin::SendspinConnection::dispatch_complete_noise_message(": [
+   "sym:setup_connection_callbacks.*_M_invoke"
+  ],
+  "void sendspin::SendspinConnection::handle_noise_handshake_text(": [
+   "SendspinServerConnection::send_text_message(",
+   "SendspinClientConnection::send_text_message("
+  ],
+  "void sendspin::SendspinConnection::send_noise_client_init()": [
+   "SendspinClientConnection::send_text_message("
+  ],
+  "vprintf": [
+   "_vfprintf_r"
+  ]
+ }
+}

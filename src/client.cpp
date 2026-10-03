@@ -435,8 +435,8 @@ bool SendspinClient::start() {
     // task's first tick.
     this->connection_manager_->start();
 
-    // The protocol task. Undersized stacks are clamped to the documented minimum, as the
-    // transport tasks' are.
+    // The protocol task. Undersized stacks are clamped to the documented minimum, the measured
+    // stack of its deepest call chain, as the transport tasks' are.
     size_t protocol_stack = this->config_.protocol_task_stack_size;
     if (protocol_stack < SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE) {
         SS_LOGW(TAG, "protocol_task_stack_size %u below minimum %u; clamping",
@@ -588,12 +588,21 @@ void SendspinClient::stop_role_threads() {
 }
 
 bool SendspinClient::create_inbound_ring() {
+    // Created whatever roles are enabled: every admitted connection receives into it, including
+    // the server/time replies whose receive stamps must be taken at the socket read, which the
+    // one-at-a-time fallback hand-off would delay behind the protocol task. The enabled roles set
+    // its size, down to two JSON messages without the player, the visualizer or artwork.
     InboundRingBudget budget;
     budget.time_burst_size = this->config_.time_burst_size;
     budget.time_burst_interval_ms = this->config_.time_burst_interval_ms;
+    size_t player_message_bytes = 0;
+    size_t visualizer_message_bytes = 0;
+    bool artwork = false;
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         budget.audio_hold_bytes = this->player_->impl_->config.audio_buffer_capacity;
+        player_message_bytes =
+            inbound_held_message_bytes(this->player_->impl_->advertised_buffer_capacity());
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
@@ -601,6 +610,8 @@ bool SendspinClient::create_inbound_ring() {
         budget.visualizer_hold_bytes = this->visualizer_->impl_->visualizer_support.buffer_capacity;
         budget.visualizer_stored_bytes_per_second =
             this->visualizer_->impl_->stored_frame_bytes_per_second();
+        visualizer_message_bytes =
+            inbound_held_message_bytes(this->visualizer_->impl_->advertised_buffer_capacity());
     }
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -608,8 +619,11 @@ bool SendspinClient::create_inbound_ring() {
         for (const auto& slot : this->artwork_->impl_->config.preferred_formats) {
             budget.artwork_images_stored_bytes += inbound_frames_stored_bytes(slot.max_image_bytes);
         }
+        artwork = true;
     }
 #endif
+    budget.largest_message_bytes =
+        inbound_largest_message_bytes(player_message_bytes, visualizer_message_bytes, artwork);
     const size_t storage_bytes = derive_inbound_ring_bytes(budget);
     auto ring = std::make_unique<InboundRing>();
     if (!ring->create(storage_bytes, this->config_.inbound_ring_location)) {
@@ -617,7 +631,8 @@ bool SendspinClient::create_inbound_ring() {
     }
     ring->quota(InboundHolder::PLAYER).set_limit(budget.audio_hold_bytes);
     ring->quota(InboundHolder::VISUALIZER).set_limit(budget.visualizer_hold_bytes);
-    SS_LOGD(TAG, "Inbound ring: %zu bytes", storage_bytes);
+    SS_LOGD(TAG, "Inbound ring: %zu bytes, messages up to %zu bytes", storage_bytes,
+            ring->max_message_bytes());
     this->inbound_ring_ = std::move(ring);
     return true;
 }
@@ -1515,9 +1530,9 @@ uint32_t SendspinClient::protocol_tick() {
 
     // 6. The receive pass, over a snapshot of the managed connections: a handler below can drop
     //    a connection from its slot, and the snapshot keeps it alive until the tick ends (see
-    //    ConnectionManager::snapshot_connections()). Each connection's pending pre-admission
-    //    message comes before its ring items: a connection has no ring item queued while a
-    //    pending message waits (InboundGate).
+    //    ConnectionManager::snapshot_connections()). Each connection's message pending in its
+    //    fallback buffer comes before the ring items it wrote after it, and after the ones it
+    //    wrote before it: pending_message() holds it back until those are taken (InboundGate).
     ConnectionManager::ConnectionSnapshot connections;
     manager.snapshot_connections(connections);
     for (auto& conn : connections) {
@@ -1578,19 +1593,22 @@ uint32_t SendspinClient::protocol_tick() {
 
     // 7. Losses: a connection the receive path closed, one the manager released, or one whose
     //    transport closed with every message it sent before the close processed, is dropped once
-    //    (a connection the manager no longer manages is a no-op there).
+    //    (a connection the manager no longer manages is a no-op there). A fallback message held
+    //    back behind ring items the pass above has now taken is due at once.
+    bool fallback_due = false;
     for (auto& conn : connections) {
         InboundGate& gate = conn->inbound_gate();
         if ((gate.is_detached() || gate.close_ready()) && conn->mark_loss_reported()) {
             manager.on_connection_lost(conn.get());
         }
+        fallback_due = fallback_due || (gate.has_pending_message() && gate.in_flight() == 0);
     }
 
     // 8. The lifecycle scans and timers, 9. the time bursts, 10. what other threads read.
     uint32_t next_deadline = manager.tick(platform_time_us());
     next_deadline = std::min(next_deadline, manager.run_time_sync());
     manager.refresh_published_state();
-    if (!ring_drained) {
+    if (!ring_drained || fallback_due) {
         next_deadline = 0;
     }
     // The snapshot's references drop here; see ConnectionManager::snapshot_connections().

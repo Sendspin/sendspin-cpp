@@ -1854,7 +1854,8 @@ TEST(ArtworkDisplayHandOff, ADisplayStampedBeforeATeardownIsNotShown) {
         delta.epochs[0] = impl->slot_epochs[0].load();
         delta.valid_mask = 0x01;
         impl->event_state->display_slot.merge(ArtworkRole::Impl::merge_artwork_display_update,
-                                              delta, row.stale ? before : live_generation(*impl));
+                                              std::move(delta),
+                                              row.stale ? before : live_generation(*impl));
 
         impl->drain_events();
 

@@ -1190,8 +1190,10 @@ public:
 // ConnectionManager::tick() returns the milliseconds until the earliest of its timers, one row per
 // timer, so the protocol task sleeps exactly until the next one is due; with none armed it
 // returns NO_DEADLINE and the task waits for a wake alone. The Control rows hold a connection, or
-// a stopped server, whose timer is not armed. The test thread plays the protocol task and stages
-// each timer directly against a fixed clock.
+// a stopped server, whose timer is not armed; the running host server in the first has no
+// upgrade reap to report (the ESP server's reap deadline, SendspinWsServer::tick(), only builds
+// for ESP). The test thread plays the protocol task and stages each timer directly against a
+// fixed clock.
 TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
     constexpr int64_t NOW_US = 3LL << 32;
     constexpr int64_t LIVENESS_US = 30'000'000;
@@ -1202,6 +1204,7 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         REPROVE,
         ATTEMPT,
         NURSERY,
+        HELLO_RETRY,
         WINDOW,
         WINDOW_AND_LIVENESS,
         NETWORK_POLL,
@@ -1222,6 +1225,7 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         {"the pairing attempt deadline", Stage::ATTEMPT, 2000},
         {"the nursery establish deadline", Stage::NURSERY,
          static_cast<uint32_t>(NURSERY_ESTABLISH_TIMEOUT_US / 1000)},
+        {"a hello retry, due ahead of the establish deadline", Stage::HELLO_RETRY, 200},
         {"the pairing window", Stage::WINDOW, 5000},
         {"the earliest of two", Stage::WINDOW_AND_LIVENESS, 5000},
         {"the network poll while the server is down", Stage::NETWORK_POLL,
@@ -1271,6 +1275,13 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
                 conn->set_provisional_time_us(NOW_US);
                 manager.nursery_.push_back(NurseryEntry{.conn = conn});
                 break;
+            case Stage::HELLO_RETRY:
+                // A refused hello backed off: the next attempt is armed 200 ms out.
+                conn->set_provisional_time_us(NOW_US);
+                manager.nursery_.push_back(NurseryEntry{.conn = conn,
+                                                        .hello_due_us = NOW_US + 200'000,
+                                                        .hello_step = HelloStep::SENDING});
+                break;
             case Stage::WINDOW:
                 manager.pairing_window_open_until_us_ = NOW_US + 5'000'000;
                 break;
@@ -1287,6 +1298,61 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         EXPECT_EQ(manager.tick(NOW_US), row.expected_ms);
         EXPECT_FALSE(conn->inbound_gate().is_detached()) << "nothing was due, yet it was dropped";
         manager.pairing_window_open_until_us_ = 0;
+        client.stop();
+    }
+}
+
+// An admitted connection's message longer than the ring takes waits in its fallback buffer until
+// the ring item it wrote first has been taken. The tick whose ring pass takes that item finds the
+// message due and asks to run again at once (it returns 0), so the next tick processes it without
+// waiting for an unrelated wake; left waiting, the transport would drop the connection's next
+// messages once its InboundGate::WRITABLE_WAIT_MS ran out. The Control row's second message fits
+// the ring: nothing waits and the tick has no deadline. The client runs with no roles, so its ring
+// is sized for JSON, and the stand-in has no Noise session, so the receive pass drops both
+// messages unread; what is under test is when the pending message is taken.
+TEST(NextDeadline, AFallbackMessageHeldBehindARingItemRunsTheNextTickAtOnce) {
+    struct Row {
+        const char* name;
+        size_t extra_len;  // added to the ring's max_message_bytes()
+        uint32_t first_tick;
+    };
+    const Row rows[] = {
+        {"Control: the second message fits the ring", 0, ProtocolTask::NO_DEADLINE},
+        {"the second message is longer than the ring takes", 1, 0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        client.connection_manager_->liveness_timeout_us_ = 0;
+
+        auto conn = std::make_shared<StubConnection>();
+        conn->attach_inbound(client.inbound_ring_.get(), client.protocol_task_.get());
+        client.connection_manager_->install_admitted(conn, 0);
+        InboundGate& gate = conn->inbound_gate();
+
+        // The transport side: a ring item, then the second message.
+        const auto receive = [&](size_t len) {
+            const auto target = conn->begin_inbound_message(len, false, platform_time_us());
+            ASSERT_EQ(target.route, SendspinConnection::InboundRoute::RECEIVE);
+            std::memset(target.data, 0x5A, len);
+            conn->end_inbound_message(true);
+        };
+        receive(3);
+        receive(client.inbound_ring_->max_message_bytes() + row.extra_len);
+        EXPECT_EQ(gate.has_pending_message(), row.extra_len > 0);
+
+        EXPECT_EQ(client.protocol_tick(), row.first_tick);
+        EXPECT_EQ(gate.in_flight(), 0U) << "the ring pass left an item untaken";
+        EXPECT_EQ(gate.has_pending_message(), row.extra_len > 0)
+            << "the fallback message overtook the ring item ahead of it";
+
+        (void)client.protocol_tick();
+        EXPECT_FALSE(gate.has_pending_message()) << "the next tick left the message waiting";
+        EXPECT_TRUE(gate.may_write());
         client.stop();
     }
 }
@@ -2304,6 +2370,90 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     client.reset();
 }
 
+// The ring's floor and the longest message it takes follow the enabled roles: a 16 KiB JSON
+// message every admitted connection can be sent, the longest chunk the player's and the
+// visualizer's advertised buffers let the server send, and a maximal Noise frame with the artwork
+// role, whatever its image cap: the server sends a refused image's bytes in maximal frames too.
+// A client without the player or artwork is floored at two JSON messages (2 x 16,440 =
+// 32,880 bytes) instead of two maximal frames (131,152), and a small player's ring follows its
+// buffer: 25,000 bytes advertise 16,666, so its chunks are at most 16,682 bytes with the tag and
+// the ring is 25,000 + 5,568 held pass-through + 2 x 16,724 = 64,016 bytes; a visualizer
+// advertising a seventh of 140,000 bytes is sent messages of up to 20,016, and at 30 loudness
+// frames a second (2,040 stored bytes) holds its oldest for 69 s, which pins 69 s of state JSON
+// and 7 time bursts behind it (70,656 + 17,472 bytes). Controller and
+// metadata hold nothing, so they leave the no-role budget unchanged. Read from the ring the
+// client creates, so every role's figures have to reach the derivation.
+TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
+    enum : uint8_t {
+        PLAYER = 1 << 0,
+        SMALL_PLAYER = 1 << 1,
+        VISUALIZER = 1 << 2,
+        ARTWORK = 1 << 3,
+        SMALL_ARTWORK = 1 << 4,
+        CONTROLLER_METADATA = 1 << 5,
+        LARGE_VISUALIZER = 1 << 6,
+    };
+    struct Row {
+        const char* name;
+        uint8_t roles;
+        size_t expected_bytes;
+        size_t expected_max_message_bytes;
+    };
+    const Row rows[] = {
+        {"no roles: two JSON messages", 0, 32880, 16400},
+        {"controller and metadata: the no-role budget", CONTROLLER_METADATA, 32880, 16400},
+        {"visualizer only: its 4,096-byte quota, 3 s of pass-through, the JSON floor", VISUALIZER,
+         42544, 21232},
+        {"a 140,000-byte visualizer: 69 s of pass-through, two 20,016-byte messages",
+         LARGE_VISUALIZER, 268240, INBOUND_MAX_MESSAGE_BYTES},
+        {"a 25,000-byte player: two of its longest chunks", SMALL_PLAYER, 64016, 31968},
+        {"artwork only: one default image, above two maximal frames", ARTWORK, 131292,
+         INBOUND_MAX_MESSAGE_BYTES},
+        {"artwork capped at 40,000-byte images: still two maximal frames", SMALL_ARTWORK, 131152,
+         INBOUND_MAX_MESSAGE_BYTES},
+        {"Control: the default player", PLAYER, 1242704, INBOUND_MAX_MESSAGE_BYTES},
+        {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1687004,
+         INBOUND_MAX_MESSAGE_BYTES},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        if ((row.roles & (PLAYER | SMALL_PLAYER)) != 0) {
+            PlayerRoleConfig player = make_pcm_player_config();
+            player.audio_buffer_capacity = (row.roles & PLAYER) != 0
+                                               ? PlayerRoleConfig::DEFAULT_AUDIO_BUFFER_CAPACITY
+                                               : 25000;
+            client.add_player(player);
+        }
+        if ((row.roles & (VISUALIZER | LARGE_VISUALIZER)) != 0) {
+            VisualizerRoleConfig visualizer = make_visualizer_config();
+            if ((row.roles & LARGE_VISUALIZER) != 0) {
+                visualizer.support.buffer_capacity = 140000;
+            }
+            client.add_visualizer(std::move(visualizer));
+        }
+        if ((row.roles & (ARTWORK | SMALL_ARTWORK)) != 0) {
+            ArtworkRoleConfig artwork;
+            artwork.preferred_formats.push_back(
+                {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 100, 100, false});
+            if ((row.roles & SMALL_ARTWORK) != 0) {
+                artwork.preferred_formats.back().max_image_bytes = 40000;
+            }
+            client.add_artwork(artwork);
+        }
+        if ((row.roles & CONTROLLER_METADATA) != 0) {
+            client.add_controller();
+            client.add_metadata();
+        }
+        ASSERT_TRUE(client.start());
+        EXPECT_EQ(client.inbound_ring_->storage_.size(), row.expected_bytes);
+        EXPECT_EQ(client.inbound_ring_->max_message_bytes(), row.expected_max_message_bytes);
+        client.stop();
+    }
+}
+
 // The ring holds the time replies that arrive while the player holds its oldest chunk, so its
 // size follows the configured burst cadence: a client syncing ten times as often gets a larger
 // ring. Read from the ring the client creates, so the configuration has to reach the derivation.
@@ -2323,6 +2473,14 @@ TEST(ClientLifecycle, TheInboundRingGrowsWithTheTimeBurstRate) {
     const size_t default_bytes = ring_bytes(SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS);
     InboundRingBudget budget;
     budget.audio_hold_bytes = make_pcm_player_config().audio_buffer_capacity;
+    // The player advertises the share of its quota the smallest chunk's stored cost leaves for
+    // encoded bytes ((N - 1) / N, N = the smallest chunk's stored size over its overhead): its
+    // longest chunk.
+    constexpr size_t CHUNK_OVERHEAD =
+        INBOUND_ITEM_STORED_OVERHEAD_BYTES + INBOUND_AUDIO_CHUNK_HEADER_BYTES;
+    constexpr size_t DENOMINATOR = (INBOUND_MIN_AUDIO_FRAME_BYTES + CHUNK_OVERHEAD) / CHUNK_OVERHEAD;
+    budget.largest_message_bytes = inbound_held_message_bytes(
+        make_pcm_player_config().audio_buffer_capacity * (DENOMINATOR - 1) / DENOMINATOR);
     EXPECT_EQ(default_bytes, derive_inbound_ring_bytes(budget)) << "Control: the defaults";
     EXPECT_GT(ring_bytes(SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS / 10), default_bytes)
         << "the configured burst interval never reached the ring's derivation";

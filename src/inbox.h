@@ -365,11 +365,19 @@ public:
     template <typename MergeFn>
     // NOLINTNEXTLINE(performance-unnecessary-value-param): delta is moved into fn, unseen by tidy
     void merge(MergeFn&& fn, T delta) {
+        this->update([&fn, &delta](T& current) { fn(current, std::move(delta)); });
+    }
+
+    /// @brief Changes the slot value in place with fn(T& current) and marks it pending. `fn` runs
+    /// under the Inbox mutex: a pure data operation only. Unlike merge() it takes no value, so a
+    /// caller holding a large payload hands it over by reference instead of by another copy.
+    template <typename UpdateFn>
+    void update(UpdateFn&& fn) {
         if (!this->check_bound()) {
             return;
         }
         std::lock_guard<std::mutex> lock(this->inbox_->mutex_);
-        fn(this->slot_, std::move(delta));
+        fn(this->slot_);
         this->dirty_ = true;
         this->inbox_->set_bit_locked(this->topic_bit_);
     }
@@ -480,22 +488,21 @@ public:
 
     /// @brief Merges a delta into the pending payload with fn(T& current, T&& delta), under the
     /// rule in the class comment. `fn` runs under the Inbox mutex: a pure data operation only.
+    /// The delta is taken and merged by reference: a by-value or stamped copy would put another
+    /// payload, a metadata state's strings among them, on the protocol task's stack.
     template <typename MergeFn>
-    // NOLINTNEXTLINE(performance-unnecessary-value-param): delta is moved into fn, unseen by tidy
-    void merge(MergeFn&& fn, T delta, uint32_t generation) {
-        this->slot_.merge(
-            [&fn, generation](Stamped& current, Stamped&& added) {
-                if (current.held && current.generation != generation) {
-                    if (!generation_after(generation, current.generation)) {
-                        return;  // Older than what is pending: the teardown discarded it.
-                    }
-                    current.value = T{};
+    void merge(MergeFn&& fn, T&& delta, uint32_t generation) {
+        this->slot_.update([&fn, &delta, generation](Stamped& current) {
+            if (current.held && current.generation != generation) {
+                if (!generation_after(generation, current.generation)) {
+                    return;  // Older than what is pending: the teardown discarded it.
                 }
-                current.held = true;
-                current.generation = generation;
-                fn(current.value, std::move(added.value));
-            },
-            Stamped{std::move(delta), generation, true});
+                current.value = T{};
+            }
+            current.held = true;
+            current.generation = generation;
+            fn(current.value, std::move(delta));
+        });
     }
 
     /// @brief Moves the pending payload and its stamp out

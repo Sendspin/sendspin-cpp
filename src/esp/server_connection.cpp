@@ -325,16 +325,18 @@ esp_err_t SendspinServerConnection::discard_frame_payload(httpd_req_t* req,
         return ESP_OK;
     }
     // httpd hands a frame's payload over only whole (httpd_ws_recv_frame() needs max_len >= the
-    // frame length, httpd_ws.c), so a dropped message still needs room for its frame. A frame
-    // larger than any message the connection could legitimately carry closes it instead.
-    if (ws_pkt.len > INBOUND_MAX_MESSAGE_BYTES) {
-        SS_LOGW(TAG, "Dropped frame of %zu bytes exceeds one Noise frame; closing", ws_pkt.len);
+    // frame length, httpd_ws.c), so a dropped message still needs room for its frame. The buffer
+    // holds the longest message a live connection drops: a ring item's, or a pre-admission
+    // message's. A longer frame is dropped only by a detached connection that is being torn down,
+    // or by an admitted one whose fallback buffer stayed full; it is closed instead.
+    if (server == nullptr || ws_pkt.len > server->discard_capacity()) {
+        SS_LOGW(TAG, "No room to drain a dropped %zu-byte frame; closing", ws_pkt.len);
         return ESP_FAIL;
     }
-    uint8_t* scratch = server != nullptr ? server->discard_buffer() : nullptr;
+    uint8_t* scratch = server->discard_buffer();
     if (scratch == nullptr) {
         SS_LOGE(TAG, "No %zu-byte buffer to discard a frame into; closing",
-                INBOUND_MAX_MESSAGE_BYTES);
+                server->discard_capacity());
         return ESP_FAIL;
     }
     return SendspinServerConnection::receive_frame_payload(req, ws_pkt, scratch);

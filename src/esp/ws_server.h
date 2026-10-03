@@ -118,6 +118,21 @@ public:
         this->server_port_ = port;
     }
 
+    /// @brief Sets the size of the buffer a dropped frame is read into (discard_buffer()): the
+    /// longest message a live connection can have dropped, max(InboundRing::max_message_bytes(),
+    /// InboundGate::PRE_ADMISSION_MESSAGE_BYTES). Call before start(); a frame longer than it is
+    /// closed rather than drained (SendspinServerConnection::discard_frame_payload()).
+    void set_discard_capacity(size_t bytes) {
+        this->discard_capacity_ = bytes;
+        // A buffer a previous run left (stop() keeps it when httpd_stop() failed) may be shorter.
+        this->discard_buf_.reset();
+    }
+
+    /// @brief The size set_discard_capacity() set
+    size_t discard_capacity() const {
+        return this->discard_capacity_;
+    }
+
     /// @brief Overrides the ESP-IDF httpd control port
     /// Defaults to 0 (uses ESP_HTTPD_DEF_CTRL_PORT + 1 to avoid conflict with web_server).
     void set_ctrl_port(uint16_t ctrl_port) {
@@ -140,12 +155,15 @@ public:
         return this->server_ != nullptr;
     }
 
-    /// @brief Scratch space of INBOUND_MAX_MESSAGE_BYTES a dropped frame's payload is read into
+    /// @brief Scratch space of discard_capacity() bytes a dropped frame's payload is read into
     /// (SendspinServerConnection::discard_frame_payload()). httpd hands a frame's payload over
     /// only whole: httpd_ws_recv_frame() needs max_len >= the frame length (httpd_ws.c), so a
     /// dropped frame still needs a buffer of its size. Allocated on the first drop, PSRAM
-    /// preferred, and kept until stop(), so a ring that stays full does not allocate per frame.
-    /// httpd task only: every session shares that one task, so one buffer serves them all.
+    /// preferred, and kept until stop() rather than freed when a run of drops ends: runs end per
+    /// connection while the buffer serves every session, and a run happens when the ring is full,
+    /// so freeing and re-allocating it per run would churn a block of up to 64 KB through the
+    /// heap exactly when memory is tightest. httpd task only: every session shares that one task,
+    /// so one buffer serves them all.
     /// @return nullptr when it cannot be allocated.
     uint8_t* discard_buffer();
 
@@ -209,6 +227,10 @@ protected:
 
     /// @brief httpd control port override (0 = use ESP_HTTPD_DEF_CTRL_PORT + 1)
     uint16_t ctrl_port_{0};
+
+    /// @brief See set_discard_capacity(). Written by the protocol task before start(); read by
+    /// the httpd task, which start() creates after it.
+    size_t discard_capacity_{INBOUND_MAX_MESSAGE_BYTES};
 };
 
 }  // namespace sendspin

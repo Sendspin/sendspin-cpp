@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -609,10 +610,13 @@ TEST(InboundGate, CloseIsHonouredOnlyOnceNothingIsInFlight) {
 
 // The derived ring always satisfies the FreeRTOS storage rule, accepts a maximal message and holds
 // every term of the derivation: each holder's quota, the pass-through traffic that can arrive
-// during the player's longest hold (state JSON, time replies, visualizer frames), and the images
-// that window carries or the maximal-message allowance. The terms are recomputed here from the
-// stated budget (a track change every 30 s). Rows cover each role mix; the first is the
-// controller-only floor.
+// during the longest hold, the player's or the visualizer's (state JSON, time replies, visualizer
+// frames behind held audio), and the images that window carries or the maximal-message
+// allowance. The terms are recomputed here from the stated budget (a track change every 30 s),
+// which re-encodes the derivation's rule: it checks the terms add up, not that the rule is right.
+// The independent check is ClientLifecycle.TheInboundRingFollowsTheEnabledRoles, whose rows
+// state each ring size as a literal worked out by hand. Rows cover each role mix; the first is
+// the controller-only floor.
 TEST(InboundRingSize, DerivationHoldsEveryTerm) {
     struct Row {
         const char* name;
@@ -629,6 +633,9 @@ TEST(InboundRingSize, DerivationHoldsEveryTerm) {
          {100000, 8192, 30 * 72, 2 * inbound_frames_stored_bytes(64 * 1024)}},
         {"player size not a multiple of 4", {100001, 0, 0, 0}},
         {"faster time bursts", {100000, 0, 0, 0, 16, 1000}},
+        {"visualizer only, holding longer than any player: 140,000 bytes at 30 loudness frames "
+         "a second",
+         {0, 140000, 30 * 68, 0}},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -640,14 +647,23 @@ TEST(InboundRingSize, DerivationHoldsEveryTerm) {
         // The player's longest hold at the lowest budgeted rate, and what arrives meanwhile.
         const size_t stored_per_second =
             (160 + 13 + INBOUND_ITEM_STORED_OVERHEAD_BYTES) * 50;  // 20 ms Opus at 64 kbit/s
-        const size_t hold_seconds =
+        const size_t player_hold_seconds =
             (row.budget.audio_hold_bytes + stored_per_second - 1) / stored_per_second;
+        // The visualizer's oldest frame waits until its quota of frames ahead of it is shown.
+        const size_t visualizer_hold_seconds =
+            row.budget.visualizer_stored_bytes_per_second > 0
+                ? (row.budget.visualizer_hold_bytes +
+                   row.budget.visualizer_stored_bytes_per_second - 1) /
+                      row.budget.visualizer_stored_bytes_per_second
+                : 0;
+        const size_t hold_seconds = std::max(player_hold_seconds, visualizer_hold_seconds);
         const size_t bursts =
             hold_seconds > 0
                 ? hold_seconds * 1000 / static_cast<size_t>(row.budget.time_burst_interval_ms) + 1
                 : 0;
         const size_t held_passthrough =
-            hold_seconds * (1024 + row.budget.visualizer_stored_bytes_per_second) +
+            hold_seconds * 1024 +
+            player_hold_seconds * row.budget.visualizer_stored_bytes_per_second +
             bursts * row.budget.time_burst_size * INBOUND_TIME_REPLY_STORED_BYTES;
         const size_t allowance =
             row.budget.artwork_images_stored_bytes > 0

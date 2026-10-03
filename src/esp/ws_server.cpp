@@ -66,9 +66,8 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
         config.task_caps = MALLOC_CAP_SPIRAM;
     }
     config.task_priority = task_priority;
-    // Clamp to the documented minimum, the value shipped and verified on hardware (see
-    // SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE), until this task's receive path is
-    // measured.
+    // Clamp to the documented minimum, the measured stack of this task's deepest call chain (see
+    // SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE).
     if (task_stack_size < SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE) {
         SS_LOGW(TAG, "httpd_stack_size %u below minimum %u; clamping",
                 static_cast<unsigned>(task_stack_size),
@@ -158,7 +157,7 @@ void SendspinWsServer::stop() {
 
 uint8_t* SendspinWsServer::discard_buffer() {
     if (this->discard_buf_.data() == nullptr &&
-        !this->discard_buf_.allocate(INBOUND_MAX_MESSAGE_BYTES, MemoryLocation::PREFER_EXTERNAL)) {
+        !this->discard_buf_.allocate(this->discard_capacity_, MemoryLocation::PREFER_EXTERNAL)) {
         return nullptr;
     }
     return this->discard_buf_.data();

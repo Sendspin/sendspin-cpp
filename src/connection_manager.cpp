@@ -1367,6 +1367,12 @@ uint32_t ConnectionManager::maybe_start_ws_server(int64_t now_us) {
     if (!this->client_->network_provider_->is_network_ready()) {
         return NETWORK_POLL_INTERVAL_MS;
     }
+    // A dropped frame is drained into a buffer of the longest message a live connection can have
+    // dropped (see SendspinWsServer::set_discard_capacity()).
+    const InboundRing* ring = this->client_->inbound_ring_.get();
+    this->ws_server_->set_discard_capacity(
+        std::max(ring != nullptr ? ring->max_message_bytes() : INBOUND_MAX_MESSAGE_BYTES,
+                 InboundGate::PRE_ADMISSION_MESSAGE_BYTES));
     if (!this->ws_server_->start(this->client_, this->client_->config_.httpd_psram_stack,
                                  this->client_->config_.httpd_priority,
                                  this->client_->config_.httpd_stack_size)) {

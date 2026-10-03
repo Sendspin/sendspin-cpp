@@ -347,6 +347,16 @@ public:
         return this->ring_.is_created();
     }
 
+    /// @brief The longest message an acquire() can succeed for: what an item of the ring's
+    /// largest size (SharedRingLayout::max_item_size(), half its storage) holds after its header,
+    /// capped at INBOUND_MAX_MESSAGE_BYTES. The derivation sizes the ring for the largest message
+    /// the enabled roles need (InboundRingBudget::largest_message_bytes), so a transport routes a
+    /// longer one through the connection's fallback buffer instead. Written by create(); read by
+    /// any thread after it.
+    size_t max_message_bytes() const {
+        return this->max_message_bytes_;
+    }
+
     /// @brief The ring's storage base, which InboundItemHeader::next offsets are relative to
     uint8_t* storage() const {
         return this->ring_.storage();
@@ -473,6 +483,8 @@ private:
 
     // size_t fields
     size_t pending_len_{0};
+    /// See max_message_bytes(). Written by create() before any producer runs.
+    size_t max_message_bytes_{0};
 
     // 32-bit fields
     /// Completions of items at the storage start. Incremented by transport threads before the
@@ -619,12 +631,15 @@ inline bool hand_inbound_item(InboundRing& ring, InboundItemList& list, InboundH
  *
  * Embedded in SendspinConnection. It carries:
  *  - the admitted flag, which decides where the transport puts a message;
- *  - the pre-admission hand-off: an unadmitted connection never writes into the shared ring,
+ *  - the fallback hand-off: an unadmitted connection never writes into the shared ring,
  *    because items returned at once still stay unreclaimable behind held audio, so a peer that
  *    holds only the Sentinel PSK could otherwise fill the ring. It delivers each complete message
  *    through its own fallback buffer, of at most PRE_ADMISSION_MESSAGE_BYTES, one message at a
  *    time. A larger message closes the connection, which is tighter than the one-frame
- *    (INBOUND_MAX_MESSAGE_BYTES) limit an admitted connection has;
+ *    (INBOUND_MAX_MESSAGE_BYTES) limit an admitted connection has. An admitted connection uses
+ *    the same hand-off for a message longer than the ring takes (InboundRing::
+ *    max_message_bytes()), which the ring is not sized for when no enabled role needs a maximal
+ *    frame;
  *  - the in-flight count of ring items the transport has begun writing and the protocol task
  *    has not yet taken;
  *  - the out-of-band close flag, honoured only once nothing of the connection is still queued
@@ -634,14 +649,16 @@ inline bool hand_inbound_item(InboundRing& ring, InboundItemList& list, InboundH
  *    drops what it receives, and a wait_until_writable() ends at once, so no transport thread a
  *    release joins is parked on this gate.
  *
- * Ordering at admission. While a pre-admission message is pending the transport writes nowhere,
+ * Ordering. While a message is pending in the fallback buffer the transport writes nowhere,
  * neither into the fallback buffer nor into the ring (may_write(), and begin_ring_write() and
  * publish_pending_message() refuse), and it waits for consume_pending_message() through
- * wait_until_writable(). The protocol task handles a connection's pending message before any of
- * its ring items. The message that gets a connection admitted is therefore processed, and the
- * admitted flag set, before the transport routes its next message, which then goes to the ring.
- * The reverse transition, dropping an admitted connection, precedes its close, so ring items it
- * still has queued never need ordering against a later fallback message.
+ * wait_until_writable(). The protocol task handles a connection's pending message only once every
+ * ring item the connection wrote before it has been taken (in_flight() is 0; with the transport
+ * writing nowhere the count can only fall), and before any ring item written after it. The
+ * message that gets a connection admitted is therefore processed, and the admitted flag set,
+ * before the transport routes its next message, which then goes to the ring; and an admitted
+ * connection's long message routed through the fallback buffer keeps its place between its ring
+ * items.
  *
  * Cost: one event group per connection for that wait (an xEventGroupCreate() heap allocation on
  * ESP, made in the constructor); is_created() reports whether it succeeded.
@@ -692,7 +709,7 @@ public:
         return this->admitted_.load(std::memory_order_acquire);
     }
 
-    // ---- Pre-admission hand-off ----
+    // ---- Fallback hand-off ----
 
     /// @brief Whether a pre-admission message of `len` bytes is within the cap; the transport
     /// closes the connection on one that is not
@@ -887,19 +904,72 @@ struct InboundMessage {
 // Ring size derivation
 // ============================================================================
 
+/// The longest JSON message the ring is sized to take: the size a reassembled pre-admission
+/// message is capped at (MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES, eight steady-state JSON
+/// arenas), plus the AEAD tag. A longer one still arrives, through the connection's fallback
+/// buffer (see InboundRing::max_message_bytes()).
+static constexpr size_t INBOUND_JSON_MESSAGE_BYTES =
+    MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES + AEAD_TAG_SIZE;
+
+/// @brief The longest message a role that holds ring items can be sent, from the buffer_capacity
+/// it advertises: the server sends no message longer than that, since it counts each whole
+/// message against it (roles/player/v1.md "Player Buffer Accounting": an audio chunk's 13-byte
+/// header and its payload; roles/visualizer/v1.md: a message's type byte, timestamp and data).
+/// Plus the AEAD tag, and at most one Noise frame: a longer chunk arrives fragmented into maximal
+/// frames. 0 for a role that is not enabled.
+static constexpr size_t inbound_held_message_bytes(size_t advertised_capacity) {
+    return advertised_capacity == 0
+               ? 0
+               : std::min(advertised_capacity + AEAD_TAG_SIZE, INBOUND_MAX_MESSAGE_BYTES);
+}
+
+/// @brief The longest message the enabled roles need delivered in one ring item: the largest of
+/// one JSON message (INBOUND_JSON_MESSAGE_BYTES), which every admitted connection receives, and
+/// the player's and the visualizer's longest message (inbound_held_message_bytes()); with the
+/// artwork role a maximal Noise frame, since its images arrive in maximal frames
+/// (roles/artwork/v1.md "Artwork (Binary)").
+/// @param player_message_bytes inbound_held_message_bytes() of the player's advertised capacity,
+///        0 without the player.
+/// @param visualizer_message_bytes The same for the visualizer.
+/// @param artwork Whether the artwork role is enabled.
+static constexpr size_t inbound_largest_message_bytes(size_t player_message_bytes,
+                                                      size_t visualizer_message_bytes,
+                                                      bool artwork) {
+    if (artwork) {
+        return INBOUND_MAX_MESSAGE_BYTES;
+    }
+    return std::max({INBOUND_JSON_MESSAGE_BYTES, player_message_bytes, visualizer_message_bytes});
+}
+
+/// @brief Ring storage one item holding a message of `message_len` bytes occupies
+static constexpr size_t inbound_item_stored_bytes(size_t message_len) {
+    return SharedRingLayout::stored_size(sizeof(InboundItemHeader) + message_len);
+}
+
+/// @brief Ring storage below which a message of `largest_message_bytes` no longer fits: a
+/// FreeRTOS no-split ring accepts an item of at most half its storage
+/// (SharedRingLayout::max_item_size()), so the floor is two such items.
+static constexpr size_t inbound_ring_min_storage_bytes(size_t largest_message_bytes) {
+    return 2 * inbound_item_stored_bytes(largest_message_bytes);
+}
+
 /// Ring storage the largest inbound item occupies.
 static constexpr size_t INBOUND_MAX_ITEM_STORED_BYTES =
-    SharedRingLayout::stored_size(sizeof(InboundItemHeader) + INBOUND_MAX_MESSAGE_BYTES);
+    inbound_item_stored_bytes(INBOUND_MAX_MESSAGE_BYTES);
 
-/// Ring storage below which a maximal message no longer fits: a FreeRTOS no-split ring accepts
-/// an item of at most half its storage (SharedRingLayout::max_item_size()).
-static constexpr size_t INBOUND_RING_MIN_STORAGE_BYTES = 2 * INBOUND_MAX_ITEM_STORED_BYTES;
+/// The floor of a ring that accepts a maximal message (131,152 bytes).
+static constexpr size_t INBOUND_RING_MIN_STORAGE_BYTES =
+    inbound_ring_min_storage_bytes(INBOUND_MAX_MESSAGE_BYTES);
 static_assert(SharedRingLayout::max_item_size(INBOUND_RING_MIN_STORAGE_BYTES) >=
                   sizeof(InboundItemHeader) + INBOUND_MAX_MESSAGE_BYTES,
               "the minimum ring must accept a maximal message");
+static_assert(
+    SharedRingLayout::max_item_size(inbound_ring_min_storage_bytes(INBOUND_JSON_MESSAGE_BYTES)) >=
+        sizeof(InboundItemHeader) + INBOUND_JSON_MESSAGE_BYTES,
+    "the minimum JSON-only ring must accept a maximal JSON message");
 
 /// Pass-through allowance without the artwork role, on top of the per-second budget below:
-/// maximal messages (JSON, or a protocol message the task returns at once) that can arrive behind
+/// largest messages (JSON, or a protocol message the task returns at once) that can arrive behind
 /// a held item. Two lets one arrive while the previous is still being processed.
 static constexpr size_t INBOUND_PASSTHROUGH_MESSAGES = 2;
 
@@ -945,7 +1015,7 @@ static constexpr size_t INBOUND_STATE_BYTES_PER_SECOND = 1024;
 /// The shortest track the artwork budget assumes: one track change, and so one new image per
 /// artwork channel, every 30 seconds. An assumption about listening, not a protocol bound: a
 /// listener skipping tracks faster than this pins more images than budgeted, which the transport
-/// reports as "ring pinned behind held audio".
+/// reports as "ring pinned behind held items".
 static constexpr size_t INBOUND_MIN_TRACK_SECONDS = 30;
 
 /// @brief The configuration figures the ring size is derived from
@@ -973,6 +1043,10 @@ struct InboundRingBudget {
     size_t time_burst_size{SendspinClientConfig::DEFAULT_BURST_SIZE};
     /// SendspinClientConfig::time_burst_interval_ms: milliseconds between bursts.
     int64_t time_burst_interval_ms{SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS};
+    /// The longest message the enabled roles need in one ring item
+    /// (inbound_largest_message_bytes()), which sets the ring's floor and its pass-through
+    /// allowance without artwork.
+    size_t largest_message_bytes{INBOUND_MAX_MESSAGE_BYTES};
 };
 
 /// @brief Ring storage a run of maximal frames carrying `payload_bytes` occupies: each whole
@@ -995,12 +1069,39 @@ static constexpr size_t inbound_max_hold_seconds(size_t audio_hold_bytes) {
            INBOUND_MIN_AUDIO_STORED_BYTES_PER_SECOND;
 }
 
-/// @brief Pass-through traffic that can arrive during the player's hold window and is returned
-/// at once, or at its display time, but stays unreclaimable behind the oldest audio item: the
-/// state JSON budget, every time-burst reply in the window, and the visualizer frames the window
-/// carries.
+/// @brief The longest the visualizer holds its oldest frame, in whole seconds, assuming the server
+/// fills its quota at the requested rate (visualizer_stored_bytes_per_second, every type at
+/// rate_max), rounded up. 0 without the visualizer.
+///
+/// rate_max is a cap, not a floor, so this is the shortest hold, a lower bound: a sparser stream
+/// (a beat-only stream at two frames a second against a rate_max of 30) fills the same quota
+/// over a far longer window and pins the pass-through traffic arriving meanwhile longer than
+/// budgeted. No minimum rate is assumed instead, since a sparse stream would derive an absurd
+/// ring; the symptom is the transport's "ring pinned behind held items" warning and the dropped
+/// messages it reports.
+static constexpr size_t inbound_visualizer_hold_seconds(const InboundRingBudget& budget) {
+    if (budget.visualizer_stored_bytes_per_second == 0) {
+        return 0;
+    }
+    return (budget.visualizer_hold_bytes + budget.visualizer_stored_bytes_per_second - 1) /
+           budget.visualizer_stored_bytes_per_second;
+}
+
+/// @brief The longest any holder keeps its oldest item, in whole seconds: the player's hold
+/// (inbound_max_hold_seconds()) or the visualizer's (inbound_visualizer_hold_seconds()),
+/// whichever is longer. Everything that arrives meanwhile stays unreclaimable behind that item.
+static constexpr size_t inbound_hold_seconds(const InboundRingBudget& budget) {
+    return std::max(inbound_max_hold_seconds(budget.audio_hold_bytes),
+                    inbound_visualizer_hold_seconds(budget));
+}
+
+/// @brief Pass-through traffic that can arrive during the longest hold window
+/// (inbound_hold_seconds()) and is returned at once, or at its display time, but stays
+/// unreclaimable behind the oldest held item: the state JSON budget and every time-burst reply
+/// in the window, and the visualizer frames the player's window carries. Within the visualizer's
+/// own window its frames are the ones its quota already holds.
 static constexpr size_t inbound_held_passthrough_bytes(const InboundRingBudget& budget) {
-    const size_t hold_seconds = inbound_max_hold_seconds(budget.audio_hold_bytes);
+    const size_t hold_seconds = inbound_hold_seconds(budget);
     if (hold_seconds == 0) {
         return 0;
     }
@@ -1008,17 +1109,17 @@ static constexpr size_t inbound_held_passthrough_bytes(const InboundRingBudget& 
         budget.time_burst_interval_ms > 0
             ? hold_seconds * 1000 / static_cast<size_t>(budget.time_burst_interval_ms) + 1
             : 0;
-    return hold_seconds *
-               (INBOUND_STATE_BYTES_PER_SECOND + budget.visualizer_stored_bytes_per_second) +
+    return hold_seconds * INBOUND_STATE_BYTES_PER_SECOND +
+           inbound_max_hold_seconds(budget.audio_hold_bytes) *
+               budget.visualizer_stored_bytes_per_second +
            bursts * budget.time_burst_size * INBOUND_TIME_REPLY_STORED_BYTES;
 }
 
 /// @brief Artwork that can sit in the ring at once: one image per channel per track change
-/// within the player's hold window (INBOUND_MIN_TRACK_SECONDS), plus the set in flight, since
-/// an image returned at its display time is still pinned behind audio held longer.
+/// within the longest hold window (INBOUND_MIN_TRACK_SECONDS), plus the set in flight, since
+/// an image returned at its display time is still pinned behind items held longer.
 static constexpr size_t inbound_artwork_bytes(const InboundRingBudget& budget) {
-    const size_t images =
-        inbound_max_hold_seconds(budget.audio_hold_bytes) / INBOUND_MIN_TRACK_SECONDS + 1;
+    const size_t images = inbound_hold_seconds(budget) / INBOUND_MIN_TRACK_SECONDS + 1;
     return images * budget.artwork_images_stored_bytes;
 }
 
@@ -1031,35 +1132,54 @@ static constexpr size_t inbound_artwork_bytes(const InboundRingBudget& budget) {
  * ring therefore holds:
  *  - the player's hold window (audio_hold_bytes),
  *  - the visualizer's quota (visualizer_hold_bytes), for the frames it holds before display,
- *  - the pass-through traffic arriving inside the player's hold window
- *    (inbound_held_passthrough_bytes(): the state JSON and time-burst budget and the visualizer's
- *    frame rate, times the longest hold, inbound_max_hold_seconds()). A visualizer frame is
- *    returned at its display time, a few seconds after it arrives, but stays pinned behind
- *    audio received after it and held far longer, so its own quota does not bound it,
+ *  - the pass-through traffic arriving inside the longest hold window, the player's or the
+ *    visualizer's (inbound_held_passthrough_bytes(): the state JSON and time-burst budget times
+ *    inbound_hold_seconds(), and the visualizer's frame rate times the player's hold,
+ *    inbound_max_hold_seconds()). A visualizer frame is returned at its display time, a few
+ *    seconds after it arrives, but stays pinned behind audio received after it and held far
+ *    longer, so its own quota does not bound it,
  *  - the artwork that window carries (inbound_artwork_bytes()), or INBOUND_PASSTHROUGH_MESSAGES
- *    maximal messages without artwork,
- * and never less than INBOUND_RING_MIN_STORAGE_BYTES, rounded up to the 4-byte multiple FreeRTOS
- * requires. Unadmitted connections never write into the ring (InboundGate), so they add nothing.
+ *    items of largest_message_bytes without artwork,
+ * and never less than two items of largest_message_bytes (inbound_ring_min_storage_bytes()),
+ * rounded up to the 4-byte multiple FreeRTOS requires. Unadmitted connections never write into
+ * the ring (InboundGate), so they add nothing.
+ *
+ * The largest item follows the enabled roles (inbound_largest_message_bytes()): a maximal Noise
+ * frame with the artwork role or a player advertising a buffer of a frame or more, which floors
+ * the ring at 131,152 bytes; a 16 KiB JSON message with neither, which floors it at 32,880 bytes;
+ * and the player's longest chunk in between. An admitted connection's
+ * message longer than the ring takes (InboundRing::max_message_bytes()) goes through the
+ * connection's fallback buffer, one at a time and in order with its ring items, and is processed
+ * there: JSON and artwork as from a ring item, while a frame a consumer would hold (a visualizer
+ * frame past every requested size) finds no room for its copy and is dropped with a warning. The
+ * audio and visualizer frames the roles budget for always fit, so they are never copied.
  *
  * Traffic beyond this budget (a burst of large JSON, a lower audio rate than budgeted, faster
  * track changes) waits in the transport's acquire and is dropped after
- * INBOUND_ACQUIRE_TIMEOUT_MS with a warning naming the held audio.
+ * INBOUND_ACQUIRE_TIMEOUT_MS with a warning naming the held items. So does a visualizer stream
+ * sparser than its rate_max (see inbound_visualizer_hold_seconds()).
+ *
+ * The derivation assumes a server's visualizer lead never exceeds its audio lead. If it did, the
+ * audio returned as it plays would stay pinned behind the oldest visualizer frame, and nothing
+ * in the configuration bounds how long that frame is held.
  *
  * With the default configuration (a 1,000,000-byte player quota, no visualizer or artwork) this
  * is 1,000,000 + 111,552 held pass-through bytes (87 s at 1,024 B/s, plus 9 bursts of 8 time
  * replies at 312 stored bytes) + 131,152 for two maximal messages = 1,242,704 bytes. The separate
  * buffers it replaced held 1,000,000 bytes of encoded audio plus one maximal payload buffer per
- * open connection (1,065,551 bytes with one connection), and advertised 800,000 bytes to the
- * server against the 666,666 the player advertises now (see PlayerRole's
- * AUDIO_BUFFER_ADVERTISE_DENOMINATOR).
+ * open connection (1,065,535 bytes with one connection: MAX_TRANSPORT_PLAINTEXT + 16), and
+ * advertised 800,000 bytes to the server against the 666,666 the player advertises now (see
+ * PlayerRole's AUDIO_BUFFER_ADVERTISE_DENOMINATOR).
  */
 static constexpr size_t derive_inbound_ring_bytes(const InboundRingBudget& budget) {
     const size_t allowance = budget.artwork_images_stored_bytes > 0
                                  ? inbound_artwork_bytes(budget)
-                                 : INBOUND_PASSTHROUGH_MESSAGES * INBOUND_MAX_ITEM_STORED_BYTES;
+                                 : INBOUND_PASSTHROUGH_MESSAGES *
+                                       inbound_item_stored_bytes(budget.largest_message_bytes);
     const size_t total = budget.audio_hold_bytes + budget.visualizer_hold_bytes +
                          inbound_held_passthrough_bytes(budget) + allowance;
-    return SharedRingLayout::align(std::max(total, INBOUND_RING_MIN_STORAGE_BYTES));
+    return SharedRingLayout::align(
+        std::max(total, inbound_ring_min_storage_bytes(budget.largest_message_bytes)));
 }
 
 }  // namespace sendspin

@@ -128,6 +128,10 @@ struct VisualizerRole::Impl {
     ///        links.
     bool start(InboundRing* ring);
     void build_hello_fields(ClientHelloMessage& msg) const;
+    /// @brief The buffer_capacity client/hello advertises: the share of the quota left for wire
+    /// data (see BUFFER_ADVERTISE_DIVISOR in visualizer_role.cpp), which also bounds the longest
+    /// message the server sends.
+    size_t advertised_buffer_capacity() const;
     /// @brief Inbound ring storage the requested stream arrives at per second: every requested
     /// type at rate_max, each frame at its stored size (a spectrum frame with the configured bin
     /// count), for the ring's pass-through budget (InboundRingBudget).

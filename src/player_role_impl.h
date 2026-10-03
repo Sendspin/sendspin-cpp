@@ -92,6 +92,10 @@ struct PlayerRole::Impl {
     /// @param ring The client's inbound ring for this run, which the sync task's item list links.
     bool start(SendspinPersistenceProvider* persistence, InboundRing* ring);
     void build_hello_fields(ClientHelloMessage& msg);
+    /// @brief The buffer_capacity client/hello advertises: the share of the quota that holds
+    /// encoded frames at the smallest frame size (see AUDIO_BUFFER_ADVERTISE_DENOMINATOR in
+    /// player_role.cpp), which also bounds the longest chunk the server sends.
+    size_t advertised_buffer_capacity() const;
     void build_state_fields(ClientStateMessage& msg) const;
     // Each handler takes the teardown generation the receive gate captured when it admitted the
     // message and re-checks it where it takes effect; see accepts(). All run on the protocol task.

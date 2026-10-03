@@ -1,0 +1,23 @@
+{
+ "_comment": [
+  "Each task's stack roots: the function its FreeRTOS task starts in."
+ ],
+ "protocol_task": [
+  "pthread_task_func"
+ ],
+ "httpd": [
+  "httpd_thread"
+ ],
+ "websocket_client": [
+  "esp_websocket_client_task"
+ ],
+ "sync_task": [
+  "sym:SyncTask12thread_entry"
+ ],
+ "httpd_frame_receive": [
+  "sym:SendspinServerConnection11handle_data"
+ ],
+ "websocket_event_handler": [
+  "sym:SendspinClientConnection23websocket_event_handler"
+ ]
+}

@@ -18,6 +18,7 @@
 #include "platform/logging.h"
 #include "platform/time.h"
 
+#include <algorithm>
 #include <mutex>
 #include <utility>
 
@@ -39,6 +40,11 @@ bool InboundRing::create(size_t storage_bytes, MemoryLocation location) {
         this->storage_.reset();
         return false;
     }
+    const size_t max_item = SharedRingLayout::max_item_size(storage_bytes);
+    this->max_message_bytes_ =
+        max_item > sizeof(InboundItemHeader)
+            ? std::min(max_item - sizeof(InboundItemHeader), INBOUND_MAX_MESSAGE_BYTES)
+            : 0;
     return true;
 }
 

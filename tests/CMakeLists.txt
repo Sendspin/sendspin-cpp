@@ -76,7 +76,10 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # command_mutex_ and command_count_ (how many commands wait); ConnectionManager's admitted_,
 # nursery_, install_admitted(), refresh_published_state(), scan_nursery(), close_admission() and
 # drop_connection() (to install, swap out, and drop a stand-in connection, and to run one scan);
-# and SendspinConnection's noise_handshake_complete_ (a stand-in's finished handshake). The
+# and SendspinConnection's noise_handshake_complete_ (a stand-in's finished handshake) and its
+# transport side, begin_inbound_message() and end_inbound_message() (a stand-in's transport writing
+# a ring item and a fallback message). The ring-size tables read SendspinClient::inbound_ring_ and
+# InboundRing::storage_, the ring a start() created, whose size no public call reports. The
 # next-deadline tables also stage each timer state against a fixed clock, which no public call can
 # do: ConnectionManager's liveness_timeout_us_, pairing_window_open_until_us_,
 # ws_server_start_retry_time_us_ and tick(); SendspinTimeBurst's burst_index_,

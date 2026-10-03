@@ -76,9 +76,8 @@ void SendspinClientConnection::start() {
     config.uri = this->url_.c_str();
     config.disable_auto_reconnect = true;  // A lost connection is not reopened
     config.task_prio = static_cast<int>(this->task_priority_);
-    // Clamp to the documented minimum, the value shipped and verified on hardware (see
-    // SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE), until this task's receive path is
-    // measured.
+    // Clamp to the documented minimum, the measured stack of this task's deepest call chain (see
+    // SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE).
     size_t task_stack_size = this->task_stack_size_;
     if (task_stack_size < SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE) {
         SS_LOGW(TAG, "websocket_stack_size %u below minimum %u; clamping",

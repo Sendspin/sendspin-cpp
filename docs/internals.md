@@ -17,7 +17,7 @@ Listener callbacks fire on the caller's main loop unless noted otherwise. Connec
 | Thread | Name | Created by | Purpose |
 |--------|------|-----------|---------|
 | **Main loop** | (caller's) | User code | Drives `SendspinClient::loop()`, which only drains the Inbox: every role event, listener callback, high-performance request and persistence-provider write runs here. Calls `start()`/`stop()`. |
-| **Protocol task** | `SsProto` | `ProtocolTask::start()`, from `SendspinClient::start()` | Owns every connection and the `ConnectionManager` slots: decrypt, Noise reassembly and handshakes, hello, activation, admission and role ownership, pairing, JSON and binary dispatch, time bursts, watchdogs, every send, and the consumer requests in its command queue. Ticks on a wake or at its next deadline (`SendspinClient::protocol_tick()`, see [The Protocol Task's Tick](#the-protocol-tasks-tick)). |
+| **Protocol task** | `SsProto` | `ProtocolTask::start()`, from `SendspinClient::start()` | Owns every connection and the `ConnectionManager` slots: decrypt, Noise reassembly and handshakes, hello, activation, admission and role ownership, pairing, JSON and binary dispatch, time bursts, watchdogs, every send, and the consumer requests in its command queue. Ticks on a wake or at its next deadline (`SendspinClient::protocol_tick()`, see [The Protocol Task's Tick](#the-protocol-tasks-tick)). Runs no single-precision float of its own, with one exposure: ArduinoJson's `parseNumber()` converts a JSON number with a fraction or an exponent through `float` even with `ARDUINOJSON_USE_DOUBLE`, and on ESP-IDF a task's first FPU instruction pins it to its current core for good (ESP-IDF's FreeRTOS notes on floating point). No protocol field carries such a number. A parse filter skips unknown fields without converting them, but cannot help for a field the library keeps, so a peer that sends such a number there pins the task; the library adds no core pinning of its own. |
 | **Sync task** | `Sendspin` | `SyncTask::start()` | Decodes audio, aligns it to server timestamps (`docs/playback-sync.md`), writes PCM via `on_audio_write`, and notes its return to idle to the main loop through the Inbox. |
 | **Visualizer drain** | `SsVis` | `VisualizerRole::Impl::start()` | Delivers visualization frames from its item list at their playback time. |
 | **Artwork decode** | `SsArt` | `ArtworkRole::Impl::start()` | Calls `on_image_decode()` for completed images; hands the display deadline to the main loop. |
@@ -37,7 +37,7 @@ The primitives other than the Inbox live in `src/platform/`, with FreeRTOS imple
 | `ThreadSafeQueue` | Fixed-depth hand-off from the protocol task to a worker (the artwork notification queue) |
 | `InboundRing` (`src/inbound_ring.h`) | The one shared ring every admitted connection's transport receives into; the protocol task takes its items in arrival order |
 | `InboundItemList` | A role's FIFO of inbound ring items, linked through the items themselves: the protocol task appends, the sync task or visualizer drain thread takes and returns. Each holder's items are charged to its `InboundQuota`. Its mutex also guards the two-party return count of a task-written (LOCAL) item charged to that holder, since the ring storage may be external RAM, where the ESP32 cannot run an atomic |
-| `InboundGate` | Per connection, between its transport and the protocol task: the admitted and detached flags, the one pre-admission message in flight, the count of ring items not yet taken, and the out-of-band close |
+| `InboundGate` | Per connection, between its transport and the protocol task: the admitted and detached flags, the one fallback message in flight (pre-admission, or longer than the ring takes), the count of ring items not yet taken, and the out-of-band close |
 | `ProtocolTask` command queue | Bounded requests from any thread to the protocol task (`ProtocolCommand`): the accepts the platform servers deliver, and the consumer's `connect_to()`, `disconnect()`, `leave()`, pairing-window gestures, `send_text()` and unpaired-access changes. Beside it, one latest-wins `client/state` snapshot slot (`publish_state()`) |
 | `ShadowSlot` | Single-writer/single-reader state whose reader is not the main loop, latest-wins or merged (sync-task playback progress) |
 | `Inbox` (`src/inbox.h`) | Cross-thread state bound for the main loop |
@@ -80,10 +80,12 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
 3. The newest client/state snapshot, sent to every admitted connection
 4. Recall the inbound items of a stream role torn down since the last tick
 5. client/init on outbound connections whose WebSocket upgrade completed
-6. The receive pass over a snapshot of the managed connections: each connection's pending
-   pre-admission message, then up to 32 ring items in arrival order
+6. The receive pass over a snapshot of the managed connections: each connection's message
+   pending in its fallback buffer once the ring items it wrote before it are taken, then up to
+   32 ring items in arrival order
 7. Losses: a connection whose gate is detached or whose close is ready is dropped
-   (ConnectionManager::on_connection_lost())
+   (ConnectionManager::on_connection_lost()); a fallback message the ring items just taken held
+   back makes the tick run again at once
 8. ConnectionManager::tick(): the nursery's hello sends, the promotion of operational nursery
    connections, the establish reap; the admitted connections' liveness, re-prove and
    pairing-attempt watchdogs; the pairing window's expiry; the platform server's upgrade reap;
@@ -94,7 +96,7 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
     connected slots other threads read
 ```
 
-The tick returns the milliseconds until the earliest of its timers: a nursery entry's hello retry or establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound returns 0 and runs again at once. Every handler a message reaches runs inside step 6, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
+The tick returns the milliseconds until the earliest of its timers: a nursery entry's hello retry or establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound, or one that freed a held-back fallback message, returns 0 and runs again at once. No timer is periodic except the network poll, which runs only while the server is down, so an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 6, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
 
 ## One Main Loop Drain
 
@@ -186,7 +188,12 @@ Encryption is mandatory, so every application message arrives as a binary Noise 
 Transport thread (IXWebSocket / esp_http_server / esp_websocket_client)
   │
   ├─ Admitted connection: receives the message straight into an InboundRing item
-  │  (waits up to INBOUND_ACQUIRE_TIMEOUT_MS for room, else drops it with a warning)
+  │  (waits up to INBOUND_ACQUIRE_TIMEOUT_MS for room, else drops it with a warning); a
+  │  message longer than the ring takes (InboundRing::max_message_bytes()) goes to the
+  │  fallback buffer, waiting the same bound for the previous one to be consumed, else
+  │  dropped with a warning; on the ESP server, which must drain the frame into a discard
+  │  buffer sized to the ring's longest message, the connection closes instead: every
+  │  admitted fallback drop closes on ESP
   ├─ Unadmitted connection: receives into its fallback buffer and publishes it as the one
   │  pending message (waits up to InboundGate::WRITABLE_WAIT_MS for the previous one, else
   │  closes); a message over InboundGate::PRE_ADMISSION_MESSAGE_BYTES closes
@@ -195,7 +202,7 @@ Transport thread (IXWebSocket / esp_http_server / esp_websocket_client)
   └─ wakes the protocol task
          │
 Protocol task: SendspinClient::protocol_tick()
-  ├─ per connection: its pending pre-admission message
+  ├─ per connection: its pending fallback message, once its earlier ring items are taken
   └─ ring items in arrival order → SendspinConnection::process_inbound_message()
      ├─ detached connection → dropped (teardown guard)
      ├─ Text frame → handshake driver only (server/init, noise/handshake)
@@ -312,7 +319,7 @@ Each getter reads the slot once, so a caller that checks `is_time_synced()` and 
 
 ### Client Start and Stop
 
-`SendspinClient::start()` validates the pairing config, creates the `RecordStore` and identity, loads persisted state, creates the inbound ring (sized by `derive_inbound_ring_bytes()` from the player's and visualizer's quotas, the pass-through traffic that arrives while the player holds its oldest chunk (state JSON, time-burst replies and visualizer frames), and the artwork images that window carries), starts the threaded roles with it, publishes the first `client/state` snapshot, opens `ConnectionManager` for admission (starting the WebSocket server at once when the network is already up, otherwise the protocol task starts it once it is), and starts the protocol task. An accept the server delivers before the task starts waits in the command queue.
+`SendspinClient::start()` validates the pairing config, creates the `RecordStore` and identity, loads persisted state, creates the inbound ring whatever roles are enabled, since every admitted connection receives into it, the time replies included (sized by `derive_inbound_ring_bytes()` from the player's and visualizer's quotas, the pass-through traffic that arrives during the longest hold, the player's or the visualizer's (state JSON, time-burst replies, and visualizer frames behind held audio), and the artwork images that window carries, never below two of the longest messages the enabled roles need in one item: a 16 KiB JSON message, the longest chunk the player's and visualizer's advertised buffers allow, or a maximal Noise frame with artwork), starts the threaded roles with it, publishes the first `client/state` snapshot, opens `ConnectionManager` for admission (starting the WebSocket server at once when the network is already up, otherwise the protocol task starts it once it is), and starts the protocol task. An accept the server delivers before the task starts waits in the command queue.
 
 `SendspinClient::stop()` is synchronous and ordered so that every producer is gone before any state is reset:
 

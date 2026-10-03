@@ -791,9 +791,12 @@ public:
     /// detaches the inbound gate. The caller returns `message.item` if it is still set.
     void process_inbound_message(InboundMessage& message);
 
-    /// @brief Describes the pre-admission message the transport published, if there is one.
-    /// Protocol task only; hand the buffer back with consume_pending_message() once done with it.
-    /// @return false when no message is pending.
+    /// @brief Describes the message the transport published to the fallback buffer (a
+    /// pre-admission message, or an admitted connection's message longer than the ring takes),
+    /// once it is next in this connection's order. Protocol task only; hand the buffer back with
+    /// consume_pending_message() once done with it.
+    /// @return false when no message is pending, or while a ring item the connection wrote before
+    ///         it is still untaken (InboundGate::in_flight(); see InboundGate "Ordering").
     bool pending_message(InboundMessage& out);
 
     /// @brief Hands the fallback buffer back to the transport. Protocol task only.
@@ -864,8 +867,13 @@ protected:
     /// begin_inbound_fragment() was asked about
     enum class InboundRoute : uint8_t {
         RECEIVE,  ///< Receive the bytes into InboundTarget::data, then end the message
-        DROP,     ///< Read and discard the bytes; the connection stays open
-        CLOSE,    ///< Close the connection: fail_inbound() has already run
+        /// Read and discard the bytes; the connection stays open (a detached connection, or an
+        /// admitted one's message that found no ring item or fallback buffer in time). For a
+        /// message longer than the ring takes, on the ESP server, which must drain the frame into
+        /// a discard buffer sized to the ring's longest message, the connection closes instead:
+        /// every admitted fallback drop closes on ESP.
+        DROP,
+        CLOSE,  ///< Close the connection: fail_inbound() has already run
     };
 
     /// @brief Where the transport puts the bytes it is about to receive
@@ -879,7 +887,12 @@ protected:
     /// An admitted connection receives straight into a ring item it acquires here, waiting up to
     /// INBOUND_ACQUIRE_TIMEOUT_MS for room, and drops the message with a warning when there is
     /// none; a message longer than INBOUND_MAX_MESSAGE_BYTES closes the connection, since no
-    /// conforming peer sends one (the Noise layer fragments). An unadmitted connection receives
+    /// conforming peer sends one (the Noise layer fragments), and one longer than the ring takes
+    /// (InboundRing::max_message_bytes()) goes through the fallback buffer, in order with the ring
+    /// items, waiting up to INBOUND_ACQUIRE_TIMEOUT_MS for the previous one to be consumed and
+    /// dropped with a warning after it (route_to_fallback(); on the ESP server, which must drain
+    /// the frame into a discard buffer sized to the ring's longest message, the connection closes
+    /// instead: every admitted fallback drop closes on ESP). An unadmitted connection receives
     /// into its fallback buffer once the previous pre-admission message is consumed, waiting up
     /// to InboundGate::WRITABLE_WAIT_MS; a message over InboundGate::PRE_ADMISSION_MESSAGE_BYTES,
     /// a wait that times out, or a buffer that cannot be allocated closes the connection. A
@@ -935,8 +948,22 @@ protected:
 
     /// @brief Chooses the destination for a complete message of `len` bytes, as
     /// begin_inbound_message() describes, without touching the liveness stamp or the fallback
-    /// buffer's lifetime. Transport thread.
+    /// buffer's lifetime: including the DROP of an admitted fallback message, which on the ESP
+    /// server closes the connection instead. Transport thread.
     InboundTarget route_inbound_message(size_t len, InboundKind kind, uint32_t stamp);
+
+    /// @brief Routes a complete message of `len` bytes to the fallback buffer, once the protocol
+    /// task has consumed the previous one, allocating the buffer when it is shorter. Transport
+    /// thread.
+    ///
+    /// An unadmitted connection waits up to InboundGate::WRITABLE_WAIT_MS and is closed when the
+    /// wait times out (wait_until_writable()). An admitted connection's message, one longer than
+    /// the ring takes, waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and is then
+    /// dropped with the same throttled warning, the connection left open; on the ESP server,
+    /// which must drain the frame into a discard buffer sized to the ring's longest message, the
+    /// connection closes instead: every admitted fallback drop closes on ESP.
+    /// @return RECEIVE into the buffer; DROP or CLOSE as above; an allocation failure closes.
+    InboundTarget route_to_fallback(size_t len, InboundKind kind, uint32_t stamp, bool admitted);
 
     /// @brief InboundGate::wait_until_writable() bounded by InboundGate::WRITABLE_WAIT_MS; a
     /// timeout on a connection that is not detached closes it through fail_inbound(). Transport
@@ -969,8 +996,9 @@ protected:
 
     // Struct fields
 
-    /// The fallback buffer: a pre-admission message, or a multi-frame message being assembled
-    /// (see begin_inbound_fragment()). Written by the transport thread; read by the protocol task
+    /// The fallback buffer: a pre-admission message, an admitted connection's message longer than
+    /// the ring takes, or a multi-frame message being assembled (see begin_inbound_fragment()).
+    /// Written by the transport thread; read by the protocol task
     /// only while a message is pending (InboundGate::has_pending_message()), during which the
     /// transport does not touch it. Allocated on demand up to the cap in force
     /// (InboundGate::PRE_ADMISSION_MESSAGE_BYTES unadmitted, INBOUND_MAX_MESSAGE_BYTES admitted)

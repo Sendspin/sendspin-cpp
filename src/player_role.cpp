@@ -285,15 +285,18 @@ void PlayerRole::Impl::stop() const {
 void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::PLAYER);
 
-    // Advertise the share of the quota that holds encoded frames at the smallest frame size (see
-    // AUDIO_BUFFER_ADVERTISE_DENOMINATOR), so the server's fill never overruns the quota
+    // Advertise the share of the quota that holds encoded frames at the smallest frame size, so
+    // the server's fill never overruns the quota
     PlayerSupportObject player_support = {
         .supported_formats = this->config.audio_formats,
-        .buffer_capacity = this->config.audio_buffer_capacity *
-                           (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
-                           AUDIO_BUFFER_ADVERTISE_DENOMINATOR,
+        .buffer_capacity = this->advertised_buffer_capacity(),
     };
     msg.player_v1_support = std::move(player_support);
+}
+
+size_t PlayerRole::Impl::advertised_buffer_capacity() const {
+    return this->config.audio_buffer_capacity * (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
+           AUDIO_BUFFER_ADVERTISE_DENOMINATOR;
 }
 
 void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
@@ -500,7 +503,7 @@ void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
                 cp.output_delay_ms = dp.output_delay_ms;
             }
         },
-        cmd, generation);
+        ServerCommandMessage{cmd}, generation);
 }
 
 void PlayerRole::Impl::on_stream_ring_event(PlayerStreamCallbackType event) {

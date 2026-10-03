@@ -302,8 +302,12 @@ void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
     // buffer_capacity bytes of ring storage, but per-item overhead leaves only a fraction of it
     // for wire data (see BUFFER_ADVERTISE_DIVISOR). The quota itself is the full value.
     VisualizerSupportObject advertised = this->visualizer_support;
-    advertised.buffer_capacity /= BUFFER_ADVERTISE_DIVISOR;
+    advertised.buffer_capacity = this->advertised_buffer_capacity();
     msg.visualizer_support = advertised;
+}
+
+size_t VisualizerRole::Impl::advertised_buffer_capacity() const {
+    return this->visualizer_support.buffer_capacity / BUFFER_ADVERTISE_DIVISOR;
 }
 
 void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
