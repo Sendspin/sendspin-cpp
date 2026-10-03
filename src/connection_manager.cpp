@@ -494,8 +494,8 @@ void ConnectionManager::start() {
     }
 
     this->ws_server_->set_new_connection_callback(
-        [this](std::shared_ptr<SendspinServerConnection> conn) {
-            this->on_new_connection(std::move(conn));
+        [this](const std::shared_ptr<SendspinServerConnection>& conn) {
+            this->on_new_connection(conn);
         });
 
     this->ws_server_->set_connection_closed_callback(
@@ -1427,7 +1427,7 @@ void ConnectionManager::setup_connection_callbacks(SendspinConnection* conn) {
     };
 }
 
-void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnection> conn) {
+void ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerConnection>& conn) {
     // Called from the platform ws_server's delivery path (ESP: httpd task, host: IXWebSocket
     // thread) once the connection's WebSocket upgrade has been observed, so the manager never sees
     // a socket that has not proven it speaks WebSocket. The authoritative owner is the platform's
@@ -1483,12 +1483,12 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
                                        std::string(NOISE_SUITE_CHACHAPOLY));
             conn->send_noise_client_init();
-            this->push_nursery_entry(NurseryEntry{.conn = std::move(conn)});
+            this->push_nursery_entry(NurseryEntry{.conn = conn});
         }
     }
-    // Outside the lock, since the send can block (see DeferredRelease). Dropping this inbound
-    // connection here joins nothing: host shares the IX socket with the server, ESP's is owned by
-    // its httpd session.
+    // Outside the lock, since the send can block (see DeferredRelease). The caller's reference to
+    // a rejected inbound connection then drops on this thread, which joins nothing: host shares the
+    // IX socket with the server, ESP's is owned by its httpd session.
     if (rejection.has_value()) {
         conn->disconnect(rejection.value(), nullptr);
     }

@@ -566,9 +566,9 @@ private:
     /// is armed later, once the Noise handshake completes (see the hello scan in
     /// scan_hello_and_nursery()).
     /// @param conn The newly delivered server connection. The session slot keeps a parallel
-    ///             refcount, so this observer can be reset at any time without freeing the conn
-    ///             out from under in-flight httpd workers.
-    void on_new_connection(std::shared_ptr<SendspinServerConnection> conn);
+    ///             refcount, so the caller's reference can be dropped at any time without freeing
+    ///             the conn out from under in-flight httpd workers.
+    void on_new_connection(const std::shared_ptr<SendspinServerConnection>& conn);
 
     /// @brief Finds the nursery entry holding `conn`, or nursery_.end(). Caller must hold
     /// conn_ptr_mutex_.
