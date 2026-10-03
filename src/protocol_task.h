@@ -175,8 +175,9 @@ struct ProtocolCommand {
  *
  * Lifecycle matches the role threads: start() clears every flag and spawns the thread; stop()
  * sets COMMAND_STOP, wakes the wait, lets the thread run one final tick so commands queued
- * before the stop are seen by the task, joins it, and then drops anything still queued one
- * command at a time.
+ * before the stop are seen by the task, and joins it. Commands pushed after that final tick stay
+ * queued for the joining thread, which takes them (take_command()) or drops them
+ * (drop_commands()).
  */
 class ProtocolTask {
 public:
@@ -229,10 +230,24 @@ public:
     /// @return false when the event flags could not be created or the task already runs.
     bool start(Tick tick, size_t stack_size, unsigned priority, bool stack_in_psram);
 
-    /// @brief Signals the thread, waits for its final tick and joins it, then drops every
-    /// command and state snapshot still queued, one command at a time. No-op when the thread is
-    /// not running. Main loop only.
+    /// @brief Signals the thread, waits for its final tick and joins it, then drops the state
+    /// snapshot still waiting. Commands stay queued for the caller (take_command(),
+    /// drop_commands()). No-op when the thread is not running. Main loop only.
     void stop();
+
+    /// @brief Drops every queued command, one at a time, outside the queue lock. Main loop only,
+    /// with the thread joined; the destructor runs it too.
+    void drop_commands();
+
+    /// @brief Refuses every later ACCEPT_CONNECTION push (push_command() returns false). Set
+    /// under the queue lock, so an accept is either queued before it, and taken by the caller's
+    /// refusal pass, or refused at its push, with nothing in between. Main loop, from stop() once
+    /// the thread is joined.
+    void close_accepts();
+
+    /// @brief Takes accepts again; see close_accepts(). Main loop, from start() before the
+    /// platform server can deliver.
+    void open_accepts();
 
     /// @brief Whether the thread is running. Main loop only.
     bool is_running() const {
@@ -308,6 +323,10 @@ private:
     size_t command_count_{0};
     size_t command_head_{0};
     size_t accepts_queued_{0};
+
+    // 8-bit fields
+    /// Set by close_accepts(), cleared by open_accepts(); guarded by command_mutex_.
+    bool accepts_closed_{false};
 };
 
 }  // namespace sendspin

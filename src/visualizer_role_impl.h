@@ -145,22 +145,21 @@ struct VisualizerRole::Impl {
     void handle_stream_ring_event(VisualizerEventType event) const;
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
-    /// The gate in SendspinClient's role dispatch is checked once, on the protocol task, while the
-    /// handler it admits runs on: a teardown on the main loop can land in between. Re-checking at
-    /// each point of effect invalidates the whole handler instead of only the part that ran
-    /// before it.
+    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
+    /// runs, and stop()'s teardown on the main loop can land in between. Re-checking at each point
+    /// of effect invalidates the whole handler instead of only the part that ran before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
     }
 
-    /// @brief Stops the role and discards its state. Main loop only.
+    /// @brief Stops the role and discards its state. Protocol task, or the main loop in
+    /// SendspinClient::stop() once every other thread is joined.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
     /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
     /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
-    /// the inbox rather than fired here, because both callers run under the connection manager's
-    /// conn_ptr_mutex_.
+    /// the inbox, stamped with the new generation.
     void cleanup();
 
     // ========================================
@@ -233,7 +232,7 @@ struct VisualizerRole::Impl {
     // Bitmask of negotiated wire types, bit N = wire type SENDSPIN_BINARY_VISUALIZER_FIRST + N.
     // Written by handle_stream_start and read by handle_binary on the same protocol task, so
     // admission is always judged against the config in force when a message arrives; atomic only
-    // because cleanup() clears it from the main thread.
+    // because stop() runs cleanup() on the main loop once the protocol task is joined.
     std::atomic<uint8_t> negotiated_types_mask{0};
 };
 

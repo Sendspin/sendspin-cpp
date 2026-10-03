@@ -70,13 +70,10 @@ public:
     /// @brief Starts the connection (initializes time filter, prepares for messages)
     void start() override;
 
-    /// @brief Periodic loop processing (handles time message sending)
-    void loop() override;
-
     /// @brief Sends a goodbye carrying @p reason, then calls trigger_close() from the send's
     /// async completion callback.
     /// @param on_complete Optional; invoked after the goodbye send completes or fails, on the
-    ///                    httpd worker thread. Use defer() if main-loop context is needed.
+    ///                    httpd worker thread, so it must be safe to run there.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
     /// @brief Closes the transport immediately without blocking (see base class doc comment).
@@ -89,7 +86,7 @@ public:
     /// @brief Marks the connection closed after the httpd session ends
     ///
     /// Called from the ws server's close notification (httpd thread). Without this,
-    /// is_connected() stayed true until the manager dropped the connection on the main loop,
+    /// is_connected() stayed true until the protocol task dropped the connection,
     /// and a queued async send in that window could resolve the stale sockfd against a
     /// recycled httpd session and write the frame to the wrong peer.
     void mark_closed() {

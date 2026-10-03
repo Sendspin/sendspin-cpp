@@ -49,9 +49,6 @@ public:
     /// @brief No-op on server connections; the transport is already established when this is called
     void start() override;
 
-    /// @brief No-op on server connections; state is event-driven via handle_message()
-    void loop() override;
-
     /// @brief Sends a goodbye message and closes the connection
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 

@@ -114,7 +114,8 @@ static constexpr uint32_t INBOUND_LIST_END = UINT32_MAX;
 /// which the message is dropped with a warning. The ring holds every holder's quota plus a
 /// pass-through allowance (derive_inbound_ring_bytes()), so an acquire waits only while the
 /// protocol task is behind on taking items or while ring-order reclamation holds space behind the
-/// oldest held item. Sized at the bottom of the 100-200 ms stall budget the main loop is held to:
+/// oldest held item. Sized at the bottom of the 100-200 ms stall budget the library's threads are
+/// held to:
 /// longer than a protocol tick that runs a Noise handshake's DH operations (tens of milliseconds
 /// on an ESP32), so a busy task does not cost a message, and short enough that a stalled one
 /// costs a dropped message rather than a parked transport. On ESP each timed-out acquire parks
@@ -655,14 +656,13 @@ public:
         MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES;
 
     /// Bound on the transport's wait_until_writable() before it gives up on an unadmitted
-    /// connection and closes it. A protocol tick can wait on three things: the Noise handshake's
-    /// DH operations (tens of milliseconds on an ESP32), up to two INBOUND_ACQUIRE_TIMEOUT_MS
-    /// waits for ring space for a codec header and a stream marker (200 ms), and
-    /// ConnectionManager::conn_ptr_mutex_, which is held as long as a main-loop section holds it
-    /// and so has no bound of its own. 500 ms covers the first two with a margin, on the
-    /// assumption that no main-loop section holds the manager lock for more than about 250 ms;
-    /// a longer hold closes the waiting connection rather than parking the transport thread,
-    /// which on ESP is the httpd task every inbound connection shares.
+    /// connection and closes it. A protocol tick can wait on two things: the Noise handshake's
+    /// DH operations (tens of milliseconds on an ESP32), and up to two INBOUND_ACQUIRE_TIMEOUT_MS
+    /// waits for ring space for a codec header and a stream marker (200 ms). Every lock the
+    /// task takes is a leaf held for a copy, so nothing else stretches a tick. 500 ms covers
+    /// both with a margin; a task stalled beyond it closes the waiting connection rather than
+    /// parking the transport thread, which on ESP is the httpd task every inbound connection
+    /// shares.
     static constexpr uint32_t WRITABLE_WAIT_MS = 500;
 
     InboundGate() {
@@ -838,8 +838,9 @@ private:
     /// Written by the thread that admits and drops connections; read by the transport thread and
     /// any thread asking whether the connection is admitted.
     std::atomic<bool> admitted_{false};
-    /// Set by the connection manager (main loop) or the protocol task; read by the transport
-    /// thread and the protocol task.
+    /// Set by the protocol task (the connection manager, or the receive path closing the
+    /// connection), or by stop() once it is joined; read by the transport thread and the protocol
+    /// task.
     std::atomic<bool> detached_{false};
     /// Set by the transport thread (publish), cleared by the protocol task (consume).
     std::atomic<bool> message_pending_{false};
@@ -855,10 +856,10 @@ private:
  * @brief One complete inbound message as the protocol task processes it
  *
  * The bytes are in a ring item (`item` set: an admitted connection's message), in the
- * connection's fallback buffer (a pre-admission message), in the Noise reassembly buffer (a
- * fragmented message), or in the pre-admission hold (a replayed message); only the first can be
- * handed to a consumer as it is. A role that keeps the item (appends it to its consumer's list)
- * clears `item`, and the caller returns whatever is left set.
+ * connection's fallback buffer (a pre-admission message), or in the Noise reassembly buffer (a
+ * fragmented message); only the first can be handed to a consumer as it is. A role that keeps the
+ * item (appends it to its consumer's list) clears `item`, and the caller returns whatever is left
+ * set.
  */
 struct InboundMessage {
     // Pointer fields

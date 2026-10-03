@@ -13,23 +13,25 @@
 // limitations under the License.
 
 /// @file admission.h
-/// @brief Pure functions for server/activate trust enforcement and multi-server admission
-/// arbitration.
+/// @brief Pure functions for server/activate trust enforcement, multi-server admission
+/// arbitration, and role ownership among admitted connections.
 ///
 /// Implements the allowed-activity-set table and the rejection order in messaging.md
 /// "server/activate", and the priority arbitration in connection.md "Multiple servers
 /// (server-initiated)".
 ///
-/// All functions are pure, so they unit-test independently of the network layer. The admission
-/// handler in ConnectionManager::loop() applies them on the main loop thread; do not call from
-/// the protocol task.
+/// All functions are pure, so they unit-test independently of the network layer.
+/// ConnectionManager applies them on the protocol task as each server/activate is processed.
 
 #pragma once
 
 #include "protocol_messages.h"
 #include "record_store.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -238,6 +240,58 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
     }
 
     return true;
+}
+
+// ============================================================================
+// Role ownership among admitted connections
+// ============================================================================
+
+/// @brief One admitted slot as role ownership sees it
+struct AdmittedRoles {
+    /// Roles the slot's connection owns, as SendspinConnection::get_active_role_mask() bits.
+    uint16_t owned_roles{0};
+    /// Whether a connection occupies the slot.
+    bool occupied{false};
+};
+
+/// @brief Which admitted slots an incoming connection must win arbitration against
+///
+/// Each admitted connection owns the roles it drives, and no role has two owners. An incoming
+/// connection whose roles no admitted connection owns takes a free slot without arbitration. It
+/// conflicts with every admitted connection that owns one of its roles, and must win
+/// should_admit_connection() against each of them, displacing them all, to be admitted. With no
+/// such conflict and no free slot, it competes with every occupied slot: a slot can only be freed
+/// by displacing its connection.
+/// @param incoming_roles The incoming connection's active roles, as role_mask_bit() bits.
+/// @param slots The admitted slots.
+/// @return Bit i set when slot i is a conflict; 0 when the incoming connection takes a free slot
+///         unopposed.
+inline uint32_t admission_conflicts(uint16_t incoming_roles, std::span<const AdmittedRoles> slots) {
+    uint32_t conflicts = 0;
+    uint32_t occupied = 0;
+    bool has_free_slot = false;
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (!slots[i].occupied) {
+            has_free_slot = true;
+            continue;
+        }
+        occupied |= 1U << i;
+        if ((slots[i].owned_roles & incoming_roles) != 0) {
+            conflicts |= 1U << i;
+        }
+    }
+    if (conflicts == 0 && !has_free_slot) {
+        return occupied;
+    }
+    return conflicts;
+}
+
+/// @brief The roles an admitted connection owns after an activation: the ones it activates that
+/// no other admitted connection owns
+/// @param active_roles The connection's active roles after the activation.
+/// @param owned_by_others The union of every other admitted connection's owned roles.
+inline uint16_t claimable_roles(uint16_t active_roles, uint16_t owned_by_others) {
+    return static_cast<uint16_t>(active_roles & ~owned_by_others);
 }
 
 }  // namespace sendspin

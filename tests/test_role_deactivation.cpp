@@ -23,7 +23,6 @@
 /// and each later activation is sent as a plain application message.
 
 #include "artwork_role_impl.h"  // In-flight transfer state after a removal; private, see CMakeLists
-#include "connection_manager.h"  // Pending-activate flag, to queue an event ahead of a removal
 #include "color_role_impl.h"     // Held scheduled palette after a removal
 #include "controller_role_impl.h"  // Seeded supported-commands mask for the inactive-role send gate
 #include "crypto/constants.h"
@@ -72,6 +71,11 @@ constexpr uint16_t STALE_START_CONTROL_TEST_PORT = 19038;
 constexpr uint16_t INACTIVE_TRAFFIC_TEST_PORT = 19039;
 constexpr uint16_t VERSION_REPLACED_TEST_PORT = 19040;
 constexpr uint16_t INACTIVE_ROLE_SEND_TEST_PORT = 19085;
+
+/// A group/update the protocol task processes after whatever the server sent before it, so its
+/// inbox bit marks those messages as applied.
+constexpr const char* GROUP_UPDATE_JSON =
+    R"({"type":"group/update","payload":{"playback_state":"playing"}})";
 
 /// How long a scenario pumps to give a callback that must NOT fire every chance to fire.
 constexpr int SETTLE_MS = 300;
@@ -613,14 +617,14 @@ TEST(RoleDeactivation, ReAddedPlayerPublishesItsStateAndPlaysAgain) {
 // ============================================================================
 
 // A stream/start that reached the inbox before the activate that removes the role must not act
-// after it. The client applies the activation (and the teardown) in connection_manager_->loop(),
-// which runs ahead of the event drain in the same tick, so the queued START is drained with the
-// role already stopped: acting on it would fire on_stream_start() for a removed role and re-arm
-// the sync task, which then writes PCM from the chunks already in its ring.
+// after it. The protocol task applies the activation (and the teardown) as soon as it parses it,
+// while the START waits in the inbox for the main loop, so the START is drained with the role
+// already stopped: acting on it would fire on_stream_start() for a removed role and re-arm the
+// sync task, which then writes PCM from the chunks already in its ring.
 //
-// Nothing is pumped between the three sends, so the START is provably still in the ring when the
-// activate is applied: the test waits for the ring bit and the manager's pending-event flag
-// instead of for a duration.
+// Nothing is pumped between the sends, so the START is provably still in the ring when the
+// activate is applied: a group/update sent behind the activate is processed after it, and the
+// test waits for its inbox bit beside the ring bit instead of for a duration.
 TEST(RoleDeactivation, StreamStartQueuedBeforeARemovalNeverStarts) {
     CountingPlayerListener player_listener;
 
@@ -645,12 +649,13 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeARemovalNeverStarts) {
         ts += 20 * 1000;
     }
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["metadata@v1"])")));
+    ASSERT_TRUE(server->send_app_json(GROUP_UPDATE_JSON));
 
-    // Both halves are in: the START sits in the event ring, the activate in the manager's pending
-    // events. The next loop() tick applies the activate first and drains the ring second.
+    // Both halves are in: the START sits in the event ring and the activate has been applied,
+    // since the group/update behind it reached the inbox.
     wait_until([&] {
-        return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
-               client.connection_manager_->has_pending_events_.load();
+        const uint32_t bits = client.player()->impl_->inbox->poll();
+        return (bits & INBOX_TOPIC_EVENTS) != 0 && (bits & INBOX_TOPIC_GROUP) != 0;
     });
 
     pump_for(client, SETTLE_MS);
@@ -692,10 +697,11 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeAKeepingActivateStillStarts) {
     }
     // Adds metadata, keeps the player: the queued START is for a role that is still active.
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","metadata@v1"])")));
+    ASSERT_TRUE(server->send_app_json(GROUP_UPDATE_JSON));
 
     wait_until([&] {
-        return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
-               client.connection_manager_->has_pending_events_.load();
+        const uint32_t bits = client.player()->impl_->inbox->poll();
+        return (bits & INBOX_TOPIC_EVENTS) != 0 && (bits & INBOX_TOPIC_GROUP) != 0;
     });
 
     pump_until(client, [&] { return player_listener.stream_starts == 1; });

@@ -67,14 +67,23 @@ add_executable(sendspin_tests
 set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_client_lifecycle.cpp checks what a role's stop() left on its item list, which nothing on
-# the public surface reports, and installs a stand-in connection in ConnectionManager's admitted
-# slot (and drops it mid-publish) to pin publish_state()'s hold on it; it reads the private members
-# directly instead of adding a seam. Reached: SendspinClient::connection_manager_, player_ and
-# each role's impl_ (the sync task, which a feeder thread hands chunks to directly, and the
-# visualizer's drain list, whose links it reads under the list's lock); ConnectionManager's
-# conn_ptr_mutex_, current_connection_, set_current_connection(), drop_connection() and
-# flush_deferred_releases() (to install, swap out, and drop a stand-in connection) and accepting_
-# (closed to take on_new_connection()'s admission-closed rejection).
+# the public surface reports, and plays the protocol task on the test thread to install a stand-in
+# connection in ConnectionManager's admitted slot, to stage an accept or a full command queue at
+# stop(), and to hand on_new_connection() a delivery; it reads the private members directly instead
+# of adding a seam. Reached: SendspinClient::connection_manager_, protocol_task_, protocol_tick(),
+# player_ and each role's impl_ (the sync task, which a feeder thread hands chunks to directly, and
+# the visualizer's drain list, whose links it reads under the list's lock); ProtocolTask's
+# command_mutex_ and command_count_ (how many commands wait); ConnectionManager's admitted_,
+# nursery_, install_admitted(), refresh_published_state(), scan_nursery(), close_admission() and
+# drop_connection() (to install, swap out, and drop a stand-in connection, and to run one scan);
+# and SendspinConnection's noise_handshake_complete_ (a stand-in's finished handshake). The
+# next-deadline tables also stage each timer state against a fixed clock, which no public call can
+# do: ConnectionManager's liveness_timeout_us_, pairing_window_open_until_us_,
+# ws_server_start_retry_time_us_ and tick(); SendspinTimeBurst's burst_index_,
+# last_burst_complete_time_, pending_embedded_, current_message_sent_time_, send_retry_after_ms_
+# and pending_burst_completed_; and SendspinConnection's first_activate_received_ and
+# last_receive_time_us_. The stale-command and refused-delivery tests reach the queue through
+# protocol_task_ to push a command, or close accepts, the way a race or stop() would.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
@@ -83,8 +92,7 @@ set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS
 # state role's held scheduled update and its teardown generation (including a direct
 # handle_server_state() call with that generation), the controller's supported-commands mask
 # (seeded so a command reaches the inactive-role send gate), plus the queued-event probe that proves
-# ordering without a sleep (a role inbox's topic bits and the connection manager's pending-event
-# flag).
+# ordering without a sleep (a role inbox's topic bits).
 set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_player_role.cpp drives PlayerRole::Impl directly - no connected server, no sync-task
@@ -145,30 +153,23 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     works through: the store answers whether an unpaired record still resolves for this boot,
 #     which is what "revoked" means. (The persisted half of the same removal is observable through
 #     the test's persistence provider.)
-#   - SendspinClient::process_json_message(), admit_connection(), replay_admitted_messages(),
-#     protocol_tick() and protocol_task_, to deliver traffic to a stand-in connection, admit it
-#     and replay its hold on the test thread, which is how the hold/replay tests place messages on
-#     either side of admission. Those fixtures stop the protocol task after start() and play it
-#     themselves, since a second thread running the same entry points would race them.
-#   - ConnectionManager::conn_ptr_mutex_, held where loop() holds it.
+#   - SendspinClient::process_json_message(), process_binary_message(), protocol_tick() and
+#     protocol_task_, to deliver traffic to a stand-in connection on the test thread. Those
+#     fixtures stop the protocol task after start() and play it themselves, since a second thread
+#     running the same entry points would race them.
 #   - SendspinClient::request_persist(), note_last_played_server() and
-#     flush_pending_persistence(), plus ConnectionManager::set_current_connection()/
-#     flush_pending_admission() and handle_server_unpair()/flush_deferred_releases(): the RAM
-#     change and its flush are separate steps on purpose, and only a test that takes them apart
-#     can show what one tick coalesces.
-#   - SendspinConnection::last_receive_time_us_, held_count_ and held_bytes_, the hold buffer's
-#     accounting and the liveness stamp a stand-in connection has no transport to set (and, for
-#     the stamp, one the liveness tick test ages directly instead of waiting). Likewise
+#     flush_pending_persistence(), plus ConnectionManager::install_admitted(),
+#     note_playback_activity() and handle_server_unpair(): the RAM change and its flush are
+#     separate steps on purpose, and only a test that takes them apart can show what one drain
+#     coalesces.
+#   - SendspinConnection::last_receive_time_us_, the liveness stamp a stand-in connection has no
+#     transport to set (and one the liveness tick test ages directly instead of waiting). Likewise
 #     time_frame_tag_ and time_frame_sent_us_, the client/time frame in flight that only a send
 #     over a Noise transport records.
-#   - ConnectionManager::nursery_ (read under conn_ptr_mutex_), swap_out_pending_events() and
-#     DrainedEvents: the outbound open/close callbacks are reachable only through the connect_to()
-#     connection that carries them, and whether an event about an already-released connection was
-#     dropped or queued is visible only in the pending queues until loop() drains them.
-#   - ConnectionManager::push_nursery_entry(), to hand loop() a stand-in connection to promote:
-#     when the first client/state leaves relative to admission, and whether the liveness tick
-#     drops the connection, are decided inside one tick. The liveness test also reads
-#     liveness_timeout_us_, the timeout that tick compares against.
+#   - ConnectionManager::admitted_, primary(), nursery_, refresh_published_state() and
+#     liveness_timeout_us_: a stand-in connection handed to the nursery is promoted by one
+#     protocol tick, which decides when the first client/state leaves relative to admission and
+#     whether the liveness scan drops the connection.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

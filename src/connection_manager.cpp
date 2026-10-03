@@ -29,6 +29,7 @@
 #include "platform/time.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
+#include "protocol_task.h"
 #include "record_store.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
@@ -37,8 +38,10 @@
 #include "time_filter.h"
 #include "ws_server.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
+#include <cinttypes>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -57,24 +60,19 @@ static const std::vector<std::string> EMPTY_ROLES{};
 /// @brief Refuses an activation the client cannot act on
 ///
 /// pairing.md "Client <-> Server: pair/abort" answers a method or format the client does not offer
-/// with pair/abort rather than a close, so the activation is never applied. The role bits the
-/// protocol task added for it when it parsed the message (see
-/// SendspinConnection::note_activated_roles()) are taken back in the same step, so the receive
-/// gate cannot be widened by an activation the client refused.
+/// with pair/abort rather than a close, so the activation is never applied: the connection keeps
+/// the activities and roles it had.
 ///
 /// Answering here rather than ignoring the activate matters: a server that never hears back sits
 /// waiting for the device forever, with nothing on either side to explain the stall.
-/// @param event The activation being refused.
+/// @param conn The connection the activation arrived on.
 /// @param why What the activation asked for that the client cannot act on.
 /// @param method The pairing method the activation named, for the diagnostic.
-static void refuse_activate(const ServerActivateEvent& event, const char* why, const char* method) {
-    SendspinConnection* conn = event.conn.get();
+static void refuse_activate(SendspinConnection* conn, const char* why, const char* method) {
     SS_LOGW(TAG,
             "server/activate %s (pairing.method=%s) for server_id=%s; replying "
             "pair/abort(method_not_supported), connection stays open",
             why, method, conn->get_server_id().c_str());
-    conn->withdraw_activated_roles(event.active_roles.has_value() ? event.active_roles.value()
-                                                                  : EMPTY_ROLES);
     conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
 }
 
@@ -289,7 +287,7 @@ static std::optional<SendspinPairMethod> selected_pairing_method(
     return std::nullopt;
 }
 
-// A cap under liveness_expired()'s 2^31 us range leaves the tick minutes in which to see an expiry.
+// A cap under liveness_expired()'s 2^31 us range leaves minutes in which to see an expiry.
 static_assert(SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS * US_PER_MS < INT32_MAX,
               "liveness cap exceeds the 32-bit arrival stamp's range");
 
@@ -316,6 +314,22 @@ bool liveness_expired(int64_t now_us, uint32_t last_receive_us, int64_t timeout_
     return timeout_us > 0 && silence_us >= timeout_us;
 }
 
+int64_t liveness_remaining_us(int64_t now_us, uint32_t last_receive_us, int64_t timeout_us) {
+    // The same signed 32-bit silence liveness_expired() measures.
+    const auto silence_us = static_cast<int32_t>(static_cast<uint32_t>(now_us) - last_receive_us);
+    return silence_us >= timeout_us ? 0 : timeout_us - silence_us;
+}
+
+uint32_t ms_until(int64_t due_us, int64_t now_us) {
+    if (due_us <= now_us) {
+        return 0;
+    }
+    const int64_t wait_ms = (due_us - now_us + US_PER_MS - 1) / US_PER_MS;
+    // UINT32_MAX is ProtocolTask::NO_DEADLINE, which a real deadline must never read as.
+    return wait_ms >= static_cast<int64_t>(UINT32_MAX) ? UINT32_MAX - 1
+                                                       : static_cast<uint32_t>(wait_ms);
+}
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -326,45 +340,226 @@ ConnectionManager::ConnectionManager(SendspinClient* client)
       liveness_timeout_us_(resolve_liveness_timeout_ms(client->config_) * US_PER_MS) {}
 
 ConnectionManager::~ConnectionManager() {
-    // Move everything out under the locks, destroy outside them: a connection destructor can join
-    // its transport thread (see DeferredRelease), which must not happen while a lock is held.
-    // conn_mutex_ and conn_ptr_mutex_ guard disjoint state and are taken in separate scopes.
-    DrainedEvents dropped;
-    this->swap_out_pending_events(dropped);
-
-    std::shared_ptr<SendspinConnection> current;
-    // cppcheck-suppress variableScope
-    InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery;
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        // Cleared through the setter so has_current_ and the time filter slot follow.
-        current.swap(this->current_connection_);
-        this->set_current_connection(nullptr);
-        nursery.swap(this->nursery_);
-        this->refresh_nursery_size_hint();
+    // The protocol task is joined (or never ran) and finish_stop() released what the shutdown pass
+    // kept, so anything left here is released on the thread destroying the client. Detach first:
+    // a destructor below can join its transport thread, which must not be parked on its gate.
+    for (auto& entry : this->admitted_) {
+        if (entry.conn != nullptr) {
+            entry.conn->detach_inbound();
+            entry.conn->set_admitted(false);
+        }
     }
-    // Nothing reads them any more, and their release may join the transport threads that feed
-    // them.
-    if (current != nullptr) {
-        current->detach_inbound();
-    }
-    for (auto& entry : nursery) {
+    for (auto& entry : this->nursery_) {
         entry.conn->detach_inbound();
     }
-    assert(this->deferred_releases_.empty());  // See DeferredRelease
-    // Locals and the swapped-out events release here, outside both locks; shutdown drops slots
-    // without a send.
+    for (auto& conn : this->closing_) {
+        conn->detach_inbound();
+    }
 }
 
 // ============================================================================
-// Public API
+// Main loop
 // ============================================================================
+
+void ConnectionManager::start() {
+    // A restart begins with no shutdown pass behind it and retries the server at once rather than
+    // honoring a backoff from before the stop. The protocol task is not running, so these writes
+    // reach it through its start.
+    this->shutdown_done_ = false;
+    this->shutdown_goodbyes_pending_ = 0;
+    this->shutdown_wait_.reset();
+    this->shutdown_ui_ = {false, false};
+    this->ws_server_start_retry_time_us_ = 0;
+
+    if (this->ws_server_ == nullptr) {
+        // First start: create the server object and configure it once. The config is immutable
+        // for the client's lifetime, so a restart reuses these values along with the object.
+        this->ws_server_ = std::make_unique<SendspinWsServer>();
+        this->ws_server_->set_port(this->client_->config_.server_port);
+        this->ws_server_->set_max_connections(this->client_->config_.server_max_connections);
+        this->ws_server_->set_ctrl_port(this->client_->config_.httpd_ctrl_port);
+
+        // Graceful rejection needs transport headroom: the manager can hold MAX_ADMITTED admitted
+        // connections plus NURSERY_CAPACITY unproven ones, and rejecting a surplus peer with a
+        // client/goodbye requires the transport to accept that peer's socket on top. Below this
+        // bound the nursery-full goodbye path is unreachable; surplus peers are refused at accept
+        // instead (and on ESP they wait unanswered in the TCP backlog, since httpd stops
+        // accepting).
+        constexpr size_t GRACEFUL_SOCKETS = MAX_ADMITTED + NURSERY_CAPACITY + 1;
+        if (this->client_->config_.server_max_connections < GRACEFUL_SOCKETS) {
+            SS_LOGW(TAG,
+                    "server_max_connections (%u) is below %u (%u admitted + %u nursery + 1 spare); "
+                    "surplus peers will be refused at accept instead of receiving a goodbye",
+                    static_cast<unsigned>(this->client_->config_.server_max_connections),
+                    static_cast<unsigned>(GRACEFUL_SOCKETS), static_cast<unsigned>(MAX_ADMITTED),
+                    static_cast<unsigned>(NURSERY_CAPACITY));
+        }
+
+        this->ws_server_->set_new_connection_callback(
+            [this](const std::shared_ptr<SendspinServerConnection>& conn) {
+                return this->on_new_connection(conn);
+            });
+        // The server's own deadline (a pending upgrade) is reported by tick(); a new pending
+        // session wakes the task so the deadline it reports covers it.
+        ProtocolTask* task = this->client_->protocol_task_.get();
+        this->ws_server_->set_wake_callback([task]() { task->wake(); });
+    }
+
+    this->accepting_.store(true, std::memory_order_release);
+    // Started here when the network is already up, so the server is listening once start()
+    // returns; otherwise the protocol task starts it once the provider reports ready.
+    (void)this->maybe_start_ws_server(platform_time_us());
+}
+
+void ConnectionManager::close_admission() {
+    this->accepting_.store(false, std::memory_order_release);
+    this->client_->protocol_task_->wake();
+}
+
+PairingUiSnapshot ConnectionManager::finish_stop() {
+    // The protocol task is joined. A shutdown pass that never ran (the task never started) leaves
+    // the slots to fold in here; they hold nothing on a client whose start() failed before the
+    // task ran, since only the task fills them.
+    if (!this->shutdown_done_) {
+        for (auto& entry : this->admitted_) {
+            if (entry.conn != nullptr) {
+                entry.conn->detach_inbound();
+                entry.conn->set_admitted(false);
+                this->closing_.push_back(std::move(entry.conn));
+                entry = AdmittedEntry{};
+            }
+        }
+        for (auto& entry : this->nursery_) {
+            entry.conn->detach_inbound();
+            this->closing_.push_back(std::move(entry.conn));
+        }
+        this->nursery_.clear();
+        this->shutdown_done_ = true;
+        this->refresh_published_state();
+    }
+
+    // Close every transport the shutdown pass kept before the server stops, so its join does not
+    // wait out a peer that never closes. Every gate is detached, so no transport thread the stop
+    // joins is parked on one, and one in a ring acquire gives up within
+    // INBOUND_ACQUIRE_TIMEOUT_MS.
+    for (auto& conn : this->closing_) {
+        conn->close_transport_now();
+    }
+    if (this->ws_server_ != nullptr) {
+        this->ws_server_->stop();
+    }
+    // Released here, after the server stop: an outbound connection's destructor stops its
+    // transport synchronously.
+    std::vector<std::shared_ptr<SendspinConnection>> releasing;
+    releasing.swap(this->closing_);
+    releasing.clear();
+
+    const PairingUiSnapshot ui = this->shutdown_ui_;
+    this->shutdown_ui_ = {false, false};
+    return ui;
+}
+
+// ============================================================================
+// Any thread
+// ============================================================================
+
+std::shared_ptr<SendspinTimeFilter> ConnectionManager::time_filter() const {
+    std::lock_guard<std::mutex> lock(this->time_filter_mutex_);
+    return this->time_filter_;
+}
+
+std::optional<ServerInformationObject> ConnectionManager::server_information() const {
+    std::lock_guard<std::mutex> lock(this->server_info_mutex_);
+    return this->server_information_;
+}
+
+// ============================================================================
+// Transport threads
+// ============================================================================
+
+bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerConnection>& conn) {
+    // On the transport's delivery thread, ahead of the connection's first frame and before the
+    // protocol task can reach the connection: the push below publishes these writes to the task.
+    conn->init_time_filter();
+    conn->time_burst().configure(this->client_->config_.time_burst_size,
+                                 this->client_->config_.time_burst_interval_ms,
+                                 this->client_->config_.time_burst_response_timeout_ms);
+    conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
+    conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
+    this->setup_connection_callbacks(conn.get());
+
+    ProtocolCommand command;
+    command.type = ProtocolCommandType::ACCEPT_CONNECTION;
+    command.connection = conn;
+    if (this->client_->protocol_task_->push_command(std::move(command))) {
+        return true;
+    }
+    // Refused (push_command() logged it: the slots are full, or stop() closed accepts once the
+    // task was joined): the transport drops what the peer sends from here, and the caller closes
+    // the socket and releases the connection on its own close path. The delivery runs ahead of
+    // the connection's first frame on the delivering thread, so nothing reached the ring before
+    // the detach.
+    conn->detach_inbound();
+    return false;
+}
+
+// ============================================================================
+// Protocol task: commands
+// ============================================================================
+
+void ConnectionManager::accept(std::shared_ptr<SendspinConnection> conn) {
+    if (!this->accepting_.load(std::memory_order_acquire)) {
+        this->refuse_accept(std::move(conn));
+        return;
+    }
+
+    // Start the establish clock: the nursery scan reaps the connection if it does not complete
+    // the hello handshake within NURSERY_ESTABLISH_TIMEOUT_US.
+    conn->set_provisional_time_us(platform_time_us());
+
+    // The newcomer has not completed the hello handshake, so it never touches an admitted slot;
+    // it enters the bounded nursery and is admitted only once it establishes. Only inbound
+    // entries count against the capacity (see NURSERY_CAPACITY). If the inbound slots are full,
+    // reject the newcomer: every occupant speaks WebSocket, so there is no safe eviction
+    // candidate. The goodbye reaches the peer because its session is already upgraded, provided
+    // the transport had a socket to accept it on (the socket budget in NURSERY_CAPACITY).
+    size_t inbound_count = 0;
+    for (const auto& entry : this->nursery_) {
+        if (!entry.conn->is_outbound()) {
+            ++inbound_count;
+        }
+    }
+    if (inbound_count >= NURSERY_CAPACITY) {
+        SS_LOGW(TAG, "Nursery full of live connections, rejecting new connection");
+        release_connection(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
+        return;
+    }
+
+    SS_LOGD(TAG, "Admitting new connection into the nursery");
+    this->nursery_.push_back(NurseryEntry{.conn = std::move(conn)});
+    // The connection arrives WS-upgraded, so client/init goes out at once.
+    this->start_noise_handshake(this->nursery_[this->nursery_.size() - 1]);
+}
+
+void ConnectionManager::refuse_accept(std::shared_ptr<SendspinConnection> conn) {
+    // Delivered while admission is closed (a stop() under way): the slots are being emptied, so
+    // the newcomer gets a goodbye and a close instead of one, and is kept for finish_stop().
+    SS_LOGD(TAG, "Not accepting connections, rejecting new connection");
+    conn->detach_inbound();
+    if (this->shutdown_wait_ == nullptr) {
+        this->shutdown_wait_ = std::make_shared<GoodbyeWait>();
+    }
+    std::shared_ptr<GoodbyeWait> wait = this->shutdown_wait_;
+    wait->add_pending();
+    ++this->shutdown_goodbyes_pending_;
+    conn->disconnect(SendspinGoodbyeReason::SHUTDOWN, [wait] { wait->complete_one(); });
+    this->closing_.push_back(std::move(conn));
+}
 
 void ConnectionManager::connect_to(const std::string& url) {
     SS_LOGI(TAG, "Initiating client connection to: %s", url.c_str());
 
     auto client_conn = std::make_shared<SendspinClientConnection>(url);
-    client_conn->set_auto_reconnect(false);
     client_conn->set_task_config(this->client_->config_.websocket_priority,
                                  this->client_->config_.websocket_stack_size);
     client_conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
@@ -372,327 +567,216 @@ void ConnectionManager::connect_to(const std::string& url) {
 
     // Wired before start(): the transport may deliver from its own thread as soon as it runs.
     this->setup_connection_callbacks(client_conn.get());
-    // Can run during the destructor's transport join, with no owner left (see "Event queuing" in
-    // connection_manager.h).
-    client_conn->on_connected_cb = [this](SendspinConnection* c) {
-        // Only outbound transports fire this, so it is wired here rather than in
-        // setup_connection_callbacks. The connect succeeded, so the WebSocket upgrade is complete;
-        // record it and defer starting the Noise handshake to loop() (this runs on the transport
-        // thread). Inbound connections arrive already upgraded and start theirs at admission.
-        std::shared_ptr<SendspinConnection> owned = c->weak_from_this().lock();
-        if (owned == nullptr) {
-            return;
-        }
-        owned->mark_ws_upgraded();
-        std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->queue_pending(this->pending_connected_events_, std::move(owned));
+    // Only outbound transports fire this, on the transport thread, once the WebSocket upgrade is
+    // complete; the protocol task starts the Noise handshake on its next tick
+    // (start_upgraded_handshakes()). It can run during the destructor's transport join, so it
+    // touches only the connection it is handed.
+    client_conn->on_connected_cb = [](SendspinConnection* c) {
+        c->mark_ws_upgraded();
+        c->wake_protocol_task();
     };
 
     client_conn->init_time_filter();
+    client_conn->time_burst().configure(this->client_->config_.time_burst_size,
+                                        this->client_->config_.time_burst_interval_ms,
+                                        this->client_->config_.time_burst_response_timeout_ms);
 
-    // Start the nursery clock: loop() reaps the connection if it has not completed the hello
-    // handshake within NURSERY_ESTABLISH_TIMEOUT_US. The stamp predates DNS/TCP resolve, which is
-    // why outbound entries are exempt from the short upgrade deadline.
+    // Start the nursery clock: the nursery scan reaps the connection if it has not completed the
+    // hello handshake within NURSERY_ESTABLISH_TIMEOUT_US. The stamp predates DNS/TCP resolve,
+    // which is why outbound entries are exempt from the short upgrade deadline.
     client_conn->set_provisional_time_us(platform_time_us());
 
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-
-        // A present-but-disconnected current connection (its close event not yet processed) is
-        // being replaced. Tear its state down as on_connection_lost would (the transport is
-        // already gone, so no goodbye), instead of leaving it to occupy the slot with orphaned
-        // dispatch/time-filter/client state.
-        if (this->current_connection_ != nullptr && !this->current_connection_->is_connected()) {
-            this->drop_connection(this->current_connection_.get(), std::nullopt);
+    // An admitted connection whose transport is already gone (its close not processed yet) is
+    // being replaced. Tear its state down as a loss would (no goodbye), instead of leaving it to
+    // occupy the slot with orphaned role state.
+    for (auto& entry : this->admitted_) {
+        if (entry.conn != nullptr && !entry.conn->is_connected()) {
+            this->drop_connection(entry.conn.get(), std::nullopt);
         }
-
-        // Only one outbound attempt at a time: release any previous outbound entry before pushing
-        // the new one. Otherwise it would be dropped with no goodbye and, on ESP, leave its httpd
-        // session pinned.
-        for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
-            if (it->conn->is_outbound()) {
-                it = this->release_nursery_entry(it, SendspinGoodbyeReason::ANOTHER_SERVER);
-            } else {
-                ++it;
-            }
-        }
-
-        // A user-initiated connect is admitted even against a full nursery: there is at most one
-        // outbound entry (replaced above), so the nursery is still bounded (MAX_NURSERY_ENTRIES)
-        // and an explicit user request never fails against inbound peers.
-        this->push_nursery_entry(NurseryEntry{.conn = client_conn});
-        client_conn->start();
     }
-    this->flush_deferred_releases();
+
+    // Only one outbound attempt at a time: release any previous outbound entry before pushing
+    // the new one. Otherwise it would be dropped with no goodbye and, on ESP, leave its httpd
+    // session pinned.
+    for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
+        if (it->conn->is_outbound()) {
+            it = this->release_nursery_entry(it, SendspinGoodbyeReason::ANOTHER_SERVER);
+        } else {
+            ++it;
+        }
+    }
+
+    // A user-initiated connect is admitted even against a full nursery: there is at most one
+    // outbound entry (replaced above), so the nursery is still bounded (MAX_NURSERY_ENTRIES)
+    // and an explicit user request never fails against inbound peers.
+    this->nursery_.push_back(NurseryEntry{.conn = client_conn});
+    client_conn->start();
 }
 
 void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
-    // Collect under the lock, send outside it: disconnect() can block on the transport (and on
-    // host outbound it joins the transport thread), which must not stall other manager entry
-    // points. The connections stay in their slots until their close events arrive (or the
-    // manager is destroyed).
+    // The connected connections stay in their slots until the loss pass sees their detached gates
+    // (or the manager is stopped). An unconnected (pre-upgrade) nursery entry has no transport to
+    // goodbye and yields no close, so it is released here rather than left for the establish
+    // deadline.
     InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> to_disconnect;
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
-            to_disconnect.push_back(this->current_connection_);
-        }
-        // Drain the nursery too. A connected entry gets a goodbye and leaves on its close event; an
-        // unconnected (pre-upgrade) entry has no transport to goodbye and yields no close, so
-        // release it here rather than leave it for the nursery deadline to reap.
-        for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
-            if (it->conn->is_connected()) {
-                to_disconnect.push_back(it->conn);
-                ++it;
-            } else {
-                it = this->release_nursery_entry(it, std::nullopt);
-            }
+    for (const auto& entry : this->admitted_) {
+        if (entry.conn != nullptr && entry.conn->is_connected()) {
+            to_disconnect.push_back(entry.conn);
         }
     }
-    this->flush_deferred_releases();
+    for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
+        if (it->conn->is_connected()) {
+            to_disconnect.push_back(it->conn);
+            ++it;
+        } else {
+            it = this->release_nursery_entry(it, std::nullopt);
+        }
+    }
+    // Detached before the goodbye, as release_connection() does: an outbound connection's
+    // disconnect() joins its transport thread, which must not be parked waiting on this task
+    // (InboundGate::wait_until_writable() or a ring acquire) while the join waits for it.
     for (auto& conn : to_disconnect) {
+        conn->detach_inbound();
         conn->disconnect(reason, nullptr);
     }
 }
 
-// ============================================================================
-// Server lifecycle
-// ============================================================================
-
-void ConnectionManager::start() {
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        this->accepting_ = true;
-    }
-    // A restart reuses the server object: stop() only stopped it, and loop() starts it again
-    // once the network is ready. Retry immediately rather than honoring a backoff from before
-    // the stop.
-    this->ws_server_start_retry_time_us_ = 0;
-    if (this->ws_server_ != nullptr) {
+void ConnectionManager::leave() {
+    // messaging.md "client/leave". Not a role message, so it does not route through
+    // send_role_text(). It still shares the activation gate every outbound message has: nothing
+    // may be sent before the connection is admitted and its server/activate has arrived.
+    // Admission does not imply the latter: an in-band re-handshake rewinds the connection to
+    // awaiting its next activation while it keeps the admitted slot.
+    AdmittedEntry* entry = this->primary();
+    SendspinConnection* conn = entry != nullptr ? entry->conn.get() : nullptr;
+    if (conn == nullptr || !conn->is_connected() || !conn->first_activate_received()) {
+        SS_LOGW(TAG, "client/leave ignored: no activated connection with a group to leave");
         return;
     }
+    SS_LOGI(TAG, "Leaving the group (client/leave)");
+    conn->send_app_json(format_client_leave_message(), nullptr);
+}
 
-    // First start: create the server object and configure it once. The config is immutable for
-    // the client's lifetime, so a restart reuses these values along with the object.
-    this->ws_server_ = std::make_unique<SendspinWsServer>();
-    this->ws_server_->set_port(this->client_->config_.server_port);
-    this->ws_server_->set_max_connections(this->client_->config_.server_max_connections);
-    this->ws_server_->set_ctrl_port(this->client_->config_.httpd_ctrl_port);
-
-    // Graceful rejection needs transport headroom: the manager can hold one established inbound
-    // connection plus NURSERY_CAPACITY unproven ones, and rejecting a surplus peer with a
-    // client/goodbye requires the transport to accept that peer's socket on top. Below this bound
-    // the nursery-full goodbye path is unreachable; surplus peers are refused at accept instead
-    // (and on ESP they wait unanswered in the TCP backlog, since httpd stops accepting).
-    if (this->client_->config_.server_max_connections < NURSERY_CAPACITY + 2) {
-        SS_LOGW(TAG,
-                "server_max_connections (%u) is below %u (1 established + %u nursery + 1 spare); "
-                "surplus peers will be refused at accept instead of receiving a goodbye",
-                static_cast<unsigned>(this->client_->config_.server_max_connections),
-                static_cast<unsigned>(NURSERY_CAPACITY + 2),
-                static_cast<unsigned>(NURSERY_CAPACITY));
+void ConnectionManager::send_role_text(SendspinRole role, const std::string& text) {
+    // Routed to the connection that owns the role, whose activation of it is the role's own gate
+    // (see owns_role()): the same gate the receive path and the client/state role objects apply.
+    // A declared PAIRING activity is not a gate: pairing.md "Entering and leaving pairing" says an
+    // activate that adds it does not by itself affect active_roles, so an active role keeps
+    // driving its own traffic across the attempt.
+    SendspinConnection* conn = this->role_owner(role);
+    if (conn == nullptr || !conn->is_connected()) {
+        SS_LOGD(TAG, "Dropping a %s message: no admitted connection owns the role", to_cstr(role));
+        return;
     }
-
-    this->ws_server_->set_new_connection_callback(
-        [this](const std::shared_ptr<SendspinServerConnection>& conn) {
-            this->on_new_connection(conn);
-        });
-
-    // A transport's close reaches loop() through the protocol task (report_connection_lost()),
-    // once the messages the connection sent before it are processed.
+    // connection.md "Re-handshake": once the client has received Noise message 1 it sends nothing
+    // but the handshake until the new server/activate arrives. Same gate client/leave and
+    // client/state apply.
+    if (!conn->first_activate_received()) {
+        SS_LOGD(TAG, "Dropping a %s message: the connection awaits its server/activate",
+                to_cstr(role));
+        return;
+    }
+    conn->send_app_json(text, nullptr);
 }
 
-bool ConnectionManager::DrainedEvents::any() const {
-    return !this->connected.empty() || !this->disconnected.empty() || !this->activates.empty() ||
-           !this->pair_aborts.empty() || !this->server_unpairs.empty() ||
-           !this->pairing_messages.empty() || !this->pairing_succeeded.empty() ||
-           this->pairing_window_confirm || this->pairing_window_cancel;
+void ConnectionManager::confirm_pairing_window() {
+    // Without a record store there is nothing to pair with, so the gesture is ignored.
+    if (this->client_->record_store_ == nullptr) {
+        return;
+    }
+    this->open_pairing_window();
 }
 
-void ConnectionManager::DrainedEvents::clear() {
-    this->connected.clear();
-    this->disconnected.clear();
-    this->activates.clear();
-    this->pair_aborts.clear();
-    this->server_unpairs.clear();
-    this->pairing_messages.clear();
-    this->pairing_succeeded.clear();
-    this->pairing_window_confirm = false;
-    this->pairing_window_cancel = false;
-}
+void ConnectionManager::cancel_pairing_window() {
+    // Operator cancellation is one of the window's closing events (pairing.md "Pairing Window"). An
+    // attempt still withheld for the gesture has just lost the only thing that could admit it, so
+    // it ends here with the reason that says why; an attempt already under way runs to its own end,
+    // as it does on expiry.
+    this->close_pairing_window();
 
-PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
-    // Close admission and detach every managed connection under the lock. Nothing is sent or
-    // released here (see DeferredRelease): the goodbyes below run outside the lock, and a
-    // rejection for a peer delivered during the wait can take the lock meanwhile.
-    std::vector<std::shared_ptr<SendspinConnection>> to_goodbye;
-    PairingUiSnapshot ui{false, false};
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        this->accepting_ = false;
-        if (this->current_connection_ != nullptr) {
-            // A code or pairing-window prompt still showing must be dismissed once the client has
-            // reset its state; the flags live on the connection, so capture them before it goes
-            // (see PairingUiSnapshot). The caller queues the dismissal after its own cleanup.
-            const PairingUiSnapshot current_ui =
-                snapshot_pairing_ui(this->current_connection_.get());
-            ui.code_was_emitted |= current_ui.code_was_emitted;
-            ui.window_was_shown |= current_ui.window_was_shown;
-            this->current_connection_->detach_inbound();
-            // Vacate the admitted slot explicitly, as drop_connection() does: the connection is
-            // swapped out below (see drop_connection() for why not moved), so
-            // set_current_connection(nullptr) finds an empty slot and clears no admitted flag,
-            // and the goodbye keeps the connection alive past this call.
-            this->current_connection_->set_admitted(false);
-            std::shared_ptr<SendspinConnection> outgoing;
-            outgoing.swap(this->current_connection_);
-            this->set_current_connection(nullptr);
-            to_goodbye.push_back(std::move(outgoing));
+    InlineVector<SendspinConnection*, MAX_ADMITTED> waiting;
+    for (const auto& entry : this->admitted_) {
+        if (entry.conn != nullptr && entry.conn->pairing_session().step ==
+                                         SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW) {
+            waiting.push_back(entry.conn.get());
         }
-        for (auto& entry : this->nursery_) {
-            const PairingUiSnapshot entry_ui = snapshot_pairing_ui(entry.conn.get());
-            ui.code_was_emitted |= entry_ui.code_was_emitted;
-            ui.window_was_shown |= entry_ui.window_was_shown;
-            entry.conn->detach_inbound();
-            to_goodbye.push_back(std::move(entry.conn));
-        }
-        this->nursery_.clear();
-        this->refresh_nursery_size_hint();
-        // A standing pairing window belongs to this run; a restart begins with it closed.
-        this->close_pairing_window();
     }
-    assert(this->deferred_releases_.empty());  // See DeferredRelease
-
-    // Goodbye every connection and wait, bounded, for the sends to complete. Every count is
-    // registered before the wait starts, so a completion that runs inline (host, and any
-    // not-connected transport) cannot satisfy the wait early. A disconnected connection completes
-    // immediately (see SendspinConnection::disconnect), so none needs a pre-check.
-    auto wait = std::make_shared<GoodbyeWait>();
-    for (auto& conn : to_goodbye) {
-        wait->add_pending();
-        conn->disconnect(reason, [wait] { wait->complete_one(); });
+    for (SendspinConnection* conn : waiting) {
+        SS_LOGI(TAG, "Pairing window cancelled: ending the waiting attempt for server_id=%s",
+                conn->get_server_id().c_str());
+        this->local_abort_pairing(conn, PairAbortReason::USER_CANCELLED);
     }
-    // The bound scales with the goodbyes issued: on ESP they are handed to lwIP one at a time by
-    // the single httpd worker, so several peers need several quanta.
-    const uint32_t flush_bound_ms =
-        GOODBYE_FLUSH_TIMEOUT_MS * static_cast<uint32_t>(to_goodbye.size());
-    if (!wait->wait(flush_bound_ms)) {
-        SS_LOGD(TAG, "Goodbye flush bound (%u ms for %u goodbyes) elapsed; closing regardless",
-                static_cast<unsigned>(flush_bound_ms), static_cast<unsigned>(to_goodbye.size()));
-    }
-
-    // Tear the server down regardless. This joins every transport thread on host and waits for
-    // the httpd task on ESP, so no callback of any kind arrives after it returns. Every
-    // connection is detached, so none of those threads is parked on its inbound gate, and one in
-    // a ring acquire gives up within INBOUND_ACQUIRE_TIMEOUT_MS.
-    if (this->ws_server_ != nullptr) {
-        this->ws_server_->stop();
-    }
-
-    // Drop every deferred event those closes (or the last ticks) queued: the connections they
-    // name are gone, and a pairing event has no session to act on.
-    DrainedEvents dropped;
-    this->swap_out_pending_events(dropped);
-    // Locals release here, outside every lock. An outbound connection's destructor stops its
-    // transport synchronously; deferring that is not an option (see DeferredRelease).
-    return ui;
 }
 
-void ConnectionManager::maybe_start_ws_server() {
-    // Start WS server when network becomes ready. A persistent failure (e.g. the server port is
-    // already in use) is retried with backoff instead of on every tick, which would spam the log.
-    if (this->ws_server_ != nullptr && !this->ws_server_->is_started()) {
-        const int64_t now_us = platform_time_us();
-        if (now_us >= this->ws_server_start_retry_time_us_ && this->client_->network_provider_ &&
-            this->client_->network_provider_->is_network_ready()) {
-            if (!this->ws_server_->start(this->client_, this->client_->config_.httpd_psram_stack,
-                                         this->client_->config_.httpd_priority,
-                                         this->client_->config_.httpd_stack_size)) {
-                this->ws_server_start_retry_time_us_ = now_us + WS_SERVER_START_RETRY_US;
+void ConnectionManager::apply_unpaired_access_change(bool enabled) {
+    // pairing.md "Unpaired Access": disabling closes the connections relying on it with
+    // pairing_required; enabling restarts unpaired connections so their servers read the new value
+    // in the next client/hello.
+
+    // Collect first: drop_connection() edits the slots being walked.
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> doomed;
+    auto consider = [&](const std::shared_ptr<SendspinConnection>& conn, bool hello_sent) {
+        if (!enabled) {
+            // A connection still awaiting its activation is judged against the new setting
+            // when that activation is applied.
+            if (conn->first_activate_received() &&
+                relies_on_unpaired_access(conn->get_psk_category(), conn->get_activities(),
+                                          !conn->get_active_roles().empty())) {
+                doomed.push_back(conn);
             }
+            return;
         }
+        // messaging.md "client/goodbye": restart on a connection the client opened promises
+        // that the client reopens it, and nothing reopens a connect_to() connection. A
+        // connection declaring pairing is left to finish. A Pairing-PSK one that has not
+        // activated yet is most likely about to declare pairing, and a restart would cost that
+        // attempt, so it is left alone too; if it activates idle instead, it keeps the hello
+        // it already read until it reconnects. A Sentinel one awaiting its activation is
+        // restarted, since its server may be deciding that activation on the value its hello
+        // carried.
+        if (hello_sent && !conn->is_outbound() &&
+            conn->get_psk_category() != PskCategory::LONG_TERM &&
+            !conn->has_activity(SendspinActivity::PAIRING) &&
+            (conn->first_activate_received() || conn->get_psk_category() != PskCategory::PAIRING)) {
+            doomed.push_back(conn);
+        }
+    };
+
+    // An admitted connection sent its hello to be admitted. One between a re-handshake and the
+    // activation that follows it is left alone: its server may be moving it into pairing.
+    for (const auto& entry : this->admitted_) {
+        if (entry.conn != nullptr && entry.conn->first_activate_received()) {
+            consider(entry.conn, /*hello_sent=*/true);
+        }
+    }
+    for (const auto& entry : this->nursery_) {
+        consider(entry.conn, entry.hello_step == HelloStep::DONE);
+    }
+
+    const SendspinGoodbyeReason reason =
+        enabled ? SendspinGoodbyeReason::RESTART : SendspinGoodbyeReason::PAIRING_REQUIRED;
+    for (const auto& conn : doomed) {
+        SS_LOGI(TAG, "Unpaired access %s: closing the session with server_id=%s",
+                enabled ? "enabled" : "disabled", conn->get_server_id().c_str());
+        this->drop_connection(conn.get(), reason);
     }
 }
 
-void ConnectionManager::swap_out_pending_events(DrainedEvents& ev) {
-    // Skip the conn_mutex_ acquisition entirely when the hint says all queues are
-    // empty. Sound because every push site sets has_pending_events_ = true under
-    // conn_mutex_ before releasing it (see the field's doc comment in connection_manager.h).
-    if (this->has_pending_events_.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        ev.connected.swap(this->pending_connected_events_);
-        ev.disconnected.swap(this->pending_disconnect_events_);
-        ev.activates.swap(this->pending_activate_events_);
-        ev.pair_aborts.swap(this->pending_pair_abort_events_);
-        ev.server_unpairs.swap(this->pending_server_unpair_events_);
-        ev.pairing_messages.swap(this->pending_pairing_message_events_);
-        ev.pairing_succeeded.swap(this->pending_pairing_succeeded_events_);
-        ev.pairing_window_confirm = std::exchange(this->pending_pairing_window_confirm_, false);
-        ev.pairing_window_cancel = std::exchange(this->pending_pairing_window_cancel_, false);
-        this->has_pending_events_.store(false, std::memory_order_release);
-    }
-}
+// ============================================================================
+// Protocol task: message handlers
+// ============================================================================
 
-void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
-    // Connection close/disconnect events (inbound ws_server closes on both platforms,
-    // outbound host IXWebSocket disconnects). Keyed on connection identity, never on
-    // sockfd: the OS recycles fds, so an fd-keyed event could outlive its connection and
-    // mis-route to a newcomer admitted onto the recycled fd. A connection already
-    // released by an earlier event is a no-op inside drop_connection.
-    for (auto& conn : ev.disconnected) {
-        this->on_connection_lost(conn.get());
-    }
-
-    // Transport connected events: an outbound connection's WebSocket upgrade completed.
-    // This is where the outbound side starts the Noise handshake (client_init is sent
-    // proactively; the client is always the Noise responder regardless of who opened the
-    // socket, but it still sends client/init first as the Sendspin protocol client). The
-    // hello is armed later, once the Noise handshake completes (see the hello scan in
-    // scan_hello_and_nursery()). (Inbound connections arrive already upgraded and
-    // are handled the same way in on_new_connection().) Guarded by nursery membership: a
-    // connection promoted or released by an earlier event is skipped.
-    for (auto& conn : ev.connected) {
-        if (this->find_in_nursery(conn.get()) == this->nursery_.end()) {
-            continue;
-        }
-        conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
-                                   std::string(NOISE_SUITE_CHACHAPOLY));
-        conn->send_noise_client_init();
-    }
-
-    // server/activate events: trust enforcement, operational gating, and admission
-    // arbitration. All decisions (admissibility, arbitration, RecordStore mutations)
-    // happen here on the main loop thread, never on the protocol task.
-    for (auto& event : ev.activates) {
-        this->process_activate_event(event);
-    }
-
-    // Promotion/arbitration scan: handles every nursery entry that has proven itself
-    // (is_operational(): hello handshake complete and first server/activate applied and
-    // admissible; trust was already checked above, for every activate event, including
-    // ones that arrived before the hello completed). Level-triggered rather than
-    // edge-triggered on the activate events just processed, because hello completion is
-    // itself level-triggered (see the establishment invariant note on
-    // is_handshake_complete() elsewhere in this file): the two conditions can become true
-    // in either order.
-    for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
-        if (!it->conn->is_operational()) {
-            ++it;
-            continue;
-        }
-        it = this->promote_or_arbitrate_nursery_entry(it);
-    }
-}
-
-void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
-    const bool in_nursery = this->find_in_nursery(event.conn.get()) != this->nursery_.end();
-    const bool is_current = event.conn.get() == this->current_connection_.get();
-    if (!in_nursery && !is_current) {
-        // Already released by an earlier event in the same loop() pass.
+void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActivateMessage&& msg) {
+    NurseryEntry* nursery_entry = this->find_in_nursery(conn);
+    AdmittedEntry* admitted_entry = this->find_admitted(conn);
+    if (nursery_entry == this->nursery_.end() && admitted_entry == nullptr) {
+        // Released while its messages were still queued (a rejection, a reap).
+        SS_LOGD(TAG, "Ignoring server/activate from a connection the manager released");
         return;
     }
 
-    const bool unpaired_access = this->client_->unpaired_access_enabled_;
+    const bool unpaired_access =
+        this->client_->unpaired_access_enabled_.load(std::memory_order_relaxed);
 
     // Compute the effective active_roles (sticky: nullopt keeps the prior set), except
     // when this activate omits active_roles and its activities are no longer
@@ -700,27 +784,26 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // persisted roles as empty in that case rather than rejecting the message (a later
     // activate can legally narrow activities without re-sending an empty active_roles).
     const bool playback_capable =
-        is_playback_capable(event.conn->get_psk_category(), event.activities, unpaired_access);
+        is_playback_capable(conn->get_psk_category(), msg.activities, unpaired_access);
     const std::vector<std::string>& effective_roles =
-        event.active_roles.has_value()
-            ? event.active_roles.value()
-            : (playback_capable ? event.conn->get_active_roles() : EMPTY_ROLES);
+        msg.active_roles.has_value() ? msg.active_roles.value()
+                                     : (playback_capable ? conn->get_active_roles() : EMPTY_ROLES);
     const bool has_roles = !effective_roles.empty();
 
     // Trust enforcement against the PSK category the Noise handshake resolved for this
     // connection. Every connection has one: no server/activate can arrive before the
     // handshake completes.
     const bool trust_ok =
-        admissible(event.conn->get_psk_category(), event.activities, has_roles, unpaired_access);
+        admissible(conn->get_psk_category(), msg.activities, has_roles, unpaired_access);
 
     if (!trust_ok) {
         const SendspinGoodbyeReason reject_reason = inadmissible_reject_reason(
-            event.conn->get_psk_category(), event.activities, has_roles, unpaired_access);
+            conn->get_psk_category(), msg.activities, has_roles, unpaired_access);
         SS_LOGW(TAG, "server/activate inadmissible (psk_category=%d): closing with %s",
-                static_cast<int>(event.conn->get_psk_category()),
+                static_cast<int>(conn->get_psk_category()),
                 reject_reason == SendspinGoodbyeReason::PAIRING_REQUIRED ? "pairing_required"
                                                                          : "unauthorized");
-        this->drop_connection(event.conn.get(), reject_reason);
+        this->drop_connection(conn, reject_reason);
         return;
     }
 
@@ -730,9 +813,9 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // single point every pairing server/activate is received, so a rejected activate does not
     // leave the client permanently behind the server's count. handle_enter_pairing() reads this
     // value; it must not bump again.
-    const bool is_pairing_activate = contains_activity(event.activities, SendspinActivity::PAIRING);
+    const bool is_pairing_activate = contains_activity(msg.activities, SendspinActivity::PAIRING);
     if (is_pairing_activate) {
-        event.conn->bump_pairing_index();
+        conn->bump_pairing_index();
     }
 
     // Structurally admissible already (the activity set passed the table above),
@@ -744,16 +827,16 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // A pairing activate that names no usable method (pairing object absent, or a
     // method string this client does not recognize; process_server_activate_message
     // logs the raw value) cannot start any flow.
-    if (is_pairing_activate && !event.pairing_method.has_value()) {
-        refuse_activate(event, "declares pairing with no usable pairing.method",
+    if (is_pairing_activate && !msg.pairing_method.has_value()) {
+        refuse_activate(conn, "declares pairing with no usable pairing.method",
                         "absent or unrecognized");
         return;
     }
 
-    if (is_pairing_activate && event.pairing_method.has_value()) {
-        const SendspinPairMethod method = event.pairing_method.value();
+    if (is_pairing_activate && msg.pairing_method.has_value()) {
+        const SendspinPairMethod method = msg.pairing_method.value();
         const bool category_ok = (method == SendspinPairMethod::PAIRING_PSK) ==
-                                 (event.conn->get_psk_category() == PskCategory::PAIRING);
+                                 (conn->get_psk_category() == PskCategory::PAIRING);
         // The same predicates build_hello_message() advertises from (pairing_offers.h).
         const auto& cfg = this->client_->config_;
         bool offered = true;
@@ -769,7 +852,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                 break;
         }
         if (!category_ok || !offered) {
-            refuse_activate(event, "selects an unsupported pairing method", to_cstr(method));
+            refuse_activate(conn, "selects an unsupported pairing method", to_cstr(method));
             return;
         }
 
@@ -778,48 +861,55 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         // or unoffered one is pair/abort(method_not_supported) with the connection left
         // open (pairing.md "Client <-> Server: pair/abort").
         if (method == SendspinPairMethod::DYNAMIC_PAIRING_CODE &&
-            !offers_pairing_code_format(this->client_->config_, event.pairing_format)) {
-            refuse_activate(event, "names no usable pairing.format", to_cstr(method));
+            !offers_pairing_code_format(this->client_->config_, msg.pairing_format)) {
+            refuse_activate(conn, "names no usable pairing.format", to_cstr(method));
             return;
         }
     }
 
-    const bool is_first = !event.conn->first_activate_received();
+    const bool is_first = !conn->first_activate_received();
     // Pass the same active_roles the admissibility check above used: when the message
     // omitted active_roles but the connection is no longer playback-capable, that is
     // effective_roles == EMPTY_ROLES, and it must be applied (not left sticky) so the
     // persisted active_roles_ is actually cleared (messaging.md "Playback-capable connections").
     const std::optional<std::vector<std::string>> active_roles_to_apply =
-        event.active_roles.has_value()
-            ? event.active_roles
+        msg.active_roles.has_value()
+            ? msg.active_roles
             : (!playback_capable ? std::make_optional(EMPTY_ROLES) : std::nullopt);
     // Copied before the activate is applied: messaging.md "client/state" ties the next state
     // update to the active-role set changing, so the comparison needs the set this activation
     // replaces.
-    const std::vector<std::string> roles_before = event.conn->get_active_roles();
-    event.conn->apply_server_activate(event.activities, active_roles_to_apply, event.pairing_method,
-                                      event.pairing_format);
-    const bool roles_changed = roles_before != event.conn->get_active_roles();
+    const uint16_t roles_before = conn->get_active_role_mask();
+    conn->apply_server_activate(msg.activities, active_roles_to_apply, msg.pairing_method,
+                                msg.pairing_format);
+    const bool roles_changed = roles_before != conn->get_active_role_mask();
 
-    if (event.conn.get() == this->current_connection_.get()) {
+    if (admitted_entry != nullptr) {
         // messaging.md "server/activate": a role this activation took out of active_roles stops
         // its output and drops its state as part of applying the activation, so the teardown runs
-        // before the branches below act on the new activation. Only the admitted connection has
-        // roles driving anything, and only its role set can shrink: a nursery entry sees one
-        // activate and has no prior set. roles_changed covers additions too, which have nothing to
-        // remove.
-        if (roles_changed) {
-            this->client_->apply_role_removals(roles_before, event.conn->get_active_roles());
+        // before the branches below act on the new activation. The connection keeps owning what
+        // it still activates and claims what it newly activates unless another admitted
+        // connection owns it; only the roles it owned and no longer does are torn down. A nursery
+        // entry sees one activate and owns nothing yet.
+        const uint16_t owned_before = admitted_entry->owned_roles;
+        admitted_entry->owned_roles = claimable_roles(conn->get_active_role_mask(),
+                                                      this->roles_owned_by_others(admitted_entry));
+        const auto removed = static_cast<uint16_t>(owned_before & ~admitted_entry->owned_roles);
+        if (removed != 0) {
+            this->client_->apply_role_removals(removed);
+        }
+        if (admitted_entry->owned_roles != owned_before) {
+            this->refresh_published_state();
         }
 
         // Already admitted: no arbitration needed. is_first can still be true here after an
         // in-band re-handshake reset first_activate_received_, so the branches below that act on
         // an is_first activate also require is_handshake_complete().
-        this->note_playback_activity(event.conn.get());
+        this->note_playback_activity(conn);
 
-        const auto& activities = event.conn->get_activities();
+        const auto& activities = conn->get_activities();
         const std::optional<SendspinPairMethod> pairing_method =
-            selected_pairing_method(activities, event.conn->get_pairing_method());
+            selected_pairing_method(activities, conn->get_pairing_method());
         const bool selects_pairing = pairing_method.has_value();
 
         // The pairing-selection check runs on every activate and takes priority over the plain
@@ -827,7 +917,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         // resets first_activate_received_, so its pairing activate looks like a first activate,
         // and the operational branch would publish client/state while the server waits for
         // client/pair-finalize.
-        if (event.conn->is_pairing_in_progress()) {
+        if (conn->is_pairing_in_progress()) {
             // Pairing was in progress and the server sent another server/activate instead of
             // server/pair-finalize: it abandoned pairing without finalizing. Going operational
             // discards any pending record and resets the pairing session structurally.
@@ -838,417 +928,400 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
             SS_LOGI(TAG,
                     "Subsequent activate during pairing (leftover): clearing pairing "
                     "state and going operational for server_id=%s",
-                    event.conn->get_server_id().c_str());
-            this->client_->on_handshake_complete(event.conn.get());
+                    conn->get_server_id().c_str());
+            this->client_->on_handshake_complete(conn);
             if (selects_pairing) {
                 SS_LOGI(TAG,
                         "Leftover activate selects pairing again (%s): starting the "
                         "attempt it admits for server_id=%s",
-                        to_cstr(pairing_method.value()), event.conn->get_server_id().c_str());
-                this->handle_enter_pairing(event.conn.get());
+                        to_cstr(pairing_method.value()), conn->get_server_id().c_str());
+                this->handle_enter_pairing(conn);
             }
         } else if (selects_pairing) {
             // Reached both when the operator initiates pairing on an already-operational
             // connection (is_first false) and when the server first rehandshakes the connection
             // onto the pairing PSK (is_first true).
-            if (!is_first || event.conn->is_handshake_complete()) {
+            if (!is_first || conn->is_handshake_complete()) {
                 // pairing.md "Entering and leaving pairing": adding 'pairing' does not by
                 // itself affect active_roles, streams or group membership. An activate that
                 // declares both purposes therefore runs the operational path as well as the
                 // pairing one, and first: going operational clears stale pairing state the
                 // new attempt must not inherit.
                 if (is_first && contains_activity(activities, SendspinActivity::PLAYBACK)) {
-                    this->client_->on_handshake_complete(event.conn.get());
+                    this->client_->on_handshake_complete(conn);
                 }
                 SS_LOGI(TAG,
                         "Activate selects pairing (%s): entering pairing for "
                         "server_id=%s",
-                        to_cstr(pairing_method.value()), event.conn->get_server_id().c_str());
-                this->handle_enter_pairing(event.conn.get());
+                        to_cstr(pairing_method.value()), conn->get_server_id().c_str());
+                this->handle_enter_pairing(conn);
                 // connection.md "Re-handshake" makes a post-re-handshake activation a subsequent
                 // one, so messaging.md "client/state" owes an update for a role it activates.
-                const bool adds_role = (active_role_mask(event.conn->get_active_roles()) &
-                                        ~active_role_mask(roles_before)) != 0;
+                const bool adds_role = (conn->get_active_role_mask() & ~roles_before) != 0;
                 if (is_first && adds_role &&
                     !contains_activity(activities, SendspinActivity::PLAYBACK)) {
-                    this->client_->publish_client_state(event.conn.get());
+                    this->client_->publish_client_state(conn);
                 }
             }
-        } else if (is_first && event.conn->is_handshake_complete()) {
-            this->client_->on_handshake_complete(event.conn.get());
+        } else if (is_first && conn->is_handshake_complete()) {
+            this->client_->on_handshake_complete(conn);
         }
 
         // messaging.md "client/state": a role that becomes active in active_roles must be told
         // about in an update that includes that role's object, before the server may send its
         // binary data. A first activate publishes through on_handshake_complete(), or above when
         // it selects pairing alone and adds a role; this covers every later one that moves the set.
-        if (roles_changed && !is_first && event.conn->is_operational()) {
-            this->client_->publish_client_state(event.conn.get());
+        if (roles_changed && !is_first && conn->is_operational()) {
+            this->client_->publish_client_state(conn);
         }
         return;
     }
 
-    // A nursery entry is resolved by the level-triggered scan below, not here: this event only
-    // proves the activate arrived, and the hello handshake may still be in flight (a
-    // nonconforming peer's server/hello and server/activate can race ahead of our client/hello).
-    // The scan promotes or arbitrates once both are true, in whichever order they complete, and
-    // a pairing-flavored activate goes through it like any other operational candidate; see
-    // promote_or_arbitrate_nursery_entry().
-}
-
-void ConnectionManager::drain_pairing_events(DrainedEvents& ev) {
-    // pair/abort: clean up pairing state and close the connection. The server/pair-finalize ack
-    // is committed synchronously on the protocol task, and the leftover-activate case is handled
-    // inline in drain_lifecycle_events(), so neither needs a deferred event here.
-    for (auto& event : ev.pair_aborts) {
-        if (event.conn.get() != this->current_connection_.get()) {
-            SS_LOGD(TAG,
-                    "Discarding pair/abort (reason=%s) for server_id=%s: not the current "
-                    "connection",
-                    to_cstr(event.reason), event.conn->get_server_id().c_str());
-            continue;
-        }
-        this->handle_pair_abort(event.conn.get(), event.reason);
-    }
-
-    // Only ever targets the current connection: a pairing-code session only exists on a
-    // connection that already won promotion into current_connection_ (see the pairing
-    // branch in promote_or_arbitrate_nursery_entry()).
-    for (auto& event : ev.pairing_messages) {
-        if (event.conn.get() != this->current_connection_.get()) {
-            SS_LOGD(TAG,
-                    "Discarding pairing message (kind=%d) for server_id=%s: not the current "
-                    "connection",
-                    static_cast<int>(event.kind), event.conn->get_server_id().c_str());
-            continue;
-        }
-        this->handle_pairing_message(event.conn.get(), event);
-    }
-
-    // Triggered by the protocol-task server/pair-finalize ack handler
-    // (SendspinClient::schedule_pairing_succeeded); only ever targets the current
-    // connection for the same reason as ev.pairing_messages above.
-    for (const auto& server_id : ev.pairing_succeeded) {
-        // A completed pairing closes the pairing window (pairing.md "Pairing Window"). The
-        // pairing is complete here and not a message earlier: pairing.md "Entering and leaving
-        // pairing" has a client that sent client/pair-finalize and then received server/activate
-        // in place of server/pair-finalize persist nothing, so the attempt only becomes a
-        // pairing when that ack arrives and the record is stored, which is what schedules this
-        // event. The window is closed only when it is the one this connection's attempt ran
-        // under: an attempt it never admitted has not spent the operator's gesture.
-        if (this->pairing_window_conn_ != nullptr &&
-            this->pairing_window_conn_ == this->current_connection_.get()) {
-            this->close_pairing_window();
-        }
-        this->client_->note_pairing_succeeded(server_id);
-    }
-
-    // Cancellation runs after confirmation so a cancel that arrived in the same tick wins: the
-    // operator's last action is the one that stands.
-    if (ev.pairing_window_confirm) {
-        this->handle_pairing_window_confirmed();
-    }
-    if (ev.pairing_window_cancel) {
-        this->handle_pairing_window_cancelled();
+    // A nursery entry is admitted here when the hello handshake has already completed, so the
+    // messages the server sends behind its activate are dispatched with the connection admitted.
+    // A nonconforming peer's server/activate can race ahead of the hello exchange; the
+    // level-triggered admission in scan_nursery() then admits it once both are true, in whichever
+    // order they complete. A pairing-flavored activate goes through admission like any other
+    // operational candidate; see promote_or_arbitrate_nursery_entry().
+    if (conn->is_operational()) {
+        this->promote_or_arbitrate_nursery_entry(nursery_entry);
     }
 }
 
-void ConnectionManager::drain_unpair_events(DrainedEvents& ev) {
-    // Only the current connection is acted on. A nursery peer that has proven itself can send
+void ConnectionManager::on_pair_abort(SendspinConnection* conn, PairAbortReason reason) {
+    // A pairing attempt only ever runs on an admitted connection (see the pairing branch in
+    // promote_or_arbitrate_nursery_entry()).
+    if (this->find_admitted(conn) == nullptr) {
+        SS_LOGD(TAG, "Discarding pair/abort (reason=%s) for server_id=%s: not admitted",
+                to_cstr(reason), conn->get_server_id().c_str());
+        return;
+    }
+    this->handle_pair_abort(conn, reason);
+}
+
+void ConnectionManager::on_server_unpair(SendspinConnection* conn) {
+    // Only an admitted connection is acted on. A nursery peer that has proven itself can send
     // server/unpair too (the spec calls it valid regardless of the current activities), so this
     // drops one from a peer the client is not actually running a session with. Rare, and it
-    // costs that peer nothing but a repeat once it holds the session.
-    for (auto& event : ev.server_unpairs) {
-        if (event.conn.get() != this->current_connection_.get()) {
-            SS_LOGD(TAG, "Discarding server/unpair for server_id=%s: not the current connection",
-                    event.conn->get_server_id().c_str());
-            continue;
-        }
-        this->handle_server_unpair(event.conn.get(), event);
+    // costs that peer nothing but a repeat once it is admitted.
+    if (this->find_admitted(conn) == nullptr) {
+        SS_LOGD(TAG, "Discarding server/unpair for server_id=%s: not admitted",
+                conn->get_server_id().c_str());
+        return;
     }
+    this->handle_server_unpair(conn);
 }
 
-void ConnectionManager::loop_managed_connections() {
-    // Call loop on active connections using shared_ptr copies to avoid holding the lock.
-    std::shared_ptr<SendspinConnection> current_copy;
-    InlineVector<std::shared_ptr<SendspinConnection>, MAX_NURSERY_ENTRIES> nursery_copies;
-    // Skip the copy (and thus every conn->loop() call below) when there is nothing to call it
-    // on: no current connection and an empty nursery.
-    if (this->nursery_size_.load(std::memory_order_acquire) > 0 ||
-        this->has_current_.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        current_copy = this->current_connection_;
-        for (const auto& entry : this->nursery_) {
-            nursery_copies.push_back(entry.conn);
-        }
+void ConnectionManager::on_pairing_message(SendspinConnection* conn,
+                                           const ServerPairingMessage& message) {
+    // Only ever targets an admitted connection: a pairing-code session only exists on a
+    // connection that already won admission.
+    if (this->find_admitted(conn) == nullptr) {
+        SS_LOGD(TAG, "Discarding pairing message (kind=%d) for server_id=%s: not admitted",
+                static_cast<int>(message.kind), conn->get_server_id().c_str());
+        return;
     }
-    if (current_copy) {
-        current_copy->loop();
-    }
-    for (auto& conn : nursery_copies) {
-        conn->loop();
-    }
+    this->handle_pairing_message(conn, message);
 }
 
-void ConnectionManager::scan_hello_and_nursery() {
-    // Both scans operate purely on nursery membership: a hello is only ever sent while its
-    // connection is proving itself, so the nursery_size_ hint covers the hello scan too.
-    if (this->nursery_size_.load(std::memory_order_acquire) > 0) {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-
-        // Hello scan. Arming is level-triggered because noise_handshake_complete_ flips on the
-        // protocol task (inside handle_noise_handshake_text) with no corresponding queued
-        // event. Each entry arms once (AWAIT_NOISE -> SENDING) and, once its
-        // hello is queued, refused, or out of attempts, stays DONE (see HelloStep); the state
-        // lives on the entry, so a second connection arriving mid-handshake cannot clobber the
-        // first's.
-        {
-            const int64_t now_us = platform_time_us();
-            for (auto& entry : this->nursery_) {
-                SendspinConnection* c = entry.conn.get();
-                if (entry.hello_step == HelloStep::AWAIT_NOISE) {
-                    if (!c->is_noise_handshake_complete()) {
-                        continue;
-                    }
-                    entry.hello_step = HelloStep::SENDING;
-                    entry.hello_due_us = now_us;
-                }
-                if (entry.hello_step != HelloStep::SENDING || now_us < entry.hello_due_us) {
-                    continue;
-                }
-
-                if (this->send_hello_message(entry.hello_attempts_left - 1, c)) {
-                    entry.hello_step = HelloStep::DONE;
-                    continue;
-                }
-
-                if (entry.hello_attempts_left > 1) {
-                    entry.hello_retry_delay_ms *= 2;
-                    entry.hello_attempts_left--;
-                    entry.hello_due_us =
-                        now_us + static_cast<int64_t>(entry.hello_retry_delay_ms) * US_PER_MS;
-                    continue;
-                }
-
-                // Attempts exhausted: the establish-deadline scan below reaps the entry.
-                entry.hello_step = HelloStep::DONE;
-            }
-        }
-
-        // Nursery tick: reap connections that miss the establish deadline. This is the only
-        // release path for peers that connect and then stall without completing the hello, and
-        // for outbound sockets whose transport never delivers a close (host IXWebSocket), and so
-        // also for a connection whose hello never completed.
-        {
-            const int64_t now_us = platform_time_us();
-            for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
-                const NurseryEntry& entry = *it;
-                if (now_us - entry.conn->get_provisional_time_us() >=
-                    NURSERY_ESTABLISH_TIMEOUT_US) {
-                    SS_LOGW(TAG, "Nursery connection stalled at %s (>%d s), dropping",
-                            to_cstr(setup_stage(*entry.conn)),
-                            static_cast<int>(NURSERY_ESTABLISH_TIMEOUT_US / US_PER_SECOND));
-                    it = this->release_nursery_entry(it, SendspinGoodbyeReason::ANOTHER_SERVER);
-                    continue;
-                }
-                ++it;
-            }
-        }
+void ConnectionManager::on_pairing_succeeded(SendspinConnection* conn) {
+    // A completed pairing closes the pairing window (pairing.md "Pairing Window"). The pairing is
+    // complete here and not a message earlier: pairing.md "Entering and leaving pairing" has a
+    // client that sent client/pair-finalize and then received server/activate in place of
+    // server/pair-finalize persist nothing, so the attempt only becomes a pairing when that ack
+    // arrives and the record is stored, which is what calls this. The window is closed only when
+    // it is the one this connection's attempt ran under: an attempt it never admitted has not
+    // spent the operator's gesture.
+    if (this->pairing_window_conn_ != nullptr && this->pairing_window_conn_ == conn) {
+        this->close_pairing_window();
     }
+    this->client_->note_pairing_succeeded(conn->get_server_id());
 }
 
-void ConnectionManager::scan_pairing_attempt_timeout() {
-    // Abort a pairing attempt that has stalled past PAIRING_ATTEMPT_TIMEOUT_US (pairing.md
-    // "Entering and leaving pairing"). local_abort_pairing also withdraws the emitted code.
-    // Only the current connection can host a pairing attempt (see the pairing branch in
-    // promote_or_arbitrate_nursery_entry()).
-    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-    if (this->current_connection_ != nullptr) {
-        // Between the server's pair-finalize ack and the post-rekey activate that reaches
-        // clear_pairing_state(), pairing_session_ still reports its last pre-ack step (non-IDLE)
-        // and attempt_deadline_us keeps counting down against an exchange that has already
-        // succeeded. Skip the scan for that window so a slow rekey cannot abort a completed
-        // pairing.
-        if (this->current_connection_->is_pairing_finalized()) {
-            return;
-        }
-        // connection.md "Re-handshake": between Noise message 1 and the new server/activate the
-        // client starts no application message but the handshake, which a pair/abort would be.
-        // first_activate_received() is false for exactly that window, so the abort waits for the
-        // activation; if it never comes, scan_reprove_watchdog() closes the connection instead
-        // and the attempt ends with it. pairing.md "Entering and leaving pairing" bounds an
-        // attempt with a timeout "on expiry it sends pair/abort"; the re-handshake rule is the
-        // narrower MUST NOT, and the wait it imposes is bounded by REPROVE_TIMEOUT_US.
-        if (!this->current_connection_->first_activate_received()) {
-            return;
-        }
-        const auto& ps = this->current_connection_->pairing_session();
-        const int64_t now_us = platform_time_us();
-        const bool attempt_expired =
-            ps.attempt_deadline_us != 0 && now_us >= ps.attempt_deadline_us;
-        if (attempt_expired) {
-            SS_LOGW(TAG, "Pairing attempt timed out for server_id=%s; aborting",
-                    this->current_connection_->get_server_id().c_str());
-            this->local_abort_pairing(this->current_connection_.get(),
-                                      PairAbortReason::ATTEMPT_TIMEOUT);
-        }
+void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
+    if (conn == nullptr) {
+        return;
     }
-}
-
-void ConnectionManager::scan_reprove_watchdog() {
-    // current_connection_ is briefly non-operational while it re-proves itself: after a
-    // successful in-band re-handshake (SendspinConnection::handle_noise_rehandshake(), which
-    // leaves it awaiting the post-swap server/activate) or after the server acks
-    // client/pair-finalize and is expected to rekey via one
-    // (SendspinConnection::note_pairing_finalize_ack()). Both call sites reset
-    // provisional_time_us_ to a fresh, non-zero timestamp when they enter this window.
-    // current_connection_ is never non-operational for any other reason: a nursery entry is only
-    // ever promoted once it is already operational (see promote_or_arbitrate_nursery_entry()),
-    // and an in-progress pairing-code PAKE exchange keeps is_operational() true throughout (that
-    // flow has its own timeouts: the PAIRING_ATTEMPT_TIMEOUT_US check above, and
-    // pairing_window_open() while a gesture is awaited). The provisional_time_us_ != 0 guard
-    // additionally excludes a connection that was never stamped, keeping the check inert for
-    // anything that reaches current_connection_ by a route that skips both admission paths.
-    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-    if (this->current_connection_ != nullptr && !this->current_connection_->is_operational()) {
-        const int64_t provisional_us = this->current_connection_->get_provisional_time_us();
-        const int64_t now_us = platform_time_us();
-        if (provisional_us != 0 && now_us - provisional_us >= REPROVE_TIMEOUT_US) {
-            SS_LOGW(TAG,
-                    "Current connection failed to re-prove itself within %d s "
-                    "(server_id=%s); dropping",
-                    static_cast<int>(REPROVE_TIMEOUT_US / US_PER_SECOND),
-                    this->current_connection_->get_server_id().c_str());
-            // Closed without a goodbye. One of the two windows this reaps starts at Noise
-            // message 1, and connection.md "Re-handshake" lets the client start no application
-            // message there but the handshake; the other ends at a rekey the peer has already
-            // failed to perform. No goodbye reason describes either, and the peer learns the
-            // same thing from the close. close_silently() tears the transport down here (it is
-            // non-blocking on every platform), so the nullopt release below has nothing to send.
-            this->current_connection_->close_silently(SendspinGoodbyeReason::ANOTHER_SERVER);
-            this->drop_connection(this->current_connection_.get(), std::nullopt);
-        }
+    if (this->find_admitted(conn) != nullptr) {
+        SS_LOGI(TAG, "Admitted connection lost");
+    } else if (this->find_in_nursery(conn) != this->nursery_.end()) {
+        SS_LOGD(TAG, "Nursery connection lost");
     }
-}
-
-void ConnectionManager::loop() {
-    this->maybe_start_ws_server();
-
-    // Process deferred connection lifecycle events: one conn_mutex_ swap, then (when there is
-    // something to do) one conn_ptr_mutex_ section applying lifecycle, pairing, and unpair
-    // events in order.
-    this->swap_out_pending_events(this->drained_events_);
-    DrainedEvents& ev = this->drained_events_;
-
-    // Also runs whenever the nursery is non-empty even with no swapped-out events: the
-    // hello scan in scan_hello_and_nursery() (called further down) is
-    // level-triggered on handshake flags set by the protocol task with no corresponding event
-    // push, so loop() must keep running every tick a nursery connection exists.
-    if (ev.any() || this->nursery_size_.load(std::memory_order_acquire) > 0) {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        this->drain_lifecycle_events(ev);
-        this->drain_pairing_events(ev);
-        this->drain_unpair_events(ev);
-    }
-
-    // The provider writes the locked handlers left owed, ahead of the two flushes below so a
-    // revocation is on flash before its session is told to leave.
-    this->client_->flush_pending_persistence();
-
-    // Admit the connection the promotion scan installed, outside the lock. Ahead of the goodbyes
-    // below so the incoming connection is driving the roles before the outgoing one is told to
-    // leave.
-    this->flush_pending_admission();
-
-    // Send the goodbyes and release the connections dropped above, outside the lock.
-    this->flush_deferred_releases();
-
-    // Call loop() on active connections using shared_ptr copies to avoid holding the lock.
-    this->loop_managed_connections();
-
-    // Hello scan (arming and sends) and the nursery establish-deadline reap.
-    this->scan_hello_and_nursery();
-
-    // Liveness tick: a blackholed socket (no FIN, RST, or close frame) never produces a transport
-    // close event, so drop the established connection once its inbound silence reaches the timeout.
-    // The outer timeout test is the cost gate: a disabled check takes no lock and reads no clock.
-    if (this->liveness_timeout_us_ > 0 && this->has_current_.load(std::memory_order_acquire)) {
-        const int64_t now_us = platform_time_us();
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        if (this->current_connection_ != nullptr &&
-            liveness_expired(now_us, this->current_connection_->get_last_receive_time_us(),
-                             this->liveness_timeout_us_)) {
-            SS_LOGW(TAG, "Current connection silent for >%" PRId64 " ms, dropping as lost",
-                    this->liveness_timeout_us_ / US_PER_MS);
-            // The goodbye actively closes the transport, which the silent peer never will; an
-            // inbound session would otherwise hold its server slot. Per the spec's
-            // `client/goodbye` section, restart asks a server that was only slow to reconnect.
-            this->drop_connection(this->current_connection_.get(), SendspinGoodbyeReason::RESTART);
-        }
-    }
-
-    // Send the goodbyes and release the connections reaped by the nursery tick, outside the lock.
-    this->flush_deferred_releases();
-
-    // Drive the platform ws_server's pending-upgrade reap (ESP: close sessions that never
-    // complete their upgrade; host: no-op, IXWebSocket times them out itself). Called with no
-    // manager lock held.
-    if (this->ws_server_ != nullptr) {
-        this->ws_server_->tick();
-    }
-
-    this->scan_pairing_attempt_timeout();
-    // Send the goodbye and release the connection if the timeout check above aborted one.
-    this->flush_deferred_releases();
-
-    // Drop the current connection if it failed to re-prove itself after an in-band re-handshake
-    // or a pairing-finalize rekey.
-    this->scan_reprove_watchdog();
-    // Send the goodbye and release the connection if the re-proving watchdog above dropped one.
-    this->flush_deferred_releases();
-
-    // Release this tick's drained events, outside every lock and after the flushes above.
-    ev.clear();
-}
-
-// ============================================================================
-// Connection queries
-// ============================================================================
-
-bool ConnectionManager::is_connected() const {
-    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-    return this->current_connection_ != nullptr && this->current_connection_->is_connected() &&
-           this->current_connection_->is_operational();
-}
-
-std::shared_ptr<SendspinTimeFilter> ConnectionManager::current_time_filter() const {
-    std::lock_guard<std::mutex> lock(this->time_filter_mutex_);
-    return this->current_time_filter_;
+    // The transport is already gone, so no goodbye is attempted (nullopt). A connection the
+    // manager no longer manages is a no-op.
+    this->drop_connection(conn, std::nullopt);
 }
 
 std::vector<std::string> ConnectionManager::open_connection_psk_ids() const {
-    // Called from the protocol task (the server/pair-finalize ack handler) as well as the main
-    // loop, so it takes conn_ptr_mutex_ and copies. The ack handler holds no lock while it calls
-    // this. conn_ptr_mutex_ sits before RecordStore::mutex_ in the lock order
-    // (docs/conventions.md, "Threading and cross-thread state"), matching every main-loop path
-    // that reaches the store while holding this lock; the caller passes the result into the
-    // store afterwards rather than holding both at once.
     std::vector<std::string> psk_ids;
     psk_ids.reserve(MAX_OPEN_CONNECTIONS);
-    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-    if (this->current_connection_) {
-        std::string psk_id = this->current_connection_->get_psk_id();
-        if (!psk_id.empty()) {
-            psk_ids.push_back(std::move(psk_id));
+    for (const auto& entry : this->admitted_) {
+        if (entry.conn != nullptr && !entry.conn->get_psk_id().empty()) {
+            psk_ids.push_back(entry.conn->get_psk_id());
         }
     }
     for (const auto& entry : this->nursery_) {
-        std::string psk_id = entry.conn->get_psk_id();
-        if (!psk_id.empty()) {
-            psk_ids.push_back(std::move(psk_id));
+        if (!entry.conn->get_psk_id().empty()) {
+            psk_ids.push_back(entry.conn->get_psk_id());
         }
     }
     return psk_ids;
+}
+
+// ============================================================================
+// Protocol task: tick
+// ============================================================================
+
+void ConnectionManager::snapshot_connections(ConnectionSnapshot& out) const {
+    for (const auto& entry : this->admitted_) {
+        if (entry.conn != nullptr) {
+            out.push_back(entry.conn);
+        }
+    }
+    for (const auto& entry : this->nursery_) {
+        out.push_back(entry.conn);
+    }
+}
+
+void ConnectionManager::start_upgraded_handshakes() {
+    // Level-triggered on the upgrade flag the transport sets (on_connected_cb), so a wake that
+    // carried several upgrades, or one that raced the previous tick, is never missed. An inbound
+    // entry sent its client/init at accept().
+    for (auto& entry : this->nursery_) {
+        if (!entry.client_init_sent && entry.conn->is_ws_upgraded()) {
+            this->start_noise_handshake(entry);
+        }
+    }
+}
+
+uint32_t ConnectionManager::tick(int64_t now_us) {
+    uint32_t next = this->scan_nursery(now_us);
+    next = std::min(next, this->scan_admitted(now_us));
+
+    // The pairing window's lifetime (pairing.md "Pairing Window"): closed silently at expiry,
+    // whether or not it admitted an attempt.
+    if (this->pairing_window_open_until_us_ != 0) {
+        if (now_us >= this->pairing_window_open_until_us_) {
+            this->close_pairing_window();
+        } else {
+            next = std::min(next, ms_until(this->pairing_window_open_until_us_, now_us));
+        }
+    }
+
+    // The platform server's pending-upgrade reap (ESP: close sessions that never complete their
+    // upgrade; host: none, IXWebSocket times them out itself).
+    if (this->ws_server_ != nullptr) {
+        next = std::min(next, this->ws_server_->tick());
+    }
+    next = std::min(next, this->maybe_start_ws_server(now_us));
+    return next;
+}
+
+uint32_t ConnectionManager::run_time_sync() {
+    uint32_t next = ProtocolTask::NO_DEADLINE;
+    AdmittedEntry* primary = this->primary();
+    for (auto& entry : this->admitted_) {
+        SendspinConnection* conn = entry.conn.get();
+        // Gate on is_operational() (hello + first server/activate), not just admission: an
+        // in-band re-handshake resets first_activate_received_ on an admitted connection, and a
+        // stale pre-re-handshake time exchange must not resume mid-rotation. A declared PAIRING
+        // activity is not a gate: pairing.md "Entering and leaving pairing" runs pairing
+        // alongside playback, leaving streams open and their timeline unaffected, which a player
+        // can only deliver with its time filter still converging. A connection whose transport
+        // is gone waits for its close to be processed.
+        if (conn == nullptr || !conn->is_operational() || !conn->is_connected()) {
+            continue;
+        }
+        const TimeBurstResult result = conn->time_burst().loop(conn);
+
+        // A burst in flight holds the platform's high-performance networking for the round trips
+        // it measures; the request and release reach the listener on the main loop.
+        if (result.sent && !entry.high_performance_held) {
+            this->client_->request_high_performance(true);
+            entry.high_performance_held = true;
+        }
+        if (result.burst_completed) {
+            if (entry.high_performance_held) {
+                this->client_->request_high_performance(false);
+                entry.high_performance_held = false;
+            }
+            if (&entry == primary && conn->get_time_filter() != nullptr) {
+                this->client_->post_time_sync_error(conn->get_time_filter()->get_error());
+            }
+        }
+        // A client/state held for this connection's clock goes out with its first measurement.
+        if (entry.state_held && conn->is_time_synced()) {
+            this->client_->publish_client_state(conn);
+        }
+        next = std::min(next, conn->time_burst().ms_until_due(platform_time_us() / US_PER_MS));
+    }
+    return next;
+}
+
+void ConnectionManager::refresh_published_state() {
+    AdmittedEntry* primary = this->primary();
+    SendspinConnection* primary_conn = primary != nullptr ? primary->conn.get() : nullptr;
+    const uint64_t primary_id = primary_conn != nullptr ? primary_conn->get_instance_id() : 0;
+    if (primary_id != this->published_primary_id_) {
+        // The slots change only with the primary connection: its filter is fixed at creation and
+        // its server information is complete before admission (server/hello precedes it).
+        this->published_primary_id_ = primary_id;
+        std::shared_ptr<SendspinTimeFilter> filter =
+            primary_conn != nullptr ? primary_conn->get_shared_time_filter() : nullptr;
+        std::optional<ServerInformationObject> info =
+            primary_conn != nullptr ? std::make_optional(primary_conn->get_server_information())
+                                    : std::nullopt;
+        {
+            // Swapped under the leaf lock; what they replace is destroyed outside it.
+            std::lock_guard<std::mutex> lock(this->time_filter_mutex_);
+            this->time_filter_.swap(filter);
+        }
+        {
+            std::lock_guard<std::mutex> lock(this->server_info_mutex_);
+            this->server_information_.swap(info);
+        }
+    }
+
+    bool connected = false;
+    for (const auto& entry : this->admitted_) {
+        if (entry.conn != nullptr && entry.conn->is_connected() && entry.conn->is_operational()) {
+            connected = true;
+            break;
+        }
+    }
+    this->connected_.store(connected, std::memory_order_release);
+}
+
+void ConnectionManager::shutdown() {
+    this->shutdown_done_ = true;
+
+    // A code or pairing-window prompt still showing must be dismissed once the client has reset
+    // its state; the flags live on the connections, so capture them before they go (see
+    // PairingUiSnapshot). stop() queues the dismissal after its own cleanup.
+    PairingUiSnapshot ui{false, false};
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> to_goodbye;
+    for (auto& entry : this->admitted_) {
+        if (entry.conn == nullptr) {
+            continue;
+        }
+        const PairingUiSnapshot entry_ui = snapshot_pairing_ui(entry.conn.get());
+        ui.code_was_emitted |= entry_ui.code_was_emitted;
+        ui.window_was_shown |= entry_ui.window_was_shown;
+        entry.conn->detach_inbound();
+        entry.conn->set_admitted(false);
+        entry.conn->time_burst().reset();
+        if (entry.high_performance_held) {
+            this->client_->request_high_performance(false);
+        }
+        to_goodbye.push_back(std::move(entry.conn));
+        entry = AdmittedEntry{};
+    }
+    for (auto& entry : this->nursery_) {
+        const PairingUiSnapshot entry_ui = snapshot_pairing_ui(entry.conn.get());
+        ui.code_was_emitted |= entry_ui.code_was_emitted;
+        ui.window_was_shown |= entry_ui.window_was_shown;
+        entry.conn->detach_inbound();
+        to_goodbye.push_back(std::move(entry.conn));
+    }
+    this->nursery_.clear();
+    // A standing pairing window belongs to this run; a restart begins with it closed.
+    this->close_pairing_window();
+    // Empties the time filter slot before stop() stops the role threads: a role thread that reads
+    // it from here converts to 0, which reads as late.
+    this->refresh_published_state();
+    this->shutdown_ui_.code_was_emitted |= ui.code_was_emitted;
+    this->shutdown_ui_.window_was_shown |= ui.window_was_shown;
+
+    // Goodbye every connection, registering each count before any wait starts, so a completion
+    // that runs inline (host, and any not-connected transport) cannot satisfy the wait early. A
+    // disconnected connection completes immediately (see SendspinConnection::disconnect).
+    if (this->shutdown_wait_ == nullptr) {
+        this->shutdown_wait_ = std::make_shared<GoodbyeWait>();
+    }
+    std::shared_ptr<GoodbyeWait> wait = this->shutdown_wait_;
+    for (auto& conn : to_goodbye) {
+        wait->add_pending();
+        ++this->shutdown_goodbyes_pending_;
+        conn->disconnect(SendspinGoodbyeReason::SHUTDOWN, [wait] { wait->complete_one(); });
+        this->closing_.push_back(std::move(conn));
+    }
+    this->flush_shutdown_goodbyes();
+}
+
+void ConnectionManager::flush_shutdown_goodbyes() {
+    if (this->shutdown_goodbyes_pending_ == 0 || this->shutdown_wait_ == nullptr) {
+        return;
+    }
+    // The bound scales with the goodbyes issued: on ESP they are handed to lwIP one at a time by
+    // the single httpd worker, so several peers need several quanta.
+    const uint32_t count = this->shutdown_goodbyes_pending_;
+    const uint32_t flush_bound_ms = GOODBYE_FLUSH_TIMEOUT_MS * count;
+    if (!this->shutdown_wait_->wait(flush_bound_ms)) {
+        SS_LOGD(TAG, "Goodbye flush bound (%u ms for %u goodbyes) elapsed; closing regardless",
+                static_cast<unsigned>(flush_bound_ms), static_cast<unsigned>(count));
+    }
+    this->shutdown_goodbyes_pending_ = 0;
+}
+
+// ============================================================================
+// Protocol task: role ownership
+// ============================================================================
+
+AdmittedEntry* ConnectionManager::find_admitted(const SendspinConnection* conn) {
+    if (conn == nullptr) {
+        return nullptr;
+    }
+    for (auto& entry : this->admitted_) {
+        if (entry.conn.get() == conn) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+bool ConnectionManager::owns_role(const SendspinConnection* conn, SendspinRole role) const {
+    for (const auto& entry : this->admitted_) {
+        if (entry.conn.get() == conn && conn != nullptr) {
+            return (entry.owned_roles & role_mask_bit(role)) != 0 && conn->is_role_active(role);
+        }
+    }
+    return false;
+}
+
+SendspinConnection* ConnectionManager::role_owner(SendspinRole role) const {
+    for (const auto& entry : this->admitted_) {
+        if (entry.conn != nullptr && (entry.owned_roles & role_mask_bit(role)) != 0 &&
+            entry.conn->is_role_active(role)) {
+            return entry.conn.get();
+        }
+    }
+    return nullptr;
+}
+
+AdmittedEntry* ConnectionManager::primary() {
+    AdmittedEntry* first = nullptr;
+    for (auto& entry : this->admitted_) {
+        if (entry.conn == nullptr) {
+            continue;
+        }
+        if ((entry.owned_roles & role_mask_bit(SendspinRole::PLAYER)) != 0) {
+            return &entry;
+        }
+        if (first == nullptr) {
+            first = &entry;
+        }
+    }
+    return first;
+}
+
+uint16_t ConnectionManager::roles_owned_by_others(const AdmittedEntry* except) const {
+    uint16_t owned = 0;
+    for (const auto& entry : this->admitted_) {
+        if (&entry != except && entry.conn != nullptr) {
+            owned |= entry.owned_roles;
+        }
+    }
+    return owned;
 }
 
 // ============================================================================
@@ -1264,126 +1337,195 @@ void ConnectionManager::set_last_played_server_id(const std::string& server_id) 
 }
 
 // ============================================================================
-// Event queuing (thread-safe)
+// Tick steps
 // ============================================================================
 
-void ConnectionManager::schedule_activate(ServerActivateEvent event) {
-    // Called from SendspinClient::process_json_message() on the protocol task.
-    if (event.conn == nullptr) {
-        return;
+uint32_t ConnectionManager::maybe_start_ws_server(int64_t now_us) {
+    if (this->ws_server_ == nullptr || this->ws_server_->is_started() ||
+        !this->accepting_.load(std::memory_order_acquire)) {
+        return ProtocolTask::NO_DEADLINE;
     }
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending(this->pending_activate_events_, std::move(event));
-}
-
-void ConnectionManager::schedule_pair_abort(PairAbortEvent event) {
-    // Called from SendspinClient::process_json_message() on the protocol task when a pair/abort
-    // message arrives (or a malformed pairing frame forces one).
-    if (event.conn == nullptr) {
-        return;
+    if (now_us < this->ws_server_start_retry_time_us_) {
+        return ms_until(this->ws_server_start_retry_time_us_, now_us);
     }
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending(this->pending_pair_abort_events_, std::move(event));
-}
-
-void ConnectionManager::schedule_server_unpair(ServerUnpairEvent&& event) {
-    // Called from SendspinClient::process_json_message() on the protocol task when
-    // server/unpair arrives.
-    if (event.conn == nullptr) {
-        return;
+    // is_network_ready() is called here, on the protocol task, and from start() on the main loop
+    // (see SendspinNetworkProvider).
+    if (this->client_->network_provider_ == nullptr) {
+        return ProtocolTask::NO_DEADLINE;
     }
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending(this->pending_server_unpair_events_, std::move(event));
-}
-
-void ConnectionManager::schedule_pairing_message(ServerPairingMessageEvent&& event) {
-    // Called from SendspinClient::process_json_message() on the protocol task when a
-    // pairing message arrives (or a malformed pairing frame forces a MALFORMED event).
-    if (event.conn == nullptr) {
-        return;
+    if (!this->client_->network_provider_->is_network_ready()) {
+        return NETWORK_POLL_INTERVAL_MS;
     }
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending(this->pending_pairing_message_events_, std::move(event));
+    if (!this->ws_server_->start(this->client_, this->client_->config_.httpd_psram_stack,
+                                 this->client_->config_.httpd_priority,
+                                 this->client_->config_.httpd_stack_size)) {
+        // A persistent failure (e.g. the server port is already in use) is retried with backoff
+        // instead of on every tick, which would spam the log.
+        this->ws_server_start_retry_time_us_ = now_us + WS_SERVER_START_RETRY_US;
+        return ms_until(this->ws_server_start_retry_time_us_, now_us);
+    }
+    return ProtocolTask::NO_DEADLINE;
 }
 
-void ConnectionManager::schedule_pairing_succeeded(std::string server_id) {
-    // Called from SendspinClient::process_json_message() on the protocol task when the
-    // server/pair-finalize ack handler stores a long-term record.
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending(this->pending_pairing_succeeded_events_, std::move(server_id));
-}
+uint32_t ConnectionManager::scan_nursery(int64_t now_us) {
+    uint32_t next = ProtocolTask::NO_DEADLINE;
 
-void ConnectionManager::schedule_pairing_window_confirm() {
-    // Called from SendspinClient::confirm_pairing_window(), which may run on any thread
-    // (typically the application's UI thread relaying an operator gesture).
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->pending_pairing_window_confirm_ = true;
-    this->mark_pending();
-}
-
-void ConnectionManager::schedule_pairing_window_cancel() {
-    // Called from SendspinClient::cancel_pairing_window(); same threading as the confirm above.
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->pending_pairing_window_cancel_ = true;
-    this->mark_pending();
-}
-
-void ConnectionManager::apply_unpaired_access_change(bool enabled) {
-    // pairing.md "Unpaired Access": disabling closes the connections relying on it with
-    // pairing_required; enabling restarts unpaired connections so their servers read the new value
-    // in the next client/hello.
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-
-        // Collect first: drop_connection() edits the nursery being walked.
-        InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> doomed;
-        auto consider = [&](const std::shared_ptr<SendspinConnection>& conn, bool hello_sent) {
-            if (!enabled) {
-                // A connection still awaiting its activation is judged against the new setting
-                // when that activation is applied.
-                if (conn->first_activate_received() &&
-                    relies_on_unpaired_access(conn->get_psk_category(), conn->get_activities(),
-                                              !conn->get_active_roles().empty())) {
-                    doomed.push_back(conn);
-                }
-                return;
+    // Hello scan. Arming is level-triggered on noise_handshake_complete_, which the receive path
+    // sets with no event of its own. Each entry arms once (AWAIT_NOISE -> SENDING) and, once its
+    // hello is queued, refused, or out of attempts, stays DONE (see HelloStep); the state lives
+    // on the entry, so a second connection arriving mid-handshake cannot clobber the first's.
+    for (auto& entry : this->nursery_) {
+        SendspinConnection* c = entry.conn.get();
+        if (entry.hello_step == HelloStep::AWAIT_NOISE) {
+            if (!c->is_noise_handshake_complete()) {
+                continue;
             }
-            // messaging.md "client/goodbye": restart on a connection the client opened promises
-            // that the client reopens it, and nothing reopens a connect_to() connection. A
-            // connection declaring pairing is left to finish. A Pairing-PSK one that has not
-            // activated yet is most likely about to declare pairing, and a restart would cost that
-            // attempt, so it is left alone too; if it activates idle instead, it keeps the hello
-            // it already read until it reconnects. A Sentinel one awaiting its activation is
-            // restarted, since its server may be deciding that activation on the value its hello
-            // carried.
-            if (hello_sent && !conn->is_outbound() &&
-                conn->get_psk_category() != PskCategory::LONG_TERM &&
-                !conn->has_activity(SendspinActivity::PAIRING) &&
-                (conn->first_activate_received() ||
-                 conn->get_psk_category() != PskCategory::PAIRING)) {
-                doomed.push_back(conn);
+            entry.hello_step = HelloStep::SENDING;
+            entry.hello_due_us = now_us;
+        }
+        if (entry.hello_step != HelloStep::SENDING) {
+            continue;
+        }
+        if (now_us < entry.hello_due_us) {
+            next = std::min(next, ms_until(entry.hello_due_us, now_us));
+            continue;
+        }
+
+        if (this->send_hello_message(entry.hello_attempts_left - 1, c)) {
+            entry.hello_step = HelloStep::DONE;
+            continue;
+        }
+
+        if (entry.hello_attempts_left > 1) {
+            entry.hello_retry_delay_ms *= 2;
+            entry.hello_attempts_left--;
+            entry.hello_due_us =
+                now_us + static_cast<int64_t>(entry.hello_retry_delay_ms) * US_PER_MS;
+            next = std::min(next, ms_until(entry.hello_due_us, now_us));
+            continue;
+        }
+
+        // Attempts exhausted: the establish-deadline reap below releases the entry.
+        entry.hello_step = HelloStep::DONE;
+    }
+
+    // Admission: every nursery entry that has proven itself (is_operational(): hello handshake
+    // complete and first server/activate applied and admissible; trust was already checked when
+    // that activate was processed). The activate handler admits at once when the hello completed
+    // first; this level-triggered pass covers the other order.
+    for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
+        if (!it->conn->is_operational()) {
+            ++it;
+            continue;
+        }
+        it = this->promote_or_arbitrate_nursery_entry(it);
+    }
+
+    // Establish reap: the only release path for peers that connect and then stall without
+    // completing the hello, for outbound sockets whose transport never delivers a close (host
+    // IXWebSocket), and so also for a connection whose hello never completed.
+    for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
+        const int64_t deadline_us =
+            it->conn->get_provisional_time_us() + NURSERY_ESTABLISH_TIMEOUT_US;
+        if (now_us >= deadline_us) {
+            SS_LOGW(TAG, "Nursery connection stalled at %s (>%d s), dropping",
+                    to_cstr(setup_stage(*it->conn)),
+                    static_cast<int>(NURSERY_ESTABLISH_TIMEOUT_US / US_PER_SECOND));
+            it = this->release_nursery_entry(it, SendspinGoodbyeReason::ANOTHER_SERVER);
+            continue;
+        }
+        next = std::min(next, ms_until(deadline_us, now_us));
+        ++it;
+    }
+    return next;
+}
+
+uint32_t ConnectionManager::scan_admitted(int64_t now_us) {
+    uint32_t next = ProtocolTask::NO_DEADLINE;
+    // The array is never compacted, so a drop below frees its slot without moving the others.
+    for (auto& entry : this->admitted_) {
+        SendspinConnection* conn = entry.conn.get();
+        if (conn == nullptr) {
+            continue;
+        }
+
+        // Liveness: a blackholed socket (no FIN, RST, or close frame) never produces a transport
+        // close, so drop an admitted connection once its inbound silence reaches the timeout.
+        if (this->liveness_timeout_us_ > 0) {
+            if (liveness_expired(now_us, conn->get_last_receive_time_us(),
+                                 this->liveness_timeout_us_)) {
+                SS_LOGW(TAG, "Admitted connection silent for >%" PRId64 " ms, dropping as lost",
+                        this->liveness_timeout_us_ / US_PER_MS);
+                // The goodbye actively closes the transport, which the silent peer never will; an
+                // inbound session would otherwise hold its server slot. Per the spec's
+                // `client/goodbye` section, restart asks a server that was only slow to reconnect.
+                this->drop_connection(conn, SendspinGoodbyeReason::RESTART);
+                continue;
             }
-        };
-
-        // The admitted connection sent its hello to be admitted. One between a re-handshake and
-        // the activation that follows it is left alone: its server may be moving it into pairing.
-        if (this->current_connection_ != nullptr &&
-            this->current_connection_->first_activate_received()) {
-            consider(this->current_connection_, /*hello_sent=*/true);
-        }
-        for (const auto& entry : this->nursery_) {
-            consider(entry.conn, entry.hello_step == HelloStep::DONE);
+            next = std::min(next, ms_until(now_us + liveness_remaining_us(
+                                                        now_us, conn->get_last_receive_time_us(),
+                                                        this->liveness_timeout_us_),
+                                           now_us));
         }
 
-        const SendspinGoodbyeReason reason =
-            enabled ? SendspinGoodbyeReason::RESTART : SendspinGoodbyeReason::PAIRING_REQUIRED;
-        for (const auto& conn : doomed) {
-            SS_LOGI(TAG, "Unpaired access %s: closing the session with server_id=%s",
-                    enabled ? "enabled" : "disabled", conn->get_server_id().c_str());
-            this->drop_connection(conn.get(), reason);
+        // Re-prove: an admitted connection is briefly non-operational while it re-proves itself,
+        // after a successful in-band re-handshake (SendspinConnection::handle_noise_rehandshake(),
+        // which leaves it awaiting the post-swap server/activate) or after the server acks
+        // client/pair-finalize and is expected to rekey via one
+        // (SendspinConnection::note_pairing_finalize_ack()). Both stamp provisional_time_us_ when
+        // they enter this window. An admitted connection is never non-operational for any other
+        // reason: a nursery entry is only admitted once it is operational, and an in-progress
+        // pairing-code exchange keeps is_operational() true throughout (that flow has its own
+        // timeouts: the attempt deadline below, and the pairing window while a gesture is
+        // awaited). The stamp != 0 guard keeps the check inert for a connection never stamped.
+        if (!conn->is_operational() && conn->get_provisional_time_us() != 0) {
+            const int64_t deadline_us = conn->get_provisional_time_us() + REPROVE_TIMEOUT_US;
+            if (now_us >= deadline_us) {
+                SS_LOGW(TAG,
+                        "Admitted connection failed to re-prove itself within %d s "
+                        "(server_id=%s); dropping",
+                        static_cast<int>(REPROVE_TIMEOUT_US / US_PER_SECOND),
+                        conn->get_server_id().c_str());
+                // Closed without a goodbye. One of the two windows this reaps starts at Noise
+                // message 1, and connection.md "Re-handshake" lets the client start no application
+                // message there but the handshake; the other ends at a rekey the peer has already
+                // failed to perform. No goodbye reason describes either, and the peer learns the
+                // same thing from the close. close_silently() tears the transport down here (it is
+                // non-blocking on every platform), so the nullopt release below has nothing to
+                // send.
+                conn->close_silently(SendspinGoodbyeReason::ANOTHER_SERVER);
+                this->drop_connection(conn, std::nullopt);
+                continue;
+            }
+            next = std::min(next, ms_until(deadline_us, now_us));
+        }
+
+        // Pairing attempt timeout (pairing.md "Entering and leaving pairing"); local_abort_pairing
+        // also withdraws an emitted code. Between the server's pair-finalize ack and the
+        // post-rekey activate that reaches clear_pairing_state(), pairing_session_ still reports
+        // its last pre-ack step and attempt_deadline_us keeps counting down against an exchange
+        // that has already succeeded, so the check is skipped for that window: a slow rekey must
+        // not abort a completed pairing. connection.md "Re-handshake": between Noise message 1 and
+        // the new server/activate the client starts no application message but the handshake,
+        // which a pair/abort would be. first_activate_received() is false for exactly that window,
+        // so the abort waits for the activation; if it never comes, the re-prove check above
+        // closes the connection instead and the attempt ends with it. pairing.md "Entering and
+        // leaving pairing" bounds an attempt with a timeout "on expiry it sends pair/abort"; the
+        // re-handshake rule is the narrower MUST NOT, and the wait it imposes is bounded by
+        // REPROVE_TIMEOUT_US.
+        const int64_t attempt_deadline_us = conn->pairing_session().attempt_deadline_us;
+        if (attempt_deadline_us != 0 && !conn->is_pairing_finalized() &&
+            conn->first_activate_received()) {
+            if (now_us >= attempt_deadline_us) {
+                SS_LOGW(TAG, "Pairing attempt timed out for server_id=%s; aborting",
+                        conn->get_server_id().c_str());
+                this->local_abort_pairing(conn, PairAbortReason::ATTEMPT_TIMEOUT);
+                continue;
+            }
+            next = std::min(next, ms_until(attempt_deadline_us, now_us));
         }
     }
-    this->flush_deferred_releases();
+    return next;
 }
 
 // ============================================================================
@@ -1402,92 +1544,66 @@ void ConnectionManager::setup_connection_callbacks(SendspinConnection* conn) {
     conn->attach_inbound(this->client_->inbound_ring_.get(), this->client_->protocol_task_.get());
 }
 
-void ConnectionManager::snapshot_connections(ConnectionSnapshot& out) const {
-    // Runs on the protocol task every tick, and conn_ptr_mutex_ is held by main-loop sections
-    // across blocking work (an application send, a goodbye flush), so this is the task's one
-    // unbounded wait (docs/conventions.md "Threading and cross-thread state").
-    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-    if (this->current_connection_ != nullptr) {
-        out.push_back(this->current_connection_);
-    }
-    for (const auto& entry : this->nursery_) {
-        out.push_back(entry.conn);
-    }
+void ConnectionManager::start_noise_handshake(NurseryEntry& entry) {
+    // client/init is sent proactively: the client is always the Noise responder regardless of
+    // who opened the socket, but it still sends client/init first as the Sendspin protocol
+    // client. The hello is armed later, once the Noise handshake completes (the hello scan in
+    // scan_nursery()).
+    entry.conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
+                                     std::string(NOISE_SUITE_CHACHAPOLY));
+    entry.conn->send_noise_client_init();
+    entry.client_init_sent = true;
 }
 
-void ConnectionManager::report_connection_lost(std::shared_ptr<SendspinConnection> conn) {
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending(this->pending_disconnect_events_, std::move(conn));
-}
-
-void ConnectionManager::drop_pending_events() {
-    DrainedEvents dropped;
-    this->swap_out_pending_events(dropped);
-    // Released here, outside conn_mutex_.
-}
-
-void ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerConnection>& conn) {
-    // Called from the platform ws_server's delivery path (ESP: httpd task, host: IXWebSocket
-    // thread) once the connection's WebSocket upgrade has been observed, so the manager never sees
-    // a socket that has not proven it speaks WebSocket. The authoritative owner is the platform's
-    // session/transport context; the nursery entry takes its own reference.
-    conn->init_time_filter();
-    conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
-    conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
-
-    // On the transport's delivery thread, ahead of the connection's first frame.
-    this->setup_connection_callbacks(conn.get());
-
-    // Start the establish clock: loop() reaps the connection if it does not complete the hello
-    // handshake within NURSERY_ESTABLISH_TIMEOUT_US.
-    conn->set_provisional_time_us(platform_time_us());
-
-    std::optional<SendspinGoodbyeReason> rejection;
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-
-        // The newcomer has not completed the hello handshake, so it never touches the current
-        // slot; it enters the bounded nursery and is promoted only once it establishes. Only
-        // inbound entries count against the capacity (see NURSERY_CAPACITY). If the inbound slots
-        // are full, reject the newcomer: every occupant speaks WebSocket, so there is no safe
-        // eviction candidate. The goodbye reaches the peer because its session is already upgraded,
-        // provided the transport had a socket to accept it on (the NURSERY_CAPACITY + 2 budget).
-        size_t inbound_count = 0;
-        for (const auto& entry : this->nursery_) {
-            if (!entry.conn->is_outbound()) {
-                ++inbound_count;
-            }
-        }
-        if (!this->accepting_) {
-            // Delivered while stop() is tearing down (or before start()): the nursery is being
-            // emptied, so the newcomer gets a goodbye and a close instead of a slot. Same shape
-            // as the nursery-full rejection below.
-            SS_LOGD(TAG, "Not accepting connections, rejecting new connection");
-            conn->detach_inbound();
-            rejection = SendspinGoodbyeReason::SHUTDOWN;
-        } else if (inbound_count >= NURSERY_CAPACITY) {
-            SS_LOGW(TAG, "Nursery full of live connections, rejecting new connection");
-            // Never managed, but already wired to the inbound ring: detach it so it cannot
-            // inject messages during the goodbye window.
-            conn->detach_inbound();
-            rejection = SendspinGoodbyeReason::ANOTHER_SERVER;
-        } else {
-            SS_LOGD(TAG, "Admitting new connection into the nursery");
-            // The connection arrives WS-upgraded, so client/init can be sent right away (there
-            // is no earlier signal to wait for). The hello is armed later, once the Noise
-            // handshake completes (see the hello scan in scan_hello_and_nursery()).
-            conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
-                                       std::string(NOISE_SUITE_CHACHAPOLY));
-            conn->send_noise_client_init();
-            this->push_nursery_entry(NurseryEntry{.conn = conn});
+NurseryEntry* ConnectionManager::find_in_nursery(const SendspinConnection* conn) {
+    for (auto it = this->nursery_.begin(); it != this->nursery_.end(); ++it) {
+        if (it->conn.get() == conn) {
+            return it;
         }
     }
-    // Outside the lock, since the send can block (see DeferredRelease). The caller's reference
-    // drops on this thread when the callback returns, even when it is the last one, which joins
-    // nothing: host shares the IX socket with the server, ESP's is owned by its httpd session.
-    if (rejection.has_value()) {
-        conn->disconnect(rejection.value(), nullptr);
+    return this->nursery_.end();
+}
+
+void ConnectionManager::install_admitted(std::shared_ptr<SendspinConnection> conn,
+                                         uint16_t owned_roles) {
+    for (auto& entry : this->admitted_) {
+        if (entry.conn != nullptr) {
+            continue;
+        }
+        entry = AdmittedEntry{};
+        entry.owned_roles = owned_roles;
+        // The admitted flag is what the transport routes on (admitted connections receive into
+        // the ring) and what the dispatch gate reads; it tracks the slot exactly.
+        conn->set_admitted(true);
+        entry.conn = std::move(conn);
+        this->refresh_published_state();
+        return;
     }
+    // promote_or_arbitrate_nursery_entry() frees a slot before it installs.
+    assert(false && "install_admitted() with every admitted slot taken");
+}
+
+NurseryEntry* ConnectionManager::release_nursery_entry(
+    NurseryEntry* it, std::optional<SendspinGoodbyeReason> reason) {
+    auto conn = std::move(it->conn);
+    auto next = this->nursery_.erase(it);
+    release_connection(std::move(conn), reason);
+    return next;
+}
+
+void ConnectionManager::release_connection(std::shared_ptr<SendspinConnection> conn,
+                                           std::optional<SendspinGoodbyeReason> goodbye) {
+    // Leaving the manager: stop its inbound traffic first, so nothing it sends during the goodbye
+    // reaches the roles and its transport never waits on the protocol task. Outgoing sends,
+    // including the goodbye itself, are unaffected. On ESP the httpd session slot keeps the
+    // connection alive until the goodbye worker runs and the session closes; the host transports
+    // send synchronously, so the goodbye and the close have both completed when disconnect()
+    // returns.
+    conn->detach_inbound();
+    if (goodbye.has_value()) {
+        conn->disconnect(goodbye.value(), nullptr);
+    }
+    // The caller's reference drops here.
 }
 
 // ============================================================================
@@ -1504,15 +1620,14 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
 
     // send_app_json (not send_text_message): client/hello is encrypted like every other
     // post-handshake message. The hello is only ever armed once the Noise handshake completes,
-    // so the transport send_app_json routes to is always active here.
+    // so the transport send_app_json routes to is always active here, and that path runs the
+    // completion inline, on this task.
     SsErr err = conn->send_app_json(
         hello_message,
         [conn](bool success) {
-            // Runs on the transport's send-completion context (httpd worker on ESP, inline on
-            // host); conn is kept alive for the duration by the transport (see AsyncRespArg).
-            // Setting the flag is all that is needed: establishment is level-triggered, so
-            // drain_lifecycle_events()'s promotion scan observes is_handshake_complete() on its
-            // next tick even when the peer's server/hello raced ahead of this send.
+            // Setting the flag is all that is needed: admission is level-triggered, so the
+            // nursery scan observes is_handshake_complete() even when the peer's server/hello
+            // raced ahead of this send.
             if (!success) {
                 SS_LOGW(TAG, "Hello message send failed");
                 return;
@@ -1539,93 +1654,20 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
 // Connection lifecycle
 // ============================================================================
 
-NurseryEntry* ConnectionManager::find_in_nursery(const SendspinConnection* conn) {
-    for (auto it = this->nursery_.begin(); it != this->nursery_.end(); ++it) {
-        if (it->conn.get() == conn) {
-            return it;
-        }
-    }
-    return this->nursery_.end();
-}
-
-void ConnectionManager::refresh_nursery_size_hint() {
-    this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
-}
-
-void ConnectionManager::push_nursery_entry(NurseryEntry entry) {
-    this->nursery_.push_back(std::move(entry));
-    this->refresh_nursery_size_hint();
-}
-
-void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnection> conn) {
-    // The admitted flag tracks this slot exactly: it is what the protocol-task dispatch gate
-    // reads to decide whether a connection may drive the roles (see SendspinConnection::
-    // is_admitted()). Clear the outgoing occupant before marking the incoming one so a handoff
-    // never leaves two connections flagged as admitted, and skip the clear when the same
-    // connection is being re-set.
-    //
-    // This only covers an occupant still sitting in the slot. drop_connection() and stop() swap
-    // the outgoing connection out before calling here, so they clear the flag themselves; keep
-    // them in step if any of them changes.
-    if (this->current_connection_ != nullptr && this->current_connection_ != conn) {
-        this->current_connection_->set_admitted(false);
-    }
-    // Admitting replays the role messages this connection held while it was proving itself, so
-    // it goes through the client rather than setting the flag here, and it runs outside this
-    // lock, in flush_pending_admission(). Staging it on every assignment, including the null
-    // one, is what keeps the staged pointer and the slot the same connection: a slot cleared
-    // before the flush has nothing to admit.
-    this->pending_admission_ = conn;
-    this->has_current_.store(conn != nullptr, std::memory_order_release);
-    {
-        // A leaf under conn_ptr_mutex_ (docs/conventions.md lock order). The filter is fixed at
-        // creation (init_time_filter()), so this copy stays valid while the connection is current.
-        std::lock_guard<std::mutex> lock(this->time_filter_mutex_);
-        this->current_time_filter_ = conn != nullptr ? conn->get_shared_time_filter() : nullptr;
-    }
-    this->current_connection_ = std::move(conn);
-}
-
-void ConnectionManager::flush_pending_admission() {
-    // Caller must not hold conn_ptr_mutex_ (see the declaration).
-    std::shared_ptr<SendspinConnection> conn;
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        conn = std::move(this->pending_admission_);
-    }
-    if (conn != nullptr) {
-        this->client_->admit_connection(conn.get());
-    }
-}
-
-NurseryEntry* ConnectionManager::release_nursery_entry(
-    NurseryEntry* it, std::optional<SendspinGoodbyeReason> reason) {
-    auto conn = std::move(it->conn);
-    auto next = this->nursery_.erase(it);
-    this->refresh_nursery_size_hint();
-    // Leaving the connection manager: stop its inbound traffic during the goodbye window, so
-    // nothing reaches the role/state queues and its transport never waits on the protocol task.
-    // Outgoing sends, including the goodbye itself, are unaffected.
-    conn->detach_inbound();
-    this->queue_deferred_release(std::move(conn), reason);
-    return next;
-}
-
 void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
                                                       const SendspinConnection* except) {
     if (psk_id.empty()) {
         return;
     }
 
-    // Collect first, then drop: drop_connection() mutates both the current slot and nursery_,
-    // so dropping while walking the nursery would invalidate the iterator underneath us.
-    //
-    // get_psk_id() locks: a nursery member can be completing its Noise handshake on the protocol
-    // task right now, and that write rewrites the very string being compared here.
+    // Collect first, then drop: drop_connection() mutates the admitted slots and nursery_, so
+    // dropping while walking the nursery would invalidate the iterator underneath us.
     InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> doomed;
-    if (this->current_connection_ != nullptr && this->current_connection_.get() != except &&
-        this->current_connection_->get_psk_id() == psk_id) {
-        doomed.push_back(this->current_connection_);
+    for (const auto& entry : this->admitted_) {
+        if (entry.conn != nullptr && entry.conn.get() != except &&
+            entry.conn->get_psk_id() == psk_id) {
+            doomed.push_back(entry.conn);
+        }
     }
     for (const auto& entry : this->nursery_) {
         if (entry.conn.get() != except && entry.conn->get_psk_id() == psk_id) {
@@ -1638,45 +1680,6 @@ void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
                 conn->get_server_id().c_str());
         this->drop_connection(conn.get(), SendspinGoodbyeReason::UNAUTHORIZED);
     }
-}
-
-void ConnectionManager::queue_deferred_release(std::shared_ptr<SendspinConnection> conn,
-                                               std::optional<SendspinGoodbyeReason> reason) {
-    // Every release passes through here, so none can leave a transport the release joins
-    // waiting on the protocol task; the callers detach earlier where ordering needs it.
-    conn->detach_inbound();
-    this->deferred_releases_.push_back({std::move(conn), reason});
-}
-
-void ConnectionManager::flush_deferred_releases() {
-    if (this->deferred_releases_.empty()) {
-        return;
-    }
-    std::vector<DeferredRelease> releases;
-    releases.swap(this->deferred_releases_);
-    for (auto& release : releases) {
-        if (release.goodbye.has_value()) {
-            disconnect_and_release(std::move(release.conn), release.goodbye.value());
-        }
-        // Without a goodbye the shared_ptr simply drops (below, when `releases` goes out of
-        // scope): even bare destruction happens outside the lock, because a connection
-        // destructor can join its transport thread.
-    }
-}
-
-void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
-    if (conn == nullptr) {
-        return;
-    }
-
-    if (conn == this->current_connection_.get()) {
-        SS_LOGI(TAG, "Current connection lost");
-    } else if (this->find_in_nursery(conn) != this->nursery_.end()) {
-        SS_LOGD(TAG, "Nursery connection lost");
-    }
-
-    // The transport is already gone, so no goodbye is attempted (nullopt).
-    this->drop_connection(conn, std::nullopt);
 }
 
 void ConnectionManager::drop_connection(SendspinConnection* conn,
@@ -1692,71 +1695,70 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         this->close_pairing_window();
     }
 
-    if (conn == this->current_connection_.get()) {
-        // Dropping the admitted connection: block stale protocol-task events and quiesce the
-        // client's per-connection state (including the time burst). The slot stays empty; the next
-        // nursery establishment promotes into it. The goodbye send and the release itself are
-        // deferred (see DeferredRelease).
+    if (AdmittedEntry* entry = this->find_admitted(conn); entry != nullptr) {
+        // Dropping an admitted connection: vacate its slot, then quiesce the client state no
+        // remaining admitted connection owns. The slot stays empty; the next nursery
+        // establishment is admitted into it.
         //
-        // Snapshot before cleanup_connection_state() clears the pending notification state (see
+        // Snapshot before cleanup_connection_state() clears the queued pairing notes (see
         // PairingUiSnapshot), then queue the note_* calls after it.
         const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         conn->detach_inbound();
-        // Vacate the admitted slot explicitly. set_current_connection(nullptr) below cannot do
-        // it: the outgoing connection is swapped out of current_connection_ first, so the setter
-        // sees an already-null slot and has no admitted flag to clear. The connection outlives this
-        // call (queue_deferred_release keeps it alive through the goodbye window), so leaving the
-        // flag set would leave a dropped connection claiming admission.
         conn->set_admitted(false);
-        this->client_->cleanup_connection_state();
-        // Swapped out rather than moved out so the slot is null by construction when
-        // set_current_connection(nullptr) reads it. A moved-from shared_ptr is empty too, but the
-        // analyzer's use-after-move check does not model that.
-        std::shared_ptr<SendspinConnection> dropped;
-        dropped.swap(this->current_connection_);
-        this->set_current_connection(nullptr);
-        this->queue_deferred_release(std::move(dropped), goodbye);
+        conn->time_burst().reset();
+        if (entry->high_performance_held) {
+            this->client_->request_high_performance(false);
+        }
+        std::shared_ptr<SendspinConnection> dropped = std::move(entry->conn);
+        *entry = AdmittedEntry{};
+        // Ahead of the slot refresh below: the teardown commands the stream to end before the
+        // time filter slot stops naming this connection's filter (see docs/internals.md "Time
+        // Filter Slot").
+        this->client_->cleanup_connection_state(
+            static_cast<uint16_t>(ALL_ROLES_MASK & ~this->roles_owned_by_others(nullptr)));
+        this->refresh_published_state();
+        release_connection(std::move(dropped), goodbye);
         this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
         return;
     }
 
     if (auto it = this->find_in_nursery(conn); it != this->nursery_.end()) {
         // Dropping an unproven connection: no client-state cleanup (it was never admitted). A
-        // code session only ever exists on the current connection (see the pairing-events
-        // comment above, in loop()), so no prompt can be showing here; the dismissal is kept for
-        // symmetry with the other drop paths and costs two bool reads. Snapshot before release
-        // for the same reason as the current-slot path above (see PairingUiSnapshot).
+        // code session only ever exists on an admitted connection, so no prompt can be showing
+        // here; the dismissal is kept for symmetry with the other drop paths and costs two bool
+        // reads. Snapshot before release for the same reason as the admitted path above.
         const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         this->release_nursery_entry(it, goodbye);
         this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
     }
-    // Not a managed connection: nothing to do (already released by an earlier event this tick).
+    // Not a managed connection: nothing to do (already released).
 }
 
-bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* current,
+bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* admitted,
                                                     const SendspinConnection* new_conn) const {
-    // Applies admission.h::should_admit_connection (activity-priority arbitration). `current` may
-    // be null (nothing admitted yet); the pure function's has_admitted=false path always admits.
-    const bool has_current = current != nullptr;
+    // Applies admission.h::should_admit_connection (activity-priority arbitration). `admitted`
+    // may be null (nothing to displace); the pure function's has_admitted=false path always
+    // admits.
+    const bool has_admitted = admitted != nullptr;
     // An incumbent whose pair-finalize was acked still reports the pre-finalize [PAIRING] set,
     // so tell rule 2 the pairing is no longer in flight rather than rewriting the activities
     // (see admission.h).
-    const bool pairing_in_flight = !has_current || !current->is_pairing_finalized();
+    const bool pairing_in_flight = !has_admitted || !admitted->is_pairing_finalized();
     return should_admit_connection(
         /*incoming_activities=*/new_conn->get_activities(),
         /*incoming_server_id=*/new_conn->get_server_id(),
         /*admitted_activities=*/
-        has_current ? current->get_activities() : std::vector<SendspinActivity>{},
-        /*admitted_server_id=*/has_current ? current->get_server_id() : std::string{},
-        /*has_admitted=*/has_current,
+        has_admitted ? admitted->get_activities() : std::vector<SendspinActivity>{},
+        /*admitted_server_id=*/has_admitted ? admitted->get_server_id() : std::string{},
+        /*has_admitted=*/has_admitted,
         /*last_playback_server_id=*/this->last_played_server_id_,
         /*admitted_pairing_in_flight=*/pairing_in_flight);
 }
 
 void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
-    // connection.md "Multiple servers (server-initiated)": only the ADMITTED (current)
-    // connection updates last_played_server_id, and only when it carries PLAYBACK.
-    if (conn == nullptr || conn != this->current_connection_.get()) {
+    // connection.md "Multiple servers (server-initiated)": only an ADMITTED connection updates
+    // last_played_server_id, and only when it carries PLAYBACK.
+    if (conn == nullptr || this->find_admitted(conn) == nullptr) {
         return;
     }
     if (!conn->has_activity(SendspinActivity::PLAYBACK)) {
@@ -1766,19 +1768,16 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     if (server_id.empty()) {
         return;
     }
-    // The RAM half updates here, because the promotion scan's should_switch_to_new_server()
-    // reads last_played_server_id_ later in this same locked block; the provider writes for this
-    // and for the recency move below wait for SendspinClient::flush_pending_persistence().
+    // The RAM half updates here, because a later arbitration reads last_played_server_id_; the
+    // provider writes for this and for the recency move below wait for
+    // SendspinClient::flush_pending_persistence() on the main loop.
     this->client_->note_last_played_server(server_id);
-    // A protocol-task pair-finalize at capacity evicts against the recency order and spares
-    // only the records of open connections, so a connection that closes later in this locked
-    // block must not leave its record looking least recent until a deferred move lands.
-    // RecordStore::mutex_ is the innermost lock (docs/conventions.md, "Threading and
-    // cross-thread state"), so taking it here is in order. The psk_id is read once: a server may
-    // start an in-band re-handshake while this runs, and a second read could straddle the protocol
-    // task's rewrite of it and disagree with the first.
+    // A pair-finalize at capacity evicts against the recency order and spares only the records
+    // of open connections, so a connection that closes later must not leave its record looking
+    // least recent until a deferred move lands. RecordStore::mutex_ is a leaf (docs/conventions.md,
+    // "Threading and cross-thread state"), and this holds no other lock.
     if (conn->get_psk_category() == PskCategory::LONG_TERM) {
-        const std::string psk_id = conn->get_psk_id();
+        const std::string& psk_id = conn->get_psk_id();
         if (!psk_id.empty() && this->client_->record_store_->note_record_played(psk_id)) {
             this->client_->request_persist();
         }
@@ -1788,100 +1787,101 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
 NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry* it) {
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
-    this->refresh_nursery_size_hint();
 
-    if (this->current_connection_ == nullptr) {
-        this->set_current_connection(std::move(conn));
-    } else if (this->should_switch_to_new_server(this->current_connection_.get(), conn.get())) {
-        // Both sides of the comparison are operational (hello + first activate applied), so
+    // Role ownership decides whom the incoming connection competes with: the admitted
+    // connections owning one of its roles, or, with no slot free, every admitted one.
+    std::array<AdmittedRoles, MAX_ADMITTED> slots{};
+    for (size_t i = 0; i < MAX_ADMITTED; ++i) {
+        slots[i].occupied = this->admitted_[i].conn != nullptr;
+        slots[i].owned_roles = this->admitted_[i].owned_roles;
+    }
+    const uint16_t incoming_roles = conn->get_active_role_mask();
+    const uint32_t conflicts = admission_conflicts(incoming_roles, slots);
+
+    if (conflicts != 0) {
+        // The incoming side is always operational (hello + first activate applied), so
         // arbitration always runs on real activity data. No incumbent is ever evicted on timing
-        // alone.
-        SS_LOGI(TAG, "Admission arbitration: switch to new server");
-        this->drop_connection(this->current_connection_.get(),
-                              SendspinGoodbyeReason::ANOTHER_SERVER);
-        this->set_current_connection(std::move(conn));
-    } else {
-        SS_LOGI(TAG, "Admission arbitration: reject incoming (keep current)");
-        // Pairing connections receive pair/abort first (the reference dismissal for a displaced
-        // pairing attempt); the subsequent goodbye from queue_deferred_release is a benign
-        // over-send, since the transport layer has no close-without-goodbye path to use instead.
-        if (conn->has_activity(SendspinActivity::PAIRING)) {
-            conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT),
-                                nullptr);
+        // alone, and the incoming connection must win against every one it conflicts with.
+        for (size_t i = 0; i < MAX_ADMITTED; ++i) {
+            if ((conflicts & (1U << i)) == 0 ||
+                this->should_switch_to_new_server(this->admitted_[i].conn.get(), conn.get())) {
+                continue;
+            }
+            SS_LOGI(TAG, "Admission arbitration: reject incoming (keep admitted)");
+            // Pairing connections receive pair/abort first (the reference dismissal for a
+            // displaced pairing attempt); the goodbye after it is a benign over-send, since the
+            // transport layer has no close-without-goodbye path to use instead.
+            if (conn->has_activity(SendspinActivity::PAIRING)) {
+                conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT),
+                                    nullptr);
+            }
+            release_connection(std::move(conn), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
+            return next;
         }
-        // Leaving the connection manager: stop its inbound traffic during the goodbye window
-        // (outgoing sends, including the goodbye itself, are unaffected).
-        conn->detach_inbound();
-        this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
-        return next;
+        SS_LOGI(TAG, "Admission arbitration: switch to new server");
+        for (size_t i = 0; i < MAX_ADMITTED; ++i) {
+            if ((conflicts & (1U << i)) != 0) {
+                this->drop_connection(this->admitted_[i].conn.get(),
+                                      SendspinGoodbyeReason::ANOTHER_SERVER);
+            }
+        }
     }
 
-    // Notify the client and record playback activity, only for the winner. The client/state
-    // published below is held until flush_pending_admission() admits the connection (see
-    // SendspinClient::publish_client_state()).
-    this->note_playback_activity(this->current_connection_.get());
+    SendspinConnection* admitted = conn.get();
+    this->install_admitted(std::move(conn),
+                           claimable_roles(incoming_roles, this->roles_owned_by_others(nullptr)));
 
-    // The connection still occupies current_connection_ (so admission.h's "in-flight pairing is
-    // not displaced" rule applies). An activate declaring pairing alone is not announced to the
-    // client as operational until pairing finishes and the post-finalize re-handshake completes;
-    // one that also declares playback is announced first, because pairing.md "Entering and
-    // leaving pairing" leaves active_roles and streams untouched and going operational is what
-    // clears any stale pairing state before the new attempt. A playback-capable connection may
-    // carry active roles with pairing alone (messaging.md "server/activate"), and those still
-    // owe the initial client/state (messaging.md "client/state"), published without going
-    // operational.
-    const auto& activities = this->current_connection_->get_activities();
+    // Notify the client and record playback activity, only for the winner.
+    this->note_playback_activity(admitted);
+
+    // An activate declaring pairing alone is not announced to the client as operational until
+    // pairing finishes and the post-finalize re-handshake completes; one that also declares
+    // playback is announced first, because pairing.md "Entering and leaving pairing" leaves
+    // active_roles and streams untouched and going operational is what clears any stale pairing
+    // state before the new attempt. A playback-capable connection may carry active roles with
+    // pairing alone (messaging.md "server/activate"), and those still owe the initial
+    // client/state (messaging.md "client/state"), published without going operational.
+    const auto& activities = admitted->get_activities();
     const std::optional<SendspinPairMethod> pairing_method =
-        selected_pairing_method(activities, this->current_connection_->get_pairing_method());
+        selected_pairing_method(activities, admitted->get_pairing_method());
     const bool selects_pairing = pairing_method.has_value();
 
     if (!selects_pairing || contains_activity(activities, SendspinActivity::PLAYBACK)) {
-        this->client_->on_handshake_complete(this->current_connection_.get());
+        this->client_->on_handshake_complete(admitted);
     }
     if (selects_pairing) {
         SS_LOGI(TAG, "Pairing activate received (%s): entering pairing for server_id=%s",
-                to_cstr(pairing_method.value()),
-                this->current_connection_->get_server_id().c_str());
-        this->handle_enter_pairing(this->current_connection_.get());
+                to_cstr(pairing_method.value()), admitted->get_server_id().c_str());
+        this->handle_enter_pairing(admitted);
         if (!contains_activity(activities, SendspinActivity::PLAYBACK) &&
-            !this->current_connection_->get_active_roles().empty()) {
-            this->client_->publish_client_state(this->current_connection_.get());
+            !admitted->get_active_roles().empty() && this->find_admitted(admitted) != nullptr) {
+            this->client_->publish_client_state(admitted);
         }
     }
 
-    SS_LOGI(TAG, "Connection admitted: server_id=%s",
-            this->current_connection_->get_server_id().c_str());
+    if (this->find_admitted(admitted) != nullptr) {
+        SS_LOGI(TAG, "Connection admitted: server_id=%s", admitted->get_server_id().c_str());
+    }
     return next;
 }
 
-void ConnectionManager::disconnect_and_release(std::shared_ptr<SendspinConnection>&& conn,
-                                               SendspinGoodbyeReason reason) {
-    // Take ownership of the caller's shared_ptr into a local, send the goodbye, then let the
-    // local go out of scope. On ESP the httpd session slot keeps the conn alive until the
-    // goodbye worker runs, calls trigger_close, the session tears down, and the slot's free_fn
-    // fires. On host the IXWebSocket send is synchronous, so the goodbye + close have both
-    // completed by the time disconnect() returns.
-    auto local = std::move(conn);
-    local->disconnect(reason, nullptr);
-}
-
 // ============================================================================
-// Pairing main-loop handlers
+// Pairing handlers
 // ============================================================================
 
 void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
-    // conn is the connection that just won promotion into current_connection_ with a pairing
-    // activate (see promote_or_arbitrate_nursery_entry).
+    // conn is an admitted connection whose activate selects pairing: one that just won admission
+    // (see promote_or_arbitrate_nursery_entry()) or one already admitted (on_server_activate()).
 
     // An attempt is in flight from here until it finalizes or aborts: pairing messages are only
     // routed while it is (pairing.md "Entering and leaving pairing"). Playback is untouched.
     conn->set_pairing_in_progress(true);
 
-    // The pairing server/activate counter (pairing.md "Pairing index") was already bumped by the
-    // caller at the point this activate was received (see the activate-events loop in
-    // drain_lifecycle_events()). Do not bump again here: this handler can also be reached well
-    // after reception (the "subsequent activate transitions into pairing" branch applies the
-    // activate first, then calls this), so bumping here would double-count or use a stale value.
+    // The pairing server/activate counter (pairing.md "Pairing index") was already bumped at the
+    // point this activate was received (on_server_activate()). Do not bump again here: this
+    // handler can also be reached after the activate was applied (the "subsequent activate
+    // transitions into pairing" branch applies the activate first, then calls this), so bumping
+    // here would double-count or use a stale value.
     // The current value is captured into the pairing session below for the code-based branches
     // (sent as pairing_index and reused for the CPace sid).
     const uint32_t pairing_index = conn->get_pairing_index();
@@ -1921,11 +1921,9 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
         return;
     }
 
-    // Capture the Noise handshake hash now (main loop, before any further I/O). The
-    // NoiseTransport session is protocol-task-owned, but we are on the main loop and the
-    // session was set before the first server/activate fired; no concurrent write
-    // is possible at this point (no re-handshake is in progress). If the hash is
-    // unavailable the PAKE sid and the code derivation cannot be computed, so abort.
+    // Capture the Noise handshake hash now, before any further I/O: a re-handshake would replace
+    // it. If the hash is unavailable the PAKE sid and the code derivation cannot be computed, so
+    // abort.
     auto hash_opt = conn->get_noise_handshake_hash();
     if (!hash_opt.has_value()) {
         SS_LOGE(TAG, "handle_enter_pairing: no handshake hash for server_id=%s; aborting",
@@ -1959,7 +1957,7 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
         // No window open: report the pending gesture with client/pair-pending and wait.
         // pair-pending does not start the attempt or its timeout (the server applies its
         // own timeout and cancels via server/activate), so no attempt deadline is armed
-        // here (attempt_deadline_us == 0 disables the loop() timeout check).
+        // here (attempt_deadline_us == 0 disables the timeout check in scan_admitted()).
         ps.step = SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW;
         ps.attempt_deadline_us = 0;
         SS_LOGI(TAG,
@@ -2018,8 +2016,8 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
     conn->send_app_json(finalize_msg, nullptr);
     secure_zero(finalize_msg.data(), finalize_msg.size());
 
-    // Hold the pending record: committed to the RecordStore by the protocol-task
-    // server/pair-finalize handler on ack.
+    // Hold the pending record: committed to the RecordStore by the server/pair-finalize handler
+    // on ack.
     conn->set_pending_pairing_record(std::move(outcome.record));
 
     this->client_->note_pairing_started(server_id);
@@ -2055,8 +2053,6 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
         to_public_abort_reason(reason), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
 }
 
-/// @brief Dismisses whichever pairing UI element was left showing. Caller must hold
-/// conn_ptr_mutex_.
 void ConnectionManager::dismiss_pairing_ui(bool code_was_emitted, bool window_was_shown) {
     if (code_was_emitted) {
         this->client_->note_clear_pairing_code();
@@ -2080,8 +2076,8 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
         conn->send_app_json(format_pair_abort_message(wire_abort_reason.value()), nullptr);
     }
 
-    // On the current-slot path drop_connection() -> cleanup_connection_state() clears the
-    // pending pairing-note queue, so the note_* calls below must come after it.
+    // On the admitted path drop_connection() -> cleanup_connection_state() clears the queued
+    // pairing notes, so the note_* calls below must come after it.
     conn->clear_pairing_state();
     if (drop_action != PairingDropAction::KEEP_OPEN) {
         const std::optional<SendspinGoodbyeReason> drop_goodbye_reason =
@@ -2091,19 +2087,18 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
         this->drop_connection(conn, drop_goodbye_reason);
     }
 
-    // Queued after any drop_connection() so they survive to be dispatched from
-    // SendspinClient::loop(); only the queue push happens under the lock.
+    // Queued after any drop_connection() so they survive to be dispatched on the main loop.
     this->client_->note_pairing_failed(server_id, public_reason);
     this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
 }
 
 // ============================================================================
-// Pairing-code main-loop handlers
+// Pairing-code handlers
 // ============================================================================
 
 void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
-                                               const ServerPairingMessageEvent& event) {
-    // Runs on the main loop. All CPace / nonce / hash state is main-loop-only.
+                                               const ServerPairingMessage& message) {
+    // All CPace / nonce / hash state is protocol-task-only, like this handler.
 
     // pairing.md "Entering and leaving pairing": a client that has aborted an attempt silently
     // discards pairing messages received before the next server/activate. is_pairing_in_progress()
@@ -2115,21 +2110,21 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
         SS_LOGI(TAG,
                 "handle_pairing_message: discarding pairing message (kind=%d) for "
                 "server_id=%s; no attempt in progress",
-                static_cast<int>(event.kind), conn->get_server_id().c_str());
+                static_cast<int>(message.kind), conn->get_server_id().c_str());
         return;
     }
 
-    switch (event.kind) {
+    switch (message.kind) {
         case PairingMessageKind::PAIR_INIT:
-            this->handle_pair_init(conn, event);
+            this->handle_pair_init(conn, message);
             break;
 
         case PairingMessageKind::PAIR_AUTH:
-            this->handle_pair_auth(conn, event);
+            this->handle_pair_auth(conn, message);
             break;
 
         case PairingMessageKind::PAIR_CONFIRM:
-            this->handle_pair_confirm(conn, event);
+            this->handle_pair_confirm(conn, message);
             break;
 
         case PairingMessageKind::MALFORMED: {
@@ -2174,7 +2169,7 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
 }
 
 void ConnectionManager::handle_pair_init(SendspinConnection* conn,
-                                         const ServerPairingMessageEvent& event) {
+                                         const ServerPairingMessage& message) {
     auto& ps = conn->pairing_session();
     const std::string& server_id = conn->get_server_id();
 
@@ -2195,11 +2190,11 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
     // (pairing.md "Protocol Errors"): close without a pair/abort and persist nothing. Ignoring a
     // late nonce would be no safer, since it must not move the code the operator already holds.
     const bool first_round = ps.round == 0;
-    if (first_round != event.nonce_a.has_value()) {
+    if (first_round != message.nonce_a.has_value()) {
         SS_LOGW(TAG,
                 "handle_pairing_message: server/pair-init %s nonce_A in round %u for "
                 "server_id=%s; closing per pairing.md Protocol Errors (no pair/abort sent)",
-                event.nonce_a.has_value() ? "carries an unexpected" : "is missing its",
+                message.nonce_a.has_value() ? "carries an unexpected" : "is missing its",
                 static_cast<unsigned>(ps.round + 1), server_id.c_str());
         this->abort_pairing_attempt(conn, /*wire_abort_reason=*/std::nullopt,
                                     PairingDropAction::CLOSE_SILENTLY,
@@ -2208,7 +2203,7 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
     }
 
     if (first_round) {
-        ps.nonce_a = event.nonce_a.value();
+        ps.nonce_a = message.nonce_a.value();
 
         // Derive the code both formats share: the digest over the handshake hash and the two
         // binding nonces (pairing.md "Pairing code derivation").
@@ -2236,7 +2231,7 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
             emitted = std::move(digits);
         }
 
-        // Emit the code to the operator (deferred to loop() via note_display_pairing_code).
+        // Emit the code to the operator (queued for the main loop by note_display_pairing_code).
         // Record that one is being emitted so the abort/cleanup paths know to withdraw it. A
         // later round re-emits nothing: the code has not changed, so an emission that persists
         // (a display) is already showing the right one (pairing.md "Client verification").
@@ -2256,7 +2251,7 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
 }
 
 void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
-                                         const ServerPairingMessageEvent& event) {
+                                         const ServerPairingMessage& message) {
     auto& ps = conn->pairing_session();
     const std::string& server_id = conn->get_server_id();
 
@@ -2281,7 +2276,7 @@ void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
     // without sending any application-level error message, and persists nothing. This
     // is the same class as the MALFORMED case in handle_pairing_message(), so it follows
     // the same shape: no pair/abort, unconditional close.
-    if (!ps.cpace.derive(event.pake_msg_1.data(), event.pake_msg_1.size())) {
+    if (!ps.cpace.derive(message.pake_msg_1.data(), message.pake_msg_1.size())) {
         SS_LOGW(TAG,
                 "handle_pairing_message: CPace::derive failed (malformed/low-order "
                 "peer share) for server_id=%s; closing per pairing.md Protocol Errors "
@@ -2297,7 +2292,7 @@ void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
 }
 
 void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
-                                            const ServerPairingMessageEvent& event) {
+                                            const ServerPairingMessage& message) {
     auto& ps = conn->pairing_session();
     RecordStore& store = *this->client_->record_store_;
     const std::string& server_id = conn->get_server_id();
@@ -2311,7 +2306,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     // Verify server_kc (server confirmation tag). A failure means the operator entered a
     // different code than the one this client emitted, which the Dynamic Pairing Code Flow
     // answers with another round rather than ending the attempt (pairing.md "Rounds").
-    if (!ps.cpace.verify(event.server_kc.data(), event.server_kc.size())) {
+    if (!ps.cpace.verify(message.server_kc.data(), message.server_kc.size())) {
         const bool can_retry = ps.method == SendspinPairMethod::DYNAMIC_PAIRING_CODE &&
                                !this->pairing_round_limit_reached();
         if (!can_retry) {
@@ -2455,7 +2450,7 @@ void ConnectionManager::close_on_sequence_violation(SendspinConnection* conn,
 }
 
 // ============================================================================
-// Pairing-window main-loop handlers
+// Pairing window
 // ============================================================================
 
 void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
@@ -2546,8 +2541,9 @@ bool ConnectionManager::pairing_window_open() const {
 }
 
 void ConnectionManager::open_pairing_window() {
-    // A pairing session only ever exists on current_connection_: pairing only starts once a nursery
-    // entry has won promotion (see the pairing branch in promote_or_arbitrate_nursery_entry()).
+    // A pairing session only ever exists on an admitted connection: pairing only starts once a
+    // nursery entry has won admission (see the pairing branch in
+    // promote_or_arbitrate_nursery_entry()).
     //
     // The window's lifetime runs from here and is not paused by the attempts it admits
     // (pairing.md "Pairing Window"), so it is armed whether or not an attempt is waiting: with
@@ -2561,16 +2557,17 @@ void ConnectionManager::open_pairing_window() {
     this->pairing_window_failed_attempts_ = 0;
     this->pairing_window_open_until_us_ = platform_time_us() + WINDOW_LIFETIME_US;
 
-    SendspinConnection* conn = this->current_connection_.get();
-    const bool awaiting =
-        conn != nullptr &&
-        conn->pairing_session().step == SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW;
-
-    if (awaiting) {
-        SS_LOGI(TAG, "Pairing window opened: starting the waiting %s attempt for server_id=%s",
-                to_cstr(conn->pairing_session().method), conn->get_server_id().c_str());
-        this->start_pairing_attempt(conn);
-        return;
+    // The window admits attempts on one connection only (pairing.md "Pairing Window"), so the
+    // gesture starts the first attempt it finds waiting and binds itself to that connection.
+    for (const auto& entry : this->admitted_) {
+        SendspinConnection* conn = entry.conn.get();
+        if (conn != nullptr &&
+            conn->pairing_session().step == SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW) {
+            SS_LOGI(TAG, "Pairing window opened: starting the waiting %s attempt for server_id=%s",
+                    to_cstr(conn->pairing_session().method), conn->get_server_id().c_str());
+            this->start_pairing_attempt(conn);
+            return;
+        }
     }
 
     SS_LOGI(TAG, "Pairing window opened: standing open for %lld s awaiting a pairing attempt",
@@ -2579,30 +2576,6 @@ void ConnectionManager::open_pairing_window() {
 
 bool ConnectionManager::pairing_round_limit_reached() const {
     return this->pairing_rounds_since_verified_kc_ >= PAIRING_ROUND_LIMIT;
-}
-
-void ConnectionManager::handle_pairing_window_confirmed() {
-    // Without a record store there is nothing to pair with, so the gesture is ignored.
-    if (this->client_->record_store_ == nullptr) {
-        return;
-    }
-    this->open_pairing_window();
-}
-
-void ConnectionManager::handle_pairing_window_cancelled() {
-    // Operator cancellation is one of the window's closing events (pairing.md "Pairing Window"). An
-    // attempt still withheld for the gesture has just lost the only thing that could admit it, so
-    // it ends here with the reason that says why; an attempt already under way runs to its own end,
-    // as it does on expiry.
-    this->close_pairing_window();
-
-    SendspinConnection* conn = this->current_connection_.get();
-    if (conn != nullptr &&
-        conn->pairing_session().step == SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW) {
-        SS_LOGI(TAG, "Pairing window cancelled: ending the waiting attempt for server_id=%s",
-                conn->get_server_id().c_str());
-        this->local_abort_pairing(conn, PairAbortReason::USER_CANCELLED);
-    }
 }
 
 void ConnectionManager::close_pairing_window() {
@@ -2637,37 +2610,36 @@ void ConnectionManager::note_pairing_window_attempt_failed() {
 }
 
 // ============================================================================
-// Unpair main-loop handler
+// Unpair handler
 // ============================================================================
 
-void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
-                                             const ServerUnpairEvent& event) {
+void ConnectionManager::handle_server_unpair(SendspinConnection* conn) {
     // Only a session running on a long-term record is paired at all (messaging.md "server/unpair":
     // if the session is unpaired, ignore the message), so a pairing or Sentinel handshake has
     // nothing to drop.
-    if (event.psk_category != PskCategory::LONG_TERM) {
+    if (conn->get_psk_category() != PskCategory::LONG_TERM) {
         SS_LOGD(TAG, "server/unpair ignored (non-LONG_TERM category, server_id=%s)",
                 conn->get_server_id().c_str());
         return;
     }
 
+    // Copied: the drops below release the connection that owns the string.
+    const std::string psk_id = conn->get_psk_id();
     SS_LOGI(TAG, "server/unpair: dropping record and disconnecting (server_id=%s, psk_id=%s)",
-            conn->get_server_id().c_str(), event.matched_psk_id.c_str());
+            conn->get_server_id().c_str(), psk_id.c_str());
 
     // Drop the matched pairing record (messaging.md "server/unpair"). The RAM erase runs here,
-    // under this lock, because a re-handshake on the revoked psk_id resolves against the store on
-    // the protocol task and must miss it from this instant: deferring it would leave the
-    // credential usable until the flush. RecordStore::mutex_ is
-    // the innermost lock (docs/conventions.md, "Threading and cross-thread state"), so taking it
-    // here is in order. The slot write is left to SendspinClient::flush_pending_persistence().
-    if (this->client_->record_store_->note_record_removed(event.matched_psk_id)) {
+    // because a re-handshake on the revoked psk_id resolves against the store and must miss it
+    // from this instant: deferring it would leave the credential usable until the flush. The slot
+    // write is left to SendspinClient::flush_pending_persistence() on the main loop.
+    if (this->client_->record_store_->note_record_removed(psk_id)) {
         this->client_->request_persist();
     }
 
     // Any OTHER session running on the same record is no longer trusted either; see
     // drop_connections_using_psk_id(). `conn` itself is excluded and dropped below with the
     // spec's UNPAIRED reason rather than UNAUTHORIZED.
-    this->drop_connections_using_psk_id(event.matched_psk_id, conn);
+    this->drop_connections_using_psk_id(psk_id, conn);
 
     this->drop_connection(conn, SendspinGoodbyeReason::UNPAIRED);
 }

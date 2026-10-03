@@ -43,8 +43,8 @@ void ControllerRole::set_listener(ControllerRoleListener* listener) {
     this->impl_->listener = listener;
 }
 
-void ControllerRole::send_command(const ClientCommandControllerObject& cmd) {
-    this->impl_->send_command(cmd);
+bool ControllerRole::send_command(const ClientCommandControllerObject& cmd) {
+    return this->impl_->send_command(cmd);
 }
 
 // ============================================================================
@@ -80,20 +80,20 @@ static bool has_required_parameter(const ClientCommandControllerObject& cmd) {
     }
 }
 
-void ControllerRole::Impl::send_command(const ClientCommandControllerObject& cmd) const {
+bool ControllerRole::Impl::send_command(const ClientCommandControllerObject& cmd) const {
     // roles/controller/v1.md "client/command controller object": only a command listed in the
     // latest supported_commands, with its required parameter.
     if ((this->supported_commands_mask.load(std::memory_order_relaxed) &
          command_bit(cmd.command)) == 0) {
         SS_LOGW(TAG, "Dropping '%s': not in the server's supported_commands", to_cstr(cmd.command));
-        return;
+        return false;
     }
     if (!has_required_parameter(cmd)) {
         SS_LOGW(TAG, "Dropping '%s': missing or out-of-range parameter", to_cstr(cmd.command));
-        return;
+        return false;
     }
     std::string command_message = format_client_command_message(cmd);
-    this->client->send_text(command_message, "controller");
+    return this->client->send_text(command_message, "controller");
 }
 
 void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
@@ -124,8 +124,8 @@ void ControllerRole::Impl::drain_events() {
 }
 
 void ControllerRole::Impl::handle_cleared_event() const {
-    // Deferred from cleanup() to avoid invoking the listener while ConnectionManager holds
-    // conn_ptr_mutex_; a listener that calls back into the client would otherwise deadlock.
+    // Queued by cleanup(), which runs on the protocol task, so the listener is called here on the
+    // main loop.
     if (this->listener) {
         this->listener->on_controller_state_clear();
     }
@@ -133,14 +133,20 @@ void ControllerRole::Impl::handle_cleared_event() const {
 
 void ControllerRole::Impl::cleanup() {
     // Bumped first: it invalidates any handler the gate already admitted (see accepts()).
-    this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
+    const uint32_t generation =
+        this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();
-    this->controller_state = {};
     this->supported_commands_mask.store(0, std::memory_order_relaxed);
 
-    // Unstamped: a clear is idempotent, so it is delivered whatever teardown overtook it.
+    // Stamped so the drain catches the main-loop state up before the callback; the callback
+    // itself is idempotent, so it is delivered whatever teardown overtook it.
     push_event_or_log(this->inbox, InboxEventType::CONTROLLER_CLEARED, 0, TAG,
-                      "controller cleared event", /*epoch=*/0);
+                      "controller cleared event", generation);
+}
+
+void ControllerRole::Impl::complete_teardown() {
+    this->controller_state = {};
+    this->supported_commands_mask.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace sendspin

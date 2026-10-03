@@ -31,12 +31,14 @@
 #include "player_role_impl.h"  // Stream start and the sync task; private access, see tests/CMakeLists.txt
 #include "protocol_messages.h"  // SENDSPIN_BINARY_VISUALIZER_LOUDNESS
 #include "protocol_task.h"
+#include "server_connection.h"  // A delivered connection, handed over without a socket
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
 #include "sendspin/visualizer_role.h"
 #include "sync_task.h"
+#include "time_burst.h"  // ms_until_due(), staged directly
 #include "visualizer_role_impl.h"  // Ring state after stop(); private access, see tests/CMakeLists.txt
 
 #include <gtest/gtest.h>
@@ -78,8 +80,8 @@ constexpr uint16_t HIGH_PERF_TEST_PORT = 19067;
 constexpr uint16_t VISUALIZER_TEST_PORT = 19068;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 19069;
 constexpr uint16_t PROVIDER_TEST_PORT = 19070;
-constexpr uint16_t PUBLISH_STATE_TEST_PORT = 19071;
-constexpr uint16_t STREAM_FILTER_LOCK_TEST_PORT = 19072;
+constexpr uint16_t STOP_ACCEPT_AFTER_JOIN_TEST_PORT = 19071;
+constexpr uint16_t STREAM_FILTER_STOPPED_TASK_TEST_PORT = 19072;
 constexpr uint16_t STREAM_FILTER_OFFSET_TEST_PORT = 19073;
 constexpr uint16_t TIME_FILTER_SLOT_TEST_PORT = 19074;
 constexpr uint16_t ADMISSION_CLOSED_TEST_PORT = 19075;
@@ -114,6 +116,52 @@ bool port_accepts(uint16_t port) {
     ::close(fd);
     return connected;
 }
+
+/// A loopback listener that never accepts: a connection to it completes the TCP handshake in the
+/// backlog and then hears nothing, so an outbound WebSocket attempt neither upgrades nor closes.
+class SilentListener {
+public:
+    SilentListener() {
+        this->fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        socklen_t len = sizeof(addr);
+        if (this->fd_ >= 0 &&
+            ::bind(this->fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+            ::listen(this->fd_, 4) == 0 &&
+            ::getsockname(this->fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+            this->port_ = ntohs(addr.sin_port);
+        }
+    }
+    ~SilentListener() {
+        this->close();
+    }
+
+    /// Closes the listener, resetting the connections waiting in its backlog. IXWebSocket clears
+    /// its cancellation flag when it enters the handshake, so a close() that lands before that
+    /// point is forgotten and the connection's destructor (ix::WebSocket::stop()) waits for the
+    /// handshake to time out (SendspinClientConnection::HANDSHAKE_TIMEOUT_SECS). The test resets
+    /// the attempt first, so stopping the client does not wait out that bound.
+    void close() {
+        if (this->fd_ >= 0) {
+            ::close(this->fd_);
+            this->fd_ = -1;
+        }
+    }
+    SilentListener(const SilentListener&) = delete;
+    SilentListener& operator=(const SilentListener&) = delete;
+
+    /// The listening port, or 0 when the socket could not be set up.
+    uint16_t port() const {
+        return this->port_;
+    }
+
+private:
+    int fd_{-1};
+    uint16_t port_{0};
+};
 
 /// Records on_metadata_clear() and, from inside it, tries to drive the lifecycle re-entrantly.
 class ReentrantMetadataListener : public MetadataRoleListener {
@@ -784,18 +832,8 @@ TEST(ClientLifecycle, DestructorReleasesHighPerformanceHold) {
 }
 
 // ============================================================================
-// publish_state() connection lifetime
+// Stand-in connections
 // ============================================================================
-
-/// Rendezvous state for PublishingConnection, owned by the test rather than by the connection so
-/// the send path can still reach it after the connection has been destroyed.
-struct PublishRendezvous {
-    std::promise<void> in_send;      // Signalled once the send is inside the connection
-    std::promise<void> slot_dropped;  // Signalled once the manager's slot is gone
-    std::vector<std::string> sent;
-    bool destroyed{false};
-    bool destroyed_during_send{false};
-};
 
 /// Connection stand-in with every transport override inert: nothing is sent anywhere, a send
 /// completes inline and reports success, and the connection always reads as connected. Tests that
@@ -804,7 +842,6 @@ struct PublishRendezvous {
 class StubConnection : public SendspinConnection {
 public:
     void start() override {}
-    void loop() override {}
     void disconnect(SendspinGoodbyeReason, std::function<void()> on_complete) override {
         if (on_complete) {
             on_complete();
@@ -827,78 +864,6 @@ public:
         return SsErr::OK;
     }
 };
-
-/// Parks inside its own send until the test has dropped the connection manager's slot, then
-/// records whether it was destroyed while that send was still running.
-class PublishingConnection : public StubConnection {
-public:
-    explicit PublishingConnection(PublishRendezvous* rv) : rv_(rv) {}
-    ~PublishingConnection() override {
-        this->rv_->destroyed = true;
-    }
-
-    // No Noise session, so send_app_json() routes the client/state here as raw text.
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb, bool) override {
-        // Everything this send needs after the drop lives on the stack: under the defect the
-        // object is gone by then, and touching a member would be the use-after-free rather than
-        // the assertion that names it.
-        PublishRendezvous* rv = this->rv_;
-        rv->sent.push_back(msg);
-        rv->in_send.set_value();
-        rv->slot_dropped.get_future().wait();
-        rv->destroyed_during_send = rv->destroyed;
-        if (cb) {
-            cb(true);
-        }
-        return SsErr::OK;
-    }
-
-private:
-    PublishRendezvous* rv_;
-};
-
-// publish_state() resolves the current connection as a shared_ptr, so a caller that is not the
-// main loop (a role thread, against its documented contract) cannot have the connection freed
-// under its send. The main loop drops the manager's slot while the publish is parked inside the
-// connection's own send: the shared_ptr publish_state() holds is then the last reference, so the
-// connection outlives the call and is destroyed only when it returns.
-TEST(ClientLifecycle, PublishStateOutlivesADropDuringTheSend) {
-    TestNetworkProvider network;
-    SendspinClient client(make_config(PUBLISH_STATE_TEST_PORT));
-    client.set_network_provider(&network);
-    ASSERT_TRUE(client.start());
-
-    PublishRendezvous rv;
-    {
-        auto conn = std::make_shared<PublishingConnection>(&rv);
-        conn->set_client_hello_sent(true);
-        conn->set_server_hello_received(true);
-        conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
-                                    std::nullopt);
-        // Installed directly, so mark it the way admission would: client/state waits for it.
-        conn->set_admitted(true);
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->current_connection_ = std::move(conn);
-    }
-
-    std::thread role_thread([&client] { client.publish_state(); });
-    rv.in_send.get_future().wait();
-    {
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->current_connection_.reset();
-    }
-    EXPECT_FALSE(rv.destroyed) << "the manager held the only other reference, so the publish's "
-                                  "own shared_ptr is what kept the connection alive";
-    rv.slot_dropped.set_value();
-    role_thread.join();
-
-    EXPECT_FALSE(rv.destroyed_during_send)
-        << "the connection was destroyed while its own send was running";
-    EXPECT_TRUE(rv.destroyed) << "the publish leaked the connection past its own call";
-    EXPECT_EQ(rv.sent.size(), 1u) << "the client/state never reached the connection";
-
-    client.stop();
-}
 
 /// Counts client/hello sends; `result` is what each send returns. The completion fires inline with
 /// the send's outcome, as the encrypted send_app_json() path reports it.
@@ -945,17 +910,15 @@ TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
         client.set_network_provider(&network);
         ASSERT_TRUE(client.start());
         ConnectionManager& manager = *client.connection_manager_;
+        // The test thread plays the protocol task, which owns the nursery.
+        client.protocol_task_->stop();
         auto conn = std::make_shared<HelloCountingConnection>(row.send_result);
-        conn->noise_handshake_complete_.store(true);
+        conn->noise_handshake_complete_ = true;
         conn->set_provisional_time_us(platform_time_us());
-        {
-            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-            manager.push_nursery_entry(NurseryEntry{.conn = conn});
-        }
+        manager.nursery_.push_back(NurseryEntry{.conn = conn, .client_init_sent = true});
 
         for (int tick = 0; tick < NurseryEntry::MAX_HELLO_ATTEMPTS + 3; ++tick) {
-            manager.scan_hello_and_nursery();
-            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+            (void) manager.scan_nursery(platform_time_us());
             for (auto& entry : manager.nursery_) {
                 entry.hello_due_us = 0;
             }
@@ -967,49 +930,356 @@ TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
 }
 
 // ============================================================================
-// Admission-closed rejection
+// Accepts queued at stop()
 // ============================================================================
 
-// A peer delivered while admission is closed (stop() tearing down, or before start()) gets a
-// client/goodbye with reason shutdown instead of a nursery slot. The goodbye is sent by
-// on_new_connection() itself, on the transport thread, so the closed row waits on the peer without
-// pumping loop(). The open row is the control: the same peer is admitted and owed no goodbye.
-// The nursery-full rejection is covered by
+/// Commands waiting in the protocol task's queue.
+size_t queued_commands(ProtocolTask& task) {
+    std::lock_guard<std::mutex> lock(task.command_mutex_);
+    return task.command_count_;
+}
+
+// A peer the server delivers while stop() is under way waits in the command queue as an accept,
+// and stop() refuses it with a client/goodbye of reason shutdown instead of a nursery slot,
+// whether the protocol task's final tick takes it or stop() itself takes it once the task is
+// joined. The test thread plays the protocol task, so the accept provably sits in the queue when
+// admission closes. The open row is the control: the same queued accept is admitted and owed no
+// goodbye. The nursery-full rejection is covered by
 // ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer.
-TEST(ClientLifecycle, ANewcomerWhileAdmissionIsClosedIsGoodbyedWithShutdown) {
-    struct AdmissionRow {
+TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
+    enum class Taker : uint8_t { FINAL_TICK, AFTER_JOIN, OPEN_TICK };
+    struct AcceptRow {
         const char* name;
-        bool accepting;
+        Taker taker;
         uint16_t port;
     };
-    const AdmissionRow rows[] = {
-        {"admission closed", false, ADMISSION_CLOSED_TEST_PORT},
-        {"Control: admission open", true, ADMISSION_OPEN_TEST_PORT},
+    const AcceptRow rows[] = {
+        {"the final tick takes it", Taker::FINAL_TICK, ADMISSION_CLOSED_TEST_PORT},
+        {"stop() takes it after the join", Taker::AFTER_JOIN, STOP_ACCEPT_AFTER_JOIN_TEST_PORT},
+        {"Control: admission open", Taker::OPEN_TICK, ADMISSION_OPEN_TEST_PORT},
     };
 
-    for (const AdmissionRow& row : rows) {
+    for (const AcceptRow& row : rows) {
         SCOPED_TRACE(row.name);
         PairedClientBundle bundle(make_config(row.port));
         SendspinClient& client = bundle.client();
         ASSERT_TRUE(bundle.start());
-        {
-            std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-            client.connection_manager_->accepting_ = row.accepting;
-        }
+        client.protocol_task_->stop();
 
         auto peer = connect_paired_server(bundle.peer, row.port);
-        if (row.accepting) {
-            pump_until(client, [&] { return client.is_connected(); });
-            EXPECT_FALSE(peer->goodbye_reason().has_value())
-                << "an admitted peer was sent a goodbye";
-        } else {
+        wait_until([&] { return queued_commands(*client.protocol_task_) == 1; });
+
+        switch (row.taker) {
+            case Taker::FINAL_TICK:
+                // stop()'s order: admission closes, then the task's final tick runs.
+                client.connection_manager_->close_admission();
+                (void) client.protocol_tick();
+                break;
+            case Taker::AFTER_JOIN:
+                client.stop();
+                break;
+            case Taker::OPEN_TICK:
+                (void) client.protocol_tick();
+                EXPECT_EQ(client.connection_manager_->nursery_.size(), 1U)
+                    << "the queued accept never reached the nursery";
+                EXPECT_TRUE(never_within([&] { return peer->goodbye_reason().has_value(); }, 200))
+                    << "an admitted peer was sent a goodbye";
+                break;
+        }
+        if (row.taker != Taker::OPEN_TICK) {
             wait_until([&] { return peer->goodbye_reason().has_value(); });
             EXPECT_EQ(peer->goodbye_reason().value_or(""), "shutdown")
-                << "a newcomer rejected with admission closed must be told why";
-            EXPECT_FALSE(client.is_connected())
-                << "a rejected newcomer must not become the current connection";
+                << "a newcomer refused at stop() must be told why";
+            EXPECT_TRUE(client.connection_manager_->nursery_.empty())
+                << "a refused newcomer took a nursery slot";
         }
 
+        client.stop();
+    }
+}
+
+/// Fills the protocol task's accept slots with accepts that carry no connection, so the next
+/// delivery finds them all taken. The test thread plays the protocol task, so none is taken.
+void fill_accept_slots(ProtocolTask& task) {
+    for (;;) {
+        ProtocolCommand command;
+        command.type = ProtocolCommandType::ACCEPT_CONNECTION;
+        if (!task.push_command(std::move(command))) {
+            return;
+        }
+    }
+}
+
+// A refused delivery leaves the connection with the transport that delivered it:
+// on_new_connection() reports the refusal and keeps no reference, so the delivering thread's own
+// reference is the last one and the transport releases the connection once the delivery returns
+// (SendspinWsServer::NewConnectionCallback), never inside it. A delivery is refused when every
+// accept slot is taken, and once stop() has joined the protocol task and closed accepts
+// (ProtocolTask::close_accepts()), when no refusal pass would take an accept any more. The accepted row is the control: the queued
+// accept holds a reference for the protocol task.
+TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
+    struct Row {
+        const char* name;
+        bool fill_queue;
+        bool refusing;
+        bool expected_accepted;
+        long expected_use_count;
+    };
+    const Row rows[] = {
+        {"Control: room in the queue", false, false, true, 2},
+        {"every accept slot taken", true, false, false, 1},
+        {"stop() has joined the protocol task", false, true, false, 1},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        if (row.fill_queue) {
+            fill_accept_slots(*client.protocol_task_);
+        }
+        if (row.refusing) {
+            client.protocol_task_->close_accepts();
+        }
+
+        auto conn = std::make_shared<SendspinServerConnection>(nullptr, 1);
+        bool accepted = false;
+        // The delivering thread stands in for the transport's.
+        std::thread transport(
+            [&] { accepted = client.connection_manager_->on_new_connection(conn); });
+        transport.join();
+
+        EXPECT_EQ(accepted, row.expected_accepted);
+        EXPECT_EQ(conn.use_count(), row.expected_use_count)
+            << "who holds the delivered connection after the delivery returns";
+        EXPECT_EQ(conn->inbound_gate().is_detached(), !row.expected_accepted)
+            << "a refused connection must stop routing what the peer sends";
+
+        client.stop();
+    }
+}
+
+// A command left in the queue after a stop() (a request that raced it on another thread) belongs
+// to the run that ended: the next start() begins with an empty queue, so the stale connect_to()
+// opens nothing. The command is pushed straight onto the stopped client's queue, the state such a
+// race leaves, since the public entry points refuse while stopped. The Control row pushes the same
+// command after start() and sees it acted on.
+TEST(ClientLifecycle, AStaleCommandIsNotCarriedIntoTheNextRun) {
+    for (const bool stale : {true, false}) {
+        SCOPED_TRACE(stale ? "pushed while stopped" : "Control: pushed while running");
+        SilentListener silent;
+        ASSERT_NE(silent.port(), 0);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.stop();
+
+        ProtocolCommand command;
+        command.type = ProtocolCommandType::CONNECT_TO;
+        // The attempt waits in the nursery: the listener never answers or closes.
+        command.text = "ws://127.0.0.1:" + std::to_string(silent.port()) + "/sendspin";
+        if (stale) {
+            ASSERT_TRUE(client.protocol_task_->push_command(std::move(command)));
+        }
+        ASSERT_TRUE(client.start());
+        // The test thread plays the protocol task from here, so the nursery is read where it is
+        // written.
+        client.protocol_task_->stop();
+        if (!stale) {
+            ASSERT_TRUE(client.protocol_task_->push_command(std::move(command)));
+        }
+        (void) client.protocol_tick();
+        EXPECT_EQ(client.connection_manager_->nursery_.size(), stale ? 0U : 1U);
+        silent.close();
+        client.stop();
+    }
+}
+
+// send_text() reports a request the protocol task will never see: once the consumer burst of the
+// command queue is taken, the next request is refused with false rather than dropped silently.
+// The test thread plays the protocol task, so nothing drains the queue between the requests.
+TEST(ClientLifecycle, SendTextIsRefusedWhenTheCommandQueueIsFull) {
+    TestNetworkProvider network;
+    SendspinClient client(make_config(0));
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    client.protocol_task_->stop();
+
+    const std::string command = R"({"type":"client/command","payload":{}})";
+    for (size_t i = 0; i < ProtocolTask::CONSUMER_COMMAND_BURST; ++i) {
+        EXPECT_TRUE(client.send_text(command, "controller")) << "Control: request " << i;
+    }
+    EXPECT_FALSE(client.send_text(command, "controller"))
+        << "a request past the consumer burst must be refused";
+    // Control: once the task drains the queue, requests are taken again.
+    (void) client.protocol_tick();
+    EXPECT_TRUE(client.send_text(command, "controller")) << "the drained queue takes requests";
+    // A family that names no role is refused on its own, queue or not.
+    EXPECT_FALSE(client.send_text(command, "no-such-role"));
+
+    client.stop();
+    EXPECT_FALSE(client.send_text(command, "controller")) << "a stopped client refuses";
+}
+
+// ============================================================================
+// The protocol task's next deadline
+// ============================================================================
+
+// SendspinTimeBurst::ms_until_due() is the burst's part of the protocol task's wait: the end of
+// the interval between bursts, the timeout of the message in flight, the backoff after a refused
+// send, or 0 when loop() has work now. The burst's state is staged directly; loop() moves it
+// through these states over real time.
+TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
+    struct Row {
+        const char* name;
+        uint8_t burst_index;
+        int64_t last_complete_ms;
+        int64_t pending;
+        int64_t sent_ms;
+        int64_t retry_after_ms;
+        bool completed;
+        uint32_t expected_ms;
+    };
+    constexpr int64_t NOW_MS = 1'000'000;
+    constexpr uint8_t SIZE = 8;
+    constexpr int64_t INTERVAL_MS = 500;
+    constexpr int64_t TIMEOUT_MS = 100;
+    const Row rows[] = {
+        {"between bursts", SIZE, NOW_MS - 200, 0, 0, 0, false, 300},
+        {"Control: the interval has elapsed", SIZE, NOW_MS - INTERVAL_MS, 0, 0, 0, false, 0},
+        {"a message in flight times out strictly after the timeout", 3, 0, 42, NOW_MS - 50, 0, false,
+         51},
+        {"a refused send backs off", 3, 0, 0, 0, NOW_MS + 70, false, 70},
+        {"Control: ready to send the next message", 3, 0, 0, 0, 0, false, 0},
+        {"a completed burst is reported at once", SIZE, NOW_MS, 0, 0, 0, true, 0},
+        {"a far interval clamps short of NO_DEADLINE", SIZE, NOW_MS + (1LL << 40), 0, 0, 0, false,
+         ProtocolTask::NO_DEADLINE - 1},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SendspinTimeBurst burst;
+        burst.configure(SIZE, INTERVAL_MS, TIMEOUT_MS);
+        burst.burst_index_ = row.burst_index;
+        burst.last_burst_complete_time_ = row.last_complete_ms;
+        burst.pending_embedded_ = row.pending;
+        burst.current_message_sent_time_ = row.sent_ms;
+        burst.send_retry_after_ms_ = row.retry_after_ms;
+        burst.pending_burst_completed_ = row.completed;
+        EXPECT_EQ(burst.ms_until_due(NOW_MS), row.expected_ms);
+    }
+}
+
+/// Network provider that never reports ready, so the WebSocket server stays down.
+class OfflineNetworkProvider : public SendspinNetworkProvider {
+public:
+    bool is_network_ready() override {
+        return false;
+    }
+};
+
+// ConnectionManager::tick() returns the milliseconds until the earliest of its timers, one row per
+// timer, so the protocol task sleeps exactly until the next one is due; with none armed it
+// returns NO_DEADLINE and the task waits for a wake alone. The Control rows hold a connection, or
+// a stopped server, whose timer is not armed. The test thread plays the protocol task and stages
+// each timer directly against a fixed clock.
+TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
+    constexpr int64_t NOW_US = 3LL << 32;
+    constexpr int64_t LIVENESS_US = 30'000'000;
+    enum class Stage : uint8_t {
+        NOTHING,
+        ADMITTED_UNARMED,
+        LIVENESS,
+        REPROVE,
+        ATTEMPT,
+        NURSERY,
+        WINDOW,
+        WINDOW_AND_LIVENESS,
+        NETWORK_POLL,
+        SERVER_RETRY,
+    };
+    struct Row {
+        const char* name;
+        Stage stage;
+        uint32_t expected_ms;
+    };
+    const Row rows[] = {
+        {"Control: nothing armed", Stage::NOTHING, ProtocolTask::NO_DEADLINE},
+        {"Control: an admitted connection with no timer armed", Stage::ADMITTED_UNARMED,
+         ProtocolTask::NO_DEADLINE},
+        {"the liveness timeout, a second of silence in", Stage::LIVENESS,
+         static_cast<uint32_t>((LIVENESS_US - 1'000'000) / 1000)},
+        {"the re-prove deadline", Stage::REPROVE, static_cast<uint32_t>(REPROVE_TIMEOUT_US / 1000)},
+        {"the pairing attempt deadline", Stage::ATTEMPT, 2000},
+        {"the nursery establish deadline", Stage::NURSERY,
+         static_cast<uint32_t>(NURSERY_ESTABLISH_TIMEOUT_US / 1000)},
+        {"the pairing window", Stage::WINDOW, 5000},
+        {"the earliest of two", Stage::WINDOW_AND_LIVENESS, 5000},
+        {"the network poll while the server is down", Stage::NETWORK_POLL,
+         NETWORK_POLL_INTERVAL_MS},
+        {"the server start retry", Stage::SERVER_RETRY, 3000},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider online;
+        OfflineNetworkProvider offline;
+        SendspinClient client(make_config(0));
+        const bool server_down = row.stage == Stage::NETWORK_POLL || row.stage == Stage::SERVER_RETRY;
+        if (server_down) {
+            client.set_network_provider(&offline);
+        } else {
+            client.set_network_provider(&online);
+        }
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+        manager.liveness_timeout_us_ = 0;
+
+        auto conn = std::make_shared<StubConnection>();
+        conn->last_receive_time_us_.store(static_cast<uint32_t>(NOW_US));
+        switch (row.stage) {
+            case Stage::NOTHING:
+            case Stage::NETWORK_POLL:
+                break;
+            case Stage::ADMITTED_UNARMED:
+                manager.install_admitted(conn, 0);
+                break;
+            case Stage::LIVENESS:
+                manager.liveness_timeout_us_ = LIVENESS_US;
+                conn->last_receive_time_us_.store(static_cast<uint32_t>(NOW_US - 1'000'000));
+                manager.install_admitted(conn, 0);
+                break;
+            case Stage::REPROVE:
+                conn->set_provisional_time_us(NOW_US);
+                manager.install_admitted(conn, 0);
+                break;
+            case Stage::ATTEMPT:
+                conn->first_activate_received_ = true;
+                conn->pairing_session().attempt_deadline_us = NOW_US + 2'000'000;
+                manager.install_admitted(conn, 0);
+                break;
+            case Stage::NURSERY:
+                conn->set_provisional_time_us(NOW_US);
+                manager.nursery_.push_back(NurseryEntry{.conn = conn});
+                break;
+            case Stage::WINDOW:
+                manager.pairing_window_open_until_us_ = NOW_US + 5'000'000;
+                break;
+            case Stage::WINDOW_AND_LIVENESS:
+                manager.liveness_timeout_us_ = LIVENESS_US;
+                manager.install_admitted(conn, 0);
+                manager.pairing_window_open_until_us_ = NOW_US + 5'000'000;
+                break;
+            case Stage::SERVER_RETRY:
+                manager.ws_server_start_retry_time_us_ = NOW_US + 3'000'000;
+                break;
+        }
+
+        EXPECT_EQ(manager.tick(NOW_US), row.expected_ms);
+        EXPECT_FALSE(conn->inbound_gate().is_detached()) << "nothing was due, yet it was dropped";
+        manager.pairing_window_open_until_us_ = 0;
         client.stop();
     }
 }
@@ -1091,8 +1361,7 @@ using ConnectionList = std::vector<std::shared_ptr<SendspinConnection>>;
 /// counts the ring-order return of the LOCAL items the feeder hands over, and returns the rest
 /// (the time replies a connected server still sends) unprocessed, uncounting each from its
 /// connection's in-flight count as the task does (InboundGate::note_item_taken()).
-/// @param connections The connections the items can come from, snapshotted beforehand: the
-///        manager lock may be held while this runs.
+/// @param connections The connections the items can come from, snapshotted beforehand.
 void drain_ring_as_protocol_task(InboundRing& ring, const ConnectionList& connections) {
     size_t len = 0;
     void* item = nullptr;
@@ -1156,8 +1425,7 @@ constexpr int64_t SINK_CHUNK_LEAD_US = 250 * 1000;
 /// clock's offset from this one, which the stream's time filter was synced to.
 class ChunkFeeder {
 public:
-    /// @param connections The client's connections (snapshot()), taken before the caller holds
-    ///        the manager lock.
+    /// @param connections The client's connections (snapshot()).
     ChunkFeeder(SendspinClient& client, ConnectionList connections,
                 const VirtualSinkListener& listener, int64_t server_offset_us = 0)
         : thread_([&impl = *client.player_->impl_, &listener, server_offset_us,
@@ -1173,7 +1441,7 @@ public:
         this->thread_.join();
     }
 
-    /// The client's connections. Takes the manager lock.
+    /// The client's connections. Protocol-task work: the caller plays the task.
     static ConnectionList snapshot(SendspinClient& client) {
         ConnectionManager::ConnectionSnapshot snapshot;
         client.connection_manager_->snapshot_connections(snapshot);
@@ -1184,14 +1452,14 @@ private:
     std::thread thread_;
 };
 
-// The sync task's per-chunk time getters read the manager's time filter slot, not
-// conn_ptr_mutex_, so a chunk decodes while this thread holds that lock, as the main loop does in
-// ConnectionManager's lifecycle block. A getter that took the lock would park the task and no fed
-// chunk would reach the sink. The wait has no timeout of its own, since no bound could tell a
-// parked task from a slow machine: the suite watchdog in tests/main.cpp names it instead.
-TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
+// The sync task's per-chunk time getters read the manager's time filter slot, which the protocol
+// task publishes, so a chunk decodes while the protocol task is not running at all. A getter that
+// waited on the task would park the sync task and no fed chunk would reach the sink. The wait has
+// no timeout of its own, since no bound could tell a parked task from a slow machine: the suite
+// watchdog in tests/main.cpp names it instead.
+TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheProtocolTaskIsStopped) {
     VirtualSinkListener listener;
-    auto config = make_config(STREAM_FILTER_LOCK_TEST_PORT);
+    auto config = make_config(STREAM_FILTER_STOPPED_TASK_TEST_PORT);
     config.time_burst_interval_ms = 100;  // Sync promptly after the connect
     PairedClientBundle bundle(std::move(config));
     SendspinClient& client = bundle.client();
@@ -1202,7 +1470,7 @@ TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
     FakeEncryptedServerOptions options;
     options.answer_time = true;
     ASSERT_TRUE(bundle.start());
-    auto server = connect_paired_server(bundle.peer, STREAM_FILTER_LOCK_TEST_PORT, options);
+    auto server = connect_paired_server(bundle.peer, STREAM_FILTER_STOPPED_TASK_TEST_PORT, options);
     pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
@@ -1210,10 +1478,8 @@ TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
     pump_until(client, [&] { return sync_task.is_running(); });
     play_protocol_task(client);
 
-    ConnectionList connections = ChunkFeeder::snapshot(client);
     {
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        ChunkFeeder feeder(client, std::move(connections), listener);
+        ChunkFeeder feeder(client, ChunkFeeder::snapshot(client), listener);
         listener.wait_for_decoded();
     }
 
@@ -1273,16 +1539,32 @@ SendspinClientConfig make_stand_in_config(uint16_t port) {
     return config;
 }
 
-/// Installs a stand-in connection as current, the way a promotion does, and starts a stream on it,
+/// Puts `conn` in the manager's admitted slot, owning every role, the way a promotion does, and
+/// returns what the slot held; a null `conn` only vacates it. Protocol-task work: the caller plays
+/// the task, or the client is not started.
+std::shared_ptr<SendspinConnection> replace_admitted(ConnectionManager& manager,
+                                                     std::shared_ptr<SendspinConnection> conn) {
+    AdmittedEntry& entry = manager.admitted_[0];
+    std::shared_ptr<SendspinConnection> replaced = std::move(entry.conn);
+    entry = AdmittedEntry{};
+    if (replaced != nullptr) {
+        replaced->set_admitted(false);
+    }
+    if (conn != nullptr) {
+        manager.install_admitted(std::move(conn), ALL_ROLES_MASK);
+    } else {
+        manager.refresh_published_state();
+    }
+    return replaced;
+}
+
+/// Installs a stand-in connection as admitted, the way a promotion does, and starts a stream on it,
 /// returning once the sync task is running. The stream is driven through PlayerRole::Impl, since
 /// nothing is connected to carry a stream/start, on the test thread, which plays the protocol task
 /// from here on. The client must use make_stand_in_config().
 void start_stream_on(SendspinClient& client, std::shared_ptr<ObservedConnection> conn) {
     play_protocol_task(client);
-    {
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->set_current_connection(std::move(conn));
-    }
+    (void) replace_admitted(*client.connection_manager_, std::move(conn));
     PlayerRole::Impl& impl = *client.player_->impl_;
     impl.handle_stream_start(pcm_stream_params(), impl.cleanup_generation.load());
     SyncTask& sync_task = *impl.sync_task;
@@ -1301,11 +1583,10 @@ std::shared_ptr<ObservedConnection> make_synced_connection(ConnectionObservation
     return conn;
 }
 
-// set_current_connection() keeps the time filter slot on the current connection's filter: a
-// synced connection converts with its offset, a vacated slot reads as unsynced, the slot never
-// keeps a connection alive, and an unsynced newcomer installed over a synced one reads its own
-// filter.
-TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheCurrentConnection) {
+// The time filter slot follows the primary admitted connection's filter: a synced connection
+// converts with its offset, a vacated slot reads as unsynced, the slot never keeps a connection
+// alive, and an unsynced newcomer installed over a synced one reads its own filter.
+TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheAdmittedConnection) {
     ConnectionObservation dropped_obs;  // All outlive the client
     ConnectionObservation replaced_obs;
     ConnectionObservation newcomer_obs;
@@ -1313,42 +1594,27 @@ TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheCurrentConnection) {
     ConnectionManager& manager = *client.connection_manager_;
     constexpr int64_t SERVER_TS_US = 50 * 1000 * 1000;
 
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.set_current_connection(make_synced_connection(&dropped_obs));
-    }
+    (void) replace_admitted(manager, make_synced_connection(&dropped_obs));
     EXPECT_TRUE(client.is_time_synced());
     EXPECT_EQ(client.get_client_time(SERVER_TS_US), SERVER_TS_US - SEEDED_SERVER_OFFSET_US);
 
-    std::shared_ptr<SendspinConnection> slot;
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        slot.swap(manager.current_connection_);
-        manager.set_current_connection(nullptr);
-    }
+    std::shared_ptr<SendspinConnection> slot = replace_admitted(manager, nullptr);
     EXPECT_FALSE(client.is_time_synced());
     EXPECT_EQ(client.get_client_time(SERVER_TS_US), 0);
     slot.reset();
     EXPECT_TRUE(dropped_obs.destroyed.load())
         << "a reference other than the slot's kept the connection alive";
 
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.set_current_connection(make_synced_connection(&replaced_obs));
-    }
+    (void) replace_admitted(manager, make_synced_connection(&replaced_obs));
     ASSERT_TRUE(client.is_time_synced());
-    auto newcomer = std::make_shared<ObservedConnection>(&newcomer_obs);
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.set_current_connection(std::move(newcomer));
-    }
+    (void) replace_admitted(manager, std::make_shared<ObservedConnection>(&newcomer_obs));
     EXPECT_FALSE(client.is_time_synced()) << "the newcomer read the replaced connection's filter";
 }
 
 // The sync task converts chunks with the current connection's offset. The fed
 // chunks are stamped in the server's clock, so a task that never saw the filter (parked unsynced)
 // or a conversion that skipped the offset (every chunk late) never reaches the sink. No timeout of
-// its own, as in SyncTaskDecodesAChunkWhileTheManagerLockIsHeld.
+// its own, as in SyncTaskDecodesAChunkWhileTheProtocolTaskIsStopped.
 TEST(ClientLifecycle, TheSyncTaskConvertsEachChunkWithTheCurrentOffset) {
     ConnectionObservation observation;  // Outlives the client
     VirtualSinkListener listener;
@@ -1372,10 +1638,10 @@ TEST(ClientLifecycle, TheSyncTaskConvertsEachChunkWithTheCurrentOffset) {
 }
 
 // A stream's connection dropped mid-stream carries exactly one client/goodbye on its wire and
-// is freed on the thread that pumps loop(), never on the sync task's: the task holds no
-// connection reference of its own. A task that did would keep the connection alive past the
-// flush and free it on the audio thread when the stream ended.
-TEST(ClientLifecycle, ADroppedStreamConnectionIsGoodbyedOnceAndFreedOnTheLoopThread) {
+// is freed on the protocol task (here the test thread, which plays it), never on the sync task's:
+// the sync task holds no connection reference of its own. One that did would keep the connection
+// alive past the drop and free it on the audio thread when the stream ended.
+TEST(ClientLifecycle, ADroppedStreamConnectionIsGoodbyedOnceAndFreedOnTheProtocolTask) {
     ConnectionObservation observation;  // Outlives the client
     CountingPlayerListener listener;
     TestNetworkProvider network;
@@ -1389,11 +1655,7 @@ TEST(ClientLifecycle, ADroppedStreamConnectionIsGoodbyedOnceAndFreedOnTheLoopThr
     start_stream_on(client, std::move(conn));
     ConnectionManager& manager = *client.connection_manager_;
 
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.drop_connection(streamed, SendspinGoodbyeReason::ANOTHER_SERVER);
-    }
-    manager.flush_deferred_releases();
+    manager.drop_connection(streamed, SendspinGoodbyeReason::ANOTHER_SERVER);
     pump_until(client, [&] { return listener.stream_ends == 1; });
     pump_until(client, [&] { return observation.destroyed.load(); });
 
@@ -1401,7 +1663,7 @@ TEST(ClientLifecycle, ADroppedStreamConnectionIsGoodbyedOnceAndFreedOnTheLoopThr
         << "expected exactly one client/goodbye on this connection's wire";
     // Private read: nothing a caller or peer observes distinguishes the destructor's thread.
     EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
-        << "the connection was freed on a thread other than the one that pumps loop()";
+        << "the connection was freed on a thread other than the one playing the protocol task";
 
     client.stop();
 }

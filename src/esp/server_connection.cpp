@@ -97,10 +97,6 @@ void SendspinServerConnection::start() {
     // Time filter is initialized by the hub when it sets up the connection.
 }
 
-void SendspinServerConnection::loop() {
-    // Time message sending is handled by the hub
-}
-
 void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
                                           std::function<void()> on_complete) {
     if (!this->is_connected()) {
@@ -124,9 +120,8 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
             self->trigger_close();
         }
 
-        // Invoke user-provided completion callback if provided.
-        // Already running in httpd worker thread context (async_send_frame),
-        // so caller should use defer() if they need main loop context
+        // Invoke the caller's completion callback, if any, on the httpd worker thread
+        // (async_send_frame); it must be safe there, as the GoodbyeWait completion is.
         if (on_complete) {
             on_complete();
         }

@@ -89,7 +89,8 @@ struct ArtworkNotification {
 /// while `in_flight` is set is the malformed-sequence rule rather than a second record.
 ///
 /// Guarded by DrainTask::slot_mutex: written from the protocol task (handle_binary() and the
-/// stream lifecycle handlers) and cleared from the main loop by cleanup().
+/// stream lifecycle handlers) and cleared by cleanup(), which runs there too, or on the main
+/// loop in stop() once the protocol task is joined.
 ///
 /// `buffer_idx`/`generation` name the SlotBuffer the parts accumulate into, claimed once at the
 /// announce so every part of the transfer lands in the same buffer. `discarding` marks a transfer
@@ -200,22 +201,21 @@ struct ArtworkRole::Impl {
     void drain_events();
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
-    /// The gate in SendspinClient's role dispatch is checked once, on the protocol task, while the
-    /// handler it admits runs on: a teardown on the main loop can land in between (neither a lost
-    /// connection nor a deactivation waits for the protocol task). The dispatch captures this
+    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
+    /// runs, and stop()'s teardown on the main loop can land in between. The dispatch captures this
     /// counter with the gate and hands it back here at each point of effect, so a teardown inside
     /// that window invalidates the whole handler instead of only the part that ran before it.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
     }
 
-    /// @brief Stops the role and discards its state. Main loop only.
+    /// @brief Stops the role and discards its state. Protocol task, or the main loop in
+    /// SendspinClient::stop() once every other thread is joined.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
     /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
     /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
-    /// the inbox rather than fired here, because both callers run under the connection manager's
-    /// conn_ptr_mutex_.
+    /// the inbox, stamped with the new generation.
     void cleanup();
 
     // ========================================

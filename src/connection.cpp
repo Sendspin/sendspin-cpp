@@ -78,6 +78,12 @@ void SendspinConnection::init_time_filter() {
     this->time_filter_ = std::make_shared<SendspinTimeFilter>(SendspinTimeFilter::Config{});
 }
 
+void SendspinConnection::wake_protocol_task() const {
+    if (this->inbound_task_ != nullptr) {
+        this->inbound_task_->wake();
+    }
+}
+
 // ============================================================================
 // Message sending
 // ============================================================================
@@ -93,16 +99,14 @@ SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
 
 SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCallback cb,
                                         bool allow_before_hello) {
-    // Delegate to the pointer/length overload: same routing, same is_active() race-freedom
-    // reasoning (see that overload).
+    // Delegate to the pointer/length overload: same routing (see that overload).
     return this->send_app_json(json.data(), json.size(), std::move(cb), allow_before_hello);
 }
 
 SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendCompleteCallback cb,
                                         bool allow_before_hello) {
-    // is_active() is an atomic read; NoiseTransport owns its own session mutex, so this
-    // main-loop check cannot race the protocol-task re-handshake swap: send_encrypted_text
-    // re-checks the session under NoiseTransport's own lock.
+    // Protocol task only, like the re-handshake swap, so the session cannot change between this
+    // check and the encrypt.
     if (this->noise_transport_.is_active()) {
         // Post-handshake: encrypt straight from the caller's buffer. The transport's send path
         // takes no callback, so fire cb here on the encrypt result (best-effort).
@@ -237,10 +241,7 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
             return;
         }
         // Record the server's identity (public key) and the PSK category/psk_id that admitted
-        // the connection, resolved by the handshake. Every write below happens-before the store of
-        // noise_handshake_complete_ just after it, so main-loop readers that observe
-        // is_operational() (itself gated behind server_hello_received_/client_hello_sent_,
-        // which cannot be true before the Noise transport is active) see these values.
+        // the connection, resolved by the handshake.
         this->set_noise_handshake_result(outcome->server_id, outcome->resolved_psk.category,
                                          outcome->resolved_psk.psk_id);
         // pairing.md "Pairing index": a fresh handshake starts a fresh count for the
@@ -249,7 +250,7 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
         // Install the cipher session; send_app_json() routes encrypted from here on.
         this->noise_transport_.activate(std::move(outcome->session));
         this->noise_handshake_.reset();
-        this->noise_handshake_complete_.store(true, std::memory_order_release);
+        this->noise_handshake_complete_ = true;
         SS_LOGI(TAG, "Noise transport active (server_id=%s, psk_category=%d)",
                 this->server_information_.server_id.c_str(),
                 static_cast<int>(this->get_psk_category()));
@@ -273,31 +274,22 @@ bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
         return false;
     }
 
-    // Restart the re-proving watchdog (ConnectionManager::scan_reprove_watchdog()): the
-    // connection is once again awaiting its first server/activate, under the new keys.
-    //
-    // This must precede the first_activate_received_ store below. The watchdog reads
-    // is_operational() and then get_provisional_time_us() while holding nothing that excludes
-    // this thread, so clearing the flag first would let it pair "not operational" with this
-    // connection's previous stamp, which for a long-admitted connection is far older than
-    // REPROVE_TIMEOUT_US, and drop a healthy connection mid-rekey. In this order the relaxed
-    // stamp is sequenced before the release store, so any reader whose acquire load observes
-    // the cleared flag is guaranteed to see the fresh stamp with it.
+    // Restart the re-proving watchdog (ConnectionManager's re-prove scan): the connection is
+    // once again awaiting its first server/activate, under the new keys.
     this->set_provisional_time_us(platform_time_us());
 
     // Suppress app-level sends (client/state, client/time) for the duration of the
-    // re-handshake. The main loop gates on first_activate_received(), so clearing it here
-    // cleanly stops publish_client_state()/the time burst until the new server/activate
-    // arrives after the session swap.
-    this->first_activate_received_.store(false, std::memory_order_release);
+    // re-handshake. Every send gates on first_activate_received(), so clearing it here
+    // stops publish_client_state() and the time burst until the new server/activate arrives
+    // after the session swap.
+    this->first_activate_received_ = false;
 
     // Clear the pairing-in-progress flag: the re-handshake is the server's signal that
-    // pairing finalized and it is rekeying onto the new long-term PSK. Clearing it here
-    // (protocol task) before the new server/activate arrives is what makes the main loop read
-    // that activate as a fresh one rather than a re-entry into the attempt, and discard any
-    // pairing message still in flight as stale.
-    // Atomic store: written on the protocol task, read on main loop.
-    this->pairing_in_progress_.store(false, std::memory_order_release);
+    // pairing finalized and it is rekeying onto the new long-term PSK. Clearing it before the
+    // new server/activate arrives is what makes the manager read that activate as a fresh one
+    // rather than a re-entry into the attempt, and discard any pairing message still in flight
+    // as stale.
+    this->pairing_in_progress_ = false;
 
     // Run the deferred-PSK-binding msg1 read with prologue = the prior handshake hash h.
     auto prior_h = this->noise_transport_.handshake_hash();
@@ -315,9 +307,7 @@ bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
         return false;
     }
 
-    // Commit: encrypt msg2 under the OLD session and send it, then swap to the new session,
-    // both under NoiseTransport's session_mutex_ so a concurrent main-loop encrypt cannot
-    // interleave between the msg2 send and the swap.
+    // Commit: encrypt msg2 under the OLD session and send it, then swap to the new session.
     SsErr err =
         this->noise_transport_.send_msg2_and_swap(result->msg2_text, std::move(result->session));
     if (err != SsErr::OK) {
@@ -326,13 +316,8 @@ bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
     }
 
     // Update PSK metadata from the re-handshake result. server_id is unchanged (same server).
-    this->psk_category_.store(result->resolved_psk.category, std::memory_order_release);
-    {
-        // Same reason as in set_noise_handshake_result(): get_psk_id() may be reading this
-        // string from the main loop (the revocation sweep) while the protocol task rewrites it.
-        std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
-        this->psk_id_ = result->resolved_psk.psk_id;
-    }
+    this->psk_category_ = result->resolved_psk.category;
+    this->psk_id_ = result->resolved_psk.psk_id;
 
     // pairing.md "Pairing index": a re-handshake starts a fresh count for the pairing_index /
     // CPace-sid counter, same as an initial handshake.
@@ -389,7 +374,7 @@ SS_HOT void SendspinConnection::process_inbound_message(InboundMessage& message)
     //
     // A WS-upgraded connection with no driver yet (outbound between connect and
     // init_noise_handshake()) never hears anything legitimate, so its frames are dropped.
-    const bool noise_active = this->noise_handshake_complete_.load(std::memory_order_acquire);
+    const bool noise_active = this->noise_handshake_complete_;
     const bool noise_pending = !noise_active && this->noise_handshake_;
 
     if (message.kind == InboundKind::TEXT) {
@@ -766,64 +751,17 @@ void SendspinConnection::end_inbound_fragment(size_t len, bool last) {
 }
 
 // ============================================================================
-// Pre-admission message hold
-// ============================================================================
-
-bool SendspinConnection::hold_pre_admission_message(const char* data, size_t len,
-                                                    int64_t arrival_us) {
-    if (this->held_count_ >= MAX_HELD_MESSAGES || this->held_bytes_ + len > MAX_HELD_BYTES) {
-        SS_LOGW(TAG,
-                "Pre-admission hold budget spent (%zu/%zu messages, %zu+%zu/%zu bytes); dropping",
-                this->held_count_, MAX_HELD_MESSAGES, this->held_bytes_, len, MAX_HELD_BYTES);
-        return false;
-    }
-    if (this->held_messages_.data() == nullptr && !this->held_messages_.allocate(MAX_HELD_BYTES)) {
-        SS_LOGW(TAG, "Failed to allocate the pre-admission hold buffer");
-        return false;
-    }
-    std::memcpy(this->held_messages_.data() + this->held_bytes_, data, len);
-    this->held_extents_[this->held_count_] = {this->held_bytes_, len, arrival_us};
-    this->held_bytes_ += len;
-    ++this->held_count_;
-    return true;
-}
-
-void SendspinConnection::replay_pre_admission_messages(const HeldMessageVisitor& visit) {
-    const size_t count = this->held_count_;
-    // Cleared before the visits so a message the visitor routes back here cannot be replayed
-    // twice or read from a buffer this call is already draining.
-    this->held_count_ = 0;
-    this->held_bytes_ = 0;
-    for (size_t i = 0; i < count; ++i) {
-        // The admission that started the replay is read once by its caller; a main-loop drop
-        // landing between two messages clears the flag and detaches the gate, and the rest of
-        // the hold belongs to a connection that no longer drives the roles.
-        if (this->inbound_gate_.is_detached() || !this->inbound_gate_.is_admitted()) {
-            SS_LOGD(TAG, "Connection dropped during its admission replay; discarding the rest");
-            break;
-        }
-        const HeldMessageExtent& extent = this->held_extents_[i];
-        visit(reinterpret_cast<const char*>(this->held_messages_.data()) + extent.offset,
-              extent.length, extent.arrival_us);
-    }
-    // Returned to the heap now rather than staying allocated for the rest of the session.
-    this->held_messages_ = PlatformBuffer{};
-}
-
-// ============================================================================
 // Pairing finalize watchdog
 // ============================================================================
 
 void SendspinConnection::note_pairing_finalize_ack() {
-    // Stamp the provisional timer before clearing first_activate_received_, for the reason given
-    // in handle_noise_rehandshake(): the watchdog reads is_operational() and then
-    // get_provisional_time_us() unsynchronized, so the reverse order lets it pair "not
-    // operational" with this connection's previous, arbitrarily old stamp and drop it.
+    // Restart the re-prove window, as handle_noise_rehandshake() does: the rekey that follows
+    // the ack has REPROVE_TIMEOUT_US to deliver its server/activate.
     this->set_provisional_time_us(platform_time_us());
-    this->first_activate_received_.store(false, std::memory_order_release);
+    this->first_activate_received_ = false;
     // Mark the activities snapshot stale: activities_ still reads [PAIRING] until the post-rekey
     // activate lands, and admission must not keep shielding this as an in-flight pairing.
-    this->pairing_finalized_.store(true, std::memory_order_release);
+    this->pairing_finalized_ = true;
 }
 
 }  // namespace sendspin

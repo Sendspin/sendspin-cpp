@@ -436,11 +436,11 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     // acquire for playback happens when the main loop drains the STREAM_START event, keeping
     // high_performance_requested_for_playback main-thread-only. The params write and the event push
     // are two separate Inbox lock acquisitions, not one critical section: the mutex orders the
-    // write before the push for visibility, but a concurrent main-thread cleanup() can slip its
-    // stream_params_slot.reset() between them. That teardown also bumped the generation this
-    // START is stamped with, so the drain discards the START and the stale params sit unread
-    // until the next stream replaces them; if instead the START wins the race, the drain takes
-    // it, finds the slot empty and keeps the prior params (see stream_params_slot.take() in
+    // write before the push for visibility, but a concurrent cleanup() (stop()'s, on the main loop)
+    // can slip its stream_params_slot.reset() between them. That teardown also bumped the
+    // generation this START is stamped with, so the drain discards the START and the stale params
+    // sit unread until the next stream replaces them; if instead the START wins the race, the drain
+    // takes it, finds the slot empty and keeps the prior params (see stream_params_slot.take() in
     // drain_events()).
     this->event_state->stream_params_slot.write(player_obj);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation);
@@ -670,13 +670,14 @@ void PlayerRole::Impl::cleanup() {
     // Enqueue a clean STREAM_END - drain_events() will fire the callback (enqueue_stream_event()
     // logs if the ring is too full to take it)
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
+}
 
-    // Clear awaiting events too (main-thread only, no mutex needed)
+void PlayerRole::Impl::complete_teardown() {
+    // The lifecycle events the teardown overtook. The STREAM_END cleanup() queued is appended
+    // after this runs: the drain catches up on its generation before dispatching it.
     this->awaiting_sync_idle_events.clear();
-
-    // Deferred: cleanup() runs under ConnectionManager::conn_ptr_mutex_ on both paths.
     if (this->high_performance_requested_for_playback) {
-        this->client->release_high_performance_deferred();
+        this->client->release_high_performance();
         this->high_performance_requested_for_playback = false;
     }
 }

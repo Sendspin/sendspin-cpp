@@ -52,8 +52,18 @@ public:
     SendspinWsServer() = default;
     ~SendspinWsServer();
 
-    /// @brief Callback type for notifying the client of new connections
-    using NewConnectionCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
+    /// @brief Callback type for notifying the client of new connections, on the connection's
+    /// IXWebSocket thread
+    ///
+    /// Returns false when the client refused the connection: the server then closes the socket
+    /// and releases its own reference once the callback has returned, so a refusal never destroys
+    /// the connection inside the callback. (ESP keeps a refused connection until its httpd session
+    /// is freed; see the ESP ws_server.)
+    using NewConnectionCallback =
+        std::function<bool(const std::shared_ptr<SendspinServerConnection>&)>;
+
+    /// @brief Callback that wakes the protocol task; unused here (see set_wake_callback())
+    using WakeCallback = std::function<void()>;
 
     /// @brief Starts the WebSocket server on the configured port; the three task parameters are
     /// ESP-IDF httpd settings and are ignored here.
@@ -63,12 +73,15 @@ public:
     /// @brief Stops the WebSocket server and releases its resources
     void stop();
 
-    /// @brief No-op on host builds. On ESP the manager loop drives the pending-upgrade reap
+    /// @brief No-op on host builds. On ESP the protocol task drives the pending-upgrade reap
     /// through this; here IXWebSocket delivers Open events and times out stalled handshakes on
     /// its own threads (bounded by WS_HANDSHAKE_TIMEOUT_SECS, pinned in start()). Kept as an
     /// instance method for symmetry with the ESP build.
+    /// @return UINT32_MAX: no deadline of the server's own.
     // cppcheck-suppress functionStatic
-    void tick() {}
+    uint32_t tick() {
+        return UINT32_MAX;
+    }
 
     /// @brief Sets the maximum number of simultaneous client connections
     /// The default supports handoff plus graceful rejection: one established connection, the
@@ -93,6 +106,11 @@ public:
     void set_new_connection_callback(NewConnectionCallback&& callback) {
         this->new_connection_callback_ = std::move(callback);
     }
+
+    /// @brief No-op on host builds: no session waits on a deadline tick() reports. Kept for
+    /// symmetry with the ESP build.
+    // cppcheck-suppress functionStatic
+    void set_wake_callback(WakeCallback&& /*callback*/) {}
 
     /// @brief Whether the WebSocket server is currently running
     bool is_started() const {

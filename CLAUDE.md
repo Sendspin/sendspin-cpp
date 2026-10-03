@@ -8,8 +8,9 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 
 ### Key classes
 
-- `SendspinClient` (`client.h`): main orchestration class, owns connections, time sync, the inbound ring and the protocol task, and message routing
-- `ProtocolTask` (`protocol_task.h`): the library-owned `SsProto` thread that runs all per-connection receive work (decrypt, reassembly, the handshake, dispatch, the admission replay, close reporting) through `SendspinClient::protocol_tick()`, plus its bounded command queue
+- `SendspinClient` (`client.h`): main orchestration class, owns the protocol task, the connection manager, the inbound ring and message routing; `loop()` only drains the inbox on the consumer's main loop, and the requests that act on a connection are queued to the protocol task
+- `ProtocolTask` (`protocol_task.h`): the library-owned `SsProto` thread that owns every connection and does all protocol work (Noise, reassembly, hello, activation, admission, pairing, JSON dispatch, time sync, watchdogs, sends) through `SendspinClient::protocol_tick()`, which returns its next deadline; plus its bounded command queue for main-loop and consumer requests and the latest client/state snapshot slot
+- `ConnectionManager` (`connection_manager.h`): the admitted array with each connection's owned roles, the nursery, admission and ownership arbitration, pairing, per-connection time bursts and the watchdogs, and the leaf-locked time filter and server information slots other threads read; runs on the protocol task
 - `InboundRing` / `InboundItemList` / `InboundGate` (`inbound_ring.h`): the one shared ring every admitted connection's transport receives into, the per-role item lists that hand audio and visualizer frames to their consumer threads in place (charged to per-role quotas), and the per-connection transport/protocol-task hand-off
 - `PlayerRole` (`player_role.h`): audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
 - `ControllerRole` (`controller_role.h`): sends playback commands to the server
@@ -22,11 +23,11 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `SendspinServerConnection` / `SendspinClientConnection`: platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
 - `NoiseHandshake` (`noise_handshake.h`): drives the Noise KKpsk2 handshake frames on the protocol task and resolves the PSK through `RecordStore`
 - `NoiseSession` (`noise_session.h`): noise-c wrapper holding the KKpsk2 handshake and transport cipher states
-- `NoiseTransport` (`noise_transport.h`): per-connection encrypted framing, owns fragmentation and reassembly around the session
+- `NoiseTransport` (`noise_transport.h`): per-connection encrypted framing, owns fragmentation and reassembly around the session; protocol task only, so it takes no lock
 - `RecordStore` (`record_store.h`): pairing records and the Pairing PSK (configured, stored, or generated), seeded from the client config and the persistence provider
-- `Inbox` / `InboxSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle events
+- `Inbox` / `InboxSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state (the protocol task and role threads produce, the main loop consumes) - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle events
 - `SendspinTimeFilter` (`time_filter.h`): 2D Kalman filter for NTP-style time sync
-- `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator
+- `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator, one per connection
 - `SendspinDecoder` (`decoder.h`): FLAC/PCM decoder wrapper, plus Opus when built with `SENDSPIN_ENABLE_OPUS`
 
 ### Role composition
@@ -99,7 +100,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - Namespace: `sendspin`
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
 - Memory: the `platform_malloc` family from `platform/memory.h`, never raw `heap_caps_malloc`/`malloc` in core code (variant semantics under Platform abstraction above)
-- Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer.
+- Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer. Connection state belongs to the protocol task; requests that act on a connection go through its command queue, and work bound for the main loop goes through the inbox.
 - Apache 2.0 license headers on all files
 
 ## Pre-commit hooks

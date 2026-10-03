@@ -247,9 +247,10 @@ struct SendspinClientConfig {
 
     /// @brief Default protocol task stack size in bytes (ESP-IDF only). The protocol task runs
     /// every Noise handshake, including the in-band re-handshake that runs the full KKpsk2 X25519
-    /// handshake nested under the transport decrypt and encrypt layers, plus the JSON parse and
-    /// the role handlers: the work whose stack the transport tasks were sized for, so it takes
-    /// their verified 8192 bytes until it is measured with -fstack-usage.
+    /// handshake nested under the transport decrypt and encrypt layers, the pairing exchange
+    /// (CPace and SHA-512), plus the JSON parse and the role handlers: the work whose stack the
+    /// transport tasks were sized for, so it takes their verified 8192 bytes until it is measured
+    /// with -fstack-usage.
     static constexpr size_t DEFAULT_PROTOCOL_TASK_STACK_SIZE = 8192U;
 
     size_t protocol_task_stack_size{

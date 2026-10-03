@@ -55,15 +55,12 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -83,7 +80,6 @@ public:
     // --- Interface stubs ---
 
     void start() override {}
-    void loop() override {}
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
         disconnect_calls_.push_back(reason);
         if (on_complete) {
@@ -151,7 +147,7 @@ public:
     /// Install a noise session directly (bypasses handshake, for transport-only tests).
     void set_noise_session(std::unique_ptr<NoiseSession> session) {
         this->noise_transport_.activate(std::move(session));
-        this->noise_handshake_complete_.store(true, std::memory_order_release);
+        this->noise_handshake_complete_ = true;
     }
 
     /// Direct access to NoiseTransport::send_binary() for tests exercising the binary send
@@ -159,13 +155,6 @@ public:
     /// binary message today).
     SsErr test_send_binary(const uint8_t* data, size_t len) {
         return this->noise_transport_.send_binary(data, len);
-    }
-
-    /// Direct access to NoiseTransport::accept_plaintext() for feeding already-decrypted frames
-    /// through the reassembly state machine, independent of decrypt_in_place. Lets a test judge
-    /// an emitted frame sequence the way a peer would without standing up a second live session.
-    NoiseTransport::CompleteMessage test_accept_plaintext(uint8_t* pt, size_t len) {
-        return this->noise_transport_.accept_plaintext(pt, len, this->is_admitted());
     }
 
     // Accumulated outgoing messages
@@ -181,41 +170,6 @@ public:
     // close_silently(), which calls this instead of disconnect() so it never blocks on or joins
     // a transport thread from the protocol task it runs on).
     int close_transport_now_calls_{0};
-};
-
-/// TestConnection whose send_binary_message() capture is serialized by its own mutex, so
-/// concurrent test threads can push into sent_binary_ without racing the vector itself. This
-/// mutex guards only the capture; it deliberately does not serialize the encrypt, which is
-/// NoiseTransport::session_mutex_'s job and is what ConcurrentSendsDoNotInterleaveFragments
-/// exercises. Frames land in sent_binary_ in the order they reached the sink, which is the
-/// order they would reach the wire.
-///
-/// The sink also answers whether the race it is part of actually happened: every frame big
-/// enough to be a fragment is counted as overlapped if a second sender had a send in flight as
-/// it was emitted. Without that count a round where the two senders never met would report
-/// success while proving nothing.
-class ConcurrentCaptureConnection : public TestConnection {
-public:
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                              bool allow_before_hello) override {
-        if (len > FRAGMENT_FRAME_MIN_BYTES && this->other_sends_in_flight_.load() > 0) {
-            ++this->overlapped_frames_;
-        }
-        std::lock_guard<std::mutex> lock(this->capture_mutex_);
-        return TestConnection::send_binary_message(data, len, cb, allow_before_hello);
-    }
-
-    /// Any frame above this is a full fragment; the concurrent sender's messages are a few
-    /// dozen bytes.
-    static constexpr size_t FRAGMENT_FRAME_MIN_BYTES = 1024;
-
-    /// Raised by the concurrent sender around each send, so the count includes the time it
-    /// spends waiting on session_mutex_ rather than only the moment it reaches the sink.
-    std::atomic<int> other_sends_in_flight_{0};
-    std::atomic<int> overlapped_frames_{0};
-
-private:
-    std::mutex capture_mutex_;
 };
 
 // ============================================================================
@@ -1692,89 +1646,6 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
 // ============================================================================
 // Concurrent sends
 // ============================================================================
-
-// The fragments of one logical message must reach the wire consecutively. A peer that sees a
-// non-fragment frame while a fragmented message is in flight treats it as a spec
-// "Malformed sequences" protocol error and closes the connection (accept_plaintext() sets
-// malformed, and connection.cpp turns that into close_silently()).
-//
-// Sends come from more than one thread in production: the main loop sends client/time,
-// client/state and pairing messages while the protocol task sends, for example, the
-// re-handshake's msg2 (send_msg2_and_swap()).
-// fragment_and_send_locked() therefore has to hold session_mutex_ across every frame, not
-// re-acquire it per frame; otherwise a small concurrent send lands a complete frame in the gap.
-//
-// This test races a fragmenting send against a stream of small sends on one transport, then
-// replays the captured frames, in emission order, through an independent reassembly state
-// machine and requires it to find no protocol violation. Two things make that race real rather
-// than hopeful: the fragmenting send does not start until the other sender is in its loop, and
-// the sink counts the fragment frames emitted while one of that sender's sends was in flight.
-// Under correct locking that send is parked on session_mutex_ for the whole message, so a
-// fragment emitted while one of that sender's sends is in flight proves the two met; a round
-// that counted none never raced and is failed as vacuous.
-// Elapsed time is not part of any verdict here, and correct locking cannot produce a malformed
-// sequence at all, so a slow machine cannot fail this test.
-TEST(NoiseTransport, ConcurrentSendsDoNotInterleaveFragments) {
-    constexpr int ROUNDS = 4;
-    // Fragments into roughly 14 frames at MAX_TRANSPORT_PLAINTEXT, giving many gaps to hit.
-    constexpr size_t LARGE_JSON_BYTES = 900000;
-
-    for (int round = 0; round < ROUNDS; ++round) {
-        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-        ASSERT_TRUE(r.has_value());
-
-        ConcurrentCaptureConnection conn;
-        conn.set_noise_session(std::move(r->responder_session));
-
-        std::string large_json(LARGE_JSON_BYTES, 'A');
-        std::atomic<bool> stop{false};
-        std::atomic<int> small_sends{0};
-
-        std::thread small_sender([&]() {
-            int i = 0;
-            while (!stop.load(std::memory_order_acquire)) {
-                conn.other_sends_in_flight_.fetch_add(1, std::memory_order_release);
-                conn.send_encrypted_text("{\"i\":" + std::to_string(i) + "}");
-                conn.other_sends_in_flight_.fetch_sub(1, std::memory_order_release);
-                ++i;
-                small_sends.store(i, std::memory_order_release);
-            }
-        });
-
-        // The fragmenting send runs on this thread, and only once the other sender is looping:
-        // a small sender that has not started yet cannot collide with anything.
-        while (small_sends.load(std::memory_order_acquire) == 0) {
-            std::this_thread::yield();
-        }
-        EXPECT_EQ(conn.send_encrypted_text(large_json), SsErr::OK);
-        stop.store(true, std::memory_order_release);
-        small_sender.join();
-
-        ASSERT_GE(conn.sent_binary_.size(), 2u);
-        EXPECT_GT(conn.overlapped_frames_.load(), 0)
-            << "round " << round << " emitted no fragment while a concurrent send was in "
-               "flight, so it raced nothing";
-
-        // Decrypt in emission order with the peer's matching cipher. conn encrypted with the
-        // responder session, so the initiator's recv cipher is its counterpart; the std::move
-        // of responder_session above leaves r->initiator untouched.
-        TestConnection receiver;
-        size_t frame_index = 0;
-        for (auto& frame : conn.sent_binary_) {
-            std::vector<uint8_t> pt = raw_decrypt(r->initiator.recv_cs, frame);
-            ASSERT_FALSE(pt.empty()) << "round " << round << " frame " << frame_index
-                                     << " failed to decrypt";
-            NoiseTransport::CompleteMessage msg =
-                receiver.test_accept_plaintext(pt.data(), pt.size());
-            ASSERT_FALSE(msg.malformed)
-                << "round " << round << ": frame " << frame_index << " of "
-                << conn.sent_binary_.size()
-                << " broke the fragment sequence, so a concurrent send interleaved with a "
-                   "fragmented one";
-            ++frame_index;
-        }
-    }
-}
 
 // ============================================================================
 // client/time send stamps

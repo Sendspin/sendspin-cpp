@@ -25,14 +25,15 @@
 // handshake hash while leaving the Noise session unset, so SendspinConnection::send_app_json
 // emits raw JSON via send_text_message, which this file parses directly with ArduinoJson.
 //
-// Server-to-client pairing messages are injected via ConnectionManager's public
-// schedule_pairing_message() / schedule_pair_abort() / schedule_pairing_window_confirm()
-// APIs followed by SendspinClient::loop() (the same entry points process_json_message() uses
-// on the protocol task), so these tests exercise the real deferred-event + main-loop path.
-// Listener callbacks are NOT fired directly by ConnectionManager; they are queued into
-// SendspinClient::EventState and drained by SendspinClient::loop() after
-// connection_manager_->loop() returns, so every scenario below calls client.loop() and asserts
-// on the RecordingListener rather than on ConnectionManager state directly.
+// The fixture stops the protocol task right after start() and plays its part on the test
+// thread: server-to-client pairing messages are handed to ConnectionManager's handlers
+// (on_pairing_message() / on_pair_abort() / on_server_activate(), the same entry points
+// process_json_message() calls on the protocol task), and pump() runs one protocol tick (the
+// queued commands such as confirm_pairing_window(), the watchdogs and the window lifetime)
+// followed by SendspinClient::loop(). Listener callbacks are NOT fired directly by
+// ConnectionManager; they are queued into SendspinClient::EventState and drained by loop(), so
+// every scenario below pumps and asserts on the RecordingListener rather than on
+// ConnectionManager state directly.
 
 #include "connection.h"
 #include "connection_manager.h"
@@ -45,6 +46,7 @@
 #include "platform/time.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
+#include "protocol_task.h"
 #include "record_store.h"
 #include "record_test_helpers.h"
 #include "sendspin/client.h"
@@ -56,6 +58,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -64,12 +67,33 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
+
+// ============================================================================
+// Handler arguments
+// ============================================================================
+
+/// The arguments of one ConnectionManager::on_pairing_message() call, gathered so a helper can
+/// build the message before it delivers it.
+struct ServerPairingMessageEvent {
+    std::shared_ptr<SendspinConnection> conn;
+    PairingMessageKind kind{};
+    std::optional<std::array<uint8_t, 32>> nonce_a{};
+    std::array<uint8_t, 32> pake_msg_1{};
+    std::array<uint8_t, 64> server_kc{};
+};
+
+/// The arguments of one ConnectionManager::on_pair_abort() call.
+struct PairAbortEvent {
+    std::shared_ptr<SendspinConnection> conn;
+    PairAbortReason reason{};
+};
 
 // ============================================================================
 // FakeConnection: minimal SendspinConnection stand-in
@@ -87,7 +111,6 @@ public:
     // Interface stubs
 
     void start() override {}
-    void loop() override {}
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
         this->last_disconnect_reason_ = reason;
         this->disconnect_count_++;
@@ -483,15 +506,52 @@ protected:
         this->client_->set_persistence_provider(&this->persistence_provider_);
         this->client_->set_unpaired_access_enabled(this->unpaired_access_enabled_);
         ASSERT_TRUE(this->client_->start());
+        // The test thread plays the protocol task from here (pump()), so every handler and scan
+        // runs where the assertions can see it.
+        this->client_->protocol_task_->stop();
     }
 
-    /// Inject a fresh FakeConnection as current_connection_, with the given server_id and
+    /// One protocol tick on the test thread, then the main loop's drain.
+    void pump() {
+        (void) this->client_->protocol_tick();
+        this->client_->loop();
+    }
+
+    /// Pumps until `conn`'s time burst has a client/time frame in flight. Unbounded: a burst that
+    /// stopped sending hangs here and the suite watchdog names the test.
+    void pump_until_time_frame(FakeConnection* conn) {
+        while (conn->time_frame_tag_.load() == 0) {
+            this->pump();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+
+    /// Admits `conn` the way the promotion does, owning the roles its activation made active. A
+    /// connection already in the admitted slot is displaced without a teardown; the fixture keeps
+    /// its own reference to every connection it injected.
+    void admit(const std::shared_ptr<FakeConnection>& conn) {
+        for (auto& entry : this->client_->connection_manager_->admitted_) {
+            if (entry.conn != nullptr) {
+                entry.conn->set_admitted(false);
+                entry = AdmittedEntry{};
+            }
+        }
+        conn->time_burst().configure(SendspinClientConfig{}.time_burst_size,
+                                     SendspinClientConfig{}.time_burst_interval_ms,
+                                     SendspinClientConfig{}.time_burst_response_timeout_ms);
+        // Fresh inbound traffic, so the liveness watchdog reads the connection as live.
+        conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
+                                          std::memory_order_relaxed);
+        this->client_->connection_manager_->install_admitted(conn, conn->get_active_role_mask());
+    }
+
+    /// Admit a fresh FakeConnection, with the given server_id and
     /// pairing method already applied (as if a server/activate had been admitted;
     /// dynamic_pairing_code activations carry the emission format), and pairing_in_progress
     /// cleared. Returns a raw pointer valid for the test's lifetime.
     ///
     /// The test fixture also keeps its own shared_ptr (injected_conn_) alive independently of
-    /// ConnectionManager::current_connection_: abort/cleanup paths (local_abort_pairing,
+    /// ConnectionManager's admitted slot: abort/cleanup paths (local_abort_pairing,
     /// handle_pair_abort, on_connection_lost) move-and-drop ConnectionManager's slot as part of
     /// tearing the connection down, which would otherwise destroy the FakeConnection out from
     /// under the test (its sent_text_ / disconnect_count_ are asserted AFTER those paths run).
@@ -505,49 +565,34 @@ protected:
                                         ? std::optional<SendspinPairingCodeFormat>(format)
                                         : std::nullopt);
         conn->set_pairing_in_progress(false);
-        // The slot is assigned directly, bypassing set_current_connection() and the admission
-        // flush, so set the flag the way admission would: the current connection is the admitted
-        // one, and client/state among other things is gated on it.
-        conn->set_admitted(true);
         FakeConnection* raw = conn.get();
         this->injected_conn_ = conn;
-        {
-            std::lock_guard<std::mutex> lock(this->client_->connection_manager_->conn_ptr_mutex_);
-            this->client_->connection_manager_->current_connection_ = conn;
-        }
+        this->admit(conn);
         return raw;
     }
 
-    /// Inject a fresh FakeConnection as current_connection_ WITHOUT applying any activate (no
-    /// activities, no selected pair method, first_activate_received() still false). Unlike
-    /// inject_current_connection, this lets a test drive the real ServerActivateEvent
-    /// arbitration path via post_activate() + loop(), so the first-vs-subsequent activate
-    /// handling in ConnectionManager::loop() is exercised end to end (not bypassed through the
-    /// handle_enter_pairing() seam).
+    /// Admit a fresh FakeConnection WITHOUT applying any activate (no activities, no selected
+    /// pair method, first_activate_received() still false). Unlike inject_current_connection,
+    /// this lets a test drive the real activation path via post_activate(), so the
+    /// first-vs-subsequent activate handling in ConnectionManager::on_server_activate() is
+    /// exercised end to end (not bypassed through the handle_enter_pairing() seam).
     FakeConnection* inject_provisional_current_connection(const std::string& server_id) {
         auto conn = std::make_shared<FakeConnection>();
         conn->set_noise_handshake_result(server_id, PskCategory::SENTINEL, /*psk_id=*/"");
-        // The slot is assigned directly, bypassing set_current_connection() and the admission
-        // flush, so set the flag the way admission would: the current connection is the admitted
-        // one, and client/state among other things is gated on it.
-        conn->set_admitted(true);
         FakeConnection* raw = conn.get();
         this->injected_conn_ = conn;
-        {
-            std::lock_guard<std::mutex> lock(this->client_->connection_manager_->conn_ptr_mutex_);
-            this->client_->connection_manager_->current_connection_ = conn;
-        }
+        this->admit(conn);
         return raw;
     }
 
     /// Drive handle_enter_pairing() for the injected current connection via the same call
-    /// ConnectionManager::loop() makes for a first pairing activate. Called directly (through
+    /// ConnectionManager::on_server_activate() makes for a first pairing activate. Called directly (through
     /// the private-access seam) rather than replaying the full activate-arbitration path, since
     /// arbitration itself is exercised by test_admission.cpp and is not the subject of this
     /// harness.
     ///
-    /// Production bumps pairing_index at the point a pairing server/activate is RECEIVED (the
-    /// activate_events loop in ConnectionManager::loop(), before the admissibility gate), not
+    /// Production bumps pairing_index at the point a pairing server/activate is RECEIVED
+    /// (ConnectionManager::on_server_activate(), before the admissibility gate), not
     /// inside handle_enter_pairing() itself: pairing_index must reflect every received activate,
     /// not only ones that reach this seam. This seam skips that loop entirely, so it must bump
     /// here to stand in for "a pairing server/activate was just received for this connection",
@@ -557,12 +602,9 @@ protected:
         this->client_->connection_manager_->handle_enter_pairing(conn);
     }
 
-    /// Simulate the connection being lost (protocol task reporting a close/disconnect),
-    /// exercising ConnectionManager::on_connection_lost() with a pairing attempt in flight.
-    /// Under conn_ptr_mutex_, as loop()'s lifecycle drain runs it: the protocol task snapshots
-    /// the slots under that lock every tick.
+    /// Simulate the connection being lost (the protocol task's loss pass), exercising
+    /// ConnectionManager::on_connection_lost() with a pairing attempt in flight.
     void simulate_connection_lost(SendspinConnection* conn) {
-        std::lock_guard<std::mutex> lock(this->client_->connection_manager_->conn_ptr_mutex_);
         this->client_->connection_manager_->on_connection_lost(conn);
     }
 
@@ -577,8 +619,8 @@ protected:
         return mgr.should_switch_to_new_server(current, incoming);
     }
 
-    /// Drives SendspinClient::note_last_played_server() and the flush that follows it in a
-    /// tick, both private to SendspinClient.
+    /// Drives SendspinClient::note_last_played_server() and the main loop's flush that follows
+    /// it, both private to SendspinClient.
     void note_and_flush_last_played_server(const std::string& server_id) {
         this->client_->note_last_played_server(server_id);
         this->client_->flush_pending_persistence();
@@ -591,64 +633,64 @@ protected:
     /// path has released ConnectionManager's slot.
     std::shared_ptr<SendspinConnection> current_connection_sp() { return this->injected_conn_; }
 
-    /// Returns ConnectionManager::current_connection_ (nullptr once dropped), through the
+    /// Returns the primary admitted connection (nullptr once dropped), through the
     /// private-access seam. Unlike current_connection_sp() above, this reflects whether the
     /// connection is still actually managed, not just whether the fixture's own reference is
     /// still alive.
     SendspinConnection* current_connection() {
-        return this->client_->connection_manager_->current();
+        AdmittedEntry* primary = this->client_->connection_manager_->primary();
+        return primary != nullptr ? primary->conn.get() : nullptr;
     }
 
-    /// Drive ConnectionManager's real teardown path for `conn`, through the private-access seam,
-    /// taking
-    /// the same lock and running the same deferred-release flush loop() would.
+    /// Drive ConnectionManager's real teardown path for `conn`, through the private-access seam.
     void drop_connection(SendspinConnection* conn, SendspinGoodbyeReason goodbye) {
-        {
-            std::lock_guard<std::mutex> lock(this->client_->connection_manager_->conn_ptr_mutex_);
-            this->client_->connection_manager_->drop_connection(conn, goodbye);
-        }
-        this->client_->connection_manager_->flush_deferred_releases();
+        this->client_->connection_manager_->drop_connection(conn, goodbye);
     }
 
-    /// Schedule a server-to-client code pairing message for deferred processing (the same public
-    /// entry point process_json_message() uses on the protocol task), without pumping loop().
-    void schedule_pairing_message_event(ServerPairingMessageEvent event) {
-        this->client_->connection_manager_->schedule_pairing_message(std::move(event));
+    /// Hand a server-to-client code pairing message to the state machine, the call
+    /// process_json_message() makes on the protocol task. The listener hears of it on the next
+    /// pump().
+    void schedule_pairing_message_event(const ServerPairingMessageEvent& event) {
+        ServerPairingMessage message;
+        message.kind = event.kind;
+        message.nonce_a = event.nonce_a;
+        message.pake_msg_1 = event.pake_msg_1;
+        message.server_kc = event.server_kc;
+        this->client_->connection_manager_->on_pairing_message(event.conn.get(), message);
     }
 
-    /// Schedule a pair/abort event for deferred processing, without pumping loop().
-    void schedule_abort(PairAbortEvent event) {
-        this->client_->connection_manager_->schedule_pair_abort(std::move(event));
+    /// Hand a pair/abort to the manager, the call process_json_message() makes.
+    void schedule_abort(const PairAbortEvent& event) {
+        this->client_->connection_manager_->on_pair_abort(event.conn.get(), event.reason);
     }
 
-    /// Schedule a server/activate event on the injected current connection for deferred
-    /// processing, without pumping loop(). Drives the real activate-arbitration path in
-    /// ConnectionManager::loop() (trust check, apply_server_activate, then either the
-    /// already-admitted branch's leftover-activate handling or on_handshake_complete()):
-    /// the same entry point process_json_message() uses on the protocol task.
+    /// Apply a server/activate on the injected current connection through the real activation
+    /// path, ConnectionManager::on_server_activate() (trust check, apply_server_activate, then
+    /// either the already-admitted branch's leftover-activate handling or
+    /// on_handshake_complete()): the call process_json_message() makes on the protocol task.
     void post_activate(std::vector<SendspinActivity> activities,
                        std::optional<std::vector<std::string>> active_roles,
                        std::optional<SendspinPairMethod> pairing_method,
                        std::optional<SendspinPairingCodeFormat> pairing_format = std::nullopt) {
-        ServerActivateEvent event;
-        event.conn = this->current_connection_sp();
-        event.activities = std::move(activities);
-        event.active_roles = std::move(active_roles);
-        event.pairing_method = pairing_method;
-        event.pairing_format = pairing_format;
-        this->client_->connection_manager_->schedule_activate(std::move(event));
+        ServerActivateMessage message;
+        message.activities = std::move(activities);
+        message.active_roles = std::move(active_roles);
+        message.pairing_method = pairing_method;
+        message.pairing_format = pairing_format;
+        this->client_->connection_manager_->on_server_activate(this->current_connection_sp().get(),
+                                                               std::move(message));
     }
 
     /// Put the injected connection into, or out of, the state
     /// SendspinConnection::handle_noise_rehandshake() leaves it in after a session swap: awaiting
     /// its next server/activate, with the re-proving stamp refreshed. The real call needs a live
-    /// Noise transport this harness has none of, and the flags are what the loop() scans under
-    /// test actually read. first_activate_received_ is private to SendspinConnection.
+    /// Noise transport this harness has none of, and the flags are what the protocol tick's
+    /// scans under test actually read. first_activate_received_ is private to SendspinConnection.
     void set_awaiting_activate(FakeConnection* conn, bool awaiting) {
         if (awaiting) {
             conn->set_provisional_time_us(platform_time_us());
         }
-        conn->first_activate_received_.store(!awaiting, std::memory_order_release);
+        conn->first_activate_received_ = !awaiting;
     }
 
     /// Read the standing pairing-window deadline (0 = closed) through the private-access seam.
@@ -662,8 +704,8 @@ protected:
     }
 
     /// Deliver the server's server/pair-finalize ack for `conn`, the way
-    /// SendspinClient::process_json_message()'s SERVER_PAIR_FINALIZE handler does on the network
-    /// thread: commit the pending record and schedule the pairing-succeeded note. Routed through
+    /// SendspinClient::process_json_message()'s SERVER_PAIR_FINALIZE handler does on the protocol
+    /// task: commit the pending record and queue the pairing-succeeded note. Routed through
     /// the private-access seam rather than a fake transport, since this harness never installs a
     /// real Noise session to decrypt a frame through.
     void deliver_pair_finalize_ack(FakeConnection* conn) {
@@ -672,9 +714,9 @@ protected:
         ASSERT_TRUE(this->client_->record_store_->store_record_superseding(
             std::move(record.value()),
             this->client_->connection_manager_->open_connection_psk_ids()));
-        this->client_->connection_manager_->schedule_pairing_succeeded(conn->get_server_id());
+        this->client_->connection_manager_->on_pairing_succeeded(conn);
         conn->note_pairing_finalize_ack();
-        this->client_->loop();
+        this->pump();
     }
 
     /// Read the connection the open window is bound to (nullptr until it admits its first
@@ -734,7 +776,7 @@ protected:
         FakeConnection* conn = this->inject_current_connection(
             server_id, SendspinPairMethod::DYNAMIC_PAIRING_CODE, format);
         this->enter_pairing(conn);
-        this->client_->loop();
+        this->pump();
         return conn;
     }
 
@@ -771,7 +813,7 @@ protected:
         pair_init_event.kind = PairingMessageKind::PAIR_INIT;
         pair_init_event.nonce_a = out.nonce_a;
         this->schedule_pairing_message_event(std::move(pair_init_event));
-        this->client_->loop();
+        this->pump();
 
         ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_CODE));
     }
@@ -789,7 +831,7 @@ protected:
         pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
         pair_auth_event.pake_msg_1 = server.initiator.public_share();
         this->schedule_pairing_message_event(std::move(pair_auth_event));
-        this->client_->loop();
+        this->pump();
 
         ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
         JsonDocument auth_doc;
@@ -815,7 +857,7 @@ protected:
         pair_confirm_event.kind = PairingMessageKind::PAIR_CONFIRM;
         pair_confirm_event.server_kc = server_kc;
         this->schedule_pairing_message_event(std::move(pair_confirm_event));
-        this->client_->loop();
+        this->pump();
     }
 
     /// Read ConnectionManager::pairing_rounds_since_verified_kc_, the count the dynamic-code
@@ -839,7 +881,7 @@ protected:
         event.conn = this->current_connection_sp();
         event.kind = PairingMessageKind::PAIR_INIT;
         this->schedule_pairing_message_event(std::move(event));
-        this->client_->loop();
+        this->pump();
     }
 
     /// Run one whole round that the "server" fails deliberately: it starts CPace over the code
@@ -858,7 +900,7 @@ protected:
         pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
         pair_auth_event.pake_msg_1 = server.initiator.public_share();
         this->schedule_pairing_message_event(std::move(pair_auth_event));
-        this->client_->loop();
+        this->pump();
         ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
 
         std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
@@ -874,7 +916,7 @@ protected:
     void drive_failed_static_attempt(FakeConnection* conn, const std::string& code,
                                      uint32_t pairing_index) {
         this->enter_pairing(conn);
-        this->client_->loop();
+        this->pump();
         ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 
         ServerStandIn server;
@@ -887,7 +929,7 @@ protected:
         pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
         pair_auth_event.pake_msg_1 = server.initiator.public_share();
         this->schedule_pairing_message_event(std::move(pair_auth_event));
-        this->client_->loop();
+        this->pump();
         ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
 
         std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
@@ -1111,7 +1153,7 @@ TEST_F(PairingStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyWithdrawnC
     abort_event.conn = this->current_connection_sp();
     abort_event.reason = PairAbortReason::USER_CANCELLED;
     this->schedule_abort(std::move(abort_event));
-    this->client_->loop();
+    this->pump();
 
     // The attempt now fails, but on_clear_pairing_code must NOT fire a second time:
     // code_emitted was already reset to false at PAIR_CONFIRM.
@@ -1255,7 +1297,7 @@ TEST_F(PairingStateMachineTest, StandingRoundLimitHoldsTheNextAttemptForAGesture
     this->set_rounds_since_verified_kc(20);
     conn->sent_text_.clear();
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     // pairing.md "Rounds": while the limit holds an attempt back the client says so with
     // client/pair-pending, and starts nothing until the gesture admits it.
@@ -1264,7 +1306,7 @@ TEST_F(PairingStateMachineTest, StandingRoundLimitHoldsTheNextAttemptForAGesture
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
 
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(this->rounds_since_verified_kc(), 0u)
         << "the gesture clears the standing limit before what it admits can run";
@@ -1303,39 +1345,36 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     // Complete the hello preconditions is_operational() also requires. A real connection would
     // already have these true long before any server/activate (this one included); the fixture's
     // inject/enter-pairing helpers never touch them, so they are set explicitly here purely to
-    // exercise SendspinClient::loop()'s time-burst gate, which is otherwise unreachable through
-    // this harness.
+    // exercise the time-burst gate in ConnectionManager::run_time_sync(), which is otherwise
+    // unreachable through this harness.
     conn->set_client_hello_sent(true);
     conn->set_server_hello_received(true);
     ASSERT_TRUE(conn->is_operational());
 
     // A fresh SendspinTimeBurst starts its first burst immediately (last_burst_complete_time_
     // defaults to 0, so the inter-burst wait is trivially satisfied), so any tick that reaches
-    // time_burst_->loop() sends. The connection still declares 'pairing', which must not stop it:
+    // the connection's time_burst().loop() sends. The connection still declares 'pairing', which must not stop it:
     // a player keeps its timeline across an attempt and can only do that with a converging filter.
     //
     // Without a Noise session the send itself fails, but send_time_message() records the frame in
     // flight before sending, so a nonzero tag shows the burst reached the send.
+    // A burst whose send fails retries after SendspinTimeBurst::SEND_RETRY_DELAY_MS, so each wait
+    // below pumps until the next attempt; the suite watchdog names a burst that never sends.
     ASSERT_EQ(conn->time_frame_tag_.load(), 0U);
-    for (int i = 0; i < 5; ++i) {
-        this->client_->loop();
-    }
-    EXPECT_NE(conn->time_frame_tag_.load(), 0U)
-        << "client/time must keep flowing while activities declare pairing";
+    this->pump_until_time_frame(conn);
 
     // Any change publishes.
     this->client_->set_available(false);
+    this->pump();
     EXPECT_TRUE(any_frame_of_type(conn->sent_text_, "client/state"))
         << "client/state must keep flowing while activities declare pairing";
 
     // The activate that leaves pairing changes nothing about any of this.
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
+    this->pump();
     ASSERT_FALSE(conn->has_activity(SendspinActivity::PAIRING));
     conn->time_frame_tag_.store(0);
-    this->client_->loop();
-    EXPECT_NE(conn->time_frame_tag_.load(), 0U)
-        << "client/time must keep flowing when the connection leaves pairing too";
+    this->pump_until_time_frame(conn);
 }
 
 // ============================================================================
@@ -1357,7 +1396,7 @@ TEST_F(PairingStateMachineTest, AttemptTimeoutAbortWaitsForThePostRekeyActivate)
     conn->pairing_session().attempt_deadline_us = platform_time_us() - 1;
 
     for (int i = 0; i < 5; ++i) {
-        this->client_->loop();
+        this->pump();
     }
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
         << "pair/abort must not be sent while the connection awaits a server/activate";
@@ -1368,7 +1407,7 @@ TEST_F(PairingStateMachineTest, AttemptTimeoutAbortWaitsForThePostRekeyActivate)
     // Control: the same expired deadline aborts on the next tick once the activation has landed,
     // so the hold is the window and not something that swallowed the timeout outright.
     this->set_awaiting_activate(conn, false);
-    this->client_->loop();
+    this->pump();
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "attempt_timeout");
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
 }
@@ -1381,12 +1420,12 @@ TEST_F(PairingStateMachineTest, DynamicCodeAttemptTimeout) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-3", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 
     // Force the attempt deadline into the past; the next loop() tick must detect and abort it.
     conn->pairing_session().attempt_deadline_us = platform_time_us() - 1;
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "attempt_timeout");
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
@@ -1402,16 +1441,16 @@ TEST_F(PairingStateMachineTest, PairingPskAttemptTimeout) {
     FakeConnection* conn =
         this->inject_current_connection("server-psk-timeout", SendspinPairMethod::PAIRING_PSK);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
 
     const int64_t deadline = conn->pairing_session().attempt_deadline_us;
     EXPECT_GT(deadline, platform_time_us()) << "pair-init must arm the attempt deadline";
-    this->client_->loop();
+    this->pump();
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 
     conn->pairing_session().attempt_deadline_us = platform_time_us() - 1;
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "attempt_timeout");
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
@@ -1434,9 +1473,9 @@ TEST_F(PairingStateMachineTest, StaticCodeAttemptClosesOnServerPairInit) {
     FakeConnection* conn = this->inject_current_connection("server-static-seq",
                                                            SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
     const size_t frames_before = conn->sent_text_.size();
 
@@ -1445,7 +1484,7 @@ TEST_F(PairingStateMachineTest, StaticCodeAttemptClosesOnServerPairInit) {
     pair_init_event.kind = PairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = std::array<uint8_t, 32>{};
     this->schedule_pairing_message_event(std::move(pair_init_event));
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
         << "a sequence violation sends no application-level message, pair/abort included";
@@ -1468,7 +1507,7 @@ TEST_F(PairingStateMachineTest, OutOfSequenceServerPairAuthClosesSilently) {
     pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
     pair_auth_event.pake_msg_1 = std::array<uint8_t, 32>{};
     this->schedule_pairing_message_event(std::move(pair_auth_event));
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
         << "a sequence violation sends no application-level message, pair/abort included";
@@ -1513,7 +1552,7 @@ TEST_F(PairingStateMachineTest, FirstRoundServerPairInitWithoutNonceClosesSilent
     pair_init_event.conn = this->current_connection_sp();
     pair_init_event.kind = PairingMessageKind::PAIR_INIT;
     this->schedule_pairing_message_event(std::move(pair_init_event));
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
         << "a protocol error sends no application-level message, pair/abort included";
@@ -1544,7 +1583,7 @@ TEST_F(PairingStateMachineTest, RetryRoundServerPairInitCarryingNonceClosesSilen
     pair_init_event.kind = PairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = display.nonce_a;
     this->schedule_pairing_message_event(std::move(pair_init_event));
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
         << "a protocol error sends no application-level message, pair/abort included";
@@ -1568,7 +1607,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSile
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-4", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 
     auto current_conn_sp = this->current_connection_sp();
@@ -1576,7 +1615,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSile
     malformed_event.conn = current_conn_sp;
     malformed_event.kind = PairingMessageKind::MALFORMED;
     this->schedule_pairing_message_event(std::move(malformed_event));
-    this->client_->loop();
+    this->pump();
 
     // No pair/abort, or any other application-level message, is sent.
     ASSERT_EQ(conn->sent_text_.size(), 1u);
@@ -1605,7 +1644,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameWithNoActiveSessionIsIg
     malformed_event.conn = current_conn_sp;
     malformed_event.kind = PairingMessageKind::MALFORMED;
     this->schedule_pairing_message_event(std::move(malformed_event));
-    this->client_->loop();
+    this->pump();
 
     EXPECT_TRUE(conn->sent_text_.empty());
     EXPECT_EQ(conn->disconnect_count_, 0);
@@ -1629,7 +1668,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeDeriveFailureOnPairAuthClosesSilently
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-7", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 
     std::array<uint8_t, 32> nonce_a{};
@@ -1644,7 +1683,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeDeriveFailureOnPairAuthClosesSilently
     pair_init_event.kind = PairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = nonce_a;
     this->schedule_pairing_message_event(std::move(pair_init_event));
-    this->client_->loop();
+    this->pump();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_CODE));
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_AUTH);
 
@@ -1656,7 +1695,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeDeriveFailureOnPairAuthClosesSilently
     pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
     pair_auth_event.pake_msg_1.fill(0);
     this->schedule_pairing_message_event(std::move(pair_auth_event));
-    this->client_->loop();
+    this->pump();
 
     // No pair/abort (or any other application-level message) beyond the earlier
     // client/pair-init and the client/pair-auth this handler itself sends before deriving.
@@ -1686,7 +1725,7 @@ TEST_F(PairingStateMachineTest, StaticPairingCodeAttemptIsGestureGated) {
         "server-static-gated", SendspinPairMethod::STATIC_PAIRING_CODE);
 
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
@@ -1700,7 +1739,7 @@ TEST_F(PairingStateMachineTest, StaticPairingCodeAttemptIsGestureGated) {
     EXPECT_EQ(root["payload"]["pairing_index"] | 0u, 1u);
 
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(conn->sent_text_.size(), 2u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
@@ -1713,14 +1752,14 @@ TEST_F(PairingStateMachineTest, StandingWindowAdmitsLaterGatedAttempt) {
 
     // Gesture first: no attempt is waiting, so the window stands open.
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     EXPECT_GT(this->window_deadline(), 0);
 
     // The gated (static pairing code) pairing activate arrives: pair-init goes out immediately.
     FakeConnection* conn =
         this->inject_current_connection("server-standing", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
@@ -1738,7 +1777,7 @@ TEST_F(PairingStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
     this->configure_static_pairing_code("13572468");
 
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_GT(this->window_deadline(), 0);
     // Simulate the 5-minute lifetime passing.
     this->set_window_deadline(platform_time_us() - 1);
@@ -1746,7 +1785,7 @@ TEST_F(PairingStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
     FakeConnection* conn =
         this->inject_current_connection("server-expired", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
@@ -1767,7 +1806,7 @@ TEST_F(PairingStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
 TEST_F(PairingStateMachineTest, PairingWindowRunsForFiveMinutes) {
     const int64_t before = platform_time_us();
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     const int64_t after = platform_time_us();
 
     const int64_t armed = this->window_deadline();
@@ -1784,7 +1823,7 @@ TEST_F(PairingStateMachineTest, PairingAttemptRunsForTwoMinutes) {
 
     const int64_t before = platform_time_us();
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     const int64_t after = platform_time_us();
 
     const int64_t deadline = conn->pairing_session().attempt_deadline_us;
@@ -1806,7 +1845,7 @@ TEST_F(PairingStateMachineTest, WindowSurvivesFailedAttemptsUntilTheFifth) {
     this->configure_static_pairing_code(code);
 
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_GT(this->window_deadline(), 0);
 
     FakeConnection* conn =
@@ -1826,7 +1865,7 @@ TEST_F(PairingStateMachineTest, WindowSurvivesFailedAttemptsUntilTheFifth) {
     // With the window closed, the next attempt is withheld for a fresh gesture again.
     conn->sent_text_.clear();
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
 }
@@ -1838,9 +1877,9 @@ TEST_F(PairingStateMachineTest, CompletedPairingClosesTheWindow) {
     FakeConnection* conn =
         this->inject_current_connection("server-window-done", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
     ASSERT_GT(this->window_deadline(), 0);
 
@@ -1866,9 +1905,9 @@ TEST_F(PairingStateMachineTest, WindowClosesWhenItsConnectionDrops) {
     FakeConnection* conn = this->inject_current_connection("server-window-drop",
                                                            SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(this->window_connection(), conn);
 
     this->drop_connection(conn, SendspinGoodbyeReason::RESTART);
@@ -1881,11 +1920,11 @@ TEST_F(PairingStateMachineTest, WindowAdmitsOnlyTheConnectionItIsBoundTo) {
     this->configure_static_pairing_code("13572468");
 
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     FakeConnection* bound = this->inject_current_connection("server-window-bound",
                                                             SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(bound);
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(bound->sent_text_), "client/pair-init");
     ASSERT_EQ(this->window_connection(), bound);
 
@@ -1896,7 +1935,7 @@ TEST_F(PairingStateMachineTest, WindowAdmitsOnlyTheConnectionItIsBoundTo) {
                                                             SendspinPairMethod::STATIC_PAIRING_CODE);
     ASSERT_NE(other, bound);
     this->enter_pairing(other);
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(last_frame_type(other->sent_text_), "client/pair-pending")
         << "a second server must not ride a gesture the operator made for another one";
@@ -1910,12 +1949,12 @@ TEST_F(PairingStateMachineTest, OperatorCancellationClosesTheWindowAndEndsTheWai
     FakeConnection* conn = this->inject_current_connection("server-window-cancel",
                                                            SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
 
     this->client_->cancel_pairing_window();
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(this->window_deadline(), 0);
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "user_cancelled");
@@ -1930,18 +1969,18 @@ TEST_F(PairingStateMachineTest, OperatorCancellationClosesAStandingWindow) {
     this->configure_static_pairing_code("13572468");
 
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_GT(this->window_deadline(), 0);
 
     this->client_->cancel_pairing_window();
-    this->client_->loop();
+    this->pump();
     EXPECT_EQ(this->window_deadline(), 0);
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 
     FakeConnection* conn = this->inject_current_connection("server-window-recancel",
                                                            SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
 }
 
@@ -1958,7 +1997,7 @@ TEST_F(PairingStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
     FakeConnection* conn = this->inject_current_connection(
         "server-static-nowindow", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
@@ -1970,7 +2009,7 @@ TEST_F(PairingStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
 
     // A window opened later still starts the waiting attempt.
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(conn->sent_text_.size(), 2u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
@@ -1985,7 +2024,7 @@ TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
     FakeConnection* conn =
         this->inject_current_connection("server-static-1", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     // Entering static pairing-code pairing (gesture-gated, no window open) sends
     // client/pair-pending
@@ -2002,7 +2041,7 @@ TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
     // Operator confirms the pairing-window gesture: this must send client/pair-init with no
     // commit_B, but WITH the required pairing_index (pairing.md "Pairing index").
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
 
     ASSERT_EQ(conn->sent_text_.size(), 2u);
     JsonDocument init_doc;
@@ -2086,14 +2125,14 @@ TEST_F(PairingStateMachineTest, SubsequentActivateEntersPairingForEitherCodeMeth
 
         // First activate: empty activities -> connection goes operational, no pairing.
         this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-        this->client_->loop();
+        this->pump();
         EXPECT_EQ(this->listener_.count(PairingEventKind::STARTED), started_before);
         EXPECT_TRUE(conn->sent_text_.empty());
 
         // Subsequent activate declaring [pairing] -> must enter pairing.
         this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{}, row.method,
                             row.format);
-        this->client_->loop();
+        this->pump();
 
         EXPECT_EQ(this->listener_.count(PairingEventKind::STARTED), started_before + 1)
             << "a subsequent pairing activate must start the attempt";
@@ -2108,7 +2147,7 @@ TEST_F(PairingStateMachineTest, SubsequentActivateEntersPairingForEitherCodeMeth
             // Confirming the window sends the empty client/pair-init, proving the gated flow is
             // live and not just prompting.
             this->client_->confirm_pairing_window();
-            this->client_->loop();
+            this->pump();
             ASSERT_EQ(conn->sent_text_.size(), 2u);
             EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
         }
@@ -2131,14 +2170,14 @@ TEST_F(PairingStateMachineTest, UnofferedFormatOnActivationIsRejected) {
     FakeConnection* conn = this->inject_provisional_current_connection("server-badformat");
 
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
+    this->pump();
     ASSERT_TRUE(conn->sent_text_.empty());
 
     // A format this device does not advertise.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                         SendspinPairingCodeFormat::QR_CODE);
-    this->client_->loop();
+    this->pump();
 
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::IDLE);
@@ -2149,7 +2188,7 @@ TEST_F(PairingStateMachineTest, UnofferedFormatOnActivationIsRejected) {
     // Missing entirely on a dynamic_pairing_code activation (a required field): also rejected.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE, std::nullopt);
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(conn->sent_text_.size(), 2u);
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
@@ -2158,7 +2197,7 @@ TEST_F(PairingStateMachineTest, UnofferedFormatOnActivationIsRejected) {
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                         SendspinPairingCodeFormat::DIGITS);
-    this->client_->loop();
+    this->pump();
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
     ASSERT_EQ(conn->sent_text_.size(), 3u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
@@ -2171,11 +2210,11 @@ TEST_F(PairingStateMachineTest, PairingActivateWithoutMethodIsAborted) {
     FakeConnection* conn = this->inject_provisional_current_connection("server-no-method");
 
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
+    this->pump();
     ASSERT_TRUE(conn->sent_text_.empty());
 
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
+    this->pump();
 
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::IDLE);
@@ -2197,12 +2236,12 @@ TEST_F(PairingStateMachineTest, UnofferedPairingMethodOnActivationIsRejected) {
     FakeConnection* conn = this->inject_provisional_current_connection("server-unoffered-method");
 
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
+    this->pump();
     ASSERT_TRUE(conn->sent_text_.empty());
 
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::STATIC_PAIRING_CODE);
-    this->client_->loop();
+    this->pump();
 
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::IDLE);
@@ -2215,41 +2254,10 @@ TEST_F(PairingStateMachineTest, UnofferedPairingMethodOnActivationIsRejected) {
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                         SendspinPairingCodeFormat::DIGITS);
-    this->client_->loop();
+    this->pump();
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
     ASSERT_EQ(conn->sent_text_.size(), 2u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
-}
-
-// The protocol task ORs a just-received activation's roles into the receive-gate mask before the
-// main loop judges the activation, so a refusal has to take them back: otherwise the gate keeps
-// admitting traffic for a role this client never activated.
-TEST_F(PairingStateMachineTest, RefusedActivateTakesBackTheRoleBitsItAdded) {
-    this->enable_unpaired_access();
-    FakeConnection* conn = this->inject_provisional_current_connection("server-role-takeback");
-
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
-    ASSERT_TRUE(conn->sent_text_.empty());
-    ASSERT_FALSE(conn->is_role_active(SendspinRole::PLAYER));
-
-    // Stand in for the parse step post_activate() skips: by the time the main loop sees the
-    // activation, its roles are already in the gate.
-    conn->note_activated_roles({"player@v1"});
-    ASSERT_TRUE(conn->is_role_active(SendspinRole::PLAYER));
-
-    // A pairing activate naming no method: refused, connection left open, never applied.
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{"player@v1"},
-                        std::nullopt);
-    this->client_->loop();
-
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
-    ASSERT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
-    EXPECT_EQ(conn->disconnect_count_, 0);
-    EXPECT_FALSE(conn->is_role_active(SendspinRole::PLAYER))
-        << "a refused activation must not leave the receive gate widened";
-    EXPECT_TRUE(conn->get_active_roles().empty())
-        << "the refused activation must not have been applied either";
 }
 
 // ============================================================================
@@ -2261,12 +2269,12 @@ TEST_F(PairingStateMachineTest, StaticCodeMismatchRecordsFailureAndAborts) {
     FakeConnection* conn =
         this->inject_current_connection("server-static-2", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
 
     const std::array<uint8_t, 32> handshake_hash = conn->pairing_session().handshake_hash;
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 
     // Server uses the CORRECT static pairing code so derive() succeeds, then lies about server_kc.
@@ -2279,7 +2287,7 @@ TEST_F(PairingStateMachineTest, StaticCodeMismatchRecordsFailureAndAborts) {
     pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
     pair_auth_event.pake_msg_1 = server.initiator.public_share();
     this->schedule_pairing_message_event(std::move(pair_auth_event));
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
 
     std::array<uint8_t, 64> bogus_server_kc{};
@@ -2289,7 +2297,7 @@ TEST_F(PairingStateMachineTest, StaticCodeMismatchRecordsFailureAndAborts) {
     pair_confirm_event.kind = PairingMessageKind::PAIR_CONFIRM;
     pair_confirm_event.server_kc = bogus_server_kc;
     this->schedule_pairing_message_event(std::move(pair_confirm_event));
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pairing_code_mismatch");
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
@@ -2316,7 +2324,7 @@ TEST_F(PairingStateMachineTest, GestureWaitHasNoClientTimeout) {
     FakeConnection* conn =
         this->inject_current_connection("server-static-3", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
     ASSERT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
@@ -2324,17 +2332,17 @@ TEST_F(PairingStateMachineTest, GestureWaitHasNoClientTimeout) {
         << "client/pair-pending must not arm the attempt timeout";
 
     // Further loop() ticks must not abort the waiting session.
-    this->client_->loop();
-    this->client_->loop();
+    this->pump();
+    this->pump();
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 
     // Once the gesture starts the attempt, the timeout IS armed and enforceable.
     this->client_->confirm_pairing_window();
-    this->client_->loop();
+    this->pump();
     ASSERT_GT(conn->pairing_session().attempt_deadline_us, 0);
     conn->pairing_session().attempt_deadline_us = platform_time_us() - 1;
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "attempt_timeout");
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
@@ -2353,7 +2361,7 @@ TEST_F(PairingStateMachineTest, ConnectionLossDuringStaticPairingWindowClosesWin
     FakeConnection* conn =
         this->inject_current_connection("server-static-5", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
     ASSERT_FALSE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
@@ -2361,7 +2369,7 @@ TEST_F(PairingStateMachineTest, ConnectionLossDuringStaticPairingWindowClosesWin
 
     // Simulate the transport dying mid-window (before the operator ever confirms).
     this->simulate_connection_lost(conn);
-    this->client_->loop();
+    this->pump();
 
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW))
         << "on_connection_lost must dismiss a stranded pairing-window prompt";
@@ -2380,7 +2388,7 @@ TEST_F(PairingStateMachineTest, ConnectionLossWhileEmittingCodeWithdrawsIt) {
 
     // Connection dies while the code is still being emitted.
     this->simulate_connection_lost(conn);
-    this->client_->loop();
+    this->pump();
 
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_CODE))
         << "on_connection_lost must dismiss a stranded emitted code";
@@ -2408,7 +2416,7 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     abort_event.conn = this->current_connection_sp();
     abort_event.reason = PairAbortReason::USER_CANCELLED;
     this->schedule_abort(std::move(abort_event));
-    this->client_->loop();
+    this->pump();
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED))
         << "on_pairing_failed must survive cleanup_connection_state()";
@@ -2427,7 +2435,7 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupSta
     FakeConnection* conn =
         this->inject_current_connection("server-static-6", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
 
     auto current_conn_sp = this->current_connection_sp();
@@ -2435,7 +2443,7 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupSta
     abort_event.conn = current_conn_sp;
     abort_event.reason = PairAbortReason::USER_CANCELLED;
     this->schedule_abort(std::move(abort_event));
-    this->client_->loop();
+    this->pump();
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
@@ -2458,7 +2466,7 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
     FakeConnection* conn =
         this->inject_current_connection("server-leftover", SendspinPairMethod::STATIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
 
     // Simulate the state after client/pair-finalize: a pending pairing record awaiting the ack.
@@ -2469,7 +2477,7 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
 
     // The server leaves pairing without finalizing: activate instead of pair-finalize.
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
+    this->pump();
 
     // Going operational must have discarded the pending record and reset the pairing session.
     // (is_operational() also requires is_handshake_complete(), which FakeConnection never sets,
@@ -2511,7 +2519,7 @@ TEST_F(PairingStateMachineTest, PairingIndexIncrementsAcrossRepeatedPairingActiv
     // An empty activate first, so the pairing activates that follow are subsequent ones on an
     // already-operational connection (the path a repeat actually takes).
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
+    this->pump();
     ASSERT_TRUE(conn->sent_text_.empty());
     EXPECT_EQ(conn->get_pairing_index(), 0u) << "a non-pairing activate must not count";
 
@@ -2519,7 +2527,7 @@ TEST_F(PairingStateMachineTest, PairingIndexIncrementsAcrossRepeatedPairingActiv
         this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                             SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                             SendspinPairingCodeFormat::DIGITS);
-        this->client_->loop();
+        this->pump();
 
         EXPECT_EQ(conn->get_pairing_index(), expected);
         EXPECT_EQ(conn->pairing_session().pairing_index, expected)
@@ -2551,7 +2559,7 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     // take the same real arbitration path SubsequentActivateEntersStaticCodePairing exercises,
     // rather than the nursery-promotion path (which this lightweight harness does not model).
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
+    this->pump();
     EXPECT_TRUE(conn->sent_text_.empty());
 
     // Second activate: [pairing] + pairing_psk, but this connection resolved via the Sentinel PSK
@@ -2560,7 +2568,7 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     // reaching handle_enter_pairing(). The counter must still have advanced to 1.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::PAIRING_PSK);
-    this->client_->loop();
+    this->pump();
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
     EXPECT_EQ(conn->disconnect_count_, 0) << "method_not_supported must not close the connection";
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED))
@@ -2575,7 +2583,7 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                         SendspinPairingCodeFormat::DIGITS);
-    this->client_->loop();
+    this->pump();
 
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED))
         << "the second, admissible pairing activate must proceed";
@@ -2604,14 +2612,14 @@ TEST_F(PairingStateMachineTest, PairAbortConcurrentAttemptStillClosesConnection)
     FakeConnection* conn = this->inject_current_connection("server-dyn-concurrent",
                                                             SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     auto current_conn_sp = this->current_connection_sp();
     PairAbortEvent abort_event;
     abort_event.conn = current_conn_sp;
     abort_event.reason = PairAbortReason::CONCURRENT_ATTEMPT;
     this->schedule_abort(std::move(abort_event));
-    this->client_->loop();
+    this->pump();
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::CONCURRENT_ATTEMPT);
@@ -2625,11 +2633,11 @@ TEST_F(PairingStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-stale", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
 
     // The client locally aborts first (attempt timeout).
     conn->pairing_session().attempt_deadline_us = platform_time_us() - 1;
-    this->client_->loop();
+    this->pump();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::ATTEMPT_TIMEOUT);
     const size_t events_before = this->listener_.events_.size();
@@ -2641,7 +2649,7 @@ TEST_F(PairingStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
     stale_event.conn = current_conn_sp;
     stale_event.reason = PairAbortReason::PAIRING_CODE_MISMATCH;
     this->schedule_abort(std::move(stale_event));
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(this->listener_.events_.size(), events_before)
         << "a stale pair/abort must not fire any new listener event";
@@ -2672,7 +2680,7 @@ TEST_F(PairingStateMachineTest, ReproveWatchdogDropsConnectionAfterFinalizeAckGo
 
     // The server then goes silent forever instead of re-handshaking.
     conn->set_provisional_time_us(platform_time_us() - REPROVE_TIMEOUT_US - 1);
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(this->current_connection(), nullptr)
         << "a connection that never re-proves itself after a pair-finalize ack must eventually "
@@ -2705,14 +2713,14 @@ TEST_F(PairingStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingOper
     // attempt waits for a human to press a button. AWAIT_PAIRING_WINDOW leaves attempt_deadline_us
     // at 0 (see handle_enter_pairing): the wait has no fixed deadline of its own.
     this->enter_pairing(conn);
-    this->client_->loop();
+    this->pump();
     ASSERT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
     ASSERT_TRUE(conn->is_operational())
         << "entering pairing must not itself clear first_activate_received_";
 
     // A long time passes, far beyond REPROVE_TIMEOUT_US, while the human has not yet acted.
     conn->set_provisional_time_us(platform_time_us() - REPROVE_TIMEOUT_US - 1);
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(this->current_connection(), conn)
         << "a connection legitimately awaiting a human pairing gesture must not be reaped by the "
@@ -2752,7 +2760,7 @@ TEST_F(PairingStateMachineTest, PairingAttemptTimeoutScanSuppressedDuringFinaliz
 
     // The rekey takes long enough that the original attempt deadline elapses.
     conn->pairing_session().attempt_deadline_us = platform_time_us() - 1;
-    this->client_->loop();
+    this->pump();
 
     EXPECT_EQ(this->current_connection(), conn)
         << "a pairing that already finalized must not be dropped by the pairing attempt-timeout scan";

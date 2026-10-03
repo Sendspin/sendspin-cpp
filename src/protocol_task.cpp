@@ -35,6 +35,7 @@ ProtocolTask::ProtocolTask(size_t server_max_connections)
 
 ProtocolTask::~ProtocolTask() {
     this->stop();
+    this->drop_commands();
 }
 
 bool ProtocolTask::start(Tick tick, size_t stack_size, unsigned priority, bool stack_in_psram) {
@@ -63,17 +64,32 @@ void ProtocolTask::stop() {
     this->event_flags_.set(COMMAND_STOP);
     this->thread_.join();
 
-    // Joined, so this thread is the only consumer. Drop what the final tick left (or what was
-    // pushed while it ran) one command at a time through one reused local: each may hold a
-    // connection or a lease whose release must not run under the queue lock.
-    ProtocolCommand command;
-    while (this->take_command(command)) {}
-    clear_command(command);
+    // Joined. A snapshot the final tick did not take describes a run that is over. Commands
+    // stay queued for the joining thread (take_command() / drop_commands()): an accept pushed
+    // after the final tick carries a connection its transport may still be delivering to.
     std::optional<ClientStateMessage> dropped;
     {
         std::lock_guard<std::mutex> lock(this->command_mutex_);
         dropped.swap(this->latest_state_);
     }
+}
+
+void ProtocolTask::drop_commands() {
+    // One command at a time through one reused local: each may hold a connection or a lease
+    // whose release must not run under the queue lock.
+    ProtocolCommand command;
+    while (this->take_command(command)) {}
+    clear_command(command);
+}
+
+void ProtocolTask::close_accepts() {
+    std::lock_guard<std::mutex> lock(this->command_mutex_);
+    this->accepts_closed_ = true;
+}
+
+void ProtocolTask::open_accepts() {
+    std::lock_guard<std::mutex> lock(this->command_mutex_);
+    this->accepts_closed_ = false;
 }
 
 void ProtocolTask::thread_entry(ProtocolTask* self) {
@@ -106,11 +122,14 @@ bool ProtocolTask::push_command(ProtocolCommand&& command) {
     const ProtocolCommandType type = command.type;
     const bool is_accept = type == ProtocolCommandType::ACCEPT_CONNECTION;
     bool queued = false;
+    bool accepts_closed = false;
     {
         std::lock_guard<std::mutex> lock(this->command_mutex_);
+        accepts_closed = is_accept && this->accepts_closed_;
         const size_t others_queued = this->command_count_ - this->accepts_queued_;
-        const bool has_room = is_accept ? this->accepts_queued_ < this->accept_slots_
-                                        : others_queued < CONSUMER_COMMAND_BURST;
+        const bool has_room =
+            is_accept ? !this->accepts_closed_ && this->accepts_queued_ < this->accept_slots_
+                      : others_queued < CONSUMER_COMMAND_BURST;
         if (has_room) {
             // The slot is empty (moved-from or default), so this move frees nothing.
             this->commands_[(this->command_head_ + this->command_count_) % this->capacity_] =
@@ -123,7 +142,9 @@ bool ProtocolTask::push_command(ProtocolCommand&& command) {
         }
     }
     if (!queued) {
-        if (is_accept) {
+        if (accepts_closed) {
+            SS_LOGD(TAG, "Stopping; refusing a delivered connection");
+        } else if (is_accept) {
             SS_LOGE(TAG, "All %zu accept slots are taken; refusing a delivered connection",
                     this->accept_slots_);
         } else {

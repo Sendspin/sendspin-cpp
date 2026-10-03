@@ -53,25 +53,36 @@ struct PendingUpgrade {
  * Manages the ESP-IDF httpd that listens for incoming WebSocket connections. The authoritative
  * owner of each accepted SendspinServerConnection is the httpd session: open_callback() pins a
  * shared_ptr via httpd_sess_set_ctx with a free_fn deleter, and the handlers look it back up
- * with httpd_sess_get_ctx. ConnectionManager holds the same shared_ptr as a secondary observer.
+ * with httpd_sess_get_ctx. The protocol task holds the same shared_ptr as a secondary observer.
  *
  * Delivery contract: a connection reaches the NewConnectionCallback only once its WebSocket
  * upgrade has been observed in the HTTP_GET branch of websocket_handler, so the rest of the
  * library never sees a socket that might not speak WebSocket; until then it waits in the pending
  * table. IDF >= 5.5.5 / 6.0.1 reaches that branch through ws_post_handshake_cb instead of native
  * GET dispatch; the component's Kconfig selects CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
- * wherever it exists. tick() reaps sessions still undelivered after WS_UPGRADE_TIMEOUT_US, since
- * httpd has no handshake timeout of its own and max_open_sockets is small.
+ * wherever it exists. tick(), on the protocol task, reaps sessions still undelivered after
+ * WS_UPGRADE_TIMEOUT_US, since httpd has no handshake timeout of its own and max_open_sockets is
+ * small; a new pending session wakes the task (set_wake_callback()) so the deadline tick()
+ * reports covers it.
  */
 class SendspinWsServer {
 public:
     SendspinWsServer() = default;
     ~SendspinWsServer();
 
-    /// @brief Callback type for notifying the client of new connections
+    /// @brief Callback type for notifying the client of new connections, on the httpd task
+    ///
     /// The client receives a shared_ptr; the connection is also pinned to the httpd session via
     /// httpd_sess_set_ctx, which acts as the authoritative owner for the connection's lifetime.
-    using NewConnectionCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
+    /// Returns false when the client refused the connection: the server then closes the session,
+    /// and the session keeps owning the connection until its close path frees it, so a refusal
+    /// never destroys the connection inside the callback.
+    using NewConnectionCallback =
+        std::function<bool(const std::shared_ptr<SendspinServerConnection>&)>;
+
+    /// @brief Callback that wakes the protocol task, run on the httpd task when a session starts
+    /// waiting for its upgrade
+    using WakeCallback = std::function<void()>;
 
     /// @brief Starts the HTTP server and begins listening for WebSocket connections
     /// @param client Pointer to the SendspinClient (used for context in callbacks).
@@ -87,9 +98,11 @@ public:
     void stop();
 
     /// @brief Closes sessions still undelivered after WS_UPGRADE_TIMEOUT_US (raw TCP probes that
-    /// never speak WebSocket; httpd has no handshake timeout of its own). Called from the
-    /// ConnectionManager loop.
-    void tick();
+    /// never speak WebSocket; httpd has no handshake timeout of its own). Protocol task, from
+    /// ConnectionManager::tick().
+    /// @return Milliseconds until the oldest pending session's deadline, or UINT32_MAX when none
+    ///         is pending.
+    uint32_t tick();
 
     /// @brief Configures the maximum number of simultaneous connections
     /// The default supports handoff plus graceful rejection: one established connection, the
@@ -114,6 +127,12 @@ public:
     /// @brief Sets the callback to invoke when a new connection is accepted
     void set_new_connection_callback(NewConnectionCallback&& callback) {
         this->new_connection_callback_ = std::move(callback);
+    }
+
+    /// @brief Sets the callback run when a session starts waiting for its upgrade, so the
+    /// protocol task's next tick() covers its deadline
+    void set_wake_callback(WakeCallback&& callback) {
+        this->wake_callback_ = std::move(callback);
     }
 
     /// @brief Whether the server is currently running
@@ -156,14 +175,16 @@ protected:
 
     // Struct fields
 
-    /// @brief Guards pending_. Held only for table mutation/scan; delivery and closing happen
-    /// outside it (the new-connection callback takes the manager's locks).
+    /// @brief Guards pending_, between the httpd task and the protocol task's tick(). A leaf: held
+    /// only for table mutation/scan; delivery and closing happen outside it.
     std::mutex pending_mutex_;
 
     /// @brief Accepted sessions whose WebSocket upgrade has not yet been observed
     std::vector<PendingUpgrade> pending_;
 
     NewConnectionCallback new_connection_callback_;
+
+    WakeCallback wake_callback_;
 
     /// @brief Blocks for every accepted connection's queued sends. A member so it outlives each
     /// queued send (the destructor stops the server first); it adds

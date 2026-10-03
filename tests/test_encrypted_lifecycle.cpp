@@ -554,7 +554,6 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     // Initial handshake uses the accepted Pairing PSK directly (matching PskCategory::PAIRING),
     // not the Sentinel PSK: the Pairing PSK Flow's initial handshake IS the Pairing PSK (the
@@ -690,7 +689,6 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     // The FIRST server/activate (default options) is a normal playback activate that brings the
     // connection operational exactly like InBandRehandshakeResumesOperational. The SECOND (sent
@@ -795,7 +793,6 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
@@ -855,7 +852,6 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
     SendspinClient client(config);
     client.set_network_provider(&network);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     // A bare WebSocket peer: it completes the upgrade and then says nothing the protocol expects.
     std::atomic<bool> opened{false};
@@ -1134,7 +1130,6 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
@@ -1212,7 +1207,6 @@ TEST(EncryptedLifecycle, AnActivateThatReselectsPairingStartsTheNewAttempt) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
@@ -1479,7 +1473,6 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
@@ -1558,7 +1551,6 @@ TEST(EncryptedLifecycle, ActivateThatLosesPlaybackCapabilityRemovesTheRoles) {
     client.set_persistence_provider(&persistence);
     client.add_metadata().set_listener(&metadata_listener);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServerOptions options;
     options.first_roles_json = R"(["metadata@v1"])";
@@ -1611,7 +1603,6 @@ TEST(EncryptedLifecycle, CombinedActivateAfterARehandshakeGoesOperationalAndEnte
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServerOptions options;
     options.second_activities_json = R"(["playback","pairing"])";
@@ -1668,7 +1659,6 @@ TEST(EncryptedLifecycle, PairingActivateAfterARehandshakeThatAddsARoleSendsItsCl
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServerOptions options;
     // No player: an active player's state also waits for clock sync.
@@ -1697,6 +1687,39 @@ TEST(EncryptedLifecycle, PairingActivateAfterARehandshakeThatAddsARoleSendsItsCl
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+/// Frees the manager's admitted slot, the way a drop does, without the teardown. Protocol-task
+/// work: the caller plays the task, or the client is not started.
+void release_admitted(ConnectionManager& manager) {
+    for (auto& entry : manager.admitted_) {
+        if (entry.conn != nullptr) {
+            entry.conn->set_admitted(false);
+        }
+        entry = AdmittedEntry{};
+    }
+    manager.refresh_published_state();
+}
+
+/// The primary admitted connection, or nullptr. Protocol-task work, like release_admitted().
+SendspinConnection* admitted_connection(SendspinClient& client) {
+    AdmittedEntry* primary = client.connection_manager_->primary();
+    return primary != nullptr ? primary->conn.get() : nullptr;
+}
+
+/// One protocol tick on the test thread, then the main loop's drain, for a test that plays the
+/// protocol task.
+void tick(SendspinClient& client) {
+    (void) client.protocol_tick();
+    client.loop();
+}
+
+/// Ticks until pred() holds. Unbounded, like pump_until().
+void tick_until(SendspinClient& client, const std::function<bool()>& pred) {
+    while (!pred()) {
+        tick(client);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 // scan_reprove_watchdog() is the only guard against a server that rekeys an admitted connection
@@ -1728,9 +1751,11 @@ TEST(EncryptedLifecycle, RehandshakeWithoutAnActivateIsDroppedByTheReproveWatchd
     ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
     pump_until(client, [&] { return !client.is_connected(); });
 
+    // The test thread plays the protocol task from here: the stamp is the task's state.
+    client.protocol_task_->stop();
     // The state the watchdog keys on, as handle_noise_rehandshake() left it: the hello flags
     // carried over the swap, only the activation rewound, and the stamp was refreshed.
-    auto* conn = client.connection_manager_->current();
+    auto* conn = admitted_connection(client);
     ASSERT_NE(conn, nullptr);
     EXPECT_TRUE(conn->is_handshake_complete()) << "neither hello is re-sent, so both flags stand";
     EXPECT_FALSE(conn->is_operational());
@@ -1738,12 +1763,12 @@ TEST(EncryptedLifecycle, RehandshakeWithoutAnActivateIsDroppedByTheReproveWatchd
         << "the re-handshake must restamp the re-proving deadline";
 
     // Control: a connection still inside the deadline is held, not reaped.
-    pump_for(client, 100);
-    EXPECT_NE(client.connection_manager_->current(), nullptr)
+    tick(client);
+    EXPECT_NE(admitted_connection(client), nullptr)
         << "a connection still inside REPROVE_TIMEOUT must be given time to be activated";
 
     conn->set_provisional_time_us(platform_time_us() - REPROVE_TIMEOUT_US - 1);
-    pump_until(client, [&] { return client.connection_manager_->current() == nullptr; });
+    tick_until(client, [&] { return admitted_connection(client) == nullptr; });
 
     // connection.md "Re-handshake" allows no application message between Noise message 1 and the
     // new activation, so the close carries no client/goodbye. Waiting for the socket to close
@@ -1754,13 +1779,12 @@ TEST(EncryptedLifecycle, RehandshakeWithoutAnActivateIsDroppedByTheReproveWatchd
 }
 
 // ============================================================================
-// Pre-admission hold harness
+// Direct-dispatch harness
 // ============================================================================
 
-// A SendspinConnection that exists only to carry the admission flags and the held-message queue:
-// nothing is sent, and no transport is ever attached. It lets a test open the window between a
-// server/activate reaching the dispatch path and the main loop admitting the connection, which
-// over a real socket is whatever the thread scheduler makes it.
+// A SendspinConnection that exists only to carry the connection's protocol state: nothing is sent,
+// and no transport is ever attached. It lets a test hand messages straight to the dispatch path
+// on the test thread, which plays the protocol task.
 class HoldTestConnection : public SendspinConnection {
 public:
     /// Applies the activation a real connection would have received before any role traffic
@@ -1776,7 +1800,6 @@ public:
     }
 
     void start() override {}
-    void loop() override {}
     void disconnect(SendspinGoodbyeReason /*reason*/, std::function<void()> on_complete) override {
         if (on_complete) {
             on_complete();
@@ -1833,8 +1856,8 @@ public:
 
     void deliver(SendspinConnection& conn, const std::string& json) {
         // A complete message off a transport proves the peer alive (end_inbound_message()),
-        // and loop()'s liveness tick reaps a current connection whose last arrival is older than
-        // the timeout. Handing the JSON straight to the dispatch entry point skips the stamp, so
+        // and the protocol tick's liveness scan reaps an admitted connection whose last arrival
+        // is older than the timeout. Handing the JSON straight to the dispatch entry point skips the stamp, so
         // do it here rather than stubbing the tick out.
         conn.last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                          std::memory_order_relaxed);
@@ -1849,10 +1872,14 @@ public:
         return *this->connections.back();
     }
 
-    /// Admits `conn` the way a promotion does: installed as the current connection, then admitted
-    /// by the manager's admission flush. What it held is replayed by the production wiring only:
-    /// the next protocol tick (pump()) or the connection's next message.
+    /// Admits `conn` the way a promotion does, owning the roles its activation made active.
     void admit(HoldTestConnection& conn) {
+        this->admit_owning(conn, conn.get_active_role_mask());
+    }
+
+    /// Admits `conn` owning `owned_roles` (role_mask_bit() bits), as arbitration leaves a
+    /// connection that shares the admitted array with another owner.
+    void admit_owning(HoldTestConnection& conn, uint16_t owned_roles) {
         std::shared_ptr<HoldTestConnection> owned;
         for (const auto& candidate : this->connections) {
             if (candidate.get() == &conn) {
@@ -1861,11 +1888,7 @@ public:
         }
         ASSERT_NE(owned, nullptr) << "admit() takes a connection from connection()";
         ConnectionManager& manager = *this->client_storage->connection_manager_;
-        {
-            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-            manager.set_current_connection(owned);
-        }
-        manager.flush_pending_admission();
+        manager.install_admitted(owned, owned_roles);
     }
 
     /// One protocol tick on the test thread, then the main loop.
@@ -1943,8 +1966,8 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
 // messaging.md "server/time" answers the client's own client/time, yet any peer that knows the
 // Sentinel PSK can sit in the nursery and send it unasked. Twice the event ring's capacity of such
 // replies between two loop() ticks must not crowd the admitted server's next stream/start off the
-// ring: server/time traffic stays off the lifecycle ring (docs/conventions.md "Threading and
-// cross-thread state").
+// ring: server/time traffic stays on the protocol task, in each connection's own burst, and off
+// the lifecycle ring (docs/conventions.md "Threading and cross-thread state").
 //
 // Control: the same handler takes the reply to a frame in flight, seeded the way
 // send_time_message() records one, since the stand-in has no transport to send it over.
@@ -1962,8 +1985,10 @@ TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
     // The test thread plays the protocol task, as in HoldTestClient.
     client.protocol_task_->stop();
 
-    HoldTestConnection admitted;
-    client.admit_connection(&admitted);
+    auto admitted_owner = std::make_shared<HoldTestConnection>();
+    HoldTestConnection& admitted = *admitted_owner;
+    client.connection_manager_->install_admitted(admitted_owner,
+                                                 admitted_owner->get_active_role_mask());
     HoldTestConnection unsolicited;
 
     auto deliver = [&client](SendspinConnection& conn, const std::string& json) {
@@ -2255,10 +2280,9 @@ TEST(EncryptedLifecycle, RoleTrafficFromAnAdmittedConnectionIsApplied) {
     EXPECT_EQ(bundle.listener.last_title, "Admitted");
 }
 
-// A connection that never sends a server/activate is not a peer whose role traffic is worth
-// keeping: the message above stays dropped even once that connection reaches the admitted slot.
-// This is the boundary of the hold in the test below.
-TEST(EncryptedLifecycle, RoleTrafficBeforeAnyActivateIsNotReplayedAtAdmission) {
+// Role traffic from a connection that is not admitted is dropped, not kept: it stays dropped even
+// once that connection reaches the admitted slot.
+TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsNotAppliedAtAdmission) {
     HoldTestClient bundle("Pre-Activate Role Traffic Test Client");
 
     HoldTestConnection& conn = bundle.connection();
@@ -2269,218 +2293,20 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAnyActivateIsNotReplayedAtAdmission) {
     bundle.admit(conn);
     bundle.pump();
     EXPECT_EQ(bundle.listener.updates, 0)
-        << "role traffic that preceded every server/activate must not be replayed (last_title='"
+        << "role traffic that preceded the admission must not be applied (last_title='"
         << bundle.listener.last_title << "')";
 }
 
-// A server starts sending role traffic as soon as it has sent its server/activate, while the
-// client decides admission on its next loop() tick. The traffic in that window is held and
-// replayed at admission: a one-shot server/state (an artwork channel set, a colour palette) is
-// never repeated, so dropping it loses that state for the whole session.
-//
-// Driven through the dispatch entry point rather than over a socket, so the test opens and closes
-// the unadmitted window itself instead of racing the scheduler for it.
-TEST(EncryptedLifecycle, RoleTrafficBetweenActivateAndAdmissionIsReplayed) {
-    HoldTestClient bundle("Post-Activate Role Traffic Test Client");
+// Control: every role message type runs its real handler to completion on an admitted
+// connection. One message of each type, back to back, so a handler that throws the dispatch off
+// (or blocks in it) takes the metadata message behind it down with it. The group name and the
+// metadata title are what say the handlers ran rather than being walked past: a type whose arm
+// does nothing is invisible to the trailing message alone.
+TEST(EncryptedLifecycle, EveryRoleMessageTypeRunsThroughItsHandler) {
+    HoldTestClient bundle("Role Handler Test Client");
 
     HoldTestConnection& conn = bundle.connection();
-    // What the protocol task does when it hands a server/activate to the main loop.
-    conn.note_activate_delivered();
-
-    bundle.deliver(conn, metadata_state_json(1, "Held Through Admission"));
-    bundle.pump();
-    ASSERT_EQ(bundle.listener.updates, 0)
-        << "an unadmitted connection must not drive the roles, held or not";
-
     bundle.admit(conn);
-    bundle.pump();
-    EXPECT_EQ(bundle.listener.updates, 1)
-        << "the role message held across admission was never applied";
-    EXPECT_EQ(bundle.listener.last_title, "Held Through Admission");
-}
-
-// Several held messages replay in arrival order, so the last state the server sent in the window
-// is the one that stands. They land in the metadata role's collapsing slot, which merges them
-// into the single update the listener sees, exactly as it would for live traffic arriving between
-// two loop() ticks.
-TEST(EncryptedLifecycle, HeldRoleTrafficIsReplayedInArrivalOrder) {
-    HoldTestClient bundle("Held Order Test Client");
-
-    HoldTestConnection& conn = bundle.connection();
-    conn.note_activate_delivered();
-    bundle.deliver(conn, metadata_state_json(1, "First"));
-    bundle.deliver(conn, metadata_state_json(2, "Second"));
-
-    bundle.admit(conn);
-    bundle.pump();
-    EXPECT_EQ(bundle.listener.updates, 1);
-    EXPECT_EQ(bundle.listener.last_title, "Second")
-        << "the held messages were replayed out of order";
-}
-
-// Admission flips a flag on the main loop; the held messages are replayed by the protocol task,
-// from three places: its next tick, and ahead of the connection's next JSON or binary message,
-// each deciding the replay from the same read of the flag as its admission gate. Each row admits
-// the connection and then takes exactly one of those paths, so a missing replay leaves the held
-// group/update unapplied, and a replay that runs after the live message leaves the held title
-// standing over the live one. The tick row admits through the manager, as a promotion does; the
-// message rows admit a connection the manager does not hold, so only the message can replay it.
-TEST(EncryptedLifecycle, HeldRoleTrafficReplaysBeforeTheNextMessageOrOnTheNextTick) {
-    enum class Path { NONE, TICK, JSON, BINARY };
-    struct Row {
-        const char* name;
-        Path path;
-        const char* expected_group;
-        const char* expected_title;
-    };
-    const Row rows[] = {
-        {"Control: not admitted, nothing replays", Path::NONE, "", ""},
-        {"the next protocol tick", Path::TICK, "Kitchen", "Held"},
-        {"the connection's next JSON message", Path::JSON, "Kitchen", "Live"},
-        {"the connection's next binary message", Path::BINARY, "Kitchen", "Held"},
-    };
-
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        HoldTestClient bundle("Replay Wiring Test Client");
-        HoldTestConnection& conn = bundle.connection();
-        conn.note_activate_delivered();
-        bundle.deliver(conn, R"({"type":"group/update","payload":{"group_name":"Kitchen"}})");
-        bundle.deliver(conn, metadata_state_json(1, "Held"));
-
-        switch (row.path) {
-            case Path::NONE:
-                break;
-            case Path::TICK:
-                bundle.admit(conn);
-                break;
-            case Path::JSON:
-                bundle.client_ref().admit_connection(&conn);
-                bundle.deliver(conn, metadata_state_json(2, "Live"));
-                break;
-            case Path::BINARY: {
-                bundle.client_ref().admit_connection(&conn);
-                std::vector<uint8_t> chunk(17, 0x00);
-                chunk[0] = SENDSPIN_BINARY_PLAYER_AUDIO;
-                InboundMessage message;
-                message.data = chunk.data();
-                message.len = chunk.size();
-                bundle.client_ref().process_binary_message(&conn, message);
-                break;
-            }
-        }
-        bundle.pump();
-
-        EXPECT_EQ(bundle.client_ref().get_group_state().group_name.value_or(""),
-                  row.expected_group);
-        EXPECT_EQ(bundle.listener.last_title, row.expected_title);
-    }
-}
-
-// Control: the hold is bounded. A peer that sits unadmitted and keeps sending role traffic gets
-// its excess dropped rather than growing the queue without limit, and the messages inside the
-// budget still replay.
-TEST(EncryptedLifecycle, HeldRoleTrafficIsBounded) {
-    HoldTestClient bundle("Held Budget Test Client");
-
-    HoldTestConnection& conn = bundle.connection();
-    conn.note_activate_delivered();
-    const size_t over_budget = SendspinConnection::MAX_HELD_MESSAGES + 3;
-    for (size_t i = 0; i < over_budget; ++i) {
-        bundle.deliver(conn, metadata_state_json(static_cast<int>(i) + 1,
-                                                 "Title " + std::to_string(i)));
-    }
-
-    bundle.admit(conn);
-    bundle.pump();
-    // The last title to survive the merge is the last one that fit the budget: everything the
-    // peer sent past it was dropped rather than queued.
-    EXPECT_EQ(bundle.listener.updates, 1);
-    EXPECT_EQ(bundle.listener.last_title,
-              "Title " + std::to_string(SendspinConnection::MAX_HELD_MESSAGES - 1));
-}
-
-// The role mask has two writers: the protocol task ORs in a just-parsed activation's roles, and
-// the main loop republishes the applied set a tick later. Applying one activation must not erase
-// the bits of another that has already been delivered, or the receive gate drops exactly the
-// traffic a server sends immediately behind its activate.
-//
-// Driven on a bare connection because the interleave is what is under test and no sequence of
-// wire messages forces the main loop to apply one activation while the protocol task has
-// already delivered the next. is_role_active() is the gate's own reader.
-TEST(RoleMask, ApplyingAnActivationKeepsADeliveredOneSRoleBits) {
-    HoldTestConnection conn;
-    const std::vector<SendspinActivity> playback{SendspinActivity::PLAYBACK};
-    const std::vector<std::string> metadata_only{"metadata@v1"};
-
-    conn.apply_server_activate(playback, metadata_only, std::nullopt, std::nullopt);
-    ASSERT_FALSE(conn.is_role_active(SendspinRole::PLAYER));
-
-    // A second activation adds the player and is parsed on the protocol task...
-    conn.note_activated_roles({"metadata@v1", "player@v1"});
-    ASSERT_TRUE(conn.is_role_active(SendspinRole::PLAYER));
-    // ...while the main loop is still applying one that neither adds nor removes it.
-    conn.apply_server_activate(playback, metadata_only, std::nullopt, std::nullopt);
-
-    EXPECT_TRUE(conn.is_role_active(SendspinRole::PLAYER))
-        << "the delivered activation's role bit was erased by an application it had nothing to "
-           "do with";
-    EXPECT_TRUE(conn.is_role_active(SendspinRole::METADATA));
-
-    // Control: an application that does take the role out clears its bit, so the above is not
-    // passing on a mask nothing can ever clear.
-    conn.apply_server_activate(playback, std::vector<std::string>{"metadata@v1", "player@v1"},
-                               std::nullopt, std::nullopt);
-    conn.apply_server_activate(playback, metadata_only, std::nullopt, std::nullopt);
-    EXPECT_FALSE(conn.is_role_active(SendspinRole::PLAYER));
-    EXPECT_TRUE(conn.is_role_active(SendspinRole::METADATA));
-}
-
-// The other half of the same guard: the hold has two budgets, and the byte one is what keeps the
-// memcpy inside the MAX_HELD_BYTES allocation. A peer whose role states are large runs out of
-// bytes long before it runs out of slots, so the count cap above cannot stand in for this one.
-TEST(EncryptedLifecycle, HeldRoleTrafficIsBoundedByBytesBeforeMessages) {
-    HoldTestClient bundle("Held Byte Budget Test Client");
-
-    HoldTestConnection& conn = bundle.connection();
-    conn.note_activate_delivered();
-    // Each message is just over a third of the byte budget, so the third one exceeds it while
-    // the count is still 3 of MAX_HELD_MESSAGES.
-    const size_t title_len = SendspinConnection::MAX_HELD_BYTES / 3;
-    for (int i = 0; i < 3; ++i) {
-        bundle.deliver(conn,
-                       metadata_state_json(i + 1, std::string(title_len,
-                                                              static_cast<char>('a' + i))));
-    }
-
-    ASSERT_LT(3u, SendspinConnection::MAX_HELD_MESSAGES)
-        << "the byte budget must be the one that runs out first for this test to mean anything";
-    EXPECT_EQ(conn.held_count_, 2u) << "the message past the byte budget was held anyway";
-    EXPECT_LE(conn.held_bytes_, SendspinConnection::MAX_HELD_BYTES)
-        << "the hold wrote past the buffer it allocated";
-
-    bundle.admit(conn);
-    bundle.pump();
-    EXPECT_EQ(bundle.listener.updates, 1);
-    EXPECT_EQ(bundle.listener.last_title, std::string(title_len, 'b'))
-        << "the last state inside the byte budget is the one that must replay";
-
-    // The replay also ends the hold, so a later peer message is not charged against a budget
-    // the last one spent. Read directly: no callback reports a released hold.
-    EXPECT_EQ(conn.held_count_, 0u) << "the replay left messages counted as held";
-    EXPECT_EQ(conn.held_bytes_, 0u) << "the replay left the byte budget spent";
-}
-
-// Control: the replay runs every held type's real handler to completion. One message of each
-// type, replayed in one admission, so a handler that throws the replay off (or blocks in it)
-// takes the metadata message behind it down with it. The group name and the metadata title are
-// what say the handlers ran rather than being walked past: a held type whose arm does nothing is
-// invisible to the trailing message alone.
-TEST(EncryptedLifecycle, EveryHeldMessageTypeReplaysThroughItsHandler) {
-    HoldTestClient bundle("Replay Handler Test Client");
-
-    HoldTestConnection& conn = bundle.connection();
-    conn.note_activate_delivered();
     for (const std::string& json :
          {std::string(R"({"type":"server/state","payload":{"controller":{"playback_state":)"
                       R"("playing"}}})"),
@@ -2495,14 +2321,93 @@ TEST(EncryptedLifecycle, EveryHeldMessageTypeReplaysThroughItsHandler) {
         bundle.deliver(conn, json);
     }
 
-    bundle.admit(conn);
-
     bundle.pump();
-    EXPECT_EQ(bundle.listener.updates, 1) << "the replay did not run to completion";
+    EXPECT_EQ(bundle.listener.updates, 1) << "the dispatch did not run to completion";
     EXPECT_EQ(bundle.listener.last_title, "Replayed");
     ASSERT_TRUE(bundle.client_ref().get_group_state().group_name.has_value())
-        << "the replayed group/update never reached its handler";
+        << "the group/update never reached its handler";
     EXPECT_EQ(*bundle.client_ref().get_group_state().group_name, "Kitchen");
+}
+
+// Role traffic reaches a role only from the admitted connection that owns it, not from any
+// connection that merely has the role active: with more than one admitted connection, each role
+// has one owner, and the others' traffic for it is ignored. Every row's connection has the
+// metadata role active.
+TEST(EncryptedLifecycle, RoleDispatchFollowsOwnership) {
+    const uint16_t without_metadata =
+        static_cast<uint16_t>(ALL_ROLES_MASK & ~role_mask_bit(SendspinRole::METADATA));
+    struct Row {
+        const char* name;
+        bool admitted;
+        uint16_t owned_roles;
+        int expected_updates;
+    };
+    const Row rows[] = {
+        {"Control: the admitted connection owns the role", true, ALL_ROLES_MASK, 1},
+        {"admitted, but another connection owns the role", true, without_metadata, 0},
+        {"not admitted", false, 0, 0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        HoldTestClient bundle("Role Ownership Dispatch Test Client");
+        HoldTestConnection& conn = bundle.connection();
+        ASSERT_TRUE(conn.is_role_active(SendspinRole::METADATA));
+        if (row.admitted) {
+            bundle.admit_owning(conn, row.owned_roles);
+        }
+        bundle.deliver(conn, metadata_state_json(1, "Owned"));
+        bundle.pump();
+        EXPECT_EQ(bundle.listener.updates, row.expected_updates);
+    }
+}
+
+/// A stand-in that keeps every client/state it is asked to send.
+class StateCapturingConnection : public HoldTestConnection {
+public:
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb,
+                            bool allow_before_hello) override {
+        if (msg.find("client/state") != std::string::npos) {
+            this->states.push_back(msg);
+        }
+        return HoldTestConnection::send_text_message(msg, std::move(cb), allow_before_hello);
+    }
+
+    std::vector<std::string> states;
+};
+
+// messaging.md "client/state": a connection is sent the role objects of the roles it owns, and no
+// other: a role another admitted connection owns is that connection's to report. The player is
+// the role with a state object here, active on every row.
+TEST(EncryptedLifecycle, ClientStateCarriesOnlyTheOwnedRoles) {
+    struct Row {
+        const char* name;
+        uint16_t owned_roles;
+        bool expect_player;
+    };
+    const Row rows[] = {
+        {"Control: the connection owns the player", ALL_ROLES_MASK, true},
+        {"another connection owns the player",
+         static_cast<uint16_t>(ALL_ROLES_MASK & ~role_mask_bit(SendspinRole::PLAYER)), false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        HoldTestClient bundle("Owned Client State Test Client");
+        auto conn = std::make_shared<StateCapturingConnection>();
+        conn->set_client_hello_sent(true);
+        conn->set_server_hello_received(true);
+        conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
+                                          std::memory_order_relaxed);
+        bundle.client_ref().connection_manager_->install_admitted(conn, row.owned_roles);
+        // Unavailable, so a player's state does not wait for the clock.
+        bundle.client_ref().set_available(false);
+        bundle.pump();
+
+        ASSERT_FALSE(conn->states.empty()) << "the snapshot never reached the admitted connection";
+        JsonDocument doc;
+        ASSERT_FALSE(deserializeJson(doc, conn->states.back()));
+        EXPECT_FALSE(doc["payload"]["available"].as<bool>());
+        EXPECT_EQ(!doc["payload"]["player"].isNull(), row.expect_player);
+    }
 }
 
 // A stand-in that records, for each client/state it is asked to send, whether it held the
@@ -2522,15 +2427,14 @@ public:
 
 // messaging.md "client/state": the first client/state is what lets the server start a role's
 // stream and send its binary data, and the client drops binary from a connection that is not
-// admitted yet. The promotion tick installs the connection, performs the record writes it owes
-// and only then admits it, so a state sent at promotion invites an artwork announce into that
-// gap; the announce is dropped and the part behind it is a malformed sequence the role closes
-// the connection on. A first activate that selects pairing alone still carries active roles on a
+// admitted yet. A state sent before the connection is installed in the admitted slot would invite
+// an artwork announce into that gap; the announce is dropped and the part behind it is a malformed
+// sequence the role closes the connection on. A first activate that selects pairing alone still carries active roles on a
 // playback-capable connection (messaging.md "server/activate"), and those are owed the initial
 // state as well.
 //
-// Driven through the manager's own loop() from the nursery, so the order under test is the one a
-// real promotion runs. The stand-in sends inline, which makes "was it admitted when the state
+// Driven through the protocol task's own tick from the nursery, so the order under test is the
+// one a real promotion runs. The stand-in sends inline, which makes "was it admitted when the state
 // left" a plain read instead of a race against a socket. Every row runs with unpaired access, the
 // setting that makes its activation admissible on a Sentinel or Pairing PSK session. The pairing
 // row matches the Pairing PSK and selects pairing_psk, whose entry sends client/pair-init and
@@ -2571,11 +2475,10 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
         conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                           std::memory_order_relaxed);
         {
-            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-            manager.push_nursery_entry(NurseryEntry{.conn = conn});
+            manager.nursery_.push_back(NurseryEntry{.conn = conn, .client_init_sent = true});
         }
 
-        bundle.client_ref().loop();
+        tick(bundle.client_ref());
 
         ASSERT_TRUE(conn->is_admitted()) << "the tick did not promote and admit the connection";
         ASSERT_EQ(conn->state_sent_while_admitted.size(), 1u)
@@ -2600,7 +2503,7 @@ public:
     std::optional<SendspinGoodbyeReason> goodbye;
 };
 
-// loop()'s liveness tick reads the current connection's last-arrival stamp: a connection whose
+// The protocol tick's liveness scan reads the admitted connection's last-arrival stamp: a connection whose
 // last arrival is older than the timeout is dropped with a restart goodbye (messaging.md
 // "client/goodbye"), and one heard from just now stays current. The stamp is set directly rather
 // than aged by waiting, and the timeout is the manager's own, default-derived and tens of seconds,
@@ -2634,10 +2537,9 @@ TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
         conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                           std::memory_order_relaxed);
         {
-            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-            manager.push_nursery_entry(NurseryEntry{.conn = conn});
+            manager.nursery_.push_back(NurseryEntry{.conn = conn, .client_init_sent = true});
         }
-        client.loop();
+        tick(client);
         ASSERT_TRUE(client.is_connected()) << "the tick did not promote the connection";
         ASSERT_TRUE(conn->is_admitted()) << "the tick did not admit the connection";
 
@@ -2645,7 +2547,7 @@ TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
         conn->last_receive_time_us_.store(
             static_cast<uint32_t>(row.stale ? now_us - 2 * timeout_us : now_us),
             std::memory_order_relaxed);
-        client.loop();
+        tick(client);
 
         if (row.stale) {
             EXPECT_FALSE(client.is_connected()) << "a stale connection was left current";
@@ -2675,128 +2577,19 @@ TEST(EncryptedLifecycle, AnInboundMessageAdvancesTheLivenessStamp) {
                                std::string(NOISE_SUITE_CHACHAPOLY), bundle.peer.server_identity,
                                bundle.peer.record.psk_id, bundle.peer.psk);
     pump_until(client, [&] { return client.is_connected(); });
-    const std::shared_ptr<SendspinConnection> conn = client.connection_manager_->current_shared();
+    // The test thread plays the protocol task from here, so it can read the admitted slot.
+    client.protocol_task_->stop();
+    SendspinConnection* conn = admitted_connection(client);
     ASSERT_NE(conn, nullptr);
 
     const uint32_t before_us = conn->get_last_receive_time_us();
     ASSERT_TRUE(server.send_app_json(metadata_state_json(1, "Liveness Stamp")));
     // Unbounded: completion is the proof, and the suite watchdog catches a stamp that never moves.
     // Inequality, since the 32-bit stamp can wrap.
-    pump_until(client, [&] { return conn->get_last_receive_time_us() != before_us; });
+    tick_until(client, [&] { return conn->get_last_receive_time_us() != before_us; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
-}
-
-// A stand-in whose destructor raises one transport or protocol-task event about itself, as an
-// outbound transport callback does during the destructor's join.
-class ExpiringTestConnection : public HoldTestConnection {
-public:
-    ~ExpiringTestConnection() override {
-        try {
-            this->raise(this);
-        } catch (const std::bad_weak_ptr&) {
-            *this->threw = true;
-        }
-    }
-
-    std::function<void(SendspinConnection*)> raise;
-    bool* threw{nullptr};
-};
-
-// A transport or protocol-task event about a connection with no owner left is dropped without
-// throwing. Read
-// from the pending queues: until loop() drains them, a dropped and a queued event look the same.
-TEST(EncryptedLifecycle, AnEventAboutAnAlreadyReleasedConnectionIsDropped) {
-    HoldTestClient bundle("Released Connection Event Test Client");
-    ConnectionManager& manager = *bundle.client_ref().connection_manager_;
-
-    // The outbound callbacks exist only on a connect_to() connection. Nothing listens on port 1;
-    // that connection's own close event is non-null, so the counts below ignore it.
-    bundle.client_ref().connect_to("ws://127.0.0.1:1");
-    std::function<void(SendspinConnection*)> outbound_connected;
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        for (const auto& entry : manager.nursery_) {
-            if (entry.conn->is_outbound()) {
-                outbound_connected = entry.conn->on_connected_cb;
-            }
-        }
-    }
-    ASSERT_TRUE(outbound_connected);
-
-    const auto deliver = [&](const std::string& json) {
-        return [&bundle, json](SendspinConnection* conn) { bundle.deliver(*conn, json); };
-    };
-    const std::string b64_32_bytes(43, 'A');
-    const std::string b64_64_bytes(86, 'A');
-    struct Row {
-        const char* name;
-        std::function<void(SendspinConnection*)> raise;
-    };
-    const std::vector<Row> rows = {
-        {"outbound open", outbound_connected},
-        {"server/activate",
-         deliver(R"({"type":"server/activate","payload":{"activities":["playback"]}})")},
-        {"pair/abort", deliver(R"({"type":"pair/abort","payload":{"reason":"user_cancelled"}})")},
-        {"malformed pair/abort", deliver(R"({"type":"pair/abort","payload":{}})")},
-        {"server/unpair", deliver(R"({"type":"server/unpair","payload":{}})")},
-        {"server/pair-init",
-         deliver(R"({"type":"server/pair-init","payload":{"nonce_A":")" + b64_32_bytes + R"("}})")},
-        {"server/pair-auth",
-         deliver(R"({"type":"server/pair-auth","payload":{"pake_msg_1":")" + b64_32_bytes +
-                 R"("}})")},
-        {"server/pair-confirm",
-         deliver(R"({"type":"server/pair-confirm","payload":{"server_kc":")" + b64_64_bytes +
-                 R"("}})")},
-        {"malformed pairing message",
-         deliver(R"({"type":"server/pair-auth","payload":{"pake_msg_1":"!!!not_valid!!!"}})")},
-    };
-
-    // Queued events naming `target`. The swap also empties the queues for the next row.
-    const auto take_events_naming = [&manager](const SendspinConnection* target) {
-        ConnectionManager::DrainedEvents drained;
-        manager.swap_out_pending_events(drained);
-        size_t count = 0;
-        const auto tally = [&count, target](const auto& conn) {
-            count += conn.get() == target ? 1 : 0;
-        };
-        for (const auto& conn : drained.connected) {
-            tally(conn);
-        }
-        for (const auto& conn : drained.disconnected) {
-            tally(conn);
-        }
-        for (const auto& event : drained.activates) {
-            tally(event.conn);
-        }
-        for (const auto& event : drained.pair_aborts) {
-            tally(event.conn);
-        }
-        for (const auto& event : drained.server_unpairs) {
-            tally(event.conn);
-        }
-        for (const auto& event : drained.pairing_messages) {
-            tally(event.conn);
-        }
-        return count;
-    };
-
-    for (const Row& row : rows) {
-        // Control: raised by a connection that still has an owner, the same event is queued.
-        auto live = std::make_shared<HoldTestConnection>();
-        row.raise(live.get());
-        EXPECT_EQ(take_events_naming(live.get()), 1U) << row.name;
-
-        bool threw = false;
-        auto expiring = std::make_shared<ExpiringTestConnection>();
-        expiring->raise = row.raise;
-        expiring->threw = &threw;
-        expiring.reset();
-        EXPECT_FALSE(threw) << row.name << ": shared_from_this() on an expired connection";
-        EXPECT_EQ(take_events_naming(nullptr), 0U)
-            << row.name << ": an event naming no connection was queued";
-    }
 }
 
 // Seeds a set of LONG_TERM records into the slot layout RecordStore loads them from, so an
@@ -2844,7 +2637,6 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServer server(server_url(UNPAIR_RECORD_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), unpairing_identity,
@@ -2900,23 +2692,22 @@ TEST(EncryptedLifecycle, SeveralRecordChangesInOneTickWriteEachTouchedKeyOnce) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
+    // The test thread plays the protocol task, which owns the manager's slots.
+    client.protocol_task_->stop();
     ConnectionManager& manager = *client.connection_manager_;
     const size_t writes_before = record_writes(persistence);
 
     HoldTestConnection conn;
-    ServerUnpairEvent event;
-    event.matched_psk_id = unpairing_record.psk_id;
-    event.psk_category = PskCategory::LONG_TERM;
+    conn.set_noise_handshake_result(unpairing_record.server_id, PskCategory::LONG_TERM,
+                                    unpairing_record.psk_id);
     {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         // What note_playback_activity() does when a long-term connection takes playback.
         EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
         client.request_persist();
-        manager.handle_server_unpair(&conn, event);
+        manager.handle_server_unpair(&conn);
     }
 
     client.flush_pending_persistence();
-    manager.flush_deferred_releases();
 
     // Slot 2 is zeroed and the order, which both ops moved, is written once.
     EXPECT_EQ(record_writes(persistence) - writes_before, 2u)
@@ -2956,6 +2747,8 @@ TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
+    // The test thread plays the protocol task, which owns the manager's slots.
+    client.protocol_task_->stop();
     ConnectionManager& manager = *client.connection_manager_;
 
     auto conn = std::make_shared<HoldTestConnection>();
@@ -2966,8 +2759,7 @@ TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
     // Control: playback on the least recently used record does write the order.
     const size_t writes_before_first = record_writes(persistence);
     {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.current_connection_ = conn;
+        manager.install_admitted(conn, conn->get_active_role_mask());
         manager.note_playback_activity(conn.get());
     }
     client.flush_pending_persistence();
@@ -2976,7 +2768,6 @@ TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
 
     const size_t writes_before_repeat = record_writes(persistence);
     {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         manager.note_playback_activity(conn.get());
     }
     client.flush_pending_persistence();
@@ -2985,8 +2776,7 @@ TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
         << "a playback that moves nothing must not write a record key";
 
     {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.current_connection_.reset();
+        release_admitted(manager);
     }
     client.stop();
 }
@@ -3017,6 +2807,8 @@ TEST(EncryptedLifecycle, AnEvictionBeforeTheFlushSparesTheRecordJustPlayed) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
+    // The test thread plays the protocol task, which owns the manager's slots.
+    client.protocol_task_->stop();
     ConnectionManager& manager = *client.connection_manager_;
 
     auto conn = std::make_shared<HoldTestConnection>();
@@ -3024,12 +2816,11 @@ TEST(EncryptedLifecycle, AnEvictionBeforeTheFlushSparesTheRecordJustPlayed) {
     conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                 std::nullopt);
     {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.current_connection_ = conn;
+        manager.install_admitted(conn, conn->get_active_role_mask());
         manager.note_playback_activity(conn.get());
         // The connection closes in the same block, so its record is no longer in use. Resetting
         // the slot alone models the close: it is all open_connection_psk_ids() reads.
-        manager.current_connection_.reset();
+        release_admitted(manager);
     }
 
     // What a protocol-task pair-finalize at capacity does, landing before the flush.
@@ -3069,17 +2860,13 @@ TEST(EncryptedLifecycle, StopFlushesARecordChangeMadeAfterTheLastTick) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    ConnectionManager& manager = *client.connection_manager_;
 
     const size_t writes_before = record_writes(persistence);
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        // What note_playback_activity() does when a long-term connection takes playback.
-        EXPECT_TRUE(client.record_store_->note_record_played(older.psk_id));
-        client.request_persist();
-    }
+    // What note_playback_activity() does when a long-term connection takes playback.
+    EXPECT_TRUE(client.record_store_->note_record_played(older.psk_id));
+    client.request_persist();
     ASSERT_EQ(record_writes(persistence), writes_before)
-        << "a change made under the lock must not write on its own";
+        << "a change made in RAM must not write on its own";
 
     client.stop();
 
@@ -3107,13 +2894,11 @@ TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordKey) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    ConnectionManager& manager = *client.connection_manager_;
+    // The test thread plays the protocol task, which owns the last-played server_id.
+    client.protocol_task_->stop();
     const size_t writes_before = record_writes(persistence);
 
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        client.note_last_played_server(paired_record.server_id);
-    }
+    client.note_last_played_server(paired_record.server_id);
     client.flush_pending_persistence();
 
     EXPECT_EQ(record_writes(persistence), writes_before)
@@ -3153,19 +2938,17 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
                                      /*psk_id=*/"");
     conn->apply_server_activate({}, std::nullopt, std::nullopt, std::nullopt);
     {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.set_current_connection(conn);
+        manager.install_admitted(conn, conn->get_active_role_mask());
         manager.note_playback_activity(conn.get());
     }
-    manager.flush_pending_admission();
 
     const std::string playing = R"({"type":"group/update","payload":{"playback_state":"playing"}})";
     conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                       std::memory_order_relaxed);
     client.process_json_message(conn.get(), playing.data(), playing.size(), platform_time_us());
     // Two ticks: a write requested by the group drain would land on the tick after it.
-    client.loop();
-    client.loop();
+    tick(client);
+    tick(client);
 
     ASSERT_EQ(client.get_group_state().playback_state, SendspinPlaybackState::PLAYING)
         << "the group/update never reached the client";
@@ -3176,17 +2959,15 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
     conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                 std::nullopt);
     {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         manager.note_playback_activity(conn.get());
     }
-    client.loop();
+    tick(client);
     auto last_played = persistence.blob(persistence_keys::LAST_PLAYED);
     ASSERT_TRUE(last_played.has_value());
     EXPECT_EQ(*last_played, blob_bytes(server_identity.public_bytes));
 
     {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.current_connection_.reset();
+        release_admitted(manager);
     }
     client.stop();
 }
@@ -3228,15 +3009,16 @@ TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
         client.set_network_provider(&network);
         client.set_persistence_provider(&persistence);
         ASSERT_TRUE(client.start());
+        // The test thread plays the protocol task, which owns the manager's slots.
+        client.protocol_task_->stop();
         ConnectionManager& manager = *client.connection_manager_;
 
         auto conn = std::make_shared<HoldTestConnection>();
         conn->set_noise_handshake_result(older.server_id, PskCategory::LONG_TERM, older.psk_id);
         conn->apply_server_activate(row.activities, std::nullopt, std::nullopt, std::nullopt);
         {
-            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
             if (row.admitted) {
-                manager.current_connection_ = conn;
+                manager.install_admitted(conn, conn->get_active_role_mask());
             }
             manager.note_playback_activity(conn.get());
         }
@@ -3244,8 +3026,7 @@ TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
 
         EXPECT_EQ(stored_record_order(persistence), row.expected_order);
         {
-            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-            manager.current_connection_.reset();
+            release_admitted(manager);
         }
         client.stop();
     }
@@ -3291,7 +3072,6 @@ TEST(EncryptedLifecycle, PersistedRecencyFollowsPlaybackActivates) {
         client.set_network_provider(&network);
         client.set_persistence_provider(&persistence);
         ASSERT_TRUE(client.start());
-        client.loop();  // First tick binds the WS server
 
         FakeEncryptedServerOptions options;
         options.first_activities_json = row.first_activities;
@@ -3343,23 +3123,22 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
+    // The test thread plays the protocol task, which owns the manager's slots.
+    client.protocol_task_->stop();
     ConnectionManager& manager = *client.connection_manager_;
     reject_record_saves(persistence);
 
     HoldTestConnection conn;
-    ServerUnpairEvent event;
-    event.matched_psk_id = unpairing_record.psk_id;
-    event.psk_category = PskCategory::LONG_TERM;
+    conn.set_noise_handshake_result(unpairing_record.server_id, PskCategory::LONG_TERM,
+                                    unpairing_record.psk_id);
     {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         // What note_playback_activity() does when a long-term connection takes playback.
         EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
         client.request_persist();
-        manager.handle_server_unpair(&conn, event);
+        manager.handle_server_unpair(&conn);
     }
 
     client.flush_pending_persistence();
-    manager.flush_deferred_releases();
 
     EXPECT_FALSE(client.record_store_
                      ->resolve_by_psk_id(unpairing_record.psk_id, PskCategory::LONG_TERM)
@@ -3376,12 +3155,13 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
 }
 
 // The revocation itself is not deferred, only its blob write. handle_server_unpair() erases the
-// record under conn_ptr_mutex_, so a Noise re-handshake on the revoked psk_id, which resolves
-// against the store on the protocol task, misses it from that instant rather than for as long as
-// the writes staged ahead of it take to commit (an NVS commit each, tens of milliseconds, on ESP).
+// record in RAM, so a Noise re-handshake on the revoked psk_id, which resolves against the store
+// on the protocol task right behind the unpair, misses it from that instant rather than for as
+// long as the main loop takes to flush the writes (an NVS commit each, tens of milliseconds, on
+// ESP).
 //
-// Driving the handler directly is what pins that: the resolve below runs inside the locked
-// section itself, which is where an erase deferred to the flush would still be resolvable.
+// Driving the handler directly is what pins that: the resolve below runs before any flush, which
+// is where an erase deferred to the flush would still be resolvable.
 TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     HoldTestClient bundle("Unpair Revocation Window Test Client");
     SendspinClient& client = bundle.client_ref();
@@ -3394,26 +3174,15 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     ASSERT_TRUE(client.record_store_->store_record_superseding(record, {}));
 
     HoldTestConnection conn;
-    ServerUnpairEvent event;
-    event.matched_psk_id = record.psk_id;
-    event.psk_category = PskCategory::LONG_TERM;
-    std::optional<ResolvedPsk> resolved;
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.handle_server_unpair(&conn, event);
-        // The handshake thread's lookup, issued while the manager lock is still held: it takes
-        // only RecordStore::mutex_, so it neither waits on nor deadlocks against this scope.
-        std::thread network([&] {
-            resolved =
-                client.record_store_->resolve_by_psk_id(record.psk_id, PskCategory::LONG_TERM);
-        });
-        network.join();
-    }
+    conn.set_noise_handshake_result(record.server_id, PskCategory::LONG_TERM, record.psk_id);
+    manager.handle_server_unpair(&conn);
+    // The re-handshake's lookup, on the protocol task (this thread) right behind the handler.
+    const std::optional<ResolvedPsk> resolved =
+        client.record_store_->resolve_by_psk_id(record.psk_id, PskCategory::LONG_TERM);
     EXPECT_FALSE(resolved.has_value())
-        << "the revoked record still resolved a handshake while the unpair handler held the lock";
+        << "the revoked record still resolved a handshake before the write was flushed";
 
     client.flush_pending_persistence();
-    manager.flush_deferred_releases();
 }
 
 // An unpaired session has no record to revoke, so server/unpair on one is ignored outright: it
@@ -3436,7 +3205,6 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     // The Sentinel PSK admits an unpaired server (ConnectionTrust::NONE).
     FakeEncryptedServer server(server_url(UNPAIR_SENTINEL_TEST_PORT),
@@ -3495,7 +3263,6 @@ TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     // A: admitted, so its server/unpair is honoured.
     FakeEncryptedServerOptions options_a;
@@ -3601,7 +3368,6 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     // The main loop runs on its own thread from here: it is the thread that parks in the write,
     // so the probe below has to be a different one.
@@ -3652,7 +3418,6 @@ TEST(EncryptedLifecycle, TogglingUnpairedAccessBringsTheUnpairedSessionInLine) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     Identity identity = Identity::generate().value();
     FakeEncryptedServerOptions idle;
@@ -3709,7 +3474,6 @@ TEST(EncryptedLifecycle, UnpairedAccessChangesLeavePairedAndPairingSessionsAlone
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     {
         FakeEncryptedServer paired(server_url(UNPAIRED_TOGGLE_CONTROL_TEST_PORT),
@@ -3775,7 +3539,6 @@ TEST(EncryptedLifecycle, EnablingUnpairedAccessRestartsAnUnpairedSessionStillInT
         client.set_network_provider(&network);
         client.set_persistence_provider(&persistence);
         ASSERT_TRUE(client.start());
-        client.loop();  // First tick binds the WS server
 
         FakeEncryptedServerOptions options;
         options.suppress_activate = true;
@@ -3850,7 +3613,6 @@ TEST(EncryptedLifecycle, UnpairedAccessChangesWaitOutARehandshake) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     FakeEncryptedServerOptions options;
     options.suppress_activate = true;  // The post-rekey activate is the one that never comes.
@@ -3886,7 +3648,6 @@ TEST(EncryptedLifecycle, UnpairedAccessIsOffUntilSetAndIsNeverPersisted) {
     // An unpaired server declaring playback: admitted only while unpaired access is on.
     // Every call follows a start().
     auto expect_unpaired_playback = [&](SendspinClient& client, bool admitted) {
-        client.loop();  // First tick binds the WS server
         FakeEncryptedServer server(server_url(UNPAIRED_TOGGLE_STOPPED_TEST_PORT),
                                    std::string(NOISE_SUITE_CHACHAPOLY), identity,
                                    std::string(SENTINEL_PSK_ID), SENTINEL_PSK);

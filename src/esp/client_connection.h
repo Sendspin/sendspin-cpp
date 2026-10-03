@@ -35,8 +35,8 @@ namespace sendspin {
  * @brief Outbound WebSocket connection to a Sendspin server (ESP-IDF, esp_websocket_client)
  *
  * Implements SendspinConnection for the client role: the ESP device connects out to the server.
- * Handles the full connection lifecycle and auto-reconnect on connection loss; loop() drives the
- * reconnect timer.
+ * Handles the connection lifecycle. A lost connection is not reopened: connect_to() opens a new
+ * one.
  */
 class SendspinClientConnection : public SendspinConnection {
 public:
@@ -51,9 +51,6 @@ public:
 
     /// @brief Starts the connection (initializes websocket client and connects)
     void start() override;
-
-    /// @brief Periodic loop processing (handles reconnection attempts)
-    void loop() override;
 
     /// @brief Disconnects from the server with a goodbye message
     /// @param on_complete Optional; the goodbye is synchronous here, so it runs immediately.
@@ -85,12 +82,6 @@ public:
     // ========================================
     // Client connection-specific configuration
     // ========================================
-
-    /// @brief Sets whether to automatically reconnect on connection loss
-    /// @param enabled True to enable auto-reconnect, false to disable.
-    void set_auto_reconnect(bool enabled) {
-        this->auto_reconnect_ = enabled;
-    }
 
     /// @brief Configures the internal esp_websocket_client task
     /// @param priority FreeRTOS task priority for the WebSocket client task.
@@ -141,14 +132,6 @@ protected:
 
     // 32-bit fields
 
-    /// @brief Monotonic timestamp (ms) of the last reconnection attempt
-    uint32_t last_reconnect_attempt_{0};
-
-    static constexpr uint32_t DEFAULT_RECONNECT_INTERVAL_MS = 5000U;
-
-    /// @brief Delay in milliseconds between reconnection attempts
-    uint32_t reconnect_interval_ms_{DEFAULT_RECONNECT_INTERVAL_MS};
-
     // 32-bit fields (unsigned)
 
     /// @brief FreeRTOS task priority for the internal esp_websocket_client task
@@ -158,9 +141,6 @@ protected:
     size_t task_stack_size_{SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE};
 
     // 8-bit fields
-
-    /// @brief Whether to automatically reconnect after connection loss
-    bool auto_reconnect_{true};
 
     /// @brief Whether the websocket is currently connected. Written by the transport task,
     /// read cross-thread via is_connected(), hence atomic.

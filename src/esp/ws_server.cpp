@@ -23,7 +23,9 @@
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 
 namespace sendspin {
@@ -162,9 +164,9 @@ uint8_t* SendspinWsServer::discard_buffer() {
     return this->discard_buf_.data();
 }
 
-void SendspinWsServer::tick() {
+uint32_t SendspinWsServer::tick() {
     if (this->server_ == nullptr) {
-        return;
+        return UINT32_MAX;
     }
 
     // Pure age-based reap: any session still undelivered past the deadline is closed. Sparing
@@ -174,14 +176,20 @@ void SendspinWsServer::tick() {
     // exactly-once (the loser finds no entry and no-ops).
     std::vector<std::shared_ptr<SendspinServerConnection>> to_reap;
     const int64_t now_us = esp_timer_get_time();
+    // The earliest deadline still ahead, for the protocol task's wait.
+    int64_t next_due_us = INT64_MAX;
     {
         std::lock_guard<std::mutex> lock(this->pending_mutex_);
         for (auto it = this->pending_.begin(); it != this->pending_.end();) {
             // A closing session is skipped, not reaped: close_callback pops its entry.
-            if (it->conn->is_connected() && now_us - it->accept_time_us >= WS_UPGRADE_TIMEOUT_US) {
+            const int64_t due_us = it->accept_time_us + WS_UPGRADE_TIMEOUT_US;
+            if (it->conn->is_connected() && now_us >= due_us) {
                 to_reap.push_back(std::move(it->conn));
                 it = this->pending_.erase(it);
                 continue;
+            }
+            if (it->conn->is_connected()) {
+                next_due_us = std::min(next_due_us, due_us);
             }
             ++it;
         }
@@ -192,6 +200,11 @@ void SendspinWsServer::tick() {
                 static_cast<int>(WS_UPGRADE_TIMEOUT_US / (1000 * 1000)));
         conn->trigger_close();
     }
+    if (next_due_us == INT64_MAX) {
+        return UINT32_MAX;
+    }
+    // Rounded up so the wake is never early; at most WS_UPGRADE_TIMEOUT_US away.
+    return static_cast<uint32_t>((next_due_us - now_us + 999) / 1000);
 }
 
 void SendspinWsServer::deliver_upgraded(int sockfd) {
@@ -211,7 +224,11 @@ void SendspinWsServer::deliver_upgraded(int sockfd) {
 
     SS_LOGD(TAG, "WebSocket upgrade complete on socket %d, delivering connection", sockfd);
     conn->mark_ws_upgraded();
-    this->new_connection_callback_(std::move(conn));
+    if (!this->new_connection_callback_(conn)) {
+        // Refused: the session closes, and its slot keeps owning the connection until httpd
+        // frees it, so the reference dropped here is never the last.
+        conn->trigger_close();
+    }
 }
 
 std::shared_ptr<SendspinServerConnection> SendspinWsServer::pop_pending(int sockfd) {
@@ -262,6 +279,10 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
         std::lock_guard<std::mutex> lock(server->pending_mutex_);
         server->pending_.push_back(PendingUpgrade{std::move(conn), esp_timer_get_time(), sockfd});
     }
+    // The protocol task's next tick() then reports this session's upgrade deadline.
+    if (server->wake_callback_) {
+        server->wake_callback_();
+    }
     return ESP_OK;
 }
 
@@ -285,7 +306,7 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
         server->pop_pending(sockfd);
     }
 
-    // Tell the protocol task, which reports the loss to ConnectionManager (so it can drop its
+    // Tell the protocol task, which drops the connection from ConnectionManager's slots (its
     // observer shared_ptr) once the messages the session delivered before closing are processed.
     // The event is keyed on the connection's identity, never the recyclable sockfd. The session
     // slot keeps it alive until httpd invokes the free_fn, so in-flight workers still see a
@@ -334,9 +355,9 @@ SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     }
 
     // Delegate to connection's handle_data. Stale messages (i.e., after the connection has been
-    // dropped from ConnectionManager's observer slots) are dropped inside the connection by its
-    // detached inbound gate, so a still-alive session-pinned conn does not leak messages into
-    // freshly-reset role queues. A frame on a never-delivered connection (its session outliving a
+    // dropped from ConnectionManager's slots) are dropped inside the connection by its detached
+    // inbound gate, so a still-alive session-pinned conn does not leak messages into freshly-reset
+    // role queues. A frame on a never-delivered connection (its session outliving a
     // tick() reap by a moment) has no inbound ring to go to and is dropped the same way.
     return conn->handle_data(req, receive_time, server);
 }

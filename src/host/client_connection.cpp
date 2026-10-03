@@ -23,7 +23,6 @@
 #include <ixwebsocket/IXWebSocketMessageType.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <utility>
 
@@ -58,26 +57,14 @@ void SendspinClientConnection::start() {
     this->ws_ = std::make_unique<ix::WebSocket>();
     this->ws_->setUrl(this->url_);
     this->ws_->disableAutomaticReconnection();
+    // Bounds the handshake, and with it stop() for a connection whose upgrade is in flight; see
+    // HANDSHAKE_TIMEOUT_SECS.
+    this->ws_->setHandshakeTimeout(HANDSHAKE_TIMEOUT_SECS);
 
     this->setup_callbacks();
 
     this->ws_->start();
     SS_LOGD(TAG, "Client connection starting to %s", this->url_.c_str());
-}
-
-void SendspinClientConnection::loop() {
-    // Handle auto-reconnect
-    if (!this->is_connected() && this->auto_reconnect_) {
-        uint32_t now =
-            static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      std::chrono::steady_clock::now().time_since_epoch())
-                                      .count());
-        if (now - this->last_reconnect_attempt_ > this->reconnect_interval_ms_) {
-            this->last_reconnect_attempt_ = now;
-            SS_LOGD(TAG, "Attempting to reconnect to %s", this->url_.c_str());
-            this->start();
-        }
-    }
 }
 
 void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,

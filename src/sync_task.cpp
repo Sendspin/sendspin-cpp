@@ -596,8 +596,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             }
         }
     } else if (sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) {
-        // The filter may have changed since handle_load_chunk(); see docs/internals.md, "Current
-        // Time Filter Slot".
+        // The filter may have changed since handle_load_chunk(); see docs/internals.md, "Time
+        // Filter Slot".
         int64_t client_timestamp =
             this->player_impl_->client->get_client_time(
                 server_timestamp(sync_context.encoded_item)) -

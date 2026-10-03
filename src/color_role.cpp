@@ -138,8 +138,8 @@ void ColorRole::Impl::drain_events() {
 }
 
 void ColorRole::Impl::handle_cleared_event() const {
-    // Deferred from cleanup() to avoid invoking the listener while ConnectionManager holds
-    // conn_ptr_mutex_; a listener that calls back into the client would otherwise deadlock.
+    // Queued by cleanup(), which runs on the protocol task, so the listener is called here on the
+    // main loop.
     if (this->listener) {
         this->listener->on_color_clear();
     }
@@ -147,14 +147,19 @@ void ColorRole::Impl::handle_cleared_event() const {
 
 void ColorRole::Impl::cleanup() {
     // Bumped first: it invalidates any handler the gate already admitted (see accepts()).
-    this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
+    const uint32_t generation =
+        this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();
+
+    // Stamped so the drain catches the main-loop state up before the callback; the callback
+    // itself is idempotent, so it is delivered whatever teardown overtook it.
+    push_event_or_log(this->inbox, InboxEventType::COLOR_CLEARED, 0, TAG, "color cleared event",
+                      generation);
+}
+
+void ColorRole::Impl::complete_teardown() {
     this->color = {};
     this->held_state.reset();
-
-    // Unstamped: a clear is idempotent, so it is delivered whatever teardown overtook it.
-    push_event_or_log(this->inbox, InboxEventType::COLOR_CLEARED, 0, TAG, "color cleared event",
-                      /*epoch=*/0);
 }
 
 }  // namespace sendspin

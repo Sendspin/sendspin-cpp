@@ -77,16 +77,21 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
         return {.sent = false, .burst_completed = burst_completed_by_response};
     }
 
-    // State 3: Ready to send next message in burst.
+    // State 3: Ready to send next message in burst, unless a refused send is still backing off.
+    if (now_ms < this->send_retry_after_ms_) {
+        return {.sent = false, .burst_completed = burst_completed_by_response};
+    }
     const int64_t embedded = conn->send_time_message();
 
     if (embedded != 0) {
         this->pending_embedded_ = embedded;
         this->current_message_sent_time_ = now_ms;
+        this->send_retry_after_ms_ = 0;
         SS_LOGV(TAG, "Sent time message %u/%u", this->burst_index_ + 1, this->burst_size_);
         return {.sent = true, .burst_completed = burst_completed_by_response};
     }
 
+    this->send_retry_after_ms_ = now_ms + SEND_RETRY_DELAY_MS;
     return {.sent = false, .burst_completed = burst_completed_by_response};
 }
 
@@ -134,6 +139,28 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeRes
 // Lifecycle
 // ============================================================================
 
+uint32_t SendspinTimeBurst::ms_until_due(int64_t now_ms) const {
+    if (this->pending_burst_completed_) {
+        return 0;
+    }
+    int64_t due_ms = now_ms;
+    if (this->burst_index_ >= this->burst_size_) {
+        // loop() starts the next burst once the interval has fully elapsed.
+        due_ms = this->last_burst_complete_time_ + this->burst_interval_ms_;
+    } else if (this->pending_embedded_ != 0) {
+        // loop() times the message out once strictly more than the timeout has passed.
+        due_ms = this->current_message_sent_time_ + this->response_timeout_ms_ + 1;
+    } else if (this->send_retry_after_ms_ != 0) {
+        due_ms = this->send_retry_after_ms_;
+    }
+    if (due_ms <= now_ms) {
+        return 0;
+    }
+    const int64_t wait_ms = due_ms - now_ms;
+    return wait_ms >= static_cast<int64_t>(UINT32_MAX) ? UINT32_MAX - 1
+                                                       : static_cast<uint32_t>(wait_ms);
+}
+
 void SendspinTimeBurst::configure(uint8_t burst_size, int64_t burst_interval_ms,
                                   int64_t response_timeout_ms) {
     this->burst_size_ = burst_size;
@@ -148,6 +175,7 @@ void SendspinTimeBurst::reset() {
     this->current_message_sent_time_ = 0;
     this->pending_burst_completed_ = false;
     this->pending_embedded_ = 0;
+    this->send_retry_after_ms_ = 0;
     this->best_max_error_ = std::numeric_limits<int64_t>::max();
     this->best_offset_ = 0;
     this->best_timestamp_ = 0;

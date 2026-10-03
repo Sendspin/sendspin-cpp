@@ -555,8 +555,8 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         // notification still queued for them stale to the decode thread.
         //
         // The comparison and the store of the new array are inside the lock because
-        // streamed_channels is also cleared by cleanup(), which the main loop runs on a live
-        // connection when a server/activate removes the artwork role.
+        // streamed_channels is also cleared by cleanup(), which stop() runs on the main loop and
+        // the decode thread's slot reads share.
         //
         // A transfer in flight ends here only if its channel changed; the server cancels those
         // first (roles/artwork/v1.md "Artwork (Binary)"), and one on an unchanged channel
@@ -802,9 +802,9 @@ void ArtworkRole::Impl::cleanup() {
     // SendspinClient::cleanup_connection_state()'s inbox.reset_events() has already wiped them,
     // and on the deactivation path, which leaves the ring alone for the roles that stay active,
     // they carry the generation this teardown just left behind and the drain discards them (see
-    // event_is_current()).
-    this->held_display_mask = 0;
-    this->held_display_clear = 0;
+    // event_is_current()). The main-loop display holds are cleared by the STREAM_END below
+    // (handle_stream_ring_event()), and a hold that outlives a dropped STREAM_END fails its
+    // slot-epoch check, which discard_all_pending() just bumped.
     this->event_state->display_slot.reset();
 
     // discard_all_pending() bumped every slot epoch, so no transfer is in flight and nothing

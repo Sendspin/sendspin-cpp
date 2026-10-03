@@ -113,23 +113,38 @@ struct PlayerRole::Impl {
     void drain_events();
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
-    /// The gate in SendspinClient's role dispatch is checked once, on the protocol task, while the
-    /// handler it admits runs on: a teardown on the main loop can land in between. Re-checking at
-    /// each point of effect invalidates the whole handler instead of only the part that ran
-    /// before it.
+    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
+    /// runs, and stop()'s teardown on the main loop can land in between. Re-checking at each point
+    /// of effect invalidates the whole handler instead of only the part that ran before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
     }
 
-    /// @brief Stops the role and discards its state. Main loop only.
+    /// @brief Stops the role and discards the state the protocol task can reach. Protocol task,
+    /// or the main loop in SendspinClient::stop() once every other thread is joined.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
     /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
-    /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
-    /// the inbox rather than fired here, because both callers run under the connection manager's
-    /// conn_ptr_mutex_.
+    /// from active_roles (SendspinClient::apply_role_removals()). The STREAM_END is queued on
+    /// the inbox, stamped with the new generation, and the main-loop state is reset
+    /// by complete_teardown() at the head of the next drain (catch_up_teardown()).
     void cleanup();
+
+    /// @brief Resets the state only the main loop touches, for a teardown cleanup() ran. Main
+    /// loop only, through catch_up_teardown().
+    void complete_teardown();
+
+    /// @brief Runs complete_teardown() once for every teardown generation the main loop has not
+    /// caught up with. Main loop only: called at the head of each drain with the current
+    /// generation, and with a stamped event's generation before that event is acted on, so the
+    /// reset always lands ahead of the state the next connection sends.
+    void catch_up_teardown(uint32_t generation) {
+        if (generation != this->completed_generation) {
+            this->completed_generation = generation;
+            this->complete_teardown();
+        }
+    }
     /// @brief Joins the sync task thread and returns its buffered audio to the inbound ring;
     /// no-op if not started.
     void stop() const;
@@ -217,6 +232,8 @@ struct PlayerRole::Impl {
     // the teardown's read-modify-write; the drain_events() reads are relaxed because they are
     // same-thread.
     std::atomic<uint32_t> cleanup_generation{0};
+    /// The teardown generation complete_teardown() last ran for. Main loop only.
+    uint32_t completed_generation{0};
 
     // 16-bit fields
     std::atomic<uint16_t> output_delay_ms{0};

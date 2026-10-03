@@ -47,8 +47,10 @@ static constexpr uint32_t INBOX_TOPIC_PLAYER_COMMAND = 1U << 5;        // Player
 static constexpr uint32_t INBOX_TOPIC_PLAYER_STREAM_PARAMS = 1U << 6;  // Player stream params slot
 static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1U << 7;     // Visualizer config slot
 static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1U << 8;       // Artwork display slot
-static constexpr uint32_t INBOX_TOPIC_PERSIST = 1U << 9;  // Owed provider writes wakeup slot
-static constexpr uint32_t INBOX_TOPIC_TIME = 1U << 10;    // Time-sync measurement slot
+static constexpr uint32_t INBOX_TOPIC_PERSIST = 1U << 9;               // Owed provider writes slot
+static constexpr uint32_t INBOX_TOPIC_TIME = 1U << 10;                 // Time-sync report slot
+static constexpr uint32_t INBOX_TOPIC_PAIRING = 1U << 11;              // Pairing/trust notes slot
+static constexpr uint32_t INBOX_TOPIC_HIGH_PERFORMANCE = 1U << 12;     // High-performance requests
 
 // ============================================================================
 // Event ring types
@@ -60,9 +62,9 @@ static constexpr uint32_t INBOX_TOPIC_TIME = 1U << 10;    // Time-sync measureme
 /// producer/consumer); the inbox does not interpret it.
 enum class InboxEventType : uint8_t {
     PLAYER_STREAM,       // Player stream lifecycle; code = PlayerStreamCallbackType
-    CONTROLLER_CLEARED,  // Controller state cleared on disconnect; no payload
-    METADATA_CLEARED,    // Metadata cleared on disconnect; no payload
-    COLOR_CLEARED,       // Color state cleared on disconnect; no payload
+    CONTROLLER_CLEARED,  // Controller state cleared; epoch = the teardown's generation
+    METADATA_CLEARED,    // Metadata cleared; epoch = the teardown's generation
+    COLOR_CLEARED,       // Color state cleared; epoch = the teardown's generation
     ARTWORK_STREAM,      // Artwork stream lifecycle; code = ArtworkEventType
     VISUALIZER_STREAM,   // Visualizer stream lifecycle; code = VisualizerEventType
 };
@@ -95,9 +97,9 @@ class InboxSlot;
  *
  * @note HARD RULE: no user-visible code (listener callbacks, client/role methods) may run while
  * the inbox mutex is held. merge() functors passed to InboxSlot must be pure data operations on
- * the slot value, so nothing that calls back into application code. The Inbox is a leaf in the
- * lock order: code holding any other lock in this library must not then lock the Inbox, only
- * the reverse.
+ * the slot value, so nothing that calls back into application code. The Inbox mutex is a leaf, like
+ * every library lock (docs/conventions.md): nothing takes another library lock while holding it,
+ * and nothing locks the Inbox while holding another library lock.
  *
  * @code
  * Inbox inbox;

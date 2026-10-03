@@ -155,7 +155,13 @@ public:
     /// supported_commands, or without the parameter it requires (volume in 0-100, mute,
     /// position_ms, offset_ms), is dropped with a warning.
     /// @param cmd The command plus any command-specific parameters
-    void send_command(const ClientCommandControllerObject& cmd);
+    /// @return false when the command was dropped before it reached the library's protocol task:
+    ///         not in supported_commands, a missing parameter, the client not running, or the
+    ///         request queue full. Retry only on a full queue (a burst of commands faster than the
+    ///         protocol task drains them); gate on supported_commands for the rest, since a retry
+    ///         cannot fix them. true means queued, not sent: the protocol task still drops it
+    ///         unless the connection that owns the controller role has it active.
+    bool send_command(const ClientCommandControllerObject& cmd);
 
 private:
     std::unique_ptr<Impl> impl_;

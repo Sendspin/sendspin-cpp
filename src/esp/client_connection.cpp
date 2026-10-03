@@ -74,7 +74,7 @@ void SendspinClientConnection::start() {
     // Configure the websocket client
     esp_websocket_client_config_t config = {};
     config.uri = this->url_.c_str();
-    config.disable_auto_reconnect = true;  // We handle reconnection ourselves
+    config.disable_auto_reconnect = true;  // A lost connection is not reopened
     config.task_prio = static_cast<int>(this->task_priority_);
     // Clamp to the documented minimum, the value shipped and verified on hardware (see
     // SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE), until this task's receive path is
@@ -119,18 +119,6 @@ void SendspinClientConnection::start() {
 // ============================================================================
 // SendspinConnection interface implementation
 // ============================================================================
-
-void SendspinClientConnection::loop() {
-    // Handle auto-reconnect
-    if (!this->is_connected() && this->auto_reconnect_) {
-        uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
-        if (now - this->last_reconnect_attempt_ > this->reconnect_interval_ms_) {
-            this->last_reconnect_attempt_ = now;
-            SS_LOGD(TAG, "Attempting to reconnect to %s", this->url_.c_str());
-            this->start();
-        }
-    }
-}
 
 void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
                                           std::function<void()> on_complete) {

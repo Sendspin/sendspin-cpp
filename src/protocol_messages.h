@@ -173,10 +173,14 @@ inline uint16_t role_mask_bit(SendspinRole role) {
 
 static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 16, "role mask is a uint16_t");
 
+/// @brief Every role this library implements, as an active-role mask
+static constexpr uint16_t ALL_ROLES_MASK =
+    static_cast<uint16_t>((1U << static_cast<uint8_t>(SendspinRole::COUNT)) - 1U);
+
 /// @brief Builds the mask of roles this library implements that `active_roles` names.
 ///
-/// The mask is what the receive path reads (a connection publishes it atomically), so it is built
-/// with the same exact-version test role removal uses and the two can never disagree.
+/// The mask is what the receive path reads, so it is built with the same exact-version test role
+/// removal uses and the two can never disagree.
 inline uint16_t active_role_mask(const std::vector<std::string>& active_roles) {
     uint16_t mask = 0;
     for (uint8_t i = 0; i < static_cast<uint8_t>(SendspinRole::COUNT); ++i) {
@@ -796,6 +800,30 @@ struct ClientStateMessage {
     std::optional<ClientArtworkStateObject> artwork{};
     std::optional<ClientVisualizerStateObject> visualizer{};
 };
+
+/// @brief The client/state one connection receives: the snapshot's availability and the role
+/// objects of the roles in `roles` only
+///
+/// messaging.md "client/state" includes a role object only while that role is active, and a
+/// role this client drives has one owner among the admitted connections, so each connection is
+/// sent the objects of the roles it owns and has active, and no other.
+/// @param snapshot Every role's state object, as the main loop built it.
+/// @param roles The receiving connection's owned, active roles, as role_mask_bit() bits.
+inline ClientStateMessage client_state_for_roles(const ClientStateMessage& snapshot,
+                                                 uint16_t roles) {
+    ClientStateMessage msg;
+    msg.available = snapshot.available;
+    if ((roles & role_mask_bit(SendspinRole::PLAYER)) != 0) {
+        msg.player = snapshot.player;
+    }
+    if ((roles & role_mask_bit(SendspinRole::ARTWORK)) != 0) {
+        msg.artwork = snapshot.artwork;
+    }
+    if ((roles & role_mask_bit(SendspinRole::VISUALIZER)) != 0) {
+        msg.visualizer = snapshot.visualizer;
+    }
+    return msg;
+}
 
 /// @brief Parsed server/hello handshake message received at connection startup.
 /// Under encryption, server/hello carries only the server's display name; server_id comes
