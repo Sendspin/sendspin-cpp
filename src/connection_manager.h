@@ -171,8 +171,8 @@ struct NurseryEntry {
 /// and any block stalls every other manager entry point. The queue is main-loop-only: entries are
 /// queued by main-loop code inside a conn_ptr_mutex_ section, and every main-loop entry point that
 /// can queue one calls flush_deferred_releases() after the lock drops and before it returns, so
-/// the queue is empty between main-loop calls. No network or role thread queues or flushes one;
-/// on_new_connection() goodbyes its own rejections inline.
+/// the queue is empty between main-loop calls. No transport, protocol-task or role thread queues or
+/// flushes one; on_new_connection() goodbyes its own rejections inline.
 struct DeferredRelease {
     std::shared_ptr<SendspinConnection> conn;  ///< A reference to drop; not necessarily the last
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: no goodbye owed, just release
@@ -198,7 +198,7 @@ struct PairAbortEvent {
 
 /// @brief Deferred server/unpair event.
 ///
-/// Parsed on the network thread; the record removal and disconnect run on the main loop.
+/// Parsed on the protocol task; the record removal and disconnect run on the main loop.
 struct ServerUnpairEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection that received server/unpair
     std::string matched_psk_id;                ///< psk_id matched for this connection
@@ -221,7 +221,7 @@ enum class PairingMessageKind : uint8_t {
 
 /// @brief Deferred server pairing-code message event.
 ///
-/// Parsed on the network thread; the PAKE state machine (CPace, nonces, hash) runs
+/// Parsed on the protocol task; the PAKE state machine (CPace, nonces, hash) runs
 /// on the main loop only, so all pairing-message processing is deferred here.
 struct ServerPairingMessageEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection that received the message
@@ -241,9 +241,9 @@ struct ServerPairingMessageEvent {
 
 /// @brief Deferred server/activate event, processed in ConnectionManager::loop()
 ///
-/// Pushed from SendspinClient::process_json_message() (network thread) so trust enforcement,
+/// Pushed from SendspinClient::process_json_message() (protocol task) so trust enforcement,
 /// RecordStore mutations (note_record_played), and admission arbitration all happen on the main
-/// loop, never on the network thread. Carries the parsed payload rather than requiring the main
+/// loop, never on the protocol task. Carries the parsed payload rather than requiring the main
 /// loop to re-read connection state that a concurrent event could have changed.
 struct ServerActivateEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection the activate was received on
@@ -289,6 +289,38 @@ struct PairingUiSnapshot {
  */
 class ConnectionManager {
 public:
+    /// @brief Maximum number of unproven inbound connections held at once
+    ///
+    /// The platform ws_server delivers only WS-upgraded sessions, so nursery slots are only ever
+    /// occupied by peers that speak WebSocket; raw-TCP junk never reaches the nursery. Outbound
+    /// entries do not count against the capacity in either direction: a user-initiated connect_to()
+    /// is admitted even against full inbound slots, and an in-flight connect_to() never causes an
+    /// inbound peer to be rejected. An outbound entry always replaces any previous one, so the
+    /// whole nursery is bounded by MAX_NURSERY_ENTRIES.
+    ///
+    /// Socket-budget invariant: gracefully rejecting a surplus inbound peer requires the transport
+    /// to accept NURSERY_CAPACITY + 2 sockets (1 established + the nursery + the surplus peer,
+    /// which must be connected to receive its goodbye). The default server_max_connections
+    /// satisfies this; start() warns when a configured value does not.
+    static constexpr size_t NURSERY_CAPACITY = 2;
+
+    /// @brief Bound on the whole nursery: NURSERY_CAPACITY inbound entries plus the one outbound.
+    static constexpr size_t MAX_NURSERY_ENTRIES = NURSERY_CAPACITY + 1;
+
+    /// @brief Maximum connections open at once: the admitted one plus the nursery bound.
+    static constexpr size_t MAX_OPEN_CONNECTIONS = MAX_NURSERY_ENTRIES + 1;
+
+    // pairing.md "Pairing Records" requires the client to cap its concurrently open paired
+    // connections below its record capacity, so that a completed pairing at capacity always has
+    // a record left to evict. The connection budget is fixed at compile time and the record
+    // capacity has a floor, so the cap is an invariant rather than a runtime check.
+    static_assert(MAX_OPEN_CONNECTIONS < RecordStore::MIN_MAX_RECORDS,
+                  "open connections must stay below the pairing-record capacity floor");
+
+    /// @brief Every managed connection at one moment: the current one and the nursery.
+    using ConnectionSnapshot =
+        InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS>;
+
     explicit ConnectionManager(SendspinClient* client);
     ~ConnectionManager();
 
@@ -358,9 +390,8 @@ public:
 
     /// @brief Returns the current active connection. Main-thread only.
     ///
-    /// Takes conn_ptr_mutex_, which sits inside json_processing_mutex_ in the lock order
-    /// (docs/conventions.md "Threading and cross-thread state"), so a handler running under the
-    /// JSON lock may call it.
+    /// Takes conn_ptr_mutex_, the outer lock of the library's lock order (docs/conventions.md
+    /// "Threading and cross-thread state").
     /// @return Pointer to the current connection, or nullptr if none.
     SendspinConnection* current() const {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
@@ -392,6 +423,28 @@ public:
     /// Takes conn_ptr_mutex_ under the same lock order as current().
     [[nodiscard]] std::vector<std::string> open_connection_psk_ids() const;
 
+    // ========================================
+    // Protocol task support
+    // ========================================
+
+    /// @brief Copies every managed connection (the current one and the nursery) into `out`.
+    /// Protocol task; takes conn_ptr_mutex_ for the copy only. A copy can be a connection's last
+    /// reference, whose destructor then runs on the protocol task: every path that releases a
+    /// connection detaches its inbound gate first (SendspinConnection::detach_inbound()), so a
+    /// transport thread that destructor joins is never parked on the gate, and at most
+    /// INBOUND_ACQUIRE_TIMEOUT_MS in a ring acquire.
+    void snapshot_connections(ConnectionSnapshot& out) const;
+
+    /// @brief Queues a lost connection for loop() to drop (on_connection_lost()). Protocol task:
+    /// the transport's close once its messages are drained, or a detached inbound gate. A
+    /// connection the manager no longer manages is a no-op when the event is drained.
+    void report_connection_lost(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Drops every deferred event still queued. Main loop, from SendspinClient::stop()
+    /// once the protocol task is joined: the losses it reported for the connections stop()
+    /// released name connections that are gone.
+    void drop_pending_events();
+
     /// @brief Schedules a pair/abort event for deferred processing in loop().
     /// @param event The pair-abort event to schedule (moved).
     void schedule_pair_abort(PairAbortEvent event);
@@ -406,7 +459,7 @@ public:
 
     /// @brief Schedules an on_pairing_succeeded notification for deferred delivery in loop().
     ///
-    /// Called from SendspinClient::process_json_message() on the network thread when the
+    /// Called from SendspinClient::process_json_message() on the protocol task when the
     /// server/pair-finalize ack handler stores a long-term record. loop() drains it and calls
     /// SendspinClient::note_pairing_succeeded(), which queues the listener callback for
     /// SendspinClient::loop() to fire unlocked.
@@ -443,14 +496,14 @@ public:
     // Event queuing (thread-safe)
     // ========================================
     //
-    // A network thread names an event's connection with weak_from_this().lock(), never
+    // A producer names an event's connection with weak_from_this().lock(), never
     // shared_from_this(), and the schedulers drop a null-connection event: an outbound connection's
     // destructor joins its transport thread, so a transport callback can run after the last owner
     // let go, where shared_from_this() throws. Holding a reference across the callback instead
     // could make the callback the last owner and have the transport thread join itself.
 
     /// @brief Schedules a server/activate event for deferred processing in loop().
-    /// Called from SendspinClient::process_json_message() on the NETWORK thread; trust
+    /// Called from SendspinClient::process_json_message() on the protocol task; trust
     /// enforcement, RecordStore mutations, and admission arbitration all happen in loop() on
     /// the main loop instead, matching every other cross-thread mutation in this class.
     /// @param event The server/activate event to schedule (moved).
@@ -589,10 +642,10 @@ private:
     void set_current_connection(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Admits the connection staged by the last set_current_connection(), if any.
-    /// Caller must not hold conn_ptr_mutex_: admission replays the held role messages under
-    /// SendspinClient's json_processing_mutex_, which the lock order in docs/conventions.md
-    /// ("Threading and cross-thread state") places outside conn_ptr_mutex_. Staging and flushing
-    /// are both main-loop-only and happen in the same call, so the staged slot cannot go stale.
+    /// Called with conn_ptr_mutex_ dropped, ahead of flush_deferred_releases(), so the incoming
+    /// connection is admitted (and sends the client/state held for it) before the outgoing one is
+    /// told to leave. Staging and flushing are both main-loop-only and happen in the same call, so
+    /// the staged slot cannot go stale.
     void flush_pending_admission();
 
     /// @brief Sets has_pending_events_, the lock-free gate loop() polls before acquiring
@@ -665,7 +718,7 @@ private:
     /// No-op if conn is not the current connection, or does not declare PLAYBACK.
     /// On a long-term record, also moves that record to most recently used in the record store.
     /// Caller must hold conn_ptr_mutex_: both RAM updates run here, so arbitration later in the
-    /// same locked block sees the last-played server and a network-thread eviction sees the new
+    /// same locked block sees the last-played server and a protocol-task eviction sees the new
     /// recency; the durable writes are left to SendspinClient::flush_pending_persistence().
     /// @param conn The connection to check (typically the connection an activate just applied to).
     void note_playback_activity(const SendspinConnection* conn);
@@ -718,34 +771,6 @@ private:
     /// @param psk_id psk_id whose sessions are no longer trusted.
     /// @param except Connection to leave alone (its caller is already dropping it), or nullptr.
     void drop_connections_using_psk_id(const std::string& psk_id, const SendspinConnection* except);
-
-    /// @brief Maximum number of unproven inbound connections held at once
-    ///
-    /// The platform ws_server delivers only WS-upgraded sessions, so nursery slots are only ever
-    /// occupied by peers that speak WebSocket; raw-TCP junk never reaches the nursery. Outbound
-    /// entries do not count against the capacity in either direction: a user-initiated connect_to()
-    /// is admitted even against full inbound slots, and an in-flight connect_to() never causes an
-    /// inbound peer to be rejected. An outbound entry always replaces any previous one, so the
-    /// whole nursery is bounded by MAX_NURSERY_ENTRIES.
-    ///
-    /// Socket-budget invariant: gracefully rejecting a surplus inbound peer requires the transport
-    /// to accept NURSERY_CAPACITY + 2 sockets (1 established + the nursery + the surplus peer,
-    /// which must be connected to receive its goodbye). The default server_max_connections
-    /// satisfies this; start() warns when a configured value does not.
-    static constexpr size_t NURSERY_CAPACITY = 2;
-
-    /// @brief Bound on the whole nursery: NURSERY_CAPACITY inbound entries plus the one outbound.
-    static constexpr size_t MAX_NURSERY_ENTRIES = NURSERY_CAPACITY + 1;
-
-    /// @brief Maximum connections open at once: the admitted one plus the nursery bound.
-    static constexpr size_t MAX_OPEN_CONNECTIONS = MAX_NURSERY_ENTRIES + 1;
-
-    // pairing.md "Pairing Records" requires the client to cap its concurrently open paired
-    // connections below its record capacity, so that a completed pairing at capacity always has
-    // a record left to evict. The connection budget is fixed at compile time and the record
-    // capacity has a floor, so the cap is an invariant rather than a runtime check.
-    static_assert(MAX_OPEN_CONNECTIONS < RecordStore::MIN_MAX_RECORDS,
-                  "open connections must stay below the pairing-record capacity floor");
 
     // ========================================
     // Pairing main-loop handlers
@@ -989,7 +1014,7 @@ private:
 
     // 8-bit fields
     /// True between start() and stop(). Written and read only under conn_ptr_mutex_ (the read is
-    /// on_new_connection(), on the network thread), so a peer delivered after stop() closed
+    /// on_new_connection(), on a transport thread), so a peer delivered after stop() closed
     /// admission is rejected rather than admitted into a nursery stop() has already emptied.
     bool accepting_{false};
 

@@ -25,7 +25,7 @@ namespace sendspin {
 
 class SendspinConnection;
 
-/// @brief One server/time reply, measured on the network thread and handed to the main loop
+/// @brief One server/time reply, measured on the protocol task and handed to the main loop
 struct TimeResponse {
     int64_t offset{0};     ///< Server clock minus client clock (microseconds).
     int64_t max_error{0};  ///< Half the round-trip delay (microseconds).

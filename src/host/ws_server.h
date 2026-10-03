@@ -42,7 +42,9 @@ class SendspinServerConnection;
  * upgrade (the Open event); sockets that never complete the handshake are closed by IXWebSocket's
  * server-side handshake timeout, which start() pins explicitly (WS_HANDSHAKE_TIMEOUT_SECS, 3 s)
  * so the bound cannot be silently rescoped by an IXWebSocket upgrade. Such sockets are invisible
- * to the rest of the library. Connection close events are reported via ConnectionClosedCallback.
+ * to the rest of the library. A connection's messages and its close go to the connection itself
+ * (SendspinServerConnection::handle_message(), SendspinConnection::notify_transport_closed()),
+ * which hands them to the protocol task.
  *
  */
 class SendspinWsServer {
@@ -52,15 +54,6 @@ public:
 
     /// @brief Callback type for notifying the client of new connections
     using NewConnectionCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
-
-    /// @brief Callback type for notifying the client when a connection closes
-    /// Passes the closed connection itself rather than its sockfd, matching the ESP build (where
-    /// fd recycling makes fd-keyed close events ambiguous by the time the manager drains them).
-    using ConnectionClosedCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
-
-    /// @brief Callback type for looking up a connection by sockfd.
-    /// Returns a shared_ptr to keep the connection alive during message dispatch.
-    using FindConnectionCallback = std::function<std::shared_ptr<SendspinConnection>(int sockfd)>;
 
     /// @brief Starts the WebSocket server on the configured port; the three task parameters are
     /// ESP-IDF httpd settings and are ignored here.
@@ -76,16 +69,6 @@ public:
     /// instance method for symmetry with the ESP build.
     // cppcheck-suppress functionStatic
     void tick() {}
-
-    /// @brief Sets the callback invoked when a client connection closes
-    void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
-        this->connection_closed_callback_ = std::move(callback);
-    }
-
-    /// @brief Sets the callback used to look up an existing connection by socket fd
-    void set_find_connection_callback(FindConnectionCallback&& callback) {
-        this->find_connection_callback_ = std::move(callback);
-    }
 
     /// @brief Sets the maximum number of simultaneous client connections
     /// The default supports handoff plus graceful rejection: one established connection, the
@@ -118,10 +101,6 @@ public:
 
 protected:
     // Struct fields
-
-    ConnectionClosedCallback connection_closed_callback_;
-
-    FindConnectionCallback find_connection_callback_;
 
     NewConnectionCallback new_connection_callback_;
 

@@ -28,7 +28,7 @@
 // Server-to-client pairing messages are injected via ConnectionManager's public
 // schedule_pairing_message() / schedule_pair_abort() / schedule_pairing_window_confirm()
 // APIs followed by SendspinClient::loop() (the same entry points process_json_message() uses
-// on the network thread), so these tests exercise the real deferred-event + main-loop path.
+// on the protocol task), so these tests exercise the real deferred-event + main-loop path.
 // Listener callbacks are NOT fired directly by ConnectionManager; they are queued into
 // SendspinClient::EventState and drained by SendspinClient::loop() after
 // connection_manager_->loop() returns, so every scenario below calls client.loop() and asserts
@@ -557,9 +557,12 @@ protected:
         this->client_->connection_manager_->handle_enter_pairing(conn);
     }
 
-    /// Simulate the connection being lost (network thread reporting a close/disconnect),
+    /// Simulate the connection being lost (protocol task reporting a close/disconnect),
     /// exercising ConnectionManager::on_connection_lost() with a pairing attempt in flight.
+    /// Under conn_ptr_mutex_, as loop()'s lifecycle drain runs it: the protocol task snapshots
+    /// the slots under that lock every tick.
     void simulate_connection_lost(SendspinConnection* conn) {
+        std::lock_guard<std::mutex> lock(this->client_->connection_manager_->conn_ptr_mutex_);
         this->client_->connection_manager_->on_connection_lost(conn);
     }
 
@@ -608,7 +611,7 @@ protected:
     }
 
     /// Schedule a server-to-client code pairing message for deferred processing (the same public
-    /// entry point process_json_message() uses on the network thread), without pumping loop().
+    /// entry point process_json_message() uses on the protocol task), without pumping loop().
     void schedule_pairing_message_event(ServerPairingMessageEvent event) {
         this->client_->connection_manager_->schedule_pairing_message(std::move(event));
     }
@@ -622,7 +625,7 @@ protected:
     /// processing, without pumping loop(). Drives the real activate-arbitration path in
     /// ConnectionManager::loop() (trust check, apply_server_activate, then either the
     /// already-admitted branch's leftover-activate handling or on_handshake_complete()):
-    /// the same entry point process_json_message() uses on the network thread.
+    /// the same entry point process_json_message() uses on the protocol task.
     void post_activate(std::vector<SendspinActivity> activities,
                        std::optional<std::vector<std::string>> active_roles,
                        std::optional<SendspinPairMethod> pairing_method,
@@ -2218,7 +2221,7 @@ TEST_F(PairingStateMachineTest, UnofferedPairingMethodOnActivationIsRejected) {
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
 
-// The network thread ORs a just-received activation's roles into the receive-gate mask before the
+// The protocol task ORs a just-received activation's roles into the receive-gate mask before the
 // main loop judges the activation, so a refusal has to take them back: otherwise the gate keeps
 // admitting traffic for a role this client never activated.
 TEST_F(PairingStateMachineTest, RefusedActivateTakesBackTheRoleBitsItAdded) {
@@ -2761,7 +2764,7 @@ TEST_F(PairingStateMachineTest, PairingAttemptTimeoutScanSuppressedDuringFinaliz
 
 // The admitted flag must be cleared when the admitted connection is dropped.
 //
-// SendspinConnection::is_admitted() is what the network-thread dispatch gate reads to decide
+// SendspinConnection::is_admitted() is what the protocol task's dispatch gate reads to decide
 // whether a connection may drive the roles (see requires_admitted_connection() in client.cpp).
 // drop_connection() moves the connection out of current_connection_ BEFORE calling
 // set_current_connection(nullptr), so the setter sees an already-null slot and cannot clear the
@@ -2769,7 +2772,7 @@ TEST_F(PairingStateMachineTest, PairingAttemptTimeoutScanSuppressedDuringFinaliz
 // call (queue_deferred_release keeps it alive through the goodbye window), so a missed clear
 // leaves an object that still claims admission.
 //
-// Asserted on the flag directly rather than end to end: disable_message_dispatch(), called a few
+// Asserted on the flag directly rather than end to end: detach_inbound(), called a few
 // lines earlier in the same function, independently blocks dispatch from a dropped connection, so
 // an end-to-end test cannot tell a cleared flag from a stale one.
 TEST_F(PairingStateMachineTest, DropClearsTheAdmittedFlag) {

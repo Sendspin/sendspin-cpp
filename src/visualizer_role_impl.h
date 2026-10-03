@@ -17,10 +17,9 @@
 
 #pragma once
 
+#include "inbound_ring.h"
 #include "inbox.h"
 #include "platform/event_flags.h"
-#include "platform/memory.h"
-#include "platform/spsc_ring_buffer.h"
 #include "sendspin/visualizer_role.h"
 
 #include <atomic>
@@ -74,10 +73,6 @@ VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* p
 /// backlog is dropped rather than replayed late.
 static constexpr int64_t VISUALIZER_MAX_DELIVERY_LAG_US = 20000;
 
-/// @brief Recovers a frame's arrival time from the low 32 bits of platform_time_us() the network
-/// thread stored with it. Exact while the frame is younger than 2^32 us (about 71 minutes).
-int64_t visualizer_arrival_from_stamp(uint32_t stamp, int64_t now);
-
 /// @brief Decides when the drain thread delivers a frame. Pure, so the timing rules are unit
 /// tested with `now` as an argument.
 ///
@@ -86,7 +81,8 @@ int64_t visualizer_arrival_from_stamp(uint32_t stamp, int64_t now);
 /// delays them), or on arrival when that is later, unless the drain thread has fallen more than
 /// VISUALIZER_MAX_DELIVERY_LAG_US behind that point.
 /// @param client_ts         Display time in client time.
-/// @param arrival_us        When the network thread received the frame.
+/// @param arrival_us        When the transport received the frame (widen_time_stamp_us() of its
+///                          ring item's receive_time_us).
 /// @param display_offset_ms VisualizerRoleConfig::display_offset_ms.
 /// @param now               The current platform_time_us().
 /// @return Microseconds to wait before delivering (0 to deliver now), or std::nullopt to drop.
@@ -102,12 +98,18 @@ struct VisualizerRole::Impl {
     // Nested types
     // ========================================
 
-    /// @brief Persistent drain thread context and platform ring buffer for visualizer data delivery
+    /// @brief Persistent drain thread context and the item list the protocol task hands it frames
+    /// through
     struct DrainTask {
-        SpscRingBuffer ring_buffer;
-        PlatformBuffer ring_storage;
+        /// Frames and clear markers: appended on the protocol task, taken on the drain thread,
+        /// recalled on the protocol task or, once the thread is joined, on the main loop. Links
+        /// shared inbound ring items; no storage of its own.
+        InboundItemList items;
         EventFlags event_flags;
         std::thread drain_thread;
+        /// The ring the list is bound to for the current run, or nullptr outside one. Written by
+        /// start() and stop() on the main loop; read by the protocol task and the drain thread.
+        std::atomic<InboundRing*> ring{nullptr};
     };
 
     /// @brief Deferred event state for the visualizer stream config, delivered to the main thread
@@ -121,23 +123,32 @@ struct VisualizerRole::Impl {
     // ========================================
 
     void attach_inbox(Inbox& inbox);
-    bool start();
+    /// @param ring The client's inbound ring for this run, which the drain thread's item list
+    ///        links.
+    bool start(InboundRing* ring);
     void build_hello_fields(ClientHelloMessage& msg) const;
+    /// @brief Inbound ring storage the requested stream arrives at per second: every requested
+    /// type at rate_max, each frame at its stored size (a spectrum frame with the configured bin
+    /// count), for the ring's pass-through budget (InboundRingBudget).
+    size_t stored_frame_bytes_per_second() const;
     void build_state_fields(ClientStateMessage& msg) const;
     // Each handler takes the teardown generation the receive gate captured when it admitted the
     // message and re-checks it where it takes effect; see accepts(). handle_stream_end() skips
-    // the check: cleanup() performs everything it does.
-    void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len, uint32_t generation);
+    // the check: cleanup() performs everything it does. All run on the protocol task.
+    /// @brief Hands a frame to the drain thread: by its ring item when it has one (clearing
+    /// `message.item`), otherwise copied into an item the protocol task acquires.
+    /// @param message The decrypted frame; `data` points at its message type byte.
+    void handle_binary(uint8_t binary_type, InboundMessage& message, uint32_t generation);
     void handle_stream_start(const ServerVisualizerStreamObject& stream, uint32_t generation);
     void handle_stream_end(uint32_t generation);
-    void handle_stream_clear(uint32_t generation) const;
+    void handle_stream_clear(uint32_t generation);
     void handle_stream_ring_event(VisualizerEventType event) const;
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
-    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
-    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
-    /// lost connection, never quiesces the network thread). Re-checking at each point of effect
-    /// invalidates the whole handler instead of only the part that ran before it.
+    /// The gate in SendspinClient's role dispatch is checked once, on the protocol task, while the
+    /// handler it admits runs on: a teardown on the main loop can land in between. Re-checking at
+    /// each point of effect invalidates the whole handler instead of only the part that ran
+    /// before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
@@ -160,10 +171,23 @@ struct VisualizerRole::Impl {
     /// overlap the thread's exit with other teardown.
     /// @return true if a running thread was signalled, false if none was running.
     bool signal_stop() const;
+    /// @brief Joins the drain thread and returns every frame it had not taken to the ring
     void stop() const;
-    void flush_ring_buffer() const;
-    void signal_clear_marker() const;
+    /// @brief Returns every frame on the list to the ring. Drain thread, or the main loop once it
+    /// is joined.
+    void flush_items() const;
+    /// @brief Protocol-task side of a clear boundary: flags the drain thread and appends a marker
+    void signal_clear_marker(uint32_t generation);
+    /// @brief Drain-thread side: returns frames up to and including the marker
     void discard_to_clear_marker() const;
+    /// @brief Recalls the frames the drain thread has not taken once a teardown has moved the
+    /// generation past the one they were appended under. Protocol task only: each tick, and
+    /// before each item it hands over.
+    void recall_stale_items(uint32_t generation);
+    /// @brief Fills an item's consumer fields and hands it to the drain thread, returning it to
+    /// the ring with a warning when the visualizer is over quota. Protocol task only.
+    bool hand_item(void* item, size_t item_len, uint8_t type, uint32_t data_len,
+                   uint32_t generation);
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
     void enqueue_stream_event(VisualizerEventType event, uint32_t generation) const;
@@ -185,18 +209,29 @@ struct VisualizerRole::Impl {
     Inbox* inbox{nullptr};
     VisualizerRoleListener* listener{nullptr};
 
-    // Atomic fields (written by network thread, read by drain thread / cleanup)
+    /// Throttles the over-quota drop warning in hand_item(). Protocol task only.
+    InboundDropLog over_quota_log;
+    /// Throttles the warning for a frame that could not be copied into a ring item. Protocol task
+    /// only.
+    InboundDropLog copy_drop_log;
+
+    // 32-bit fields
+    /// The teardown generation the item list was last recalled for (recall_stale_items()).
+    /// Protocol task only.
+    uint32_t recalled_generation{0};
+
+    // Atomic fields (written by the protocol task, read by drain thread / cleanup)
     /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event queued
     /// afterwards. At the drain an event whose stamp no longer matches is discarded, so it cannot
-    /// act after the teardown (see event_is_current() in inbox.h). Atomic because the network
-    /// thread reads it (see accepts()).
+    /// act after the teardown (see event_is_current() in inbox.h). Atomic because the protocol
+    /// task reads it (see accepts()).
     std::atomic<uint32_t> cleanup_generation{0};
 
     std::atomic<uint8_t> spectrum_bin_count{0};
     std::atomic<bool> tracks_downbeats{false};
     std::atomic<bool> stream_active{false};
     // Bitmask of negotiated wire types, bit N = wire type SENDSPIN_BINARY_VISUALIZER_FIRST + N.
-    // Written by handle_stream_start and read by handle_binary on the same network thread, so
+    // Written by handle_stream_start and read by handle_binary on the same protocol task, so
     // admission is always judged against the config in force when a message arrives; atomic only
     // because cleanup() clears it from the main thread.
     std::atomic<uint8_t> negotiated_types_mask{0};

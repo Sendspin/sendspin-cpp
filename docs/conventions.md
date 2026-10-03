@@ -8,10 +8,19 @@ checklists in `.claude/skills/` apply these standards to a diff.
 
 ## Threading and cross-thread state
 
-- The network thread does minimal work: receive, copy, validate framing, and
-  hand off. Payload validation and decoding happen on the drain or worker
-  thread that consumes the data, following the pattern the player and artwork
-  roles establish.
+- A transport thread is a pipe: it receives a complete message into the
+  shared inbound ring (an admitted connection) or the connection's fallback
+  buffer (an unadmitted one, or a message split across WebSocket frames),
+  reports a close, and wakes the protocol task. Every other receive-side step
+  on a connection (decrypt, reassembly, the handshake, dispatch, the admission
+  replay, close reporting) runs on the protocol task. A connection's sends come
+  from the protocol task (the Noise handshake messages and the replies its
+  handlers make) and from the main loop (hellos, client/state, time requests,
+  goodbyes), and
+  `NoiseTransport::session_mutex_` serializes them. Payload validation and
+  decoding happen on the drain or worker thread that consumes the data, following the pattern the player and artwork
+  roles establish; the protocol task hands audio and visualizer frames over in
+  the ring item they arrived in rather than copying them.
 - All main-loop-bound cross-thread state goes through the `Inbox`
   (`src/inbox.h`). Do not add new mutex-protected endpoints polled by
   `loop()`. The one exemption is `ConnectionManager`'s `pending_*_events_`
@@ -30,7 +39,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - Event producers push through `push_event_or_log()` rather than hand-rolling
   the build, push, and log-on-drop sequence.
 - A bounded queue or ring that drops an item never drops it silently: log at
-  least a warning at the drop site.
+  least a warning at the drop site. A site that can drop every message of a
+  burst throttles it with `InboundDropLog`: one warning when the drops start,
+  one with their count when they stop.
 - An event whose delivery must not survive its producer being torn down
   carries the producer's teardown generation and is checked against it at the
   drain (`push_event_or_log()` / `event_is_current()`), rather than relying on
@@ -39,29 +50,41 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - Callback dispatch must tolerate re-entrant teardown: a listener callback may
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.
-- A message handler on the receive path writes to Inbox slots, role buffers,
-  the connection it was handed, and the connection manager's deferred-event
-  queues, and nothing else. It does not reach back into the client for the
-  current connection or the clock, does not publish state, and does not call a
-  listener: those belong on the main-loop drain. That keeps the network thread
-  cheap and keeps the admission replay, which runs the same handlers, as short
-  as the live path. Two handlers go further and state why at their site:
-  `noise/handshake` runs the re-handshake and its `msg2` send inline because it
-  must stay ordered with decrypt on the same thread, and `server/pair-finalize`
-  commits the pairing record to RAM inline because the re-handshake that
-  follows it resolves that psk_id on this same thread.
+- A message handler on the protocol task writes to Inbox slots, role item
+  lists and buffers, the connection it was handed, and the connection
+  manager's deferred-event queues, and nothing else. It does not reach back
+  into the client for the current connection or the clock, does not publish
+  state, and does not call a listener: those belong on the main-loop drain.
+  That keeps one connection's message from delaying every other connection's,
+  and keeps the admission replay, which runs the same handlers, as short as the
+  live path. Connection-protocol work a message triggers (the `noise/handshake`
+  re-handshake and its `msg2` send, the RAM commit of a pairing record on
+  `server/pair-finalize`) is not role work: it runs on the protocol task like
+  the decrypt it must stay ordered with.
+- A protocol-task step has a bounded wait or none, with one exception: the
+  task takes `ConnectionManager::conn_ptr_mutex_` every tick
+  (`snapshot_connections()`) and in the handlers that ask the manager about
+  open connections (`open_connection_psk_ids()`), and main-loop sections hold
+  that lock across blocking work, so the task can wait as long as they do. A
+  transport's wait on the task is bounded: an admitted connection waits at most
+  `INBOUND_ACQUIRE_TIMEOUT_MS` for ring space and drops the message with a
+  warning, and an unadmitted one waits at most
+  `InboundGate::WRITABLE_WAIT_MS` for its previous message to be consumed and
+  is closed if it is not.
 - The client holds exactly one lock order, and every site that takes two locks
-  cites it: `SendspinClient::json_processing_mutex_`, then
-  `ConnectionManager::conn_ptr_mutex_`, then the leaves
+  cites it: `ConnectionManager::conn_ptr_mutex_`, then the leaves
   (`ConnectionManager::conn_mutex_`, `ConnectionManager::time_filter_mutex_`,
-  `RecordStore::mutex_`, the Inbox mutex),
-  which nest under anything and under nothing. Taking a lock further left while
-  holding one further right is a defect, not a local trade-off. The receive path fixes this
-  order: a `server/pair-finalize` handler runs under the JSON lock and asks the
-  connection manager for the open connections' psk_ids, so work that needs the
-  JSON lock is pushed out from under `conn_ptr_mutex_` instead (see
-  `ConnectionManager::flush_pending_admission()`), the same way a blocking
-  release is (`flush_deferred_releases()`).
+  `RecordStore::mutex_`, the Inbox mutex, `SendspinConnection::psk_id_mutex_`,
+  `NoiseTransport::session_mutex_`, and the inbound ring's, item lists' and
+  protocol task command queue's own locks), which nest under anything and
+  under no other library lock. Taking `conn_ptr_mutex_` while holding a leaf
+  is a defect, not a local trade-off. `session_mutex_` is a leaf among the
+  library's locks, but a send made under it takes the transport's own send
+  lock (IXWebSocket's, or esp_websocket_client's, which a send waits for up to
+  its send timeout), so those sit under it.
+  Blocking work (a deferred release, an admission) is pushed out from under
+  `conn_ptr_mutex_` instead (see `ConnectionManager::flush_deferred_releases()`
+  and `flush_pending_admission()`).
 
 ## Protocol validation
 

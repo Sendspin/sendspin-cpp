@@ -17,6 +17,9 @@
 #include "platform/logging.h"
 #include "platform/time.h"
 
+#include <mutex>
+#include <utility>
+
 namespace sendspin {
 
 static const char* const TAG = "sendspin.inbound";
@@ -48,6 +51,14 @@ void* InboundRing::acquire(size_t message_len, uint32_t timeout_ms) {
     return item;
 }
 
+void* InboundRing::acquire_local(size_t message_len, uint32_t timeout_ms) {
+    void* item = this->acquire(message_len, timeout_ms);
+    if (item != nullptr) {
+        inbound_item_header(item)->kind = InboundKind::LOCAL;
+    }
+    return item;
+}
+
 void InboundRing::complete(void* item) {
     // Counted before the item is published, so a take woken by the publish sees the count.
     if (this->ring_.is_storage_head(item)) {
@@ -59,11 +70,40 @@ void InboundRing::complete(void* item) {
 void* InboundRing::take(size_t* message_len, uint32_t timeout_ms) {
     for (;;) {
         void* item = this->take_one(message_len, timeout_ms);
-        if (item == nullptr || inbound_item_header(item)->kind != InboundKind::DISCARD) {
+        if (item == nullptr) {
+            return nullptr;
+        }
+        const InboundKind kind = inbound_item_header(item)->kind;
+        if (kind != InboundKind::DISCARD && kind != InboundKind::LOCAL) {
             return item;
         }
-        this->return_item(item);
+        this->return_in_ring_order(item);
     }
+}
+
+void InboundRing::return_in_ring_order(void* item) {
+    InboundItemHeader* header = inbound_item_header(item);
+    if (header->kind == InboundKind::LOCAL && !this->count_local_return(header, false)) {
+        // The protocol task's party; the holder still has the item.
+        return;
+    }
+    this->ring_.return_item(item);
+}
+
+bool InboundRing::count_local_return(InboundItemHeader* header, bool release_charge) {
+    // Plain reads and writes of the header: never an atomic on ring storage, which may be
+    // external RAM (see InboundItemHeader::local_returns).
+    InboundItemList* list =
+        header->holder_set != 0 ? this->lists_[static_cast<size_t>(header->holder)] : nullptr;
+    if (list != nullptr) {
+        return list->count_local_return(header, release_charge, this->quota(header->holder));
+    }
+    // Never charged (both parties are the protocol task), or the holder's list is unbound, which
+    // happens only once every thread that returns items is joined: no lock is needed.
+    if (release_charge && header->charge != 0) {
+        this->quota(header->holder).release(std::exchange(header->charge, 0));
+    }
+    return ++header->local_returns >= LOCAL_ITEM_PARTIES;
 }
 
 void InboundRing::reset() {
@@ -77,12 +117,14 @@ void InboundRing::reset() {
             void* item = this->pending_;
             this->pending_ = nullptr;
             this->pending_len_ = 0;
-            this->return_item(item);
+            this->return_in_ring_order(item);
         }
         size_t len = 0;
         void* item = this->take_one(&len, 0);
         if (item != nullptr) {
-            this->return_item(item);
+            // The ring-order return the protocol task would have made: for a LOCAL item whose
+            // holder already returned it, this is the missing half.
+            this->return_in_ring_order(item);
         } else if (this->pending_ == nullptr) {
             return;
         }
@@ -133,11 +175,20 @@ bool InboundRing::charge(void* item, size_t message_len, InboundHolder holder) {
     InboundItemHeader* header = inbound_item_header(item);
     header->charge = static_cast<uint32_t>(stored);
     header->holder = holder;
+    header->holder_set = 1;
     return true;
 }
 
 void InboundRing::return_item(void* item) {
     InboundItemHeader* header = inbound_item_header(item);
+    if (header->kind == InboundKind::LOCAL) {
+        // The holder's party releases the charge now, so the quota never counts an item its
+        // holder is done with; the item itself goes back on the second party.
+        if (this->count_local_return(header, true)) {
+            this->ring_.return_item(item);
+        }
+        return;
+    }
     if (header->charge != 0) {
         this->quota(header->holder).release(header->charge);
         header->charge = 0;
@@ -153,6 +204,9 @@ bool InboundGate::wait_until_writable(uint32_t timeout_ms) {
     const bool forever = timeout_ms == UINT32_MAX;
     const int64_t deadline_us = platform_time_us() + static_cast<int64_t>(timeout_ms) * 1000;
     while (!this->may_write()) {
+        if (this->is_detached()) {
+            return false;
+        }
         uint32_t wait_ms = UINT32_MAX;
         if (!forever) {
             const int64_t remaining_us = deadline_us - platform_time_us();
@@ -170,13 +224,40 @@ bool InboundGate::wait_until_writable(uint32_t timeout_ms) {
 // InboundItemList
 // ============================================================================
 
-bool InboundItemList::create(InboundRing* ring) {
+bool InboundItemList::create(InboundRing* ring, InboundHolder holder) {
     if (!this->flags_.is_created() && !this->flags_.create()) {
         return false;
     }
     this->ring_ = ring;
     this->storage_ = ring->storage();
+    this->holder_ = holder;
+    ring->register_list(holder, this);
     return true;
+}
+
+void InboundItemList::unbind() {
+    if (this->ring_ != nullptr) {
+        this->ring_->register_list(this->holder_, nullptr);
+    }
+    this->ring_ = nullptr;
+    this->storage_ = nullptr;
+}
+
+bool InboundItemList::count_local_return(InboundItemHeader* header, bool release_charge,
+                                         InboundQuota& quota) {
+    uint32_t charge = 0;
+    bool second = false;
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        if (release_charge) {
+            charge = std::exchange(header->charge, 0);
+        }
+        second = ++header->local_returns >= LOCAL_ITEM_PARTIES;
+    }
+    if (charge != 0) {
+        quota.release(charge);
+    }
+    return second;
 }
 
 void InboundItemList::append(void* item) {

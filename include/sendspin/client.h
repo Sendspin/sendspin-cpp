@@ -238,7 +238,10 @@ enum class LogLevel : uint8_t {
 
 // Forward declarations
 class ConnectionManager;
+class InboundRing;
+struct InboundMessage;
 struct PairingUiSnapshot;
+class ProtocolTask;
 class RecordStore;
 class SendspinArenaAllocator;
 class SendspinConnection;
@@ -701,19 +704,53 @@ private:
     /// release's listener callback may call back into the client.
     void flush_high_performance_releases();
 
-    /// @brief Signals the drain roles, then goodbyes and closes every transport, joining the
-    /// network threads. The shared first half of stop() and the destructor's teardown.
+    /// @brief Signals the drain roles, goodbyes and closes every transport, joining the
+    /// transport threads, then joins the protocol task. The shared first half of stop() and the
+    /// destructor's teardown.
     /// @return The pairing prompts the dropped connections left showing; stop() dismisses them
     ///         after cleanup_connection_state(), the destructor dispatches nothing.
     PairingUiSnapshot close_transports();
 
     /// @brief Asks the artwork and visualizer threads to exit without joining them, so their
-    /// exit overlaps the transport teardown. The player is excluded: its ring must keep a
-    /// consumer until the network threads are gone (see stop()).
+    /// exit overlaps the transport teardown. The player is excluded: its sync task returns the
+    /// ring items it holds as it plays, which a transport waiting for ring space may need until
+    /// the transports are gone (see stop()).
     void signal_drain_role_stops();
 
-    /// @brief Stops and joins every threaded role; each is a no-op if not running
+    /// @brief Stops and joins every threaded role; each is a no-op if not running. Each role
+    /// returns the inbound ring items it holds after its join.
     void stop_role_threads();
+
+    /// @brief Creates the shared inbound ring for this run, sized by derive_inbound_ring_bytes()
+    /// from the enabled roles and placed per SendspinClientConfig::inbound_ring_location, and
+    /// sets the per-role quotas. Main loop only, from start().
+    /// @return false when the storage cannot be allocated.
+    bool create_inbound_ring();
+
+    /// @brief Returns every item left in the inbound ring and releases its storage. Main loop
+    /// only, once every transport, the protocol task and every consumer are joined.
+    void release_inbound_ring();
+
+    // ========================================
+    // Protocol task
+    // ========================================
+
+    /// @brief The protocol task's work: the command queue, the role lists' recall check, each
+    /// managed connection's held replay, pending pre-admission message and drained close, and the
+    /// inbound ring. Protocol task only.
+    /// @return ProtocolTask::NO_DEADLINE, or 0 to run again at once when the ring was not drained
+    ///         within one pass.
+    uint32_t protocol_tick();
+
+    /// @brief Runs one of a connection's messages through the receive path and returns its ring
+    /// item unless a role kept it. Protocol task only.
+    void process_inbound(SendspinConnection& conn, InboundMessage& message);
+
+    /// @brief Replays the role messages `conn` held before admission, once it is admitted.
+    /// Protocol task only: called ahead of each of the connection's messages and for every
+    /// managed connection on each tick, so the replay precedes every message that arrives after
+    /// it was held.
+    void replay_admitted_messages(SendspinConnection* conn);
 
     /// @brief Builds the formatted client hello message from config
     std::string build_hello_message();
@@ -724,9 +761,9 @@ private:
 
     /// @brief Processes a JSON message from a connection
     ///
-    /// Called on the connection's network thread. Takes the JSON processing mutex and hands off
-    /// to dispatch_json_message(). `data` is not null-terminated and is valid for the duration
-    /// of the call only.
+    /// Called on the protocol task. Replays any held role messages first, then hands off to
+    /// dispatch_json_message(). `data` is not null-terminated and is valid for the duration of
+    /// the call only.
     void process_json_message(SendspinConnection* conn, const char* data, size_t len,
                               int64_t timestamp);
 
@@ -742,29 +779,26 @@ private:
     /// differ only in the payload they parse.
     void schedule_malformed_pairing_message(SendspinConnection* conn, const char* type_name);
 
-    /// @brief Parses and routes one JSON message. The caller holds json_processing_mutex_.
+    /// @brief Parses and routes one JSON message. Protocol task only (it owns json_arena_).
     /// @param origin Whether the admission gate still applies to this message
     void dispatch_json_message(SendspinConnection* conn, const char* data, size_t len,
                                int64_t timestamp,
                                JsonMessageOrigin origin = JsonMessageOrigin::NETWORK);
 
-    /// @brief Replays the connection's held role messages and marks it admitted.
+    /// @brief Marks the connection admitted and wakes the protocol task, which replays the role
+    /// messages the connection held (replay_admitted_messages()) ahead of any later message.
     ///
-    /// Main loop only; ConnectionManager::flush_pending_admission() is the only caller. The
-    /// replay and the flag happen under one hold of json_processing_mutex_ so the role traffic a
-    /// server sent between its server/activate and this admission is applied exactly once, in
-    /// arrival order, ahead of anything that arrives afterwards. A client/state held for this
-    /// admission (see client_state_held_) is sent once the flag is set.
-    ///
-    /// THREADING: takes json_processing_mutex_, so the caller must hold no ConnectionManager
-    /// lock. That is the library-wide lock order (docs/conventions.md, "Threading and
-    /// cross-thread state"): json_processing_mutex_ outside conn_ptr_mutex_.
+    /// Main loop only; ConnectionManager::flush_pending_admission() is the only caller, with no
+    /// ConnectionManager lock held. A client/state held for this admission (see
+    /// client_state_held_) is sent once the flag is set: the server's reply traffic reaches the
+    /// protocol task only behind the replay.
     void admit_connection(SendspinConnection* conn);
 
-    /// @brief Processes a binary message from a connection
+    /// @brief Processes a binary message from a connection. Protocol task only.
     /// Every binary message is role-bound, so this is dropped unless `conn` holds the admitted
-    /// slot.
-    void process_binary_message(SendspinConnection* conn, const uint8_t* payload, size_t len);
+    /// slot. A player audio chunk or a visualizer frame is handed to its consumer by its ring item
+    /// when it has one (the role clears `message.item`).
+    void process_binary_message(SendspinConnection* conn, InboundMessage& message);
 
     // ========================================
     // State publishing
@@ -829,7 +863,7 @@ private:
 
     // Pairing and trust notifications. Each is called by ConnectionManager on the main loop,
     // most while conn_ptr_mutex_ is held, and queues the listener callback for delivery from
-    // loop() so it fires unlocked. note_pairing_succeeded() runs after the network thread's
+    // loop() so it fires unlocked. note_pairing_succeeded() runs after the protocol task's
     // schedule_pairing_succeeded() event has been drained (ConnectionManager::loop()).
 
     /// @brief Queue an on_pairing_started notification
@@ -883,12 +917,18 @@ private:
     /// provider). Set by load_or_generate_identity() in start(); outlives every
     /// connection the manager hands it out to.
     std::unique_ptr<Identity> identity_;
+    /// The shared inbound ring for the current run: created by start(), released by stop() once
+    /// every producer and consumer is joined. Null while stopped. Reached by the transports and
+    /// the protocol task through the pointers attach_inbound() and the role starts hand out.
+    /// Written on the main loop only. The httpd task also reads this member, in
+    /// ConnectionManager::on_new_connection() through attach_inbound(): safe because start()
+    /// creates the ring before the manager opens admission (and the server only starts after
+    /// that), and stop() releases it only after ConnectionManager::stop() has stopped the server
+    /// and joined its tasks.
+    std::unique_ptr<InboundRing> inbound_ring_;
     /// Internal-RAM scratch arena for parsing incoming JSON; null unless config_.json_arena_size >
-    /// 0
+    /// 0. Used by the protocol task only.
     std::unique_ptr<SendspinArenaAllocator> json_arena_;
-    /// Serializes process_json_message() (and its use of json_arena_) across the network threads
-    /// of concurrently live connections (current + pending during a handoff).
-    std::mutex json_processing_mutex_;
     SendspinClientListener* listener_{nullptr};
 #ifdef SENDSPIN_ENABLE_METADATA
     std::unique_ptr<MetadataRole> metadata_;
@@ -901,6 +941,9 @@ private:
 #ifdef SENDSPIN_ENABLE_PLAYER
     std::unique_ptr<PlayerRole> player_;
 #endif
+    /// The protocol thread, its command queue and its state slot. Created with the client and
+    /// started/stopped by start()/stop(), so a transport may wake it at any time.
+    std::unique_ptr<ProtocolTask> protocol_task_;
     /// In-memory pairing record store (PSK resolution). Set in start();
     /// outlives every connection the manager hands it out to.
     std::unique_ptr<RecordStore> record_store_;

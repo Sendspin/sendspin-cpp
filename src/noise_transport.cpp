@@ -213,8 +213,8 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
         return err;
     }
 
-    // Swap to the new session. After this line, all subsequent inbound decrypt (network
-    // thread, sequential with this call) uses the new session, and all subsequent encrypt
+    // Swap to the new session. After this line, all subsequent inbound decrypt (protocol
+    // task, sequential with this call) uses the new session, and all subsequent encrypt
     // (once the lock is released) uses the new session too.
     this->session_ = std::move(next_session);
     return SsErr::OK;
@@ -225,15 +225,16 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
 // ============================================================================
 
 size_t NoiseTransport::decrypt_in_place(uint8_t* ciphertext, size_t len) {
-    // Network thread only; unlocked by design (see the file comment).
+    // Protocol task only; unlocked by design (see the file comment).
     if (!this->session_) {
         return 0;
     }
     return this->session_->decrypt(ciphertext, len);
 }
 
-NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaintext, size_t len) {
-    // Network thread only (reassembly state is unlocked).
+NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaintext, size_t len,
+                                                                 bool admitted) {
+    // Protocol task only (reassembly state is unlocked).
     if (len == 0) {
         SS_LOGW(TAG, "accept_plaintext: empty plaintext");
         return {};
@@ -305,7 +306,7 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         if (!this->reasm_discarding_) {
             // reasm_buf_ accumulates the final message shape directly ([orig_type][data...]),
             // so completion needs no staging copy.
-            if (this->reasm_reserve(1)) {
+            if (this->reasm_reserve(1, admitted)) {
                 this->reasm_buf_.data()[0] = orig_type;
                 this->reasm_len_ = 1;
             } else {
@@ -331,11 +332,11 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         // Sentinel PSK, and nothing that legitimately arrives then approaches the tighter cap
         // (the pre-admission JSON hold budget, MAX_HELD_BYTES, is half of it), so that cap
         // applies until the connection wins the admitted slot.
-        const size_t cap = this->reasm_cap();
+        const size_t cap = reasm_cap(admitted);
         if (this->reasm_len_ - 1 + data_len > cap) {
             SS_LOGW(TAG, "fragmented message exceeds %zu bytes; discarding the rest of it", cap);
             this->reasm_discarding_ = true;
-        } else if (!this->reasm_reserve(this->reasm_len_ + data_len)) {
+        } else if (!this->reasm_reserve(this->reasm_len_ + data_len, admitted)) {
             this->reasm_discarding_ = true;
         } else {
             std::memcpy(this->reasm_buf_.data() + this->reasm_len_, data, data_len);
@@ -384,20 +385,18 @@ bool NoiseTransport::grow_buffer(PlatformBuffer& buf, size_t needed, size_t cap,
     return ok;
 }
 
-size_t NoiseTransport::reasm_cap() const {
-    return this->admitted_.load(std::memory_order_acquire)
-               ? MAX_REASSEMBLED_MESSAGE_BYTES
-               : MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES;
+size_t NoiseTransport::reasm_cap(bool admitted) {
+    return admitted ? MAX_REASSEMBLED_MESSAGE_BYTES : MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES;
 }
 
-bool NoiseTransport::reasm_reserve(size_t needed) {
+bool NoiseTransport::reasm_reserve(size_t needed, bool admitted) {
     // Capped at the cap in force + 1: the caller's own size check (accept_plaintext) admits a
     // `needed` of exactly that much, one byte of orig_type plus the largest message that cap will
     // reassemble. Both read the cap from reasm_cap() so the clamp cannot be wider than the check.
     // Without the clamp the doubling step above the admitted size would reserve ~2 MiB per
     // connection, retained for the connection's life, which a peer picks by choosing its fragment
     // sizes.
-    return this->grow_buffer(this->reasm_buf_, needed, this->reasm_cap() + 1, "reassembly");
+    return this->grow_buffer(this->reasm_buf_, needed, reasm_cap(admitted) + 1, "reassembly");
 }
 
 bool NoiseTransport::ensure_send_buf(size_t needed) {

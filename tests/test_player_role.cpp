@@ -20,10 +20,12 @@
 /// The binary audio chunk header is parsed directly too.
 
 #include "fake_persistence.h"
+#include "inbound_test_helpers.h"
 #include "inbox.h"
 #include "player_role_impl.h"  // build_state_fields(); private access, see tests/CMakeLists.txt
 #include "protocol_messages.h"
 #include "sync_task.h"
+#include "visualizer_role_impl.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/player_role.h"
@@ -272,15 +274,25 @@ TEST(PlayerAudioChunk, ShortChunkIsRejected) {
 
 namespace {
 
-// A PlayerRole::Impl whose encoded ring and event flags exist but whose sync-task thread was
-// never started, bound to its own Inbox. Nothing drains the ring or the inbox, so what a refused
+// Binds the sync task's item list to a created `ring` the way SyncTask::start() does, without
+// starting its thread, so what a handler handed over stays on the list to be read.
+void bind_items(PlayerRole::Impl& impl, InboundRing& ring) {
+    EXPECT_TRUE(impl.sync_task->init(&impl));
+    EXPECT_TRUE(impl.sync_task->encoded_items_.create(&ring, InboundHolder::PLAYER));
+    impl.sync_task->ring_.store(&ring, std::memory_order_release);
+}
+
+// A PlayerRole::Impl whose item list is bound to a ring of its own but whose sync-task thread was
+// never started, bound to its own Inbox. Nothing drains the list or the inbox, so what a refused
 // handler did not do is directly observable; a running task would discard idle-time audio and
-// make the ring say nothing either way. Heap-allocated with program lifetime (static deques,
+// make the list say nothing either way. Heap-allocated with program lifetime (static deques,
 // mirroring make_impl() in test_visualizer_role.cpp): Impl holds atomics, so it is neither
 // copyable nor movable, and it keeps a raw SendspinClient* that must outlive it.
-std::unique_ptr<PlayerRole::Impl> make_impl() {
+/// @param ring A created ring to bind to, or nullptr for one of its own.
+std::unique_ptr<PlayerRole::Impl> make_impl(InboundRing* ring = nullptr) {
     static std::deque<SendspinClient> clients;
     static std::deque<Inbox> inboxes;
+    static std::deque<InboundRing> rings;
 
     PlayerRoleConfig config;
     config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
@@ -288,7 +300,11 @@ std::unique_ptr<PlayerRole::Impl> make_impl() {
     auto impl = std::make_unique<PlayerRole::Impl>(std::move(config), &clients.back());
     inboxes.emplace_back();
     impl->attach_inbox(inboxes.back());
-    EXPECT_TRUE(impl->sync_task->init(impl.get(), impl->config.audio_buffer_capacity));
+    if (ring == nullptr) {
+        ring = &rings.emplace_back();
+        create_test_ring(*ring);
+    }
+    bind_items(*impl, *ring);
     return impl;
 }
 
@@ -317,11 +333,23 @@ ServerCommandMessage volume_command(uint8_t volume) {
     return cmd;
 }
 
-// One audio chunk: a 12-byte header followed by a frame, as handle_binary receives it.
-std::vector<uint8_t> audio_chunk() {
-    std::vector<uint8_t> chunk(12, 0x00);
-    chunk.insert(chunk.end(), {0xDE, 0xAD, 0xBE, 0xEF});
+// One audio chunk message as handle_binary receives it: the type byte, the 12-byte header (the
+// server timestamp first) and a frame, the frame's first byte set to `marker`.
+std::vector<uint8_t> audio_chunk(uint8_t marker = 0xDE, int64_t server_timestamp = 0) {
+    std::vector<uint8_t> chunk{SENDSPIN_BINARY_PLAYER_AUDIO};
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        chunk.push_back(static_cast<uint8_t>(static_cast<uint64_t>(server_timestamp) >> shift));
+    }
+    chunk.insert(chunk.end(), 4, 0x00);  // send_ahead
+    chunk.insert(chunk.end(), {marker, 0xAD, 0xBE, 0xEF});
     return chunk;
+}
+
+// Hands one chunk to the role outside any ring item, as for a reassembled chunk.
+void hand_copied_chunk(PlayerRole::Impl& impl, std::vector<uint8_t> chunk, uint32_t generation) {
+    InboundMessage message = message_over(chunk);
+    impl.handle_binary(message, generation);
+    take_in_ring_order(*impl.sync_task->ring());
 }
 
 // Drains the inbox and counts the player stream events it held.
@@ -359,8 +387,9 @@ StreamEventCounts drain_stream_events(PlayerRole::Impl& impl) {
 // in it.
 //
 // Each handler's effect is main-loop state that the role publishes rather than a callback, so the
-// inbox slots and the encoded ring are read directly: with no main loop running there is nothing
-// a caller or peer can observe that distinguishes a refused handler from one that never ran.
+// inbox slots and the sync task's item list are read directly: with no main loop running there
+// is nothing a caller or peer can observe that distinguishes a refused handler from one that
+// never ran.
 TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
     struct Row {
         const char* name;
@@ -384,15 +413,14 @@ TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
          }},
         {"audio chunk",
          [](PlayerRole::Impl& impl, uint32_t generation) {
-             const std::vector<uint8_t> chunk = audio_chunk();
-             impl.handle_binary(chunk.data(), chunk.size(), generation);
+             hand_copied_chunk(impl, audio_chunk(), generation);
          },
-         [](PlayerRole::Impl& impl) { return !impl.sync_task->encoded_ring_buffer_->is_empty(); }},
+         [](PlayerRole::Impl& impl) { return !impl.sync_task->encoded_items_.is_empty(); }},
         // stream/clear enqueues the marker that tells the sync task where the discarded pre-seek
         // audio ends, so a stale one would place that boundary in an ended stream.
         {"stream/clear",
          [](PlayerRole::Impl& impl, uint32_t generation) { impl.handle_stream_clear(generation); },
-         [](PlayerRole::Impl& impl) { return !impl.sync_task->encoded_ring_buffer_->is_empty(); }},
+         [](PlayerRole::Impl& impl) { return !impl.sync_task->encoded_items_.is_empty(); }},
         {"server/command",
          [](PlayerRole::Impl& impl, uint32_t generation) {
              impl.handle_server_command(volume_command(70), generation);
@@ -415,13 +443,15 @@ TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
 
         impl->cleanup();
         ASSERT_EQ(drain_stream_events(*impl).ends, 1) << "cleanup() queued no STREAM_END";
-        ASSERT_TRUE(impl->sync_task->encoded_ring_buffer_->is_empty());
+        ASSERT_TRUE(impl->sync_task->encoded_items_.is_empty());
 
         row.drive(*impl, captured);
+        take_in_ring_order(*impl->sync_task->ring());
         EXPECT_FALSE(row.took_effect(*impl)) << "a stale message reached the main loop";
 
         // Control: the same message with the generation the role now reports takes effect.
         row.drive(*impl, live_generation(*impl));
+        take_in_ring_order(*impl->sync_task->ring());
         EXPECT_TRUE(row.took_effect(*impl));
     }
 }
@@ -444,15 +474,235 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
+        InboundRing ring;  // outlives the client, whose sync task holds a pointer to it
+        create_test_ring(ring);
         SendspinClient client(make_client_config("player-availability"));
         client.set_available(row.available_when_added);
         PlayerRole::Impl& impl = *client.add_player(make_player_config()).impl_;
-        ASSERT_TRUE(impl.sync_task->init(&impl, impl.config.audio_buffer_capacity));
+        bind_items(impl, ring);
         client.set_available(row.available_on_arrival);
 
-        const std::vector<uint8_t> chunk = audio_chunk();
-        impl.handle_binary(chunk.data(), chunk.size(), live_generation(impl));
-        EXPECT_EQ(!impl.sync_task->encoded_ring_buffer_->is_empty(), row.queued);
+        hand_copied_chunk(impl, audio_chunk(), live_generation(impl));
+        EXPECT_EQ(!impl.sync_task->encoded_items_.is_empty(), row.queued);
+    }
+}
+
+// ============================================================================
+// The shared inbound ring: zero-copy hand-off, holder quotas, clear marker, recall
+// ============================================================================
+
+namespace {
+
+// A visualizer Impl whose drain list is bound to `ring` without its thread, its stream active
+// with every defined wire type negotiated.
+std::unique_ptr<VisualizerRole::Impl> make_visualizer(InboundRing& ring) {
+    static std::deque<Inbox> inboxes;
+    auto impl = std::make_unique<VisualizerRole::Impl>(VisualizerRoleConfig{}, nullptr);
+    impl->attach_inbox(inboxes.emplace_back());
+    impl->stream_active = true;
+    impl->negotiated_types_mask = 0x1F;
+    EXPECT_TRUE(impl->drain_task->event_flags.create());
+    EXPECT_TRUE(impl->drain_task->items.create(&ring, InboundHolder::VISUALIZER));
+    impl->drain_task->ring.store(&ring, std::memory_order_release);
+    return impl;
+}
+
+// One loudness frame as the visualizer's handle_binary receives it.
+std::vector<uint8_t> loudness_frame() {
+    std::vector<uint8_t> frame{SENDSPIN_BINARY_VISUALIZER_LOUDNESS};
+    frame.insert(frame.end(), 8, 0x00);  // server timestamp
+    frame.insert(frame.end(), {0x12, 0x34});
+    return frame;
+}
+
+// Takes every item on the sync task's list, returning each to the ring, and reports the first
+// encoded byte of each (the marker audio_chunk() put there; 0 for an item with no encoded bytes).
+std::vector<uint8_t> take_all(PlayerRole::Impl& impl) {
+    std::vector<uint8_t> markers;
+    void* item = nullptr;
+    while ((item = impl.sync_task->take_item(0)) != nullptr) {
+        markers.push_back(SyncTask::encoded_size(item) > 0 ? SyncTask::encoded_data(item)[0] : 0);
+        impl.sync_task->return_item(item);
+    }
+    return markers;
+}
+
+}  // namespace
+
+// An audio chunk received into a ring item is decoded from that item: the sync task reads the
+// frame and the server timestamp where the transport wrote and the protocol task decrypted them.
+// A chunk outside any ring item (reassembled from Noise fragments, or replayed) is the one case
+// that is copied, into an item of its own.
+TEST(PlayerInboundHandOff, AChunkInARingItemIsDecodedInPlace) {
+    struct Row {
+        const char* name;
+        bool in_ring_item;
+    };
+    const Row rows[] = {{"received into a ring item", true},
+                        {"Control: outside a ring item, copied", false}};
+    constexpr int64_t SERVER_TS = 0x0102030405060708;
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        InboundRing& ring = *impl->sync_task->ring();
+        std::vector<uint8_t> chunk = audio_chunk(0xC1, SERVER_TS);
+        InboundMessage message =
+            row.in_ring_item ? receive_into_ring(ring, chunk, 7) : message_over(chunk, 7);
+        const uint8_t* frame_in_message = message.data + 13;
+
+        impl->handle_binary(message, live_generation(*impl));
+        take_in_ring_order(ring);
+        EXPECT_EQ(message.item, nullptr) << "the role must take the item over, or never had one";
+
+        void* item = impl->sync_task->take_item(0);
+        ASSERT_NE(item, nullptr);
+        const uint8_t* decoded_from = SyncTask::encoded_data(item);
+        EXPECT_TRUE(in_ring_storage(ring, decoded_from));
+        EXPECT_EQ(decoded_from == frame_in_message, row.in_ring_item)
+            << "the frame was copied out of the item it arrived in";
+        EXPECT_EQ(SyncTask::encoded_size(item), 4U);
+        EXPECT_EQ(decoded_from[0], 0xC1);
+        EXPECT_EQ(SyncTask::server_timestamp(item), SERVER_TS);
+        impl->sync_task->return_item(item);
+    }
+}
+
+// The ring is shared, and each holder's quota bounds what it may keep outstanding. A player past
+// its quota drops the chunk with a warning, returning its item, while the visualizer, charged
+// against its own quota on the same ring, keeps receiving.
+TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeepsFlowing) {
+    struct Row {
+        const char* name;
+        size_t player_quota_chunks;
+        size_t player_items;
+    };
+    const Row rows[] = {{"Control: room for both chunks", 2, 2}, {"room for one chunk", 1, 1}};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundRing ring;
+        create_test_ring(ring);
+        auto player = make_impl(&ring);
+        auto visualizer = make_visualizer(ring);
+
+        InboundMessage first = receive_into_ring(ring, audio_chunk(0x01), 0);
+        player->handle_binary(first, live_generation(*player));
+        const size_t one_chunk = ring.quota(InboundHolder::PLAYER).outstanding();
+        ASSERT_GT(one_chunk, 0U);
+        ring.quota(InboundHolder::PLAYER).set_limit(row.player_quota_chunks * one_chunk);
+
+        InboundMessage second = receive_into_ring(ring, audio_chunk(0x02), 0);
+        player->handle_binary(second, live_generation(*player));
+        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(),
+                  row.player_items * one_chunk);
+
+        InboundMessage frame = receive_into_ring(ring, loudness_frame(), 0);
+        visualizer->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, frame,
+                                  visualizer->cleanup_generation.load());
+        EXPECT_GT(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
+            << "the player's quota stopped the visualizer";
+        EXPECT_FALSE(visualizer->drain_task->items.is_empty());
+
+        EXPECT_EQ(take_all(*player).size(), row.player_items);
+        visualizer->flush_items();
+        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
+            << "a dropped chunk kept its charge";
+        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U);
+    }
+}
+
+// messaging.md "stream/clear": the sync task discards the audio buffered before the clear and
+// keeps what the server sent after it. The marker the protocol task appends is the boundary.
+TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
+    struct Row {
+        const char* name;
+        bool clear;
+        std::vector<uint8_t> survivors;
+    };
+    const Row rows[] = {
+        {"Control: no clear, the discard drains everything", false, {}},
+        {"a clear between two chunks", true, {0x02}},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        InboundRing& ring = *impl->sync_task->ring();
+        InboundMessage before = receive_into_ring(ring, audio_chunk(0x01), 0);
+        impl->handle_binary(before, live_generation(*impl));
+        if (row.clear) {
+            impl->handle_stream_clear(live_generation(*impl));
+            take_in_ring_order(ring);
+        }
+        InboundMessage after = receive_into_ring(ring, audio_chunk(0x02), 0);
+        impl->handle_binary(after, live_generation(*impl));
+
+        SyncContext context;
+        impl->sync_task->discard_to_clear_marker(context);
+        EXPECT_EQ(take_all(*impl), row.survivors);
+    }
+}
+
+// A teardown on the main loop (a dropped connection, a removed role) moves the role's generation
+// on; the protocol task's next tick recalls what the sync task has not taken, returning it and
+// its quota charge to the ring, rather than leaving the old stream's audio to be read later.
+TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
+    struct Row {
+        const char* name;
+        bool teardown;
+        size_t items_left;
+    };
+    const Row rows[] = {{"Control: no teardown", false, 2}, {"torn down", true, 0}};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        InboundRing& ring = *impl->sync_task->ring();
+        for (uint8_t marker : {0x01, 0x02}) {
+            InboundMessage message = receive_into_ring(ring, audio_chunk(marker), 0);
+            impl->handle_binary(message, live_generation(*impl));
+        }
+        if (row.teardown) {
+            impl->cleanup();
+        }
+
+        impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
+
+        EXPECT_EQ(impl->sync_task->encoded_items_.is_empty(), row.items_left == 0);
+        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding() == 0, row.items_left == 0);
+        // Taken under the live generation, as the sync task would: a recalled item cannot come
+        // back, and an item left over is still delivered.
+        EXPECT_EQ(take_all(*impl).size(), row.items_left);
+    }
+}
+
+// roles/player/v1.md "client/hello player@v1 support object": the server fills buffer_capacity
+// with encoded frames, and each frame costs the quota its stored size in the inbound ring, so the
+// player advertises the share that holds frames at the smallest chunk size: two thirds of its
+// quota (a 160-byte frame stores in 232 bytes). The server's flow control is sized from this
+// number, so the share is spelled out rather than bounded.
+TEST(PlayerHello, AdvertisesTheShareOfItsQuotaThatHoldsEncodedFrames) {
+    struct Row {
+        const char* name;
+        size_t quota;
+        size_t advertised;
+    };
+    const Row rows[] = {
+        {"default quota", 1000000, 666666},
+        {"a quota divisible by three", 600000, 400000},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SendspinClient client(make_client_config("player-hello-share"));
+        PlayerRoleConfig config = make_player_config();
+        config.audio_buffer_capacity = row.quota;
+        PlayerRole::Impl& impl = *client.add_player(std::move(config)).impl_;
+
+        ClientHelloMessage hello;
+        impl.build_hello_fields(hello);
+        ASSERT_TRUE(hello.player_v1_support.has_value());
+        EXPECT_EQ(hello.player_v1_support->buffer_capacity, row.advertised);
     }
 }
 

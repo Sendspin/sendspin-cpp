@@ -60,7 +60,7 @@ public:
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
     /// @brief Closes the transport immediately without blocking (see base class doc comment).
-    /// Reports the loss via handle_disconnected() without touching the transport; the actual
+    /// Stops taking frames without touching the transport; the actual
     /// esp_websocket_client_stop() runs later in the destructor once the manager drops this
     /// connection (off the websocket task), because esp_websocket_client_stop() cannot be called
     /// from the websocket task's own event handler.
@@ -95,9 +95,7 @@ public:
     /// @brief Configures the internal esp_websocket_client task
     /// @param priority FreeRTOS task priority for the WebSocket client task.
     /// @param stack_size Task stack size in bytes. Values below
-    ///     SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE are clamped up to it in start()
-    ///     (see the rationale on that constant: the Noise handshake, including the in-band
-    ///     re-handshake, runs inline on this task).
+    ///     SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE are clamped up to it in start().
     void set_task_config(unsigned priority, size_t stack_size) {
         this->task_priority_ = priority;
         this->task_stack_size_ = stack_size;
@@ -118,7 +116,8 @@ protected:
     /// @brief Handles websocket disconnected event
     void handle_disconnected();
 
-    /// @brief Handles websocket data event
+    /// @brief Handles websocket data event: copies the chunk into the message's destination and
+    /// hands a complete message to the protocol task
     /// @param data Pointer to websocket event data.
     /// @param receive_time Timestamp when the event was received (for time synchronization).
     void handle_data(const esp_websocket_event_data_t* data, int64_t receive_time);
@@ -135,6 +134,10 @@ protected:
 
     /// @brief The ESP-IDF websocket client handle
     esp_websocket_client_handle_t client_{nullptr};
+
+    /// @brief Where the current single-frame message's chunks go, or nullptr while none is
+    /// being received (or it is dropped). Websocket task only.
+    uint8_t* chunk_dest_{nullptr};
 
     // 32-bit fields
 

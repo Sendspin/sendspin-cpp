@@ -275,7 +275,7 @@ TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
     EXPECT_EQ(count, 1);
 }
 
-// The supersede itself never calls the provider: in production it runs on the NETWORK thread
+// The supersede itself never calls the provider: in production it runs on the protocol task
 // (the server/pair-finalize ack handler), where the provider contract forbids calls, so the
 // durable write is deferred to persist_records() on the main loop. The RAM mutation commits
 // immediately either way; a provider that then rejects the flush leaves the replacement
@@ -1867,17 +1867,18 @@ TEST(PskZeroization, EveryPskCarryingStructWipesOnDestruction) {
 
 // Reproduces the two-thread access pattern production runs over records_:
 //
-//   network thread -> Noise handshake
+//   protocol task -> Noise handshake
 //                       -> RecordStore::resolve_by_psk_id()        [reads records_]
-//   network thread -> SendspinClient::process_json_message(), server/pair-finalize
-//                       -> RecordStore::store_record_superseding() [push_back/erase records_]
+//   main loop     -> an unpair, a playback recency move, a pairing-code commit
+//                       -> mutators that push_back/erase/reorder records_
 //
-// Both sides are real and concurrent: pair-finalize commits synchronously on its connection's
-// own thread (deliberately, so the server's follow-up re-handshake can resolve the new psk_id)
-// while another connection is handshaking, and nothing above RecordStore serializes the two.
-// mutex_ is therefore the only thing keeping a resolve off store_record_superseding()'s
-// push_back reallocation; under ThreadSanitizer (-DENABLE_TSAN=ON) dropping either lock_guard
-// is reported against records_ and fails this test.
+// The resolve and the pair-finalize commit (store_record_superseding()) both run on the protocol
+// task, so they never overlap; the concurrency left is a protocol-task resolve against a
+// main-loop mutator, and nothing above RecordStore serializes the two. The writer thread below
+// stands for that mutator, through store_record_superseding()'s push_back/erase. mutex_ is
+// therefore the only thing keeping a resolve off the writer's push_back reallocation; under
+// ThreadSanitizer (-DENABLE_TSAN=ON) dropping either lock_guard is reported against records_ and
+// fails this test.
 //
 // Without TSan the assertions still bind: two records outside the writer's server_id space are
 // stored up front, so every resolve of them must return that record's own psk no matter what
@@ -1951,7 +1952,7 @@ TEST(RecordStoreConcurrency, ResolveByPskIdDoesNotRaceRecordStores) {
 }
 
 // The persisting paths must not hold mutex_ across the provider's blob write. resolve_by_psk_id()
-// takes that same mutex on the NETWORK thread for every Noise handshake, and on ESP the write is
+// takes that same mutex on the protocol task for every Noise handshake, and on ESP the write is
 // an NVS commit of tens of milliseconds; holding the lock across it stalls a handshake for the
 // length of a flash commit (the post-pairing re-handshake is adjacent to such a write by
 // construction, see docs/internals.md "Pairing").

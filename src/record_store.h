@@ -103,8 +103,8 @@ struct ResolvedPsk {
 /// @brief In-memory client pairing record store.
 ///
 /// Thread-safety: `records_` and its dirty-slot bookkeeping are guarded by `mutex_`. Cross-thread
-/// access goes through `resolve_by_psk_id` (network thread, Noise handshake and re-handshake) or
-/// the one network-thread mutator, `store_record_superseding`, which is RAM-only and defers its
+/// access goes through `resolve_by_psk_id` (protocol task, Noise handshake and re-handshake) or
+/// the one protocol-task mutator, `store_record_superseding`, which is RAM-only and defers its
 /// provider flush, `persist_records`, to the main loop. `pairing_psk_` is set by the constructor
 /// and never written afterwards, so it is read without the lock. No provider call is ever made
 /// under `mutex_`.
@@ -162,7 +162,7 @@ public:
     /// PSK, so leaving the prior record would keep the old one valid forever and let repeated
     /// re-pairs exhaust storage).
     ///
-    /// Runs on the network thread, so it never calls the provider; the caller must schedule
+    /// Runs on the protocol task, so it never calls the provider; the caller must schedule
     /// persist_records() onto the main loop (the client uses INBOX_TOPIC_PERSIST). Until that
     /// flush lands, the mutation is RAM-only.
     ///
@@ -208,7 +208,7 @@ public:
     /// (emptying its slot and rewriting the order) to a later persist_records(). No-op if absent.
     ///
     /// For a revocation that must take effect before the caller's own lock is dropped: this takes
-    /// only mutex_, the innermost lock, so a network-thread resolve_by_psk_id() misses the record
+    /// only mutex_, the innermost lock, so a protocol-task resolve_by_psk_id() misses the record
     /// from here on even though the slot is emptied later.
     /// @param psk_id The record to erase.
     /// @return true when a record was erased, and the store therefore needs persisting.
@@ -225,7 +225,7 @@ public:
     /// write.
     ///
     /// For a move that must take effect before the caller's own lock is dropped: this takes only
-    /// mutex_, the innermost lock, so a network-thread eviction sees the new order from here on
+    /// mutex_, the innermost lock, so a protocol-task eviction sees the new order from here on
     /// even though the order blob is written later.
     /// @param psk_id The record to move.
     /// @return true when the order moved, and the store therefore needs persisting.

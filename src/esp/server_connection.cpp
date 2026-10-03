@@ -21,6 +21,7 @@
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "sendspin/types.h"
+#include "ws_server.h"
 #include <esp_err.h>
 
 #include <cstring>
@@ -134,12 +135,9 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
 
 void SendspinServerConnection::close_transport_now() {
     // trigger_close() -> httpd_sess_trigger_close() is already async/non-blocking (the same
-    // primitive disconnect() uses in its completion callback and handle_data() uses via the
-    // ESP_ERR_NO_MEM return path below), so it is safe to call directly here. on_disconnected_cb
-    // is intentionally not fired here: for inbound connections it is wired as a no-op
-    // (ConnectionManager::on_new_connection(); cleanup happens via the ws_server's own close
-    // notification instead, see close_callback() in ws_server.cpp), so the resulting close
-    // notification is what reports the loss.
+    // primitive disconnect() uses in its completion callback), so it is safe from any thread. The
+    // resulting close notification (close_callback() in ws_server.cpp) reaches
+    // notify_transport_closed().
     this->trigger_close();
 }
 
@@ -250,10 +248,11 @@ void SendspinServerConnection::trigger_close() {
     httpd_sess_trigger_close(this->server_, this->sockfd_);
 }
 
-SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receive_time) {
-    // The connection was delivered (and marked WS-upgraded) from the upgrade GET before any
-    // frame can arrive; frames on a never-delivered connection are dropped by the null guards
-    // in dispatch_completed_message.
+SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receive_time,
+                                                       SendspinWsServer* server) {
+    // The connection was delivered (and wired to the inbound ring) from the upgrade GET before any
+    // frame can arrive; a frame on a never-delivered or released connection is dropped by the
+    // inbound routing (begin_inbound_message()).
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
 
@@ -264,52 +263,84 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
         return ret;
     }
 
-    // Track frame type: text/binary frames set the type, continuation frames inherit it
-    if (ws_pkt.type == HTTPD_WS_TYPE_TEXT || ws_pkt.type == HTTPD_WS_TYPE_BINARY) {
-        this->is_text_frame_ = (ws_pkt.type == HTTPD_WS_TYPE_TEXT);
-    } else if (ws_pkt.type != HTTPD_WS_TYPE_CONTINUE) {
+    const bool continuation = ws_pkt.type == HTTPD_WS_TYPE_CONTINUE;
+    if (!continuation && ws_pkt.type != HTTPD_WS_TYPE_TEXT && ws_pkt.type != HTTPD_WS_TYPE_BINARY) {
         // Control frames (ping, pong, close): not handled here
         return ESP_OK;
     }
+    const bool is_text = ws_pkt.type == HTTPD_WS_TYPE_TEXT;
 
-    bool is_final = ws_pkt.final;
-
-    if (ws_pkt.len == 0) {
-        // No payload data, but still dispatch if final (for empty messages or buffered data)
-        if (is_final) {
-            this->dispatch_completed_message(this->is_text_frame_, receive_time);
+    if (!continuation && ws_pkt.final) {
+        // A single-frame message, the only kind a conforming peer sends: received straight into
+        // its destination, a ring item once the connection is admitted.
+        const InboundTarget target = this->begin_inbound_message(ws_pkt.len, is_text, receive_time);
+        if (target.route == InboundRoute::CLOSE) {
+            return ESP_FAIL;
         }
-        return ESP_OK;
-    }
-
-    // Allocate/grow directly into the websocket payload buffer (zero-copy)
-    uint8_t* dest = this->prepare_receive_buffer(ws_pkt.len);
-    if (dest == nullptr) {
-        // Returning an error makes httpd close the session, which tears the slot down via
-        // the close notification on the main loop
-        SS_LOGE(TAG, "Allocation failed, dropping connection");
-        this->disable_message_dispatch();
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Point httpd directly at our payload buffer so it writes there without an intermediate copy
-    ws_pkt.payload = dest;
-
-    // Second call with max_len = ws_pkt.len to receive frame payload directly into our buffer
-    ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
-    if (ret != ESP_OK) {
-        SS_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
-        this->reset_websocket_payload();
+        if (target.route == InboundRoute::DROP) {
+            return SendspinServerConnection::discard_frame_payload(req, ws_pkt, server);
+        }
+        ret = SendspinServerConnection::receive_frame_payload(req, ws_pkt, target.data);
+        this->end_inbound_message(ret == ESP_OK);
         return ret;
     }
 
-    this->commit_receive_buffer(ws_pkt.len);
-
-    if (is_final) {
-        this->dispatch_completed_message(this->is_text_frame_, receive_time);
+    // A frame of a multi-frame message (the rare path; see begin_inbound_fragment()).
+    const InboundTarget target =
+        this->begin_inbound_fragment(ws_pkt.len, !continuation, is_text, receive_time);
+    if (target.route == InboundRoute::CLOSE) {
+        return ESP_FAIL;
     }
-
+    if (target.route == InboundRoute::DROP) {
+        ret = SendspinServerConnection::discard_frame_payload(req, ws_pkt, server);
+        this->end_inbound_fragment(0, ws_pkt.final);
+        return ret;
+    }
+    ret = SendspinServerConnection::receive_frame_payload(req, ws_pkt, target.data);
+    if (ret != ESP_OK) {
+        // httpd closes the session over the error; nothing assembled so far is published.
+        return ret;
+    }
+    this->end_inbound_fragment(ws_pkt.len, ws_pkt.final);
     return ESP_OK;
+}
+
+esp_err_t SendspinServerConnection::receive_frame_payload(httpd_req_t* req,
+                                                          httpd_ws_frame_t& ws_pkt, uint8_t* dest) {
+    // A zero-length frame has nothing to read, and a second httpd_ws_recv_frame() on a zero
+    // length would parse the next frame's header instead.
+    if (ws_pkt.len == 0) {
+        return ESP_OK;
+    }
+    // Point httpd directly at the destination so it writes there without an intermediate copy.
+    ws_pkt.payload = dest;
+    const esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
+    if (ret != ESP_OK) {
+        SS_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
+    }
+    return ret;
+}
+
+esp_err_t SendspinServerConnection::discard_frame_payload(httpd_req_t* req,
+                                                          httpd_ws_frame_t& ws_pkt,
+                                                          SendspinWsServer* server) {
+    if (ws_pkt.len == 0) {
+        return ESP_OK;
+    }
+    // httpd hands a frame's payload over only whole (httpd_ws_recv_frame() needs max_len >= the
+    // frame length, httpd_ws.c), so a dropped message still needs room for its frame. A frame
+    // larger than any message the connection could legitimately carry closes it instead.
+    if (ws_pkt.len > INBOUND_MAX_MESSAGE_BYTES) {
+        SS_LOGW(TAG, "Dropped frame of %zu bytes exceeds one Noise frame; closing", ws_pkt.len);
+        return ESP_FAIL;
+    }
+    uint8_t* scratch = server != nullptr ? server->discard_buffer() : nullptr;
+    if (scratch == nullptr) {
+        SS_LOGE(TAG, "No %zu-byte buffer to discard a frame into; closing",
+                INBOUND_MAX_MESSAGE_BYTES);
+        return ESP_FAIL;
+    }
+    return SendspinServerConnection::receive_frame_payload(req, ws_pkt, scratch);
 }
 
 void SendspinServerConnection::async_send_frame(void* arg) {

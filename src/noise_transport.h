@@ -16,18 +16,18 @@
 /// @brief Encrypted transport layer for a Sendspin connection: owns the Noise cipher session,
 /// its send-side mutex, outbound fragmentation, and inbound fragment reassembly.
 ///
-/// This class isolates every piece of state that the "decrypt runs unlocked on the network
-/// thread" invariant applies to. Its threading contract:
+/// This class isolates every piece of state that the "decrypt runs unlocked on the protocol task"
+/// invariant applies to. Its threading contract:
 ///
-///   - ENCRYPT / send (send_json, send_binary): any thread; serialized by session_mutex_. The
-///     non-fragmented path also fills and encrypts the reused send_buf_ member under the same
-///     lock, so that reuse is safe precisely because this path is fully serialized (see
-///     send_buf_'s doc comment).
-///   - DECRYPT (decrypt_in_place) and reassembly (accept_plaintext): network thread only.
+///   - ENCRYPT / send (send_json, send_binary): the main loop and the protocol task; serialized
+///     by session_mutex_. The non-fragmented path also fills and encrypts the reused send_buf_
+///     member under the same lock, so that reuse is safe precisely because this path is fully
+///     serialized (see send_buf_'s doc comment).
+///   - DECRYPT (decrypt_in_place) and reassembly (accept_plaintext): protocol task only.
 ///     The decrypt path is deliberately unlocked: the only writer that can replace the session
 ///     mid-connection (send_msg2_and_swap, driven by an inbound re-handshake frame) runs on the
-///     same network thread, so decrypt and swap are sequential, never concurrent.
-///   - Session swap (activate, send_msg2_and_swap): network thread, under session_mutex_ so a
+///     same protocol task, so decrypt and swap are sequential, never concurrent.
+///   - Session swap (activate, send_msg2_and_swap): protocol task, under session_mutex_ so a
 ///     concurrent main-loop encrypt cannot interleave with the swap.
 
 #pragma once
@@ -87,7 +87,7 @@ public:
     }
 
     /// @brief Installs the cipher session produced by the initial Noise handshake and marks
-    /// the transport active. Called on the network thread at handshake COMPLETE.
+    /// the transport active. Called on the protocol task at handshake COMPLETE.
     void activate(std::unique_ptr<NoiseSession> session);
 
     /// @brief Returns the current session's 32-byte Noise handshake hash, or nullopt if no
@@ -125,13 +125,13 @@ public:
 
     /// @brief Re-handshake commit: encrypt and send msg2 under the OLD session, then swap to
     /// the new session, all inside one locked region so a concurrent encrypt cannot interleave
-    /// between the msg2 send and the swap. Called on the network thread.
+    /// between the msg2 send and the swap. Called on the protocol task.
     /// @return SsErr::OK on success (session swapped); on error the old session is kept.
     SsErr send_msg2_and_swap(const std::string& msg2_text,
                              std::unique_ptr<NoiseSession> next_session);
 
     // ========================================
-    // Inbound (decrypt + reassemble); network thread only
+    // Inbound (decrypt + reassemble); protocol task only
     // ========================================
 
     /// @brief Decrypts one transport frame in-place. Unlocked by design: see the file comment
@@ -141,25 +141,20 @@ public:
     size_t decrypt_in_place(uint8_t* ciphertext, size_t len);
 
     /// @brief Routes one decrypted plaintext frame through the fragment state machine.
-    /// Non-fragment frames are returned directly; type-1 fragment frames are buffered until one
+    /// Non-fragment frames are returned directly (the same pointer, so the caller can tell the
+    /// message is still where it decrypted it); type-1 fragment frames are buffered until one
     /// carrying FRAGMENT_FLAG_LAST produces the reassembled message.
+    /// @param admitted Whether the owning connection holds the admitted slot
+    ///        (InboundGate::is_admitted()), which selects the reassembly cap:
+    ///        MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES until it does.
     /// @return The complete message (type byte first), or {nullptr, 0} if the frame was
     ///         consumed by reassembly, discarded, or dropped as malformed.
-    CompleteMessage accept_plaintext(uint8_t* plaintext, size_t len);
+    CompleteMessage accept_plaintext(uint8_t* plaintext, size_t len, bool admitted);
 
     /// @brief Sets memory placement for the fragmentation and reassembly buffers (ESP-IDF
     /// only; ignored on host). Call during connection setup, before any transport traffic.
     void set_buffer_location(MemoryLocation location) {
         this->buffer_location_ = location;
-    }
-
-    /// @brief Tracks whether the owning connection holds the admitted slot, which selects the
-    /// reassembly cap (MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES until it does).
-    ///
-    /// Written by SendspinConnection::set_admitted() on the main loop; read on the network
-    /// thread by accept_plaintext(), same arrangement as the connection's own admitted_ flag.
-    void set_admitted(bool admitted) {
-        this->admitted_.store(admitted, std::memory_order_release);
     }
 
 private:
@@ -196,12 +191,12 @@ private:
     bool grow_buffer(PlatformBuffer& buf, size_t needed, size_t cap, const char* what);
 
     /// @brief The reassembly cap in force: MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES until the
-    /// owning connection is admitted, MAX_REASSEMBLED_MESSAGE_BYTES after. Network thread only.
-    size_t reasm_cap() const;
+    /// owning connection is admitted, MAX_REASSEMBLED_MESSAGE_BYTES after.
+    static size_t reasm_cap(bool admitted);
 
     /// @brief Grows reasm_buf_ to at least `needed` bytes, capped at the cap in force plus the
     /// orig_type byte. See grow_buffer().
-    bool reasm_reserve(size_t needed);
+    bool reasm_reserve(size_t needed, bool admitted);
 
     /// @brief Grows send_buf_ to at least `needed` bytes, capped at MAX_TRANSPORT_PLAINTEXT + 16
     /// (the largest plaintext + AEAD tag room the non-fragmented path ever handles). Caller
@@ -219,9 +214,6 @@ private:
     /// True once a transport session exists. See is_active().
     std::atomic<bool> active_{false};
 
-    /// True while the owning connection holds the admitted slot. See set_admitted().
-    std::atomic<bool> admitted_{false};
-
     /// Emits one encrypted frame as a binary WS frame.
     FrameSink frame_sink_;
 
@@ -229,7 +221,7 @@ private:
     /// message is in flight; on completion accept_plaintext() returns a pointer into this
     /// buffer, valid until the next accept_plaintext() call. Grows with the largest
     /// fragmented message received (a player audio chunk) and retains its capacity, so it is
-    /// placed per buffer_location_ (PSRAM-preferring by default on ESP). Network thread only.
+    /// placed per buffer_location_ (PSRAM-preferring by default on ESP). Protocol task only.
     PlatformBuffer reasm_buf_;
 
     /// Reused scratch buffer for the non-fragmented send path (send_json, send_binary,
@@ -252,7 +244,7 @@ private:
 
     // size_t fields
     /// Bytes used in reasm_buf_ (including the leading orig_type byte), 0 while the in-flight
-    /// message is being discarded. Network thread only.
+    /// message is being discarded. Protocol task only.
     size_t reasm_len_{0};
 
     // 8-bit fields
@@ -262,11 +254,11 @@ private:
     /// True when the in-flight message's data is being thrown away rather than buffered: its
     /// orig_type is a reserved ID nothing implements, it outgrew the reassembly cap in force,
     /// or the buffer could not be grown for it. The sequence is still tracked to its last
-    /// fragment, but the message is never dispatched. Network thread only.
+    /// fragment, but the message is never dispatched. Protocol task only.
     bool reasm_discarding_{false};
 
     /// True while a fragmented message is in flight, whether it is being reassembled or
-    /// discarded. This is the flag the malformed-sequence rules key off. Network thread only.
+    /// discarded. This is the flag the malformed-sequence rules key off. Protocol task only.
     bool reasm_in_progress_{false};
 };
 

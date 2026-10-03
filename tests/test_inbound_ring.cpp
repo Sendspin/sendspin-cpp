@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -65,7 +66,7 @@ void* routed_item(InboundRing& ring, uint32_t tag, size_t len = 16) {
 struct Fixture {
     explicit Fixture(size_t ring_bytes) {
         EXPECT_TRUE(this->ring.create(ring_bytes, MemoryLocation::PREFER_EXTERNAL));
-        EXPECT_TRUE(this->list.create(&this->ring));
+        EXPECT_TRUE(this->list.create(&this->ring, InboundHolder::PLAYER));
     }
     InboundRing ring;
     InboundItemList list;
@@ -84,15 +85,15 @@ TEST(InboundRing, TakeHoldsBackAWrappedItemUntilItIsCompleted) {
     size_t len = 0;
 
     // A and B store 108 bytes each, leaving a 48-byte tail.
-    void* a = acquire_item(ring, 72);
-    void* b = acquire_item(ring, 72);
+    void* a = acquire_item(ring, 68);
+    void* b = acquire_item(ring, 68);
     ring.complete(a);
     ring.complete(b);
     ASSERT_EQ(ring.take(&len, 0), a);
     ring.return_item(a);
 
-    void* x = acquire_item(ring, 4);   // 40 stored, at the tail
-    void* y = acquire_item(ring, 32);  // 68 stored: does not fit the 8 bytes left, wraps
+    void* x = acquire_item(ring, 4);   // 44 stored, at the tail
+    void* y = acquire_item(ring, 28);  // 68 stored: does not fit the 4 bytes left, wraps
     void* z = acquire_item(ring, 0);   // behind Y
     ASSERT_NE(x, nullptr);
     ASSERT_NE(y, nullptr);
@@ -109,7 +110,7 @@ TEST(InboundRing, TakeHoldsBackAWrappedItemUntilItIsCompleted) {
     EXPECT_EQ(ring.take(&len, 0), nullptr) << "and Z must not overtake it";
     ring.complete(y);
     EXPECT_EQ(ring.take(&len, 0), y);
-    EXPECT_EQ(len, 32U);
+    EXPECT_EQ(len, 28U);
     EXPECT_EQ(ring.take(&len, 0), z);
     EXPECT_EQ(len, 0U);
 }
@@ -161,6 +162,98 @@ TEST(InboundRing, TakeReturnsDiscardedItemsWithoutHandingThemOut) {
     EXPECT_NE(ring.acquire(SharedRingLayout::max_item_size(RING_BYTES) - sizeof(InboundItemHeader),
                            0),
               nullptr);
+}
+
+// A LOCAL item (one the protocol task wrote itself) goes back to the ring only on the second of
+// its two returns: the protocol task's take in ring order and its holder's return, in either
+// order. Its quota charge is released on the holder's return, whichever comes first, so the
+// quota never counts an item its holder is done with. Two pass-through items written behind it
+// are returned at once, so only the LOCAL item can keep the largest item from fitting (three
+// 112-byte items leave a 176-byte tail).
+TEST(InboundRing, ALocalItemGoesBackOnItsSecondReturn) {
+    constexpr size_t RING_BYTES = 512;
+    constexpr size_t LEN = 72;
+    struct Row {
+        const char* name;
+        bool holder_first;
+        bool charged;
+    };
+    const Row rows[] = {
+        {"holder returns first", true, true},
+        {"take comes first", false, true},
+        {"never charged (both parties are the protocol task)", true, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Fixture f(RING_BYTES);
+        f.ring.quota(InboundHolder::PLAYER).set_limit(RING_BYTES);
+        const size_t largest =
+            SharedRingLayout::max_item_size(RING_BYTES) - sizeof(InboundItemHeader);
+
+        void* local = f.ring.acquire_local(LEN, 0);
+        ASSERT_NE(local, nullptr);
+        EXPECT_EQ(inbound_item_header(local)->kind, InboundKind::LOCAL);
+        f.ring.complete(local);
+        if (row.charged) {
+            ASSERT_TRUE(f.ring.charge(local, LEN, InboundHolder::PLAYER));
+        }
+        void* passthrough[2] = {f.ring.acquire(LEN, 0), f.ring.acquire(LEN, 0)};
+        for (void* item : passthrough) {
+            ASSERT_NE(item, nullptr);
+            f.ring.complete(item);
+        }
+        // The protocol task's pass: the LOCAL item is counted, never handed out.
+        const auto take_in_order = [&] {
+            size_t len = 0;
+            for (void* expected : passthrough) {
+                EXPECT_EQ(f.ring.take(&len, 0), expected);
+                f.ring.return_item(expected);
+            }
+        };
+
+        if (row.holder_first) {
+            f.ring.return_item(local);
+            EXPECT_EQ(inbound_item_header(local)->local_returns, 1U);
+            EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
+                << "the holder's return releases the charge";
+            take_in_order();
+        } else {
+            take_in_order();
+            EXPECT_EQ(inbound_item_header(local)->local_returns, 1U);
+            EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding() > 0, row.charged)
+                << "the take does not release the holder's charge";
+            EXPECT_EQ(f.ring.acquire(largest, 0), nullptr) << "one return is not enough";
+            f.ring.return_item(local);
+            EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 0U);
+        }
+        EXPECT_NE(f.ring.acquire(largest, 0), nullptr) << "the second return reclaims it";
+    }
+}
+
+// reset() supplies the protocol task's half of a LOCAL item's two returns: an item its holder
+// returned but the task never reached in ring order is reclaimed. Control: before the reset the
+// queued items pin the ring.
+TEST(InboundRing, ResetSuppliesTheMissingHalfOfALocalItem) {
+    constexpr size_t RING_BYTES = 512;
+    constexpr size_t LEN = 72;
+    Fixture f(RING_BYTES);
+    f.ring.quota(InboundHolder::PLAYER).set_limit(RING_BYTES);
+    const size_t largest = SharedRingLayout::max_item_size(RING_BYTES) - sizeof(InboundItemHeader);
+
+    void* local = f.ring.acquire_local(LEN, 0);
+    ASSERT_NE(local, nullptr);
+    f.ring.complete(local);
+    ASSERT_TRUE(f.ring.charge(local, LEN, InboundHolder::PLAYER));
+    for (int i = 0; i < 2; ++i) {
+        void* item = f.ring.acquire(LEN, 0);
+        ASSERT_NE(item, nullptr);
+        f.ring.complete(item);
+    }
+    f.ring.return_item(local);
+    EXPECT_EQ(f.ring.acquire(largest, 0), nullptr) << "Control: the queued items pin the ring";
+
+    f.ring.reset();
+    EXPECT_NE(f.ring.acquire(largest, 0), nullptr);
 }
 
 // reset() returns every item still in the ring, so a restart begins with all of it free.
@@ -289,6 +382,34 @@ TEST(InboundItemList, RecallReturnsEveryLinkedItemAndReleasesItsCharge) {
     EXPECT_EQ(f.list.take(0), nullptr);
     EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 0U);
     EXPECT_NE(f.ring.acquire(largest, 0), nullptr);
+}
+
+// unbind() unregisters a list from its ring before the list goes away. A LOCAL item its holder
+// returned but the protocol task never took in ring order is counted on the ring's reset: through
+// the holder's list while it is registered, directly once it is unbound. Without the unbind the
+// reset reaches the destroyed list. The reset reclaiming the item is the Control.
+TEST(InboundItemList, TheRingResetNeverReachesAnUnboundList) {
+    constexpr size_t RING_BYTES = 512;
+    constexpr size_t LEN = 72;
+    InboundRing ring;
+    ASSERT_TRUE(ring.create(RING_BYTES, MemoryLocation::PREFER_EXTERNAL));
+    ring.quota(InboundHolder::PLAYER).set_limit(RING_BYTES);
+    const size_t largest = SharedRingLayout::max_item_size(RING_BYTES) - sizeof(InboundItemHeader);
+
+    auto list = std::make_unique<InboundItemList>();
+    ASSERT_TRUE(list->create(&ring, InboundHolder::PLAYER));
+    void* local = ring.acquire_local(LEN, 0);
+    ASSERT_NE(local, nullptr);
+    ring.complete(local);
+    ASSERT_TRUE(hand_inbound_item(ring, *list, InboundHolder::PLAYER, local, LEN));
+    ASSERT_EQ(list->take(0), local);
+    ring.return_item(local);  // the holder's return; the ring-order one never came
+
+    list->unbind();  // what a role's stop() does once its consumer is joined
+    list.reset();
+
+    ring.reset();
+    EXPECT_NE(ring.acquire(largest, 0), nullptr) << "Control: the reset reclaimed the item";
 }
 
 // A recall leaves the list usable: an item appended afterwards is taken normally.
@@ -486,33 +607,28 @@ TEST(InboundGate, CloseIsHonouredOnlyOnceNothingIsInFlight) {
     }
 }
 
-// The buffers a shared ring stands in for, at their worst case: each open connection's
-// WebSocket payload buffer grown to one maximal message, a player encoded ring of
-// audio_hold_bytes, and a visualizer frame ring of visualizer_hold_bytes.
-constexpr size_t separate_inbound_buffer_bytes(const InboundRingBudget& budget,
-                                               size_t open_connections) {
-    return budget.audio_hold_bytes + budget.visualizer_hold_bytes +
-           open_connections * INBOUND_MAX_MESSAGE_BYTES;
-}
-
-// The derived ring always satisfies the FreeRTOS storage rule, accepts a maximal message, holds
-// every term of the derivation, and stays within the separate per-role and per-connection buffers
-// for the same configuration at the default connection budget. Rows cover each role mix; the
-// first is the controller-only floor.
-TEST(InboundRingSize, DerivationIsValidAndWithinTheSeparateBuffers) {
-    constexpr size_t OPEN_CONNECTIONS = SendspinClientConfig::DEFAULT_SERVER_MAX_CONNECTIONS;
+// The derived ring always satisfies the FreeRTOS storage rule, accepts a maximal message and holds
+// every term of the derivation: each holder's quota, the pass-through traffic that can arrive
+// during the player's longest hold (state JSON, time replies, visualizer frames), and the images
+// that window carries or the maximal-message allowance. The terms are recomputed here from the
+// stated budget (a track change every 30 s). Rows cover each role mix; the first is the
+// controller-only floor.
+TEST(InboundRingSize, DerivationHoldsEveryTerm) {
     struct Row {
         const char* name;
         InboundRingBudget budget;
     };
+    const size_t default_image =
+        inbound_frames_stored_bytes(ImageSlotPreference::DEFAULT_MAX_IMAGE_BYTES);
     const std::vector<Row> rows = {
-        {"Control: no holding role, no artwork", {0, 0, 0}},
-        {"default player", {PlayerRoleConfig::DEFAULT_AUDIO_BUFFER_CAPACITY, 0, 0}},
-        {"default player and artwork",
-         {PlayerRoleConfig::DEFAULT_AUDIO_BUFFER_CAPACITY, 0,
-          ImageSlotPreference::DEFAULT_MAX_IMAGE_BYTES}},
-        {"small player, visualizer, artwork", {100000, 8192, 64 * 1024}},
-        {"player size not a multiple of 4", {100001, 0, 0}},
+        {"Control: no holding role, no artwork", {0, 0, 0, 0}},
+        {"default player", {PlayerRoleConfig::DEFAULT_AUDIO_BUFFER_CAPACITY, 0, 0, 0}},
+        {"default player and one artwork channel",
+         {PlayerRoleConfig::DEFAULT_AUDIO_BUFFER_CAPACITY, 0, 0, default_image}},
+        {"small player, visualizer, two artwork channels",
+         {100000, 8192, 30 * 72, 2 * inbound_frames_stored_bytes(64 * 1024)}},
+        {"player size not a multiple of 4", {100001, 0, 0, 0}},
+        {"faster time bursts", {100000, 0, 0, 0, 16, 1000}},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -520,16 +636,38 @@ TEST(InboundRingSize, DerivationIsValidAndWithinTheSeparateBuffers) {
         EXPECT_EQ(bytes % SharedRingLayout::STORAGE_ALIGNMENT, 0U);
         EXPECT_GE(SharedRingLayout::max_item_size(bytes),
                   sizeof(InboundItemHeader) + INBOUND_MAX_MESSAGE_BYTES);
-        const size_t passthrough = row.budget.largest_image_bytes > 0
-                                       ? row.budget.largest_image_bytes
-                                       : INBOUND_PASSTHROUGH_MESSAGES * INBOUND_MAX_ITEM_STORED_BYTES;
-        EXPECT_GE(bytes,
-                  row.budget.audio_hold_bytes + row.budget.visualizer_hold_bytes + passthrough);
-        EXPECT_LE(bytes, separate_inbound_buffer_bytes(row.budget, OPEN_CONNECTIONS));
+
+        // The player's longest hold at the lowest budgeted rate, and what arrives meanwhile.
+        const size_t stored_per_second =
+            (160 + 13 + INBOUND_ITEM_STORED_OVERHEAD_BYTES) * 50;  // 20 ms Opus at 64 kbit/s
+        const size_t hold_seconds =
+            (row.budget.audio_hold_bytes + stored_per_second - 1) / stored_per_second;
+        const size_t bursts =
+            hold_seconds > 0
+                ? hold_seconds * 1000 / static_cast<size_t>(row.budget.time_burst_interval_ms) + 1
+                : 0;
+        const size_t held_passthrough =
+            hold_seconds * (1024 + row.budget.visualizer_stored_bytes_per_second) +
+            bursts * row.budget.time_burst_size * INBOUND_TIME_REPLY_STORED_BYTES;
+        const size_t allowance =
+            row.budget.artwork_images_stored_bytes > 0
+                ? (hold_seconds / 30 + 1) * row.budget.artwork_images_stored_bytes
+                : INBOUND_PASSTHROUGH_MESSAGES * INBOUND_MAX_ITEM_STORED_BYTES;
+        EXPECT_GE(bytes, row.budget.audio_hold_bytes + row.budget.visualizer_hold_bytes +
+                             held_passthrough + allowance);
 
         InboundRing ring;
         EXPECT_TRUE(ring.create(bytes, MemoryLocation::PREFER_EXTERNAL));
     }
+}
+
+// The hold window the pass-through term is sized for: the default player quota filled with
+// 160-byte frames every 20 ms holds its oldest chunk for 87 s (1,000,000 bytes at 11,600 stored
+// bytes a second, rounded up). Spelled out: it is the figure the default ring size rests on.
+TEST(InboundRingSize, TheDefaultPlayerHoldsAudioFor87Seconds) {
+    EXPECT_EQ(INBOUND_MIN_AUDIO_STORED_BYTES_PER_SECOND, 11600U);
+    EXPECT_EQ(inbound_max_hold_seconds(PlayerRoleConfig::DEFAULT_AUDIO_BUFFER_CAPACITY), 87U);
+    EXPECT_EQ(inbound_max_hold_seconds(0), 0U) << "Control: no player, no hold window";
 }
 
 // A run of frames is stored as whole items: each maximal frame and the final partial one pays

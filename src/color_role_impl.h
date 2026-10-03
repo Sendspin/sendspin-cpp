@@ -79,10 +79,10 @@ struct ColorRole::Impl {
     void handle_cleared_event() const;
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
-    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
-    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
-    /// lost connection, never quiesces the network thread). Re-checking at each point of effect
-    /// invalidates the whole handler instead of only the part that ran before it.
+    /// The gate in SendspinClient's role dispatch is checked once, on the protocol task, while the
+    /// handler it admits runs on: a teardown on the main loop can land in between (neither a lost
+    /// connection nor a deactivation waits for the protocol task). Re-checking at each point of
+    /// effect invalidates the whole handler instead of only the part that ran before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
@@ -115,7 +115,7 @@ struct ColorRole::Impl {
 
     // 32-bit fields
     /// @brief Teardown generation, bumped by cleanup() and re-checked at every point of effect
-    /// (see accepts()). Atomic because the network thread reads it.
+    /// (see accepts()). Atomic because the protocol task reads it.
     std::atomic<uint32_t> cleanup_generation{0};
 };
 

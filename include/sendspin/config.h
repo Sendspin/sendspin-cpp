@@ -208,11 +208,11 @@ struct SendspinClientConfig {
     unsigned httpd_priority{DEFAULT_HTTPD_PRIORITY};  ///< FreeRTOS priority for the HTTP server
                                                       ///< task (ESP-IDF only)
 
-    /// @brief Default HTTP server task stack size in bytes (ESP-IDF only). Larger than the
-    /// esp_http_server 4096-byte default because the Noise handshake runs on this task: the
-    /// initial handshake fits in 4096, but the in-band re-handshake (server-initiated after
-    /// pairing finalize) runs the full KKpsk2 X25519 handshake nested under the transport
-    /// decrypt/encrypt layers, which overflows 4096.
+    /// @brief Default HTTP server task stack size in bytes (ESP-IDF only). The value shipped and
+    /// verified on hardware. The task runs no Noise or protocol work (the protocol task does; see
+    /// DEFAULT_PROTOCOL_TASK_STACK_SIZE), only the frame receive into the inbound ring and the
+    /// queued sends, so the floor over the esp_http_server 4096-byte default is a candidate to
+    /// lower once that path is measured with -fstack-usage.
     static constexpr size_t DEFAULT_HTTPD_STACK_SIZE = 8192U;
 
     size_t httpd_stack_size{DEFAULT_HTTPD_STACK_SIZE};  ///< HTTP server task stack size in bytes
@@ -223,14 +223,39 @@ struct SendspinClientConfig {
                                      ///< (ESP-IDF only)
 
     /// @brief Default esp_websocket_client task stack size in bytes (ESP-IDF only). Same
-    /// rationale as DEFAULT_HTTPD_STACK_SIZE above; this task runs the Noise handshake inline
-    /// for outbound connections rather than for an accepted server connection.
+    /// rationale as DEFAULT_HTTPD_STACK_SIZE above, for the outbound connection's transport
+    /// task.
     static constexpr size_t DEFAULT_WEBSOCKET_STACK_SIZE = 8192U;
 
     size_t websocket_stack_size{
         DEFAULT_WEBSOCKET_STACK_SIZE};  ///< esp_websocket_client task stack size in bytes
                                         ///< (ESP-IDF only). Values below
                                         ///< DEFAULT_WEBSOCKET_STACK_SIZE are clamped up to it.
+
+    bool protocol_task_psram_stack{false};  ///< Allocate the protocol task stack in PSRAM
+                                            ///< (ESP-IDF only)
+
+    /// @brief Default FreeRTOS priority for the protocol task (ESP-IDF only). The same priority
+    /// as the httpd task that hands it messages, so neither starves the other, and below the
+    /// player's sync task (PlayerRoleConfig::DEFAULT_SYNC_TASK_PRIORITY), which must keep
+    /// decoding through the burst of audio a stream start delivers.
+    static constexpr unsigned DEFAULT_PROTOCOL_TASK_PRIORITY = DEFAULT_HTTPD_PRIORITY;
+
+    unsigned protocol_task_priority{DEFAULT_PROTOCOL_TASK_PRIORITY};  ///< FreeRTOS priority for
+                                                                      ///< the protocol task
+                                                                      ///< (ESP-IDF only)
+
+    /// @brief Default protocol task stack size in bytes (ESP-IDF only). The protocol task runs
+    /// every Noise handshake, including the in-band re-handshake that runs the full KKpsk2 X25519
+    /// handshake nested under the transport decrypt and encrypt layers, plus the JSON parse and
+    /// the role handlers: the work whose stack the transport tasks were sized for, so it takes
+    /// their verified 8192 bytes until it is measured with -fstack-usage.
+    static constexpr size_t DEFAULT_PROTOCOL_TASK_STACK_SIZE = 8192U;
+
+    size_t protocol_task_stack_size{
+        DEFAULT_PROTOCOL_TASK_STACK_SIZE};  ///< Protocol task stack size in bytes (ESP-IDF only).
+                                            ///< Values below DEFAULT_PROTOCOL_TASK_STACK_SIZE are
+                                            ///< clamped up to it.
 
     static constexpr uint16_t DEFAULT_SERVER_PORT = 8928U;  ///< Default WebSocket server port
 
@@ -251,7 +276,9 @@ struct SendspinClientConfig {
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
     static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
 
-    uint8_t time_burst_size{8};  ///< Number of messages per time sync burst
+    static constexpr uint8_t DEFAULT_BURST_SIZE = 8;  ///< Default messages per time sync burst
+
+    uint8_t time_burst_size{DEFAULT_BURST_SIZE};  ///< Number of messages per time sync burst
     int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};  ///< Milliseconds between bursts
     int64_t time_burst_response_timeout_ms{
         DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
@@ -264,9 +291,12 @@ struct SendspinClientConfig {
     /// MAX_LIVENESS_TIMEOUT_MS.
     std::optional<int64_t> liveness_timeout_ms{};
 
-    /// @brief Memory placement for the per-connection WebSocket payload reassembly buffer
-    /// (ESP-IDF only; ignored on host). Defaults to PREFER_EXTERNAL (SPIRAM).
-    MemoryLocation websocket_payload_location{MemoryLocation::PREFER_EXTERNAL};
+    /// @brief Memory placement for the shared inbound ring every admitted connection receives
+    /// into (sized from the enabled roles' buffers: the player's audio_buffer_capacity, the
+    /// visualizer's buffer_capacity and the largest artwork image) and for each connection's
+    /// fallback buffer, which holds a pre-admission message (ESP-IDF only; ignored on host).
+    /// Defaults to PREFER_EXTERNAL (SPIRAM), falling back to internal RAM.
+    MemoryLocation inbound_ring_location{MemoryLocation::PREFER_EXTERNAL};
 
     /// @brief Memory placement for the Noise transport's fragment reassembly buffer, the ~64 KB
     /// fragmentation frame buffer, and the outbound send scratch buffer (ESP-IDF only; ignored on
@@ -282,9 +312,10 @@ struct SendspinClientConfig {
     /// @brief Size in bytes of an internal-RAM scratch arena for parsing incoming JSON messages.
     /// When non-zero, the JSON document used to parse each incoming protocol message is allocated
     /// from a fixed internal-RAM buffer of this size instead of PSRAM, cutting PSRAM traffic on the
-    /// network task; messages too large for the budget fall back to PSRAM. Costs this many bytes
+    /// protocol task; messages too large for the budget fall back to PSRAM. Costs this many bytes
     /// of internal RAM permanently; smaller values just fall back more often. Set to 0 to disable
     /// the arena. On host there is no PSRAM distinction and the arena is a plain scratch buffer.
+    /// Used by the protocol task only.
     size_t json_arena_size{DEFAULT_JSON_ARENA_SIZE};
 };
 
@@ -378,11 +409,13 @@ struct PlayerRoleConfig {
     bool psram_stack{false};  ///< Allocate sync task stack in PSRAM (ESP-IDF only)
 
     /// @brief Default FreeRTOS priority for the sync/decode task (ESP-IDF only).
-    /// One above SendspinClientConfig::DEFAULT_HTTPD_PRIORITY so the httpd server task
-    /// cannot starve the decoder during the initial burst of incoming encoded audio that
-    /// fills the audio buffer at stream start.
+    /// One above SendspinClientConfig::DEFAULT_HTTPD_PRIORITY so the httpd server task and the
+    /// protocol task cannot starve the decoder during the initial burst of incoming encoded audio
+    /// that fills the audio buffer at stream start.
     static constexpr unsigned DEFAULT_SYNC_TASK_PRIORITY =
         SendspinClientConfig::DEFAULT_HTTPD_PRIORITY + 1U;
+    static_assert(SendspinClientConfig::DEFAULT_PROTOCOL_TASK_PRIORITY < DEFAULT_SYNC_TASK_PRIORITY,
+                  "The protocol task must stay below the sync task");
 
     unsigned priority{DEFAULT_SYNC_TASK_PRIORITY};  ///< FreeRTOS priority for the sync/decode
                                                     ///< task (ESP-IDF only)
@@ -466,11 +499,13 @@ struct ArtworkRoleConfig {
     bool psram_stack{false};  ///< Allocate decode thread stack in PSRAM (ESP-IDF only)
 
     /// @brief Default FreeRTOS priority for the image decode thread (ESP-IDF only). Image
-    /// decoding is best-effort work with seconds of slack, so it sits below the network and httpd
-    /// tasks (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY).
+    /// decoding is best-effort work with seconds of slack, so it sits below the protocol and
+    /// httpd tasks (SendspinClientConfig::DEFAULT_PROTOCOL_TASK_PRIORITY, DEFAULT_HTTPD_PRIORITY).
     static constexpr unsigned DEFAULT_ARTWORK_PRIORITY = 2U;
     static_assert(DEFAULT_ARTWORK_PRIORITY < SendspinClientConfig::DEFAULT_HTTPD_PRIORITY,
                   "The artwork decode thread must stay below the httpd task");
+    static_assert(DEFAULT_ARTWORK_PRIORITY < SendspinClientConfig::DEFAULT_PROTOCOL_TASK_PRIORITY,
+                  "The artwork decode thread must stay below the protocol task");
 
     /// @brief FreeRTOS priority for the image decode thread (ESP-IDF only)
     unsigned priority{DEFAULT_ARTWORK_PRIORITY};
@@ -507,12 +542,14 @@ struct VisualizerSpectrumConfig {
 
 /// @brief Visualizer capabilities advertised to the server during the hello handshake
 struct VisualizerSupportObject {
-    /// @brief Total RAM budget in bytes for the internal ring buffer (the exact allocation size).
-    /// This is not the amount of wire data that fits: each entry stores its full wire message
-    /// (message-type byte + timestamp + data), a 4-byte arrival stamp and an aligned per-entry
-    /// ItemHeader, so for the small visualizer entries only roughly a third of this budget holds
-    /// actual wire data. The client advertises that effective (~1/3) capacity to the server, not
-    /// this raw budget, so the server's flow control does not overrun the ring
+    /// @brief RAM budget in bytes for the frames the visualizer holds: its share of the shared
+    /// inbound ring and the quota its held frames are charged against. This is not the amount of
+    /// wire data that fits: each frame is held as the encrypted message it arrived in, with the
+    /// ring's per-item overhead, so for the small visualizer frames only about a seventh of this
+    /// budget holds actual wire data. The client advertises that effective capacity to the
+    /// server, not this raw budget, so the server's flow control does not overrun the quota.
+    /// VisualizerRole's start fails below 70 bytes, the smallest budget that advertises one
+    /// smallest frame, the default 0 included.
     size_t buffer_capacity{};
 };
 
@@ -542,11 +579,14 @@ struct VisualizerRoleConfig {
     int32_t display_offset_ms{0};
 
     /// @brief Default FreeRTOS priority for the visualization drain thread (ESP-IDF only).
-    /// Delivering frames is best-effort work, so it sits below the network and httpd tasks
-    /// (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY).
+    /// Delivering frames is best-effort work, so it sits below the protocol and httpd tasks
+    /// (SendspinClientConfig::DEFAULT_PROTOCOL_TASK_PRIORITY, DEFAULT_HTTPD_PRIORITY).
     static constexpr unsigned DEFAULT_VISUALIZER_PRIORITY = 2U;
     static_assert(DEFAULT_VISUALIZER_PRIORITY < SendspinClientConfig::DEFAULT_HTTPD_PRIORITY,
                   "The visualization drain thread must stay below the httpd task");
+    static_assert(DEFAULT_VISUALIZER_PRIORITY <
+                      SendspinClientConfig::DEFAULT_PROTOCOL_TASK_PRIORITY,
+                  "The visualization drain thread must stay below the protocol task");
 
     /// @brief FreeRTOS priority for the visualization drain thread (ESP-IDF only)
     unsigned priority{DEFAULT_VISUALIZER_PRIORITY};

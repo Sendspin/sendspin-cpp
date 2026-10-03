@@ -8,7 +8,9 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 
 ### Key classes
 
-- `SendspinClient` (`client.h`): main orchestration class, owns connections, time sync, and message routing
+- `SendspinClient` (`client.h`): main orchestration class, owns connections, time sync, the inbound ring and the protocol task, and message routing
+- `ProtocolTask` (`protocol_task.h`): the library-owned `SsProto` thread that runs all per-connection receive work (decrypt, reassembly, the handshake, dispatch, the admission replay, close reporting) through `SendspinClient::protocol_tick()`, plus its bounded command queue
+- `InboundRing` / `InboundItemList` / `InboundGate` (`inbound_ring.h`): the one shared ring every admitted connection's transport receives into, the per-role item lists that hand audio and visualizer frames to their consumer threads in place (charged to per-role quotas), and the per-connection transport/protocol-task hand-off
 - `PlayerRole` (`player_role.h`): audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
 - `ControllerRole` (`controller_role.h`): sends playback commands to the server
 - `MetadataRole` (`metadata_role.h`): receives track metadata and progress
@@ -16,9 +18,9 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `VisualizerRole` (`visualizer_role.h`): receives spectrum/beat visualization data
 - `ColorRole` (`color_role.h`): receives audio-derived RGB color palette from the server
 - `SyncTask` (`sync_task.h`): decodes encoded audio, synchronizes to server timestamps, writes PCM via audio write callback
-- `SendspinConnection` (`connection.h`): abstract WebSocket connection base
+- `SendspinConnection` (`connection.h`): abstract WebSocket connection base; its transport only receives into the inbound ring or its fallback buffer and reports a close, and everything else on it runs on the protocol task
 - `SendspinServerConnection` / `SendspinClientConnection`: platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
-- `NoiseHandshake` (`noise_handshake.h`): drives the Noise KKpsk2 handshake frames on the network thread and resolves the PSK through `RecordStore`
+- `NoiseHandshake` (`noise_handshake.h`): drives the Noise KKpsk2 handshake frames on the protocol task and resolves the PSK through `RecordStore`
 - `NoiseSession` (`noise_session.h`): noise-c wrapper holding the KKpsk2 handshake and transport cipher states
 - `NoiseTransport` (`noise_transport.h`): per-connection encrypted framing, owns fragmentation and reassembly around the session
 - `RecordStore` (`record_store.h`): pairing records and the Pairing PSK (configured, stored, or generated), seeded from the client config and the persistence provider
@@ -74,7 +76,6 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `json_arena.h`: bounded internal-RAM bump-arena ArduinoJson allocator with PSRAM fallback
 - `network_info.h`: best-effort lookup of the local network interface MAC address
 - `types.h`: platform type abstractions
-- `spsc_ring_buffer.h`: single-producer/single-consumer ring buffer (ESP: FreeRTOS `xRingbuffer`, host: mutex/condition variable)
 - `shared_ring_buffer.h`: multi-producer ring buffer with acquire/complete writes, one ordered consumer, any-order returns and ring-order reclamation (ESP: FreeRTOS no-split `xRingbuffer`, host: a mutex/condition-variable reimplementation of its layout)
 - `thread_safe_queue.h`: thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
 - `event_flags.h`: event flag group (ESP: FreeRTOS event group, host: mutex/condition variable)

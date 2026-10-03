@@ -53,7 +53,6 @@ function(sendspin_get_sources BASE_DIR)
     # Per-role source sets: conditionally compiled based on SENDSPIN_ENABLE_* options
     set(SENDSPIN_PLAYER_SOURCES
         ${BASE_DIR}/src/player_role.cpp
-        ${BASE_DIR}/src/audio_ring_buffer.cpp
         ${BASE_DIR}/src/decoder.cpp
         ${BASE_DIR}/src/sync_task.cpp
 

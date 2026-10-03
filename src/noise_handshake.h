@@ -80,7 +80,7 @@ enum class HandshakeFrameResult : uint8_t {
 
 /// @brief Run the responder side of an in-band Noise KKpsk2 re-handshake.
 ///
-/// Called on the network thread when a decrypted noise/handshake JSON arrives
+/// Called on the protocol task when a decrypted noise/handshake JSON arrives
 /// after transport mode is already active.  The prologue for the re-handshake
 /// is the 32-byte handshake hash `h` from the PRIOR handshake.
 ///
@@ -94,7 +94,7 @@ enum class HandshakeFrameResult : uint8_t {
 /// @param msg1_json      Decrypted noise/handshake JSON string (the re-handshake msg1 envelope).
 /// @param server_id      Known server peer_id (43-char base64url) from the prior handshake.
 /// @param identity       Our static X25519 identity.
-/// @param record_store   Record store for psk_id resolution (read-only on network thread).
+/// @param record_store   Record store for psk_id resolution (read-only on protocol task).
 /// @param suite_name     Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
 /// @param prior_h        32-byte handshake hash from the prior session (used as prologue).
 /// @return Populated NoiseHandshakeResult (session + msg2_text to send) on success,
@@ -115,13 +115,13 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(std::string_view msg1_j
 /// build_client_init() produces the first cleartext frame, on_text_frame() takes each incoming
 /// text frame, and take_result() yields the session once that returns COMPLETE.
 ///
-/// Threading: runs entirely on the network thread. PSK resolution goes through
+/// Threading: runs entirely on the protocol task. PSK resolution goes through
 /// RecordStore::resolve_by_psk_id(), which locks the store's mutex internally (see
 /// record_store.h).
 class NoiseHandshake {
 public:
     /// @brief Construct the handshake driver.
-    /// @param record_store Record store for psk_id resolution (read-only on network thread).
+    /// @param record_store Record store for psk_id resolution (read-only on protocol task).
     /// @param suite_name   Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
     NoiseHandshake(const Identity& identity, const RecordStore& record_store,
                    const std::string& suite_name);

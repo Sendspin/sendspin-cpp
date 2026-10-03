@@ -34,8 +34,9 @@ namespace sendspin {
 /**
  * @brief Outbound WebSocket connection to a Sendspin server (host build, IXWebSocket)
  *
- * Connects to a server URL, delivers incoming messages through the base class callbacks, and
- * reconnects automatically after connection loss; loop() drives the reconnect timer.
+ * Connects to a server URL and hands each incoming message to the protocol task through the
+ * inbound ring, and reconnects automatically after connection loss; loop() drives the reconnect
+ * timer.
  */
 class SendspinClientConnection : public SendspinConnection {
 public:

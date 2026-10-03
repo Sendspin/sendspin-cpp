@@ -98,22 +98,14 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                 int64_t receive_time = platform_time_us();
 
                 if (msg->type == ix::WebSocketMessageType::Message) {
-                    // Find the connection by sockfd; hold shared_ptr to keep it alive
-                    // during dispatch
-                    std::shared_ptr<SendspinConnection> conn_holder;
-                    if (this->find_connection_callback_) {
-                        conn_holder = this->find_connection_callback_(synthetic_sockfd);
-                    }
-                    auto* conn = static_cast<SendspinServerConnection*>(conn_holder.get());
+                    // The reference keeps the connection alive for the hand-off. A connection the
+                    // manager rejected at delivery or has since released is detached, so its
+                    // frames are dropped inside handle_message().
+                    auto conn = delivered->lock();
                     if (conn == nullptr) {
-                        // Not managed: the manager rejected it at delivery (goodbye + close
-                        // already sent) or has since released it. Frames racing that close
-                        // are dropped here.
-                        SS_LOGD(TAG, "Dropping message for unmanaged sockfd %d", synthetic_sockfd);
+                        SS_LOGD(TAG, "Dropping message for released sockfd %d", synthetic_sockfd);
                         return;
                     }
-
-                    // Route through the connection's public handle_message method
                     conn->handle_message(msg->str, msg->binary, receive_time);
 
                 } else if (msg->type == ix::WebSocketMessageType::Open) {
@@ -141,10 +133,10 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                             synthetic_sockfd);
                     // lock() fails once the manager (the sole long-term owner) has already
                     // released the connection; there is nothing left to notify it about.
+                    // Otherwise the protocol task reports the loss once the messages before the
+                    // close are processed.
                     if (auto conn = delivered->lock()) {
-                        if (this->connection_closed_callback_) {
-                            this->connection_closed_callback_(std::move(conn));
-                        }
+                        conn->notify_transport_closed();
                     }
                 } else if (msg->type == ix::WebSocketMessageType::Error) {
                     SS_LOGE(TAG, "WebSocket error: %s", msg->errorInfo.reason.c_str());

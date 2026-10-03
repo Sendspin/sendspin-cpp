@@ -22,7 +22,7 @@
 ///
 /// All functions are pure, so they unit-test independently of the network layer. The admission
 /// handler in ConnectionManager::loop() applies them on the main loop thread; do not call from
-/// the network thread.
+/// the protocol task.
 
 #pragma once
 

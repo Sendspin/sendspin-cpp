@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <utility>
 
 static const char* const TAG = "sendspin.visualizer";
 
@@ -30,15 +31,15 @@ static const char* const TAG = "sendspin.visualizer";
 // Entry format constants
 // ============================================================================
 
-// Each ring buffer entry is [wire_type(1)][arrival(4)][server_ts(8)][payload]: the wire message
-// after its type byte, preceded by the low 32 bits of the local time the network thread received
-// it (see visualizer_arrival_from_stamp()). buffer_capacity is the ring's total RAM budget, not a
-// wire-data quota: on top of these bytes each entry costs an aligned per-entry ItemHeader, so
+// Each frame stays in the inbound ring item it arrived in: its plaintext is
+// [wire_type(1)][server_ts(8)][payload], the item header carries the wire type, the payload's
+// offset and length, and the transport's receive stamp. buffer_capacity is the visualizer's quota
+// of ring storage, not a wire-data quota: each frame also costs the ring's per-item overhead, so
 // effective wire-data capacity is smaller (see the buffer_capacity note in config.h).
 static constexpr size_t ENTRY_TYPE_SIZE = 1;
-static constexpr size_t ARRIVAL_SIZE = sizeof(uint32_t);
-static constexpr size_t ENTRY_HEADER_SIZE = ENTRY_TYPE_SIZE + ARRIVAL_SIZE;
 static constexpr size_t TIMESTAMP_SIZE = 8;
+/// @brief Offset of a frame's payload in its plaintext
+static constexpr size_t FRAME_PAYLOAD_OFFSET = ENTRY_TYPE_SIZE + TIMESTAMP_SIZE;
 
 // Minimum payload bytes after the timestamp, per wire message type
 static constexpr size_t LOUDNESS_PAYLOAD_SIZE = 2;  // uint16 value
@@ -49,51 +50,63 @@ static constexpr size_t PEAK_PAYLOAD_SIZE = 1;      // uint8 strength
 /// @brief Bit 0 of the beat flags byte marks a downbeat (bar start)
 static constexpr uint8_t BEAT_FLAG_DOWNBEAT = 0x01;
 
-// buffer_capacity is the ring's RAM budget, but each entry costs an 8-byte ItemHeader plus 8-byte
-// alignment on top of its entry, so the smallest entries (beat/peak, 10 wire bytes -> 24 stored;
-// f_peak, 13 -> 32) leave only ~1/3 of the budget for actual wire data. Advertise that effective
-// fraction to the server (not the raw budget) so its flow control never sends more than the ring
-// can hold. This mirrors the player role's conservative buffer advertisement.
-static constexpr size_t BUFFER_ADVERTISE_DIVISOR = 3;
+/// @brief The smallest frame on the wire: a beat or peak, one payload byte behind the type byte and
+/// the timestamp
+static constexpr size_t MIN_FRAME_WIRE_BYTES = FRAME_PAYLOAD_OFFSET + BEAT_PAYLOAD_SIZE;
 
-/// @brief Ring storage for an entry of `entry_size` bytes: an 8-byte item header plus the entry
-/// rounded up to 8 bytes, the host ring's layout and no less than the ESP ring stores.
-static constexpr size_t stored_entry_size(size_t entry_size) {
-    return 8 + ((entry_size + 7) / 8) * 8;
-}
+// buffer_capacity is the visualizer's quota of inbound ring storage, but each frame is held at
+// its stored cost, at most sendspin::INBOUND_ITEM_STORED_OVERHEAD_BYTES over its wire size, so
+// the smallest frames (10 wire bytes stored as 68) leave only about a seventh of the quota for
+// wire data. Advertise that fraction to the server (not the raw budget) so its flow control never
+// sends more than the quota holds. This mirrors the player role's derived buffer advertisement.
+static constexpr size_t BUFFER_ADVERTISE_DIVISOR =
+    (MIN_FRAME_WIRE_BYTES + sendspin::INBOUND_ITEM_STORED_OVERHEAD_BYTES + MIN_FRAME_WIRE_BYTES -
+     1) /
+    MIN_FRAME_WIRE_BYTES;
+
+/// @brief The smallest buffer_capacity the role starts with: one that advertises at least one
+/// smallest frame (MIN_FRAME_WIRE_BYTES) to the server, which also holds that frame's stored size.
+static constexpr size_t MIN_BUFFER_CAPACITY = BUFFER_ADVERTISE_DIVISOR * MIN_FRAME_WIRE_BYTES;
+static_assert(MIN_BUFFER_CAPACITY >=
+                  sendspin::SharedRingLayout::stored_size(sizeof(sendspin::InboundItemHeader) +
+                                                          MIN_FRAME_WIRE_BYTES +
+                                                          sendspin::AEAD_TAG_SIZE),
+              "the floor must hold one stored frame");
 
 /// @brief Whether a message with `payload_size` bytes after its timestamp stores within the
 /// advertised fraction.
 static constexpr bool fits_advertised_fraction(size_t payload_size) {
-    const size_t wire_size = ENTRY_TYPE_SIZE + TIMESTAMP_SIZE + payload_size;
+    const size_t wire_size = FRAME_PAYLOAD_OFFSET + payload_size;
     return BUFFER_ADVERTISE_DIVISOR * wire_size >=
-           stored_entry_size(ENTRY_HEADER_SIZE + TIMESTAMP_SIZE + payload_size);
+           sendspin::SharedRingLayout::stored_size(sizeof(sendspin::InboundItemHeader) + wire_size +
+                                                   sendspin::AEAD_TAG_SIZE);
 }
 static_assert(fits_advertised_fraction(BEAT_PAYLOAD_SIZE) &&
                   fits_advertised_fraction(PEAK_PAYLOAD_SIZE) &&
                   fits_advertised_fraction(LOUDNESS_PAYLOAD_SIZE) &&
                   fits_advertised_fraction(F_PEAK_PAYLOAD_SIZE),
-              "the advertised buffer_capacity would exceed what the ring holds");
+              "the advertised buffer_capacity would exceed the visualizer's quota");
 
 // Event flag bits for drain thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
 static constexpr uint32_t COMMAND_FLUSH = (1 << 1);  // Drain to empty (producer already stopped)
 static constexpr uint32_t COMMAND_CLEAR = (1 << 2);  // Discard up to the clear marker entry
 
-// Sentinel entry marking a stream/start or stream/clear boundary in the ring buffer. Entries
-// before the marker predate the boundary and are discarded; entries after it survive. The value
+// Type of the item marking a stream/start or stream/clear boundary on the item list. Frames
+// before the marker predate the boundary and are discarded; frames after it survive. The value
 // is outside the visualizer wire-type range (16-23) so it can never collide with a real message,
-// and the entry is a single byte so the drain loop's minimum-size check drops any leftover marker
-// encountered in normal flow.
+// and the marker carries no timestamp, so the drain loop drops any leftover marker encountered in
+// normal flow.
 static constexpr uint8_t ENTRY_TYPE_CLEAR_MARKER = 0xFF;
 
-/// @brief Timeout for enqueueing the clear marker. The drain thread is concurrently discarding,
-/// so a full buffer frees quickly; if this still times out the boundary is lost and the drain
-/// falls back to discarding everything it finds (matching the player's marker semantics).
-static constexpr uint32_t MARKER_ENQUEUE_TIMEOUT_MS = 100U;
+/// @brief Timeout for acquiring ring space for the clear marker (see
+/// sendspin::INBOUND_ACQUIRE_TIMEOUT_MS). The drain thread is concurrently discarding, so space
+/// frees quickly; if this still times out the boundary is lost and the drain falls back to
+/// discarding everything it finds (matching the player's marker semantics).
+static constexpr uint32_t MARKER_ENQUEUE_TIMEOUT_MS = sendspin::INBOUND_ACQUIRE_TIMEOUT_MS;
 
-/// @brief Fallback wakeup interval for the drain thread's blocking ring buffer receive. Stop,
-/// flush, and clear commands wake the receive immediately via wake_receiver(), so this is only
+/// @brief Fallback wakeup interval for the drain thread's blocking item list take. Stop,
+/// flush, and clear commands wake the take immediately via wake_receiver(), so this is only
 /// a safety net against a missed wake: long enough to keep an idle thread asleep, short enough
 /// that a wake bug degrades to a slow reaction rather than a hang.
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 5000U;
@@ -143,16 +156,6 @@ VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
       client(client),
       event_state(std::make_unique<EventState>()) {
     this->drain_task = std::make_unique<DrainTask>();
-
-    // buffer_capacity is the total RAM budget for the ring buffer. Each entry carries an
-    // 8-byte ItemHeader aligned to 8 bytes, so with the small visualizer entries roughly a
-    // third of this storage holds actual wire data and the rest is per-entry overhead.
-    // The storage is written once per frame off the network thread and drained on a task of its
-    // own, so it prefers SPIRAM like the artwork image buffers.
-    size_t capacity = this->visualizer_support.buffer_capacity;
-    if (this->drain_task->ring_storage.allocate(capacity, MemoryLocation::PREFER_EXTERNAL)) {
-        this->drain_task->ring_buffer.create(capacity, this->drain_task->ring_storage.data());
-    }
 }
 
 VisualizerRole::Impl::~Impl() {
@@ -181,7 +184,7 @@ void VisualizerRole::Impl::attach_inbox(Inbox& inbox) {
     this->event_state->config_slot.bind(inbox, INBOX_TOPIC_VISUALIZER_CONFIG);
 }
 
-bool VisualizerRole::Impl::start() {
+bool VisualizerRole::Impl::start(InboundRing* ring) {
     // roles/visualizer/v1.md "client/state visualizer object": rate_max is a positive integer,
     // and a types list containing 'spectrum' without a spectrum object is a protocol error the
     // server SHOULD close the connection for. The configuration is reported as given, so a
@@ -192,17 +195,17 @@ bool VisualizerRole::Impl::start() {
         SS_LOGE(TAG, "VisualizerStreamConfig::rate_max must be positive while types are requested");
         return false;
     }
+    // A quota that advertises less than one frame (or cannot store one) drops every frame;
+    // refuse it as the configuration error it is.
+    if (this->visualizer_support.buffer_capacity < MIN_BUFFER_CAPACITY) {
+        SS_LOGE(TAG, "VisualizerSupportObject::buffer_capacity must be at least %zu bytes",
+                MIN_BUFFER_CAPACITY);
+        return false;
+    }
     if (!stream.spectrum.has_value() &&
         std::find(stream.types.begin(), stream.types.end(), VisualizerDataType::SPECTRUM) !=
             stream.types.end()) {
         SS_LOGE(TAG, "VisualizerStreamConfig::spectrum is required to request the spectrum type");
-        return false;
-    }
-    if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
-        SS_LOGE(TAG,
-                "Failed to start visualizer: no ring buffer for a "
-                "VisualizerSupportObject::buffer_capacity of %zu bytes",
-                this->visualizer_support.buffer_capacity);
         return false;
     }
     if (this->drain_task->drain_thread.joinable()) {
@@ -212,11 +215,18 @@ bool VisualizerRole::Impl::start() {
         SS_LOGE(TAG, "Failed to create visualizer event flags");
         return false;
     }
+    // Bound before the thread and before the protocol task can hand anything over: the list
+    // links items by their offset in this run's ring storage.
+    if (!this->drain_task->items.create(ring, InboundHolder::VISUALIZER)) {
+        SS_LOGE(TAG, "Failed to create the visualizer item list");
+        return false;
+    }
+    this->drain_task->ring.store(ring, std::memory_order_release);
 
     // The flags survive a stop()/start() cycle, and a flush or clear signalled between the join
     // and this start (cleanup() on a stopped role) is still set. Clear the whole group so the new
     // thread starts from a clean command state whatever bits the role defines (stop() already
-    // emptied the ring).
+    // emptied the list).
     this->drain_task->event_flags.clear_all();
 
     platform_configure_thread("SsVis", 4096, static_cast<int>(this->config.priority),
@@ -231,9 +241,9 @@ bool VisualizerRole::Impl::signal_stop() const {
     }
     // Set the flag before waking: the thread re-checks its command flags at the top of every
     // loop iteration, so this ordering guarantees it observes the stop no matter which wait
-    // it was parked in (display-time flags wait or ring buffer receive).
+    // it was parked in (display-time flags wait or item list take).
     this->drain_task->event_flags.set(COMMAND_STOP);
-    this->drain_task->ring_buffer.wake_receiver();
+    this->drain_task->items.wake_receiver();
     return true;
 }
 
@@ -243,17 +253,54 @@ void VisualizerRole::Impl::stop() const {
     }
     this->drain_task->drain_thread.join();
 
-    // Joined, so this is the ring's only consumer (the single-consumer contract the ring
-    // requires): discard entries the old thread never took, so a restart does not deliver the
-    // previous session's frames against the new session's format.
-    this->flush_ring_buffer();
+    // Joined, so nothing takes from the list any more: return the frames the old thread never
+    // took, so a restart does not deliver the previous session's frames against the new
+    // session's format. Unbound until the next start(): the ring is this run's, and the list
+    // must not stay registered with it.
+    this->drain_task->items.recall();
+    this->drain_task->items.unbind();
+    this->drain_task->ring.store(nullptr, std::memory_order_release);
+}
+
+size_t VisualizerRole::Impl::stored_frame_bytes_per_second() const {
+    // roles/visualizer/v1.md "client/state visualizer object": rate_max caps the frames per second
+    // the server sends of each periodic type (loudness, f_peak, spectrum). Beat and peak frames
+    // are events the spec does not throttle; they are budgeted at the same rate, an assumption
+    // (onsets and beats come at most a few times a second), not a bound.
+    const VisualizerStreamConfig& stream = this->config.stream;
+    size_t per_round = 0;
+    for (const VisualizerDataType type : stream.types) {
+        size_t payload = 0;
+        switch (type) {
+            case VisualizerDataType::LOUDNESS:
+                payload = LOUDNESS_PAYLOAD_SIZE;
+                break;
+            case VisualizerDataType::BEAT:
+                payload = BEAT_PAYLOAD_SIZE;
+                break;
+            case VisualizerDataType::F_PEAK:
+                payload = F_PEAK_PAYLOAD_SIZE;
+                break;
+            case VisualizerDataType::PEAK:
+                payload = PEAK_PAYLOAD_SIZE;
+                break;
+            case VisualizerDataType::SPECTRUM:
+                payload = stream.spectrum.has_value()
+                              ? sizeof(uint16_t) * stream.spectrum->n_disp_bins
+                              : 0;
+                break;
+        }
+        per_round += SharedRingLayout::stored_size(sizeof(InboundItemHeader) +
+                                                   FRAME_PAYLOAD_OFFSET + payload + AEAD_TAG_SIZE);
+    }
+    return per_round * stream.rate_max;
 }
 
 void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
     msg.supported_roles.push_back(SendspinRole::VISUALIZER);
-    // Advertise the effective wire-data capacity, not the raw RAM budget: the ring is sized at
-    // buffer_capacity bytes but per-entry overhead leaves only ~1/3 for wire data (see
-    // BUFFER_ADVERTISE_DIVISOR). The RAM allocation in the constructor still uses the full value.
+    // Advertise the effective wire-data capacity, not the raw budget: the quota is
+    // buffer_capacity bytes of ring storage, but per-item overhead leaves only a fraction of it
+    // for wire data (see BUFFER_ADVERTISE_DIVISOR). The quota itself is the full value.
     VisualizerSupportObject advertised = this->visualizer_support;
     advertised.buffer_capacity /= BUFFER_ADVERTISE_DIVISOR;
     msg.visualizer_support = advertised;
@@ -268,13 +315,13 @@ void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
 }
 
 // ============================================================================
-// Binary handling (network thread)
+// Binary handling (protocol task)
 // ============================================================================
 
-void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* data, size_t len,
+void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& message,
                                          uint32_t generation) {
-    if (!this->accepts(generation) || !this->stream_active || !this->drain_task ||
-        !this->drain_task->ring_buffer.is_created()) {
+    InboundRing* ring = this->drain_task->ring.load(std::memory_order_acquire);
+    if (!this->accepts(generation) || !this->stream_active || ring == nullptr) {
         return;
     }
 
@@ -286,35 +333,86 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
         return;
     }
 
-    // Forward the raw message verbatim behind its arrival time. Like the player and
-    // artwork roles, the network thread stays dumb: it records the message and hands it to the
-    // drain thread, which owns all structural validation and per-type truncation. The only other
-    // check here is that a timestamp is present, since the drain thread needs it to schedule the
-    // entry. No size cap is applied: the ring buffer records each entry's length, so an oversized
-    // message is self-limiting (it either fits or is dropped when acquire() fails).
-    if (len < TIMESTAMP_SIZE) {
+    // Hand the message over verbatim. Like the player and artwork roles, the protocol task stays
+    // dumb: it records the message and hands it to the drain thread, which owns all structural
+    // validation and per-type truncation. The only other check here is that a timestamp is
+    // present, since the drain thread needs it to schedule the frame. No size cap is applied:
+    // the frame is one ring item, charged against the quota.
+    if (message.len < FRAME_PAYLOAD_OFFSET) {
         return;
     }
-
-    // Build entry: [wire_type][arrival(4)][server_ts(8)][payload]. Use acquire+commit to avoid
-    // double-copy.
-    const auto arrival = static_cast<uint32_t>(platform_time_us());
-    size_t entry_size = ENTRY_HEADER_SIZE + len;
-    void* dest = this->drain_task->ring_buffer.acquire(entry_size, 0);
-    if (dest == nullptr) {
-        return;  // Buffer full, drop
+    const auto payload_len = static_cast<uint32_t>(message.len - FRAME_PAYLOAD_OFFSET);
+    if (message.item != nullptr) {
+        // The frame stays in the ring item it was received and decrypted into.
+        void* item = std::exchange(message.item, nullptr);
+        this->hand_item(item, message.item_len, binary_type, payload_len, generation);
+        return;
     }
+    // A frame reassembled from Noise fragments or delivered before admission is not in a ring
+    // item: copied into one, whole, keeping the transport's receive stamp.
+    void* item = ring->acquire_local(message.len, 0);
+    if (item == nullptr) {
+        // Throttled: see InboundDropLog.
+        if (this->copy_drop_log.note_drop()) {
+            SS_LOGW(TAG, "No inbound ring space for a visualizer frame; dropping until there is");
+        }
+        return;
+    }
+    if (const uint32_t dropped = this->copy_drop_log.note_delivery(); dropped != 0) {
+        SS_LOGW(TAG, "Dropped %" PRIu32 " visualizer frames for want of ring space", dropped);
+    }
+    std::memcpy(inbound_item_bytes(item), message.data, message.len);
+    inbound_item_header(item)->receive_time_us = message.receive_time_us;
+    ring->complete(item);
+    this->hand_item(item, message.len, binary_type, payload_len, generation);
+}
 
-    auto* entry = static_cast<uint8_t*>(dest);
-    entry[0] = binary_type;
-    std::memcpy(entry + ENTRY_TYPE_SIZE, &arrival, ARRIVAL_SIZE);
-    std::memcpy(entry + ENTRY_HEADER_SIZE, data, len);
+bool VisualizerRole::Impl::hand_item(void* item, size_t item_len, uint8_t type, uint32_t data_len,
+                                     uint32_t generation) {
+    InboundRing* ring = this->drain_task->ring.load(std::memory_order_acquire);
+    InboundItemHeader* header = inbound_item_header(item);
+    header->type = type;
+    header->data_offset =
+        static_cast<uint8_t>(type == ENTRY_TYPE_CLEAR_MARKER ? 0 : FRAME_PAYLOAD_OFFSET);
+    header->data_len = data_len;
+    header->generation = generation;
+    this->recall_stale_items(generation);
+    if (!hand_inbound_item(*ring, this->drain_task->items, InboundHolder::VISUALIZER, item,
+                           item_len)) {
+        // Throttled: see InboundDropLog.
+        if (this->over_quota_log.note_drop()) {
+            SS_LOGW(TAG, "Visualizer over its %zu-byte buffer; dropping frames until it drains",
+                    this->visualizer_support.buffer_capacity);
+        }
+        ring->return_item(item);
+        return false;
+    }
+    if (const uint32_t dropped = this->over_quota_log.note_delivery(); dropped != 0) {
+        SS_LOGW(TAG, "Visualizer dropped %" PRIu32 " frames over its buffer", dropped);
+    }
+    return true;
+}
 
-    this->drain_task->ring_buffer.commit(dest);
+void VisualizerRole::Impl::recall_stale_items(uint32_t generation) {
+    if (generation == this->recalled_generation ||
+        this->drain_task->ring.load(std::memory_order_acquire) == nullptr) {
+        return;
+    }
+    // Every item on the list was appended under an earlier generation: an append under
+    // `generation` runs this first, so none of its items can be here yet.
+    this->recalled_generation = generation;
+    this->drain_task->items.recall();
+    // The stream the drops belonged to is gone, so no delivery will end their runs.
+    if (const uint32_t dropped = this->over_quota_log.note_delivery(); dropped != 0) {
+        SS_LOGW(TAG, "Visualizer dropped %" PRIu32 " frames over its buffer", dropped);
+    }
+    if (const uint32_t dropped = this->copy_drop_log.note_delivery(); dropped != 0) {
+        SS_LOGW(TAG, "Dropped %" PRIu32 " visualizer frames for want of ring space", dropped);
+    }
 }
 
 // ============================================================================
-// Stream lifecycle (network thread)
+// Stream lifecycle (protocol task)
 // ============================================================================
 
 void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObject& stream,
@@ -365,9 +463,9 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
     this->negotiated_types_mask = types_mask;
     this->stream_active = true;
 
-    // Mark the config boundary: buffered entries predate this (re)start and must be discarded,
-    // while entries arriving after it belong to the new config and must survive.
-    this->signal_clear_marker();
+    // Mark the config boundary: buffered frames predate this (re)start and must be discarded,
+    // while frames arriving after it belong to the new config and must survive.
+    this->signal_clear_marker(generation);
 
     // Write the config to the inbox slot for the main thread, then push the event. Both lock the
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
@@ -380,24 +478,24 @@ void VisualizerRole::Impl::handle_stream_end(uint32_t generation) {
     this->stream_active = false;
     this->negotiated_types_mask = 0;
 
-    if (this->drain_task && this->drain_task->ring_buffer.is_created()) {
-        // Flag first, then wake, so a drain thread parked in its ring receive starts the
+    if (this->drain_task->event_flags.is_created()) {
+        // Flag first, then wake, so a drain thread parked in its item list take starts the
         // flush immediately instead of at its next idle-receive timeout.
         this->drain_task->event_flags.set(COMMAND_FLUSH);
-        this->drain_task->ring_buffer.wake_receiver();
+        this->drain_task->items.wake_receiver();
     }
 
     this->enqueue_stream_event(VisualizerEventType::STREAM_END, generation);
 }
 
-void VisualizerRole::Impl::handle_stream_clear(uint32_t generation) const {
+void VisualizerRole::Impl::handle_stream_clear(uint32_t generation) {
     if (!this->accepts(generation)) {
         return;
     }
     // messaging.md "stream/clear" discards buffered data but the stream stays active; data
     // received after this message continues to flow. The marker separates the two: a blind
-    // flush would race this thread and drop post-clear frames it has already enqueued.
-    this->signal_clear_marker();
+    // flush would race this thread and drop post-clear frames it has already appended.
+    this->signal_clear_marker(generation);
 
     this->enqueue_stream_event(VisualizerEventType::STREAM_CLEAR, generation);
 }
@@ -453,10 +551,11 @@ void VisualizerRole::Impl::cleanup() {
     this->stream_active = false;
     this->negotiated_types_mask = 0;
 
-    if (this->drain_task && this->drain_task->ring_buffer.is_created()) {
-        // Flag first, then wake, matching handle_stream_end().
+    if (this->drain_task->event_flags.is_created()) {
+        // Flag first, then wake, matching handle_stream_end(). The protocol task recalls the
+        // frames still on the list on its next tick (recall_stale_items()).
         this->drain_task->event_flags.set(COMMAND_FLUSH);
-        this->drain_task->ring_buffer.wake_receiver();
+        this->drain_task->items.wake_receiver();
     }
 
     // Discard stale slot content. Stale ring-borne events (an in-flight
@@ -476,11 +575,6 @@ void VisualizerRole::Impl::cleanup() {
 // ============================================================================
 // Drain thread helpers
 // ============================================================================
-
-int64_t visualizer_arrival_from_stamp(uint32_t stamp, int64_t now) {
-    // Unsigned subtraction of the low words gives the age modulo 2^32 us.
-    return now - static_cast<uint32_t>(static_cast<uint32_t>(now) - stamp);
-}
 
 std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int64_t arrival_us,
                                                    int32_t display_offset_ms, int64_t now) {
@@ -550,57 +644,56 @@ VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* p
     return out;
 }
 
-void VisualizerRole::Impl::flush_ring_buffer() const {
-    if (!this->drain_task) {
+void VisualizerRole::Impl::flush_items() const {
+    InboundRing* ring = this->drain_task->ring.load(std::memory_order_acquire);
+    if (ring == nullptr) {
         return;
     }
-    size_t item_size = 0;
     void* item = nullptr;
-    while ((item = this->drain_task->ring_buffer.receive(&item_size, 0)) != nullptr) {
-        this->drain_task->ring_buffer.return_item(item);
+    while ((item = this->drain_task->items.take(0)) != nullptr) {
+        ring->return_item(item);
     }
 }
 
-void VisualizerRole::Impl::signal_clear_marker() const {
-    // Network-thread side of a clear boundary. Set the flag before enqueueing the marker (like
-    // PlayerRole::handle_stream_clear) so the drain thread starts discarding (freeing
-    // ring space) while we wait for the marker slot.
-    if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
+void VisualizerRole::Impl::signal_clear_marker(uint32_t generation) {
+    // Protocol-task side of a clear boundary. Set the flag before appending the marker (like
+    // PlayerRole::handle_stream_clear) so the drain thread starts discarding (freeing ring space)
+    // while the marker waits for room.
+    InboundRing* ring = this->drain_task->ring.load(std::memory_order_acquire);
+    if (ring == nullptr) {
         return;
     }
-    // Flag first, then wake, matching the other command signals. The marker commit below
-    // would usually wake the drain thread anyway, but the explicit wake keeps the discard
-    // prompt even when the marker enqueue times out.
+    // Flag first, then wake, matching the other command signals. The marker's append below
+    // would usually wake the drain thread anyway, but the explicit wake keeps the discard prompt
+    // even when the marker cannot be appended.
     this->drain_task->event_flags.set(COMMAND_CLEAR);
-    this->drain_task->ring_buffer.wake_receiver();
+    this->drain_task->items.wake_receiver();
 
-    void* dest = this->drain_task->ring_buffer.acquire(1, MARKER_ENQUEUE_TIMEOUT_MS);
-    if (dest == nullptr) {
-        // Boundary lost: the drain thread will discard to empty instead, so frames enqueued
-        // after this point may be dropped along with the old ones (brief visual gap, no harm).
-        SS_LOGW(TAG, "Failed to enqueue clear marker; clear boundary may be imprecise");
+    void* item = ring->acquire_local(0, MARKER_ENQUEUE_TIMEOUT_MS);
+    if (item == nullptr) {
+        // Boundary lost: the drain thread will discard to empty instead, so frames appended after
+        // this point may be dropped along with the old ones (brief visual gap, no harm).
+        SS_LOGW(TAG, "Failed to append clear marker; clear boundary may be imprecise");
         return;
     }
-    static_cast<uint8_t*>(dest)[0] = ENTRY_TYPE_CLEAR_MARKER;
-    this->drain_task->ring_buffer.commit(dest);
+    ring->complete(item);
+    this->hand_item(item, 0, ENTRY_TYPE_CLEAR_MARKER, 0, generation);
 }
 
 void VisualizerRole::Impl::discard_to_clear_marker() const {
-    // Drain-thread side of a clear boundary: discard entries up to and including the marker.
-    // Stopping at the marker preserves frames the network thread enqueued after the clear,
-    // which messaging.md "stream/clear" requires to survive. If the buffer empties without a
-    // marker, either the marker could not be enqueued or it was already consumed in normal flow (it
-    // is a 1-byte entry, dropped by the drain loop's minimum-size check); nothing is left to
-    // discard either way.
-    if (!this->drain_task) {
+    // Drain-thread side of a clear boundary: discard frames up to and including the marker.
+    // Stopping at the marker preserves frames the protocol task appended after the clear,
+    // which messaging.md "stream/clear" requires to survive. If the list empties without a
+    // marker, either the marker could not be appended or it was already consumed in normal flow
+    // (the drain loop drops it); nothing is left to discard either way.
+    InboundRing* ring = this->drain_task->ring.load(std::memory_order_acquire);
+    if (ring == nullptr) {
         return;
     }
-    size_t item_size = 0;
     void* item = nullptr;
-    while ((item = this->drain_task->ring_buffer.receive(&item_size, 0)) != nullptr) {
-        bool is_marker =
-            item_size == 1 && static_cast<const uint8_t*>(item)[0] == ENTRY_TYPE_CLEAR_MARKER;
-        this->drain_task->ring_buffer.return_item(item);
+    while ((item = this->drain_task->items.take(0)) != nullptr) {
+        const bool is_marker = inbound_item_header(item)->type == ENTRY_TYPE_CLEAR_MARKER;
+        ring->return_item(item);
         if (is_marker) {
             return;
         }
@@ -610,7 +703,9 @@ void VisualizerRole::Impl::discard_to_clear_marker() const {
 void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     SS_LOGD(TAG, "Drain thread started");
 
-    auto& rb = self->drain_task->ring_buffer;
+    // Bound by start() before this thread exists and unbound by stop() only after it is joined.
+    InboundRing& ring = *self->drain_task->ring.load(std::memory_order_acquire);
+    auto& items = self->drain_task->items;
     auto& flags = self->drain_task->event_flags;
     const int32_t offset_ms = self->config.display_offset_ms;
 
@@ -618,21 +713,21 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     // grows to the largest bin count seen and is resized (not reallocated) after that.
     std::vector<uint16_t> spectrum_bins;
 
-    // RAII guard so the ring-buffer slot is returned exactly once on every exit path. Each branch
-    // calls release() to hand the slot back *before* invoking the listener callback, so a slow
-    // callback never blocks the network producer; if a branch exits without releasing (a short-
-    // payload drop, or a future wire type that forgets), the destructor returns it. Stack-only.
-    struct SlotGuard {
-        SpscRingBuffer& rb;
+    // RAII guard so the ring item is returned exactly once on every exit path. Each branch calls
+    // release() to hand the item back *before* invoking the listener callback, so a slow callback
+    // never holds ring space; if a branch exits without releasing (a short-payload drop, or a
+    // future wire type that forgets), the destructor returns it. Stack-only.
+    struct ItemGuard {
+        InboundRing& ring;
         void* item = nullptr;
         bool released = false;
         void release() {
             if (!this->released) {
-                this->rb.return_item(this->item);
+                this->ring.return_item(this->item);
                 this->released = true;
             }
         }
-        ~SlotGuard() {
+        ~ItemGuard() {
             this->release();
         }
     };
@@ -645,7 +740,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         }
         if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
             if (cmd & COMMAND_FLUSH) {
-                self->flush_ring_buffer();
+                self->flush_items();
             }
             if (cmd & COMMAND_CLEAR) {
                 self->discard_to_clear_marker();
@@ -653,45 +748,43 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Blocking receive; returns early (nullptr) when wake_receiver() signals a stop,
-        // flush, or clear. The timeout is only a safety net against a missed wake (see
+        // Blocking take; returns early (nullptr) when wake_receiver() signals a stop, flush, or
+        // clear. The timeout is only a safety net against a missed wake (see
         // DRAIN_RECEIVE_TIMEOUT_MS).
-        size_t item_size = 0;
-        void* item = rb.receive(&item_size, DRAIN_RECEIVE_TIMEOUT_MS);
+        void* item = items.take(DRAIN_RECEIVE_TIMEOUT_MS);
         if (item == nullptr) {
             continue;
         }
+        const InboundItemHeader* header = inbound_item_header(item);
 
-        // Wait for time sync
-        if (!self->client->is_time_synced()) {
-            rb.return_item(item);
+        // Appended for a stream a teardown has since ended (the protocol task recalls such frames
+        // on its next tick; this catches one taken first), or waiting for time sync.
+        if (header->generation != self->cleanup_generation.load(std::memory_order_acquire) ||
+            !self->client->is_time_synced()) {
+            ring.return_item(item);
             continue;
         }
 
-        // Entry format: [wire_type][arrival(4)][server_ts(8)][payload]. This also drops any
-        // leftover 1-byte clear marker whose COMMAND_CLEAR was already handled (everything before
-        // it was consumed in order, so the boundary it marks has already been honored).
-        if (item_size < ENTRY_HEADER_SIZE + TIMESTAMP_SIZE) {
-            rb.return_item(item);
+        // A clear marker whose COMMAND_CLEAR was already handled carries no timestamp: everything
+        // before it was consumed in order, so the boundary it marks has already been honored.
+        if (header->type == ENTRY_TYPE_CLEAR_MARKER) {
+            ring.return_item(item);
             continue;
         }
-        auto* raw = static_cast<const uint8_t*>(item);
-        uint8_t wire_type = raw[0];
-        uint32_t arrival_stamp = 0;
-        std::memcpy(&arrival_stamp, raw + ENTRY_TYPE_SIZE, ARRIVAL_SIZE);
-        int64_t server_ts = read_be64(raw + ENTRY_HEADER_SIZE);
+        const uint8_t wire_type = header->type;
+        const int64_t server_ts = read_be64(inbound_item_bytes(item) + ENTRY_TYPE_SIZE);
         int64_t client_ts = self->client->get_client_time(server_ts);
 
         if (client_ts == 0) {
-            rb.return_item(item);
+            ring.return_item(item);
             continue;
         }
 
         const int64_t now = platform_time_us();
         const std::optional<int64_t> wait_us = visualizer_delivery_wait_us(
-            client_ts, visualizer_arrival_from_stamp(arrival_stamp, now), offset_ms, now);
+            client_ts, widen_time_stamp_us(header->receive_time_us, now), offset_ms, now);
         if (!wait_us.has_value()) {
-            rb.return_item(item);
+            ring.return_item(item);
             continue;
         }
 
@@ -701,15 +794,15 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         if (wait_ms > 0) {
             cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, wait_ms);
             if (cmd & COMMAND_STOP) {
-                rb.return_item(item);
+                ring.return_item(item);
                 break;
             }
             if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
-                // The held item was popped before the signal, so it predates the boundary and is
-                // discarded along with the buffered pre-boundary entries.
-                rb.return_item(item);
+                // The held item was taken before the signal, so it predates the boundary and is
+                // discarded along with the queued pre-boundary frames.
+                ring.return_item(item);
                 if (cmd & COMMAND_FLUSH) {
-                    self->flush_ring_buffer();
+                    self->flush_items();
                 }
                 if (cmd & COMMAND_CLEAR) {
                     self->discard_to_clear_marker();
@@ -719,20 +812,17 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         }
 
         if (self->listener == nullptr) {
-            rb.return_item(item);
+            ring.return_item(item);
             continue;
         }
 
-        // Decode and deliver. The network thread forwards messages verbatim, so decode validates
-        // each payload's length before reading. Copy out of the slot, release it via the guard,
-        // then deliver, so a slow listener callback never blocks the network producer.
-        const uint8_t* payload = raw + ENTRY_HEADER_SIZE + TIMESTAMP_SIZE;
-        size_t payload_len = item_size - ENTRY_HEADER_SIZE - TIMESTAMP_SIZE;
-
-        SlotGuard guard{rb, item};
-        VisualizerDelivery out =
-            decode_visualizer_message(wire_type, payload, payload_len, self->spectrum_bin_count,
-                                      self->tracks_downbeats, spectrum_bins);
+        // Decode and deliver. The protocol task hands messages over verbatim, so decode validates
+        // each payload's length before reading. Decode out of the item, release it via the
+        // guard, then deliver, so a slow listener callback never holds ring space.
+        ItemGuard guard{ring, item};
+        VisualizerDelivery out = decode_visualizer_message(
+            wire_type, inbound_item_data(item), header->data_len, self->spectrum_bin_count,
+            self->tracks_downbeats, spectrum_bins);
         guard.release();
 
         switch (out.kind) {

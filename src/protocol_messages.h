@@ -924,9 +924,9 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
 /// present and parsed
 ///
 /// The server/state sections are parsed one at a time, not into an aggregate struct: the caller
-/// runs on the network task, whose stack is bounded on ESP-IDF (at least
-/// SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE), and an aggregate would keep every section's
-/// storage live in that frame for the whole parse.
+/// runs on the protocol task, whose stack is bounded on ESP-IDF (at least
+/// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE), and an aggregate would keep every
+/// section's storage live in that frame for the whole parse.
 bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* metadata);
 
 /// @brief Parses the color section of a server/state JSON message; true if the section was

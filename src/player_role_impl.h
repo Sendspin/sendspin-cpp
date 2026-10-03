@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "audio_types.h"
+#include "inbound_ring.h"
 #include "inbox.h"
 #include "sendspin/player_role.h"
 #include "sync_task.h"
@@ -24,6 +26,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace sendspin {
@@ -33,7 +36,7 @@ class SendspinPersistenceProvider;
 struct ClientHelloMessage;
 struct ClientStateMessage;
 
-/// @brief Deferred stream lifecycle callback types queued from the network thread
+/// @brief Deferred stream lifecycle callback types queued from the protocol task
 enum class PlayerStreamCallbackType : uint8_t {
     STREAM_START,  // New stream is starting
     STREAM_END,    // Stream ended normally
@@ -81,15 +84,19 @@ struct PlayerRole::Impl {
     void attach_inbox(Inbox& inbox);
     /// @param persistence The client's provider at this start, or nullptr; replaces the one
     ///        add_player() set.
-    bool start(SendspinPersistenceProvider* persistence);
+    /// @param ring The client's inbound ring for this run, which the sync task's item list links.
+    bool start(SendspinPersistenceProvider* persistence, InboundRing* ring);
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
     // Each handler takes the teardown generation the receive gate captured when it admitted the
-    // message and re-checks it where it takes effect; see accepts().
-    void handle_binary(const uint8_t* data, size_t len, uint32_t generation) const;
-    void handle_stream_start(const ServerPlayerStreamObject& player_obj, uint32_t generation) const;
+    // message and re-checks it where it takes effect; see accepts(). All run on the protocol task.
+    /// @brief Hands an audio chunk to the sync task: by its ring item when it has one (clearing
+    /// `message.item`), otherwise copied into an item the protocol task acquires.
+    /// @param message The decrypted chunk; `data` points at its message type byte.
+    void handle_binary(InboundMessage& message, uint32_t generation);
+    void handle_stream_start(const ServerPlayerStreamObject& player_obj, uint32_t generation);
     void handle_stream_end(uint32_t generation) const;
-    void handle_stream_clear(uint32_t generation) const;
+    void handle_stream_clear(uint32_t generation);
     void handle_server_command(const ServerCommandMessage& cmd, uint32_t generation) const;
     void on_stream_ring_event(PlayerStreamCallbackType event);
     // True if this tick has drainable player work. The command-slot bit covers server
@@ -106,10 +113,10 @@ struct PlayerRole::Impl {
     void drain_events();
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
-    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
-    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
-    /// lost connection, never quiesces the network thread). Re-checking at each point of effect
-    /// invalidates the whole handler instead of only the part that ran before it.
+    /// The gate in SendspinClient's role dispatch is checked once, on the protocol task, while the
+    /// handler it admits runs on: a teardown on the main loop can land in between. Re-checking at
+    /// each point of effect invalidates the whole handler instead of only the part that ran
+    /// before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
@@ -123,8 +130,15 @@ struct PlayerRole::Impl {
     /// the inbox rather than fired here, because both callers run under the connection manager's
     /// conn_ptr_mutex_.
     void cleanup();
-    /// @brief Joins the sync task thread and discards its buffered audio; no-op if not started.
+    /// @brief Joins the sync task thread and returns its buffered audio to the inbound ring;
+    /// no-op if not started.
     void stop() const;
+
+    /// @brief Recalls the items the sync task has not taken once a teardown has moved the
+    /// generation past the one they were appended under. Protocol task only: each tick, and
+    /// before each item it hands over, so no item of the new generation is ever recalled.
+    /// @param generation The generation about to be appended under, or the live one.
+    void recall_stale_items(uint32_t generation);
 
     // ========================================
     // Consumer-facing method implementations
@@ -138,8 +152,29 @@ struct PlayerRole::Impl {
     // Helpers
     // ========================================
 
-    bool send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
-                          uint8_t chunk_type, uint32_t timeout_ms) const;
+    /// @brief Fills an item's consumer fields and hands it to the sync task, returning it to the
+    /// ring with a warning when the player is over quota. Protocol task only.
+    /// @param item_len The item's message length (InboundMessage::item_len, or what
+    ///        acquire_local() was asked for).
+    /// @param data_offset Where the sync task's bytes start in the item's message bytes.
+    /// @param data_len How many bytes the sync task reads.
+    /// @return false when the item was returned instead of handed over.
+    bool hand_item(void* item, size_t item_len, ChunkType chunk_type, uint8_t data_offset,
+                   uint32_t data_len, uint32_t generation);
+
+    /// @brief Writes `len` bytes into an item the protocol task acquires itself and hands it to
+    /// the sync task: a codec header, a stream/clear marker (len 0), or a chunk that reached the
+    /// protocol task outside a ring item. Protocol task only.
+    /// @param timeout_ms Bound on waiting for ring space.
+    /// @return false when the ring had no room in time or the player is over quota.
+    bool hand_local_item(const uint8_t* data, size_t len, ChunkType chunk_type, uint8_t data_offset,
+                         uint32_t receive_time_us, uint32_t timeout_ms, uint32_t generation);
+
+    /// @brief Base64-decodes a FLAC codec header straight into an item the protocol task
+    /// acquires and hands it to the sync task. Protocol task only.
+    /// @return false when the header does not decode, the ring had no room in time, or the
+    ///         player is over quota.
+    bool hand_flac_header(const std::string& codec_header, uint32_t generation);
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
     void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation) const;
@@ -164,12 +199,21 @@ struct PlayerRole::Impl {
     SendspinPersistenceProvider* persistence{nullptr};
     std::unique_ptr<SyncTask> sync_task;
 
+    /// Throttles the over-quota drop warning in hand_item(). Protocol task only.
+    InboundDropLog over_quota_log;
+    /// Throttles the warning for a chunk that could not be copied into a ring item. Protocol task
+    /// only.
+    InboundDropLog copy_drop_log;
+
     // 32-bit fields
+    /// The teardown generation the sync task's item list was last recalled for
+    /// (recall_stale_items()). Protocol task only.
+    uint32_t recalled_generation{0};
     // Bumped by cleanup() and stamped onto every stream event queued afterwards. At the drain it
     // decides whether a ring event is still current: a STREAM_START queued before the teardown
     // must not re-arm the sync task for a stream that is gone. Within drain_events() it also
     // detects a listener callback that re-entered teardown while the STREAM_START tail was running.
-    // Atomic because the network thread reads it (see accepts()), which loads acquire to pair with
+    // Atomic because the protocol task reads it (see accepts()), which loads acquire to pair with
     // the teardown's read-modify-write; the drain_events() reads are relaxed because they are
     // same-thread.
     std::atomic<uint32_t> cleanup_generation{0};
@@ -184,7 +228,7 @@ struct PlayerRole::Impl {
     // on_stream_end() from firing without a matching on_stream_start()
     bool stream_active{false};
     std::atomic<bool> output_delay_adjustable{false};
-    // Set by the client while it is unavailable; read by handle_binary() on the network thread.
+    // Set by the client while it is unavailable; read by handle_binary() on the protocol task.
     std::atomic<bool> discard_audio{false};
     uint8_t volume{0};
 };

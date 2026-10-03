@@ -16,7 +16,7 @@ The filter's first measurement gates playback: the sync task decodes no audio un
 
 ## Sync Task
 
-The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded chunks into PCM that plays at the server's timestamps. It runs a two-level state machine: an outer loop per stream, and an inner loop per chunk.
+The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded chunks into PCM that plays at the server's timestamps. Its input is an `InboundItemList` of inbound ring items the protocol task appends to: each audio chunk is decoded in place from the ring item it was received and decrypted into, with its server timestamp read from plaintext bytes 1 to 8, and the item goes back to the ring once decoded. It runs a two-level state machine: an outer loop per stream, and an inner loop per chunk.
 
 ### Outer Loop
 
@@ -55,7 +55,7 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 │               │ STOP/END                                 │
 │               ▼                                          │
 │  ┌────────────────────────────────────┐                  │
-│  │  Return borrowed ring buffer entry │──────→ loop back │
+│  │  Return the held ring item         │──────→ loop back │
 │  └────────────────────────────────────┘                  │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -76,11 +76,11 @@ COMMAND_STREAM_CLEAR from any state → discard up to the clear marker → INITI
 ```
 
 - **INITIAL_SYNC** primes the audio pipeline with `INITIAL_SYNC_PRIMING_MS` of silence, then adds `extra_startup_silence_ms` (`PlayerRoleConfig`) of lead once the sink confirms it is consuming, so the decoder starts with slack ahead of the sink.
-- **LOAD_CHUNK** takes and decodes the next encoded chunk once the clock is synced; a chunk already too late to play is discarded undecoded. While aligning (at stream start or after a seek) it feeds silence on an empty ring (`UNDERFLOW_SILENCE_KEEPALIVE_MS` at a time, in `src/sync_task.cpp`) to keep the sink fed; in steady state an empty ring is left empty, so a stream winding down does not pile silence into the sink.
+- **LOAD_CHUNK** takes and decodes the next encoded chunk once the clock is synced; a chunk already too late to play is discarded undecoded. While aligning (at stream start or after a seek) it feeds silence on an empty item list (`UNDERFLOW_SILENCE_KEEPALIVE_MS` at a time, in `src/sync_task.cpp`) to keep the sink fed; in steady state an empty list is left empty, so a stream winding down does not pile silence into the sink.
 - **SYNCHRONIZE_AUDIO** compares the chunk's playback time, converted to the client clock and adjusted for the output delay and `fixed_delay_us`, with the time the next written audio will actually play. An error beyond `HARD_SYNC_THRESHOLD_US` is corrected at once (a hard sync): silence is inserted when the audio is early, and late audio is dropped. A smaller error beyond `SOFT_SYNC_THRESHOLD_US` is corrected gradually (a soft sync): one frame is added or removed per chunk. Errors inside that dead zone pass through unmodified. From stream start or a seek, and after any hard sync, the tighter `HARD_SYNC_SETTLE_THRESHOLD_US` applies until the error settles, and a hard sync outside alignment is logged as a loss of sync. These thresholds are in `src/sync_task.cpp`.
 - **TRANSFER_AUDIO** writes the PCM through `on_audio_write`. When a hard sync inserted silence, it writes that first and then returns to SYNCHRONIZE_AUDIO to re-check the chunk it held back.
 
-A `stream/clear` (a seek) keeps the stream ACTIVE: the inner loop discards encoded and already-decoded audio up to the clear marker the network thread enqueued, keeps the decoder and playtime accounting, and re-enters INITIAL_SYNC, which resumes priming only if it had not finished and otherwise passes straight to LOAD_CHUNK. The next chunk then re-aligns under the alignment rules above.
+A `stream/clear` (a seek) keeps the stream ACTIVE: the inner loop discards encoded and already-decoded audio up to the clear marker the protocol task appended, keeps the decoder and playtime accounting, and re-enters INITIAL_SYNC, which resumes priming only if it had not finished and otherwise passes straight to LOAD_CHUNK. The next chunk then re-aligns under the alignment rules above.
 
 ### Playback Progress
 

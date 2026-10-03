@@ -29,7 +29,6 @@ add_executable(sendspin_tests
     test_time_filter.cpp
     test_protocol.cpp
     test_network_info.cpp
-    test_spsc_ring_buffer.cpp
     test_thread_safe_queue.cpp
     test_shared_ring_buffer.cpp
     test_inbound_ring.cpp
@@ -67,19 +66,20 @@ add_executable(sendspin_tests
 # chunk back, and nothing on the public surface reaches it without the sync thread.
 set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
-# test_client_lifecycle.cpp checks what a role's stop() left in its ring, which nothing on the
-# public surface reports, and installs a stand-in connection in ConnectionManager's admitted slot
-# (and drops it mid-publish) to pin publish_state()'s hold on it; it reads the private members
+# test_client_lifecycle.cpp checks what a role's stop() left on its item list, which nothing on
+# the public surface reports, and installs a stand-in connection in ConnectionManager's admitted
+# slot (and drops it mid-publish) to pin publish_state()'s hold on it; it reads the private members
 # directly instead of adding a seam. Reached: SendspinClient::connection_manager_, player_ and
-# each role's impl_ (the sync task and the visualizer's drain ring); ConnectionManager's
+# each role's impl_ (the sync task, which a feeder thread hands chunks to directly, and the
+# visualizer's drain list, whose links it reads under the list's lock); ConnectionManager's
 # conn_ptr_mutex_, current_connection_, set_current_connection(), drop_connection() and
 # flush_deferred_releases() (to install, swap out, and drop a stand-in connection) and accepting_
 # (closed to take on_new_connection()'s admission-closed rejection).
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
-# public surface does not expose: the sync task's run state and its encoded ring, the artwork
-# transfer in flight and its drain-side slot buffers, the visualizer's stream flag and ring, a
+# public surface does not expose: the sync task's run state and its item list, the artwork
+# transfer in flight and its drain-side slot buffers, the visualizer's stream flag and list, a
 # state role's held scheduled update and its teardown generation (including a direct
 # handle_server_state() call with that generation), the controller's supported-commands mask
 # (seeded so a command reaches the inactive-role send gate), plus the queued-event probe that proves
@@ -90,9 +90,12 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # test_player_role.cpp drives PlayerRole::Impl directly - no connected server, no sync-task
 # thread - which is the only way to see the client/state player object and the only way to hand
 # a handler a stale teardown generation. Reached: Impl's handle_stream_start(), handle_binary(),
-# handle_stream_clear(), handle_server_command(), cleanup(), attach_inbox(), cleanup_generation
-# and event_state's latest-wins slots; SyncTask's encoded_ring_buffer_, which is what says a
-# refused handler buffered nothing.
+# handle_stream_clear(), handle_server_command(), cleanup(), recall_stale_items(), attach_inbox(),
+# cleanup_generation and event_state's latest-wins slots; SyncTask's encoded_items_ and ring_,
+# bound to a test ring the way start() binds them but with no thread, so what a handler handed
+# over (or, refused, did not) stays on the list to be read, and discard_to_clear_marker(), the
+# sync thread's stream/clear step. The inbound tests also bind a VisualizerRole::Impl to the same
+# ring, to show one holder's quota does not stop the other.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_inbound_ring.cpp sets InboundGate's private CONSUMED bit directly to stage a consume bit
@@ -142,13 +145,12 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     works through: the store answers whether an unpaired record still resolves for this boot,
 #     which is what "revoked" means. (The persisted half of the same removal is observable through
 #     the test's persistence provider.)
-#   - SendspinClient::process_json_message() and admit_connection(), to deliver traffic to a
-#     stand-in connection and admit it on the test thread, which is how the hold/replay tests
-#     place messages on either side of admission.
-#   - ConnectionManager::conn_ptr_mutex_ and SendspinClient::json_processing_mutex_, taken and
-#     probed directly by the lock-order test: holding the manager lock exactly where loop() holds
-#     it is what makes an admission that reaches for the JSON lock hang the test instead of a
-#     device.
+#   - SendspinClient::process_json_message(), admit_connection(), replay_admitted_messages(),
+#     protocol_tick() and protocol_task_, to deliver traffic to a stand-in connection, admit it
+#     and replay its hold on the test thread, which is how the hold/replay tests place messages on
+#     either side of admission. Those fixtures stop the protocol task after start() and play it
+#     themselves, since a second thread running the same entry points would race them.
+#   - ConnectionManager::conn_ptr_mutex_, held where loop() holds it.
 #   - SendspinClient::request_persist(), note_last_played_server() and
 #     flush_pending_persistence(), plus ConnectionManager::set_current_connection()/
 #     flush_pending_admission() and handle_server_unpair()/flush_deferred_releases(): the RAM

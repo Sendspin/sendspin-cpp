@@ -250,14 +250,17 @@ void start_context(SyncContext& context, const std::vector<uint8_t>& header,
     ASSERT_NE(context.decode_buffer, nullptr);
 }
 
-/// Storage for a ring entry holding `chunk`, laid out as the encoded ring stores it.
-std::vector<uint64_t> ring_entry(const std::vector<uint8_t>& chunk) {
-    std::vector<uint64_t> storage(
-        (sizeof(sendspin::AudioRingBufferEntry) + chunk.size()) / sizeof(uint64_t) + 1);
-    auto* entry = reinterpret_cast<sendspin::AudioRingBufferEntry*>(storage.data());
-    entry->chunk_type = sendspin::CHUNK_TYPE_ENCODED_AUDIO;
-    entry->data_size = chunk.size();
-    std::memcpy(entry->data(), chunk.data(), chunk.size());
+/// Storage for an inbound ring item holding `chunk` as its encoded bytes, laid out as the sync
+/// task reads one: the item header, then the bytes.
+std::vector<uint32_t> chunk_item(const std::vector<uint8_t>& chunk) {
+    std::vector<uint32_t> storage((sizeof(sendspin::InboundItemHeader) + chunk.size()) /
+                                      sizeof(uint32_t) +
+                                  1);
+    auto* header = reinterpret_cast<sendspin::InboundItemHeader*>(storage.data());
+    *header = sendspin::InboundItemHeader{};
+    header->type = sendspin::CHUNK_TYPE_ENCODED_AUDIO;
+    header->data_len = static_cast<uint32_t>(chunk.size());
+    std::memcpy(sendspin::inbound_item_bytes(header), chunk.data(), chunk.size());
     return storage;
 }
 
@@ -299,8 +302,8 @@ TEST(SyncTaskDecodeWholeChunk, DecodesEveryFrameOrLeavesTheBufferEmpty) {
         SCOPED_TRACE(row.name);
         SyncContext context;
         ASSERT_NO_FATAL_FAILURE(start_context(context, *row.header, row.header_type));
-        std::vector<uint64_t> storage = ring_entry(row.chunk);
-        context.encoded_entry = reinterpret_cast<sendspin::AudioRingBufferEntry*>(storage.data());
+        std::vector<uint32_t> storage = chunk_item(row.chunk);
+        context.encoded_item = storage.data();
 
         EXPECT_EQ(SyncTask::decode_whole_chunk(context), row.output_bytes != 0);
         EXPECT_EQ(context.decode_buffer->available(), row.output_bytes);

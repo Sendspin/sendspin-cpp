@@ -42,7 +42,7 @@ namespace sendspin {
  * Bump allocator: ArduinoJson frees in LIFO order, so a finished document drains the arena on its
  * own. ArduinoJson::Allocator has no "document destroyed" hook, so the owner calls reset() between
  * documents as a safety net for any non-LIFO leftover; it does not touch blocks that escaped to
- * PSRAM. Not thread-safe: the parser's one instance is serialized by json_processing_mutex_.
+ * PSRAM. Not thread-safe: the parser's one instance is used by the protocol task only.
  *
  * If the backing buffer cannot be allocated, every request falls back to PSRAM, i.e. it behaves
  * like PsramJsonAllocator.

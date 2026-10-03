@@ -64,11 +64,8 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
 
 void SendspinServerConnection::close_transport_now() {
     // trigger_close() -> ws_->close() is already async/non-blocking (the same primitive
-    // disconnect() uses in its completion callback), so it is safe to call directly from the
-    // network thread here. on_disconnected_cb is intentionally not fired here: for inbound
-    // connections it is wired as a no-op (ConnectionManager::on_new_connection(); cleanup
-    // happens via the ws_server's own close notification instead), so the resulting Close event
-    // is what reports the loss.
+    // disconnect() uses in its completion callback), so it is safe from any thread. The resulting
+    // Close event reaches notify_transport_closed() through the ws_server.
     this->trigger_close();
 }
 
@@ -126,23 +123,15 @@ void SendspinServerConnection::trigger_close() {
 
 void SendspinServerConnection::handle_message(const std::string& data, bool is_binary,
                                               int64_t receive_time) {
-    if (!data.empty()) {
-        uint8_t* dest = this->prepare_receive_buffer(data.size());
-        if (dest == nullptr) {
-            // Dispatching would hand a stale/partial buffer to the protocol layer. Drop the
-            // connection instead: the close event tears the slot down on the main loop. The
-            // payload is reset here because the ws_server close path does not do it, unlike the
-            // client connections' close handling.
-            SS_LOGE(TAG, "Allocation failed, dropping connection");
-            this->disable_message_dispatch();
-            this->reset_websocket_payload();
-            this->trigger_close();
-            return;
-        }
-        std::copy(data.begin(), data.end(), dest);
-        this->commit_receive_buffer(data.size());
+    // IXWebSocket hands over each message reassembled, so every message takes the single-frame
+    // path: one copy, from IXWebSocket's string into a ring item (or, before admission, into
+    // the fallback buffer).
+    const InboundTarget target = this->begin_inbound_message(data.size(), !is_binary, receive_time);
+    if (target.route != InboundRoute::RECEIVE) {
+        return;
     }
-    this->dispatch_completed_message(!is_binary, receive_time);
+    std::copy(data.begin(), data.end(), target.data);
+    this->end_inbound_message(true);
 }
 
 }  // namespace sendspin
