@@ -6,7 +6,7 @@ This document explains how the library keeps audio in time with the server: esti
 
 Each connection owns one `SendspinTimeFilter` (`src/time_filter.h`), created once when the connection is set up and never replaced, and one `SendspinTimeBurst`. Only that connection's own measurements feed its filter: the protocol task hands a `server/time` reply to the burst of the connection it arrived on, and only when it answers that connection's `client/time` in flight. The role threads convert through the primary admitted connection's filter (`docs/internals.md`, "Time Filter Slot").
 
-`SendspinTimeBurst` (`src/time_burst.h`) collects measurements in NTP-style bursts: `time_burst_size` `client/time` exchanges whose lowest-round-trip measurement goes to the filter, then a pause of `time_burst_interval_ms` until the next burst (both in `SendspinClientConfig`). The protocol task runs each admitted connection's burst while that connection is operational, and high-performance networking is held for its duration so the round trips are not inflated by power saving.
+`SendspinTimeBurst` (`src/time_burst.h`) collects measurements in NTP-style bursts: `time_burst_size` `client/time` exchanges whose lowest-round-trip measurement goes to the filter, then a pause of `time_burst_interval_ms` until the next burst (both in `SendspinClientConfig`). The protocol task runs each admitted connection's burst while that connection is operational, and high-performance networking is held for its duration so the round trips are not inflated by power saving: the burst sends its first `client/time` only once the main loop has delivered the request to the listener (`docs/internals.md`, "One Main Loop Drain").
 
 Each `client/time` round trip is timed from the socket write, not from the time the message carries: `SendspinConnection::send_time_message()` hands `NoiseTransport::send_json()` a hook that the transport runs immediately before writing the message's last frame, and the echoed `client_transmitted` only identifies the frame a `server/time` answers (`SendspinConnection::claim_time_frame()`). Recording the write time before the write, never after it, keeps every scheduling delay on the side that lengthens the measured round trip, which `max_error` reports and the burst's lowest-round-trip selection discards.
 
@@ -30,8 +30,12 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 │  │  • Clear TASK_RUNNING and the      │                  │
 │  │    stream COMMAND flags            │                  │
 │  │  • Set TASK_IDLE                   │                  │
+│  │  • Leaving a stream: note sync     │                  │
+│  │    idle to the main loop's inbox   │                  │
 │  │  • Reset context + progress slot   │                  │
-│  │  • Wait for codec header (wake)    │◄──┐              │
+│  │  • Wait for codec header (wake);   │◄──┐              │
+│  │    a COMMAND_START with no header  │   │              │
+│  │    pending is stale: loop back     │   │              │
 │  └────────────┬───────────────────────┘   │              │
 │               │ got header                │              │
 │               ▼                           │              │
@@ -60,7 +64,7 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 └──────────────────────────────────────────────────────────┘
 ```
 
-The WAIT FOR CLIENT ACK step is the sync task's half of the stream end/start handshake with the main loop (`docs/internals.md`, "Stream End and Start").
+The WAIT FOR CLIENT ACK step is the sync task's half of the stream end/start handshake with the main loop (`docs/internals.md`, "Stream End and Start"). A `COMMAND_START` that reaches the task while it waits for a header, with none pending, belongs to a stream the task already left (a `stream/start` and `stream/end` the main loop drained together): the task takes it as stale and loops back through IDLE, which clears it and notes the idle state the main loop's held STREAM_END waits for, so the next stream waits for its own start (except in the case `docs/internals.md`, "Stream End and Start", names as a gap).
 
 ### Inner Loop
 

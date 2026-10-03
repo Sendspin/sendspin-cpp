@@ -1828,7 +1828,7 @@ TEST(TimeBurst, CountsOnlyTheReplyToItsPendingMessage) {
     SendspinTimeBurst burst;
     // Long enough that loop() never times a message out here.
     burst.configure(/*burst_size=*/2, /*burst_interval_ms=*/0, /*response_timeout_ms=*/60000);
-    burst.loop(&conn);
+    burst.loop(&conn, platform_time_us() / 1000, true);
     const int64_t first = sent_echo(0);
 
     EXPECT_FALSE(burst.on_time_response(&conn, reply(first + 1)));
@@ -1836,7 +1836,7 @@ TEST(TimeBurst, CountsOnlyTheReplyToItsPendingMessage) {
         << "the real reply ends the burst only if a reply above was counted";
     EXPECT_FALSE(burst.on_time_response(&conn, reply(first))) << "no message is pending";
 
-    burst.loop(&conn);
+    burst.loop(&conn, platform_time_us() / 1000, true);
     const int64_t second = sent_echo(1);
     EXPECT_FALSE(burst.on_time_response(&conn, reply(first)))
         << "a reply to the first message, drained after the second was sent";
@@ -1859,14 +1859,14 @@ TEST(TimeBurst, TimedOutMessageIsRetired) {
 
     SendspinTimeBurst burst;
     burst.configure(/*burst_size=*/2, /*burst_interval_ms=*/0, /*response_timeout_ms=*/0);
-    burst.loop(&conn);
+    burst.loop(&conn, platform_time_us() / 1000, true);
     ASSERT_EQ(conn.sent_binary_.size(), 1U);
     const int64_t echo = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_.at(0));
     // A zero timeout expires once the millisecond clock moves past the send.
     const int64_t sent_ms = platform_time_us() / 1000;
     while (platform_time_us() / 1000 <= sent_ms) {
     }
-    burst.loop(&conn);
+    burst.loop(&conn, platform_time_us() / 1000, true);
 
     EXPECT_FALSE(conn.claim_time_frame(echo).has_value());
     TimeResponse late;

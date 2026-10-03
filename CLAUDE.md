@@ -25,7 +25,8 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `NoiseSession` (`noise_session.h`): noise-c wrapper holding the KKpsk2 handshake and transport cipher states
 - `NoiseTransport` (`noise_transport.h`): per-connection encrypted framing, owns fragmentation and reassembly around the session; protocol task only, so it takes no lock
 - `RecordStore` (`record_store.h`): pairing records and the Pairing PSK (configured, stored, or generated), seeded from the client config and the persistence provider
-- `Inbox` / `InboxSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state (the protocol task and role threads produce, the main loop consumes) - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle events
+- `Inbox` / `InboxSlot` / `GenerationSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state (the protocol task and role threads produce, the main loop consumes) - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle events; a role's slots stamp each payload with the role's teardown generation
+- `TeardownTracker` (`teardown_tracker.h`): the main-loop half of a role's two-half teardown, run once per teardown generation (`catch_up_teardown()`) before the main loop acts on anything stamped with it
 - `SendspinTimeFilter` (`time_filter.h`): 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator, one per connection
 - `SendspinDecoder` (`decoder.h`): FLAC/PCM decoder wrapper, plus Opus when built with `SENDSPIN_ENABLE_OPUS`

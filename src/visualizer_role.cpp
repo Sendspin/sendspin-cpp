@@ -470,7 +470,8 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
     // Write the config to the inbox slot for the main thread, then push the event. Both lock the
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
     // guaranteed to observe this config (see config_slot.take() in handle_stream_ring_event()).
-    this->event_state->config_slot.write(stream);
+    // Both carry `generation`, so a config left over from a torn-down stream is never applied.
+    this->event_state->config_slot.write(stream, generation);
     this->enqueue_stream_event(VisualizerEventType::STREAM_START, generation);
 }
 
@@ -517,11 +518,20 @@ void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event,
 // SendspinClient::loop()
 // ============================================================================
 
-void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event) const {
+void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event,
+                                                    uint32_t generation) const {
     switch (event) {
         case VisualizerEventType::STREAM_START: {
             ServerVisualizerStreamObject config{};
-            if (this->event_state->config_slot.take(config) && this->listener) {
+            uint32_t stamp = 0;
+            if (!this->event_state->config_slot.take(config, stamp)) {
+                break;
+            }
+            if (stamp != generation) {
+                SS_LOGD(TAG, "Dropping a visualizer config queued before the role was torn down");
+                break;
+            }
+            if (this->listener) {
                 this->listener->on_visualizer_stream_start(config);
             }
             break;
@@ -540,7 +550,7 @@ void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event) c
 }
 
 // ============================================================================
-// Cleanup (main thread)
+// Cleanup (protocol task, or the main loop in stop() once it is joined)
 // ============================================================================
 
 void VisualizerRole::Impl::cleanup() {

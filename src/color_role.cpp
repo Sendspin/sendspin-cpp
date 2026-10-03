@@ -81,7 +81,7 @@ void ColorRole::Impl::handle_server_state(const ServerColorStateObject& color,
     // an overlay on the one before it (see coalesce_color_states).
     PendingColorStates arrival;
     arrival.oldest = color;
-    this->event_state->slot.merge(coalesce_color_states, arrival);
+    this->event_state->slot.merge(coalesce_color_states, arrival, generation);
 }
 
 bool ColorRole::Impl::state_is_due(int64_t timestamp) const {
@@ -105,6 +105,25 @@ void ColorRole::Impl::apply_due_state() {
 }
 
 void ColorRole::Impl::drain_events() {
+    // Taken before the catch-up: a teardown that ran before the take is caught up below (its
+    // clear fires first) and drops a payload stamped before it; one that runs after the take is
+    // caught up by the next drain, behind what this drain applies.
+    PendingColorStates taken;
+    uint32_t stamp = 0;
+    bool have_taken = this->event_state->slot.take(taken, stamp);
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
+    catch_up_teardown(*this, generation);
+    // Every check below against `generation` also catches a listener callback that re-entered
+    // teardown (a listener calling stop()): its cleanup() moved the generation on, and its own
+    // drain already reset this role.
+    if (!this->accepts(generation)) {
+        return;
+    }
+    if (have_taken && stamp != generation) {
+        SS_LOGD(TAG, "Dropping color queued before the role was torn down");
+        have_taken = false;
+    }
+
     // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex;
     // see inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
     // moves the pending palettes into held_state, then each deadline is evaluated below with no
@@ -114,8 +133,7 @@ void ColorRole::Impl::drain_events() {
     // future is the pending update and a newer one replaces it, while a past or present one is
     // applied at once and discards the pending update. Both fall out of replacing held_state with
     // each taken palette in arrival order, applying whatever is due in between.
-    PendingColorStates taken;
-    if (this->event_state->slot.take(taken)) {
+    if (have_taken) {
         const bool collapses =
             taken.newest.has_value() && this->state_is_due(taken.newest->timestamp);
         if (taken.oldest.has_value() && !collapses) {
@@ -123,6 +141,9 @@ void ColorRole::Impl::drain_events() {
             // within this tick, so no listener could observe it.
             this->held_state = taken.oldest;
             this->apply_due_state();
+            if (!this->accepts(generation)) {
+                return;
+            }
         }
         if (taken.newest.has_value()) {
             this->held_state = taken.newest;
@@ -131,18 +152,10 @@ void ColorRole::Impl::drain_events() {
 
     // A future-dated palette is held across ticks without any topic bit set (take() above cleared
     // it). It is re-evaluated against its deadline on later ticks only because needs_drain() ORs
-    // in held_state.has_value() alongside the INBOX_TOPIC_COLOR bit test, so this drain_events()
-    // keeps running each tick until the deadline fires. Dropping that OR term would strand the
-    // palette until an unrelated new one re-set the topic bit.
+    // in held_state.has_value() alongside the INBOX_TOPIC_COLOR bit test, so this
+    // drain_events() keeps running each tick until the deadline fires. Dropping that OR term
+    // would strand the palette until an unrelated new one re-set the topic bit.
     this->apply_due_state();
-}
-
-void ColorRole::Impl::handle_cleared_event() const {
-    // Queued by cleanup(), which runs on the protocol task, so the listener is called here on the
-    // main loop.
-    if (this->listener) {
-        this->listener->on_color_clear();
-    }
 }
 
 void ColorRole::Impl::cleanup() {
@@ -151,8 +164,8 @@ void ColorRole::Impl::cleanup() {
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();
 
-    // Stamped so the drain catches the main-loop state up before the callback; the callback
-    // itself is idempotent, so it is delivered whatever teardown overtook it.
+    // Stamped so the drain runs complete_teardown() for this generation before it applies
+    // anything the next connection sends.
     push_event_or_log(this->inbox, InboxEventType::COLOR_CLEARED, 0, TAG, "color cleared event",
                       generation);
 }
@@ -160,6 +173,9 @@ void ColorRole::Impl::cleanup() {
 void ColorRole::Impl::complete_teardown() {
     this->color = {};
     this->held_state.reset();
+    if (this->listener) {
+        this->listener->on_color_clear();
+    }
 }
 
 }  // namespace sendspin

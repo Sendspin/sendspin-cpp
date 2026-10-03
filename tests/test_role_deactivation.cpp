@@ -851,8 +851,10 @@ TEST(RoleDeactivation, ControllerCommandsWaitForTheRoleToBeActive) {
         connect_paired_server(bundle.peer, INACTIVE_ROLE_SEND_TEST_PORT, std::move(options));
     pump_until(client, [&] { return client.is_connected(); });
 
-    controller.impl_->supported_commands_mask =
-        1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY);
+    // Stamped with the role's current generation, as the drain stamps a mask it applies.
+    controller.impl_->supported_commands =
+        (controller.impl_->cleanup_generation.load() << 16) |
+        (1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY));
     controller.send_command({.command = SendspinControllerCommand::PLAY});
     pump_for(client, 100);
     EXPECT_TRUE(server->controller_commands().empty())

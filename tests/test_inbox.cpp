@@ -13,10 +13,12 @@
 // limitations under the License.
 
 /// @file test_inbox.cpp
-/// @brief Tests for the Inbox/InboxSlot primitives: slot write/take/merge semantics, event ring
-/// FIFO and overflow behavior, and a concurrent producer/consumer smoke test
+/// @brief Tests for the Inbox/InboxSlot primitives: slot write/take/merge semantics, the
+/// generation-stamped slot and the teardown tracker, event ring FIFO and overflow behavior, and
+/// a concurrent producer/consumer smoke test
 
 #include "inbox.h"
+#include "teardown_tracker.h"
 
 #include <gtest/gtest.h>
 
@@ -142,6 +144,63 @@ TEST(Inbox, ResetEventsEmptiesRingAndClearsBit) {
 
     InboxEvent out[4];
     EXPECT_EQ(inbox.take_events(out, 4), 0u);
+}
+
+// A GenerationSlot hands its payload out with the teardown generation it was written under, and
+// keeps the newest generation's content: a write from a later generation replaces what is
+// pending, one from an earlier generation (a producer that lost a race with a teardown) is
+// dropped, and once the slot is taken any generation starts it afresh. Each row writes two deltas
+// with an appending merge, so a replaced payload is told apart from a merged one.
+TEST(GenerationSlot, KeepsTheNewestGenerationsContent) {
+    struct Row {
+        const char* name;
+        uint32_t first;
+        uint32_t second;
+        bool take_between;
+        int expected_value;
+        uint32_t expected_generation;
+    };
+    const Row rows[] = {
+        {"Control: same generation merges", 3, 3, false, 12, 3},
+        {"a later generation replaces the pending payload", 3, 4, false, 2, 4},
+        {"an earlier generation is dropped", 4, 3, false, 1, 4},
+        {"an earlier generation is taken once the slot is clean", 4, 3, true, 2, 3},
+        {"ordered across the counter's wrap", UINT32_MAX, 0, false, 2, 0},
+    };
+    const auto append = [](int& current, int&& delta) { current = current * 10 + delta; };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Inbox inbox;
+        GenerationSlot<int> slot;
+        slot.bind(inbox, INBOX_TOPIC_CONTROLLER);
+        int value = 0;
+        uint32_t generation = 0;
+
+        slot.merge(append, 1, row.first);
+        if (row.take_between) {
+            ASSERT_TRUE(slot.take(value, generation));
+        }
+        slot.merge(append, 2, row.second);
+
+        ASSERT_TRUE(slot.take(value, generation));
+        EXPECT_EQ(value, row.expected_value);
+        EXPECT_EQ(generation, row.expected_generation);
+        EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_CONTROLLER));
+    }
+}
+
+// TeardownTracker::advance() reports a teardown generation pending exactly once, so a role's
+// main-loop half runs once per teardown however many paths (stamped events, slot payloads) carry
+// that generation, and never for a generation a later catch-up already passed.
+TEST(TeardownTracker, AdvancesOncePerGenerationAndNeverBackwards) {
+    TeardownTracker tracker;
+    EXPECT_FALSE(tracker.advance(0)) << "Control: a role never torn down has nothing pending";
+    EXPECT_TRUE(tracker.advance(1));
+    EXPECT_FALSE(tracker.advance(1)) << "the same teardown caught up twice";
+    EXPECT_TRUE(tracker.advance(3)) << "two teardowns between catch-ups collapse into one";
+    EXPECT_FALSE(tracker.advance(2)) << "an older stamp caught up after a newer one";
+    EXPECT_TRUE(tracker.pending(4));
+    EXPECT_FALSE(tracker.pending(3));
 }
 
 // The epoch a producer stamps must reach the consumer per event, not per ring: it is what

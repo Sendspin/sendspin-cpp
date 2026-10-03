@@ -355,13 +355,17 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     // resumption from trust change, which is covered separately below).
     ASSERT_TRUE(server.trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
 
-    // Immediately after the swap the connection must go non-operational: first_activate_received_
-    // is reset. This is the expected transient dip described in connection_manager.h's invariant
-    // comment, not a failure.
-    pump_until(client, [&] { return !client.is_connected(); });
-
-    // The post-swap server/activate alone brings it back.
-    pump_until(client, [&] { return client.is_connected(); });
+    // The post-swap server/activate alone brings it back. The evidence is monotonic: the client
+    // sends client/state only while operational, and a client/state the server counted after it
+    // sent that activate was sent in answer to it (every pre-swap one reached the server before
+    // the msg2 the activate follows). The non-operational dip between the swap and that
+    // activation is not waited for: the protocol task can apply both within one receive pass, so
+    // is_connected() may never read false.
+    pump_until(client, [&] {
+        return server.activate_count() == 2 &&
+               server.client_state_count() > server.client_states_at_last_activate() &&
+               client.is_connected();
+    });
     EXPECT_EQ(server.client_hello_count(), 1) << "client/hello must not be re-sent";
     EXPECT_EQ(server.activate_count(), 2) << "the server's first message under the new keys";
     // server_id is unchanged (same server, new session keys).

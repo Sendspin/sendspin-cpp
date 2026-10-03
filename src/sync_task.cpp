@@ -164,7 +164,10 @@ void SyncTask::signal_stream_start() {
     if (!this->is_initialized()) {
         return;
     }
+    // Flag first, then wake: a task parked waiting for a codec header with none pending takes the
+    // start as stale and returns to idle (see wait_for_codec_header()).
     this->event_flags_.set(EventGroupBits::COMMAND_START);
+    this->encoded_items_.wake_receiver();
 }
 
 int64_t SyncTask::server_timestamp(void* item) {
@@ -687,9 +690,19 @@ bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
 
     while (
         !(this->event_flags_.get() & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR))) {
-        void* item = this->take_item(IDLE_RECEIVE_TIMEOUT_MS);
+        // A COMMAND_START with no codec header pending is the main loop starting a stream this
+        // task already left (a stream/start and stream/end drained in one tick, whose header this
+        // task took and returned on the end). The header always precedes its start on the list,
+        // so one non-blocking take settles it: nothing left means the start is stale, and
+        // returning to idle clears it and notes the idle state the main loop's held STREAM_END
+        // waits for. Left set, it would start the next stream before its own START.
+        const bool start_pending = (this->event_flags_.get() & COMMAND_START) != 0;
+        void* item = this->take_item(start_pending ? 0 : IDLE_RECEIVE_TIMEOUT_MS);
         if (item == nullptr) {
-            continue;  // Timed out; check flags and try again
+            if (start_pending) {
+                return false;
+            }
+            continue;  // Woken or timed out; check flags and try again
         }
         if (chunk_type(item) != CHUNK_TYPE_ENCODED_AUDIO &&
             chunk_type(item) != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
@@ -869,10 +882,18 @@ void SyncTask::thread_entry(void* params) {
     // === OUTER LOOP: persists for one started session, until stop() ===
     while (!(this_task->event_flags_.get() & COMMAND_STOP)) {
         // --- IDLE STATE ---
-        this_task->event_flags_.clear(
+        constexpr uint32_t STREAM_BITS =
             EventGroupBits::TASK_RUNNING | EventGroupBits::COMMAND_STREAM_END |
-            EventGroupBits::COMMAND_STREAM_CLEAR | EventGroupBits::COMMAND_START);
+            EventGroupBits::COMMAND_STREAM_CLEAR | EventGroupBits::COMMAND_START;
+        const bool left_stream = (this_task->event_flags_.get() & STREAM_BITS) != 0;
+        this_task->event_flags_.clear(STREAM_BITS);
         this_task->event_flags_.set(EventGroupBits::TASK_IDLE);
+        // After TASK_RUNNING is cleared: the main loop holds a STREAM_END until is_running() reads
+        // false and re-examines it when this note arrives (PlayerRole::Impl::drain_events()). Only
+        // when a stream was running or being started, so an idle wake costs the main loop nothing.
+        if (left_stream) {
+            this_task->player_impl_->note_sync_idle();
+        }
 
         this_task->reset_context(sync_context);
         this_task->playback_progress_slot_.reset();
@@ -885,7 +906,7 @@ void SyncTask::thread_entry(void* params) {
         }
 
         if (!got_header) {
-            // Woke due to STREAM_END or STREAM_CLEAR during idle.
+            // Woke due to STREAM_END, STREAM_CLEAR or a stale START during idle.
             // Only drain audio on STREAM_CLEAR; codec headers are preserved.
             if (this_task->event_flags_.get() & COMMAND_STREAM_CLEAR) {
                 this_task->drain_items(sync_context);

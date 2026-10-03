@@ -1828,3 +1828,36 @@ TEST(ArtworkChannelReporting, NoConfiguredChannelsReportsNothing) {
     impl->build_state_fields(state);
     EXPECT_FALSE(state.artwork.has_value());
 }
+
+// A display the decode thread handed over before a teardown, and which a drain takes on the far
+// side of it, is dropped by its generation stamp instead of displayed for the next stream: the
+// slot epoch alone cannot tell, since the hand-off below carries the epoch the slot still has.
+// The slot is written with the old stamp directly, the hand-off such a drain would hold; nothing
+// public interleaves the decode thread, the protocol task and the main loop on demand.
+TEST(ArtworkDisplayHandOff, ADisplayStampedBeforeATeardownIsNotShown) {
+    struct Row {
+        const char* name;
+        bool stale;
+        size_t expected_displays;
+    };
+    const Row rows[] = {{"Control: stamped with the current generation", false, 1},
+                        {"stamped before the teardown", true, 0}};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl(make_single_slot_config(false));
+        RecordingListener listener;
+        impl->listener = &listener;
+        const uint32_t before = live_generation(*impl);
+        impl->cleanup();
+        ArtworkDisplayUpdate delta{};
+        delta.timestamps[0] = 1;
+        delta.epochs[0] = impl->slot_epochs[0].load();
+        delta.valid_mask = 0x01;
+        impl->event_state->display_slot.merge(ArtworkRole::Impl::merge_artwork_display_update,
+                                              delta, row.stale ? before : live_generation(*impl));
+
+        impl->drain_events();
+
+        EXPECT_EQ(listener.display_count(), row.expected_displays);
+    }
+}

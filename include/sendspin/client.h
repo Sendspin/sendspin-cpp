@@ -72,7 +72,9 @@ public:
     /// power saving)
     ///
     /// Toggle the platform's networking mode and return; the body must not call any
-    /// SendspinClient or role method.
+    /// SendspinClient or role method. A time burst sends its first time message only once this
+    /// call has returned, so the round trips it measures run in the mode it selects. Every
+    /// request is followed by exactly one on_release_high_performance(); requests do not nest.
     virtual void on_request_high_performance() {}
 
     /// @brief Called when the library no longer needs high-performance networking
@@ -616,7 +618,9 @@ public:
     /// So is one on the Pairing PSK still awaiting its first server/activate: it is most likely
     /// about to declare pairing, and a restart would cost that attempt. If it activates idle
     /// instead, it keeps the hello it already read until it reconnects.
-    /// Callable at any time, before the first start() and while stopped included.
+    /// Callable at any time, before the first start() and while stopped included: while the
+    /// client is stopped the value is stored, and the next start() uses it from its first
+    /// client/hello on (there is no connection to close).
     ///
     /// The library never persists the setting. An application that keeps it across reboots
     /// stores it and restores it by calling this before start(), so the first client/hello and
@@ -693,18 +697,15 @@ public:
 
 private:
     /// @brief The protocol-task half of a teardown: when `teardown_roles` covers every role, wipes
-    /// the event ring, the pending group, time-sync and pairing-note slots and the trust level;
-    /// and runs cleanup() on each role in `teardown_roles`, each of which queues its clear for the
-    /// main loop. Protocol task,
-    /// or the main loop in stop() once every other thread is joined. The main-loop half runs at
-    /// the head of the next drain_inbox() (complete_role_teardowns()).
+    /// the event ring, the pending group and time-sync slots, the pairing notes other than a
+    /// dismissal already owed, and the trust level; and runs cleanup() on each role in
+    /// `teardown_roles`, each of which queues its stamped clear for the main loop. Protocol task,
+    /// or the main loop in stop() once every other thread is joined. Each role's main-loop half
+    /// runs in drain_inbox() before anything stamped with the new generation is acted on
+    /// (catch_up_teardown() in src/teardown_tracker.h).
     /// @param teardown_roles The roles to tear down, as role_mask_bit() bits: the roles no
     ///        remaining admitted connection owns.
     void cleanup_connection_state(uint16_t teardown_roles);
-
-    /// @brief Runs each role's main-loop teardown half (state only the main loop touches) once for
-    /// every teardown cleanup() ran since the last call. Main loop, at the head of drain_inbox().
-    void complete_role_teardowns();
 
     /// @brief Wakes the main loop to run flush_pending_persistence(). Callable from any thread
     /// and under any library lock: it takes only the Inbox mutex.
@@ -718,19 +719,28 @@ private:
     /// succeeded.
     void flush_pending_persistence();
 
-    /// @brief Drains the inbox: role teardown halves, high-performance requests, provider
-    /// writes, the time-sync report, lifecycle events, pairing notes, role slots, and group
-    /// updates, dispatching listener callbacks on the calling (main-loop) thread. Shared by loop()
-    /// and stop().
+    /// @brief Drains the inbox: high-performance requests, provider writes, the time-sync report,
+    /// lifecycle events (each role's teardown half caught up ahead of its stamped events),
+    /// pairing notes, role slots, and group updates, dispatching listener callbacks on the
+    /// calling (main-loop) thread. Shared by loop() and stop(). A callback that calls stop()
+    /// abandons the rest of this drain (EventState::drain_generation).
     void drain_inbox();
 
-    /// @brief Applies the high-performance requests the protocol task queued: every acquire, then
-    /// every release, so a release never lands before the acquire it ends. Main loop only.
+    /// @brief Applies the high-performance edges the protocol task queued: every acquire, then
+    /// the grant for them (high_performance_granted_, waking the protocol task), then every
+    /// release, so a release never lands before the acquire it ends. Main loop only.
     void apply_high_performance_requests();
 
     /// @brief Queues a high-performance acquire (true) or release (false) for the main loop,
     /// where the listener is called. Protocol task.
-    void request_high_performance(bool acquire);
+    /// @return For an acquire, its ticket: the burst that requested the hold sends its first
+    ///         time frame only once high_performance_granted() reports the ticket granted. 0 for
+    ///         a release, which waits for nothing.
+    uint32_t request_high_performance(bool acquire);
+
+    /// @brief Whether the main loop has called the listener for the acquire `ticket` names (see
+    /// request_high_performance()). Protocol task.
+    bool high_performance_granted(uint32_t ticket) const;
 
     /// @brief Queues a completed time burst's filter error for on_time_sync_updated() on the main
     /// loop. Protocol task.
@@ -953,11 +963,19 @@ private:
     /// In-memory pairing record store (PSK resolution). Set in start();
     /// outlives every connection the manager hands it out to.
     std::unique_ptr<RecordStore> record_store_;
-    /// State the protocol task owns at client level (the latest client/state snapshot).
+    /// State the protocol task owns at client level (the latest client/state snapshot and the
+    /// high-performance ticket count).
     std::unique_ptr<TaskState> task_state_;
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     std::unique_ptr<VisualizerRole> visualizer_;
 #endif
+
+    // 32-bit fields
+    /// High-performance acquires the main loop has applied, the listener called for each: the
+    /// grant a time burst waits for before its first time frame (high_performance_granted()).
+    /// Written by the main loop's drain (apply_high_performance_requests()); read by the protocol
+    /// task.
+    std::atomic<uint32_t> high_performance_granted_{0};
 
     // 8-bit fields
     /// Consumer-owned availability; see set_available(). Main loop only (the protocol task reads

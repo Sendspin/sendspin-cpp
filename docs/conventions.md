@@ -27,9 +27,16 @@ checklists in `.claude/skills/` apply these standards to a diff.
   roles establish; the protocol task hands audio and visualizer frames over in
   the ring item they arrived in rather than copying them.
 - All main-loop-bound cross-thread state goes through the `Inbox`
-  (`src/inbox.h`). Do not add new mutex-protected endpoints polled by
-  `loop()`, and the protocol task calls no listener: what a consumer hears of
-  connection work it hears from the main loop's drain.
+  (`src/inbox.h`). `loop()` runs the Inbox drain and nothing else: do not add
+  mutex-protected endpoints or atomics that `loop()` polls for work. The
+  protocol task calls no listener, a role thread calls only the data-path
+  callbacks `docs/integration-guide.md` names for it (`on_audio_write()` on
+  the sync task, `on_image_decode()` on the artwork decode thread, the
+  visualizer data callbacks on its drain thread), and only the main loop
+  calls the persistence provider: everything else a consumer hears it hears
+  from the main loop's drain. A thread that must wait for the main loop to
+  have called a listener waits for a grant the drain publishes (the
+  high-performance grant), never for the main loop itself.
 - The Inbox event ring is for ordered lifecycle events only (stream start and
   end, cleared, connection events). Latest-wins state (player state, metadata,
   progress) belongs on a collapsing `InboxSlot`, never the ring: a flood of
@@ -48,11 +55,12 @@ checklists in `.claude/skills/` apply these standards to a diff.
   least a warning at the drop site. A site that can drop every message of a
   burst throttles it with `InboundDropLog`: one warning when the drops start,
   one with their count when they stop.
-- An event whose delivery must not survive its producer being torn down
-  carries the producer's teardown generation and is checked against it at the
-  drain (`push_event_or_log()` / `event_is_current()`), rather than relying on
-  the ring being reset: a teardown that leaves other producers running cannot
-  reset it.
+- An event or a slot payload whose delivery must not survive its producer
+  being torn down carries the producer's teardown generation and is checked
+  against it at the drain (`push_event_or_log()` / `event_is_current()` for
+  events, `GenerationSlot` for a role's slots), rather than relying on the
+  ring or the slot being reset: a teardown that leaves other producers running
+  cannot reset it, and a drain can take a slot on either side of a teardown.
 - Callback dispatch must tolerate re-entrant teardown: a listener callback may
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.
@@ -65,9 +73,11 @@ checklists in `.claude/skills/` apply these standards to a diff.
   the main-loop drain, and one connection's message must not delay every other
   connection's. The roles a teardown takes away are torn down in two halves:
   the protocol task resets what its handlers and the role threads reach and
-  stamps the role's events with the new teardown generation, and the main loop
-  resets its own state before acting on any event of that generation
-  (`catch_up_teardown()`).
+  stamps the role's events and slot payloads with the new teardown generation,
+  and the main loop runs the role's own half once per generation, through the
+  role's `TeardownTracker` (`catch_up_teardown()`), before acting on anything
+  stamped with it. A role drain takes its slot before it catches up, then
+  applies only a payload stamped with the current generation.
 - A protocol-task step has a bounded wait or none: the Noise DH operations, a
   ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, a transport send
   bounded by the transport's own send timeout, and at shutdown the goodbye

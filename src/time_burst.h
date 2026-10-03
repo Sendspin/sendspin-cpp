@@ -54,7 +54,8 @@ struct TimeBurstResult {
  *
  * Each SendspinConnection owns one, beside its time filter, and drives it on the protocol task:
  * 1. Call loop() on each tick while the connection is admitted and operational, and wake again
- *    after ms_until_due()
+ *    after ms_until_due(); starts_burst() says when the next loop() opens a burst, which the
+ *    caller may hold back until the platform is ready for it
  * 2. Call on_time_response() when a SERVER_TIME response arrives for that connection
  * 3. Call reset() when the connection is dropped
  * 4. Check TimeBurstResult::burst_completed to know when to act on updated time estimates
@@ -64,7 +65,8 @@ struct TimeBurstResult {
  * burst.reset();
  *
  * // On the protocol task's tick:
- * TimeBurstResult result = burst.loop(conn);
+ * const int64_t now_ms = platform_time_us() / US_PER_MS;
+ * TimeBurstResult result = burst.loop(conn, now_ms, burst.starts_burst(now_ms));
  * if (result.burst_completed) {
  *     int64_t server_now = conn->get_time_filter()->compute_server_time(platform_time_us());
  * }
@@ -81,8 +83,12 @@ public:
 
     /// @brief Drive the burst state machine. Protocol task only.
     /// @param conn The connection that owns this burst, to send time messages on.
+    /// @param now_ms platform_time_us() / US_PER_MS, read once by the caller for this call and
+    ///        its starts_burst().
+    /// @param may_open_burst Whether a burst that is due may be opened (its first time message
+    ///        sent) by this call. A burst already open runs on regardless.
     /// @return Result indicating whether a message was sent and/or the burst completed.
-    TimeBurstResult loop(SendspinConnection* conn);
+    TimeBurstResult loop(SendspinConnection* conn, int64_t now_ms, bool may_open_burst);
 
     /// @brief Called when a SERVER_TIME response arrives; ignored unless it answers the time
     /// message still pending
@@ -90,6 +96,14 @@ public:
     /// @param response The measurement and the echo identifying the message it answers.
     /// @return true if this completed the burst (Kalman filter was updated).
     bool on_time_response(SendspinConnection* conn, const TimeResponse& response);
+
+    /// @brief Whether the next loop() starts a new burst: the previous one is complete and the
+    /// interval since it has elapsed, so loop() would send the burst's first time frame
+    /// @param now_ms platform_time_us() / US_PER_MS, the value the caller passes loop().
+    [[nodiscard]] bool starts_burst(int64_t now_ms) const {
+        return this->burst_index_ >= this->burst_size_ && !this->pending_burst_completed_ &&
+               now_ms - this->last_burst_complete_time_ >= this->burst_interval_ms_;
+    }
 
     /// @brief Milliseconds until loop() has something to do: the next message of a burst (0),
     /// the timeout of the message in flight, or the end of the inter-burst interval

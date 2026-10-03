@@ -132,7 +132,7 @@ void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadat
     // an overlay on the one before it (see coalesce_metadata_states).
     PendingMetadataStates arrival;
     arrival.oldest = std::move(metadata);
-    this->event_state->slot.merge(coalesce_metadata_states, std::move(arrival));
+    this->event_state->slot.merge(coalesce_metadata_states, std::move(arrival), generation);
 }
 
 bool MetadataRole::Impl::state_is_due(int64_t timestamp) const {
@@ -156,6 +156,25 @@ void MetadataRole::Impl::apply_due_state() {
 }
 
 void MetadataRole::Impl::drain_events() {
+    // Taken before the catch-up: a teardown that ran before the take is caught up below (its
+    // clear fires first) and drops a payload stamped before it; one that runs after the take is
+    // caught up by the next drain, behind what this drain applies.
+    PendingMetadataStates taken;
+    uint32_t stamp = 0;
+    bool have_taken = this->event_state->slot.take(taken, stamp);
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
+    catch_up_teardown(*this, generation);
+    // Every check below against `generation` also catches a listener callback that re-entered
+    // teardown (a listener calling stop()): its cleanup() moved the generation on, and its own
+    // drain already reset this role.
+    if (!this->accepts(generation)) {
+        return;
+    }
+    if (have_taken && stamp != generation) {
+        SS_LOGD(TAG, "Dropping metadata queued before the role was torn down");
+        have_taken = false;
+    }
+
     // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex;
     // see inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
     // moves the pending states into held_state, then each deadline is evaluated below with no
@@ -165,8 +184,7 @@ void MetadataRole::Impl::drain_events() {
     // future is the pending update and a newer one replaces it, while a past or present one is
     // applied at once and discards the pending update. Both fall out of replacing held_state with
     // each taken state in arrival order, applying whatever is due in between.
-    PendingMetadataStates taken;
-    if (this->event_state->slot.take(taken)) {
+    if (have_taken) {
         const bool collapses =
             taken.newest.has_value() && this->state_is_due(taken.newest->timestamp);
         if (taken.oldest.has_value() && !collapses) {
@@ -174,6 +192,9 @@ void MetadataRole::Impl::drain_events() {
             // within this tick, so no listener could observe it.
             this->held_state = std::move(taken.oldest);
             this->apply_due_state();
+            if (!this->accepts(generation)) {
+                return;
+            }
         }
         if (taken.newest.has_value()) {
             this->held_state = std::move(taken.newest);
@@ -184,16 +205,8 @@ void MetadataRole::Impl::drain_events() {
     // it). It is re-evaluated against its deadline on later ticks only because needs_drain() ORs
     // in held_state.has_value() alongside the INBOX_TOPIC_METADATA bit test, so this
     // drain_events() keeps running each tick until the deadline fires. Dropping that OR term
-    // would strand the state until an unrelated new state re-set the topic bit.
+    // would strand the state until an unrelated new one re-set the topic bit.
     this->apply_due_state();
-}
-
-void MetadataRole::Impl::handle_cleared_event() const {
-    // Queued by cleanup(), which runs on the protocol task, so the listener is called here on the
-    // main loop.
-    if (this->listener) {
-        this->listener->on_metadata_clear();
-    }
 }
 
 void MetadataRole::Impl::cleanup() {
@@ -202,8 +215,8 @@ void MetadataRole::Impl::cleanup() {
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();
 
-    // Stamped so the drain catches the main-loop state up before the callback; the callback
-    // itself is idempotent, so it is delivered whatever teardown overtook it.
+    // Stamped so the drain runs complete_teardown() for this generation before it applies
+    // anything the next connection sends.
     push_event_or_log(this->inbox, InboxEventType::METADATA_CLEARED, 0, TAG,
                       "metadata cleared event", generation);
 }
@@ -211,6 +224,9 @@ void MetadataRole::Impl::cleanup() {
 void MetadataRole::Impl::complete_teardown() {
     this->metadata = {};
     this->held_state.reset();
+    if (this->listener) {
+        this->listener->on_metadata_clear();
+    }
 }
 
 }  // namespace sendspin

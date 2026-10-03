@@ -1132,28 +1132,39 @@ uint32_t ConnectionManager::run_time_sync() {
         if (conn == nullptr || !conn->is_operational() || !conn->is_connected()) {
             continue;
         }
-        const TimeBurstResult result = conn->time_burst().loop(conn);
+        SendspinTimeBurst& burst = conn->time_burst();
 
-        // A burst in flight holds the platform's high-performance networking for the round trips
-        // it measures; the request and release reach the listener on the main loop.
-        if (result.sent && !entry.high_performance_held) {
-            this->client_->request_high_performance(true);
+        // A burst holds the platform's high-performance networking for the round trips it
+        // measures, so it requests the hold when it comes due and sends its first time frame only
+        // once the main loop has granted it: called the listener and counted the grant
+        // (SendspinClient::high_performance_granted()). The grant wakes the task, so a burst
+        // waiting for it adds no deadline. The release at the burst's end waits for nothing.
+        // One clock read for both, so the burst loop() may open is the one the request was made
+        // for; loop() opens none without the grant (may_open_burst).
+        const int64_t now_ms = platform_time_us() / US_PER_MS;
+        if (!entry.high_performance_held && burst.starts_burst(now_ms)) {
+            entry.high_performance_ticket = this->client_->request_high_performance(true);
             entry.high_performance_held = true;
         }
-        if (result.burst_completed) {
-            if (entry.high_performance_held) {
-                this->client_->request_high_performance(false);
-                entry.high_performance_held = false;
+        const bool granted = entry.high_performance_held &&
+                             this->client_->high_performance_granted(entry.high_performance_ticket);
+        if (granted || !entry.high_performance_held) {
+            const TimeBurstResult result = burst.loop(conn, now_ms, granted);
+            if (result.burst_completed) {
+                if (entry.high_performance_held) {
+                    this->client_->request_high_performance(false);
+                    entry.high_performance_held = false;
+                }
+                if (&entry == primary && conn->get_time_filter() != nullptr) {
+                    this->client_->post_time_sync_error(conn->get_time_filter()->get_error());
+                }
             }
-            if (&entry == primary && conn->get_time_filter() != nullptr) {
-                this->client_->post_time_sync_error(conn->get_time_filter()->get_error());
-            }
+            next = std::min(next, burst.ms_until_due(now_ms));
         }
         // A client/state held for this connection's clock goes out with its first measurement.
         if (entry.state_held && conn->is_time_synced()) {
             this->client_->publish_client_state(conn);
         }
-        next = std::min(next, conn->time_burst().ms_until_due(platform_time_us() / US_PER_MS));
     }
     return next;
 }

@@ -31,6 +31,7 @@
 #include "platform/network_info.h"
 #include "platform/time.h"
 #include "record_store.h"
+#include "teardown_tracker.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
 #endif
@@ -102,6 +103,28 @@ constexpr bool is_coalesced_note(PairingNoteType type) {
            type == PairingNoteType::CLOSE_PAIRING_WINDOW;
 }
 
+/// @brief Drops every pending note except a dismissal whose prompt reached the listener in an
+/// earlier drain: a CLEAR_PAIRING_CODE with no DISPLAY_PAIRING_CODE pending, a
+/// CLOSE_PAIRING_WINDOW with no OPEN_PAIRING_WINDOW pending. A prompt still pending is never
+/// shown, so its dismissal goes with it. Runs under the Inbox mutex: a pure data operation.
+void retain_delivered_dismissals(std::vector<PairingNote>& notes) {
+    bool code_pending = false;
+    bool window_pending = false;
+    for (const PairingNote& note : notes) {
+        code_pending |= note.type == PairingNoteType::DISPLAY_PAIRING_CODE;
+        window_pending |= note.type == PairingNoteType::OPEN_PAIRING_WINDOW;
+    }
+    std::erase_if(notes, [code_pending, window_pending](const PairingNote& note) {
+        if (note.type == PairingNoteType::CLEAR_PAIRING_CODE) {
+            return code_pending;
+        }
+        if (note.type == PairingNoteType::CLOSE_PAIRING_WINDOW) {
+            return window_pending;
+        }
+        return true;
+    });
+}
+
 /// @brief The provider writes the main loop owes, accumulated by request_persist() and
 /// note_last_played_server() and performed by flush_pending_persistence()
 struct PersistRequest {
@@ -109,24 +132,15 @@ struct PersistRequest {
     std::optional<std::string> last_played{};
 };
 
-/// @brief High-performance requests the protocol task queued for the main loop, which calls the
-/// listener. Counts rather than a net value, so an acquire and a release queued between two
-/// drains still reach the listener as a request and a release.
+/// @brief High-performance edges the protocol task queued for the main loop, which calls the
+/// listener. Two counts rather than a net value, so an acquire and a release queued inside one
+/// stalled main-loop tick still reach the listener as a request followed by its release. 32-bit:
+/// each acquire waits for its grant before its burst sends, so the counts grow by at most a few
+/// per drain.
 struct HighPerformanceRequests {
-    uint8_t acquires{0};
-    uint8_t releases{0};
+    uint32_t acquires{0};
+    uint32_t releases{0};
 };
-
-/// @brief Adds `delta` to `count`, saturating; a saturated count means the main loop stopped
-/// draining, which the caller logs.
-bool add_saturating(uint8_t& count, uint8_t delta) {
-    if (count > UINT8_MAX - delta) {
-        count = UINT8_MAX;
-        return false;
-    }
-    count = static_cast<uint8_t>(count + delta);
-    return true;
-}
 
 /// @brief Resolve the `locations` hint for a pair-method descriptor in client/hello.
 /// @return The hint to advertise, or nullopt to omit the field.
@@ -190,14 +204,15 @@ struct SendspinClient::EventState {
     /// rather than an event: cleanup_connection_state() wipes the event ring, and an owed write
     /// must survive the connection dying before the next drain.
     InboxSlot<PersistRequest> persist_slot{inbox, INBOX_TOPIC_PERSIST};
-    /// High-performance requests from the protocol task (time bursts), applied by the drain.
+    /// High-performance edges from the protocol task (time bursts), applied by the drain, which
+    /// grants each acquire (SendspinClient::high_performance_granted_).
     InboxSlot<HighPerformanceRequests> high_performance_slot{inbox, INBOX_TOPIC_HIGH_PERFORMANCE};
     /// Pairing/trust listener notifications, appended on the protocol task in the order they
     /// happen and dispatched by the drain.
     InboxSlot<std::vector<PairingNote>> pairing_slot{inbox, INBOX_TOPIC_PAIRING};
     /// Bumped by stop() before its teardown so a drain frame already on the stack (a listener
-    /// callback that called stop()) abandons the events it copied out before the teardown. Main
-    /// loop only.
+    /// callback that called stop()) abandons what it has not delivered yet: the events it copied
+    /// out, the rest of the pairing notes, the role drains and the group update. Main loop only.
     uint32_t drain_generation{0};
 
     /// @brief Appends `note` to the pairing slot. Every SendspinClient::note_*() method funnels
@@ -224,6 +239,9 @@ struct SendspinClient::TaskState {
     /// connection is sent its filtered copy (publish_client_state()). Protocol task only, and
     /// reset by stop() once the task is joined.
     std::optional<ClientStateMessage> client_state;
+    /// High-performance acquires queued so far (request_high_performance()); the ticket of the
+    /// latest one. Protocol task only.
+    uint32_t high_performance_requests{0};
 };
 
 // ============================================================================
@@ -477,8 +495,9 @@ void SendspinClient::stop() {
     this->group_state_ = GroupUpdateObject{};
 
     // A pairing attempt cut short by the stop leaves its code or pairing-window prompt showing.
-    // Queue the dismissals now, after cleanup_connection_state() wiped the pending notes, so the
-    // drain below delivers them (same ordering rule as the ConnectionManager drop paths).
+    // Queue the dismissals now, after cleanup_connection_state() dropped the pending notes, so the
+    // drain below delivers them (same ordering rule as the ConnectionManager drop paths). One an
+    // earlier drop left pending survived that cleanup; the two coalesce into one callback.
     if (pairing_ui.code_was_emitted) {
         this->note_clear_pairing_code();
     }
@@ -486,9 +505,11 @@ void SendspinClient::stop() {
         this->note_close_pairing_window();
     }
 
-    // 7. Deliver the clear callbacks the cleanup queued, now rather than on a loop() tick that is
-    //    not coming. Every getter already reports the stopped state, so a callback that reads
-    //    the client sees exactly what a caller sees once stop() returns.
+    // 7. Deliver what the teardown owes, now rather than on a loop() tick that is not coming:
+    //    each role's main-loop half (its clear or STREAM_END callback), the high-performance
+    //    releases the shutdown pass queued, the owed provider writes and the dismissals above.
+    //    Every getter already reports the stopped state, so a callback that reads the client sees
+    //    exactly what a caller sees once stop() returns.
     this->drain_inbox();
 
     this->lifecycle_.store(LifecycleState::STOPPED, std::memory_order_release);
@@ -673,22 +694,29 @@ void SendspinClient::flush_pending_persistence() {
     }
 }
 
-void SendspinClient::request_high_performance(bool acquire) {
+uint32_t SendspinClient::request_high_performance(bool acquire) {
     HighPerformanceRequests delta;
+    uint32_t ticket = 0;
     if (acquire) {
         delta.acquires = 1;
+        ticket = ++this->task_state_->high_performance_requests;
     } else {
         delta.releases = 1;
     }
     this->event_state_->high_performance_slot.merge(
         [](HighPerformanceRequests& current, HighPerformanceRequests&& added) {
-            // A saturated count means the main loop stopped draining: the platform stays pinned
-            // in whichever mode it was in, which the drain cannot repair, so the excess is
-            // dropped rather than logged under the Inbox mutex.
-            (void)add_saturating(current.acquires, added.acquires);
-            (void)add_saturating(current.releases, added.releases);
+            current.acquires += added.acquires;
+            current.releases += added.releases;
         },
         delta);
+    return ticket;
+}
+
+bool SendspinClient::high_performance_granted(uint32_t ticket) const {
+    // Tickets and grants count the same acquires in the same order, so the grant for `ticket`
+    // is visible once the granted count has reached it (compared across the wrap).
+    return !generation_after(ticket,
+                             this->high_performance_granted_.load(std::memory_order_acquire));
 }
 
 void SendspinClient::apply_high_performance_requests() {
@@ -696,12 +724,20 @@ void SendspinClient::apply_high_performance_requests() {
     if (!this->event_state_->high_performance_slot.take(requests)) {
         return;
     }
-    // Acquires first: a burst that both started and finished since the last drain must reach
-    // the listener as a request followed by its release, never a release of nothing.
-    for (uint8_t i = 0; i < requests.acquires; ++i) {
+    // Acquires first: a burst whose hold was requested and then released inside one stalled
+    // tick (its connection dropped before the grant) must reach the listener as a request
+    // followed by its release, never a release of nothing.
+    for (uint32_t i = 0; i < requests.acquires; ++i) {
         this->acquire_high_performance();
     }
-    for (uint8_t i = 0; i < requests.releases; ++i) {
+    if (requests.acquires != 0) {
+        // The grant: the listener has been called for every acquire taken, so the bursts that
+        // wait for these tickets may send. Released after the callbacks, and the task woken,
+        // since a waiting burst has no deadline of its own.
+        this->high_performance_granted_.fetch_add(requests.acquires, std::memory_order_release);
+        this->protocol_task_->wake();
+    }
+    for (uint32_t i = 0; i < requests.releases; ++i) {
         this->release_high_performance();
     }
 }
@@ -710,49 +746,60 @@ void SendspinClient::post_time_sync_error(double error) {
     this->event_state_->time_sync_slot.write(error);
 }
 
-void SendspinClient::complete_role_teardowns() {
-    // Each role's cleanup() runs on the protocol task and leaves the state only the main loop
-    // touches for this half. The generation is loaded here, ahead of the events and slots the
-    // drain takes below, so a teardown that ran before them is always caught up before the state
-    // that follows it is applied. A stamped event of a newer teardown catches up again at its
-    // dispatch (see the event drain).
-#ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        this->player_->impl_->catch_up_teardown(
-            this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (this->controller_) {
-        this->controller_->impl_->catch_up_teardown(
-            this->controller_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_METADATA
-    if (this->metadata_) {
-        this->metadata_->impl_->catch_up_teardown(
-            this->metadata_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_COLOR
-    if (this->color_) {
-        this->color_->impl_->catch_up_teardown(
-            this->color_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
-#endif
-}
-
 void SendspinClient::drain_inbox() {
-    // The main-loop halves of the teardowns the protocol task ran since the last drain.
-    this->complete_role_teardowns();
-
     // Process deferred events: all state mutations and user callbacks happen here, on the main
     // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
     // inbox_bits (here) gates the high-performance requests, the provider writes, the time-sync
     // report and the event-ring drain immediately following it; slot_bits (taken after that drain
     // completes, below) gates the pairing notes, the role drains and the group-update drain, since
     // a slot can be written by a producer between this snapshot and that one.
-    const uint32_t inbox_bits = this->event_state_->inbox.poll();
+    auto& es = *this->event_state_;
+    // A listener callback below may call stop(), which tears every role down and runs a drain of
+    // its own; everything this frame has not delivered by then is abandoned (see
+    // EventState::drain_generation).
+    const uint32_t drain_generation = es.drain_generation;
+
+    // Each role with main-loop state catches up on the teardowns the protocol task ran since the
+    // last drain: one acquire load per role (the visualizer has no main-loop half). Event dispatch
+    // and the role drains catch up on their own, at the stamp they act on; this pass covers a
+    // teardown whose stamped CLEARED or STREAM_END the full event ring dropped, which would
+    // otherwise leave the role holding the torn-down connection's state (and the player its
+    // playback hold) until the role's next drain. It can only run a teardown half earlier, never
+    // apply anything: a slot payload is still applied only when its stamp is the current
+    // generation.
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (this->player_) {
+        catch_up_teardown(*this->player_->impl_,
+                          this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    if (this->controller_) {
+        catch_up_teardown(
+            *this->controller_->impl_,
+            this->controller_->impl_->cleanup_generation.load(std::memory_order_acquire));
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    if (this->metadata_) {
+        catch_up_teardown(*this->metadata_->impl_, this->metadata_->impl_->cleanup_generation.load(
+                                                       std::memory_order_acquire));
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    if (this->color_) {
+        catch_up_teardown(*this->color_->impl_,
+                          this->color_->impl_->cleanup_generation.load(std::memory_order_acquire));
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    if (this->artwork_) {
+        catch_up_teardown(*this->artwork_->impl_, this->artwork_->impl_->cleanup_generation.load(
+                                                      std::memory_order_acquire));
+    }
+#endif
+
+    const uint32_t inbox_bits = es.inbox.poll();
 
     // --- High-performance requests (time bursts) ---
     if (inbox_bits & INBOX_TOPIC_HIGH_PERFORMANCE) {
@@ -769,13 +816,15 @@ void SendspinClient::drain_inbox() {
     // --- Time sync report ---
     if (inbox_bits & INBOX_TOPIC_TIME) {
         double error = 0.0;
-        if (this->event_state_->time_sync_slot.take(error) && this->listener_ != nullptr) {
+        if (es.time_sync_slot.take(error) && this->listener_ != nullptr) {
             this->listener_->on_time_sync_updated(static_cast<float>(error));
         }
     }
 
     // --- Lifecycle events ---
-    if (inbox_bits & INBOX_TOPIC_EVENTS) {
+    // Skipped once a callback above called stop(): its own drain delivered the ring, and a take
+    // here would pull off what a start() from the same callback queued for the next drain.
+    if ((inbox_bits & INBOX_TOPIC_EVENTS) && es.drain_generation == drain_generation) {
         // Drain in small batches to bound the stack cost on the shared main-loop task. A batch that
         // comes back partial means the ring is empty, ending the loop; events pushed mid-drain are
         // still delivered this tick as long as full batches keep arriving. Sized as a fraction of
@@ -784,29 +833,25 @@ void SendspinClient::drain_inbox() {
         constexpr size_t EVENT_DRAIN_BATCH_SIZE = Inbox::EVENT_CAPACITY / 4;
         InboxEvent events[EVENT_DRAIN_BATCH_SIZE];
         size_t event_count = 0;
-        // Snapshot the drain generation: a dispatched event below can run a listener callback
-        // that calls stop(), whose teardown bumps the counter and wipes the ring. Events already
-        // copied into the local batch are stale at that point and must be dropped, exactly as
-        // the ring reset intended.
-        const uint32_t drain_generation = this->event_state_->drain_generation;
+        // A dispatched event below can run a listener callback that calls stop(), whose teardown
+        // bumps the drain generation and wipes the ring. Events already copied into the local
+        // batch are stale at that point and must be dropped, exactly as the ring reset intended.
         bool drain_aborted = false;
         do {
-            event_count = this->event_state_->inbox.take_events(events, EVENT_DRAIN_BATCH_SIZE);
+            event_count = es.inbox.take_events(events, EVENT_DRAIN_BATCH_SIZE);
             for (size_t i = 0; i < event_count; ++i) {
-                if (this->event_state_->drain_generation != drain_generation) {
+                if (es.drain_generation != drain_generation) {
                     drain_aborted = true;
                     break;
                 }
                 const InboxEvent& event = events[i];
-                // Every event is stamped with its role's teardown generation. A current one may
-                // belong to a teardown the protocol task ran after complete_role_teardowns()
-                // loaded the generation, so the role catches up on it before acting: the reset
-                // lands ahead of what the event starts.
+                // Every event is stamped with its role's teardown generation. The role catches up
+                // on that teardown before the event is acted on (catch_up_teardown()), so the
+                // reset, and for a state role its clear callback, lands ahead of what the event
+                // starts and of any state the next connection sends.
                 switch (event.type) {
                     // Stream lifecycle events from the player role, appended to
                     // awaiting_sync_idle_events (the sync-idle gate itself is untouched).
-                    // Client-state updates from the sync task travel via the player's
-                    // latest-wins state slot, not this ring; see PlayerRole::Impl::EventState.
                     case InboxEventType::PLAYER_STREAM: {
 #ifdef SENDSPIN_ENABLE_PLAYER
                         if (this->player_ &&
@@ -814,7 +859,7 @@ void SendspinClient::drain_inbox() {
                                              this->player_->impl_->cleanup_generation.load(
                                                  std::memory_order_acquire),
                                              TAG, "a player stream event")) {
-                            this->player_->impl_->catch_up_teardown(event.epoch);
+                            catch_up_teardown(*this->player_->impl_, event.epoch);
                             this->player_->impl_->on_stream_ring_event(
                                 static_cast<PlayerStreamCallbackType>(event.code));
                         }
@@ -822,18 +867,14 @@ void SendspinClient::drain_inbox() {
                         break;
                     }
                     // CONTROLLER_CLEARED / METADATA_CLEARED / COLOR_CLEARED: pushed by each role's
-                    // cleanup(). A role removed, re-added and removed again between two drains
-                    // queues two. The callbacks are idempotent by contract (see
-                    // on_controller_state_clear() / on_metadata_clear() / on_color_clear()), so an
-                    // older one is still delivered; only a current one catches the role up.
+                    // cleanup(). The clear callback is the role's main-loop teardown half, so the
+                    // event only catches the role up; a stale one (a later teardown, or a drain
+                    // that took the next connection's state, already caught up past it) is a
+                    // no-op.
                     case InboxEventType::CONTROLLER_CLEARED: {
 #ifdef SENDSPIN_ENABLE_CONTROLLER
                         if (this->controller_) {
-                            if (event.epoch == this->controller_->impl_->cleanup_generation.load(
-                                                   std::memory_order_acquire)) {
-                                this->controller_->impl_->catch_up_teardown(event.epoch);
-                            }
-                            this->controller_->impl_->handle_cleared_event();
+                            catch_up_teardown(*this->controller_->impl_, event.epoch);
                         }
 #endif
                         break;
@@ -841,11 +882,7 @@ void SendspinClient::drain_inbox() {
                     case InboxEventType::METADATA_CLEARED: {
 #ifdef SENDSPIN_ENABLE_METADATA
                         if (this->metadata_) {
-                            if (event.epoch == this->metadata_->impl_->cleanup_generation.load(
-                                                   std::memory_order_acquire)) {
-                                this->metadata_->impl_->catch_up_teardown(event.epoch);
-                            }
-                            this->metadata_->impl_->handle_cleared_event();
+                            catch_up_teardown(*this->metadata_->impl_, event.epoch);
                         }
 #endif
                         break;
@@ -853,19 +890,13 @@ void SendspinClient::drain_inbox() {
                     case InboxEventType::COLOR_CLEARED: {
 #ifdef SENDSPIN_ENABLE_COLOR
                         if (this->color_) {
-                            if (event.epoch == this->color_->impl_->cleanup_generation.load(
-                                                   std::memory_order_acquire)) {
-                                this->color_->impl_->catch_up_teardown(event.epoch);
-                            }
-                            this->color_->impl_->handle_cleared_event();
+                            catch_up_teardown(*this->color_->impl_, event.epoch);
                         }
 #endif
                         break;
                     }
                     // ARTWORK_STREAM / VISUALIZER_STREAM: code is the role-local
-                    // ArtworkEventType/VisualizerEventType. Neither role keeps main-loop state a
-                    // teardown must reset ahead of its events: the artwork STREAM_END is that
-                    // reset.
+                    // ArtworkEventType/VisualizerEventType.
                     case InboxEventType::ARTWORK_STREAM: {
 #ifdef SENDSPIN_ENABLE_ARTWORK
                         if (this->artwork_ &&
@@ -873,6 +904,7 @@ void SendspinClient::drain_inbox() {
                                              this->artwork_->impl_->cleanup_generation.load(
                                                  std::memory_order_acquire),
                                              TAG, "an artwork stream event")) {
+                            catch_up_teardown(*this->artwork_->impl_, event.epoch);
                             this->artwork_->impl_->handle_stream_ring_event(
                                 static_cast<ArtworkEventType>(event.code));
                         }
@@ -886,8 +918,9 @@ void SendspinClient::drain_inbox() {
                                              this->visualizer_->impl_->cleanup_generation.load(
                                                  std::memory_order_acquire),
                                              TAG, "a visualizer stream event")) {
+                            catch_up_teardown(*this->visualizer_->impl_, event.epoch);
                             this->visualizer_->impl_->handle_stream_ring_event(
-                                static_cast<VisualizerEventType>(event.code));
+                                static_cast<VisualizerEventType>(event.code), event.epoch);
                         }
 #endif
                         break;
@@ -905,7 +938,7 @@ void SendspinClient::drain_inbox() {
             // never runs again because there is no next iteration. Re-check here so the loop stops
             // instead of calling take_events() again and destructively pulling the cleanup's
             // freshly re-pushed CLEARED/STREAM_END events off the live ring (dropping them).
-            if (this->event_state_->drain_generation != drain_generation) {
+            if (es.drain_generation != drain_generation) {
                 drain_aborted = true;
             }
         } while (!drain_aborted && event_count == EVENT_DRAIN_BATCH_SIZE);
@@ -914,15 +947,16 @@ void SendspinClient::drain_inbox() {
     // Second snapshot: catches topic bits a producer set while the ring drain above was running.
     // Gates the pairing notes, the role drains and the group drain below; see the inbox_bits
     // comment above for the staleness argument, which applies identically here.
-    const uint32_t slot_bits = this->event_state_->inbox.poll();
+    const uint32_t slot_bits = es.inbox.poll();
 
     // --- Pairing/trust notifications ---
-    if (slot_bits & INBOX_TOPIC_PAIRING) {
-        auto& es = *this->event_state_;
+    // After the event ring, so a role's clear can precede a pairing note queued before it. The
+    // two never describe the same listener state (role state against the pairing UI and trust),
+    // and the one ordering that matters, a record's provider write ahead of
+    // on_pairing_succeeded, is the provider step above.
+    if ((slot_bits & INBOX_TOPIC_PAIRING) && es.drain_generation == drain_generation) {
         std::vector<PairingNote> notes;
         if (es.pairing_slot.take(notes) && this->listener_ != nullptr) {
-            // Same staleness rule as the ring drain above.
-            const uint32_t note_generation = es.drain_generation;
             // Set when a re-entrant stop() bumps the generation, abandoning the rest of the
             // batch.
             bool notes_aborted = false;
@@ -966,7 +1000,7 @@ void SendspinClient::drain_inbox() {
                             // Unreachable: the walk above stops before COUNT.
                             break;
                     }
-                    if (es.drain_generation != note_generation) {
+                    if (es.drain_generation != drain_generation) {
                         notes_aborted = true;
                         break;
                     }
@@ -979,36 +1013,44 @@ void SendspinClient::drain_inbox() {
     }
 
     // --- Role events: bit-gated so an idle tick performs zero inbox mutex acquisitions here ---
+    // Each role drain takes its slot first and catches the role up on its teardowns before
+    // applying anything (see TeardownTracker), and abandons the rest of its own work when one of
+    // its callbacks re-entered teardown (its generation moved on). Between role drains, and
+    // before the group update, the drain generation decides whether this frame was overtaken by
+    // a stop() a callback made.
+    const auto overtaken = [&es, drain_generation] {
+        return es.drain_generation != drain_generation;
+    };
 #ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_ && this->player_->impl_->needs_drain(slot_bits)) {
+    if (!overtaken() && this->player_ && this->player_->impl_->needs_drain(slot_bits)) {
         this->player_->impl_->drain_events();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (this->controller_ && this->controller_->impl_->needs_drain(slot_bits)) {
+    if (!overtaken() && this->controller_ && this->controller_->impl_->needs_drain(slot_bits)) {
         this->controller_->impl_->drain_events();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
-    if (this->metadata_ && this->metadata_->impl_->needs_drain(slot_bits)) {
+    if (!overtaken() && this->metadata_ && this->metadata_->impl_->needs_drain(slot_bits)) {
         this->metadata_->impl_->drain_events();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_COLOR
-    if (this->color_ && this->color_->impl_->needs_drain(slot_bits)) {
+    if (!overtaken() && this->color_ && this->color_->impl_->needs_drain(slot_bits)) {
         this->color_->impl_->drain_events();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_ && this->artwork_->impl_->needs_drain(slot_bits)) {
+    if (!overtaken() && this->artwork_ && this->artwork_->impl_->needs_drain(slot_bits)) {
         this->artwork_->impl_->drain_events();
     }
 #endif
 
     // --- Group update events ---
-    if (slot_bits & INBOX_TOPIC_GROUP) {
+    if (!overtaken() && (slot_bits & INBOX_TOPIC_GROUP) != 0) {
         GroupUpdateObject group_delta;
-        if (this->event_state_->group_slot.take(group_delta)) {
+        if (es.group_slot.take(group_delta)) {
             apply_group_update_deltas(&this->group_state_, group_delta);
 
             if (this->listener_) {
@@ -1278,11 +1320,19 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
         this->event_state_->group_slot.reset();
         this->event_state_->time_sync_slot.reset();
 
-        // Also wipes any not-yet-dispatched pairing listener notifications. Callers that need a
-        // notification to survive teardown (e.g. handle_pair_abort's on_pairing_failed /
-        // on_clear_pairing_code) must call the corresponding note_*() after
-        // cleanup_connection_state() returns; see the ConnectionManager pairing handlers.
-        this->event_state_->pairing_slot.reset();
+        // Also wipes the not-yet-dispatched pairing listener notifications, except a dismissal
+        // whose prompt was already delivered (see retain_delivered_dismissals()): a teardown
+        // queues the dismissals for the connection it drops itself, but one queued by an earlier
+        // drop that no drain has delivered yet must survive this one. Callers that need another
+        // notification to survive teardown (e.g. handle_pair_abort's on_pairing_failed) must
+        // call the corresponding note_*() after cleanup_connection_state() returns; see the
+        // ConnectionManager pairing handlers.
+        // An edit, not a merge: it touches only notes already pending, and one that leaves none
+        // behind clears the topic bit instead of waking the drain for nothing.
+        this->event_state_->pairing_slot.edit([](std::vector<PairingNote>& current) {
+            retain_delivered_dismissals(current);
+            return !current.empty();
+        });
 
         // The trust level is per-connection state: with no active connection there is nothing to
         // trust, so the getter reports NONE until the next handshake completes.

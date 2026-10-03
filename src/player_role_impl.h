@@ -22,6 +22,7 @@
 #include "inbox.h"
 #include "sendspin/player_role.h"
 #include "sync_task.h"
+#include "teardown_tracker.h"
 
 #include <atomic>
 #include <memory>
@@ -73,8 +74,12 @@ struct PlayerRole::Impl {
     // ========================================
 
     struct EventState {
-        InboxSlot<ServerPlayerStreamObject> stream_params_slot;
-        InboxSlot<ServerCommandMessage> command_slot;
+        GenerationSlot<ServerPlayerStreamObject> stream_params_slot;
+        GenerationSlot<ServerCommandMessage> command_slot;
+        /// Written by the sync task each time it returns to idle from a stream it was running or
+        /// about to run, so a STREAM_END the drain holds for the sync task to go idle is
+        /// re-examined then (see awaiting_sync_idle) rather than on every loop().
+        InboxSlot<bool> sync_idle_slot;
     };
 
     // ========================================
@@ -99,23 +104,28 @@ struct PlayerRole::Impl {
     void handle_stream_clear(uint32_t generation);
     void handle_server_command(const ServerCommandMessage& cmd, uint32_t generation) const;
     void on_stream_ring_event(PlayerStreamCallbackType event);
-    // True if this tick has drainable player work. The command-slot bit covers server
-    // volume/mute/output-delay commands; a non-empty awaiting_sync_idle_events is a
-    // main-thread-only flag set by on_stream_ring_event() above during this tick's ring dispatch,
-    // or carried over from a prior tick while a STREAM_END waits for the sync task to go idle.
-    // stream_params_slot's own topic bit (INBOX_TOPIC_PLAYER_STREAM_PARAMS) needs no separate term
-    // here: it is only ever consumed from the STREAM_START branch while that event sits in
-    // awaiting_sync_idle_events, which the awaiting_sync_idle_events term above already covers.
+    /// @brief Tells the main loop the sync task returned to idle from a stream (sync_idle_slot).
+    /// Sync task.
+    void note_sync_idle() const {
+        this->event_state->sync_idle_slot.write(true);
+    }
+    // True if this tick has drainable player work: a server command (volume/mute/output delay)
+    // in command_slot; the sync task having left a stream (sync_idle_slot) while a STREAM_END
+    // waits for it; or stream lifecycle events in awaiting_sync_idle_events, appended by
+    // on_stream_ring_event() during this tick's ring dispatch, that are not held for the sync
+    // task. stream_params_slot's own topic bit needs no term: it is only ever consumed from the
+    // STREAM_START branch while that event sits in awaiting_sync_idle_events.
     bool needs_drain(uint32_t pending_bits) const {
-        return (pending_bits & INBOX_TOPIC_PLAYER_COMMAND) != 0 ||
-               !this->awaiting_sync_idle_events.empty();
+        return (pending_bits & (INBOX_TOPIC_PLAYER_COMMAND | INBOX_TOPIC_PLAYER_SYNC_IDLE)) != 0 ||
+               (!this->awaiting_sync_idle_events.empty() && !this->awaiting_sync_idle);
     }
     void drain_events();
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
     /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
     /// runs, and stop()'s teardown on the main loop can land in between. Re-checking at each point
-    /// of effect invalidates the whole handler instead of only the part that ran before it.
+    /// of effect invalidates the whole handler instead of only the part that ran before it. The
+    /// drain applies the same check to a slot payload's stamp.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
@@ -127,24 +137,14 @@ struct PlayerRole::Impl {
     /// Shared by the two paths that take the role out of service: a connection being torn down
     /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
     /// from active_roles (SendspinClient::apply_role_removals()). The STREAM_END is queued on
-    /// the inbox, stamped with the new generation, and the main-loop state is reset
-    /// by complete_teardown() at the head of the next drain (catch_up_teardown()).
+    /// the inbox, stamped with the new generation, and the main loop runs complete_teardown() for
+    /// it before acting on that event (catch_up_teardown()).
     void cleanup();
 
-    /// @brief Resets the state only the main loop touches, for a teardown cleanup() ran. Main
-    /// loop only, through catch_up_teardown().
+    /// @brief The main-loop teardown half: drops the stream events the teardown overtook and
+    /// releases the playback high-performance hold. Main loop only, through catch_up_teardown().
     void complete_teardown();
 
-    /// @brief Runs complete_teardown() once for every teardown generation the main loop has not
-    /// caught up with. Main loop only: called at the head of each drain with the current
-    /// generation, and with a stamped event's generation before that event is acted on, so the
-    /// reset always lands ahead of the state the next connection sends.
-    void catch_up_teardown(uint32_t generation) {
-        if (generation != this->completed_generation) {
-            this->completed_generation = generation;
-            this->complete_teardown();
-        }
-    }
     /// @brief Joins the sync task thread and returns its buffered audio to the inbound ring;
     /// no-op if not started.
     void stop() const;
@@ -205,6 +205,7 @@ struct PlayerRole::Impl {
     PlayerRoleConfig config;
     ServerPlayerStreamObject current_stream_params{};
     std::vector<PlayerStreamCallbackType> awaiting_sync_idle_events;
+    TeardownTracker teardown;  ///< Main loop only.
 
     // Pointer fields
     SendspinClient* client;
@@ -224,21 +225,21 @@ struct PlayerRole::Impl {
     /// The teardown generation the sync task's item list was last recalled for
     /// (recall_stale_items()). Protocol task only.
     uint32_t recalled_generation{0};
-    // Bumped by cleanup() and stamped onto every stream event queued afterwards. At the drain it
-    // decides whether a ring event is still current: a STREAM_START queued before the teardown
-    // must not re-arm the sync task for a stream that is gone. Within drain_events() it also
-    // detects a listener callback that re-entered teardown while the STREAM_START tail was running.
-    // Atomic because the protocol task reads it (see accepts()), which loads acquire to pair with
-    // the teardown's read-modify-write; the drain_events() reads are relaxed because they are
-    // same-thread.
+    // Bumped by cleanup() and stamped onto every stream event and slot payload queued
+    // afterwards. At the drain it decides whether a ring event or a payload is still current: a
+    // STREAM_START queued before the teardown must not re-arm the sync task for a stream that is
+    // gone. Within drain_events() it also detects a listener callback that re-entered teardown.
+    // Written on the protocol task (or the main loop in stop() once it is joined); read on the
+    // main loop, the sync task (which drops items of an older generation) and the protocol task.
     std::atomic<uint32_t> cleanup_generation{0};
-    /// The teardown generation complete_teardown() last ran for. Main loop only.
-    uint32_t completed_generation{0};
 
     // 16-bit fields
     std::atomic<uint16_t> output_delay_ms{0};
 
     // 8-bit fields
+    // True while the head of awaiting_sync_idle_events is a STREAM_END waiting for the sync task
+    // to go idle; the drain then runs again when sync_idle_slot is written. Main loop only.
+    bool awaiting_sync_idle{false};
     bool high_performance_requested_for_playback{false};
     bool muted{false};
     // True between the drained STREAM_START and STREAM_END callbacks (main-thread only); keeps

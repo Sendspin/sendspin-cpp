@@ -197,7 +197,8 @@ public:
     /// @brief Signals the sync task that the client has processed the stream start
     /// The sync task waits for this after finding a codec header before transitioning
     /// to the active state, so the client's stream lifecycle callbacks
-    /// (end/clear -> start) fire before the task begins decoding.
+    /// (end/clear -> start) fire before the task begins decoding. A start that finds no codec
+    /// header pending is stale: the task clears it on its way back to idle.
     /// Thread-safe: may be called from any context.
     void signal_stream_start();
 
@@ -295,8 +296,9 @@ protected:
     static bool decode_whole_chunk(SyncContext& sync_context);
 
     /// @brief Waits in IDLE for a codec header to arrive on the item list
-    /// Discards stale audio chunks. Returns true if a codec header was found.
-    /// Returns false if COMMAND_STOP was signaled.
+    /// Discards stale audio chunks. Returns true if a codec header was found. Returns false when
+    /// COMMAND_STOP, COMMAND_STREAM_END or COMMAND_STREAM_CLEAR was signaled, or COMMAND_START
+    /// with no codec header pending (a start for a stream this task already left).
     bool wait_for_codec_header(SyncContext& sync_context);
 
     /// @brief Non-blocking drain of audio data from the item list, preserving codec headers

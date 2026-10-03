@@ -83,15 +83,29 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # last_burst_complete_time_, pending_embedded_, current_message_sent_time_, send_retry_after_ms_
 # and pending_burst_completed_; and SendspinConnection's first_activate_received_ and
 # last_receive_time_us_. The stale-command and refused-delivery tests reach the queue through
-# protocol_task_ to push a command, or close accepts, the way a race or stop() would.
+# protocol_task_ to push a command, or close accepts, the way a race or stop() would. The
+# teardown reorder table interleaves the protocol task and the main loop, which no public call
+# does on demand: it calls the controller, metadata and color roles' handle_server_state(),
+# cleanup() and drain_events() and writes their generation-stamped slot (event_state) with an old
+# stamp, and reads their cleanup_generation and applied state (controller_state, metadata,
+# color). The high-performance grant table plays the protocol task's run_time_sync() on a
+# stand-in in the admitted slot (find_admitted(), its high_performance_held) and reads the
+# stand-in's time_frame_tag_, the one trace of a time frame written without a Noise session; its
+# wake test restarts the protocol task (protocol_task_->start()) with liveness off
+# (liveness_timeout_us_) so the grant is the only wake, and polls the client's Inbox through a
+# role's impl_->inbox, which also lets the reorder table fill the event ring. The stream
+# start/end test drives the player's handle_stream_start()/handle_stream_end() as the task would,
+# waits on the sync task's item list and reads its COMMAND_START bit (event_flags_), whose
+# survival a caller cannot observe on demand.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
 # public surface does not expose: the sync task's run state and its item list, the artwork
 # transfer in flight and its drain-side slot buffers, the visualizer's stream flag and list, a
 # state role's held scheduled update and its teardown generation (including a direct
-# handle_server_state() call with that generation), the controller's supported-commands mask
-# (seeded so a command reaches the inactive-role send gate), plus the queued-event probe that proves
+# handle_server_state() call with that generation), the controller's supported-commands word
+# (seeded, stamped with the role's generation, so a command reaches the inactive-role send gate),
+# plus the queued-event probe that proves
 # ordering without a sleep (a role inbox's topic bits).
 set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
@@ -99,7 +113,9 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # thread - which is the only way to see the client/state player object and the only way to hand
 # a handler a stale teardown generation. Reached: Impl's handle_stream_start(), handle_binary(),
 # handle_stream_clear(), handle_server_command(), cleanup(), recall_stale_items(), attach_inbox(),
-# cleanup_generation and event_state's latest-wins slots; SyncTask's encoded_items_ and ring_,
+# drain_events(), volume, cleanup_generation and event_state's generation-stamped slots (one
+# written with a stamp from before a teardown, the payload a drain on the far side of it would
+# hold); SyncTask's encoded_items_ and ring_,
 # bound to a test ring the way start() binds them but with no thread, so what a handler handed
 # over (or, refused, did not) stays on the list to be read, and discard_to_clear_marker(), the
 # sync thread's stream/clear step. The inbound tests also bind a VisualizerRole::Impl to the same

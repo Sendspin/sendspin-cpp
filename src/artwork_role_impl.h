@@ -23,6 +23,7 @@
 #include "platform/thread_safe_queue.h"
 #include "protocol_messages.h"
 #include "sendspin/artwork_role.h"
+#include "teardown_tracker.h"
 
 #include <atomic>
 #include <cstddef>
@@ -67,6 +68,10 @@ enum class SlotAckState : uint8_t {
 /// on (epoch mismatch, see ArtworkRole::Impl::slot_epochs), the notification is skipped rather
 /// than decoding torn or superseded data. See ArtworkRole::Impl::drain_thread_func.
 ///
+/// `teardown_generation` is the role's cleanup_generation when the protocol task handed the
+/// image over; the decode thread stamps the display hand-off with it, so the main loop drops a
+/// display whose role was torn down since (see ArtworkRole::Impl::drain_events()).
+///
 /// `data_length == 0` marks the protocol's empty image (an announce with `total_size` 0), which
 /// clears the channel. It names no buffer, so `buffer_idx`/`generation` are unused and left at 0;
 /// everything else about it (queue ordering, the ack gate, and the timestamp-scheduled hand-off
@@ -79,6 +84,7 @@ struct ArtworkNotification {
     SendspinImageFormat format;
     uint32_t generation;
     uint32_t epoch;
+    uint32_t teardown_generation;
 };
 
 /// @brief The one image transfer the role has in flight, across all of its channels
@@ -168,7 +174,7 @@ struct ArtworkRole::Impl {
     /// @brief Deferred event state for artwork display timestamps, delivered to the main thread
     /// via the shared Inbox
     struct EventState {
-        InboxSlot<ArtworkDisplayUpdate> display_slot;
+        GenerationSlot<ArtworkDisplayUpdate> display_slot;
     };
 
     // ========================================
@@ -198,7 +204,15 @@ struct ArtworkRole::Impl {
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & INBOX_TOPIC_ARTWORK_DISPLAY) != 0 || this->held_display_mask != 0;
     }
+    /// @brief Takes the display slot, catches the role up on any teardown (complete_teardown()),
+    /// folds the taken displays into the holds if they were decoded under the current generation,
+    /// and fires the displays whose deadline has passed. Main loop.
     void drain_events();
+    /// @brief The main-loop teardown half: drops the held displays, which the protocol task
+    /// cannot reach, releasing the ack gate of each dropped decode. The clears it owes the
+    /// listener are the STREAM_END cleanup() queues (handle_stream_ring_event()). Main loop only,
+    /// through catch_up_teardown().
+    void complete_teardown();
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
     /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
@@ -348,11 +362,13 @@ struct ArtworkRole::Impl {
     // a fresh announce) and the display must be dropped, since the protocol task cannot reach
     // the main-thread holds to cancel it. Main-thread only; see held_display_ts.
     uint32_t held_display_epoch[ARTWORK_MAX_SLOTS]{};
+    TeardownTracker teardown;  ///< Main loop only.
 
-    /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event queued
-    /// afterwards. At the drain an event whose stamp no longer matches is discarded, so an event
-    /// queued before a teardown cannot act after it (see event_is_current() in inbox.h). Atomic
-    /// because the protocol task reads it (see accepts()).
+    /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event and
+    /// display hand-off queued afterwards. At the drain an event or display whose stamp no longer
+    /// matches is discarded, so nothing queued before a teardown can act after it (see
+    /// event_is_current() in inbox.h). Written on the protocol task (or the main loop in stop()
+    /// once it is joined); read on the main loop and the protocol task.
     std::atomic<uint32_t> cleanup_generation{0};
 
     /// @brief Per-channel delivery epoch, bumped whenever the channel's pending image is

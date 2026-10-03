@@ -197,12 +197,17 @@ struct NurseryEntry {
 struct AdmittedEntry {
     /// The admitted connection; null for a free slot.
     std::shared_ptr<SendspinConnection> conn;
+    /// The ticket of the high-performance acquire this connection's burst requested
+    /// (SendspinClient::request_high_performance()); meaningful while high_performance_held.
+    uint32_t high_performance_ticket{0};
     /// The roles the connection owns, as SendspinConnection::get_active_role_mask() bits.
     uint16_t owned_roles{0};
     /// A client/state for this connection waits for its first clock measurement (see
     /// SendspinClient::publish_client_state()).
     bool state_held{false};
-    /// This connection's time burst holds a high-performance request.
+    /// This connection's time burst holds a high-performance request: from the tick its burst
+    /// came due until the burst completes or the connection leaves the slot. The burst sends
+    /// nothing until the main loop has granted the request (see run_time_sync()).
     bool high_performance_held{false};
 };
 
@@ -514,12 +519,13 @@ public:
     /// @return Milliseconds until the earliest of those timers, or ProtocolTask::NO_DEADLINE.
     uint32_t tick(int64_t now_us);
 
-    /// @brief Drives each admitted, operational connection's time burst: sends its client/time,
-    /// holds and releases the high-performance request around a burst, reports a completed
-    /// burst's filter error to the main loop, and sends a client/state that waited for the
-    /// clock
-    /// @param now_us platform_time_us() at the start of the tick.
-    /// @return Milliseconds until the earliest burst is due, or ProtocolTask::NO_DEADLINE.
+    /// @brief Drives each admitted, operational connection's time burst: requests the
+    /// high-performance hold when a burst comes due and sends its first client/time only once the
+    /// main loop has granted that request (SendspinClient::high_performance_granted()), releases
+    /// the hold when the burst completes without waiting for anything, reports a completed
+    /// burst's filter error to the main loop, and sends a client/state that waited for the clock
+    /// @return Milliseconds until the earliest burst is due, or ProtocolTask::NO_DEADLINE; a
+    ///         burst waiting for its grant adds no deadline, since the grant wakes the task.
     uint32_t run_time_sync();
 
     /// @brief Refreshes what other threads read without a protocol-task lock: the time filter and

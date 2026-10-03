@@ -56,11 +56,18 @@ void ControllerRole::Impl::attach_inbox(Inbox& inbox) {
     this->event_state->slot.bind(inbox, INBOX_TOPIC_CONTROLLER);
 }
 
-/// @brief The command's bit in ControllerRole::Impl::supported_commands_mask.
+/// @brief The command's bit in the mask half of ControllerRole::Impl::supported_commands.
 static uint32_t command_bit(SendspinControllerCommand command) {
-    static_assert(static_cast<uint8_t>(SendspinControllerCommand::SEEK_RELATIVE) < 32,
-                  "every command needs a bit in supported_commands_mask");
+    static_assert(static_cast<uint8_t>(SendspinControllerCommand::SEEK_RELATIVE) < 16,
+                  "every command needs a bit in the mask half of supported_commands");
     return 1U << static_cast<uint8_t>(command);
+}
+
+/// @brief Packs a supported-commands mask with the generation it was admitted under: the mask in
+/// the low 16 bits, the generation's low 16 bits above it. One atomic word, so send_command()
+/// reads a mask and its stamp together.
+static uint32_t pack_supported_commands(uint32_t generation, uint32_t mask) {
+    return (generation << 16) | (mask & 0xFFFFU);
 }
 
 /// @brief Whether `cmd` carries the parameter roles/controller/v1.md "Command behaviour" requires
@@ -83,8 +90,11 @@ static bool has_required_parameter(const ClientCommandControllerObject& cmd) {
 bool ControllerRole::Impl::send_command(const ClientCommandControllerObject& cmd) const {
     // roles/controller/v1.md "client/command controller object": only a command listed in the
     // latest supported_commands, with its required parameter.
-    if ((this->supported_commands_mask.load(std::memory_order_relaxed) &
-         command_bit(cmd.command)) == 0) {
+    // A mask stamped with an earlier generation belongs to a torn-down connection.
+    const uint32_t packed = this->supported_commands.load(std::memory_order_acquire);
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
+    const uint32_t mask = (packed >> 16) == (generation & 0xFFFFU) ? (packed & 0xFFFFU) : 0;
+    if ((mask & command_bit(cmd.command)) == 0) {
         SS_LOGW(TAG, "Dropping '%s': not in the server's supported_commands", to_cstr(cmd.command));
         return false;
     }
@@ -105,48 +115,55 @@ void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& sta
     if (!this->accepts(generation)) {
         return;
     }
-    this->event_state->slot.write(std::move(state));
+    this->event_state->slot.write(std::move(state), generation);
 }
 
 void ControllerRole::Impl::drain_events() {
+    // Taken before the catch-up: whatever the slot held, a teardown that ran before the take is
+    // caught up below and drops a payload stamped before it, and one that runs after the take is
+    // caught up by the next drain, behind the state applied here.
     ServerStateControllerObject state;
-    if (this->event_state->slot.take(state)) {
-        this->controller_state = std::move(state);
-        uint32_t mask = 0;
-        for (const auto command : this->controller_state.supported_commands) {
-            mask |= command_bit(command);
-        }
-        this->supported_commands_mask.store(mask, std::memory_order_relaxed);
-        if (this->listener) {
-            this->listener->on_controller_state(this->controller_state);
-        }
+    uint32_t stamp = 0;
+    const bool taken = this->event_state->slot.take(state, stamp);
+    catch_up_teardown(*this, this->cleanup_generation.load(std::memory_order_acquire));
+    if (!taken) {
+        return;
     }
-}
-
-void ControllerRole::Impl::handle_cleared_event() const {
-    // Queued by cleanup(), which runs on the protocol task, so the listener is called here on the
-    // main loop.
+    // Also false once the clear callback above re-entered teardown (a listener calling stop()).
+    if (!this->accepts(stamp)) {
+        SS_LOGD(TAG, "Dropping controller state queued before the role was torn down");
+        return;
+    }
+    this->controller_state = std::move(state);
+    uint32_t mask = 0;
+    for (const auto command : this->controller_state.supported_commands) {
+        mask |= command_bit(command);
+    }
+    this->supported_commands.store(pack_supported_commands(stamp, mask), std::memory_order_release);
     if (this->listener) {
-        this->listener->on_controller_state_clear();
+        this->listener->on_controller_state(this->controller_state);
     }
 }
 
 void ControllerRole::Impl::cleanup() {
-    // Bumped first: it invalidates any handler the gate already admitted (see accepts()).
+    // Bumped first: it invalidates any handler the gate already admitted (see accepts()) and the
+    // supported-commands mask (see supported_commands).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();
-    this->supported_commands_mask.store(0, std::memory_order_relaxed);
 
-    // Stamped so the drain catches the main-loop state up before the callback; the callback
-    // itself is idempotent, so it is delivered whatever teardown overtook it.
+    // Stamped so the drain runs complete_teardown() for this generation before it applies
+    // anything the next connection sends.
     push_event_or_log(this->inbox, InboxEventType::CONTROLLER_CLEARED, 0, TAG,
                       "controller cleared event", generation);
 }
 
 void ControllerRole::Impl::complete_teardown() {
     this->controller_state = {};
-    this->supported_commands_mask.store(0, std::memory_order_relaxed);
+    this->supported_commands.store(0, std::memory_order_release);
+    if (this->listener) {
+        this->listener->on_controller_state_clear();
+    }
 }
 
 }  // namespace sendspin

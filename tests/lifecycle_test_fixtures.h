@@ -551,6 +551,12 @@ public:
         return this->activate_count_.load();
     }
 
+    /// client_state_count() when the most recent server/activate was sent: a client/state counted
+    /// beyond it was sent in answer to that activation or later.
+    int client_states_at_last_activate() const {
+        return this->client_states_at_last_activate_.load();
+    }
+
     /// The keys of supported_pair_methods from the most recent client/hello, in wire order.
     std::vector<std::string> hello_pair_methods() const {
         std::lock_guard<std::mutex> lock(this->pair_methods_mutex_);
@@ -930,6 +936,7 @@ private:
     // client/hello, the second_* options for every one after a re-handshake. Caller must hold
     // crypto_mutex_.
     void send_activate_locked() {
+        this->client_states_at_last_activate_.store(this->client_state_count_.load());
         const bool first = this->activate_count_.fetch_add(1) == 0;
         const std::string& activities = first ? this->options_.first_activities_json
                                               : this->options_.second_activities_json;
@@ -976,6 +983,7 @@ private:
 
     std::atomic<int> client_leave_count_{0};
     std::atomic<int> client_state_count_{0};
+    std::atomic<int> client_states_at_last_activate_{0};
     std::atomic<bool> got_client_time_{false};
 };
 
