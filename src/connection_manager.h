@@ -565,9 +565,8 @@ private:
     /// connection is already WS-upgraded, so there is no earlier signal to wait for); the hello
     /// is armed later, once the Noise handshake completes (see the hello scan in
     /// scan_hello_and_nursery()).
-    /// @param conn The newly delivered server connection. The session slot keeps a parallel
-    ///             refcount, so the caller's reference can be dropped at any time without freeing
-    ///             the conn out from under in-flight httpd workers.
+    /// @param conn The newly delivered server connection; the nursery entry keeps its own
+    ///             reference on admission.
     void on_new_connection(const std::shared_ptr<SendspinServerConnection>& conn);
 
     /// @brief Finds the nursery entry holding `conn`, or nursery_.end(). Caller must hold

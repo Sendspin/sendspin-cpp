@@ -295,7 +295,7 @@ The client destructor performs steps 1 and 2 and releases any outstanding high-p
 On ESP, a `SendspinServerConnection`'s lifetime belongs to its httpd session rather than to `ConnectionManager`:
 
 1. `SendspinWsServer::open_callback` creates the `shared_ptr` and stores a heap-allocated copy as the session context, with a `free_fn` that deletes it. That copy is the authoritative reference.
-2. `ConnectionManager::on_new_connection()` receives the same `shared_ptr` and holds it as an observer.
+2. `ConnectionManager::on_new_connection()` receives the same `shared_ptr`; its nursery entry keeps a copy as an observer.
 3. The WebSocket handler looks the connection up through the session context each time it runs. Queued send workers capture a `weak_ptr` and lock it when they run, rather than a socket number, which httpd can reuse for a different session after the original closes.
 4. On close, httpd calls `close_fn` (which tells `ConnectionManager` to drop its observer), then `free_fn` once no worker is queued for the session.
 

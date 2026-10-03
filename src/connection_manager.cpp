@@ -1431,8 +1431,7 @@ void ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
     // Called from the platform ws_server's delivery path (ESP: httpd task, host: IXWebSocket
     // thread) once the connection's WebSocket upgrade has been observed, so the manager never sees
     // a socket that has not proven it speaks WebSocket. The authoritative owner is the platform's
-    // session/transport context; this observer shared_ptr can be reset at any time without freeing
-    // the conn out from under in-flight workers.
+    // session/transport context; the nursery entry takes its own reference.
     conn->init_time_filter();
     conn->set_websocket_payload_location(this->client_->config_.websocket_payload_location);
     conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
@@ -1486,9 +1485,9 @@ void ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
             this->push_nursery_entry(NurseryEntry{.conn = conn});
         }
     }
-    // Outside the lock, since the send can block (see DeferredRelease). The caller's reference to
-    // a rejected inbound connection then drops on this thread, which joins nothing: host shares the
-    // IX socket with the server, ESP's is owned by its httpd session.
+    // Outside the lock, since the send can block (see DeferredRelease). The caller's reference
+    // drops on this thread when the callback returns, even when it is the last one, which joins
+    // nothing: host shares the IX socket with the server, ESP's is owned by its httpd session.
     if (rejection.has_value()) {
         conn->disconnect(rejection.value(), nullptr);
     }
