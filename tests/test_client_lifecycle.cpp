@@ -27,7 +27,7 @@
 #include "fake_persistence.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/time.h"
-#include "player_role_impl.h"  // Sync task pin; private access, see tests/CMakeLists.txt
+#include "player_role_impl.h"  // Stream start and the sync task; private access, see tests/CMakeLists.txt
 #include "protocol_messages.h"  // SENDSPIN_BINARY_VISUALIZER_LOUDNESS
 #include "sendspin/client.h"
 #include "sendspin/config.h"
@@ -75,11 +75,12 @@ constexpr uint16_t VISUALIZER_TEST_PORT = 19068;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 19069;
 constexpr uint16_t PROVIDER_TEST_PORT = 19070;
 constexpr uint16_t PUBLISH_STATE_TEST_PORT = 19071;
-constexpr uint16_t SYNC_PIN_LOCK_TEST_PORT = 19072;
-constexpr uint16_t SYNC_PIN_RELEASE_TEST_PORT = 19073;
-constexpr uint16_t SYNC_PIN_STOP_TEST_PORT = 19075;
-constexpr uint16_t SYNC_PIN_DROP_TEST_PORT = 19076;
-constexpr uint16_t SYNC_PIN_MIDSTREAM_TEST_PORT = 19077;
+constexpr uint16_t STREAM_FILTER_LOCK_TEST_PORT = 19072;
+constexpr uint16_t STREAM_FILTER_OFFSET_TEST_PORT = 19073;
+constexpr uint16_t TIME_FILTER_SLOT_TEST_PORT = 19074;
+constexpr uint16_t ADMISSION_CLOSED_TEST_PORT = 19075;
+constexpr uint16_t ADMISSION_OPEN_TEST_PORT = 19076;
+constexpr uint16_t STREAM_FILTER_MIDSTREAM_TEST_PORT = 19077;
 constexpr uint16_t VISUALIZER_SPECTRUM_TEST_PORT = 19078;
 constexpr uint16_t VISUALIZER_STALE_TEST_PORT = 19084;
 constexpr uint16_t VISUALIZER_SHARED_TS_TEST_PORT = 19086;
@@ -999,17 +1000,65 @@ TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
 }
 
 // ============================================================================
-// Sync task connection pin
+// Admission-closed rejection
+// ============================================================================
+
+// A peer delivered while admission is closed (stop() tearing down, or before start()) gets a
+// client/goodbye with reason shutdown instead of a nursery slot. The goodbye is sent by
+// on_new_connection() itself, on the network thread, so the closed row waits on the peer without
+// pumping loop(). The open row is the control: the same peer is admitted and owed no goodbye.
+// The nursery-full rejection is covered by
+// ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer.
+TEST(ClientLifecycle, ANewcomerWhileAdmissionIsClosedIsGoodbyedWithShutdown) {
+    struct AdmissionRow {
+        const char* name;
+        bool accepting;
+        uint16_t port;
+    };
+    const AdmissionRow rows[] = {
+        {"admission closed", false, ADMISSION_CLOSED_TEST_PORT},
+        {"admission open (control)", true, ADMISSION_OPEN_TEST_PORT},
+    };
+
+    for (const AdmissionRow& row : rows) {
+        SCOPED_TRACE(row.name);
+        PairedClientBundle bundle(make_config(row.port));
+        SendspinClient& client = bundle.client();
+        ASSERT_TRUE(bundle.start());
+        {
+            std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+            client.connection_manager_->accepting_ = row.accepting;
+        }
+
+        auto peer = connect_paired_server(bundle.peer, row.port);
+        if (row.accepting) {
+            pump_until(client, [&] { return client.is_connected(); });
+            EXPECT_FALSE(peer->goodbye_reason().has_value())
+                << "an admitted peer was sent a goodbye";
+        } else {
+            wait_until([&] { return peer->goodbye_reason().has_value(); });
+            EXPECT_EQ(peer->goodbye_reason().value_or(""), "shutdown")
+                << "a newcomer rejected with admission closed must be told why";
+            EXPECT_FALSE(client.is_connected())
+                << "a rejected newcomer must not become the current connection";
+        }
+
+        client.stop();
+    }
+}
+
+// ============================================================================
+// Time filter slot
 // ============================================================================
 
 // 48 kHz stereo 16-bit, the format make_pcm_player_config() advertises.
-constexpr uint32_t PIN_SAMPLE_RATE = 48000;
-constexpr size_t PIN_FRAME_BYTES = 4;
-constexpr size_t PIN_CHUNK_BYTES = PIN_SAMPLE_RATE / 50 * PIN_FRAME_BYTES;  // 20 ms
+constexpr uint32_t SINK_SAMPLE_RATE = 48000;
+constexpr size_t SINK_FRAME_BYTES = 4;
+constexpr size_t SINK_CHUNK_BYTES = SINK_SAMPLE_RATE / 50 * SINK_FRAME_BYTES;  // 20 ms
 /// Byte every chunk these tests feed is filled with, so a write the sink takes can be told apart
 /// from the silence the sync task emits while priming or filling a hard-sync gap. PCM decoding is
 /// a copy, so the pattern survives into the sink.
-constexpr uint8_t PIN_AUDIO_MARK = 0x7F;
+constexpr uint8_t SINK_AUDIO_MARK = 0x7F;
 
 /// Stands in for an audio sink. Every write is reported back through
 /// PlayerRole::notify_audio_played() with the time those frames finish, which is what moves the
@@ -1020,13 +1069,13 @@ class VirtualSinkListener : public PlayerRoleListener {
 public:
     size_t on_audio_write(uint8_t* data, size_t length, uint32_t /*timeout_ms*/) override {
         const bool marked = std::any_of(data, data + length, [](uint8_t b) { return b != 0; });
-        const auto frames = static_cast<uint32_t>(length / PIN_FRAME_BYTES);
+        const auto frames = static_cast<uint32_t>(length / SINK_FRAME_BYTES);
         const int64_t now = platform_time_us();
         if (this->playhead_us_ < now) {
             this->playhead_us_ = now;
         }
         this->playhead_us_ +=
-            static_cast<int64_t>(frames) * 1000000 / static_cast<int64_t>(PIN_SAMPLE_RATE);
+            static_cast<int64_t>(frames) * 1000000 / static_cast<int64_t>(SINK_SAMPLE_RATE);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         if (this->player_ != nullptr && frames > 0) {
             this->player_->notify_audio_played(frames, this->playhead_us_);
@@ -1043,7 +1092,7 @@ public:
     void attach(PlayerRole& player) {
         this->player_ = &player;
     }
-    /// True once a write carried PIN_AUDIO_MARK, i.e. a fed chunk was converted and decoded.
+    /// True once a write carried SINK_AUDIO_MARK, i.e. a fed chunk was converted and decoded.
     bool decoded() const {
         return this->decoded_seen_.load();
     }
@@ -1062,11 +1111,11 @@ private:
     int64_t playhead_us_{0};  // Sync-task thread only
 };
 
-/// Writes `count` marked 20 ms chunks straight into the sync task's encoded ring, stamped from
-/// `first_timestamp` onward. Bypasses the server so a test can feed audio while it holds a lock
-/// the client's own loop needs.
+/// Writes `count` marked 20 ms chunks straight into the sync task's encoded ring, stamped in the
+/// server's clock from `first_timestamp` onward. Bypasses the server so a test can feed audio
+/// while it holds a lock the client's own loop needs.
 void feed_marked_chunks(SyncTask& sync_task, int64_t first_timestamp, int count) {
-    const std::vector<uint8_t> chunk(PIN_CHUNK_BYTES, PIN_AUDIO_MARK);
+    const std::vector<uint8_t> chunk(SINK_CHUNK_BYTES, SINK_AUDIO_MARK);
     int64_t timestamp = first_timestamp;
     for (int i = 0; i < count; ++i) {
         sync_task.write_audio_chunk(chunk.data(), chunk.size(), timestamp,
@@ -1077,19 +1126,22 @@ void feed_marked_chunks(SyncTask& sync_task, int64_t first_timestamp, int count)
 
 /// The lead the fed chunks are stamped with: past the pipeline's own priming and startup silence,
 /// so the first chunk is ahead of the sink's playhead rather than late enough to be skipped.
-constexpr int64_t PIN_CHUNK_LEAD_US = 250 * 1000;
+constexpr int64_t SINK_CHUNK_LEAD_US = 250 * 1000;
 
 /// Keeps feeding marked chunks until the sink has decoded one. Each batch is stamped from a fresh
 /// read of the clock, so a batch the decoder skipped as late (the gate is
 /// HARD_SYNC_THRESHOLD_US behind the sink's playhead) is followed by one that is early again. A
 /// fixed number of chunks would instead leave a loaded machine with nothing left to decode, which
-/// hangs the waiter exactly the way a parked sync task does.
+/// hangs the waiter exactly the way a parked sync task does. `server_offset_us` is the server
+/// clock's offset from this one, which the stream's time filter was synced to.
 class ChunkFeeder {
 public:
-    ChunkFeeder(SyncTask& sync_task, const VirtualSinkListener& listener)
-        : thread_([&sync_task, &listener] {
+    ChunkFeeder(SyncTask& sync_task, const VirtualSinkListener& listener,
+                int64_t server_offset_us = 0)
+        : thread_([&sync_task, &listener, server_offset_us] {
               while (!listener.decoded()) {
-                  feed_marked_chunks(sync_task, platform_time_us() + PIN_CHUNK_LEAD_US, 4);
+                  feed_marked_chunks(sync_task,
+                                     platform_time_us() + server_offset_us + SINK_CHUNK_LEAD_US, 4);
                   std::this_thread::sleep_for(std::chrono::milliseconds(10));
               }
           }) {}
@@ -1101,17 +1153,14 @@ private:
     std::thread thread_;
 };
 
-// The sync task resolves the current connection once, when the stream goes active, and converts
-// every chunk timestamp through that pin. So a chunk decodes while another thread owns
-// conn_ptr_mutex_, which is a lifetime lock and not a time-sync one. This thread holds that lock
-// for the whole decode, exactly as the main loop does inside ConnectionManager's lifecycle block,
-// or as a network thread does in on_new_connection(); a per-chunk current_shared() would park the
-// sync task on it and no fed chunk would ever reach the sink. The wait has no timeout of its own,
-// since no bound of this test's could tell a parked task from a slow machine: the suite watchdog
-// in tests/main.cpp names it instead, the way PairFinalizeDoesNotDeadlockAgainstAnAdmission fails.
+// The sync task's per-chunk time getters read the manager's time filter slot, not
+// conn_ptr_mutex_, so a chunk decodes while this thread holds that lock, as the main loop does in
+// ConnectionManager's lifecycle block. A getter that took the lock would park the task and no fed
+// chunk would reach the sink. The wait has no timeout of its own, since no bound could tell a
+// parked task from a slow machine: the suite watchdog in tests/main.cpp names it instead.
 TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
     VirtualSinkListener listener;
-    auto config = make_config(SYNC_PIN_LOCK_TEST_PORT);
+    auto config = make_config(STREAM_FILTER_LOCK_TEST_PORT);
     config.time_burst_interval_ms = 100;  // Sync promptly after the connect
     PairedClientBundle bundle(std::move(config));
     SendspinClient& client = bundle.client();
@@ -1122,7 +1171,7 @@ TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
     FakeEncryptedServerOptions options;
     options.answer_time = true;
     ASSERT_TRUE(bundle.start());
-    auto server = connect_paired_server(bundle.peer, SYNC_PIN_LOCK_TEST_PORT, options);
+    auto server = connect_paired_server(bundle.peer, STREAM_FILTER_LOCK_TEST_PORT, options);
     pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
@@ -1139,9 +1188,9 @@ TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
     EXPECT_EQ(listener.stream_ends, 1);
 }
 
-/// What the test learns about the pinned connection after it is gone; owned by the test, since
+/// What a test learns about a stand-in connection after it is gone; owned by the test, since
 /// the connection is what reports its own destruction.
-struct PinObservation {
+struct ConnectionObservation {
     std::atomic<int> goodbyes{0};
     std::thread::id destroyed_on{};
     std::atomic<bool> destroyed{false};  // Published last: orders the id above for the reader
@@ -1149,11 +1198,11 @@ struct PinObservation {
 
 /// Connection stand-in that records where it was destroyed and how many goodbyes it was asked
 /// for. The tests drive the stream through the player's own handlers, so no message traffic
-/// reaches it: it exists to be pinned, goodbyed and freed.
-class PinnedConnection : public StubConnection {
+/// reaches it: it exists to carry the stream's time filter, and to be goodbyed and freed.
+class ObservedConnection : public StubConnection {
 public:
-    explicit PinnedConnection(PinObservation* obs) : obs_(obs) {}
-    ~PinnedConnection() override {
+    explicit ObservedConnection(ConnectionObservation* obs) : obs_(obs) {}
+    ~ObservedConnection() override {
         this->obs_->destroyed_on = std::this_thread::get_id();
         this->obs_->destroyed.store(true);
     }
@@ -1167,187 +1216,157 @@ public:
     }
 
 private:
-    PinObservation* obs_;
+    ConnectionObservation* obs_;
 };
 
-/// The stream the pin tests start: the format make_pcm_player_config() advertises.
-ServerPlayerStreamObject pin_stream_params() {
+/// The stream the stand-in connection tests start: the format make_pcm_player_config() advertises.
+ServerPlayerStreamObject pcm_stream_params() {
     ServerPlayerStreamObject params;
     params.codec = SendspinCodecFormat::PCM;
-    params.sample_rate = PIN_SAMPLE_RATE;
+    params.sample_rate = SINK_SAMPLE_RATE;
     params.channels = 2;
     params.bit_depth = 16;
     return params;
 }
 
-/// Starts a stream on a stand-in connection installed in the admitted slot and returns once the
-/// sync task holds it as its pin. The stream is driven through PlayerRole::Impl, since nothing
-/// is connected to carry a stream/start.
-void pin_stream_on(SendspinClient& client, std::shared_ptr<PinnedConnection> conn) {
+/// Config for a client whose current connection is a stand-in: the stand-in never receives
+/// anything, so the liveness check is disabled rather than left to drop it as silent.
+SendspinClientConfig make_stand_in_config(uint16_t port) {
+    SendspinClientConfig config = make_config(port);
+    config.liveness_timeout_ms = 0;
+    return config;
+}
+
+/// Installs a stand-in connection as current, the way a promotion does, and starts a stream on it,
+/// returning once the sync task is running. The stream is driven through PlayerRole::Impl, since
+/// nothing is connected to carry a stream/start. The client must use make_stand_in_config().
+void start_stream_on(SendspinClient& client, std::shared_ptr<ObservedConnection> conn) {
     {
         std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->current_connection_ = std::move(conn);
+        client.connection_manager_->set_current_connection(std::move(conn));
     }
     PlayerRole::Impl& impl = *client.player_->impl_;
-    impl.handle_stream_start(pin_stream_params(), impl.cleanup_generation.load());
+    impl.handle_stream_start(pcm_stream_params(), impl.cleanup_generation.load());
     SyncTask& sync_task = *impl.sync_task;
     pump_until(client, [&] { return sync_task.is_running(); });
 }
 
-// The pin lives exactly as long as the stream, and the sync task never destroys what it pinned.
-// The manager's own reference is dropped mid-stream, leaving the pin the only owner: the
-// connection is then alive for exactly as long as the task holds it, which is what the two
-// destroyed checks read, and use_count() cannot say (a transient current_shared() copy of any
-// other caller would count too).
-//
-// The first check does not race the task: the pin is resolved before TASK_RUNNING is published,
-// so a task that reads as running has already taken it and the slot can be dropped from here
-// with nothing left to resolve.
-TEST(ClientLifecycle, TheStreamPinKeepsTheConnectionAliveUntilStreamEnd) {
+/// Server clock offset the stand-in connections' filters are seeded with: 10 min behind this
+/// client, beyond the hang watchdog's budget, so an unconverted chunk cannot age back into a
+/// starved sink's window before the watchdog fires.
+constexpr int64_t SEEDED_SERVER_OFFSET_US = -10LL * 60 * 1000 * 1000;
+
+/// A stand-in connection whose time filter has taken one measurement of SEEDED_SERVER_OFFSET_US.
+std::shared_ptr<ObservedConnection> make_synced_connection(ConnectionObservation* obs) {
+    auto conn = std::make_shared<ObservedConnection>(obs);
+    conn->init_time_filter();
+    conn->get_time_filter()->update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000, platform_time_us());
+    return conn;
+}
+
+// set_current_connection() keeps the time filter slot on the current connection's filter: a
+// synced connection converts with its offset, a vacated slot reads as unsynced, the slot never
+// keeps a connection alive, and an unsynced newcomer installed over a synced one reads its own
+// filter.
+TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheCurrentConnection) {
+    ConnectionObservation dropped_obs;  // All outlive the client
+    ConnectionObservation replaced_obs;
+    ConnectionObservation newcomer_obs;
+    SendspinClient client(make_config(TIME_FILTER_SLOT_TEST_PORT));
+    ConnectionManager& manager = *client.connection_manager_;
+    constexpr int64_t SERVER_TS_US = 50 * 1000 * 1000;
+
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.set_current_connection(make_synced_connection(&dropped_obs));
+    }
+    EXPECT_TRUE(client.is_time_synced());
+    EXPECT_EQ(client.get_client_time(SERVER_TS_US), SERVER_TS_US - SEEDED_SERVER_OFFSET_US);
+
+    std::shared_ptr<SendspinConnection> slot;
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        slot.swap(manager.current_connection_);
+        manager.set_current_connection(nullptr);
+    }
+    EXPECT_FALSE(client.is_time_synced());
+    EXPECT_EQ(client.get_client_time(SERVER_TS_US), 0);
+    slot.reset();
+    EXPECT_TRUE(dropped_obs.destroyed.load())
+        << "a reference other than the slot's kept the connection alive";
+
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.set_current_connection(make_synced_connection(&replaced_obs));
+    }
+    ASSERT_TRUE(client.is_time_synced());
+    auto newcomer = std::make_shared<ObservedConnection>(&newcomer_obs);
+    newcomer->init_time_filter();
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.set_current_connection(std::move(newcomer));
+    }
+    EXPECT_FALSE(client.is_time_synced()) << "the newcomer read the replaced connection's filter";
+}
+
+// The sync task converts chunks with the current connection's offset. The fed
+// chunks are stamped in the server's clock, so a task that never saw the filter (parked unsynced)
+// or a conversion that skipped the offset (every chunk late) never reaches the sink. No timeout of
+// its own, as in SyncTaskDecodesAChunkWhileTheManagerLockIsHeld.
+TEST(ClientLifecycle, TheSyncTaskConvertsEachChunkWithTheCurrentOffset) {
+    ConnectionObservation observation;  // Outlives the client
+    VirtualSinkListener listener;
+    TestNetworkProvider network;
+    SendspinClient client(make_stand_in_config(STREAM_FILTER_OFFSET_TEST_PORT));
+    client.set_network_provider(&network);
+    PlayerRole& player = client.add_player(make_pcm_player_config());
+    player.set_listener(&listener);
+    listener.attach(player);
+    ASSERT_TRUE(client.start());
+
+    start_stream_on(client, make_synced_connection(&observation));
+    {
+        ChunkFeeder feeder(*client.player_->impl_->sync_task, listener, SEEDED_SERVER_OFFSET_US);
+        listener.wait_for_decoded();
+    }
+
+    client.stop();
+    EXPECT_EQ(listener.stream_ends, 1);
+}
+
+// A stream's connection dropped mid-stream carries exactly one client/goodbye on its wire and
+// is freed on the thread that pumps loop(), never on the sync task's: the task holds no
+// connection reference of its own. A task that did would keep the connection alive past the
+// flush and free it on the audio thread when the stream ended.
+TEST(ClientLifecycle, ADroppedStreamConnectionIsGoodbyedOnceAndFreedOnTheLoopThread) {
+    ConnectionObservation observation;  // Outlives the client
     CountingPlayerListener listener;
     TestNetworkProvider network;
-    SendspinClient client(make_config(SYNC_PIN_RELEASE_TEST_PORT));
+    SendspinClient client(make_stand_in_config(STREAM_FILTER_MIDSTREAM_TEST_PORT));
     client.set_network_provider(&network);
     client.add_player(make_pcm_player_config()).set_listener(&listener);
     ASSERT_TRUE(client.start());
 
-    PinObservation observation;
-    pin_stream_on(client, std::make_shared<PinnedConnection>(&observation));
+    auto conn = std::make_shared<ObservedConnection>(&observation);
+    SendspinConnection* streamed = conn.get();
+    start_stream_on(client, std::move(conn));
+    ConnectionManager& manager = *client.connection_manager_;
 
     {
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->current_connection_.reset();
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.drop_connection(streamed, SendspinGoodbyeReason::ANOTHER_SERVER);
     }
-    EXPECT_FALSE(observation.destroyed.load())
-        << "the sync task did not pin the connection for the stream";
-
-    PlayerRole::Impl& impl = *client.player_->impl_;
-    impl.handle_stream_end(impl.cleanup_generation.load());
+    manager.flush_deferred_releases();
     pump_until(client, [&] { return listener.stream_ends == 1; });
     pump_until(client, [&] { return observation.destroyed.load(); });
 
-    client.stop();
-}
-
-// The hand-back exists to keep ~SendspinConnection off the thread that held the pin, and a flush
-// is not always the main loop: ConnectionManager::on_new_connection() flushes on the
-// network/httpd thread after admitting or rejecting a peer. That flush must leave the hand-back
-// alone, or the destructor it relocated lands on another borrowed stack. Here a peer arrives
-// while the hand-back is queued; admission is closed first, so the peer is rejected and its
-// goodbye proves the network-thread flush ran before anything is asserted. A goodbye-bearing
-// release is queued ahead of the hand-back, so that flush has to take an entry from in front of
-// it and leave this one behind.
-//
-// Both reads are about which thread ran the destructor, kept for the reason the test above gives:
-// nothing a caller or peer observes distinguishes it.
-TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandBackForTheLoop) {
-    PinObservation observation;  // Outlives the client (see the test above)
-    CountingPlayerListener listener;
-    PairedClientBundle bundle(make_config(SYNC_PIN_DROP_TEST_PORT));
-    SendspinClient& client = bundle.client();
-    client.add_player(make_pcm_player_config()).set_listener(&listener);
-    ASSERT_TRUE(bundle.start());
-
-    auto pinned = std::make_shared<PinnedConnection>(&observation);
-    SendspinConnection* dropped = pinned.get();
-    pin_stream_on(client, std::move(pinned));
-
-    {
-        // Drop the slot's reference, with a goodbye, so this entry is queued first and the
-        // hand-back behind it is the only reference left: whoever performs that entry runs the
-        // destructor. Nothing flushes until the rejection below, which is off the main loop.
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->drop_connection(dropped, SendspinGoodbyeReason::ANOTHER_SERVER);
-    }
-
-    PlayerRole::Impl& impl = *client.player_->impl_;
-    impl.handle_stream_end(impl.cleanup_generation.load());
-    SyncTask& sync_task = *impl.sync_task;
-    wait_until([&] { return !sync_task.is_running(); });
-
-    {
-        // Take the rejection branch of on_new_connection() with one peer, rather than filling
-        // the nursery with peers whose handshakes would race each other.
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->accepting_ = false;
-    }
-    auto rejected = connect_paired_server(bundle.peer, SYNC_PIN_DROP_TEST_PORT);
-    wait_until([&] { return rejected->goodbye_reason().has_value(); });
-    EXPECT_FALSE(observation.destroyed.load())
-        << "the network thread that flushed its own rejection also ran the pin's destructor";
-
-    pump_until(client, [&] { return observation.destroyed.load(); });
+    EXPECT_EQ(observation.goodbyes.load(), 1)
+        << "expected exactly one client/goodbye on this connection's wire";
+    // Private read: nothing a caller or peer observes distinguishes the destructor's thread.
     EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
         << "the connection was freed on a thread other than the one that pumps loop()";
 
     client.stop();
-}
-
-// However a pinned stream ends, the connection's wire carries exactly one client/goodbye and the
-// object is freed: one queue entry speaks for the session and owes the goodbye, while the sync
-// task's hand-back only drops a reference. The two rows reach that from opposite sides - the
-// session taken away mid-stream, and a stop() that runs while the hand-back is still queued, so
-// stop()'s sweep sees the same connection twice at once.
-TEST(ClientLifecycle, APinnedConnectionIsGoodbyedOnceAndFreed) {
-    struct EndingRow {
-        const char* name;
-        bool drop_mid_stream;
-        uint16_t port;
-    };
-    const EndingRow rows[] = {
-        {"session dropped mid-stream", true, SYNC_PIN_MIDSTREAM_TEST_PORT},
-        {"stop() with the hand-back still queued", false, SYNC_PIN_STOP_TEST_PORT},
-    };
-
-    for (const EndingRow& row : rows) {
-        SCOPED_TRACE(row.name);
-        // Outlives the client, which goodbyes what is still in its slot as it goes.
-        PinObservation observation;
-        CountingPlayerListener listener;
-        TestNetworkProvider network;
-        SendspinClient client(make_config(row.port));
-        client.set_network_provider(&network);
-        client.add_player(make_pcm_player_config()).set_listener(&listener);
-        ASSERT_TRUE(client.start());
-
-        auto conn = std::make_shared<PinnedConnection>(&observation);
-        SendspinConnection* pinned = conn.get();
-        pin_stream_on(client, std::move(conn));
-        PlayerRole::Impl& impl = *client.player_->impl_;
-        ConnectionManager& manager = *client.connection_manager_;
-
-        if (row.drop_mid_stream) {
-            // The pin is live by construction: nothing has ended the stream, and the task cannot
-            // reach its release without the lock held here, so the drop's own entry is the one
-            // that speaks for the session.
-            {
-                std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-                manager.drop_connection(pinned, SendspinGoodbyeReason::ANOTHER_SERVER);
-            }
-            manager.flush_deferred_releases();
-            pump_until(client, [&] { return listener.stream_ends == 1; });
-            pump_until(client, [&] { return observation.destroyed.load(); });
-        } else {
-            // End the stream and stop with no tick in between. The pin is handed back before the
-            // task stops reading as running, so waiting on that leaves the hand-back queued for
-            // stop() to find while the connection is still in the slot.
-            impl.handle_stream_end(impl.cleanup_generation.load());
-            SyncTask& sync_task = *impl.sync_task;
-            wait_until([&] { return !sync_task.is_running(); });
-            client.stop();
-            EXPECT_TRUE(observation.destroyed.load()) << "stop() left the hand-back queued";
-        }
-
-        EXPECT_EQ(observation.goodbyes.load(), 1)
-            << "expected exactly one client/goodbye on this connection's wire";
-        // Private read, kept because nothing a caller or peer observes distinguishes the thread
-        // the destructor ran on: ~SendspinConnection joins the transport, which on device must
-        // not happen on the audio thread that held the pin.
-        EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
-            << "the connection was freed on a thread other than the one that pumps loop()";
-
-        client.stop();
-    }
 }
 
 }  // namespace

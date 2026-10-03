@@ -48,7 +48,6 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 │  │         ACTIVE STATE               │                  │
 │  │  • Clear TASK_IDLE, COMMAND_START  │                  │
 │  │  • Drain stale playback progress   │                  │
-│  │  • Pin the current connection      │                  │
 │  │  • Set TASK_RUNNING                │                  │
 │  │  • Decode initial codec header     │                  │
 │  │  • Run inner state machine loop    │                  │
@@ -56,13 +55,12 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 │               │ STOP/END                                 │
 │               ▼                                          │
 │  ┌────────────────────────────────────┐                  │
-│  │  Return the borrowed ring buffer   │──────→ loop back │
-│  │  entry, then release the pin       │                  │
+│  │  Return borrowed ring buffer entry │──────→ loop back │
 │  └────────────────────────────────────┘                  │
 └──────────────────────────────────────────────────────────┘
 ```
 
-The WAIT FOR CLIENT ACK step is the sync task's half of the stream end/start handshake with the main loop (`docs/internals.md`, "Stream End and Start"). The connection pin taken on entering ACTIVE is described in `docs/internals.md`, "Stream Connection Pin".
+The WAIT FOR CLIENT ACK step is the sync task's half of the stream end/start handshake with the main loop (`docs/internals.md`, "Stream End and Start").
 
 ### Inner Loop
 

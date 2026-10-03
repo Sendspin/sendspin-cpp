@@ -24,6 +24,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - State published from one writer thread to one reader thread uses a
   `ShadowSlot` (`src/platform/shadow_slot.h`), whichever side (if either) the
   main loop is on. State the main loop *reads* goes through the Inbox instead.
+  The one value read by several threads without being consumed, the current
+  connection's time filter, sits in `ConnectionManager`'s own slot behind a
+  leaf mutex (`current_time_filter()`).
 - Event producers push through `push_event_or_log()` rather than hand-rolling
   the build, push, and log-on-drop sequence.
 - A bounded queue or ring that drops an item never drops it silently: log at
@@ -50,7 +53,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - The client holds exactly one lock order, and every site that takes two locks
   cites it: `SendspinClient::json_processing_mutex_`, then
   `ConnectionManager::conn_ptr_mutex_`, then the leaves
-  (`ConnectionManager::conn_mutex_`, `RecordStore::mutex_`, the Inbox mutex),
+  (`ConnectionManager::conn_mutex_`, `ConnectionManager::time_filter_mutex_`,
+  `RecordStore::mutex_`, the Inbox mutex),
   which nest under anything and under nothing. Taking a lock further left while
   holding one further right is a defect, not a local trade-off. The receive path fixes this
   order: a `server/pair-finalize` handler runs under the JSON lock and asks the

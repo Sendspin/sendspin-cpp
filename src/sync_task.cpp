@@ -15,8 +15,6 @@
 #include "sync_task.h"
 
 #include "audio_utils.h"
-#include "connection.h"
-#include "connection_manager.h"
 #include "constants.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
@@ -216,11 +214,10 @@ SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
 }
 
 SyncTaskState SyncTask::handle_load_chunk(SyncContext& sync_context) {
-    if (this->stream_connection_ == nullptr || !this->stream_connection_->is_time_synced()) {
+    if (!this->player_impl_->client->is_time_synced()) {
         // Wait for the time filter to receive its first measurement before processing audio chunks.
         // Without a valid time offset, server timestamps can't be correctly converted to client
-        // timestamps. A stream that began with no current connection has no filter to wait on and
-        // stays here until it ends; the next stream resolves the pin again.
+        // timestamps.
         std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_FOR_TIME_SYNC_MS));
         return SyncTaskState::LOAD_CHUNK;
     }
@@ -588,10 +585,10 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             }
         }
     } else if (sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) {
-        // An encoded-audio chunk only reaches here through handle_load_chunk(), which returns
-        // early unless the stream pin is live, so the pin is non-null.
+        // The filter may have changed since handle_load_chunk(); see docs/internals.md, "Current
+        // Time Filter Slot".
         int64_t client_timestamp =
-            this->stream_connection_->get_client_time(sync_context.encoded_entry->timestamp) -
+            this->player_impl_->client->get_client_time(sync_context.encoded_entry->timestamp) -
             static_cast<int64_t>(this->player_impl_->get_effective_output_delay_ms()) * US_PER_MS -
             this->player_impl_->config.fixed_delay_us;
 
@@ -760,21 +757,7 @@ void SyncTask::discard_to_clear_marker(SyncContext& sync_context) {
     this->apply_stream_clear(sync_context);
 }
 
-void SyncTask::release_stream_pin() {
-    if (this->stream_connection_ == nullptr) {
-        return;
-    }
-    // Hand it to the manager rather than dropping it here: the destructor must not run on the
-    // audio thread (see DeferredRelease). One lock take per stream.
-    this->conn_manager_->release_from_role_thread(std::move(this->stream_connection_));
-}
-
 void SyncTask::reset_context(SyncContext& sync_context) {
-    // Backstop only: an outer-loop path that skipped the release after the inner loop must not
-    // carry a pin into the next stream. This runs after TASK_IDLE is published, so it does not
-    // stand in for the ordered release in thread_entry().
-    this->release_stream_pin();
-
     // Reset SyncContext between streams without deallocating buffers.
     sync_context.encoded_entry = nullptr;
     sync_context.decoded_timestamp = 0;
@@ -931,21 +914,6 @@ void SyncTask::thread_entry(void* params) {
         // buffered_frames tracking.
         this_task->playback_progress_slot_.reset();
 
-        // Pin the connection whose time filter converts this stream's timestamps. The filter is
-        // created once per connection (SendspinConnection::init_time_filter()) and never replaced,
-        // and the admitted slot cannot be handed to another server without ending this stream
-        // first: ConnectionManager::drop_connection() runs cleanup_connection_state() on the
-        // outgoing connection before a promotion installs the successor. An in-band re-handshake
-        // keeps the same connection object. Holding it for the stream keeps the per-chunk
-        // conversion off conn_ptr_mutex_, and keeping a dropped connection alive a little longer
-        // is what the deferred-release design already expects (see DeferredRelease). Resolved
-        // before TASK_RUNNING is published, so a reader that sees the task running sees a stream
-        // whose pin is settled. The lock wait therefore sits inside the window where the task
-        // reads neither idle nor running, which is safe because every STREAM_END producer sets
-        // COMMAND_STREAM_END before enqueuing the event, so the sync-idle gate that reads
-        // is_running() can only release an end the task is already commanded to honour.
-        this_task->stream_connection_ = this_task->conn_manager_->current_shared();
-
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
         // Decode the initial codec header
@@ -989,22 +957,12 @@ void SyncTask::thread_entry(void* params) {
             }
         }
 
-        // Return any borrowed ring buffer entry ahead of the pin hand-over below, which blocks
-        // on the manager lock: a network thread can be parked on ring space for as long as
-        // HEADER_SEND_TIMEOUT_MS and this task is its only drainer. The stream-start pin above
-        // takes the same lock with the codec header still borrowed; that is not a cycle either,
-        // since no path takes conn_ptr_mutex_ and then blocks on ring space.
+        // Return a borrowed entry: reset_context() drops the pointer without returning it, and a
+        // network thread may be parked on ring space with this task its only drainer.
         if (sync_context.encoded_entry != nullptr) {
             this_task->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
             sync_context.encoded_entry = nullptr;
         }
-
-        // Give the pin back before the task reports idle, so a connection dropped during the
-        // stream is freed on the next flush rather than outliving it. The position matters: the
-        // STREAM_END drain gate keys on is_running(), so the pin must be gone before the task
-        // reads idle. Every outer-loop exit below this point goes through here; reset_context()
-        // repeats the call at the top of the next iteration as a backstop.
-        this_task->release_stream_pin();
 
         if (this_task->event_flags_.get() & COMMAND_STOP) {
             break;

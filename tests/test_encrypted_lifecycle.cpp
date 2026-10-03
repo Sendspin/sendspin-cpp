@@ -3550,17 +3550,14 @@ private:
 }  // namespace
 
 // The lifecycle handlers change RAM under conn_ptr_mutex_ and leave the provider write to
-// SendspinClient::flush_pending_persistence(), which holds no lock. What that buys is here:
-// the sync task takes the same mutex for every decoded audio chunk through current_shared(), and
-// on ESP the write is an NVS commit that stalls code running from flash for tens of milliseconds,
-// so a write held under the lock is a stall of the audio path.
+// SendspinClient::flush_pending_persistence(), which holds no lock. Consumer threads reading the
+// connection and the network thread's server/pair-finalize handler take the same mutex, and on ESP
+// the write is an NVS commit that stalls code running from flash for tens of milliseconds.
 //
 // The provider above holds that whole window open inside the persist_records() the flush after
 // the first activate performs.
-// A current_shared() caller issued in the window must still return: is_time_synced() is exactly
-// the call the sync task makes (SendspinClient::is_time_synced() -> current_shared()). It is
-// waited on with no timeout, so a regression hangs rather than turning a loaded runner into a
-// failure, and the watchdog in tests/main.cpp names the test.
+// A get_server_information() issued in the window must still return. It is waited on with no timeout, so a regression hangs rather than turning a
+// loaded runner into a failure, and the watchdog in tests/main.cpp names the test.
 TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     PairedPeer peer = make_paired_peer();
     TestNetworkProvider network;
@@ -3593,7 +3590,7 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     std::promise<void> probed;
     std::future<void> probed_future = probed.get_future();
     std::thread probe([&] {
-        client.is_time_synced();
+        (void)client.get_server_information();
         probed.set_value();
     });
 

@@ -43,6 +43,7 @@ namespace sendspin {
 class SendspinClient;
 class SendspinConnection;
 class SendspinServerConnection;
+class SendspinTimeFilter;
 class SendspinWsServer;
 
 /// @brief Converts a duration in seconds to microseconds at compile time.
@@ -167,19 +168,14 @@ struct NurseryEntry {
 /// Sending a goodbye can block on the transport, and even shared_ptr destruction can join the
 /// transport thread (the host outbound destructor stops its IXWebSocket). Neither may happen under
 /// the manager lock: the join can deadlock against a transport callback waiting on that same lock,
-/// and any block stalls every other manager entry point. Locked sections only queue releases;
-/// flush_deferred_releases() performs them lock-free.
-///
-/// A role thread that holds its own reference (the sync task pins the connection whose time
-/// filter its stream uses) hands it back through release_from_role_thread(), which queues it
-/// here with main_loop_only set, so the outbound destructor's transport join never lands on the
-/// audio thread. Inbound destructors are trivial but take the same route, for one rule.
+/// and any block stalls every other manager entry point. The queue is main-loop-only: entries are
+/// queued by main-loop code inside a conn_ptr_mutex_ section, and every main-loop entry point that
+/// can queue one calls flush_deferred_releases() after the lock drops and before it returns, so
+/// the queue is empty between main-loop calls. No network or role thread queues or flushes one;
+/// on_new_connection() goodbyes its own rejections inline.
 struct DeferredRelease {
     std::shared_ptr<SendspinConnection> conn;  ///< A reference to drop; not necessarily the last
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: no goodbye owed, just release
-    /// true: perform only on the main loop. A network-thread flush leaves the entry queued rather
-    /// than moving the destructor it was queued to relocate onto another borrowed stack.
-    bool main_loop_only{false};
 };
 
 /// @brief Disposition for the connection once abort_pairing_attempt() ends a pairing attempt.
@@ -300,7 +296,8 @@ public:
     // Public API
     // ========================================
 
-    /// @brief Initiates a client connection to a Sendspin server.
+    /// @brief Initiates a client connection to a Sendspin server. Main loop only (see
+    /// SendspinClient::connect_to()).
     /// @param url WebSocket URL of the server to connect to.
     void connect_to(const std::string& url);
 
@@ -344,12 +341,12 @@ public:
     /// events, retries hello, calls loop() on active connections.
     ///
     /// Tick cost: most steps are gated on one of the atomic hints
-    /// (has_pending_events_, nursery_size_, has_current_, deferred_size_), so they pay only the
-    /// atomic loads needed to decide there is nothing to do. flush_pending_admission(),
-    /// scan_pairing_attempt_timeout(), and scan_reprove_watchdog() take conn_ptr_mutex_
-    /// unconditionally, so an idle tick costs three acquisitions while disconnected and five
-    /// while connected (adding the current/nursery copy ahead of the conn->loop() calls and the
-    /// liveness check).
+    /// (has_pending_events_, nursery_size_, has_current_), or on deferred_releases_ being empty,
+    /// so they pay only the loads needed to decide there is nothing to do.
+    /// flush_pending_admission(), scan_pairing_attempt_timeout(), and scan_reprove_watchdog() take
+    /// conn_ptr_mutex_ unconditionally, so an idle tick costs three acquisitions while disconnected
+    /// and five while connected (adding the current/nursery copy ahead of the conn->loop() calls
+    /// and the liveness check).
     void loop();
 
     // ========================================
@@ -380,27 +377,15 @@ public:
         return this->current_connection_;
     }
 
-    /// @brief Takes a role thread's connection reference back so the main loop destroys it.
-    /// Thread-safe.
+    /// @brief Returns the current connection's time filter, or nullptr if there is no current
+    /// connection. Thread-safe.
     ///
-    /// Queued as a main-loop-only DeferredRelease, so ~SendspinConnection's transport join never
-    /// runs on a role thread. The one deferred-release push site that does not flush on its own
-    /// thread; loop() flushes twice per tick and SendspinClient::stop() once after the joins.
-    /// @param conn The reference to hand over; taken by value. Null is a no-op.
-    void release_from_role_thread(std::shared_ptr<SendspinConnection> conn);
-
-    /// @brief Performs the queued goodbye sends and connection releases from deferred_releases_.
-    /// Main loop only; performs every queued entry, including the main-loop-only hand-overs.
-    /// Caller must not hold conn_ptr_mutex_ (see DeferredRelease). A queued release is performed
-    /// exactly once. Called after every locked section that can queue a release, by loop() as a
-    /// backstop, and by SendspinClient::stop() after the role threads are joined. Early-returns
-    /// without locking when deferred_size_ reads 0.
-    void flush_deferred_releases();
-
-    /// @brief flush_deferred_releases() for a network thread: leaves the main-loop-only entries
-    /// queued. Used by on_new_connection(), whose own rejections must leave on the thread that
-    /// took them. A skipped entry keeps deferred_size_ nonzero for the next loop() flush.
-    void flush_deferred_releases_off_loop();
+    /// Never takes conn_ptr_mutex_, so a role thread converting timestamps (the sync task per
+    /// chunk, the visualizer drain per frame) never waits on a main-loop section holding it. Hands
+    /// out the filter, never the connection: a role-thread copy of the connection could be its last
+    /// reference and join the transport on that thread, while the filter's last drop only frees
+    /// memory.
+    std::shared_ptr<SendspinTimeFilter> current_time_filter() const;
 
     /// @brief psk_ids backing a currently-open connection, provisional or admitted. Thread-safe.
     /// These are the records a completed pairing must not evict (pairing.md "Pairing Records").
@@ -572,8 +557,9 @@ private:
     /// @brief Admits an incoming server connection into the nursery and starts its prove stage
     ///
     /// Never enters the current slot directly (the connection has not proven itself yet). If the
-    /// inbound slots are full (outbound entries do not count) the newcomer is rejected with a
-    /// goodbye, which reaches the peer because its session is already upgraded.
+    /// inbound slots are full (outbound entries do not count), or admission is closed, the
+    /// newcomer is rejected with a goodbye, which reaches the peer because its session is already
+    /// upgraded.
     ///
     /// This installs the Noise handshake driver and sends client/init immediately (the
     /// connection is already WS-upgraded, so there is no earlier signal to wait for); the hello
@@ -588,27 +574,18 @@ private:
     /// conn_ptr_mutex_.
     NurseryEntry* find_in_nursery(const SendspinConnection* conn);
 
-    // Each refresh_* helper below re-derives its hint atomic from the container's .size() in the
-    // same critical section as the mutation, so the hint can never drift. Caller must hold
-    // conn_ptr_mutex_.
-
-    /// @brief Refreshes nursery_size_ from nursery_.size().
+    /// @brief Refreshes nursery_size_ from nursery_.size() in the same critical section as the
+    /// mutation, so the hint cannot drift. Caller must hold conn_ptr_mutex_.
     void refresh_nursery_size_hint();
-
-    /// @brief Shared body of the two flush entry points.
-    /// @param on_main_loop false leaves the main-loop-only entries queued (see DeferredRelease).
-    void flush_deferred_releases(bool on_main_loop);
-
-    /// @brief Refreshes deferred_size_ from deferred_releases_.size().
-    void refresh_deferred_size_hint();
 
     /// @brief Appends an entry to nursery_ and refreshes the hint. Caller must hold
     /// conn_ptr_mutex_.
     void push_nursery_entry(NurseryEntry entry);
 
-    /// @brief Assigns current_connection_ and refreshes has_current_. Pass nullptr to clear the
-    /// slot. Caller must hold conn_ptr_mutex_ and call flush_pending_admission() after dropping
-    /// it: installing a connection only stages its admission.
+    /// @brief Assigns current_connection_ and keeps has_current_ and the time filter slot
+    /// (current_time_filter_) in step with it. Pass nullptr to clear the slot. Caller must hold
+    /// conn_ptr_mutex_ and call flush_pending_admission() after dropping it: installing a
+    /// connection only stages its admission.
     /// @param conn The connection to install as current, or nullptr to clear; moved from.
     void set_current_connection(std::shared_ptr<SendspinConnection> conn);
 
@@ -645,16 +622,17 @@ private:
     NurseryEntry* release_nursery_entry(NurseryEntry* it,
                                         std::optional<SendspinGoodbyeReason> reason);
 
-    /// @brief Appends a release to deferred_releases_ and refreshes the hint. Caller must hold
+    /// @brief Appends a release to deferred_releases_. Main loop only. Caller must hold
     /// conn_ptr_mutex_ and call flush_deferred_releases() after dropping it.
     /// @param reason The goodbye reason to send before closing, or nullopt when no goodbye is
     ///        owed (the transport is gone, the close is deliberately silent, or another entry
     ///        covers it).
-    /// @param main_loop_only true to keep the entry queued until a main-loop flush reaches it
-    ///        (see DeferredRelease).
     void queue_deferred_release(std::shared_ptr<SendspinConnection> conn,
-                                std::optional<SendspinGoodbyeReason> reason,
-                                bool main_loop_only = false);
+                                std::optional<SendspinGoodbyeReason> reason);
+
+    /// @brief Performs the queued goodbye sends and connection releases from deferred_releases_.
+    /// Main loop only; caller must not hold conn_ptr_mutex_ (see DeferredRelease).
+    void flush_deferred_releases();
 
     // ========================================
     // Hello handshake
@@ -954,9 +932,8 @@ private:
 
     // Struct fields
     std::mutex conn_mutex_;                           // Protects deferred lifecycle event queues
-    mutable std::mutex conn_ptr_mutex_;               // Protects current_connection_, nursery_, and
-                                                      // deferred_releases_
-    std::vector<DeferredRelease> deferred_releases_;  // Queued releases; see DeferredRelease
+    mutable std::mutex conn_ptr_mutex_;               // Protects current_connection_ and nursery_
+    std::vector<DeferredRelease> deferred_releases_;  // See DeferredRelease
     // Unproven connections awaiting establishment, each carrying its hello send state
     InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
@@ -1041,8 +1018,10 @@ private:
     /// when there is no current connection and the nursery is empty.
     std::atomic<bool> has_current_{false};
 
-    /// deferred_releases_.size(). Lets flush_deferred_releases() early-return without locking.
-    std::atomic<size_t> deferred_size_{0};
+    /// Guards current_time_filter_ (a leaf in the docs/conventions.md lock order).
+    mutable std::mutex time_filter_mutex_;
+    /// The current connection's time filter; written only by set_current_connection().
+    std::shared_ptr<SendspinTimeFilter> current_time_filter_;
 };
 
 }  // namespace sendspin

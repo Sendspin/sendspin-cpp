@@ -223,10 +223,6 @@ void PlayerRole::Impl::update_output_delay(uint16_t delay_ms) {
 // Impl: Internal integration methods
 // ============================================================================
 
-void PlayerRole::Impl::attach_connection_manager(ConnectionManager& manager) const {
-    this->sync_task->attach_connection_manager(manager);
-}
-
 void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
     this->inbox = &inbox;
     this->event_state->stream_params_slot.bind(inbox, INBOX_TOPIC_PLAYER_STREAM_PARAMS);

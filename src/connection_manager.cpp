@@ -34,11 +34,13 @@
 #include "sendspin/types.h"
 #include "server_connection.h"
 #include "time_burst.h"
+#include "time_filter.h"
 #include "ws_server.h"
 
 #include <array>
 #include <cassert>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -326,29 +328,24 @@ ConnectionManager::ConnectionManager(SendspinClient* client)
 ConnectionManager::~ConnectionManager() {
     // Move everything out under the locks, destroy outside them: a connection destructor can join
     // its transport thread (see DeferredRelease), which must not happen while a lock is held.
-    // The two mutexes guard disjoint state and are taken in separate scopes, never nested.
+    // conn_mutex_ and conn_ptr_mutex_ guard disjoint state and are taken in separate scopes.
     DrainedEvents dropped;
     this->swap_out_pending_events(dropped);
 
     std::shared_ptr<SendspinConnection> current;
     // cppcheck-suppress variableScope
     InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery;
-    // cppcheck-suppress variableScope
-    std::vector<DeferredRelease> releases;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        current = std::move(this->current_connection_);
+        // Cleared through the setter so has_current_ and the time filter slot follow.
+        current.swap(this->current_connection_);
+        this->set_current_connection(nullptr);
         nursery.swap(this->nursery_);
-        // cppcheck-suppress unreadVariable
-        releases = std::move(this->deferred_releases_);
-        // Keep the hint atomics in sync with the now-empty containers (has_pending_events_ was
-        // handled above under its own mutex).
-        this->has_current_.store(false, std::memory_order_release);
         this->refresh_nursery_size_hint();
-        this->refresh_deferred_size_hint();
     }
-    // Locals and the swapped-out events release here, outside both locks. Queued goodbyes are
-    // skipped on destruction; shutdown drops slots without a send.
+    assert(this->deferred_releases_.empty());  // See DeferredRelease
+    // Locals and the swapped-out events release here, outside both locks; shutdown drops slots
+    // without a send.
 }
 
 // ============================================================================
@@ -555,9 +552,6 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
     // released here (see DeferredRelease): the goodbyes below run outside the lock, and a
     // rejection for a peer delivered during the wait can take the lock meanwhile.
     std::vector<std::shared_ptr<SendspinConnection>> to_goodbye;
-    // Queued releases that are owed no goodbye. They are moved out of the queue rather than
-    // destroyed inside it: a destructor can join a transport thread, which must not run here.
-    std::vector<std::shared_ptr<SendspinConnection>> to_release;
     PairingUiSnapshot ui{false, false};
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
@@ -573,8 +567,8 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
             this->current_connection_->disable_message_dispatch();
             // Vacate the admitted slot explicitly, as drop_connection() does: the connection is
             // swapped out below (see drop_connection() for why not moved), so
-            // set_current_connection(nullptr) finds an empty slot and clears nothing, and the
-            // goodbye keeps the connection alive past this call.
+            // set_current_connection(nullptr) finds an empty slot and clears no admitted flag,
+            // and the goodbye keeps the connection alive past this call.
             this->current_connection_->set_admitted(false);
             std::shared_ptr<SendspinConnection> outgoing;
             outgoing.swap(this->current_connection_);
@@ -592,21 +586,8 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
         this->refresh_nursery_size_hint();
         // A standing pairing window belongs to this run; a restart begins with it closed.
         this->close_pairing_window();
-        // A queued release that carries a reason (a handoff loser, a reaped entry) had its
-        // dispatch disabled when it was queued; the shutdown goodbye replaces whatever reason it
-        // carried. A reason-less entry is owed no goodbye (its transport is gone, the close was
-        // deliberately silent, or another entry covers it), and sending one here would put a
-        // frame on a live wire that is owed none.
-        for (auto& release : this->deferred_releases_) {
-            if (release.goodbye.has_value()) {
-                to_goodbye.push_back(std::move(release.conn));
-            } else {
-                to_release.push_back(std::move(release.conn));
-            }
-        }
-        this->deferred_releases_.clear();
-        this->refresh_deferred_size_hint();
     }
+    assert(this->deferred_releases_.empty());  // See DeferredRelease
 
     // Goodbye every connection and wait, bounded, for the sends to complete. Every count is
     // registered before the wait starts, so a completion that runs inline (host, and any
@@ -1266,6 +1247,11 @@ bool ConnectionManager::is_connected() const {
            this->current_connection_->is_operational();
 }
 
+std::shared_ptr<SendspinTimeFilter> ConnectionManager::current_time_filter() const {
+    std::lock_guard<std::mutex> lock(this->time_filter_mutex_);
+    return this->current_time_filter_;
+}
+
 std::vector<std::string> ConnectionManager::open_connection_psk_ids() const {
     // Called from the network thread (the server/pair-finalize ack handler) as well as the main
     // loop, so it takes conn_ptr_mutex_ and copies. The ack handler holds SendspinClient's
@@ -1460,6 +1446,7 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
     // handshake within NURSERY_ESTABLISH_TIMEOUT_US.
     conn->set_provisional_time_us(platform_time_us());
 
+    std::optional<SendspinGoodbyeReason> rejection;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
 
@@ -1481,13 +1468,13 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             // as the nursery-full rejection below.
             SS_LOGD(TAG, "Not accepting connections, rejecting new connection");
             conn->disable_message_dispatch();
-            this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::SHUTDOWN);
+            rejection = SendspinGoodbyeReason::SHUTDOWN;
         } else if (inbound_count >= NURSERY_CAPACITY) {
             SS_LOGW(TAG, "Nursery full of live connections, rejecting new connection");
             // Never managed, but its callbacks are already wired: block dispatch so it cannot
             // inject messages during the goodbye window.
             conn->disable_message_dispatch();
-            this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
+            rejection = SendspinGoodbyeReason::ANOTHER_SERVER;
         } else {
             SS_LOGD(TAG, "Admitting new connection into the nursery");
             // The connection arrives WS-upgraded, so client/init can be sent right away (there
@@ -1499,9 +1486,12 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             this->push_nursery_entry(NurseryEntry{.conn = std::move(conn)});
         }
     }
-    // On the network/httpd thread: a rejection queued just above leaves on this thread, and a
-    // role's hand-over waits for loop().
-    this->flush_deferred_releases_off_loop();
+    // Outside the lock, since the send can block (see DeferredRelease). Dropping this inbound
+    // connection here joins nothing: host shares the IX socket with the server, ESP's is owned by
+    // its httpd session.
+    if (rejection.has_value()) {
+        conn->disconnect(rejection.value(), nullptr);
+    }
 }
 
 // ============================================================================
@@ -1566,10 +1556,6 @@ void ConnectionManager::refresh_nursery_size_hint() {
     this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
 }
 
-void ConnectionManager::refresh_deferred_size_hint() {
-    this->deferred_size_.store(this->deferred_releases_.size(), std::memory_order_release);
-}
-
 void ConnectionManager::push_nursery_entry(NurseryEntry entry) {
     this->nursery_.push_back(std::move(entry));
     this->refresh_nursery_size_hint();
@@ -1595,6 +1581,12 @@ void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnectio
     // before the flush has nothing to admit.
     this->pending_admission_ = conn;
     this->has_current_.store(conn != nullptr, std::memory_order_release);
+    {
+        // A leaf under conn_ptr_mutex_ (docs/conventions.md lock order). The filter is fixed at
+        // creation (init_time_filter()), so this copy stays valid while the connection is current.
+        std::lock_guard<std::mutex> lock(this->time_filter_mutex_);
+        this->current_time_filter_ = conn != nullptr ? conn->get_shared_time_filter() : nullptr;
+    }
     this->current_connection_ = std::move(conn);
 }
 
@@ -1654,70 +1646,16 @@ void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
 }
 
 void ConnectionManager::queue_deferred_release(std::shared_ptr<SendspinConnection> conn,
-                                               std::optional<SendspinGoodbyeReason> reason,
-                                               bool main_loop_only) {
-    this->deferred_releases_.push_back({std::move(conn), reason, main_loop_only});
-    this->refresh_deferred_size_hint();
-}
-
-void ConnectionManager::release_from_role_thread(std::shared_ptr<SendspinConnection> conn) {
-    if (conn == nullptr) {
-        return;
-    }
-    // No goodbye: the manager already sent one if the connection was dropped, and a role thread
-    // never speaks for the session. One lock take per stream, on the role thread, and no flush
-    // here (see the header). Main-loop-only, so a network thread flushing in on_new_connection()
-    // does not take the destructor this hand-over exists to relocate.
-    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-    this->queue_deferred_release(std::move(conn), std::nullopt, /*main_loop_only=*/true);
+                                               std::optional<SendspinGoodbyeReason> reason) {
+    this->deferred_releases_.push_back({std::move(conn), reason});
 }
 
 void ConnectionManager::flush_deferred_releases() {
-    this->flush_deferred_releases(/*on_main_loop=*/true);
-}
-
-void ConnectionManager::flush_deferred_releases_off_loop() {
-    this->flush_deferred_releases(/*on_main_loop=*/false);
-}
-
-void ConnectionManager::flush_deferred_releases(bool on_main_loop) {
-    // Caller must not hold conn_ptr_mutex_ (see DeferredRelease).
-    //
-    // Lock-free early return: deferred_size_ mirrors deferred_releases_.size() and is refreshed
-    // only under conn_ptr_mutex_, so observing 0 means the container was empty as of that load.
-    // Sound because every push site calls this function on the same call stack before returning,
-    // and loop() calls it twice per tick regardless, so nothing stays queued past a tick. If a
-    // racing flush drains it first, the entry is still performed exactly once, by whichever call
-    // swaps it out. release_from_role_thread() is the one push site that deliberately does not
-    // flush on its own thread (that is the point of the hand-over); its entries are skipped when
-    // on_main_loop is false, which keeps the destructor off the network/httpd thread.
-    if (this->deferred_size_.load(std::memory_order_acquire) == 0) {
+    if (this->deferred_releases_.empty()) {
         return;
     }
     std::vector<DeferredRelease> releases;
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        if (on_main_loop) {
-            releases.swap(this->deferred_releases_);
-        } else {
-            // Compact the main-loop-only entries down in place and take the rest. The hint stays
-            // nonzero for whatever is left, so the next loop() flush performs it.
-            size_t kept = 0;
-            for (size_t i = 0; i < this->deferred_releases_.size(); ++i) {
-                DeferredRelease& release = this->deferred_releases_[i];
-                if (release.main_loop_only) {
-                    if (kept != i) {
-                        this->deferred_releases_[kept] = std::move(release);
-                    }
-                    ++kept;
-                } else {
-                    releases.push_back(std::move(release));
-                }
-            }
-            this->deferred_releases_.resize(kept);
-        }
-        this->refresh_deferred_size_hint();
-    }
+    releases.swap(this->deferred_releases_);
     for (auto& release : releases) {
         if (release.goodbye.has_value()) {
             disconnect_and_release(std::move(release.conn), release.goodbye.value());
@@ -1768,9 +1706,9 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         conn->disable_message_dispatch();
         // Vacate the admitted slot explicitly. set_current_connection(nullptr) below cannot do
         // it: the outgoing connection is swapped out of current_connection_ first, so the setter
-        // sees an already-null slot and has nothing to clear. The connection outlives this call
-        // (queue_deferred_release keeps it alive through the goodbye window), so leaving the flag
-        // set would leave a dropped connection claiming admission.
+        // sees an already-null slot and has no admitted flag to clear. The connection outlives this
+        // call (queue_deferred_release keeps it alive through the goodbye window), so leaving the
+        // flag set would leave a dropped connection claiming admission.
         conn->set_admitted(false);
         this->client_->cleanup_connection_state();
         // Swapped out rather than moved out so the slot is null by construction when
