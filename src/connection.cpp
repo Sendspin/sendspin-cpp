@@ -67,7 +67,7 @@ SsErr SendspinConnection::send_transport_frame(const uint8_t* data, size_t len,
 // ============================================================================
 
 void SendspinConnection::init_time_filter() {
-    this->time_filter_ = std::make_unique<SendspinTimeFilter>(SendspinTimeFilter::Config{});
+    this->time_filter_ = std::make_shared<SendspinTimeFilter>(SendspinTimeFilter::Config{});
 }
 
 // ============================================================================

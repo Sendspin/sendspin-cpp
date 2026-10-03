@@ -762,20 +762,17 @@ public:
     /// @param conn Pointer to this connection.
     std::function<void(SendspinConnection*)> on_disconnected_cb;
 
-    /// @brief Converts a server timestamp to the equivalent client timestamp
-    /// @param server_time Server timestamp in microseconds.
-    /// @return Equivalent client timestamp in microseconds (0 if time filter not initialized).
-    int64_t get_client_time(int64_t server_time) const {
-        if (this->time_filter_ == nullptr) {
-            return 0;
-        }
-        return this->time_filter_->compute_client_time(server_time);
-    }
-
     /// @brief Gets the time filter for this connection
     /// @return Pointer to the time filter, or nullptr if not initialized.
     SendspinTimeFilter* get_time_filter() {
         return this->time_filter_.get();
+    }
+
+    /// @brief Returns a shared reference to this connection's time filter, for ConnectionManager's
+    /// time filter slot (see ConnectionManager::current_time_filter())
+    /// @return The time filter, or nullptr if not initialized.
+    std::shared_ptr<SendspinTimeFilter> get_shared_time_filter() const {
+        return this->time_filter_;
     }
 
     /// @brief Returns true if the time filter has received at least one measurement
@@ -787,7 +784,9 @@ public:
         return this->time_filter_->has_update();
     }
 
-    /// @brief Initializes the time filter with Kalman parameters
+    /// @brief Initializes the time filter with Kalman parameters. Call once, before the connection
+    /// can enter a manager slot: ConnectionManager's time filter slot copies this filter at install
+    /// and never refreshes it.
     void init_time_filter();
 
     // ========================================
@@ -1021,8 +1020,9 @@ protected:
 
     // Pointer fields
 
-    /// Time synchronization filter (Kalman-based).
-    std::unique_ptr<SendspinTimeFilter> time_filter_;
+    /// Time synchronization filter (Kalman-based). Shared so role threads can hold it without
+    /// holding this connection (ConnectionManager::current_time_filter()).
+    std::shared_ptr<SendspinTimeFilter> time_filter_;
 
     /// Noise handshake driver (active from connection open until handshake complete).
     std::unique_ptr<NoiseHandshake> noise_handshake_;

@@ -38,7 +38,7 @@ The primitives other than the Inbox live in `src/platform/`, with FreeRTOS imple
 | `ShadowSlot` | Single-writer/single-reader state whose reader is not the main loop, latest-wins or merged (sync-task playback progress, a connection's pending pairing record) |
 | `Inbox` (`src/inbox.h`) | Cross-thread state bound for the main loop, apart from the exemption below |
 
-One lock sits outside these primitives: each connection's `SendspinTimeFilter` guards its state with its own `state_mutex_`, because the main loop updates it while the sync task and the visualizer drain thread convert timestamps through it (`docs/playback-sync.md`).
+Two locks sit outside these primitives, both for time conversion. Each connection's `SendspinTimeFilter` guards its state with its own `state_mutex_`, because the main loop updates it while the sync task and the visualizer drain thread convert timestamps through it (`docs/playback-sync.md`). `ConnectionManager::time_filter_mutex_` guards the slot those threads resolve the current filter from, an exemption from the primitives (`docs/conventions.md`; see [Current Time Filter Slot](#current-time-filter-slot)).
 
 ### Inbox
 
@@ -58,7 +58,7 @@ The Inbox is a single-mutex mailbox with a lock-free dirty-topic bitmask. It off
 | `VisualizerRole::Impl::EventState::config_slot` | `INBOX_TOPIC_VISUALIZER_CONFIG` | Network thread |
 | `ArtworkRole::Impl::EventState::display_slot` | `INBOX_TOPIC_ARTWORK_DISPLAY` | Artwork decode thread |
 
-`ConnectionManager`'s `pending_*_events_` queues are the one exemption (`docs/conventions.md`): they carry connection events whose payloads the POD-only ring cannot hold. `deferred_releases_` is a release queue, not a state channel: the thread that queues an entry flushes it outside the manager lock, except the sync task's stream pin, which `release_from_role_thread()` marks main-loop-only for the main loop to destroy (see [Stream Connection Pin](#stream-connection-pin)). The pairing and trust listener notifications are not cross-thread either: they are queued as `PairingNote`s on the main loop itself, so they can fire after `ConnectionManager` releases its lock.
+`ConnectionManager`'s `pending_*_events_` queues are the one exemption (`docs/conventions.md`): they carry connection events whose payloads the POD-only ring cannot hold. `deferred_releases_` is main-loop-only (see `DeferredRelease`), not a cross-thread channel. The pairing and trust listener notifications are not cross-thread either: they are queued as `PairingNote`s on the main loop itself, so they can fire after `ConnectionManager` releases its lock.
 
 ## One Main Loop Tick
 
@@ -262,9 +262,11 @@ A server sends role traffic right behind its `server/activate`, a tick before pr
 
 A later `server/activate` can remove roles. Each removed role runs the same `cleanup()` a lost connection runs, but the inbox ring is not reset, since the roles that stay active keep their queued events; the `cleanup_generation` stamp drops the removed role's stale ones instead. Nothing is restarted when an activation adds the role back: its role thread never stopped, so it returns through the `client/state` that activation publishes and, for a stream role, the next `stream/start`.
 
-### Stream Connection Pin
+### Current Time Filter Slot
 
-Every timestamp a stream converts belongs to one connection's time filter, so the sync task pins that connection (`ConnectionManager::current_shared()`) as the stream goes active and holds it until the stream ends. The pin stays valid because a filter is never replaced and the admitted slot cannot change servers mid-stream: dropping a connection runs `cleanup_connection_state()`, which ends the stream, before a successor is installed. The pin is often the last reference to a dropped connection, and an outbound connection's destructor joins its transport thread, so the sync task never destroys it: `ConnectionManager::release_from_role_thread()` hands the reference to the main loop's next `flush_deferred_releases()`, or to `~ConnectionManager` when the client is destroyed without `stop()`.
+Role threads convert server timestamps through `SendspinClient::is_time_synced()` and `get_client_time()`: the sync task per chunk, the visualizer drain thread per frame. Both resolve the current connection's `SendspinTimeFilter` through `ConnectionManager::current_time_filter()`, which reads a slot of its own (`current_time_filter_`, under the leaf `time_filter_mutex_`) rather than `conn_ptr_mutex_`, which main-loop sections hold across blocking work such as an application send. `set_current_connection()` writes the slot, so it always names the current connection's filter.
+
+Each getter reads the slot once, so a caller that checks `is_time_synced()` and then calls `get_client_time()` can see two different connections across a server handoff. A drop or handoff commands the stream to end before it changes the slot, so the sync task leaves the stream before transferring such a chunk; `ConnectionManager::stop()` empties the slot before the role threads stop, and the 0 an empty slot returns reads as late.
 
 ### Client Start and Stop
 
@@ -279,9 +281,8 @@ Every timestamp a stream converts belongs to one connection's time filter, so th
    signalled yet: a network thread blocked writing to its ring needs the sync task alive
 2. ConnectionManager::stop(): close admission, snapshot the pairing-UI flags, disable
    dispatch on every connection, send goodbyes with a bounded wait, stop the ws_server
-   (joining its network threads), and release every queued connection outside the locks
-3. Join all role threads; each then discards its ring or queue content. Then flush the
-   deferred releases once more, for a stream pin handed back during the join
+   (joining its network threads), and release every managed connection outside the locks
+3. Join all role threads; each then discards its ring or queue content
 4. cleanup_connection_state(), then queue the pairing-UI dismissals the step 2 snapshot calls for
 5. drain_inbox() delivers the CLEARED / STREAM_END callbacks and pairing notes step 4 queued
 6. lifecycle_ = STOPPED
@@ -294,7 +295,7 @@ The client destructor performs steps 1 and 2 and releases any outstanding high-p
 On ESP, a `SendspinServerConnection`'s lifetime belongs to its httpd session rather than to `ConnectionManager`:
 
 1. `SendspinWsServer::open_callback` creates the `shared_ptr` and stores a heap-allocated copy as the session context, with a `free_fn` that deletes it. That copy is the authoritative reference.
-2. `ConnectionManager::on_new_connection()` receives the same `shared_ptr` and holds it as an observer.
+2. `ConnectionManager::on_new_connection()` receives the same `shared_ptr`; its nursery entry keeps a copy as an observer.
 3. The WebSocket handler looks the connection up through the session context each time it runs. Queued send workers capture a `weak_ptr` and lock it when they run, rather than a socket number, which httpd can reuse for a different session after the original closes.
 4. On close, httpd calls `close_fn` (which tells `ConnectionManager` to drop its observer), then `free_fn` once no worker is queued for the session.
 

@@ -69,9 +69,9 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # (and drops it mid-publish) to pin publish_state()'s hold on it; it reads the private members
 # directly instead of adding a seam. Reached: SendspinClient::connection_manager_, player_ and
 # each role's impl_ (the sync task and the visualizer's drain ring); ConnectionManager's
-# conn_ptr_mutex_, current_connection_, drop_connection(), accepting_ (closed to take
-# on_new_connection()'s rejection branch) and deferred_releases_, whose queued entries the
-# hand-over tests read directly - size, conn and goodbye - to catch a release before a flush.
+# conn_ptr_mutex_, current_connection_, set_current_connection(), drop_connection() and
+# flush_deferred_releases() (to install, swap out, and drop a stand-in connection) and accepting_
+# (closed to take on_new_connection()'s admission-closed rejection).
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
@@ -143,9 +143,9 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     device.
 #   - SendspinClient::request_persist(), note_last_played_server() and
 #     flush_pending_persistence(), plus ConnectionManager::set_current_connection()/
-#     flush_pending_admission() and handle_server_unpair(): the RAM change and its flush are
-#     separate steps on purpose, and only a test that takes them apart can show what one tick
-#     coalesces.
+#     flush_pending_admission() and handle_server_unpair()/flush_deferred_releases(): the RAM
+#     change and its flush are separate steps on purpose, and only a test that takes them apart
+#     can show what one tick coalesces.
 #   - SendspinConnection::last_receive_time_us_, held_count_ and held_bytes_, the hold buffer's
 #     accounting and the liveness stamp a stand-in connection has no transport to set (and, for
 #     the stamp, one the liveness tick test ages directly instead of waiting). Likewise

@@ -28,7 +28,6 @@
 
 namespace sendspin {
 
-class ConnectionManager;
 class SendspinClient;
 class SendspinPersistenceProvider;
 struct ClientHelloMessage;
@@ -80,9 +79,6 @@ struct PlayerRole::Impl {
     // ========================================
 
     void attach_inbox(Inbox& inbox);
-    /// @brief Hands the sync task the connection manager it resolves its stream pin from and
-    /// gives that pin back to. Called at role registration, before start().
-    void attach_connection_manager(ConnectionManager& manager) const;
     /// @param persistence The client's provider at this start, or nullptr; replaces the one
     ///        add_player() set.
     bool start(SendspinPersistenceProvider* persistence);
