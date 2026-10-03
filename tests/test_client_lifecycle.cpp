@@ -1017,7 +1017,7 @@ TEST(ClientLifecycle, ANewcomerWhileAdmissionIsClosedIsGoodbyedWithShutdown) {
     };
     const AdmissionRow rows[] = {
         {"admission closed", false, ADMISSION_CLOSED_TEST_PORT},
-        {"admission open (control)", true, ADMISSION_OPEN_TEST_PORT},
+        {"Control: admission open", true, ADMISSION_OPEN_TEST_PORT},
     };
 
     for (const AdmissionRow& row : rows) {
@@ -1198,10 +1198,13 @@ struct ConnectionObservation {
 
 /// Connection stand-in that records where it was destroyed and how many goodbyes it was asked
 /// for. The tests drive the stream through the player's own handlers, so no message traffic
-/// reaches it: it exists to carry the stream's time filter, and to be goodbyed and freed.
+/// reaches it: it exists to carry the stream's time filter, and to be goodbyed and freed. Its
+/// filter is created with it, as production does before a connection can enter a slot.
 class ObservedConnection : public StubConnection {
 public:
-    explicit ObservedConnection(ConnectionObservation* obs) : obs_(obs) {}
+    explicit ObservedConnection(ConnectionObservation* obs) : obs_(obs) {
+        this->init_time_filter();
+    }
     ~ObservedConnection() override {
         this->obs_->destroyed_on = std::this_thread::get_id();
         this->obs_->destroyed.store(true);
@@ -1259,7 +1262,6 @@ constexpr int64_t SEEDED_SERVER_OFFSET_US = -10LL * 60 * 1000 * 1000;
 /// A stand-in connection whose time filter has taken one measurement of SEEDED_SERVER_OFFSET_US.
 std::shared_ptr<ObservedConnection> make_synced_connection(ConnectionObservation* obs) {
     auto conn = std::make_shared<ObservedConnection>(obs);
-    conn->init_time_filter();
     conn->get_time_filter()->update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000, platform_time_us());
     return conn;
 }
@@ -1301,7 +1303,6 @@ TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheCurrentConnection) {
     }
     ASSERT_TRUE(client.is_time_synced());
     auto newcomer = std::make_shared<ObservedConnection>(&newcomer_obs);
-    newcomer->init_time_filter();
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         manager.set_current_connection(std::move(newcomer));
