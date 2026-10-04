@@ -16,15 +16,15 @@ The filter's first measurement gates playback: the sync task decodes no audio un
 
 ## Sync Task
 
-The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded chunks into PCM that plays at the server's timestamps. Its input is an `InboundItemList` of inbound ring items the protocol task appends to: each audio chunk is decoded in place from the ring item it was received and decrypted into, with its server timestamp read from plaintext bytes 1 to 8, and the item goes back to the ring once decoded. It runs a two-level state machine: an outer loop per stream, and an inner loop per chunk.
+The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded chunks into PCM that plays at the server's timestamps. Its input is an `InboundItemList` of inbound ring items the protocol task appends to: each audio chunk is decoded in place from the ring item it was received and decrypted into, with its server timestamp read from plaintext bytes 1 to 8, and the item goes back to the ring once decoded. The codec header a `stream/start` carries and the marker a `stream/clear` leaves are small items the protocol task writes into the ring itself; each codec header is numbered with its stream's ordinal (`InboundItemHeader::serial`). It runs a two-level state machine: an outer loop per stream, and an inner loop per chunk.
 
 ### Outer Loop
 
 ```api
 ┌──────────────────────────────────────────────────────────┐
-│                    COMMAND_STOP?                          │
-│                    ┌─── yes ──→ exit thread               │
-│                    │                                      │
+│                    COMMAND_STOP?                         │
+│                    ┌─── yes ──→ exit thread              │
+│                    │                                     │
 │  ┌─────────────────┴──────────────────┐                  │
 │  │           IDLE STATE               │                  │
 │  │  • Clear TASK_RUNNING and the      │                  │
@@ -33,20 +33,27 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 │  │  • Leaving a stream: note sync     │                  │
 │  │    idle to the main loop's inbox   │                  │
 │  │  • Reset context + progress slot   │                  │
-│  │  • Wait for codec header (wake);   │◄──┐              │
-│  │    a COMMAND_START with no header  │   │              │
-│  │    pending is stale: loop back     │   │              │
+│  │  • Wait for the codec header of a  │◄──┐              │
+│  │    stream not yet ended (wake),    │   │              │
+│  │    starting from one ACTIVE kept;  │   │              │
+│  │    an acknowledgement with no      │   │              │
+│  │    header pending is stale: loop   │   │              │
+│  │    back                            │   │              │
 │  └────────────┬───────────────────────┘   │              │
 │               │ got header                │              │
 │               ▼                           │              │
 │  ┌────────────────────────────────────┐   │              │
 │  │     WAIT FOR CLIENT ACK            │   │              │
-│  │  • Wait on COMMAND_START or        │   │              │
-│  │    STOP/END/CLEAR                  │   │              │
-│  │  • If END/CLEAR arrives, return    │───┘              │
-│  │    header to buffer and loop back  │                  │
+│  │  • Wait until the acknowledged     │   │              │
+│  │    ordinal reaches the header's;   │   │              │
+│  │    an earlier one is stale: note   │   │              │
+│  │    sync idle and keep waiting      │   │              │
+│  │  • CLEAR: discard up to the        │   │              │
+│  │    marker, keep the header         │   │              │
+│  │  • If END arrives, return the      │───┘              │
+│  │    header to the ring, loop back   │                  │
 │  └────────────┬───────────────────────┘                  │
-│               │ COMMAND_START                             │
+│               │ acknowledged                             │
 │               ▼                                          │
 │  ┌────────────────────────────────────┐                  │
 │  │         ACTIVE STATE               │                  │
@@ -56,7 +63,7 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 │  │  • Decode initial codec header     │                  │
 │  │  • Run inner state machine loop    │                  │
 │  └────────────┬───────────────────────┘                  │
-│               │ STOP/END                                 │
+│               │ STOP/END, or the next stream's header    │
 │               ▼                                          │
 │  ┌────────────────────────────────────┐                  │
 │  │  Return the held ring item         │──────→ loop back │
@@ -64,7 +71,7 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 └──────────────────────────────────────────────────────────┘
 ```
 
-The WAIT FOR CLIENT ACK step is the sync task's half of the stream end/start handshake with the main loop (`docs/internals.md`, "Stream End and Start"). A `COMMAND_START` that reaches the task while it waits for a header, with none pending, belongs to a stream the task already left (a `stream/start` and `stream/end` the main loop drained together): the task takes it as stale and loops back through IDLE, which clears it and notes the idle state the main loop's held STREAM_END waits for, so the next stream waits for its own start (except in the case `docs/internals.md`, "Stream End and Start", names as a gap).
+The WAIT FOR CLIENT ACK step is the sync task's half of the stream end/start handshake with the main loop (`docs/internals.md`, "Stream End and Start"). The main loop acknowledges a stream by its ordinal (`SyncTask::signal_stream_start()`, with `COMMAND_START` as the wake), and the task starts a header only on an acknowledgement that has reached the header's ordinal. An acknowledgement for an earlier stream belongs to a stream the task already left (stream events the main loop drained together): with a later header held, the task notes idle and keeps waiting; with no header pending, it loops back through IDLE, which notes the same. Either way the main loop's held STREAM_END for that stream is released, and the next stream waits for its own start. A `stream/end` records the ordinal it ended (`SyncTask::signal_stream_end()`), so a header of an ended stream that the task takes only after that end is discarded rather than started. The same ordinal settles a header the task takes while ACTIVE: once the active stream's ordinal has ended, the header belongs to the next stream, so the task keeps it (`SyncContext::next_header`) instead of decoding it into the ended one, leaves, and IDLE starts from it.
 
 ### Inner Loop
 
@@ -84,7 +91,7 @@ COMMAND_STREAM_CLEAR from any state → discard up to the clear marker → INITI
 - **SYNCHRONIZE_AUDIO** compares the chunk's playback time, converted to the client clock and adjusted for the output delay and `fixed_delay_us`, with the time the next written audio will actually play. An error beyond `HARD_SYNC_THRESHOLD_US` is corrected at once (a hard sync): silence is inserted when the audio is early, and late audio is dropped. A smaller error beyond `SOFT_SYNC_THRESHOLD_US` is corrected gradually (a soft sync): one frame is added or removed per chunk. Errors inside that dead zone pass through unmodified. From stream start or a seek, and after any hard sync, the tighter `HARD_SYNC_SETTLE_THRESHOLD_US` applies until the error settles, and a hard sync outside alignment is logged as a loss of sync. These thresholds are in `src/sync_task.cpp`.
 - **TRANSFER_AUDIO** writes the PCM through `on_audio_write`. When a hard sync inserted silence, it writes that first and then returns to SYNCHRONIZE_AUDIO to re-check the chunk it held back.
 
-A `stream/clear` (a seek) keeps the stream ACTIVE: the inner loop discards encoded and already-decoded audio up to the clear marker the protocol task appended, keeps the decoder and playtime accounting, and re-enters INITIAL_SYNC, which resumes priming only if it had not finished and otherwise passes straight to LOAD_CHUNK. The next chunk then re-aligns under the alignment rules above.
+A `stream/clear` (a seek) keeps the stream ACTIVE: the inner loop discards encoded and already-decoded audio up to the clear marker the protocol task appended, keeps the decoder, playtime accounting and any codec header queued ahead of the marker, and re-enters INITIAL_SYNC, which resumes priming only if it had not finished and otherwise passes straight to LOAD_CHUNK. The next chunk then re-aligns under the alignment rules above. A clear that reaches the task in WAIT FOR CLIENT ACK discards the same way and keeps the held header, so the stream still starts on its acknowledgement.
 
 ### Playback Progress
 

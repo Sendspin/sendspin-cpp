@@ -35,8 +35,7 @@ namespace sendspin {
  *
  * Wraps a shared IXWebSocket handed off by SendspinWsServer. Incoming messages arrive through
  * handle_message() on the server's callback thread, which hands each to the protocol task through
- * the inbound ring. start() and loop() are no-ops because the transport is already open on
- * construction.
+ * the inbound ring. start() is a no-op because the transport is already open on construction.
  */
 class SendspinServerConnection : public SendspinConnection {
 public:

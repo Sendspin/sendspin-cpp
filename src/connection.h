@@ -1126,11 +1126,13 @@ protected:
     /// Tag of the client/time frame in flight: the low 32 bits of the client_transmitted it
     /// carries, never 0 for a frame, and 0 once the frame is claimed or cancelled. A failed send
     /// leaves its tag, which no reply can echo. 32 bits because a 64-bit atomic takes a lock on
-    /// the ESP32 family.
+    /// the ESP32 family. Written on the protocol task (send, claim and cancel) and by the
+    /// transport thread's fail_inbound() (cancel); read on the protocol task.
     std::atomic<uint32_t> time_frame_tag_{0};
 
     /// Low 32 bits of the client clock when the frame in flight was handed to the socket, seeded
-    /// with the tag until the write hook overwrites it on whichever thread performs the write.
+    /// with the tag on the protocol task until the write hook overwrites it on whichever thread
+    /// performs the write; read on the protocol task (claim_time_frame()).
     std::atomic<uint32_t> time_frame_sent_us_{0};
 
     // 16-bit fields

@@ -558,8 +558,8 @@ void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event,
 // ============================================================================
 
 void VisualizerRole::Impl::cleanup() {
-    // Stamps every event queued from here on, so the STREAM_END below is delivered while an event
-    // queued for the stream this teardown ends is discarded (see cleanup_generation).
+    // Stamps every event queued from here on, so an event queued for the stream this teardown
+    // ends is discarded (see cleanup_generation).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->stream_active = false;
@@ -581,9 +581,14 @@ void VisualizerRole::Impl::cleanup() {
     // event_is_current()).
     this->event_state->config_slot.reset();
 
-    // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the callback
-    // (enqueue_stream_event() logs if the ring is too full to take it).
-    this->enqueue_stream_event(VisualizerEventType::STREAM_END, generation);
+    push_event_or_log(this->inbox, InboxEventType::VISUALIZER_CLEARED, 0, TAG,
+                      "visualizer cleared event", generation);
+}
+
+void VisualizerRole::Impl::complete_teardown() const {
+    if (this->listener) {
+        this->listener->on_visualizer_stream_end();
+    }
 }
 
 // ============================================================================
@@ -669,6 +674,16 @@ void VisualizerRole::Impl::flush_items() const {
     }
 }
 
+void* VisualizerRole::Impl::take_item(uint32_t timeout_ms) const {
+    void* item = this->drain_task->items.take(timeout_ms);
+    while (item != nullptr && inbound_item_header(item)->generation !=
+                                  this->cleanup_generation.load(std::memory_order_acquire)) {
+        this->drain_task->ring.load(std::memory_order_acquire)->return_item(item);
+        item = this->drain_task->items.take(0);
+    }
+    return item;
+}
+
 void VisualizerRole::Impl::signal_clear_marker(uint32_t generation) {
     // Protocol-task side of a clear boundary. Set the flag before appending the marker (like
     // PlayerRole::handle_stream_clear) so the drain thread starts discarding (freeing ring space)
@@ -719,7 +734,6 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
 
     // Bound by start() before this thread exists and unbound by stop() only after it is joined.
     InboundRing& ring = *self->drain_task->ring.load(std::memory_order_acquire);
-    auto& items = self->drain_task->items;
     auto& flags = self->drain_task->event_flags;
     const int32_t offset_ms = self->config.display_offset_ms;
 
@@ -765,16 +779,14 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         // Blocking take; returns early (nullptr) when wake_receiver() signals a stop, flush, or
         // clear. The timeout is only a safety net against a missed wake (see
         // DRAIN_RECEIVE_TIMEOUT_MS).
-        void* item = items.take(DRAIN_RECEIVE_TIMEOUT_MS);
+        void* item = self->take_item(DRAIN_RECEIVE_TIMEOUT_MS);
         if (item == nullptr) {
             continue;
         }
         const InboundItemHeader* header = inbound_item_header(item);
 
-        // Appended for a stream a teardown has since ended (the protocol task recalls such frames
-        // on its next tick; this catches one taken first), or waiting for time sync.
-        if (header->generation != self->cleanup_generation.load(std::memory_order_acquire) ||
-            !self->client->is_time_synced()) {
+        // Waiting for time sync.
+        if (!self->client->is_time_synced()) {
             ring.return_item(item);
             continue;
         }

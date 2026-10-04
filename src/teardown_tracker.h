@@ -45,7 +45,7 @@ class TeardownTracker {
 public:
     /// @brief Whether `generation` is a teardown the main loop has not caught up with yet
     bool pending(uint32_t generation) const {
-        return generation_after(generation, this->completed_);
+        return count_after(generation, this->completed_);
     }
 
     /// @brief Marks `generation` caught up

@@ -1423,7 +1423,7 @@ TEST(ArtworkFrameDoneGate, RestartReleasesUndisplayedDecode) {
     impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));  // restart
 
     // Give the decode thread's async display hand-off a chance to land, then confirm the restart
-    // (epoch bump + display_slot reset) keeps it from ever reaching the listener.
+    // (its epoch bump) keeps it from ever reaching the listener.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     impl->drain_events();
     impl->drain_events();

@@ -653,16 +653,24 @@ TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
     EXPECT_FALSE(pop_entry(*impl, entry));
 }
 
-// A teardown on the main loop moves the role's generation on; the protocol task's next tick
-// recalls the frames the drain thread has not taken, returning them and their quota charge to the
-// shared ring rather than leaving the old stream's frames to be delivered later.
+// A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and
+// the old stream's frames are never delivered: the protocol task's next tick recalls what the
+// drain thread has not taken, returning it and its quota charge to the shared ring, and a frame
+// the drain thread takes before that tick is dropped by its generation stamp and returned the
+// same way.
 TEST(VisualizerClearMarker, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) {
     struct Row {
         const char* name;
         bool teardown;
-        bool frames_left;
+        bool recall_tick;
+        bool listed_before_take;
+        size_t delivered;
     };
-    const Row rows[] = {{"Control: no teardown", false, true}, {"torn down", true, false}};
+    const Row rows[] = {
+        {"Control: no teardown", false, true, true, 2},
+        {"torn down, recalled by the protocol task's tick", true, true, false, 0},
+        {"torn down, taken by the drain thread before the recall", true, false, true, 0},
+    };
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -680,12 +688,22 @@ TEST(VisualizerClearMarker, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) 
         if (row.teardown) {
             impl->cleanup();
         }
+        if (row.recall_tick) {
+            impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
+        }
 
-        impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
-
-        EXPECT_EQ(!impl->drain_task->items.is_empty(), row.frames_left);
-        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding() > 0, row.frames_left);
-        impl->flush_items();
+        EXPECT_EQ(!impl->drain_task->items.is_empty(), row.listed_before_take);
+        // Taken under the live generation, as the drain thread takes them: a recalled or stale
+        // frame is not delivered, and one left over is.
+        size_t delivered = 0;
+        void* item = nullptr;
+        while ((item = impl->take_item(0)) != nullptr) {
+            ++delivered;
+            ring.return_item(item);
+        }
+        EXPECT_EQ(delivered, row.delivered);
+        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
+            << "a frame of the torn-down stream kept its charge";
     }
 }
 

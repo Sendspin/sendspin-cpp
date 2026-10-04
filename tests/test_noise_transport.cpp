@@ -1927,7 +1927,9 @@ struct InboundHarness {
 // into the shared ring, waits up to InboundGate::WRITABLE_WAIT_MS for that and is then closed
 // rather than parking the transport thread. An admitted connection's message longer than the ring
 // takes waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and is then dropped like
-// one, the connection left open. The Control rows consume the first message in time.
+// one, the connection left open. The Control rows consume the first message in time. The two
+// rows that leave the first message pending wait out those bounds (about 600 ms together): the
+// bound running out is the behavior under test.
 TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
     struct Row {
         const char* name;

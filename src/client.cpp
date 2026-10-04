@@ -506,10 +506,10 @@ void SendspinClient::stop() {
     }
 
     // 7. Deliver what the teardown owes, now rather than on a loop() tick that is not coming:
-    //    each role's main-loop half (its clear or STREAM_END callback), the high-performance
-    //    releases the shutdown pass queued, the owed provider writes and the dismissals above.
-    //    Every getter already reports the stopped state, so a callback that reads the client sees
-    //    exactly what a caller sees once stop() returns.
+    //    each role's main-loop half (its clear callback, the player's on_stream_end()), the
+    //    high-performance releases the shutdown pass queued, the owed provider writes and the
+    //    dismissals above. Every getter already reports the stopped state, so a callback that reads
+    //    the client sees exactly what a caller sees once stop() returns.
     this->drain_inbox();
 
     this->lifecycle_.store(LifecycleState::STOPPED, std::memory_order_release);
@@ -730,8 +730,7 @@ uint32_t SendspinClient::request_high_performance(bool acquire) {
 bool SendspinClient::high_performance_granted(uint32_t ticket) const {
     // Tickets and grants count the same acquires in the same order, so the grant for `ticket`
     // is visible once the granted count has reached it (compared across the wrap).
-    return !generation_after(ticket,
-                             this->high_performance_granted_.load(std::memory_order_acquire));
+    return !count_after(ticket, this->high_performance_granted_.load(std::memory_order_acquire));
 }
 
 void SendspinClient::apply_high_performance_requests() {
@@ -774,45 +773,57 @@ void SendspinClient::drain_inbox() {
     // EventState::drain_generation).
     const uint32_t drain_generation = es.drain_generation;
 
-    // Each role with main-loop state catches up on the teardowns the protocol task ran since the
-    // last drain: one acquire load per role (the visualizer has no main-loop half). Event dispatch
-    // and the role drains catch up on their own, at the stamp they act on; this pass covers a
-    // teardown whose stamped CLEARED or STREAM_END the full event ring dropped, which would
-    // otherwise leave the role holding the torn-down connection's state (and the player its
-    // playback hold) until the role's next drain. It can only run a teardown half earlier, never
-    // apply anything: a slot payload is still applied only when its stamp is the current
-    // generation.
+    // Catches each role up on a teardown: with `cleared` null, to the role's current generation;
+    // otherwise only the role a *_CLEARED event names, to the generation it carries.
+    // [[maybe_unused]]: with every role compiled out the body is empty.
+    const auto catch_up_roles = [this]([[maybe_unused]] const InboxEvent* cleared) {
+        [[maybe_unused]] const auto catch_up = [cleared](auto& impl, InboxEventType type) {
+            if (cleared == nullptr) {
+                catch_up_teardown(impl, impl.cleanup_generation.load(std::memory_order_acquire));
+            } else if (cleared->type == type) {
+                catch_up_teardown(impl, cleared->epoch);
+            }
+        };
 #ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        catch_up_teardown(*this->player_->impl_,
-                          this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
+        if (this->player_) {
+            catch_up(*this->player_->impl_, InboxEventType::PLAYER_CLEARED);
+        }
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (this->controller_) {
-        catch_up_teardown(
-            *this->controller_->impl_,
-            this->controller_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
+        if (this->controller_) {
+            catch_up(*this->controller_->impl_, InboxEventType::CONTROLLER_CLEARED);
+        }
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
-    if (this->metadata_) {
-        catch_up_teardown(*this->metadata_->impl_, this->metadata_->impl_->cleanup_generation.load(
-                                                       std::memory_order_acquire));
-    }
+        if (this->metadata_) {
+            catch_up(*this->metadata_->impl_, InboxEventType::METADATA_CLEARED);
+        }
 #endif
 #ifdef SENDSPIN_ENABLE_COLOR
-    if (this->color_) {
-        catch_up_teardown(*this->color_->impl_,
-                          this->color_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
+        if (this->color_) {
+            catch_up(*this->color_->impl_, InboxEventType::COLOR_CLEARED);
+        }
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_) {
-        catch_up_teardown(*this->artwork_->impl_, this->artwork_->impl_->cleanup_generation.load(
-                                                      std::memory_order_acquire));
-    }
+        if (this->artwork_) {
+            catch_up(*this->artwork_->impl_, InboxEventType::ARTWORK_CLEARED);
+        }
 #endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+        if (this->visualizer_) {
+            catch_up(*this->visualizer_->impl_, InboxEventType::VISUALIZER_CLEARED);
+        }
+#endif
+    };
+
+    // Each role catches up on the teardowns the protocol task ran since the last drain: one
+    // acquire load per role. Event dispatch and the role drains catch up on their own, at the
+    // stamp they act on; this pass covers a teardown whose stamped *_CLEARED event the full event
+    // ring dropped, which would otherwise leave the role's clear undelivered and the role holding
+    // the torn-down connection's state (and the player its playback hold). It can only run a
+    // teardown half earlier, never apply anything: a slot payload is still applied only when its
+    // stamp is the current generation.
+    catch_up_roles(nullptr);
 
     const uint32_t inbox_bits = es.inbox.poll();
 
@@ -875,41 +886,23 @@ void SendspinClient::drain_inbox() {
                                                  std::memory_order_acquire),
                                              TAG, "a player stream event")) {
                             catch_up_teardown(*this->player_->impl_, event.epoch);
-                            this->player_->impl_->on_stream_ring_event(
-                                static_cast<PlayerStreamCallbackType>(event.code));
+                            this->player_->impl_->on_stream_ring_event(event);
                         }
 #endif
                         break;
                     }
-                    // CONTROLLER_CLEARED / METADATA_CLEARED / COLOR_CLEARED: pushed by each role's
-                    // cleanup(). The clear callback is the role's main-loop teardown half, so the
-                    // event only catches the role up; a stale one (a later teardown, or a drain
-                    // that took the next connection's state, already caught up past it) is a
-                    // no-op.
-                    case InboxEventType::CONTROLLER_CLEARED: {
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-                        if (this->controller_) {
-                            catch_up_teardown(*this->controller_->impl_, event.epoch);
-                        }
-#endif
+                    // *_CLEARED: pushed by each role's cleanup(). The clear callback is the role's
+                    // main-loop teardown half, so the event only catches the role up; a stale one
+                    // (a later teardown, or a drain that took the next connection's state, already
+                    // caught up past it) is a no-op.
+                    case InboxEventType::PLAYER_CLEARED:
+                    case InboxEventType::CONTROLLER_CLEARED:
+                    case InboxEventType::METADATA_CLEARED:
+                    case InboxEventType::COLOR_CLEARED:
+                    case InboxEventType::ARTWORK_CLEARED:
+                    case InboxEventType::VISUALIZER_CLEARED:
+                        catch_up_roles(&event);
                         break;
-                    }
-                    case InboxEventType::METADATA_CLEARED: {
-#ifdef SENDSPIN_ENABLE_METADATA
-                        if (this->metadata_) {
-                            catch_up_teardown(*this->metadata_->impl_, event.epoch);
-                        }
-#endif
-                        break;
-                    }
-                    case InboxEventType::COLOR_CLEARED: {
-#ifdef SENDSPIN_ENABLE_COLOR
-                        if (this->color_) {
-                            catch_up_teardown(*this->color_->impl_, event.epoch);
-                        }
-#endif
-                        break;
-                    }
                     // ARTWORK_STREAM / VISUALIZER_STREAM: code is the role-local
                     // ArtworkEventType/VisualizerEventType.
                     case InboxEventType::ARTWORK_STREAM: {
@@ -952,7 +945,7 @@ void SendspinClient::drain_inbox() {
             // generation but leaves drain_aborted false: the check at the top of the inner loop
             // never runs again because there is no next iteration. Re-check here so the loop stops
             // instead of calling take_events() again and destructively pulling the cleanup's
-            // freshly re-pushed CLEARED/STREAM_END events off the live ring (dropping them).
+            // freshly re-pushed *_CLEARED events off the live ring (dropping them).
             if (es.drain_generation != drain_generation) {
                 drain_aborted = true;
             }
@@ -1327,10 +1320,10 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
     // the survivor's events, group and time-sync report in place.
     if (teardown_roles == ALL_ROLES_MASK) {
         // A second teardown before the main loop drains (a handoff chain can displace two
-        // connections in one tick) wipes the first teardown's just-pushed CLEARED/STREAM_END
-        // events here before they are ever drained. That is safe only because every role's
-        // cleanup() below pushes its full event set unconditionally, re-creating exactly what
-        // this wiped. Keep role cleanups unconditional or this reset starts losing clear signals.
+        // connections in one tick) wipes the first teardown's just-pushed *_CLEARED events here
+        // before they are ever drained. Nothing is lost: every role's cleanup() below pushes its
+        // own again, and the teardowns the two stamp collapse into one main-loop half, which the
+        // head of every drain runs from the role's generation even without the event.
         this->event_state_->inbox.reset_events();
         this->event_state_->group_slot.reset();
         this->event_state_->time_sync_slot.reset();

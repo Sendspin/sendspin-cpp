@@ -151,11 +151,11 @@ struct VisualizerRole::Impl {
     /// @param generation The event's stamp: a STREAM_START applies only the config written with
     ///        the same stamp.
     void handle_stream_ring_event(VisualizerEventType event, uint32_t generation) const;
-    /// @brief The main-loop teardown half, which the event drain runs through
-    /// catch_up_teardown() like every role's. The visualizer keeps no main-loop state (its
-    /// stream events carry everything the listener hears, and the STREAM_END cleanup() queues is
-    /// its clear), so there is nothing to reset.
-    void complete_teardown() {}
+    /// @brief The main-loop teardown half: delivers the stream end the teardown owes the
+    /// listener (on_visualizer_stream_end()). The visualizer keeps no other main-loop state: its
+    /// stream events carry everything the listener hears. Main loop only, through
+    /// catch_up_teardown().
+    void complete_teardown() const;
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
     /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
@@ -171,8 +171,8 @@ struct VisualizerRole::Impl {
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
     /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
-    /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
-    /// the inbox, stamped with the new generation.
+    /// from active_roles (SendspinClient::apply_role_removals()). Queues VISUALIZER_CLEARED,
+    /// stamped with the new generation, for the main loop to catch up on (catch_up_teardown()).
     void cleanup();
 
     // ========================================
@@ -185,6 +185,13 @@ struct VisualizerRole::Impl {
     bool signal_stop() const;
     /// @brief Joins the drain thread and returns every frame it had not taken to the ring
     void stop() const;
+    /// @brief Takes the next item from the drain list, returning to the ring any whose teardown
+    /// generation the role has moved past (it was appended for a stream a teardown ended; the
+    /// protocol task recalls such items on its next tick, and this catches one taken first).
+    /// Drain thread.
+    /// @param timeout_ms As InboundItemList::take(), applied to the first take only.
+    /// @return The item, or nullptr: treat it as "re-check the commands and retry".
+    void* take_item(uint32_t timeout_ms) const;
     /// @brief Returns every frame on the list to the ring. Drain thread, or the main loop once it
     /// is joined.
     void flush_items() const;
@@ -242,8 +249,12 @@ struct VisualizerRole::Impl {
     /// read on the main loop, the drain thread and the protocol task.
     std::atomic<uint32_t> cleanup_generation{0};
 
+    /// The negotiated stream's spectrum shape. Written by handle_stream_start() on the protocol
+    /// task; read on the drain thread.
     std::atomic<uint8_t> spectrum_bin_count{0};
     std::atomic<bool> tracks_downbeats{false};
+    /// Written on the protocol task (or the main loop in stop() once it is joined); read by
+    /// handle_binary() on the protocol task.
     std::atomic<bool> stream_active{false};
     // Bitmask of negotiated wire types, bit N = wire type SENDSPIN_BINARY_VISUALIZER_FIRST + N.
     // Written by handle_stream_start and read by handle_binary on the same protocol task, so

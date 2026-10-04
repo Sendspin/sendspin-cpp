@@ -352,10 +352,11 @@ void hand_copied_chunk(PlayerRole::Impl& impl, std::vector<uint8_t> chunk, uint3
     take_in_ring_order(*impl.sync_task->ring());
 }
 
-// Drains the inbox and counts the player stream events it held.
+// Drains the inbox and counts the player stream events and teardown markers it held.
 struct StreamEventCounts {
     int starts{0};
     int ends{0};
+    int cleared{0};
 };
 
 StreamEventCounts drain_stream_events(PlayerRole::Impl& impl) {
@@ -363,6 +364,10 @@ StreamEventCounts drain_stream_events(PlayerRole::Impl& impl) {
     InboxEvent events[Inbox::EVENT_CAPACITY];
     const size_t n = impl.inbox->take_events(events, Inbox::EVENT_CAPACITY);
     for (size_t i = 0; i < n; ++i) {
+        if (events[i].type == InboxEventType::PLAYER_CLEARED) {
+            ++counts.cleared;
+            continue;
+        }
         if (events[i].type != InboxEventType::PLAYER_STREAM) {
             continue;
         }
@@ -445,7 +450,7 @@ TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
         const uint32_t captured = live_generation(*impl);
 
         impl->cleanup();
-        ASSERT_EQ(drain_stream_events(*impl).ends, 1) << "cleanup() queued no STREAM_END";
+        ASSERT_EQ(drain_stream_events(*impl).cleared, 1) << "cleanup() queued no PLAYER_CLEARED";
         ASSERT_TRUE(impl->sync_task->encoded_items_.is_empty());
 
         row.drive(*impl, captured);

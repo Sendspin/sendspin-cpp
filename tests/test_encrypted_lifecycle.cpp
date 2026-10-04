@@ -1108,7 +1108,8 @@ TEST(EncryptedLifecycle, ControllerCommandsNeedAnOfferedCommandAndItsParameter) 
 
     std::vector<std::string> expected;
     for (const Row& row : rows) {
-        controller.send_command(row.cmd);
+        EXPECT_EQ(controller.send_command(row.cmd), row.sent_as != nullptr)
+            << "the refusal must reach the caller: " << to_cstr(row.cmd.command);
         if (row.sent_as != nullptr) {
             expected.emplace_back(row.sent_as);
         }
@@ -1872,8 +1873,8 @@ public:
     void deliver(SendspinConnection& conn, const std::string& json) {
         // A complete message off a transport proves the peer alive (end_inbound_message()),
         // and the protocol tick's liveness scan reaps an admitted connection whose last arrival
-        // is older than the timeout. Handing the JSON straight to the dispatch entry point skips the stamp, so
-        // do it here rather than stubbing the tick out.
+        // is older than the timeout. Handing the JSON straight to the dispatch entry point skips
+        // the stamp, so do it here rather than stubbing the tick out.
         conn.last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                          std::memory_order_relaxed);
         this->client_storage->process_json_message(&conn, json.data(), json.size(),
@@ -2444,9 +2445,9 @@ public:
 // stream and send its binary data, and the client drops binary from a connection that is not
 // admitted yet. A state sent before the connection is installed in the admitted slot would invite
 // an artwork announce into that gap; the announce is dropped and the part behind it is a malformed
-// sequence the role closes the connection on. A first activate that selects pairing alone still carries active roles on a
-// playback-capable connection (messaging.md "server/activate"), and those are owed the initial
-// state as well.
+// sequence the role closes the connection on. A first activate that selects pairing alone still
+// carries active roles on a playback-capable connection (messaging.md "server/activate"), and
+// those are owed the initial state as well.
 //
 // Driven through the protocol task's own tick from the nursery, so the order under test is the
 // one a real promotion runs. The stand-in sends inline, which makes "was it admitted when the state
@@ -2518,13 +2519,14 @@ public:
     std::optional<SendspinGoodbyeReason> goodbye;
 };
 
-// The protocol tick's liveness scan reads the admitted connection's last-arrival stamp: a connection whose
-// last arrival is older than the timeout is dropped with a restart goodbye (messaging.md
-// "client/goodbye"), and one heard from just now stays current. The stamp is set directly rather
-// than aged by waiting, and the timeout is the manager's own, default-derived and tens of seconds,
-// so no scheduling stall can age the control row past it. The stand-in is promoted from the
-// nursery by a real tick, so it holds the slot the way an established connection does; as a
-// Sentinel-category playback connection it is admissible only with unpaired access on.
+// The protocol tick's liveness scan reads the admitted connection's last-arrival stamp: a
+// connection whose last arrival is older than the timeout is dropped with a restart goodbye
+// (messaging.md "client/goodbye"), and one heard from just now stays current. The stamp is set
+// directly rather than aged by waiting, and the timeout is the manager's own, default-derived and
+// tens of seconds, so no scheduling stall can age the control row past it. The stand-in is
+// promoted from the nursery by a real tick, so it holds the slot the way an established
+// connection does; as a Sentinel-category playback connection it is admissible only with unpaired
+// access on.
 TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
     struct Row {
         const char* label;
@@ -3362,16 +3364,15 @@ private:
 
 }  // namespace
 
-// The lifecycle handlers change RAM under conn_ptr_mutex_ and leave the provider write to
-// SendspinClient::flush_pending_persistence(), which holds no lock. Consumer threads reading the
-// connection and the protocol task's server/pair-finalize handler take the same mutex, and on ESP
-// the write is an NVS commit that stalls code running from flash for tens of milliseconds.
-//
-// The provider above holds that whole window open inside the persist_records() the flush after
-// the first activate performs.
-// A get_server_information() issued in the window must still return. It is waited on with no timeout, so a regression hangs rather than turning a
-// loaded runner into a failure, and the watchdog in tests/main.cpp names the test.
-TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
+// The persistence provider is called only from the main loop (flush_pending_persistence()), and on
+// ESP its write is an NVS commit that stalls code running from flash for tens of milliseconds, so
+// connection work must not wait for it. The provider above parks the main loop inside the
+// persist_records() the flush after the first activate performs; while it is parked, the server
+// information the protocol task published reads back the admitted server, and a disconnect
+// requested from another thread still reaches the peer as a goodbye. Both waits have no timeout:
+// a regression hangs rather than turning a loaded runner into a failure, and the watchdog in
+// tests/main.cpp names the test.
+TEST(EncryptedLifecycle, ASlowRecordWriteDoesNotStallTheProtocolTask) {
     PairedPeer peer = make_paired_peer();
     TestNetworkProvider network;
     BlockingRecordWriteProvider persistence(peer.record);
@@ -3385,7 +3386,7 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     ASSERT_TRUE(client.start());
 
     // The main loop runs on its own thread from here: it is the thread that parks in the write,
-    // so the probe below has to be a different one.
+    // so the requests below come from a different one.
     std::atomic<bool> pumping{true};
     std::thread main_loop([&] {
         while (pumping.load(std::memory_order_acquire)) {
@@ -3399,24 +3400,18 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
                                peer.record.psk_id, peer.psk);
     persistence.wait_until_entered();
 
-    std::promise<void> probed;
-    std::future<void> probed_future = probed.get_future();
-    std::thread probe([&] {
-        (void)client.get_server_information();
-        probed.set_value();
-    });
-
-    // The provider is still parked here, so a current_shared() that waits on the manager lock
-    // hangs on this get().
-    probed_future.get();
-    probe.join();
+    // The provider stays parked until release() below.
+    const auto info = client.get_server_information();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->server_id, peer.server_identity.peer_id());
+    client.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+    wait_until([&] { return server.goodbye_reason().has_value(); });
+    EXPECT_EQ(server.goodbye_reason().value_or(""), "user_request");
 
     persistence.release();
     pumping.store(false, std::memory_order_release);
     main_loop.join();
-
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-    pump_for(client, 100);
+    client.stop();
 }
 
 // pairing.md "Unpaired Access" on one live client. Turning the setting on restarts an idle

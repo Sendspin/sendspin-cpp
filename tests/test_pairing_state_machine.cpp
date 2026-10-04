@@ -586,10 +586,10 @@ protected:
     }
 
     /// Drive handle_enter_pairing() for the injected current connection via the same call
-    /// ConnectionManager::on_server_activate() makes for a first pairing activate. Called directly (through
-    /// the private-access seam) rather than replaying the full activate-arbitration path, since
-    /// arbitration itself is exercised by test_admission.cpp and is not the subject of this
-    /// harness.
+    /// ConnectionManager::on_server_activate() makes for a first pairing activate. Called
+    /// directly (through the private-access seam) rather than replaying the full
+    /// activate-arbitration path, since arbitration itself is exercised by test_admission.cpp and
+    /// is not the subject of this harness.
     ///
     /// Production bumps pairing_index at the point a pairing server/activate is RECEIVED
     /// (ConnectionManager::on_server_activate(), before the admissibility gate), not
@@ -1353,8 +1353,9 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
 
     // A fresh SendspinTimeBurst starts its first burst immediately (last_burst_complete_time_
     // defaults to 0, so the inter-burst wait is trivially satisfied), so any tick that reaches
-    // the connection's time_burst().loop() sends. The connection still declares 'pairing', which must not stop it:
-    // a player keeps its timeline across an attempt and can only do that with a converging filter.
+    // the connection's time_burst().loop() sends. The connection still declares 'pairing', which
+    // must not stop it: a player keeps its timeline across an attempt and can only do that with a
+    // converging filter.
     //
     // Without a Noise session the send itself fails, but send_time_message() records the frame in
     // flight before sending, so a nonzero tag shows the burst reached the send.
@@ -1423,7 +1424,8 @@ TEST_F(PairingStateMachineTest, DynamicCodeAttemptTimeout) {
     this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 
-    // Force the attempt deadline into the past; the next loop() tick must detect and abort it.
+    // Force the attempt deadline into the past; the next protocol-task tick must detect and abort
+    // it.
     conn->pairing_session().attempt_deadline_us = platform_time_us() - 1;
     this->pump();
 
@@ -2358,7 +2360,7 @@ TEST_F(PairingStateMachineTest, GestureWaitHasNoClientTimeout) {
     EXPECT_EQ(conn->pairing_session().attempt_deadline_us, 0)
         << "client/pair-pending must not arm the attempt timeout";
 
-    // Further loop() ticks must not abort the waiting session.
+    // Further protocol-task ticks must not abort the waiting session.
     this->pump();
     this->pump();
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);

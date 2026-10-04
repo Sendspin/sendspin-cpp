@@ -381,6 +381,10 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t ge
 void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj,
                                            uint32_t generation) {
     bool header_sent = false;
+    // This stream's ordinal: hand_item() numbers its codec header with the same
+    // stream_ordinal + 1 and its STREAM_START carries it, so the sync task starts it only on its
+    // own acknowledgement.
+    const auto ordinal = static_cast<uint16_t>(this->stream_ordinal + 1);
 
     if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
         !player_obj.sample_rate.has_value() || !player_obj.codec.has_value()) {
@@ -422,10 +426,11 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     }
 
     if (!header_sent) {
-        this->sync_task->signal_stream_end();
-        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
+        this->sync_task->signal_stream_end(this->stream_ordinal);
+        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation, 0);
         return;
     }
+    this->stream_ordinal = ordinal;
 
     // The codec-header write above waits up to HEADER_SEND_TIMEOUT_MS for ring space, which is the
     // widest window a teardown can land in between the receive gate and this publication. One
@@ -442,12 +447,12 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     // teardown that lands between the two Inbox writes (stop()'s, on the main loop) leaves a
     // START the drain discards and params it never applies (see drain_events()).
     this->event_state->stream_params_slot.write(player_obj, generation);
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation, ordinal);
 }
 
 void PlayerRole::Impl::handle_stream_end(uint32_t generation) const {
-    this->sync_task->signal_stream_end();
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
+    this->sync_task->signal_stream_end(this->stream_ordinal);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation, 0);
 }
 
 void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
@@ -506,7 +511,7 @@ void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
         ServerCommandMessage{cmd}, generation);
 }
 
-void PlayerRole::Impl::on_stream_ring_event(PlayerStreamCallbackType event) {
+void PlayerRole::Impl::on_stream_ring_event(const InboxEvent& event) {
     this->awaiting_sync_idle_events.push_back(event);
 }
 
@@ -583,24 +588,28 @@ void PlayerRole::Impl::drain_events() {
         // and the clamp before the erase below keeps the range valid.
         // NOLINTNEXTLINE(modernize-loop-convert): body mutates the vector, see above
         for (size_t idx = 0; idx < this->awaiting_sync_idle_events.size(); ++idx) {
-            const PlayerStreamCallbackType event = this->awaiting_sync_idle_events[idx];
-            if (event == PlayerStreamCallbackType::STREAM_END && !sync_idle) {
+            const InboxEvent event = this->awaiting_sync_idle_events[idx];
+            const auto type = static_cast<PlayerStreamCallbackType>(event.code);
+            if (type == PlayerStreamCallbackType::STREAM_END && !sync_idle) {
                 // Wait for the sync task to go idle before firing this and anything after it. The
                 // sync task writes sync_idle_slot when it does, which runs this drain again.
                 this->awaiting_sync_idle = true;
                 break;
             }
 
-            switch (event) {
+            switch (type) {
                 case PlayerStreamCallbackType::STREAM_END:
-                    // Only fire the callback when a stream is actually open: cleanup() enqueues
-                    // an unconditional STREAM_END (and a failed stream start enqueues one with no
-                    // preceding START), so gating here keeps on_stream_end() paired 1:1 with
-                    // on_stream_start()
-                    if (this->listener && this->stream_active) {
-                        this->listener->on_stream_end();
+                    // Only fire the callback when a stream is actually open: every teardown owes
+                    // a STREAM_END (complete_teardown()), and a failed stream start enqueues one
+                    // with no preceding START, so gating here keeps on_stream_end() paired 1:1
+                    // with on_stream_start(). Cleared before the callback, which may re-enter
+                    // teardown and owe a STREAM_END of its own: that one finds the stream closed.
+                    if (this->stream_active) {
+                        this->stream_active = false;
+                        if (this->listener) {
+                            this->listener->on_stream_end();
+                        }
                     }
-                    this->stream_active = false;
                     if (this->high_performance_requested_for_playback) {
                         this->client->release_high_performance();
                         this->high_performance_requested_for_playback = false;
@@ -631,24 +640,24 @@ void PlayerRole::Impl::drain_events() {
                         }
                     }
                     // Mark the stream active before invoking the listener. on_stream_start() may
-                    // re-enter teardown, and the STREAM_END that cleanup() enqueues fires
+                    // re-enter teardown, and the STREAM_END the teardown owes fires
                     // on_stream_end() only when stream_active is set (see the gate above). Setting
                     // it first keeps start/end paired even when the batch is abandoned below.
                     this->stream_active = true;
                     if (this->listener) {
                         this->listener->on_stream_start();
-                        // on_stream_start() may re-enter connection teardown, which already ended
-                        // the stream, cleared this vector, and enqueued a fresh STREAM_END.
+                        // on_stream_start() may re-enter connection teardown, whose own drain
+                        // already ended the stream and replaced this vector's content.
                         // Re-arming the sync task below would resurrect the dead stream, so
-                        // abandon the batch instead (the clamp below then erases nothing from the
-                        // already-cleared vector). stream_active stays true so the enqueued
-                        // STREAM_END still delivers a paired on_stream_end().
+                        // abandon the batch instead (the clamp below keeps the erase in range).
+                        // stream_active stays true so a STREAM_END the teardown still owes
+                        // delivers a paired on_stream_end().
                         if (!this->accepts(generation)) {
                             teardown_reentered = true;
                             break;
                         }
                     }
-                    this->sync_task->signal_stream_start();
+                    this->sync_task->signal_stream_start(event.serial);
                     // The sync task sets TASK_RUNNING asynchronously after this signal, so the
                     // pre-loop snapshot is stale now: a STREAM_END later in this same batch must
                     // wait for the just-started task to drain
@@ -678,14 +687,14 @@ void PlayerRole::Impl::drain_events() {
 void PlayerRole::Impl::cleanup() {
     // Flag the teardown before anything else: it tells a drain_events() frame that may be on the
     // call stack right now (a listener callback re-entering teardown) that the stream is gone,
-    // and it stamps every event queued from here on, so the STREAM_END below is delivered while
-    // a START this teardown just invalidated is discarded (see cleanup_generation).
+    // and it stamps every event queued from here on, so a START this teardown just invalidated is
+    // discarded (see cleanup_generation).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
     // End the current stream: the sync task drains and returns to idle. (Not signal_stream_clear():
     // that path is a seek within a live stream and expects a marker to follow.)
-    this->sync_task->signal_stream_end();
+    this->sync_task->signal_stream_end(this->stream_ordinal);
 
     // Discard stale slot content. Stale ring-borne events (an in-flight STREAM_START/STREAM_END
     // queued before this teardown) need no per-queue ring reset either way: on the
@@ -696,15 +705,17 @@ void PlayerRole::Impl::cleanup() {
     this->event_state->stream_params_slot.reset();
     this->event_state->command_slot.reset();
 
-    // Enqueue a clean STREAM_END - drain_events() will fire the callback (enqueue_stream_event()
-    // logs if the ring is too full to take it)
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
+    push_event_or_log(this->inbox, InboxEventType::PLAYER_CLEARED, 0, TAG, "player cleared event",
+                      generation);
 }
 
 void PlayerRole::Impl::complete_teardown() {
-    // The lifecycle events the teardown overtook. The STREAM_END cleanup() queued is appended
-    // after this runs: the drain catches up on its generation before dispatching it.
+    // The lifecycle events the teardown overtook, replaced by the STREAM_END it owes the
+    // listener. The drain fires it once the sync task, which cleanup() told to end the stream,
+    // reads idle, and only when a stream is open (see the STREAM_END gate in drain_events()).
     this->awaiting_sync_idle_events.clear();
+    this->awaiting_sync_idle_events.push_back(InboxEvent{
+        InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(PlayerStreamCallbackType::STREAM_END)});
     this->awaiting_sync_idle = false;
     if (this->high_performance_requested_for_playback) {
         this->client->release_high_performance();
@@ -740,6 +751,12 @@ bool PlayerRole::Impl::hand_item(void* item, size_t item_len, ChunkType chunk_ty
     header->data_offset = data_offset;
     header->data_len = data_len;
     header->generation = generation;
+    if (chunk_type != CHUNK_TYPE_ENCODED_AUDIO && chunk_type != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
+        // A codec header numbers the stream it starts; handle_stream_start() computes the same
+        // ordinal for its STREAM_START and adopts it once the header is handed over. Every other
+        // item keeps acquire()'s 0.
+        header->serial = static_cast<uint16_t>(this->stream_ordinal + 1);
+    }
     this->recall_stale_items(generation);
     if (!this->sync_task->hand_item(item, item_len)) {
         // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
@@ -809,8 +826,8 @@ bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint32_
                            static_cast<uint32_t>(written), generation);
 }
 
-void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event,
-                                            uint32_t generation) const {
+void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation,
+                                            uint16_t ordinal) const {
     // A dropped STREAM_START would leave the sync task waiting for its start signal forever;
     // a dropped STREAM_END would leave the consumer believing the stream is still active. Both
     // wedge the stream, so log the drop at ERROR (the helper defaults to WARN, which suits the
@@ -818,7 +835,7 @@ void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event,
     push_event_or_log(
         this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
         event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END", generation,
-        /*error_level=*/true);
+        /*error_level=*/true, ordinal);
 }
 
 void PlayerRole::Impl::load_output_delay() {

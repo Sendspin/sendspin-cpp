@@ -188,7 +188,8 @@ protected:
 
     // 8-bit fields
 
-    /// @brief Set once the httpd session has closed (see mark_closed())
+    /// @brief Set once the httpd session has closed (see mark_closed()). Written on the httpd
+    /// thread; read by is_connected() on any thread.
     std::atomic<bool> closed_{false};
 
     /// @brief Set by the first trigger_close() (protocol task, or the httpd worker after a

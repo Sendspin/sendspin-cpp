@@ -545,11 +545,10 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         }
     }
 
-    // Unlike the other lifecycle handlers, no display_slot.reset() here: it would discard the
-    // pending display of every channel, including the unchanged ones this stream/start must
-    // leave alone. It is not needed either, because a display published by the decode thread
-    // carries the epoch it was decoded under, so drain_events() drops the ones whose channel
-    // moved on whether or not they have been folded into the main-thread holds yet.
+    // No display_slot.reset() here: it would discard the pending display of every channel,
+    // including the unchanged ones this stream/start must leave alone. A display published by
+    // the decode thread carries the epoch it was decoded under, so drain_events() drops the ones
+    // whose channel moved on whether or not they have been folded into the main-thread holds yet.
     {
         // roles/artwork/v1.md "stream/start artwork object": "A stream/start that changes a
         // channel's configuration likewise discards that channel's pending image, and the server
@@ -648,42 +647,46 @@ void ArtworkRole::Impl::enqueue_stream_event(ArtworkEventType event, uint32_t ge
 // ============================================================================
 
 void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
-    // Called from the ring drain in SendspinClient::loop() before this role's drain_events()
-    // runs each tick (see drain_events()), so clearing the holds and display_slot here cancels
-    // any display that would otherwise fire later this same tick, keeping lifecycle events
-    // ordered ahead of display delivery for the tick.
     switch (event) {
         case ArtworkEventType::STREAM_END:
-            this->held_display_mask = 0;
-            this->held_display_clear = 0;
-            this->event_state->display_slot.reset();
-            {
-                // A clear is itself a delivery that must be acked: it may drive a fade-out, and
-                // it supersedes any un-acked frame for the slot, so exactly one frame_done() is
-                // owed afterward regardless of what ack_state held before. Drop any notification
-                // parked behind an un-acked frame: it is superseded by the clear. Released
-                // before firing the callbacks below so a listener calling frame_done() from
-                // inside on_image_clear() does not deadlock on this same mutex.
-                std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-                // Sweep the whole fixed-size slot_buffers array (ARTWORK_MAX_SLOTS), matching
-                // handle_stream_start(): ack_enabled() already gates the PRESENTED arm to
-                // configured ack slots, and clearing has_parked on any others is a harmless reset
-                // (they never park).
-                for (size_t i = 0; i < ARTWORK_MAX_SLOTS; ++i) {
-                    auto& sb = this->drain_task->slot_buffers[i];
-                    sb.has_parked = false;
-                    if (this->ack_enabled(static_cast<uint8_t>(i))) {
-                        sb.ack_state = SlotAckState::PRESENTED;
-                    }
-                }
-            }
-            if (this->listener) {
-                // Array index is the authoritative slot number; see the Impl constructor.
-                for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
-                    this->listener->on_image_clear(static_cast<uint8_t>(i));
-                }
-            }
+            this->clear_every_channel();
             break;
+    }
+}
+
+void ArtworkRole::Impl::clear_every_channel() {
+    // Called from the ring drain in SendspinClient::loop() before this role's drain_events()
+    // runs each tick, or from the catch-up that heads it, so dropping the holds here cancels
+    // every display that predates the end. A display still in display_slot is left to its slot
+    // epoch, which the end bumped (discard_all_pending()): one decoded before it is dropped by
+    // the deadline check, and one decoded after it belongs to the next stream and fires after
+    // these clears.
+    this->held_display_mask = 0;
+    this->held_display_clear = 0;
+    {
+        // A clear is itself a delivery that must be acked: it may drive a fade-out, and it
+        // supersedes any un-acked frame for the slot, so exactly one frame_done() is owed
+        // afterward regardless of what ack_state held before (a decode whose display will never
+        // fire included). Drop any notification parked behind an un-acked frame: it is superseded
+        // by the clear. Released before firing the callbacks below so a listener calling
+        // frame_done() from inside on_image_clear() does not deadlock on this same mutex.
+        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        // Sweep the whole fixed-size slot_buffers array (ARTWORK_MAX_SLOTS), matching
+        // handle_stream_start(): ack_enabled() already gates the PRESENTED arm to configured ack
+        // slots, and clearing has_parked on any others is a harmless reset (they never park).
+        for (size_t i = 0; i < ARTWORK_MAX_SLOTS; ++i) {
+            auto& sb = this->drain_task->slot_buffers[i];
+            sb.has_parked = false;
+            if (this->ack_enabled(static_cast<uint8_t>(i))) {
+                sb.ack_state = SlotAckState::PRESENTED;
+            }
+        }
+    }
+    if (this->listener) {
+        // Array index is the authoritative slot number; see the Impl constructor.
+        for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
+            this->listener->on_image_clear(static_cast<uint8_t>(i));
+        }
     }
 }
 
@@ -691,9 +694,8 @@ void ArtworkRole::Impl::drain_events() {
     // Fold any newly published display update into the main-thread holds. Latest-wins per
     // artwork slot: a bit set in valid_mask means
     // timestamps[i] is a fresher pending display than whatever (if anything) slot i already
-    // held. Any STREAM_END for this tick has already run via
-    // handle_stream_ring_event() before this call (see the comment there), so a lifecycle event
-    // arriving this tick has already cleared held_display_mask before we get here.
+    // held. A stream end or teardown drained this tick has already run clear_every_channel()
+    // before this call, so it has already cleared held_display_mask before we get here.
     //
     // Taken before the catch-up, like every slot role's drain: a teardown that ran before the
     // take is caught up below (dropping the holds) and drops a display decoded before it; one
@@ -703,6 +705,11 @@ void ArtworkRole::Impl::drain_events() {
     bool have_update = this->event_state->display_slot.take(update, stamp);
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     catch_up_teardown(*this, generation);
+    // Also refused once a clear the catch-up fired re-entered teardown (a listener calling
+    // stop()), whose own drain already settled this role.
+    if (!this->accepts(generation)) {
+        return;
+    }
     if (have_update && stamp != generation) {
         SS_LOGD(TAG, "Dropping artwork displays decoded before the role was torn down");
         have_update = false;
@@ -807,30 +814,9 @@ void ArtworkRole::Impl::drain_events() {
 }
 
 void ArtworkRole::Impl::complete_teardown() {
-    // A dropped hold is a decode whose display will never fire, so its ack gate is released
-    // exactly as the epoch-mismatch drop in drain_events() releases it: DECODE_DELIVERED back to
-    // IDLE, and the decode thread woken for a notification parked behind it. PRESENTED is left
-    // armed: that delivery reached the listener and still owes its frame_done().
-    const uint8_t dropped = this->held_display_mask;
-    this->held_display_mask = 0;
-    this->held_display_clear = 0;
-    bool should_wake = false;
-    {
-        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
-            if ((dropped & (1U << slot)) == 0 || !this->ack_enabled(slot)) {
-                continue;
-            }
-            auto& sb = this->drain_task->slot_buffers[slot];
-            if (sb.ack_state == SlotAckState::DECODE_DELIVERED) {
-                sb.ack_state = SlotAckState::IDLE;
-            }
-            should_wake |= sb.has_parked;
-        }
-    }
-    if (should_wake) {
-        this->wake_drain_thread();
-    }
+    // A teardown ends the stream like a stream/end: the held displays are dropped and every
+    // channel is cleared, ahead of anything the next connection's stream displays.
+    this->clear_every_channel();
 }
 
 // ============================================================================
@@ -838,31 +824,19 @@ void ArtworkRole::Impl::complete_teardown() {
 // ============================================================================
 
 void ArtworkRole::Impl::cleanup() {
-    // Stamps every event queued from here on, so the STREAM_END below is delivered while an event
-    // queued for the stream this teardown ends is discarded at the drain (see event_is_current()).
+    // Stamps every event queued from here on, so an event queued for the stream this teardown
+    // ends is discarded at the drain (see event_is_current()).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->stream_active = false;
     this->discard_all_pending();
 
-    // Stale ring-borne events (an in-flight STREAM_END queued before this teardown)
-    // need no per-event ring reset either way: on the connection-loss path
-    // SendspinClient::cleanup_connection_state()'s inbox.reset_events() has already wiped them,
-    // and on the deactivation path, which leaves the ring alone for the roles that stay active,
-    // they carry the generation this teardown just left behind and the drain discards them (see
-    // event_is_current()). The main-loop display holds are dropped by complete_teardown(), which
-    // the drain runs for this generation before it acts on the STREAM_END below or folds in a
-    // display stamped with it, and a hold is also dropped by its slot-epoch check, which
-    // discard_all_pending() just bumped.
-    this->event_state->display_slot.reset();
-
     // discard_all_pending() bumped every slot epoch, so no transfer is in flight and nothing
     // that is still decoding can deliver.
     this->release_idle_slot_buffers();
 
-    // handle_stream_ring_event() fires the on_image_clear() callbacks (enqueue_stream_event()
-    // logs if the ring is too full to take it).
-    this->enqueue_stream_event(ArtworkEventType::STREAM_END, generation);
+    push_event_or_log(this->inbox, InboxEventType::ARTWORK_CLEARED, 0, TAG, "artwork cleared event",
+                      generation);
 }
 
 // ============================================================================
@@ -935,7 +909,7 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
         // design. Otherwise arm the gate (DECODE_DELIVERED) before decoding, so any later
         // notification for this slot parks instead of decoding concurrently with this un-acked
         // delivery. Arming gates on ack_enabled() alone, matching drain_events() and
-        // handle_stream_ring_event(); the listener is set before start() (see set_listener) so it
+        // clear_every_channel(); the listener is set before start() (see set_listener) so it
         // is non-null here, and the callback invocation below is the crash-guard for that pointer.
         if (this->ack_enabled(slot) && sb.ack_state != SlotAckState::IDLE) {
             sb.parked = notif;

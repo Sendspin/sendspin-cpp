@@ -20,6 +20,7 @@
 /// FakeEncryptedServer plays the Sendspin server over the real Noise transport and the test
 /// thread pumps client.loop().
 
+#include "artwork_role_impl.h"  // The display slot and its epochs; private, see CMakeLists
 #include "color_role_impl.h"       // The applied palette and its slot; private, see CMakeLists
 #include "connection.h"  // StubConnection stands in for a real connection
 #include "connection_manager.h"  // GoodbyeWait, GOODBYE_FLUSH_TIMEOUT_MS
@@ -35,6 +36,7 @@
 #include "protocol_messages.h"  // SENDSPIN_BINARY_VISUALIZER_LOUDNESS
 #include "protocol_task.h"
 #include "server_connection.h"  // A delivered connection, handed over without a socket
+#include "sendspin/artwork_role.h"
 #include "sendspin/client.h"
 #include "sendspin/color_role.h"
 #include "sendspin/config.h"
@@ -83,7 +85,6 @@ constexpr uint16_t DESTRUCTOR_TEST_PORT = 19065;
 constexpr uint16_t ROLLBACK_TEST_PORT = 19066;
 constexpr uint16_t HIGH_PERF_TEST_PORT = 19067;
 constexpr uint16_t VISUALIZER_TEST_PORT = 19068;
-constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 19069;
 constexpr uint16_t PROVIDER_TEST_PORT = 19070;
 constexpr uint16_t STOP_ACCEPT_AFTER_JOIN_TEST_PORT = 19071;
 constexpr uint16_t STREAM_FILTER_STOPPED_TASK_TEST_PORT = 19072;
@@ -816,28 +817,6 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
     EXPECT_EQ(listener.releases, 2);
 }
 
-// Destroying a running client ends the hold too: the release sites stop() reaches through the
-// connection cleanup do not run in the destructor, so it has to release on its own or the
-// platform is left in high-performance mode after the client is gone.
-TEST(ClientLifecycle, DestructorReleasesHighPerformanceHold) {
-    CountingClientListener listener;
-    std::unique_ptr<FakeEncryptedServer> server;
-    {
-        auto config = make_config(DESTRUCTOR_HIGH_PERF_TEST_PORT);
-        config.time_burst_interval_ms = 50;
-        PairedClientBundle bundle(std::move(config));
-        SendspinClient& client = bundle.client();
-        client.set_listener(&listener);
-        ASSERT_TRUE(bundle.start());
-
-        server = connect_paired_server(bundle.peer, DESTRUCTOR_HIGH_PERF_TEST_PORT);
-        pump_until(client, [&] { return client.is_connected() && listener.requests == 1; });
-        EXPECT_EQ(listener.releases, 0);
-        // Client destroyed here mid-burst, with the hold open.
-    }
-    EXPECT_EQ(listener.releases, 1);
-}
-
 // ============================================================================
 // Stand-in connections
 // ============================================================================
@@ -952,7 +931,9 @@ size_t queued_commands(ProtocolTask& task) {
 // joined. The test thread plays the protocol task, so the accept provably sits in the queue when
 // admission closes. The open row is the control: the same queued accept is admitted and owed no
 // goodbye. The nursery-full rejection is covered by
-// ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer.
+// ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer. Each row connects a real peer, and
+// the Control row watches 200 ms for a goodbye that must not come, so the table takes most of a
+// second.
 TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
     enum class Taker : uint8_t { FINAL_TICK, AFTER_JOIN, OPEN_TICK };
     struct AcceptRow {
@@ -1022,8 +1003,8 @@ void fill_accept_slots(ProtocolTask& task) {
 // reference is the last one and the transport releases the connection once the delivery returns
 // (SendspinWsServer::NewConnectionCallback), never inside it. A delivery is refused when every
 // accept slot is taken, and once stop() has joined the protocol task and closed accepts
-// (ProtocolTask::close_accepts()), when no refusal pass would take an accept any more. The accepted row is the control: the queued
-// accept holds a reference for the protocol task.
+// (ProtocolTask::close_accepts()), when no refusal pass would take an accept any more. The
+// accepted row is the control: the queued accept holds a reference for the protocol task.
 TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
     struct Row {
         const char* name;
@@ -1105,15 +1086,22 @@ TEST(ClientLifecycle, AStaleCommandIsNotCarriedIntoTheNextRun) {
     }
 }
 
-// send_text() reports a request the protocol task will never see: once the consumer burst of the
-// command queue is taken, the next request is refused with false rather than dropped silently.
-// The test thread plays the protocol task, so nothing drains the queue between the requests.
+// send_text() and ControllerRole::send_command() report a request the protocol task will never
+// see: once the consumer burst of the command queue is taken, the next request is refused with
+// false rather than dropped silently. The test thread plays the protocol task, so nothing drains
+// the queue between the requests. The controller's offered command is seeded, stamped with the
+// role's generation as the drain stamps a mask it applies, so the request reaches the queue.
 TEST(ClientLifecycle, SendTextIsRefusedWhenTheCommandQueueIsFull) {
     TestNetworkProvider network;
     SendspinClient client(make_config(0));
     client.set_network_provider(&network);
+    ControllerRole& controller = client.add_controller();
     ASSERT_TRUE(client.start());
     client.protocol_task_->stop();
+    controller.impl_->supported_commands =
+        (controller.impl_->cleanup_generation.load() << 16) |
+        (1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY));
+    const ClientCommandControllerObject play{.command = SendspinControllerCommand::PLAY};
 
     const std::string command = R"({"type":"client/command","payload":{}})";
     for (size_t i = 0; i < ProtocolTask::CONSUMER_COMMAND_BURST; ++i) {
@@ -1121,8 +1109,11 @@ TEST(ClientLifecycle, SendTextIsRefusedWhenTheCommandQueueIsFull) {
     }
     EXPECT_FALSE(client.send_text(command, "controller"))
         << "a request past the consumer burst must be refused";
+    EXPECT_FALSE(controller.send_command(play))
+        << "a controller command past the consumer burst must be refused";
     // Control: once the task drains the queue, requests are taken again.
     (void) client.protocol_tick();
+    EXPECT_TRUE(controller.send_command(play)) << "the drained queue takes commands";
     EXPECT_TRUE(client.send_text(command, "controller")) << "the drained queue takes requests";
     // A family that names no role is refused on its own, queue or not.
     EXPECT_FALSE(client.send_text(command, "no-such-role"));
@@ -1157,8 +1148,8 @@ TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
     const Row rows[] = {
         {"between bursts", SIZE, NOW_MS - 200, 0, 0, 0, false, 300},
         {"Control: the interval has elapsed", SIZE, NOW_MS - INTERVAL_MS, 0, 0, 0, false, 0},
-        {"a message in flight times out strictly after the timeout", 3, 0, 42, NOW_MS - 50, 0, false,
-         51},
+        {"a message in flight times out strictly after the timeout", 3, 0, 42, NOW_MS - 50, 0,
+         false, 51},
         {"a refused send backs off", 3, 0, 0, 0, NOW_MS + 70, false, 70},
         {"Control: ready to send the next message", 3, 0, 0, 0, 0, false, 0},
         {"a completed burst is reported at once", SIZE, NOW_MS, 0, 0, 0, true, 0},
@@ -1237,7 +1228,8 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         TestNetworkProvider online;
         OfflineNetworkProvider offline;
         SendspinClient client(make_config(0));
-        const bool server_down = row.stage == Stage::NETWORK_POLL || row.stage == Stage::SERVER_RETRY;
+        const bool server_down =
+            row.stage == Stage::NETWORK_POLL || row.stage == Stage::SERVER_RETRY;
         if (server_down) {
             client.set_network_provider(&offline);
         } else {
@@ -1361,12 +1353,18 @@ TEST(NextDeadline, AFallbackMessageHeldBehindARingItemRunsTheNextTickAtOnce) {
 // The main-loop teardown half
 // ============================================================================
 
-/// Records the controller, metadata and color callbacks in the order they fire: "clear", or
-/// "state <n>" for a state carrying n (the controller's volume, the metadata year, the color's
-/// primary red). Main loop only, as every one of these callbacks is.
+/// Records the callbacks of the roles that hold main-loop state, in the order they fire: "clear"
+/// for a role's clear (the controller, metadata and color clears, the player's and the
+/// visualizer's stream end, artwork's clear of channel 0), or "state <n>" for a state carrying n
+/// (the controller's volume, the metadata year, the color's primary red, the player's volume or
+/// its stream's sample rate in kHz, the visualizer stream's rate_max, the artwork channel
+/// displayed). Main loop only, as every one of these callbacks is.
 class StateRoleLog : public ControllerRoleListener,
                      public MetadataRoleListener,
-                     public ColorRoleListener {
+                     public ColorRoleListener,
+                     public PlayerRoleListener,
+                     public VisualizerRoleListener,
+                     public ArtworkRoleListener {
 public:
     void on_controller_state(const ServerStateControllerObject& state) override {
         this->calls.push_back("state " + std::to_string(state.volume));
@@ -1386,15 +1384,55 @@ public:
     void on_color_clear() override {
         this->calls.push_back("clear");
     }
+    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
+        return length;
+    }
+    void on_stream_start() override {
+        const uint32_t rate = this->player->get_current_stream_params().sample_rate.value_or(0);
+        this->calls.push_back("state " + std::to_string(rate / 1000));
+    }
+    void on_stream_end() override {
+        this->calls.push_back("clear");
+    }
+    void on_volume_changed(uint8_t volume) override {
+        this->calls.push_back("state " + std::to_string(volume));
+    }
+    void on_visualizer_stream_start(const ServerVisualizerStreamObject& stream) override {
+        this->visualizer_rate = static_cast<uint8_t>(stream.rate_max);
+        this->calls.push_back("state " + std::to_string(stream.rate_max));
+    }
+    void on_visualizer_stream_end() override {
+        this->visualizer_rate = 0;
+        this->calls.push_back("clear");
+    }
+    void on_image_display(uint8_t slot, uint32_t /*lateness_ms*/) override {
+        this->artwork_shown = slot;
+        this->calls.push_back("state " + std::to_string(slot));
+    }
+    // A teardown clears every configured channel; one entry stands for the set.
+    void on_image_clear(uint8_t slot) override {
+        if (slot == 0) {
+            this->artwork_shown = 0;
+            this->calls.push_back("clear");
+        }
+    }
 
     std::vector<std::string> calls;
+    PlayerRole* player{nullptr};
+    uint8_t visualizer_rate{0};  ///< The started stream's rate_max, 0 once it ended
+    uint8_t artwork_shown{0};    ///< The channel last displayed, 0 once cleared
 };
 
-/// One state role, reached the way the protocol task and the main loop reach it. `admit` is the
-/// handler a server/state reaches on the protocol task, `restore` writes the role's slot with an
-/// explicit stamp (the payload a drain holds when it took the slot on the far side of a
-/// teardown), `drain` is the role's step of drain_inbox(), and `applied` the state the main loop
-/// holds (0 when cleared). Each value is a state's identifying number.
+/// One role with main-loop state, reached the way the protocol task (or, for artwork, the decode
+/// thread) and the main loop reach it. `admit` is what the next connection's message produces
+/// (the handler a server/state, server/command or stream/start reaches on the protocol task, or
+/// the decode thread's display hand-off), `restore` writes the role's slot with an explicit stamp
+/// (the payload a drain holds when it took the slot on the far side of a teardown) and, for a
+/// role whose payload rides its STREAM_START, queues that START with the same stamp, `drain` is
+/// the role's step of drain_inbox() (the catch-up alone for the visualizer, which has no drain),
+/// and `applied` the state the role holds afterwards (0 when cleared). Each value is a state's
+/// identifying number. `has_clear` is false for the player's commands, device state a teardown
+/// keeps (`keeps_state`), so its rows expect no clear and A's value where a teardown clears.
 struct StateRoleAccess {
     const char* name;
     void (*admit)(SendspinClient&, uint8_t value, uint32_t generation);
@@ -1402,7 +1440,9 @@ struct StateRoleAccess {
     void (*teardown)(SendspinClient&);
     void (*drain)(SendspinClient&);
     uint32_t (*generation)(SendspinClient&);
-    uint8_t (*applied)(SendspinClient&);
+    uint8_t (*applied)(SendspinClient&, const StateRoleLog&);
+    bool has_clear;
+    bool keeps_state;
 };
 
 ServerStateControllerObject controller_state_with(uint8_t value) {
@@ -1423,6 +1463,43 @@ ServerColorStateObject color_state_with(uint8_t value) {
     return state;
 }
 
+/// A PCM stream whose sample rate is `value` kHz: the player's state value.
+ServerPlayerStreamObject player_stream_with(uint8_t value) {
+    ServerPlayerStreamObject params;
+    params.codec = SendspinCodecFormat::PCM;
+    params.sample_rate = static_cast<uint32_t>(value) * 1000;
+    params.channels = 2;
+    params.bit_depth = 16;
+    return params;
+}
+
+ServerCommandMessage player_volume_with(uint8_t value) {
+    ServerPlayerCommandObject player_cmd;
+    player_cmd.command = SendspinPlayerCommand::VOLUME;
+    player_cmd.volume = value;
+    ServerCommandMessage cmd;
+    cmd.player = player_cmd;
+    return cmd;
+}
+
+ServerVisualizerStreamObject visualizer_stream_with(uint8_t value) {
+    ServerVisualizerStreamObject stream;
+    stream.types = {VisualizerDataType::LOUDNESS};
+    stream.rate_max = value;
+    return stream;
+}
+
+/// The decode thread's hand-off of a display on artwork channel `value`, due at once, under the
+/// channel's current epoch.
+void write_artwork_display(SendspinClient& c, uint8_t value, uint32_t generation) {
+    ArtworkRole::Impl& impl = *c.artwork_->impl_;
+    ArtworkDisplayUpdate delta{};
+    delta.epochs[value] = impl.slot_epochs[value].load();
+    delta.valid_mask = static_cast<uint8_t>(1U << value);
+    impl.event_state->display_slot.merge(ArtworkRole::Impl::merge_artwork_display_update,
+                                         std::move(delta), generation);
+}
+
 const StateRoleAccess STATE_ROLES[] = {
     {"controller",
      [](SendspinClient& c, uint8_t v, uint32_t g) {
@@ -1434,7 +1511,10 @@ const StateRoleAccess STATE_ROLES[] = {
      [](SendspinClient& c) { c.controller_->impl_->cleanup(); },
      [](SendspinClient& c) { c.controller_->impl_->drain_events(); },
      [](SendspinClient& c) { return c.controller_->impl_->cleanup_generation.load(); },
-     [](SendspinClient& c) { return c.controller_->impl_->controller_state.volume; }},
+     [](SendspinClient& c, const StateRoleLog&) {
+         return c.controller_->impl_->controller_state.volume;
+     },
+     true, false},
     {"metadata",
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.metadata_->impl_->handle_server_state(metadata_state_with(v), g);
@@ -1446,9 +1526,10 @@ const StateRoleAccess STATE_ROLES[] = {
      [](SendspinClient& c) { c.metadata_->impl_->cleanup(); },
      [](SendspinClient& c) { c.metadata_->impl_->drain_events(); },
      [](SendspinClient& c) { return c.metadata_->impl_->cleanup_generation.load(); },
-     [](SendspinClient& c) {
+     [](SendspinClient& c, const StateRoleLog&) {
          return static_cast<uint8_t>(c.metadata_->impl_->metadata.year.value_or(0));
-     }},
+     },
+     true, false},
     {"color",
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.color_->impl_->handle_server_state(color_state_with(v), g);
@@ -1460,38 +1541,123 @@ const StateRoleAccess STATE_ROLES[] = {
      [](SendspinClient& c) { c.color_->impl_->cleanup(); },
      [](SendspinClient& c) { c.color_->impl_->drain_events(); },
      [](SendspinClient& c) { return c.color_->impl_->cleanup_generation.load(); },
-     [](SendspinClient& c) { return c.color_->impl_->color.primary.value_or(RgbColor{})[0]; }},
+     [](SendspinClient& c, const StateRoleLog&) {
+         return c.color_->impl_->color.primary.value_or(RgbColor{})[0];
+     },
+     true, false},
+    {"player stream params",
+     [](SendspinClient& c, uint8_t v, uint32_t g) {
+         c.player_->impl_->handle_stream_start(player_stream_with(v), g);
+     },
+     [](SendspinClient& c, uint8_t v, uint32_t g) {
+         PlayerRole::Impl& impl = *c.player_->impl_;
+         impl.event_state->stream_params_slot.write(player_stream_with(v), g);
+         impl.enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, g, 0);
+     },
+     [](SendspinClient& c) { c.player_->impl_->cleanup(); },
+     [](SendspinClient& c) { c.player_->impl_->drain_events(); },
+     [](SendspinClient& c) { return c.player_->impl_->cleanup_generation.load(); },
+     [](SendspinClient& c, const StateRoleLog&) {
+         const PlayerRole::Impl& impl = *c.player_->impl_;
+         if (!impl.stream_active) {
+             return uint8_t{0};
+         }
+         return static_cast<uint8_t>(impl.current_stream_params.sample_rate.value_or(0) / 1000);
+     },
+     true, false},
+    {"player command",
+     [](SendspinClient& c, uint8_t v, uint32_t g) {
+         c.player_->impl_->handle_server_command(player_volume_with(v), g);
+     },
+     [](SendspinClient& c, uint8_t v, uint32_t g) {
+         c.player_->impl_->event_state->command_slot.write(player_volume_with(v), g);
+     },
+     [](SendspinClient& c) { c.player_->impl_->cleanup(); },
+     [](SendspinClient& c) { c.player_->impl_->drain_events(); },
+     [](SendspinClient& c) { return c.player_->impl_->cleanup_generation.load(); },
+     [](SendspinClient& c, const StateRoleLog&) { return c.player_->impl_->volume; },
+     false, true},
+    {"visualizer stream config",
+     [](SendspinClient& c, uint8_t v, uint32_t g) {
+         c.visualizer_->impl_->handle_stream_start(visualizer_stream_with(v), g);
+     },
+     [](SendspinClient& c, uint8_t v, uint32_t g) {
+         VisualizerRole::Impl& impl = *c.visualizer_->impl_;
+         impl.event_state->config_slot.write(visualizer_stream_with(v), g);
+         impl.enqueue_stream_event(VisualizerEventType::STREAM_START, g);
+     },
+     [](SendspinClient& c) { c.visualizer_->impl_->cleanup(); },
+     [](SendspinClient& c) {
+         VisualizerRole::Impl& impl = *c.visualizer_->impl_;
+         catch_up_teardown(impl, impl.cleanup_generation.load());
+     },
+     [](SendspinClient& c) { return c.visualizer_->impl_->cleanup_generation.load(); },
+     [](SendspinClient&, const StateRoleLog& log) { return log.visualizer_rate; },
+     true, false},
+    {"artwork display",
+     write_artwork_display,
+     write_artwork_display,
+     [](SendspinClient& c) { c.artwork_->impl_->cleanup(); },
+     [](SendspinClient& c) { c.artwork_->impl_->drain_events(); },
+     [](SendspinClient& c) { return c.artwork_->impl_->cleanup_generation.load(); },
+     [](SendspinClient&, const StateRoleLog& log) { return log.artwork_shown; },
+     true, false},
 };
 
-/// A started client with the three state roles, all reporting to `log`, whose protocol task the
-/// test thread plays: role handlers and teardowns run on the test thread, between the loop()
-/// calls the test makes.
+/// A started client with every role that holds main-loop state, all reporting to `log`, whose
+/// protocol task the test thread plays: role handlers and teardowns run on the test thread,
+/// between the loop() calls the test makes. The player's sync task runs no thread: its item list
+/// is bound to the ring the way SyncTask::start() binds it, so the player's STREAM_END never
+/// waits for a thread to go idle and one loop() delivers it.
 struct StateRoleClient {
     explicit StateRoleClient(StateRoleLog& log) : client(make_config(0)) {
         this->client.set_network_provider(&this->network);
         this->client.add_controller().set_listener(&log);
         this->client.add_metadata().set_listener(&log);
         this->client.add_color().set_listener(&log);
+        PlayerRole& player = this->client.add_player(make_pcm_player_config());
+        player.set_listener(&log);
+        log.player = &player;
+        this->client.add_visualizer(make_visualizer_config()).set_listener(&log);
+        ArtworkRoleConfig artwork;
+        for (uint8_t i = 0; i < ARTWORK_MAX_SLOTS; ++i) {
+            artwork.preferred_formats.push_back(
+                {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 100, 100, false});
+        }
+        this->client.add_artwork(std::move(artwork)).set_listener(&log);
         EXPECT_TRUE(this->client.start());
         this->client.protocol_task_->stop();
+        SyncTask& sync = *this->client.player_->impl_->sync_task;
+        InboundRing* ring = sync.ring();
+        sync.stop();
+        EXPECT_TRUE(sync.encoded_items_.create(ring, InboundHolder::PLAYER));
+        sync.ring_.store(ring);
+    }
+    ~StateRoleClient() {
+        // Hands the list back as SyncTask::stop() would, before stop() releases the ring.
+        SyncTask& sync = *this->client.player_->impl_->sync_task;
+        sync.encoded_items_.recall();
+        sync.encoded_items_.unbind();
+        sync.ring_.store(nullptr);
+        this->client.stop();
     }
 
     TestNetworkProvider network;
     SendspinClient client;
 };
 
-// The teardown reorder guarantee, per state role: the connection that owned a role is dropped (the
-// role's cleanup() on the protocol task) and the next one delivers its state before the main loop
-// runs. The next drain delivers the role's clear before the new state, and the new state survives:
-// it is what the role holds afterwards. Two rows stage the interleavings a drain meets across the
-// two threads: the new state taken by a drain whose ring pass ran before the teardown queued its
-// CLEARED event (the slot written between the generation bump and the drain), and a payload of the
-// torn-down connection that a drain took on the far side of the teardown, which must never be
-// applied after the clear. Both are staged by calling the role's drain step, and by writing the
-// slot with the old stamp, through the private access the CMakeLists entry describes: no public
-// call interleaves the two threads on demand, and the order of the callbacks is the outcome. The
-// last row fills the event ring so the teardown's CLEARED is dropped: the clear still fires on the
-// next loop(), from the catch-up that heads every drain.
+// The teardown reorder guarantee, per role with main-loop state: the connection that owned a
+// role is dropped (the role's cleanup() on the protocol task) and the next one delivers its state
+// before the main loop runs. The next drain delivers the role's clear before the new state, and
+// the new state survives: it is what the role holds afterwards. Two rows stage the interleavings
+// a drain meets across the threads: the new state taken by a drain whose ring pass ran before the
+// teardown queued its CLEARED event (the slot written between the generation bump and the
+// drain), and a payload of the torn-down connection that a drain took on the far side of the
+// teardown, which must never be applied after the clear. Both are staged by calling the role's
+// drain step, and by writing the slot with the old stamp, through the private access the
+// CMakeLists entry describes: no public call interleaves the threads on demand, and the order of
+// the callbacks is the outcome. The last row fills the event ring so the teardown's CLEARED is
+// dropped: the clear still fires on the next loop(), from the catch-up that heads every drain.
 TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
     enum class Stage : uint8_t {
         CONTROL,
@@ -1507,11 +1673,11 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
         uint8_t expected_applied;
     };
     const Row rows[] = {
-        {"Control: no teardown, the next state applies", Stage::CONTROL, {"state 22"}, 22},
-        {"drop A, admit B, B's state, one loop()", Stage::ONE_LOOP, {"clear", "state 22"}, 22},
+        {"Control: no teardown, the next state applies", Stage::CONTROL, {"state 2"}, 2},
+        {"drop A, admit B, B's state, one loop()", Stage::ONE_LOOP, {"clear", "state 2"}, 2},
         {"B's state taken before its CLEARED is drained", Stage::TAKEN_BEFORE_ITS_CLEARED,
-         {"clear", "state 22"},
-         22},
+         {"clear", "state 2"},
+         2},
         {"A's state taken across the teardown", Stage::STALE_ACROSS, {"clear"}, 0},
         {"the teardown's CLEARED dropped on a full event ring", Stage::CLEARED_DROPPED, {"clear"},
          0},
@@ -1524,35 +1690,36 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
             SendspinClient& client = harness.client;
 
             // Connection A's state, applied.
-            role.admit(client, 11, role.generation(client));
+            role.admit(client, 1, role.generation(client));
             client.loop();
-            ASSERT_EQ(log.calls, std::vector<std::string>{"state 11"});
+            ASSERT_EQ(log.calls, std::vector<std::string>{"state 1"});
             log.calls.clear();
 
             const uint32_t a_generation = role.generation(client);
             switch (row.stage) {
                 case Stage::CONTROL:
-                    role.admit(client, 22, role.generation(client));
+                    role.admit(client, 2, role.generation(client));
                     break;
                 case Stage::ONE_LOOP:
                     role.teardown(client);
-                    role.admit(client, 22, role.generation(client));
+                    role.admit(client, 2, role.generation(client));
                     break;
                 case Stage::TAKEN_BEFORE_ITS_CLEARED:
                     role.teardown(client);
-                    role.admit(client, 22, role.generation(client));
+                    role.admit(client, 2, role.generation(client));
                     role.drain(client);
                     break;
                 case Stage::STALE_ACROSS:
                     role.teardown(client);
-                    role.restore(client, 33, a_generation);
+                    role.restore(client, 3, a_generation);
                     role.drain(client);
                     break;
                 case Stage::CLEARED_DROPPED: {
-                    // Fill the ring with events no role here acts on (no visualizer is added), so
-                    // the push in cleanup() is dropped with its warning.
+                    // Fill the ring with an event that acts on nothing (a teardown marker every
+                    // role has long caught up with), so the push in cleanup() is dropped with its
+                    // warning.
                     InboxEvent filler{};
-                    filler.type = InboxEventType::VISUALIZER_STREAM;
+                    filler.type = InboxEventType::CONTROLLER_CLEARED;
                     // The client's Inbox, reached through the controller it is attached to.
                     while (client.controller_->impl_->inbox->push_event(filler)) {
                     }
@@ -1562,9 +1729,16 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
             }
             client.loop();
 
-            EXPECT_EQ(log.calls, row.expected_calls);
-            EXPECT_EQ(role.applied(client), row.expected_applied);
-            client.stop();
+            std::vector<std::string> expected_calls = row.expected_calls;
+            if (!role.has_clear) {
+                expected_calls.erase(
+                    std::remove(expected_calls.begin(), expected_calls.end(), "clear"),
+                    expected_calls.end());
+            }
+            const uint8_t expected_applied =
+                row.expected_applied == 0 && role.keeps_state ? 1 : row.expected_applied;
+            EXPECT_EQ(log.calls, expected_calls);
+            EXPECT_EQ(role.applied(client, log), expected_applied);
         }
     }
 }
@@ -1573,12 +1747,28 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
 /// callback; records every state-role callback in `log`.
 class StopFromCallbackListener : public StateRoleLog {
 public:
-    StopFromCallbackListener(SendspinClient*& client, bool reenter, bool restart)
+    /// The callback that calls stop(): none, the controller's state or the player's stream end.
+    enum class Reenter : uint8_t { NONE, CONTROLLER_STATE, STREAM_END };
+
+    StopFromCallbackListener(SendspinClient*& client, Reenter reenter, bool restart)
         : client_(client), reenter_(reenter), restart_(restart) {}
 
     void on_controller_state(const ServerStateControllerObject& state) override {
         StateRoleLog::on_controller_state(state);
-        if (this->reenter_ && !this->reentered_) {
+        this->reenter_from(Reenter::CONTROLLER_STATE);
+    }
+    void on_stream_end() override {
+        StateRoleLog::on_stream_end();
+        ++this->stream_ends;
+        this->reenter_from(Reenter::STREAM_END);
+    }
+
+    bool restart_result{false};
+    int stream_ends{0};
+
+private:
+    void reenter_from(Reenter callback) {
+        if (this->reenter_ == callback && !this->reentered_) {
             this->reentered_ = true;
             this->client_->stop();
             if (this->restart_) {
@@ -1587,11 +1777,8 @@ public:
         }
     }
 
-    bool restart_result{false};
-
-private:
     SendspinClient*& client_;
-    bool reenter_;
+    Reenter reenter_;
     bool restart_;
     bool reentered_{false};
 };
@@ -1599,20 +1786,26 @@ private:
 // A listener may call stop(), and start() after it, from inside a callback a loop() drain fires.
 // stop() tears every role down and delivers each clear exactly once from its own drain; the drain
 // that fired the callback then abandons the rest of its work, so the metadata state queued beside
-// the controller's is never delivered, after its clear or at all. Control: without the re-entry
-// both states are delivered.
+// the controller's is never delivered, after its clear or at all. A stop() from on_stream_end()
+// owes no second on_stream_end(): the stream it ends is already closed. Control: without the
+// re-entry both states are delivered.
 TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
+    using Reenter = StopFromCallbackListener::Reenter;
     struct Row {
         const char* name;
-        bool reenter;
+        Reenter reenter;
         bool restart;
         std::vector<std::string> expected_calls;
         bool expected_started;
+        int expected_stream_ends;
     };
     const Row rows[] = {
-        {"Control: no re-entry", false, false, {"state 11", "state 5"}, true},
-        {"stop()", true, false, {"state 11", "clear", "clear"}, false},
-        {"stop() then start()", true, true, {"state 11", "clear", "clear"}, true},
+        {"Control: no re-entry", Reenter::NONE, false, {"state 11", "state 5"}, true, 0},
+        {"stop()", Reenter::CONTROLLER_STATE, false, {"state 11", "clear", "clear"}, false, 0},
+        {"stop() then start()", Reenter::CONTROLLER_STATE, true, {"state 11", "clear", "clear"},
+         true, 0},
+        {"stop() from on_stream_end()", Reenter::STREAM_END, false,
+         {"state 48", "clear", "clear", "clear"}, false, 1},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -1624,16 +1817,33 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
         client.set_network_provider(&network);
         client.add_controller().set_listener(&log);
         client.add_metadata().set_listener(&log);
+        PlayerRole& player = client.add_player(make_pcm_player_config());
+        player.set_listener(&log);
+        log.player = &player;
         ASSERT_TRUE(client.start());
         client.protocol_task_->stop();
 
-        client.controller_->impl_->handle_server_state(
-            controller_state_with(11), client.controller_->impl_->cleanup_generation.load());
-        client.metadata_->impl_->handle_server_state(
-            metadata_state_with(5), client.metadata_->impl_->cleanup_generation.load());
-        client.loop();
+        if (row.reenter == Reenter::STREAM_END) {
+            PlayerRole::Impl& impl = *player.impl_;
+            ServerPlayerStreamObject params;
+            params.codec = SendspinCodecFormat::PCM;
+            params.sample_rate = 48000;
+            params.channels = 2;
+            params.bit_depth = 16;
+            impl.handle_stream_start(params, impl.cleanup_generation.load());
+            pump_until(client, [&] { return impl.sync_task->is_running(); });
+            impl.handle_stream_end(impl.cleanup_generation.load());
+            pump_until(client, [&] { return !client.is_started(); });
+        } else {
+            client.controller_->impl_->handle_server_state(
+                controller_state_with(11), client.controller_->impl_->cleanup_generation.load());
+            client.metadata_->impl_->handle_server_state(
+                metadata_state_with(5), client.metadata_->impl_->cleanup_generation.load());
+            client.loop();
+        }
 
         EXPECT_EQ(log.calls, row.expected_calls);
+        EXPECT_EQ(log.stream_ends, row.expected_stream_ends);
         EXPECT_EQ(client.is_started(), row.expected_started);
         if (row.restart) {
             EXPECT_TRUE(log.restart_result) << "start() from inside the callback was refused";
@@ -1849,6 +2059,54 @@ TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
     }
 }
 
+// Destroying a running client ends every high-performance hold with the client: a hold the main
+// loop granted is released exactly once, beside the release the shutdown pass queues for it, and
+// a request no drain applied (the main loop never called the listener for it) reaches the
+// listener as neither a request nor a release. The test thread plays the protocol task
+// (run_time_sync() on a stand-in connection in the admitted slot, then the final tick's shutdown
+// pass) and the main loop, so the request is provably queued and, in the second row, provably
+// never drained. The granted row is the Control.
+TEST(HighPerformanceGrant, DestroyingTheClientReleasesOnlyAGrantedHold) {
+    struct Row {
+        const char* name;
+        bool granted;
+        std::vector<std::string> expected_edges;
+    };
+    const Row rows[] = {
+        {"Control: a granted hold is released exactly once", true, {"request", "release"}},
+        {"an ungranted request is never heard", false, {}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        HighPerformanceLog log;  // Outlives the client, as the listener contract requires
+        {
+            TestNetworkProvider network;
+            SendspinClient client(make_config(0));
+            client.set_network_provider(&network);
+            client.set_listener(&log);
+            ASSERT_TRUE(client.start());
+            client.protocol_task_->stop();
+            ConnectionManager& manager = *client.connection_manager_;
+            auto conn = std::make_shared<OperationalStubConnection>();
+            manager.install_admitted(conn, 0);
+
+            (void) manager.run_time_sync();  // The burst comes due and requests the hold
+            ASSERT_TRUE(manager.find_admitted(conn.get())->high_performance_held)
+                << "the burst requested no hold";
+            if (row.granted) {
+                client.loop();
+                ASSERT_EQ(log.edges, std::vector<std::string>{"request"});
+            }
+            // The destructor's order with the task played here: admission closes, then the
+            // task's final tick runs the shutdown pass, which queues the hold's release.
+            manager.close_admission();
+            (void) client.protocol_tick();
+            // Destroyed here, the hold granted or the request still queued.
+        }
+        EXPECT_EQ(log.edges, row.expected_edges);
+    }
+}
+
 // SendspinTimeBurst::loop() is the one chokepoint that opens a burst, and it opens one only with
 // the caller's permission: run_time_sync() grants it only once the high-performance hold was
 // granted for the burst starts_burst() reported at the same clock reading. A due burst the caller
@@ -1907,52 +2165,173 @@ TEST(HighPerformanceGrant, TheGrantWakesTheBurstThatWaitsForIt) {
 }
 
 // ============================================================================
-// Stream start and end drained in one tick
+// Stream starts and ends drained in one tick
 // ============================================================================
 
-// A stream/start and stream/end that one main-loop drain takes together, after the sync task has
-// already taken the start's codec header, met the end and gone back to waiting for a header: the
-// drain fires on_stream_start(), signals the start, and holds the STREAM_END behind it until the
-// sync task reads idle. The sync task, finding no header for that start, takes it as stale and
-// returns to idle, which releases the held end, and the stale start does not carry over: the next
-// stream waits for its own. The test thread plays the protocol task, so each step of the
-// interleaving is staged in order; every wait has no timeout, and a held end that is never
-// released hangs here and the suite watchdog names this test. The sync task's COMMAND_START bit is
-// read directly: whether a stale start survives is visible to a caller only as the next stream
-// starting before its on_stream_start(), a race no test can stage on demand.
-TEST(ClientLifecycle, AStreamStartAndEndDrainedTogetherReleaseTheHeldEnd) {
-    CountingPlayerListener listener;
-    TestNetworkProvider network;
-    SendspinClient client(make_config(0));
-    client.set_network_provider(&network);
-    client.add_player(make_pcm_player_config()).set_listener(&listener);
-    ASSERT_TRUE(client.start());
-    client.protocol_task_->stop();
-    PlayerRole::Impl& player = *client.player_->impl_;
-    SyncTask& sync = *player.sync_task;
-    ServerPlayerStreamObject params;
-    params.codec = SendspinCodecFormat::PCM;
-    params.sample_rate = 48000;
-    params.channels = 2;
-    params.bit_depth = 16;
+// Each stream/start numbers its codec header and its STREAM_START, and the sync task starts a
+// stream only on the main loop's acknowledgement of that stream's number, so stream events the
+// main loop drains together, however the sync task interleaved with them, still end each stream
+// before the next one starts: every held STREAM_END is released and the last stream plays under
+// its own on_stream_start(). The test thread plays the protocol task, so the stream events are
+// all queued before the main loop runs. The "start and its end" row stages the interleaving where
+// the acknowledgement finds no header left (the sync task took the header, met the end and went
+// back to waiting); the other rows leave the sync task free to interleave as it will, since the
+// outcome must not depend on it. Every wait has no timeout: a held end that is never released, or
+// a stream started under an earlier stream's acknowledgement (which holds the end behind it while
+// it plays), hangs here and the suite watchdog names this test.
+TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
+    enum class Stage : uint8_t {
+        ONE_START,
+        START_END,
+        START_CLEAR,
+        START_END_START,
+        PLAYING_END_START_END_START,
+    };
+    struct Row {
+        const char* name;
+        Stage stage;
+        int expected_starts;
+        int expected_ends;
+        bool expected_running;
+    };
+    const Row rows[] = {
+        {"Control: a start drained on its own", Stage::ONE_START, 1, 0, true},
+        {"a start and its end, the header already returned", Stage::START_END, 1, 1, false},
+        {"a start and a clear before its acknowledgement", Stage::START_CLEAR, 1, 0, true},
+        {"a start, its end and the next start", Stage::START_END_START, 2, 1, true},
+        {"a playing stream's end, a start, its end and the next start",
+         Stage::PLAYING_END_START_END_START, 3, 2, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        CountingPlayerListener listener;
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        client.add_player(make_pcm_player_config()).set_listener(&listener);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        PlayerRole::Impl& player = *client.player_->impl_;
+        SyncTask& sync = *player.sync_task;
+        ServerPlayerStreamObject params;
+        params.codec = SendspinCodecFormat::PCM;
+        params.sample_rate = 48000;
+        params.channels = 2;
+        params.bit_depth = 16;
+        const auto start = [&] {
+            player.handle_stream_start(params, player.cleanup_generation.load());
+        };
+        const auto end = [&] { player.handle_stream_end(player.cleanup_generation.load()); };
 
-    // stream/start: the sync task takes its codec header and waits for the main loop's start.
-    player.handle_stream_start(params, player.cleanup_generation.load());
-    wait_until([&] { return sync.encoded_items_.is_empty(); });
-    // stream/end before the main loop ran: the sync task returns the header and goes idle.
-    player.handle_stream_end(player.cleanup_generation.load());
-    wait_until([&] { return (player.inbox->poll() & INBOX_TOPIC_PLAYER_SYNC_IDLE) != 0; });
+        switch (row.stage) {
+            case Stage::ONE_START:
+                start();
+                break;
+            case Stage::START_END:
+                // The sync task takes the header and waits; the end makes it return the header
+                // and go idle before the main loop acknowledges the start.
+                start();
+                wait_until([&] { return sync.encoded_items_.is_empty(); });
+                end();
+                wait_until([&] {
+                    return (player.inbox->poll() & INBOX_TOPIC_PLAYER_SYNC_IDLE) != 0;
+                });
+                break;
+            case Stage::START_CLEAR:
+                // The sync task takes the header and waits; the clear reaches it there, and the
+                // stream it holds still plays once acknowledged.
+                start();
+                wait_until([&] { return sync.encoded_items_.is_empty(); });
+                player.handle_stream_clear(player.cleanup_generation.load());
+                wait_until([&] { return sync.encoded_items_.is_empty(); });
+                break;
+            case Stage::START_END_START:
+                start();
+                end();
+                start();
+                break;
+            case Stage::PLAYING_END_START_END_START:
+                start();
+                pump_until(client, [&] { return sync.is_running(); });
+                end();
+                start();
+                end();
+                start();
+                break;
+        }
+        pump_until(client, [&] {
+            return listener.stream_starts == row.expected_starts &&
+                   listener.stream_ends == row.expected_ends &&
+                   sync.is_running() == row.expected_running;
+        });
 
-    pump_until(client, [&] { return listener.stream_ends == 1; });
-    EXPECT_EQ(listener.stream_starts, 1);
-    EXPECT_EQ(sync.event_flags_.get() & EventGroupBits::COMMAND_START, 0U)
-        << "the stale start would start the next stream before its own";
+        if (row.stage == Stage::START_END) {
+            // The next stream starts on its own start, not on the stale one.
+            start();
+            pump_until(client, [&] { return listener.stream_starts == 2 && sync.is_running(); });
+            EXPECT_EQ(listener.stream_ends, 1);
+        }
+        client.stop();
+        EXPECT_EQ(listener.stream_ends, listener.stream_starts)
+            << "every on_stream_start() is paired with an on_stream_end() by stop()";
+    }
+}
 
-    // The next stream starts on its own start.
-    player.handle_stream_start(params, player.cleanup_generation.load());
-    pump_until(client, [&] { return listener.stream_starts == 2 && sync.is_running(); });
-    EXPECT_EQ(listener.stream_ends, 1);
-    client.stop();
+// A codec header the sync task takes while the stream before it is still ACTIVE, the end of that
+// stream signalled and the next stream/start's header appended before the task's next take,
+// starts the next stream from IDLE instead of being decoded into the stream that ended. The test
+// thread plays the sync task: its IDLE take of the first header, the ordinal ACTIVE records for
+// it, its next ACTIVE load, then its next IDLE wait. Control: a stream/start with no end between
+// is the active stream's own format change, loaded to be decoded in place.
+TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) {
+    struct Row {
+        const char* name;
+        bool end_first;
+        bool expected_loaded_in_place;
+    };
+    const Row rows[] = {
+        {"Control: a format change of the active stream", false, true},
+        {"the next stream's header, taken before the end is seen", true, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        StateRoleLog log;
+        StateRoleClient harness(log);
+        PlayerRole::Impl& player = *harness.client.player_->impl_;
+        SyncTask& sync = *player.sync_task;
+        sync.event_flags_.clear_all();  // As SyncTask::start() leaves them
+        ServerPlayerStreamObject params;
+        params.codec = SendspinCodecFormat::PCM;
+        params.sample_rate = 48000;
+        params.channels = 2;
+        params.bit_depth = 16;
+        const auto start = [&] {
+            player.handle_stream_start(params, player.cleanup_generation.load());
+        };
+
+        start();
+        SyncContext context;
+        ASSERT_TRUE(sync.wait_for_codec_header(context));
+        context.active_ordinal = inbound_item_header(context.encoded_item)->serial;
+        sync.return_item(context.encoded_item);  // Decoded: the stream is playing
+        context.encoded_item = nullptr;
+        if (row.end_first) {
+            player.handle_stream_end(player.cleanup_generation.load());
+        }
+        start();
+
+        EXPECT_EQ(sync.load_next_chunk(context), row.expected_loaded_in_place);
+        EXPECT_EQ(context.encoded_item != nullptr, row.expected_loaded_in_place);
+        if (!row.expected_loaded_in_place) {
+            ASSERT_TRUE(sync.wait_for_codec_header(context)) << "the next stream lost its header";
+            EXPECT_EQ(inbound_item_header(context.encoded_item)->serial, player.stream_ordinal);
+        }
+        for (void* held : {context.encoded_item, context.next_header}) {
+            if (held != nullptr) {
+                sync.return_item(held);
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -2250,7 +2629,8 @@ constexpr int64_t SEEDED_SERVER_OFFSET_US = -10LL * 60 * 1000 * 1000;
 /// A stand-in connection whose time filter has taken one measurement of SEEDED_SERVER_OFFSET_US.
 std::shared_ptr<ObservedConnection> make_synced_connection(ConnectionObservation* obs) {
     auto conn = std::make_shared<ObservedConnection>(obs);
-    conn->get_time_filter()->update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000, platform_time_us());
+    conn->get_time_filter()->update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000,
+                                    platform_time_us());
     return conn;
 }
 
@@ -2343,8 +2723,8 @@ TEST(ClientLifecycle, ADroppedStreamConnectionIsGoodbyedOnceAndFreedOnTheProtoco
 // and their item lists unbound. A LOCAL item (one the protocol task wrote itself, here a chunk
 // copied into the ring) that its holder already returned but the task never took in ring order
 // is counted on the ring's reset through its holder's list; with the roles reset first that list
-// is freed memory, and the process crashes or is reported by AddressSanitizer. The test thread plays the protocol task, so
-// nothing takes the item in ring order before the destructor.
+// is freed memory, and the process crashes or is reported by AddressSanitizer. The test thread
+// plays the protocol task, so nothing takes the item in ring order before the destructor.
 TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     CountingPlayerListener listener;
     TestNetworkProvider network;
@@ -2478,7 +2858,8 @@ TEST(ClientLifecycle, TheInboundRingGrowsWithTheTimeBurstRate) {
     // longest chunk.
     constexpr size_t CHUNK_OVERHEAD =
         INBOUND_ITEM_STORED_OVERHEAD_BYTES + INBOUND_AUDIO_CHUNK_HEADER_BYTES;
-    constexpr size_t DENOMINATOR = (INBOUND_MIN_AUDIO_FRAME_BYTES + CHUNK_OVERHEAD) / CHUNK_OVERHEAD;
+    constexpr size_t DENOMINATOR =
+        (INBOUND_MIN_AUDIO_FRAME_BYTES + CHUNK_OVERHEAD) / CHUNK_OVERHEAD;
     budget.largest_message_bytes = inbound_held_message_bytes(
         make_pcm_player_config().audio_buffer_capacity * (DENOMINATOR - 1) / DENOMINATOR);
     EXPECT_EQ(default_bytes, derive_inbound_ring_bytes(budget)) << "Control: the defaults";

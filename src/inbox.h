@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <type_traits>
 #include <utility>
 
 namespace sendspin {
@@ -61,13 +62,22 @@ static constexpr uint32_t INBOX_TOPIC_PLAYER_SYNC_IDLE = 1U << 13;     // Sync t
 ///
 /// The `code` field on InboxEvent carries a role-local enum value (cast to/from uint8_t by the
 /// producer/consumer); the inbox does not interpret it.
+///
+/// Each role's cleanup() pushes its *_CLEARED event, stamped with the teardown's generation; the
+/// drain only catches the role up on it (catch_up_teardown()), and the role's main-loop half
+/// delivers the clear (complete_teardown()), before the main loop acts on anything the next
+/// connection sends. The head of every drain also catches each role up, so a teardown whose event
+/// the full ring dropped still delivers its clear.
 enum class InboxEventType : uint8_t {
     PLAYER_STREAM,       // Player stream lifecycle; code = PlayerStreamCallbackType
+    PLAYER_CLEARED,      // Player torn down; epoch = the teardown's generation
     CONTROLLER_CLEARED,  // Controller state cleared; epoch = the teardown's generation
     METADATA_CLEARED,    // Metadata cleared; epoch = the teardown's generation
     COLOR_CLEARED,       // Color state cleared; epoch = the teardown's generation
     ARTWORK_STREAM,      // Artwork stream lifecycle; code = ArtworkEventType
+    ARTWORK_CLEARED,     // Artwork torn down; epoch = the teardown's generation
     VISUALIZER_STREAM,   // Visualizer stream lifecycle; code = VisualizerEventType
+    VISUALIZER_CLEARED,  // Visualizer torn down; epoch = the teardown's generation
 };
 
 /// @brief One entry in the shared event ring
@@ -76,6 +86,9 @@ enum class InboxEventType : uint8_t {
 struct InboxEvent {
     InboxEventType type{};
     uint8_t code{0};  // Role-local enum value; 0 when unused
+    /// Producer-defined sequence number, 0 when unused: the stream ordinal of a player
+    /// STREAM_START, which the drain hands back to the sync task as its start acknowledgement.
+    uint16_t serial{0};
     /// Teardown generation of the producing role at push time, 0 for events that have none; the
     /// consumer drops a mismatch so an event queued before a teardown cannot act after it (see
     /// event_is_current()).
@@ -234,12 +247,15 @@ private:
 /// role's teardown generation onto the event for event_is_current() to check; it is required,
 /// not defaulted, because an event stamped 0 by omission reads as "the role was never torn
 /// down". `error_level` logs the drop at ERROR rather than WARN: use it for events whose loss
-/// wedges the stream (player START/END), not for the idempotent CLEARED events.
+/// wedges the stream (player START/END), not for the idempotent CLEARED events. `serial` is the
+/// event's InboxEvent::serial.
 inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
-                              const char* what, uint32_t epoch, bool error_level = false) {
+                              const char* what, uint32_t epoch, bool error_level = false,
+                              uint16_t serial = 0) {
     InboxEvent event{};
     event.type = type;
     event.code = code;
+    event.serial = serial;
     event.epoch = epoch;
     if (inbox == nullptr || !inbox->push_event(event)) {
         if (error_level) {
@@ -250,12 +266,14 @@ inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, c
     }
 }
 
-/// @brief Whether teardown generation `a` is later than `b`, across the counter's wrap
+/// @brief Whether count `a` is later than `b`, across the unsigned counter's wrap
 ///
-/// Role teardown generations only ever count up, one per cleanup(), so the signed difference
-/// orders any two that are less than 2^31 teardowns apart.
-constexpr bool generation_after(uint32_t a, uint32_t b) {
-    return static_cast<int32_t>(a - b) > 0;
+/// For counters that only count up: role teardown generations (one per cleanup()), stream
+/// ordinals (one per stream/start) and high-performance tickets. The signed difference orders any
+/// two less than half the counter's range apart, far more than are ever in flight.
+template <typename T>
+constexpr bool count_after(T a, T b) {
+    return static_cast<std::make_signed_t<T>>(static_cast<T>(a - b)) > 0;
 }
 
 /// @brief Whether a ring event is still current for the role that produced it
@@ -494,7 +512,7 @@ public:
     void merge(MergeFn&& fn, T&& delta, uint32_t generation) {
         this->slot_.update([&fn, &delta, generation](Stamped& current) {
             if (current.held && current.generation != generation) {
-                if (!generation_after(generation, current.generation)) {
+                if (!count_after(generation, current.generation)) {
                     return;  // Older than what is pending: the teardown discarded it.
                 }
                 current.value = T{};

@@ -164,8 +164,6 @@ void ColorRole::Impl::cleanup() {
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();
 
-    // Stamped so the drain runs complete_teardown() for this generation before it applies
-    // anything the next connection sends.
     push_event_or_log(this->inbox, InboxEventType::COLOR_CLEARED, 0, TAG, "color cleared event",
                       generation);
 }

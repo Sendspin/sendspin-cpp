@@ -16,10 +16,11 @@ checklists in `.claude/skills/` apply these standards to a diff.
   belongs to the protocol task: the receive side (decrypt, reassembly, the
   handshake, dispatch, close handling), the lifecycle (hello, activation,
   admission, role ownership, pairing, watchdogs, time bursts) and every send
-  run there, so no connection state needs a lock. Any other thread reaches a
-  connection only by queueing a `ProtocolCommand`; a request that the full
-  queue refuses is reported to the caller (`send_text()` returns false) or
-  logged, never dropped silently. A connection refused at delivery is left with
+  run there, so no connection state needs a lock (the transport's own atomics
+  state their writer and reader at their declaration). Any other thread
+  reaches a connection only by queueing a `ProtocolCommand`; a request that
+  the full queue refuses is reported to the caller (`send_text()` returns
+  false) or logged, never dropped silently. A connection refused at delivery is left with
   the transport that delivered it, which releases it after the delivery
   returns (on ESP, with its httpd session), so no refusal destroys a connection
   inside the delivery. Payload validation and
@@ -55,6 +56,12 @@ checklists in `.claude/skills/` apply these standards to a diff.
   least a warning at the drop site. A site that can drop every message of a
   burst throttles it with `InboundDropLog`: one warning when the drops start,
   one with their count when they stop.
+- A consumer that holds items of the shared inbound ring holds them against a
+  quota of its own (`InboundQuota`), charged on the protocol task before the
+  item is handed over: a holder over its quota has the new item dropped with
+  a warning, so no holder's backlog can starve another's, and a role's share
+  of the ring is part of the ring's derivation (`derive_inbound_ring_bytes()`)
+  rather than a separate buffer.
 - An event or a slot payload whose delivery must not survive its producer
   being torn down carries the producer's teardown generation and is checked
   against it at the drain (`push_event_or_log()` / `event_is_current()` for
@@ -219,7 +226,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
   is the documented contract.
 - Tests assert on what a caller or peer can observe. Private state, queue
   contents, and which thread ran a step are reached only when no observable
-  outcome distinguishes the correct path, and the test says so.
+  outcome distinguishes the correct path, and the test says so. A test file
+  that reaches private members compiles with `-fno-access-control`, set on
+  that one translation unit in `tests/CMakeLists.txt` beside a comment naming
+  every member it reaches and why.
 - Elapsed time is never a pass/fail condition. A blocked call is proven by
   waiting with no timeout, by a value only the correct path can produce, or
   by a structural failure; hangs are caught by the suite watchdog and the

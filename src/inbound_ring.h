@@ -198,8 +198,11 @@ struct InboundItemHeader {
     /// Non-zero once InboundRing::charge() charged the item to `holder`. Written by the protocol
     /// task before the item is appended to the holder's list; never cleared.
     uint8_t holder_set;
-    /// Unused; zeroed by acquire() and keeps the header free of padding.
-    uint16_t reserved;
+    /// Consumer-defined sequence number, zeroed by acquire(): the player's stream ordinal on a
+    /// codec header item, 0 on every other item. Written on the protocol task
+    /// (PlayerRole::Impl::hand_item()) before the item is appended to the sync task's list; read
+    /// on the sync thread once it takes the item.
+    uint16_t serial;
 };
 static_assert(std::is_trivially_copyable_v<InboundItemHeader> &&
                   std::is_standard_layout_v<InboundItemHeader>,

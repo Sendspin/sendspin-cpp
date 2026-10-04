@@ -549,19 +549,42 @@ TEST(InboundGate, IndefiniteWaitOutlastsALeftoverConsumedBit) {
     EXPECT_TRUE(writable);
 }
 
-// A transport waiting for its pending message to be consumed is woken by the consume. The join
-// has no timeout: a consume that does not wake it hangs here and the watchdog names the test.
-TEST(InboundGate, ConsumeWakesATransportWaitingToWrite) {
+// A transport parked waiting for its pending message to be consumed is released by the consume,
+// and also by a detach: a connection released or stopped while its transport waits detaches the
+// gate before anything joins the transport thread, and the detach ends the wait so the join
+// completes. The wait has no timeout and neither has the join: a consume or a detach that does
+// not wake the transport hangs here and the watchdog names the test. The consume row is the
+// Control: only it leaves the transport free to write.
+TEST(InboundGate, AConsumeOrADetachReleasesATransportWaitingToWrite) {
+    struct Row {
+        const char* name;
+        bool detach;
+        bool expected_writable;
+    };
+    const Row rows[] = {
+        {"Control: the protocol task consumes the message", false, true},
+        {"the connection is released and its gate detached", true, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundGate gate;
+        ASSERT_TRUE(gate.publish_pending_message());
+        bool writable = !row.expected_writable;
+        std::thread transport([&] { writable = gate.wait_until_writable(UINT32_MAX); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(PARK_MS));
+        if (row.detach) {
+            gate.detach();
+        } else {
+            gate.consume_pending_message();
+        }
+        transport.join();
+        EXPECT_EQ(writable, row.expected_writable);
+    }
+
+    // A consume left over from a message does not end the next message's wait early.
     InboundGate gate;
     ASSERT_TRUE(gate.publish_pending_message());
-    bool writable = false;
-    std::thread transport([&] { writable = gate.wait_until_writable(UINT32_MAX); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(PARK_MS));
     gate.consume_pending_message();
-    transport.join();
-    EXPECT_TRUE(writable);
-
-    // A consume left over from that message does not end the next message's wait early.
     ASSERT_TRUE(gate.publish_pending_message());
     EXPECT_FALSE(gate.wait_until_writable(0));
     EXPECT_FALSE(gate.wait_until_writable(1));

@@ -107,7 +107,9 @@ struct PlayerRole::Impl {
     void handle_stream_end(uint32_t generation) const;
     void handle_stream_clear(uint32_t generation);
     void handle_server_command(const ServerCommandMessage& cmd, uint32_t generation) const;
-    void on_stream_ring_event(PlayerStreamCallbackType event);
+    /// @brief Holds a PLAYER_STREAM event (code: PlayerStreamCallbackType; serial: a STREAM_START's
+    /// stream ordinal) in awaiting_sync_idle_events. Main loop.
+    void on_stream_ring_event(const InboxEvent& event);
     /// @brief Tells the main loop the sync task returned to idle from a stream (sync_idle_slot).
     /// Sync task.
     void note_sync_idle() const {
@@ -116,9 +118,10 @@ struct PlayerRole::Impl {
     // True if this tick has drainable player work: a server command (volume/mute/output delay)
     // in command_slot; the sync task having left a stream (sync_idle_slot) while a STREAM_END
     // waits for it; or stream lifecycle events in awaiting_sync_idle_events, appended by
-    // on_stream_ring_event() during this tick's ring dispatch, that are not held for the sync
-    // task. stream_params_slot's own topic bit needs no term: it is only ever consumed from the
-    // STREAM_START branch while that event sits in awaiting_sync_idle_events.
+    // on_stream_ring_event() during this tick's ring dispatch or by a teardown's catch-up
+    // (complete_teardown()), that are not held for the sync task. stream_params_slot's own topic
+    // bit needs no term: it is only ever consumed from the STREAM_START branch while that event
+    // sits in awaiting_sync_idle_events.
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & (INBOX_TOPIC_PLAYER_COMMAND | INBOX_TOPIC_PLAYER_SYNC_IDLE)) != 0 ||
                (!this->awaiting_sync_idle_events.empty() && !this->awaiting_sync_idle);
@@ -140,13 +143,13 @@ struct PlayerRole::Impl {
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
     /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
-    /// from active_roles (SendspinClient::apply_role_removals()). The STREAM_END is queued on
-    /// the inbox, stamped with the new generation, and the main loop runs complete_teardown() for
-    /// it before acting on that event (catch_up_teardown()).
+    /// from active_roles (SendspinClient::apply_role_removals()). Queues PLAYER_CLEARED, stamped
+    /// with the new generation, for the main loop to catch up on (catch_up_teardown()).
     void cleanup();
 
-    /// @brief The main-loop teardown half: drops the stream events the teardown overtook and
-    /// releases the playback high-performance hold. Main loop only, through catch_up_teardown().
+    /// @brief The main-loop teardown half: replaces the stream events the teardown overtook with
+    /// the STREAM_END it owes the listener (fired once the sync task reads idle) and releases the
+    /// playback high-performance hold. Main loop only, through catch_up_teardown().
     void complete_teardown();
 
     /// @brief Joins the sync task thread and returns its buffered audio to the inbound ring;
@@ -195,8 +198,9 @@ struct PlayerRole::Impl {
     ///         player is over quota.
     bool hand_flac_header(const std::string& codec_header, uint32_t generation);
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
-    /// against the live counter before dispatching it.
-    void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation) const;
+    /// against the live counter before dispatching it, and carrying a STREAM_START's `ordinal`.
+    void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation,
+                              uint16_t ordinal) const;
     void load_output_delay();
     void persist_output_delay() const;
     uint16_t get_effective_output_delay_ms() const;
@@ -208,7 +212,7 @@ struct PlayerRole::Impl {
     // Struct fields
     PlayerRoleConfig config;
     ServerPlayerStreamObject current_stream_params{};
-    std::vector<PlayerStreamCallbackType> awaiting_sync_idle_events;
+    std::vector<InboxEvent> awaiting_sync_idle_events;
     TeardownTracker teardown;  ///< Main loop only.
 
     // Pointer fields
@@ -238,7 +242,13 @@ struct PlayerRole::Impl {
     std::atomic<uint32_t> cleanup_generation{0};
 
     // 16-bit fields
+    /// Written on the main loop (a server or consumer change, load_output_delay()); read there
+    /// and on the sync task (get_effective_output_delay_ms()).
     std::atomic<uint16_t> output_delay_ms{0};
+    /// The ordinal of the latest stream whose codec header went to the sync task, one per
+    /// stream/start (see SyncTask::signal_stream_start()). Protocol task only, or the main loop
+    /// in SendspinClient::stop() once the task is joined.
+    uint16_t stream_ordinal{0};
 
     // 8-bit fields
     // True while the head of awaiting_sync_idle_events is a STREAM_END waiting for the sync task
@@ -249,8 +259,11 @@ struct PlayerRole::Impl {
     // True between the drained STREAM_START and STREAM_END callbacks (main-thread only); keeps
     // on_stream_end() from firing without a matching on_stream_start()
     bool stream_active{false};
+    /// Written by set_output_delay_adjustable() on the consumer's thread; read on the main loop
+    /// and the sync task.
     std::atomic<bool> output_delay_adjustable{false};
-    // Set by the client while it is unavailable; read by handle_binary() on the protocol task.
+    /// Set while the client is unavailable, on the main loop (set_available(), add_player());
+    /// read by handle_binary() on the protocol task.
     std::atomic<bool> discard_audio{false};
     uint8_t volume{0};
 };

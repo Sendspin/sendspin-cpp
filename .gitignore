@@ -12,6 +12,8 @@ build-*/
 
 # Compilation artifacts
 *.o
+*.pyc
+__pycache__/
 *.a
 *.so
 *.dylib
