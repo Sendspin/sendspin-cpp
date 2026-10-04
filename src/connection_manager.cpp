@@ -1501,10 +1501,7 @@ uint32_t ConnectionManager::scan_admitted(int64_t now_us) {
                 // message 1, and connection.md "Re-handshake" lets the client start no application
                 // message there but the handshake; the other ends at a rekey the peer has already
                 // failed to perform. No goodbye reason describes either, and the peer learns the
-                // same thing from the close. close_silently() tears the transport down here (it is
-                // non-blocking on every platform), so the nullopt release below has nothing to
-                // send.
-                conn->close_silently(SendspinGoodbyeReason::ANOTHER_SERVER);
+                // same thing from the close, which the nullopt release below performs.
                 this->drop_connection(conn, std::nullopt);
                 continue;
             }
@@ -1613,6 +1610,11 @@ void ConnectionManager::release_connection(std::shared_ptr<SendspinConnection> c
     conn->detach_inbound();
     if (goodbye.has_value()) {
         conn->disconnect(goodbye.value(), nullptr);
+    } else if (conn->is_connected()) {
+        // No goodbye still closes the WebSocket (connection.md "Failure Handling", pairing.md
+        // "Protocol Errors"): an inbound transport is held open by its server until the peer
+        // closes otherwise. close_transport_now() is non-blocking on every platform.
+        conn->close_transport_now();
     }
     // The caller's reference drops here.
 }

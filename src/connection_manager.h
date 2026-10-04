@@ -652,9 +652,10 @@ private:
     NurseryEntry* release_nursery_entry(NurseryEntry* it,
                                         std::optional<SendspinGoodbyeReason> reason);
 
-    /// @brief Detaches `conn`, sends `goodbye` if there is one, and drops the caller's
-    /// reference: a connection leaving the manager. The destructor this can run (on the protocol
-    /// task) can join an outbound transport thread, which detach_inbound() keeps off the gate.
+    /// @brief Detaches `conn`, sends `goodbye` if there is one or else closes a still-connected
+    /// transport without one, and drops the caller's reference: a connection leaving the
+    /// manager. The destructor this can run (on the protocol task) can join an outbound transport
+    /// thread, which detach_inbound() keeps off the gate.
     static void release_connection(std::shared_ptr<SendspinConnection> conn,
                                    std::optional<SendspinGoodbyeReason> goodbye);
 
@@ -710,8 +711,8 @@ private:
     /// only), and goodbyes and drops it. No-op if conn is null or not a managed connection.
     ///
     /// @param conn The connection to drop; must be admitted or a nursery entry.
-    /// @param goodbye Goodbye reason to send before closing, or nullopt when the transport is
-    ///        already gone (connection-lost path) so no goodbye should be attempted.
+    /// @param goodbye Goodbye reason to send before closing, or nullopt to close without one
+    ///        (the transport is already gone, or the spec forbids an application message).
     void drop_connection(SendspinConnection* conn, std::optional<SendspinGoodbyeReason> goodbye);
 
     /// @brief Drop every managed connection that authenticated with `psk_id`.

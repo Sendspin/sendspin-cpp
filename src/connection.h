@@ -339,10 +339,10 @@ public:
     /// connection.md "Failure Handling": handshake-phase failures, an AEAD failure once in
     /// transport mode, and malformed fragment sequences all close the WebSocket without sending a
     /// client/goodbye (or any other application-level message). Called on the protocol task, from
-    /// the receive path and by the re-prove watchdog, so this routes to close_transport_now()
-    /// (non-blocking on every platform) instead of disconnect() (which can block on a transport
-    /// join; see close_transport_now()). The inbound gate is detached first, so nothing the peer
-    /// sent after the failure is processed, and the protocol task reports the loss.
+    /// the receive path, so this routes to close_transport_now() (non-blocking on every platform)
+    /// instead of disconnect() (which can block on a transport join; see close_transport_now()).
+    /// The inbound gate is detached first, so nothing the peer sent after the failure is processed,
+    /// and the protocol task reports the loss.
     void close_silently(SendspinGoodbyeReason /*reason*/) {
         this->detach_inbound();
         this->close_transport_now();

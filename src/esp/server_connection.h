@@ -115,6 +115,8 @@ public:
     ///
     /// Use disconnect() for graceful shutdown. Use trigger_close() only when you
     /// need to force-close without sending goodbye (e.g., after goodbye is already sent).
+    ///
+    /// Only the first call queues a close; later ones return (see close_triggered_).
     void trigger_close();
 
     /// @brief Gets the socket file descriptor
@@ -188,6 +190,11 @@ protected:
 
     /// @brief Set once the httpd session has closed (see mark_closed())
     std::atomic<bool> closed_{false};
+
+    /// @brief Set by the first trigger_close() (protocol task, or the httpd worker after a
+    /// goodbye). closed_ only flips when httpd runs the close, so without this a second close
+    /// queued before then could reach a session httpd has since accepted onto the same slot.
+    std::atomic<bool> close_triggered_{false};
 };
 
 }  // namespace sendspin

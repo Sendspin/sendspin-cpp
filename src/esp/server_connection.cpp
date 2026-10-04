@@ -237,7 +237,9 @@ void SendspinServerConnection::trigger_close() {
     // wrong peer. A residual instruction-scale TOCTOU remains (the session could close between
     // this check and the call below); eliminating it entirely would need an identity check on
     // the httpd task itself, which is not worth the extra queue hop for a close-time race.
-    if (!this->is_connected()) {
+    // Idempotent: httpd_sess_trigger_close() queues a close against the session slot, so a second
+    // one queued before the first runs could close a session accepted onto that slot meanwhile.
+    if (!this->is_connected() || this->close_triggered_.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
     httpd_sess_trigger_close(this->server_, this->sockfd_);

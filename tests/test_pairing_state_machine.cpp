@@ -1601,34 +1601,61 @@ TEST_F(PairingStateMachineTest, RetryRoundServerPairInitCarryingNonceClosesSilen
 // pairing.md "Protocol Errors": "a malformed or missing field ... is a protocol error: the
 // detecting side closes the WebSocket without sending any application-level error message, and
 // persists nothing." This pins that behavior for the MALFORMED case in
-// ConnectionManager::handle_pairing_message: no pair/abort, and the connection closes.
-
+// ConnectionManager::handle_pairing_message: no pair/abort and no client/goodbye, yet the
+// transport of the inbound connection is still closed, unless it is already gone. The control is
+// a drop that does send a goodbye (a received pair/abort concurrent_attempt), which closes through
+// disconnect() instead.
 TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSilently) {
-    FakeConnection* conn =
-        this->inject_current_connection("server-dyn-4", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
-    this->enter_pairing(conn);
-    this->pump();
-    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    struct Row {
+        const char* name;
+        bool malformed_frame;  // else a received pair/abort concurrent_attempt
+        bool transport_open;
+        int expected_disconnects;
+        int expected_silent_closes;
+    };
+    const Row rows[] = {
+        {"malformed_frame", true, true, 0, 1},
+        // A transport already gone has nothing left to close.
+        {"malformed_frame_transport_gone", true, false, 0, 0},
+        // Control: a drop with a goodbye closes by disconnect(), not by a silent close.
+        {"Control: pair_abort_concurrent_attempt", false, true, 1, 0},
+    };
 
-    auto current_conn_sp = this->current_connection_sp();
-    ServerPairingMessageEvent malformed_event;
-    malformed_event.conn = current_conn_sp;
-    malformed_event.kind = PairingMessageKind::MALFORMED;
-    this->schedule_pairing_message_event(std::move(malformed_event));
-    this->pump();
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        FakeConnection* conn = this->inject_current_connection(
+            "server-dyn-4", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
+        ASSERT_FALSE(conn->is_outbound());
+        this->enter_pairing(conn);
+        this->pump();
+        ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+        // The listener accumulates across rows, so each row reads its count as a delta.
+        const int failed_before = this->listener_.count(PairingEventKind::FAILED);
+        conn->connected_ = row.transport_open;
 
-    // No pair/abort, or any other application-level message, is sent.
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
-    // The close goes through drop_connection() with goodbye=std::nullopt (no client/goodbye
-    // either), so disconnect_count_ stays 0, unlike
-    // PairAbortConcurrentAttemptStillClosesConnection, which does send a goodbye.
-    EXPECT_EQ(conn->disconnect_count_, 0);
-    EXPECT_EQ(this->current_connection(), nullptr)
-        << "a malformed pairing frame during an active pairing-code session must close the connection";
-    EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::IDLE)
-        << "clear_pairing_state() must have reset the pairing session (persists nothing)";
-    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+        if (row.malformed_frame) {
+            ServerPairingMessageEvent malformed_event;
+            malformed_event.conn = this->current_connection_sp();
+            malformed_event.kind = PairingMessageKind::MALFORMED;
+            this->schedule_pairing_message_event(std::move(malformed_event));
+        } else {
+            PairAbortEvent abort_event;
+            abort_event.conn = this->current_connection_sp();
+            abort_event.reason = PairAbortReason::CONCURRENT_ATTEMPT;
+            this->schedule_abort(std::move(abort_event));
+        }
+        this->pump();
+
+        // No pair/abort, or any other application-level message, is sent.
+        EXPECT_EQ(conn->sent_text_.size(), 1u);
+        EXPECT_EQ(conn->disconnect_count_, row.expected_disconnects);
+        EXPECT_EQ(conn->close_transport_now_count_, row.expected_silent_closes);
+        EXPECT_EQ(this->current_connection(), nullptr)
+            << "the abort must drop the connection from its admitted slot";
+        EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::IDLE)
+            << "clear_pairing_state() must have reset the pairing session (persists nothing)";
+        EXPECT_EQ(this->listener_.count(PairingEventKind::FAILED), failed_before + 1);
+    }
 }
 
 TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameWithNoActiveSessionIsIgnored) {
