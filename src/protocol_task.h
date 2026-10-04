@@ -240,13 +240,13 @@ public:
     void drop_commands();
 
     /// @brief Refuses every later ACCEPT_CONNECTION push (push_command() returns false). Set
-    /// under the queue lock, so an accept is either queued before it, and taken by the caller's
-    /// refusal pass, or refused at its push, with nothing in between. Main loop, from stop() once
-    /// the thread is joined.
+    /// under the queue lock, so an accept is either queued before it, and taken by a tick of the
+    /// task (its final one at the latest), or refused at its push, with nothing in between. Main
+    /// loop, from ConnectionManager::close_admission() before stop().
     void close_accepts();
 
-    /// @brief Takes accepts again; see close_accepts(). Main loop, from start() before the
-    /// platform server can deliver.
+    /// @brief Takes accepts again; see close_accepts(). Main loop, from
+    /// ConnectionManager::start() before the platform server can deliver.
     void open_accepts();
 
     /// @brief Whether the thread is running. Main loop only.

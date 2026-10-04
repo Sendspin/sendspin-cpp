@@ -86,7 +86,7 @@ constexpr uint16_t ROLLBACK_TEST_PORT = 19066;
 constexpr uint16_t HIGH_PERF_TEST_PORT = 19067;
 constexpr uint16_t VISUALIZER_TEST_PORT = 19068;
 constexpr uint16_t PROVIDER_TEST_PORT = 19070;
-constexpr uint16_t STOP_ACCEPT_AFTER_JOIN_TEST_PORT = 19071;
+constexpr uint16_t ADMISSION_CLOSED_DELIVERY_TEST_PORT = 19071;
 constexpr uint16_t STREAM_FILTER_STOPPED_TASK_TEST_PORT = 19072;
 constexpr uint16_t STREAM_FILTER_OFFSET_TEST_PORT = 19073;
 constexpr uint16_t TIME_FILTER_SLOT_TEST_PORT = 19074;
@@ -143,6 +143,13 @@ public:
     }
     ~SilentListener() {
         this->close();
+    }
+
+    /// Takes the next connection off the backlog, blocking with no timeout. The listener still
+    /// sends nothing on it.
+    /// @return The connection's descriptor, or -1 when the listener is not set up.
+    int accept_connection() {
+        return this->fd_ >= 0 ? ::accept(this->fd_, nullptr, nullptr) : -1;
     }
 
     /// Closes the listener, resetting the connections waiting in its backlog. IXWebSocket clears
@@ -925,25 +932,28 @@ size_t queued_commands(ProtocolTask& task) {
     return task.command_count_;
 }
 
-// A peer the server delivers while stop() is under way waits in the command queue as an accept,
-// and stop() refuses it with a client/goodbye of reason shutdown instead of a nursery slot,
-// whether the protocol task's final tick takes it or stop() itself takes it once the task is
-// joined. The test thread plays the protocol task, so the accept provably sits in the queue when
-// admission closes. The open row is the control: the same queued accept is admitted and owed no
-// goodbye. The nursery-full rejection is covered by
-// ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer. Each row connects a real peer, and
-// the Control row watches 200 ms for a goodbye that must not come, so the table takes most of a
-// second.
+// A peer the server delivers while stop() is under way is refused, never given a nursery slot.
+// One queued as an accept before admission closed is refused by the protocol task's final tick
+// with a client/goodbye of reason shutdown; one delivered after admission closed is refused at
+// its push (ProtocolTask::close_accepts(), which ConnectionManager::close_admission() calls), so
+// its transport closes it without a goodbye and nothing is left queued for stop() to refuse. The
+// test thread plays the protocol task, so the accept provably sits in the queue when admission
+// closes. The open row is the control: the same queued accept is admitted and owed no goodbye.
+// The nursery-full rejection is covered by ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer.
+// Each row connects a real peer, and the Control row watches 200 ms for a goodbye that must not
+// come, so the table takes most of a second.
 TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
-    enum class Taker : uint8_t { FINAL_TICK, AFTER_JOIN, OPEN_TICK };
+    enum class Taker : uint8_t { FINAL_TICK, AFTER_CLOSE, OPEN_TICK };
     struct AcceptRow {
         const char* name;
         Taker taker;
         uint16_t port;
     };
     const AcceptRow rows[] = {
-        {"the final tick takes it", Taker::FINAL_TICK, ADMISSION_CLOSED_TEST_PORT},
-        {"stop() takes it after the join", Taker::AFTER_JOIN, STOP_ACCEPT_AFTER_JOIN_TEST_PORT},
+        {"queued before admission closed: the final tick refuses it", Taker::FINAL_TICK,
+         ADMISSION_CLOSED_TEST_PORT},
+        {"delivered after admission closed: refused at its push", Taker::AFTER_CLOSE,
+         ADMISSION_CLOSED_DELIVERY_TEST_PORT},
         {"Control: admission open", Taker::OPEN_TICK, ADMISSION_OPEN_TEST_PORT},
     };
 
@@ -953,18 +963,32 @@ TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
         SendspinClient& client = bundle.client();
         ASSERT_TRUE(bundle.start());
         client.protocol_task_->stop();
+        if (row.taker == Taker::AFTER_CLOSE) {
+            client.connection_manager_->close_admission();
+        }
 
         auto peer = connect_paired_server(bundle.peer, row.port);
-        wait_until([&] { return queued_commands(*client.protocol_task_) == 1; });
+        if (row.taker != Taker::AFTER_CLOSE) {
+            wait_until([&] { return queued_commands(*client.protocol_task_) == 1; });
+        }
 
         switch (row.taker) {
             case Taker::FINAL_TICK:
                 // stop()'s order: admission closes, then the task's final tick runs.
                 client.connection_manager_->close_admission();
                 (void) client.protocol_tick();
+                wait_until([&] { return peer->goodbye_reason().has_value(); });
+                EXPECT_EQ(peer->goodbye_reason().value_or(""), "shutdown")
+                    << "a newcomer refused at stop() must be told why";
                 break;
-            case Taker::AFTER_JOIN:
-                client.stop();
+            case Taker::AFTER_CLOSE:
+                // No timeout: a delivery the queue took instead would never be closed here, since
+                // the test thread runs no tick, and the watchdog names the test.
+                wait_until([&] { return peer->closed(); });
+                EXPECT_FALSE(peer->goodbye_reason().has_value())
+                    << "a delivery refused at its push is closed by its transport, without a goodbye";
+                EXPECT_EQ(queued_commands(*client.protocol_task_), 0U)
+                    << "a delivery after admission closed reached the queue";
                 break;
             case Taker::OPEN_TICK:
                 (void) client.protocol_tick();
@@ -975,9 +999,6 @@ TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
                 break;
         }
         if (row.taker != Taker::OPEN_TICK) {
-            wait_until([&] { return peer->goodbye_reason().has_value(); });
-            EXPECT_EQ(peer->goodbye_reason().value_or(""), "shutdown")
-                << "a newcomer refused at stop() must be told why";
             EXPECT_TRUE(client.connection_manager_->nursery_.empty())
                 << "a refused newcomer took a nursery slot";
         }
@@ -1004,9 +1025,9 @@ void fill_accept_slots(ProtocolTask& task) {
 // on_new_connection() reports the refusal and keeps no reference, so the delivering thread's own
 // reference is the last one and the transport releases the connection once the delivery returns
 // (SendspinWsServer::NewConnectionCallback), never inside it. A delivery is refused when every
-// accept slot is taken, and once stop() has joined the protocol task and closed accepts
-// (ProtocolTask::close_accepts()), when no refusal pass would take an accept any more. The
-// accepted row is the control: the queued accept holds a reference for the protocol task.
+// accept slot is taken, and once admission is closed (ConnectionManager::close_admission() closes
+// the protocol task's accepts), when no tick would take an accept any more. The accepted row is
+// the control: the queued accept holds a reference for the protocol task.
 TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
     struct Row {
         const char* name;
@@ -1018,7 +1039,7 @@ TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
     const Row rows[] = {
         {"Control: room in the queue", false, false, true, 2},
         {"every accept slot taken", true, false, false, 1},
-        {"stop() has joined the protocol task", false, true, false, 1},
+        {"admission is closed", false, true, false, 1},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -1031,7 +1052,7 @@ TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
             fill_accept_slots(*client.protocol_task_);
         }
         if (row.refusing) {
-            client.protocol_task_->close_accepts();
+            client.connection_manager_->close_admission();
         }
 
         auto conn = std::make_shared<SendspinServerConnection>(nullptr);
@@ -1083,6 +1104,181 @@ TEST(ClientLifecycle, AStaleCommandIsNotCarriedIntoTheNextRun) {
         }
         (void) client.protocol_tick();
         EXPECT_EQ(client.connection_manager_->nursery_.size(), stale ? 0U : 1U);
+        silent.close();
+        client.stop();
+    }
+}
+
+std::string loopback_url(uint16_t port) {
+    return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
+}
+
+// Releasing an outbound attempt whose upgrade is still in flight never waits for its transport on
+// the protocol task: the release closes the transport without blocking and parks the connection
+// in ConnectionManager's reaping list, which frees it once the transport reports its close. Each
+// row starts an attempt on a listener that never answers and releases it through one path that
+// can: disconnect(), a connect_to() that replaces it, and the nursery's establish reap (staged at
+// a clock past the deadline). The test thread plays the protocol task for the release, so no tick
+// can reap the attempt before it is inspected, and the attempt is watched through a weak_ptr
+// only: right after the release it is alive and parked, which a release that stops the transport
+// in place cannot produce, since that destroys the connection inside the release (after waiting
+// out the handshake timeout when its close landed before the upgrade began). The real task then
+// takes a disconnect() and a connect_to() from another thread while every listener is still
+// silent, and the probe listener sees the connect (no timeout): the parked attempt holds up no
+// later request. That half does not tell a task that never waited from one that waited and then
+// went on; the inspection above is what pins the release. Once the listeners close, the attempt's
+// transport reports its close (waited for with no timeout) and the very next tick frees it: the
+// reap drops a parked connection on its transport's close, not only at its deadline. Control: an
+// attempt nothing releases stays in the nursery with nothing parked; it is the one the real
+// task's disconnect() then releases. Each row connects loopback sockets only, so the table runs
+// in tens of milliseconds.
+TEST(ClientLifecycle, AReleasedAttemptStillConnectingIsReapedOffTheProtocolTask) {
+    enum class Release : uint8_t { DISCONNECT, REPLACED, ESTABLISH_REAP, NONE };
+    struct Row {
+        const char* name;
+        Release release;
+    };
+    const Row rows[] = {
+        {"disconnect() releases it", Release::DISCONNECT},
+        {"a connect_to() replaces it", Release::REPLACED},
+        {"the establish reap releases it", Release::ESTABLISH_REAP},
+        {"Control: nothing releases it", Release::NONE},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SilentListener silent;
+        SilentListener replacement;
+        SilentListener probe;
+        ASSERT_NE(silent.port(), 0);
+        ASSERT_NE(replacement.port(), 0);
+        ASSERT_NE(probe.port(), 0);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+
+        manager.connect_to(loopback_url(silent.port()));
+        ASSERT_EQ(manager.nursery_.size(), 1U);
+        const std::weak_ptr<SendspinConnection> attempt = manager.nursery_[0].conn;
+        switch (row.release) {
+            case Release::DISCONNECT:
+                manager.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+                break;
+            case Release::REPLACED:
+                manager.connect_to(loopback_url(replacement.port()));
+                break;
+            case Release::ESTABLISH_REAP:
+                (void) manager.scan_nursery(platform_time_us() + NURSERY_ESTABLISH_TIMEOUT_US);
+                break;
+            case Release::NONE:
+                break;
+        }
+        if (row.release == Release::NONE) {
+            EXPECT_TRUE(manager.reaping_.empty()) << "an attempt nothing released was parked";
+            EXPECT_EQ(manager.nursery_.size(), 1U);
+        } else {
+            ASSERT_FALSE(attempt.expired())
+                << "the release destroyed the connection in place, joining its transport";
+            ASSERT_EQ(manager.reaping_.size(), 1U);
+            EXPECT_EQ(manager.reaping_[0].conn, attempt.lock());
+            EXPECT_EQ(manager.nursery_.size(), row.release == Release::REPLACED ? 1U : 0U);
+        }
+
+        // The real task takes a disconnect() and then a connect_to() from another thread while
+        // every listener is still silent; the probe sees the connect once the task has acted on
+        // both.
+        ASSERT_TRUE(client.protocol_task_->start([&client] { return client.protocol_tick(); },
+                                                 SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE,
+                                                 1, false));
+        std::thread consumer([&client, &probe] {
+            client.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+            client.connect_to(loopback_url(probe.port()));
+        });
+        consumer.join();
+        const int probe_fd = probe.accept_connection();
+        EXPECT_GE(probe_fd, 0) << "the probe never saw the connect_to() behind the disconnect()";
+
+        // The attempt fails once its listener is gone; the tick after its transport reports the
+        // close frees it, long before its reaping deadline.
+        client.protocol_task_->stop();
+        ASSERT_FALSE(attempt.expired()) << "the attempt was dropped while its listener was silent";
+        if (probe_fd >= 0) {
+            ::close(probe_fd);
+        }
+        silent.close();
+        replacement.close();
+        probe.close();
+        wait_until([&] {
+            const std::shared_ptr<SendspinConnection> conn = attempt.lock();
+            return conn != nullptr && conn->inbound_gate().is_transport_closed();
+        });
+        (void) client.protocol_tick();
+        EXPECT_TRUE(attempt.expired()) << "the reap kept a parked connection whose transport closed";
+        client.stop();
+    }
+}
+
+// Only an attempt still connecting is parked: a released outbound connection whose WebSocket
+// upgrade completed is released in place, since its destructor's stop is the short close of an
+// open transport and no platform reports the close of one stopped that way, and a parked attempt
+// that opens is dropped by the next tick instead of being held to its deadline. The upgrade is
+// staged by marking it (mark_ws_upgraded(), what the transport's Open does through
+// on_connected_cb) once the listener has taken the attempt's TCP connection, so IXWebSocket is
+// inside its handshake and the destructor's close cancels it at once. The test thread plays the
+// protocol task, so nothing ticks between the steps it inspects. Control: an attempt still
+// connecting is parked.
+TEST(ClientLifecycle, AnOpenedOutboundConnectionIsNotHeldForReaping) {
+    enum class Step : uint8_t { OPENED_THEN_RELEASED, RELEASED_THEN_OPENED, STILL_CONNECTING };
+    struct Row {
+        const char* name;
+        Step step;
+    };
+    const Row rows[] = {
+        {"released after its upgrade: released in place", Step::OPENED_THEN_RELEASED},
+        {"opened after its release: the next tick drops it", Step::RELEASED_THEN_OPENED},
+        {"Control: still connecting: parked", Step::STILL_CONNECTING},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SilentListener silent;
+        ASSERT_NE(silent.port(), 0);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+
+        manager.connect_to(loopback_url(silent.port()));
+        ASSERT_EQ(manager.nursery_.size(), 1U);
+        const std::weak_ptr<SendspinConnection> attempt = manager.nursery_[0].conn;
+        const int fd = silent.accept_connection();
+        ASSERT_GE(fd, 0);
+
+        if (row.step == Step::OPENED_THEN_RELEASED) {
+            attempt.lock()->mark_ws_upgraded();
+        }
+        manager.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+        switch (row.step) {
+            case Step::OPENED_THEN_RELEASED:
+                EXPECT_TRUE(attempt.expired()) << "a connection that opened was parked";
+                EXPECT_TRUE(manager.reaping_.empty());
+                break;
+            case Step::RELEASED_THEN_OPENED:
+                ASSERT_EQ(manager.reaping_.size(), 1U);
+                attempt.lock()->mark_ws_upgraded();
+                (void) client.protocol_tick();
+                EXPECT_TRUE(attempt.expired())
+                    << "a parked attempt that opened was held for its deadline";
+                break;
+            case Step::STILL_CONNECTING:
+                EXPECT_FALSE(attempt.expired());
+                EXPECT_EQ(manager.reaping_.size(), 1U);
+                break;
+        }
+        ::close(fd);
         silent.close();
         client.stop();
     }

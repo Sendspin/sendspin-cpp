@@ -218,7 +218,6 @@ void ConnectionManager::start() {
     // honoring a backoff from before the stop. The protocol task is not running, so these writes
     // reach it through its start.
     this->shutdown_done_ = false;
-    this->shutdown_goodbyes_pending_ = 0;
     this->shutdown_wait_.reset();
     this->shutdown_ui_ = {false, false};
     this->ws_server_start_retry_time_us_ = 0;
@@ -257,6 +256,8 @@ void ConnectionManager::start() {
         this->ws_server_->set_wake_callback([task]() { task->wake(); });
     }
 
+    // Accepts reopen with admission, before the server can deliver: close_admission() closed both.
+    this->client_->protocol_task_->open_accepts();
     this->accepting_.store(true, std::memory_order_release);
     // Started here when the network is already up, so the server is listening once start()
     // returns; otherwise the protocol task starts it once the provider reports ready.
@@ -265,6 +266,11 @@ void ConnectionManager::start() {
 
 void ConnectionManager::close_admission() {
     this->accepting_.store(false, std::memory_order_release);
+    // Closed together, under the queue lock: an accept is either queued already, and the task's
+    // next or final tick refuses it with a goodbye (accept()), or refused at its push, which
+    // leaves it with its transport (on_new_connection()). None reaches the queue after the final
+    // tick, so nothing is left for the main loop to refuse once the task is joined.
+    this->client_->protocol_task_->close_accepts();
     this->client_->protocol_task_->wake();
 }
 
@@ -276,18 +282,24 @@ PairingUiSnapshot ConnectionManager::finish_stop() {
     // Close every transport the shutdown pass kept before the server stops, so its join does not
     // wait out a peer that never closes. Every gate is detached, so no transport thread the stop
     // joins is parked on one, and one in a ring acquire gives up within
-    // INBOUND_ACQUIRE_TIMEOUT_MS.
+    // INBOUND_ACQUIRE_TIMEOUT_MS. The connections still parked for reaping are closed too, so
+    // one that opened after its release does not hold its join; one still connecting is stopped
+    // by its destructor below.
     for (auto& conn : this->closing_) {
         conn->close_transport_now();
+    }
+    for (auto& entry : this->reaping_) {
+        entry.conn->close_transport_now();
     }
     if (this->ws_server_ != nullptr) {
         this->ws_server_->stop();
     }
     // Released here, after the server stop: an outbound connection's destructor stops its
-    // transport synchronously.
+    // transport synchronously, up to its connect timeout for one still connecting.
     std::vector<std::shared_ptr<SendspinConnection>> releasing;
     releasing.swap(this->closing_);
     releasing.clear();
+    this->reaping_.clear();
 
     const PairingUiSnapshot ui = this->shutdown_ui_;
     this->shutdown_ui_ = {false, false};
@@ -329,8 +341,8 @@ bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
     if (this->client_->protocol_task_->push_command(std::move(command))) {
         return true;
     }
-    // Refused (push_command() logged it: the slots are full, or stop() closed accepts once the
-    // task was joined): the transport drops what the peer sends from here, and the caller closes
+    // Refused (push_command() logged it: the slots are full, or close_admission() closed
+    // accepts): the transport drops what the peer sends from here, and the caller closes
     // the socket and releases the connection on its own close path. The delivery runs ahead of
     // the connection's first frame on the delivering thread, so nothing reached the ring before
     // the detach.
@@ -366,7 +378,7 @@ void ConnectionManager::accept(std::shared_ptr<SendspinConnection> conn) {
     }
     if (inbound_count >= NURSERY_CAPACITY) {
         SS_LOGW(TAG, "Nursery full of live connections, rejecting new connection");
-        release_connection(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
+        this->release_connection(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
         return;
     }
 
@@ -377,8 +389,9 @@ void ConnectionManager::accept(std::shared_ptr<SendspinConnection> conn) {
 }
 
 void ConnectionManager::refuse_accept(std::shared_ptr<SendspinConnection> conn) {
-    // Delivered while admission is closed (a stop() under way): the slots are being emptied, so
-    // the newcomer gets a goodbye and a close instead of one, and is kept for finish_stop().
+    // Queued before admission closed and taken after (a stop() under way): the slots are being
+    // emptied, so the newcomer gets a goodbye and a close instead of one, and is kept for
+    // finish_stop().
     SS_LOGD(TAG, "Not accepting connections, rejecting new connection");
     conn->detach_inbound();
     this->goodbye_for_shutdown(std::move(conn));
@@ -392,7 +405,6 @@ void ConnectionManager::goodbye_for_shutdown(std::shared_ptr<SendspinConnection>
     // not connected) must not satisfy a wait for goodbyes not yet counted.
     std::shared_ptr<GoodbyeWait> wait = this->shutdown_wait_;
     wait->add_pending();
-    ++this->shutdown_goodbyes_pending_;
     conn->disconnect(SendspinGoodbyeReason::SHUTDOWN, [wait] { wait->complete_one(); });
     this->closing_.push_back(std::move(conn));
 }
@@ -457,8 +469,8 @@ void ConnectionManager::connect_to(const std::string& url) {
 void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
     // The connected connections stay in their slots until the loss pass sees their detached gates
     // (or the manager is stopped). An unconnected (pre-upgrade) nursery entry has no transport to
-    // goodbye and yields no close, so it is released here rather than left for the establish
-    // deadline.
+    // goodbye and yields no close while its attempt runs, so it is released here, parked until
+    // its transport finishes (release_connection()), rather than left for the establish deadline.
     InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> to_disconnect;
     for (const auto& entry : this->admitted_) {
         if (entry.conn != nullptr && entry.conn->is_connected()) {
@@ -938,6 +950,10 @@ uint32_t ConnectionManager::tick(int64_t now_us) {
         }
     }
 
+    // After every scan above that can release a connection, so one released this tick whose
+    // transport is already closed is dropped now rather than at a later wake.
+    next = std::min(next, this->reap_released(now_us));
+
     // The platform server's pending-upgrade reap (ESP: close sessions that never complete their
     // upgrade; host: none, IXWebSocket times them out itself).
     if (this->ws_server_ != nullptr) {
@@ -1072,18 +1088,24 @@ void ConnectionManager::shutdown() {
 }
 
 void ConnectionManager::flush_shutdown_goodbyes() {
-    if (this->shutdown_goodbyes_pending_ == 0 || this->shutdown_wait_ == nullptr) {
+    if (this->shutdown_wait_ == nullptr) {
         return;
     }
-    // The bound scales with the goodbyes issued: on ESP they are handed to lwIP one at a time by
-    // the single httpd worker, so several peers need several quanta.
-    const uint32_t count = this->shutdown_goodbyes_pending_;
-    const uint32_t flush_bound_ms = GOODBYE_FLUSH_TIMEOUT_MS * count;
-    if (!this->shutdown_wait_->wait(flush_bound_ms)) {
+    // Waited for once: a goodbye that never completes (an ESP session that closed before its
+    // worker ran) is not waited for again by a later tick, and a late completion touches only the
+    // record it captured.
+    const std::shared_ptr<GoodbyeWait> wait = std::move(this->shutdown_wait_);
+    // The bound scales with the goodbyes still outstanding: on ESP they are handed to lwIP one at
+    // a time by the single httpd worker, so several peers need several quanta.
+    const size_t count = wait->outstanding();
+    if (count == 0) {
+        return;
+    }
+    const auto flush_bound_ms = static_cast<uint32_t>(GOODBYE_FLUSH_TIMEOUT_MS * count);
+    if (!wait->wait(flush_bound_ms)) {
         SS_LOGD(TAG, "Goodbye flush bound (%u ms for %u goodbyes) elapsed; closing regardless",
                 static_cast<unsigned>(flush_bound_ms), static_cast<unsigned>(count));
     }
-    this->shutdown_goodbyes_pending_ = 0;
 }
 
 // ============================================================================
@@ -1250,8 +1272,8 @@ uint32_t ConnectionManager::scan_nursery(int64_t now_us) {
     }
 
     // Establish reap: the only release path for peers that connect and then stall without
-    // completing the hello, for outbound sockets whose transport never delivers a close (host
-    // IXWebSocket), and so also for a connection whose hello never completed.
+    // completing the hello, for outbound attempts that stall without failing, and so also for a
+    // connection whose hello never completed.
     for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
         const int64_t deadline_us =
             it->conn->get_provisional_time_us() + NURSERY_ESTABLISH_TIMEOUT_US;
@@ -1264,6 +1286,32 @@ uint32_t ConnectionManager::scan_nursery(int64_t now_us) {
         }
         next = std::min(next, ms_until(deadline_us, now_us));
         ++it;
+    }
+    return next;
+}
+
+uint32_t ConnectionManager::reap_released(int64_t now_us) {
+    uint32_t next = ProtocolTask::NO_DEADLINE;
+    for (auto it = this->reaping_.begin(); it != this->reaping_.end();) {
+        // The transport's close flag, not close_ready(): nothing takes a released connection's
+        // ring items any more, so its in-flight count need not reach zero. An attempt that opened
+        // after its release is done connecting too, so its destructor's stop is the short close
+        // of an open transport; the transport's upgrade report wakes the task for it.
+        const bool closed = it->conn->inbound_gate().is_transport_closed();
+        const bool opened = it->conn->is_ws_upgraded();
+        if (!closed && !opened && now_us < it->deadline_us) {
+            next = std::min(next, ms_until(it->deadline_us, now_us));
+            ++it;
+            continue;
+        }
+        if (!closed && !opened) {
+            SS_LOGW(TAG,
+                    "Released outbound connection's transport still open after %u ms; dropping it",
+                    static_cast<unsigned>(SendspinClientConnection::CONNECT_TIMEOUT_MS));
+        }
+        // The erase drops the list's reference; the destructor's transport join is short once the
+        // transport has closed or opened, and bounded by what remains of its connect otherwise.
+        it = this->reaping_.erase(it);
     }
     return next;
 }
@@ -1424,7 +1472,7 @@ NurseryEntry* ConnectionManager::release_nursery_entry(
     NurseryEntry* it, std::optional<SendspinGoodbyeReason> reason) {
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
-    release_connection(std::move(conn), reason);
+    this->release_connection(std::move(conn), reason);
     return next;
 }
 
@@ -1445,8 +1493,38 @@ void ConnectionManager::release_connection(std::shared_ptr<SendspinConnection> c
         // closes otherwise. close_transport_now() is non-blocking on every platform.
         conn->close_transport_now();
     }
-    // The caller's reference drops here.
-    conn.reset();
+    // An outbound connection still connecting has a destructor that joins its transport for the
+    // rest of the connect, so it is parked rather than released here. One whose upgrade completed
+    // is released here: its destructor's stop is the short close of an open transport (after a
+    // goodbye, disconnect() above has already stopped it), a wait the protocol task pays. An
+    // inbound one's destructor joins nothing (on ESP its httpd session owns it). The caller's
+    // reference drops here in both cases.
+    if (conn->is_outbound() && !conn->is_ws_upgraded()) {
+        this->park_for_reaping(std::move(conn));
+    }
+}
+
+void ConnectionManager::park_for_reaping(std::shared_ptr<SendspinConnection> conn) {
+    // Non-blocking on every platform, and for an attempt still connecting it ends nothing: on host
+    // IXWebSocket's close() could wait out the handshake then, and on ESP only
+    // esp_websocket_client_stop() ends an attempt, which waits for the websocket task. The attempt
+    // reports its close once its connect fails or its peer closes, and the destructor stops what
+    // is left at the deadline.
+    conn->close_transport_now();
+    if (this->reaping_.size() == REAPING_CAPACITY) {
+        // The entry parked longest makes room: its attempt is the furthest along, so the stop in
+        // its destructor cancels an upgrade long under way (host) or finds a connect that has
+        // nearly timed out (ESP), and its join is the shortest this release could pay.
+        SS_LOGW(TAG, "Reaping list full (%zu); dropping the connection parked longest",
+                REAPING_CAPACITY);
+        this->reaping_.erase(this->reaping_.begin());
+    }
+    this->reaping_.push_back(ReapEntry{
+        .conn = std::move(conn),
+        .deadline_us =
+            platform_time_us() +
+            static_cast<int64_t>(SendspinClientConnection::CONNECT_TIMEOUT_MS) * US_PER_MS,
+    });
 }
 
 // ============================================================================
@@ -1553,7 +1631,7 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         this->client_->cleanup_connection_state(
             static_cast<uint16_t>(ALL_ROLES_MASK & ~this->roles_owned_by_others(nullptr)));
         this->refresh_published_state();
-        release_connection(std::move(dropped), goodbye);
+        this->release_connection(std::move(dropped), goodbye);
         this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
         return;
     }
@@ -1651,7 +1729,7 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
                 conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT),
                                     nullptr);
             }
-            release_connection(std::move(conn), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
+            this->release_connection(std::move(conn), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
             return next;
         }
         SS_LOGI(TAG, "Admission arbitration: switch to new server");

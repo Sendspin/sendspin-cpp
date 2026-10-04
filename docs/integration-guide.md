@@ -742,14 +742,14 @@ client.stop();
 
 ## Stopping and Restarting
 
-`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer, waits up to a short bound (50 ms per peer) for those sends to complete, then closes the server and every connection regardless, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
+`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer (a peer whose WebSocket upgrade completes after `stop()` has begun is closed without one), waits up to a short bound (50 ms per peer) for those sends to complete, then closes the server and every connection regardless, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
 
 Restarting is `start()` again; start, stop, and start again can be repeated indefinitely, and a restarted client begins with no connection, no group state, and no role state from before the stop.
 
 `stop()` may block, but the wait is bounded. Besides the goodbye bound it includes:
 
 - The transports' own close. The host server joins every accepted connection thread; a WebSocket peer completes its close handshake within about 300 ms, but a raw socket that connected and never completed the upgrade holds the join for the full 3 s handshake timeout. The ESP server waits for the httpd task to exit, which polls at 100 ms and first finishes any queued send, which can take up to httpd's send timeout for a peer that has stopped reading.
-- An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`) and, for a connection whose upgrade is still in flight, can last up to the transport's connect and handshake timeout: 30 s on host (`SendspinClientConnection::HANDSHAKE_TIMEOUT_SECS`, the nursery's establish window), and esp_websocket_client's `network_timeout_ms` on ESP (its 10 s default; the library does not set it).
+- An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`) and, for a connection whose upgrade is still in flight, can last up to the transport's connect and handshake timeout: 30 s on host (`SendspinClientConnection::HANDSHAKE_TIMEOUT_SECS`, the nursery's establish window), and on ESP esp_websocket_client's `network_timeout_ms` (10 s, `SendspinClientConnection::NETWORK_TIMEOUT_MS`) for each of the connect's three steps (TCP connect, upgrade request, its response), plus a DNS lookup with no bound of its own. That includes an attempt released earlier by `disconnect()` or a replacing `connect_to()` whose transport has not finished yet.
 - A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
 
 A pairing attempt in flight is cut short the same way: `on_clear_pairing_code()` and `on_close_pairing_window()` fire from inside `stop()` for a prompt that was still showing, and every provider write still owed (a long-term record a `server/pair-finalize` had just committed, for example) is performed before `stop()` returns. The identity and record store survive the stop, so a restarted client keeps its `client_id`, its pairing token, and every record.
@@ -1134,8 +1134,13 @@ Callable from any thread: `connect_to()`, `disconnect()`, `leave()`, `send_text(
 getters `is_started()`, `is_connected()`, `is_time_synced()`, `get_client_time()`,
 `get_server_information()`, `get_current_trust()` and `is_unpaired_access_enabled()`. The
 requests are queued to the protocol task and take effect on its next tick; the getters read
-what that task last published. Everything else (`start()`, `stop()`, `loop()`, the setters and
-role registration) belongs to the main loop.
+what that task last published. Releasing an outbound attempt that is still connecting (a
+`disconnect()`, or a `connect_to()` that replaces it) does not wait for its transport either:
+the attempt is closed without blocking and freed once its transport has finished, at the latest
+once its connect bound has passed (30 s on host; on ESP-IDF three connect steps of 10 s each,
+plus whatever a DNS lookup, which has no bound of its own, takes), so the requests behind it
+are not held up. Everything else (`start()`, `stop()`, `loop()`, the setters and role registration) belongs
+to the main loop.
 
 The pairing exchange (CPace and SHA-512) runs on the protocol task with the Noise handshakes, so
 `protocol_task_stack_size` has to carry the deepest crypto frame.

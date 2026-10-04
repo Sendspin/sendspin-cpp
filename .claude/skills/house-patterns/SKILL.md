@@ -88,7 +88,8 @@ the descriptions in `docs/internals.md`:
   `src/platform/`, `src/esp/`, `src/host/`.
 - Role compile-gates (`SENDSPIN_ENABLE_*`) appear only in
   `cmake/sources.cmake` and the dispatch points in
-  `include/sendspin/client.h` / `src/client.cpp`; the codec gate
+  `include/sendspin/client.h`, `src/client.cpp` and `src/client_dispatch.cpp`;
+  the codec gate
   `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`, and
   `src/player_role.cpp`. Examples must build with roles (and Opus) disabled:
   role and opus usage in `examples/` is guarded like an external consumer

@@ -278,39 +278,85 @@ TEST(InboundRing, ResetReturnsEverythingStillQueued) {
 }
 
 // charge() admits an item only while its holder is within quota, records the charge in the item,
-// and return_item() releases exactly that charge. Rows walk one ring through a sequence; the
-// quota is sized for two 16-byte items (52 stored bytes each).
+// and return_item() releases exactly that charge; the quota underneath admits a charge only while
+// the outstanding total stays within the limit, to the byte, and a release makes room again. One
+// table walks one ring through a sequence: the player's quota is sized for two 16-byte items, the
+// visualizer's for one, and the TRY/RELEASE rows drive the player's quota directly for the
+// byte-granular boundaries a stored item size cannot reach.
 TEST(InboundRing, ChargeAndReturnKeepTheHolderQuotaExact) {
     constexpr size_t STORED = SharedRingLayout::stored_size(sizeof(InboundItemHeader) + 16);
+    enum class Op : uint8_t { CHARGE, RETURN, TRY, RELEASE };
+    struct Row {
+        const char* name;
+        Op op;
+        size_t item;  // CHARGE, RETURN: index into `items`
+        InboundHolder holder;
+        bool exempt;
+        size_t bytes;   // TRY, RELEASE
+        bool accepted;  // CHARGE, TRY
+        size_t player_after;
+        size_t visualizer_after;
+    };
+    constexpr InboundHolder PLAYER = InboundHolder::PLAYER;
+    constexpr InboundHolder VISUALIZER = InboundHolder::VISUALIZER;
+    const Row rows[] = {
+        {"Control: an item within the quota is charged", Op::CHARGE, 0, PLAYER, false, 0, true,
+         STORED, 0},
+        {"a charge up to exactly the limit", Op::CHARGE, 1, PLAYER, false, 0, true, 2 * STORED, 0},
+        {"an item over the quota is refused", Op::CHARGE, 2, PLAYER, false, 0, false, 2 * STORED,
+         0},
+        {"one byte over the limit is refused", Op::TRY, 0, PLAYER, false, 1, false, 2 * STORED, 0},
+        {"another holder keeps flowing", Op::CHARGE, 3, VISUALIZER, false, 0, true, 2 * STORED,
+         STORED},
+        {"an exempt item passes a holder over its quota, uncharged", Op::CHARGE, 2, PLAYER, true, 0,
+         true, 2 * STORED, STORED},
+        {"returning the exempt item releases nothing", Op::RETURN, 2, PLAYER, false, 0, true,
+         2 * STORED, STORED},
+        {"a return releases exactly its item's charge", Op::RETURN, 0, PLAYER, false, 0, true,
+         STORED, STORED},
+        {"a charge that would cross the limit is refused", Op::TRY, 0, PLAYER, false, STORED + 1,
+         false, STORED, STORED},
+        {"Control: a charge that fits again is admitted", Op::TRY, 0, PLAYER, false, STORED, true,
+         2 * STORED, STORED},
+        {"a release frees exactly its bytes", Op::RELEASE, 0, PLAYER, false, STORED, true, STORED,
+         STORED},
+        {"the other holder's return releases its own quota", Op::RETURN, 3, VISUALIZER, false, 0,
+         true, STORED, 0},
+        {"the last return empties the quota", Op::RETURN, 1, PLAYER, false, 0, true, 0, 0},
+        {"a single charge larger than the limit is refused", Op::TRY, 0, PLAYER, false,
+         2 * STORED + 1, false, 0, 0},
+    };
+
     Fixture f(1024);
-    f.ring.quota(InboundHolder::PLAYER).set_limit(2 * STORED);
-    f.ring.quota(InboundHolder::VISUALIZER).set_limit(STORED);
+    InboundQuota& player = f.ring.quota(PLAYER);
+    player.set_limit(2 * STORED);
+    f.ring.quota(VISUALIZER).set_limit(STORED);
+    void* items[] = {routed_item(f.ring, 1), routed_item(f.ring, 2), routed_item(f.ring, 3),
+                     routed_item(f.ring, 4)};
 
-    void* first = routed_item(f.ring, 1);
-    void* second = routed_item(f.ring, 2);
-    void* third = routed_item(f.ring, 3);
-    void* vis = routed_item(f.ring, 4);
-
-    EXPECT_TRUE(f.ring.charge(first, 16, InboundHolder::PLAYER, false)) << "Control: within quota";
-    EXPECT_EQ(inbound_item_header(first)->charge, STORED);
-    EXPECT_TRUE(f.ring.charge(second, 16, InboundHolder::PLAYER, false));
-    EXPECT_FALSE(f.ring.charge(third, 16, InboundHolder::PLAYER, false)) << "player over quota";
-    EXPECT_TRUE(f.ring.charge(vis, 16, InboundHolder::VISUALIZER, false))
-        << "another holder keeps flowing";
-    EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 2 * STORED);
-    EXPECT_TRUE(f.ring.charge(third, 16, InboundHolder::PLAYER, /*exempt=*/true))
-        << "an exempt item passes a holder over its quota";
-    EXPECT_EQ(inbound_item_header(third)->charge, 0U);
-    EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 2 * STORED);
-
-    f.ring.return_item(third);  // exempt, never charged: releases nothing
-    EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 2 * STORED);
-    f.ring.return_item(first);
-    EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), STORED);
-    f.ring.return_item(vis);
-    EXPECT_EQ(f.ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U);
-    f.ring.return_item(second);
-    EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 0U);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        switch (row.op) {
+            case Op::CHARGE:
+                EXPECT_EQ(f.ring.charge(items[row.item], 16, row.holder, row.exempt), row.accepted);
+                if (row.accepted) {
+                    EXPECT_EQ(inbound_item_header(items[row.item])->charge, row.exempt ? 0U : STORED)
+                        << "the charge the item records, which its return releases";
+                }
+                break;
+            case Op::RETURN:
+                f.ring.return_item(items[row.item]);
+                break;
+            case Op::TRY:
+                EXPECT_EQ(player.try_charge(row.bytes), row.accepted);
+                break;
+            case Op::RELEASE:
+                player.release(row.bytes);
+                break;
+        }
+        EXPECT_EQ(player.outstanding(), row.player_after);
+        EXPECT_EQ(f.ring.quota(VISUALIZER).outstanding(), row.visualizer_after);
+    }
 }
 
 // Items come out of the list in the order the protocol task appended them, each the ring item
@@ -427,39 +473,6 @@ TEST(InboundItemList, AppendAfterRecallStartsAFreshList) {
     void* item = routed_item(f.ring, 2);
     f.list.append(item);
     EXPECT_EQ(f.list.take(0), item);
-}
-
-// The quota admits a charge only while the outstanding total stays within the limit, and a
-// release makes room again. One table walks a single quota through a sequence of operations.
-TEST(InboundQuota, ChargesWithinTheLimitOnly) {
-    enum class Op { CHARGE, RELEASE };
-    struct Row {
-        const char* name;
-        Op op;
-        size_t bytes;
-        bool accepted;  // CHARGE only
-        size_t outstanding_after;
-    };
-    const std::vector<Row> rows = {
-        {"Control: charge below the limit", Op::CHARGE, 60, true, 60},
-        {"charge up to exactly the limit", Op::CHARGE, 40, true, 100},
-        {"one byte over the limit", Op::CHARGE, 1, false, 100},
-        {"release part", Op::RELEASE, 40, true, 60},
-        {"charge that would cross the limit", Op::CHARGE, 41, false, 60},
-        {"charge that fits again", Op::CHARGE, 40, true, 100},
-        {"release all", Op::RELEASE, 100, true, 0},
-        {"single charge larger than the limit", Op::CHARGE, 101, false, 0},
-    };
-    InboundQuota quota(100);
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        if (row.op == Op::CHARGE) {
-            EXPECT_EQ(quota.try_charge(row.bytes), row.accepted);
-        } else {
-            quota.release(row.bytes);
-        }
-        EXPECT_EQ(quota.outstanding(), row.outstanding_after);
-    }
 }
 
 // Concurrent charges and releases never let the outstanding total past the limit and leave it at

@@ -86,9 +86,14 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # last_burst_complete_time_, pending_embedded_, current_message_sent_time_, send_retry_after_ms_
 # and pending_burst_completed_; and SendspinConnection's first_activate_received_ and
 # last_receive_time_us_. The stale-command and refused-delivery tests reach the queue through
-# protocol_task_ to push a command, or close accepts, the way a race or stop() would; the full
-# queue test seeds the controller's supported_commands word (stamped with its cleanup_generation)
-# so a send_command() reaches the queue. The teardown reorder table interleaves the protocol task
+# protocol_task_ to push a command, or close admission, the way a race or stop() would. The reap
+# test releases an outbound attempt on the test thread (ConnectionManager's connect_to(),
+# disconnect() and scan_nursery()) and reads reaping_ and nursery_ right after, since only a
+# release no tick follows shows whether the release itself destroyed the connection, then
+# restarts the protocol task (protocol_task_->start()) for the request it takes from another
+# thread; its sibling for an opened connection reads the same two members around a release. The
+# full queue test seeds the controller's supported_commands word (stamped with its
+# cleanup_generation) so a send_command() reaches the queue. The teardown reorder table interleaves the protocol task
 # (and, for artwork, the decode thread) with the main loop, which no public call does on demand:
 # it calls each role's handler or teardown (the controller, metadata and color roles'
 # handle_server_state(), the player's handle_stream_start() and handle_server_command(), the

@@ -95,10 +95,12 @@ public:
     /// IXWebSocket's thread entry point uncaught and crashes the process via std::terminate().
     ///
     /// Each platform implements this with whichever non-blocking close primitive it already uses
-    /// elsewhere for the same hazard. It reports nothing: the protocol task reports the loss once
-    /// the inbound gate is detached or the transport's close is drained (see
-    /// SendspinClient::protocol_tick()), and ConnectionManager::drop_connection() no-ops on a
-    /// repeat report for a connection it no longer manages.
+    /// elsewhere for the same hazard; an outbound attempt still connecting may be left to end on
+    /// its own where no such primitive can end it (see each outbound override). It reports nothing:
+    /// the protocol task reports the loss once the inbound gate is detached or the transport's
+    /// close is drained (see SendspinClient::protocol_tick()), and
+    /// ConnectionManager::drop_connection() no-ops on a repeat report for a connection it no longer
+    /// manages.
     virtual void close_transport_now() = 0;
 
     /// @brief Checks if the transport connection is established

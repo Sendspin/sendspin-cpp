@@ -89,11 +89,16 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - A protocol-task step has a bounded wait or none: the Noise DH operations, a
   ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, a transport send
   bounded by the transport's own send timeout, and at shutdown the goodbye
-  flush bounded by `GOODBYE_FLUSH_TIMEOUT_MS` per goodbye. Releasing an
-  outbound connection that is still connecting is a known longer wait on the
-  task: its destructor stops the transport synchronously, bounded on host by
-  `SendspinClientConnection::HANDSHAKE_TIMEOUT_SECS` and on ESP by
-  esp_websocket_client's `network_timeout_ms`. Its tick returns the
+  flush bounded by `GOODBYE_FLUSH_TIMEOUT_MS` per goodbye. A released
+  outbound attempt still connecting, whose destructor would join its
+  transport for the rest of the connect, is closed without blocking and
+  parked in `ConnectionManager`'s reaping list until its transport reports
+  the close or its upgrade, or its deadline passes
+  (`SendspinClientConnection::CONNECT_TIMEOUT_MS`); a drop at the deadline, or
+  of the entry parked longest when the list is full, pays a join bounded by
+  what remains of the connect. Releasing a connection whose upgrade completed
+  pays the short stop of an open transport on the task (synchronous after a
+  goodbye). The task's tick returns the
   time to its earliest deadline, or `ProtocolTask::NO_DEADLINE`, and never
   wakes on a fixed period. A transport's wait on the task is bounded too: an
   admitted connection waits at most `INBOUND_ACQUIRE_TIMEOUT_MS` for ring space
@@ -131,7 +136,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
   differences live in `src/platform/`, `src/esp/`, and `src/host/`. Within
   the library, role compile-gates (`#ifdef SENDSPIN_ENABLE_*`) live only in
   `cmake/sources.cmake` and the dispatch points in
-  `include/sendspin/client.h` / `src/client.cpp`, and the codec gate
+  `include/sendspin/client.h`, `src/client.cpp` and `src/client_dispatch.cpp`,
+  and the codec gate
   `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`, and
   `src/player_role.cpp`; consumers, including the examples, guard their own
   role and codec usage (see Public API).

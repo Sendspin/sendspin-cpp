@@ -57,8 +57,8 @@ void SendspinClientConnection::start() {
     this->ws_ = std::make_unique<ix::WebSocket>();
     this->ws_->setUrl(this->url_);
     this->ws_->disableAutomaticReconnection();
-    // Bounds the handshake, and with it stop() for a connection whose upgrade is in flight; see
-    // HANDSHAKE_TIMEOUT_SECS.
+    // Bounds the handshake, and with it the destructor's join for a connection whose upgrade is
+    // in flight; see HANDSHAKE_TIMEOUT_SECS.
     this->ws_->setHandshakeTimeout(HANDSHAKE_TIMEOUT_SECS);
 
     this->setup_callbacks();
@@ -95,8 +95,14 @@ void SendspinClientConnection::close_transport_now() {
     // (see SendspinConnection::close_silently() and fail_inbound()); the resulting Close event
     // reports it again, which the manager tolerates (drop_connection() no-ops on a connection it
     // no longer manages).
+    //
+    // An attempt whose upgrade has not completed is left to end on its own (its failure is an
+    // Error, which reports the close) or to be stopped by the destructor: before the Open,
+    // ws_->close() takes the transport mutex the connect holds for the whole handshake, and when
+    // the cancellation it sets lands before the handshake clears it, it waits out the handshake.
+    // The Open handler closes an attempt released before it opened (see setup_callbacks()).
     this->connected_ = false;
-    if (this->ws_) {
+    if (this->ws_ && this->is_ws_upgraded()) {
         this->ws_->close();
     }
 }
@@ -158,6 +164,16 @@ void SendspinClientConnection::setup_callbacks() {
                 if (this->on_connected_cb) {
                     this->on_connected_cb(this);
                 }
+                // Released while it was still connecting: close_transport_now() left the attempt
+                // running, so close it now that the close cannot wait on the handshake. A release
+                // that races this check (the detach and this load, the upgrade mark and the
+                // release's own load of it, are a store-load pair either side can miss) is caught
+                // by the reap instead, which drops a parked connection once its upgrade is marked
+                // (on_connected_cb above wakes the task for it).
+                if (this->inbound_gate_.is_detached()) {
+                    this->connected_ = false;
+                    this->ws_->close();
+                }
                 break;
 
             case ix::WebSocketMessageType::Close:
@@ -186,6 +202,10 @@ void SendspinClientConnection::setup_callbacks() {
             case ix::WebSocketMessageType::Error:
                 SS_LOGE(TAG, "WebSocket error on connection to %s: %s", this->url_.c_str(),
                         msg->errorInfo.reason.c_str());
+                // With automatic reconnection off, IXWebSocket reports a failed connect or
+                // upgrade as an Error and its thread then exits without a Close event, so this
+                // is the close of a connection that never opened.
+                this->notify_transport_closed();
                 break;
 
             default:

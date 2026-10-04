@@ -6,9 +6,9 @@ This document maps how the library's parts work together: which threads exist, h
 
 Each role class uses the pimpl pattern. The public header (`include/sendspin/<role>_role.h`) exposes the protocol types, the listener interface, and a thin role class holding `std::unique_ptr<Impl> impl_`; all private state and thread management live in `src/<role>_role_impl.h` and the role's `.cpp`. `SendspinClient` is a `friend` of each role class so it can dispatch into `impl_`. Internal references below use the `Impl` qualification (e.g. `PlayerRole::Impl::drain_events()`).
 
-Roles are disabled at build time through two cooperating mechanisms. `cmake/sources.cmake` keeps a source list per role, so a disabled role's translation units are never compiled and its dependencies are never required; `#ifdef SENDSPIN_ENABLE_<ROLE>` guards in `include/sendspin/client.h` and `src/client.cpp` remove the members, accessors, and dispatch branches that must name the role's type. The split exists because CMake cannot gate individual declarations, and `#ifdef` around whole files would still put the codec headers on the include path. On ESP-IDF the codec dependencies are gated by `idf_component.yml`'s Kconfig rules alone, because ESP-IDF collects `REQUIRES` before `sdkconfig` is loaded. The Opus decoder is a third gate inside the player role (`SENDSPIN_ENABLE_OPUS`), confined to `src/decoder.h`, `src/decoder.cpp`, and `src/player_role.cpp`.
+Roles are disabled at build time through two cooperating mechanisms. `cmake/sources.cmake` keeps a source list per role, so a disabled role's translation units are never compiled and its dependencies are never required; `#ifdef SENDSPIN_ENABLE_<ROLE>` guards in `include/sendspin/client.h`, `src/client.cpp` and `src/client_dispatch.cpp` (the protocol task's tick and message dispatch) remove the members, accessors, and dispatch branches that must name the role's type. The split exists because CMake cannot gate individual declarations, and `#ifdef` around whole files would still put the codec headers on the include path. On ESP-IDF the codec dependencies are gated by `idf_component.yml`'s Kconfig rules alone, because ESP-IDF collects `REQUIRES` before `sdkconfig` is loaded. The Opus decoder is a third gate inside the player role (`SENDSPIN_ENABLE_OPUS`), confined to `src/decoder.h`, `src/decoder.cpp`, and `src/player_role.cpp`.
 
-Adding a role therefore means: a `SENDSPIN_<ROLE>_SOURCES` list in `cmake/sources.cmake`, the guarded member, accessor, and dispatch branches in `client.h` and `client.cpp`, and any heavy dependency kept behind the role's private headers. A role-private header such as `src/decoder.h`, which pulls in the codec headers, may only be reached from the role's own sources or a guarded include in `client.cpp`; public role headers stay codec-free because core files such as `src/protocol_messages.h` include them unconditionally.
+Adding a role therefore means: a `SENDSPIN_<ROLE>_SOURCES` list in `cmake/sources.cmake`, the guarded member, accessor, and dispatch branches in `client.h`, `client.cpp` and `client_dispatch.cpp`, and any heavy dependency kept behind the role's private headers. A role-private header such as `src/decoder.h`, which pulls in the codec headers, may only be reached from the role's own sources or a guarded include in `client.cpp` or `client_dispatch.cpp`; public role headers stay codec-free because core files such as `src/protocol_messages.h` include them unconditionally.
 
 ## Thread Model
 
@@ -21,7 +21,7 @@ Listener callbacks fire on the caller's main loop unless noted otherwise. Connec
 | **Sync task** | `Sendspin` | `SyncTask::start()` | Decodes audio, aligns it to server timestamps (`docs/playback-sync.md`), writes PCM via `on_audio_write`, and notes its return to idle to the main loop through the Inbox. |
 | **Visualizer drain** | `SsVis` | `VisualizerRole::Impl::start()` | Delivers visualization frames from its item list at their playback time. |
 | **Artwork decode** | `SsArt` | `ArtworkRole::Impl::start()` | Calls `on_image_decode()` for completed images; hands the display deadline to the main loop. |
-| **Transport** | (library-internal) | IXWebSocket (host); esp_http_server for inbound and esp_websocket_client for outbound connections (ESP) | WebSocket I/O only: receives each complete message into the shared inbound ring or the connection's fallback buffer, reports a close, delivers an upgraded inbound connection to the command queue, and wakes the protocol task. |
+| **Transport** | (library-internal) | IXWebSocket (host); esp_http_server for inbound and esp_websocket_client for outbound connections (ESP) | WebSocket I/O only: receives each complete message into the shared inbound ring or the connection's fallback buffer, reports a close, delivers an upgraded inbound connection to the command queue, and wakes the protocol task. An outbound transport released while still connecting runs on until its attempt ends, its connection parked in `ConnectionManager`'s reaping list (see [Slots](#slots)). |
 
 On ESP-IDF, `platform_configure_thread()` sets each thread's stack size, priority, and name before the `std::thread` is constructed; priorities come from the client and role configs in `config.h`. On host it is a no-op.
 
@@ -105,15 +105,16 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
    back makes the tick run again at once
 8. ConnectionManager::tick(): the nursery's hello sends, the promotion of operational nursery
    connections, the establish reap; the admitted connections' liveness, re-prove and
-   pairing-attempt watchdogs; the pairing window's expiry; the platform server's upgrade reap;
-   the WebSocket server start once the network is ready
+   pairing-attempt watchdogs; the pairing window's expiry; the reap of released outbound
+   connections whose transport closed or opened, or whose deadline passed; the platform server's
+   upgrade reap; the WebSocket server start once the network is ready
 9. ConnectionManager::run_time_sync(): each admitted, operational connection's time burst, and
    the client/state that waited for its first measurement
 10. ConnectionManager::refresh_published_state(): the published primary slot (time filter and
     server information) and the connected flag other threads read
 ```
 
-The tick returns the milliseconds until the earliest of its timers: a nursery entry's hello retry or establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound, or one that freed a held-back fallback message, returns 0 and runs again at once. No timer is periodic except the network poll, which runs only while the server is down, so an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 6, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
+The tick returns the milliseconds until the earliest of its timers: a nursery entry's hello retry or establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a released outbound connection's reaping deadline, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound, or one that freed a held-back fallback message, returns 0 and runs again at once. No timer is periodic except the network poll, which runs only while the server is down, so an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 6, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
 
 ## One Main Loop Drain
 
@@ -311,9 +312,12 @@ Every slot belongs to the protocol task; nothing else reads or writes it.
 |------|---------|
 | `admitted_` | The admitted connections, `MAX_ADMITTED` entries (one today), each with the roles it owns (`AdmittedEntry`) |
 | `nursery_` | Unproven connections (inbound or outbound) awaiting establishment, bounded by `MAX_NURSERY_ENTRIES` |
+| `reaping_` | Released outbound connections whose transport may still be connecting, bounded by `REAPING_CAPACITY` (`ReapEntry`) |
 | `closing_` | Connections the shutdown pass took out of the slots, kept for `finish_stop()` to close |
 
 All hold `std::shared_ptr<SendspinConnection>`. On the ESP server path these are observers; see [Server Connection Ownership (ESP)](#server-connection-ownership-esp). The other holders of a connection reference are the protocol task's per-tick snapshot (`snapshot_connections()`), an accept waiting in the command queue, and the ESP platform server (the httpd session slot, the owner on ESP). No reference leaves the protocol task for a consumer or role thread: what they read about the connection goes through the published slots.
+
+An outbound connection's destructor joins its transport, which for one still connecting waits out the rest of the connect. So the protocol task never drops a released outbound attempt still connecting itself: every release of one (a `disconnect()`, a `connect_to()` replacing the pending attempt, the establish reap, a displaced or lost connection that never opened) closes its transport without blocking, which leaves the attempt to end on its own (`close_transport_now()` on each platform says why), and parks it in `reaping_`. The reap pass in the tick drops it once its inbound gate reports the transport closed or its upgrade completes, when the join is short, or at its deadline (`SendspinClientConnection::CONNECT_TIMEOUT_MS` after the release); a release that finds the list full drops the entry parked longest instead, and in those two cases the join is bounded by what remains of the connect. A connection whose upgrade had completed is released in place: its destructor's stop is the short close of an open transport, and a goodbye release has already stopped it synchronously. `finish_stop()` closes and drops what is still parked on the main loop, which pays those joins.
 
 Every role this client drives has at most one owner among the admitted connections. Ownership gates role dispatch, `send_text()` routing and the role objects of each connection's `client/state`. A connection owns the roles it activates that no other admitted connection owns (`claimable_roles()`); arbitration runs only when a newcomer wants a role an admitted connection owns, or when no slot is free (`admission_conflicts()`). The primary admitted connection, the owner of the player or else the first admitted one, is the one whose clock, server information and group the client reports. With one slot every role is owned by the one admitted connection; raising `MAX_ADMITTED` admits connections that share the roles between them.
 
@@ -347,16 +351,16 @@ Each getter reads the slot once, so a caller that checks `is_time_synced()` and 
 1. Signal the visualizer and artwork threads to stop, without joining. The player is not
    signalled yet: it keeps returning the ring items it plays, so a transport waiting for ring
    space is not parked behind a stopped consumer
-2. ConnectionManager::close_admission()
-3. ProtocolTask::stop(): the final tick acts on the commands queued so far (an accept is
-   refused with a shutdown goodbye) and runs the shutdown pass (snapshot the pairing-UI flags,
-   detach every connection, goodbye each with reason shutdown, wait up to the flush bound),
-   then the join. Accepts are then closed under the queue lock
-   (ProtocolTask::close_accepts()): one already queued is refused with a goodbye on the main
-   loop, and a later delivery is refused at its push, on the delivering thread
-4. ConnectionManager::finish_stop(): close every transport the shutdown pass kept, stop the
-   ws_server (joining its transport threads), release those connections; then drop any
-   command still queued
+2. ConnectionManager::close_admission(), which closes the protocol task's accepts with it
+   under the queue lock (ProtocolTask::close_accepts()): a delivery from here on is refused at
+   its push, on the delivering thread, and its transport closes it without a goodbye
+3. ProtocolTask::stop(): the final tick acts on the commands queued so far (an accept already
+   queued is refused with a shutdown goodbye) and runs the shutdown pass (snapshot the
+   pairing-UI flags, detach every connection, goodbye each with reason shutdown, wait up to the
+   flush bound per goodbye still outstanding), then the join
+4. ConnectionManager::finish_stop(): close every transport the shutdown pass kept and every
+   released outbound connection still parked for reaping, stop the ws_server (joining its
+   transport threads), release those connections; then drop any command still queued
 5. Join all role threads; each then returns its items to the ring or discards its queue
    content, and the emptied inbound ring is released
 6. Bump drain_generation, cleanup_connection_state() for every role (the protocol-task halves
@@ -369,14 +373,14 @@ Each getter reads the slot once, so a caller that checks `is_time_synced()` and 
 8. lifecycle_ = STOPPED
 ```
 
-The library's last reference to a connection is therefore dropped on the protocol task, or on the main loop in steps 3 and 4 once the task is joined, never on a role thread. An ESP inbound connection, owned by its httpd session, is destroyed by its transport when the session is freed, and a host connection the client refused at delivery by its transport's open handler once the delivery has returned (see [Server Connection Ownership (ESP)](#server-connection-ownership-esp)). The client destructor performs steps 1 to 4, drops the high-performance requests no drain applied (they were never granted, so the listener never heard them) and releases the holds the main loop applied, its only listener call; it dispatches no teardown or clear callback, and performs the provider writes still owed once the connection manager is gone; the roles' destructors then join their threads, so listeners must outlive the client.
+The library's last reference to a connection is therefore dropped on the protocol task, or on the main loop in step 4 once the task is joined, never on a role thread. An ESP inbound connection, owned by its httpd session, is destroyed by its transport when the session is freed, and a host connection the client refused at delivery by its transport's open handler once the delivery has returned (see [Server Connection Ownership (ESP)](#server-connection-ownership-esp)). The client destructor performs steps 1 to 4, drops the high-performance requests no drain applied (they were never granted, so the listener never heard them) and releases the holds the main loop applied, its only listener call; it dispatches no teardown or clear callback, and performs the provider writes still owed once the connection manager is gone; the roles' destructors then join their threads, so listeners must outlive the client.
 
 ### Server Connection Ownership (ESP)
 
 On ESP, a `SendspinServerConnection`'s lifetime belongs to its httpd session rather than to `ConnectionManager`:
 
 1. `SendspinWsServer::open_callback` creates the `shared_ptr` and stores a heap-allocated copy as the session context, with a `free_fn` that deletes it. That copy is the authoritative reference.
-2. Once the upgrade completes, `ConnectionManager::on_new_connection()` receives the same `shared_ptr` on the httpd task and queues it as an accept; the protocol task's nursery entry keeps a copy as an observer. A refused accept (a full command queue) makes the server close the session, whose slot still owns the connection, so the refusal never destroys it on the httpd task.
+2. Once the upgrade completes, `ConnectionManager::on_new_connection()` receives the same `shared_ptr` on the httpd task and queues it as an accept; the protocol task's nursery entry keeps a copy as an observer. A refused accept (a full command queue, or admission closed) makes the server close the session, whose slot still owns the connection, so the refusal never destroys it on the httpd task.
 3. The WebSocket handler looks the connection up through the session context each time it runs. Queued send workers capture a `weak_ptr` and lock it when they run, rather than a socket number, which httpd can reuse for a different session after the original closes.
 4. On close, httpd calls `close_fn`, which marks the connection's inbound gate closed and wakes the protocol task; the task drops its observer once the messages the session delivered before closing are processed. httpd calls `free_fn` once no worker is queued for the session.
 

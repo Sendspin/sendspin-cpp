@@ -364,7 +364,11 @@ public:
     /// Ignored (with a warning) unless the client is running, including from a callback fired
     /// inside stop(). start() is where the identity and record store the Noise handshake needs
     /// are created. Any thread: the request is queued to the library's protocol task, which
-    /// replaces any earlier outbound attempt; a full queue refuses it with a warning.
+    /// replaces any earlier outbound attempt; a full queue refuses it with a warning. Replacing an
+    /// attempt that is still connecting does not wait for its transport: the attempt is closed
+    /// without blocking and freed once its transport has finished, at the latest once its connect
+    /// bound has passed (30 s on host; on ESP-IDF three connect steps of 10 s each, plus whatever
+    /// a DNS lookup, which has no bound of its own, takes).
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
@@ -372,7 +376,8 @@ public:
     ///
     /// Ignored unless the client is running, including from a callback fired inside stop(). Any
     /// thread: the request is queued to the protocol task, which sends the goodbyes; a full
-    /// queue refuses it with a warning.
+    /// queue refuses it with a warning. An outbound attempt still connecting is released the
+    /// same way connect_to() releases one it replaces, without waiting for its transport.
     /// @param reason The goodbye reason to send
     void disconnect(SendspinGoodbyeReason reason);
 
@@ -835,6 +840,14 @@ private:
     /// (AdmittedEntry::state_held); ConnectionManager::run_time_sync() sends it with the first
     /// measurement.
     void publish_client_state(SendspinConnection* conn);
+
+    /// @brief Makes `snapshot` the client/state every admitted connection's is built from, and
+    /// sends each admitted connection its copy (publish_client_state()). Protocol task only.
+    void adopt_client_state(ClientStateMessage&& snapshot);
+
+    /// @brief Folds a group/update delta from the primary admitted connection into group_slot
+    /// for the main loop. Protocol task only.
+    void merge_group_update(GroupUpdateObject&& delta);
 
     // ========================================
     // Persistence & identity

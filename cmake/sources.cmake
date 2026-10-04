@@ -46,8 +46,9 @@ function(sendspin_get_sources BASE_DIR)
         # Public persistence codec (fixed-size binary storage format for the pairing structs)
         ${BASE_DIR}/src/persistence_codec.cpp
 
-        # Client orchestration
+        # Client orchestration, and its protocol-task half (the tick and the message dispatch)
         ${BASE_DIR}/src/client.cpp
+        ${BASE_DIR}/src/client_dispatch.cpp
 
         PARENT_SCOPE
     )

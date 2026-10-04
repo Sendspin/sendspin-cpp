@@ -65,8 +65,8 @@ void ProtocolTask::stop() {
     this->thread_.join();
 
     // Joined. A snapshot the final tick did not take describes a run that is over. Commands
-    // stay queued for the joining thread (take_command() / drop_commands()): an accept pushed
-    // after the final tick carries a connection its transport may still be delivering to.
+    // pushed after the final tick stay queued for the joining thread (take_command() /
+    // drop_commands()), which releases what they hold off this queue's lock.
     std::optional<ClientStateMessage> dropped;
     {
         std::lock_guard<std::mutex> lock(this->command_mutex_);

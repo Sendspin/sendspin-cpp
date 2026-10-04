@@ -858,6 +858,12 @@ public:
         this->transport_closed_.store(true, std::memory_order_release);
     }
 
+    /// @brief Whether the transport has reported its close, whatever is still queued: what the
+    /// reap of a released connection waits for (ConnectionManager::reap_released())
+    bool is_transport_closed() const {
+        return this->transport_closed_.load(std::memory_order_acquire);
+    }
+
     // ---- Detach ----
 
     /// @brief Records that nothing reads this connection any more and wakes a transport waiting
@@ -906,8 +912,8 @@ private:
     /// Set by the protocol task (the connection manager when the connection leaves it, the
     /// receive path closing it); by the transport thread closing it (fail_inbound()); by the
     /// thread delivering an accept the command queue refused; and by the main loop with the
-    /// protocol task joined (a late accept's refusal in stop(), ~ConnectionManager). Read by the
-    /// transport thread and the protocol task.
+    /// protocol task joined (~ConnectionManager). Read by the transport thread and the protocol
+    /// task.
     std::atomic<bool> detached_{false};
     /// Set by the transport thread (publish), cleared by the protocol task (consume).
     std::atomic<bool> message_pending_{false};
