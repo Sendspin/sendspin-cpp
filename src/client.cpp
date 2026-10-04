@@ -1220,7 +1220,8 @@ ClientStateMessage SendspinClient::build_client_state() const {
 }
 
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-bool SendspinClient::send_controller_command(const ClientCommandControllerObject& cmd) {
+bool SendspinClient::send_controller_command(const ClientCommandControllerObject& cmd,
+                                             uint16_t generation) {
     // The command the controller role validated, carried as the struct so the protocol task
     // builds the message in its JSON arena and applies the role gate (handle_command()).
     if (!this->is_started()) {
@@ -1230,6 +1231,7 @@ bool SendspinClient::send_controller_command(const ClientCommandControllerObject
     ProtocolCommand command;
     command.type = ProtocolCommandType::SEND_CONTROLLER_COMMAND;
     command.controller_command = cmd;
+    command.controller_generation = generation;
     return this->protocol_task_->push_command(std::move(command));
 }
 #endif

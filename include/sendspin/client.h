@@ -689,15 +689,20 @@ public:
     /// A role service, like publish_state(): consumers call ControllerRole::send_command(), which
     /// checks the command against the server's supported_commands and its parameter before
     /// calling this. This assumes those checks ran and repeats neither. The command crosses to
-    /// the protocol task as the struct, so the message is built in the task's JSON arena.
+    /// the protocol task as the struct, so the message is built in the task's JSON arena. It
+    /// carries the generation it was validated under, and the protocol task drops it if the role
+    /// has been torn down since (its owner replaced, or the role removed): the supported commands
+    /// it was validated against are retired.
     ///
     /// Callable from any thread.
     /// @param cmd The command, already validated by the controller role.
+    /// @param generation The low 16 bits of the controller role's teardown generation that
+    ///        stamped the supported_commands the command was validated against.
     /// @return false when the command was refused before it reached the protocol task: the
     ///         client is not running, or the command queue is full
     ///         (ProtocolTask::CONSUMER_COMMAND_BURST requests, logged). true means queued, not
     ///         sent.
-    bool send_controller_command(const ClientCommandControllerObject& cmd);
+    bool send_controller_command(const ClientCommandControllerObject& cmd, uint16_t generation);
 #endif
 
     /// @brief Acquires a ref-counted high-performance networking request. Main loop only: the

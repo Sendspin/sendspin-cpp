@@ -1308,7 +1308,11 @@ std::string goodbye_event(SendspinGoodbyeReason reason) {
 // later connect opens after the goodbye). The requests go ahead of the sends queued with them, so a
 // controller command queued before a disconnect() is dropped rather than sent after the goodbye, as
 // is a client/state published before it, though the stand-in still reads as connected, as an ESP
-// server connection does until httpd closes it. Gap: the same detached check in
+// server connection does until httpd closes it. A controller command validated before a teardown
+// moves the controller's generation on (as a switchover that admits a new owner later in the same
+// tick would) is dropped at the drain rather than sent to the new owner, which never offered it;
+// the row moves the generation on directly, so the stand-in still owns the role and only the
+// stamp check stands between the command and the send. Gap: the same detached check in
 // ConnectionManager::leave() has no row, since the tick applies a leave ahead of a disconnect. A
 // disconnect that only stop()'s final tick sees, once admission is closed, is dropped in favour of
 // the shutdown goodbye. The test thread plays the protocol task, so nothing drains the queue
@@ -1330,6 +1334,7 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
         UNPAIRED_OFF,
         CONNECT,
         SEND_COMMAND,
+        TEAR_DOWN_CONTROLLER,
         TICK,
         CLOSE_ADMISSION,
         SET_UNAVAILABLE,
@@ -1399,6 +1404,13 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
          {user_goodbye},
          0,
          true},
+        {"a controller command validated before its owner was torn down is not sent",
+         false,
+         {Call::SEND_COMMAND, Call::TEAR_DOWN_CONTROLLER},
+         false,
+         {},
+         0,
+         true},
         {"Control: a state change is published",
          false,
          {Call::SET_UNAVAILABLE},
@@ -1448,12 +1460,17 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
                 (1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY));
         };
         offer_play();
+        // The stamp send_command() passes along with a command it validated.
+        auto current_stamp = [&controller] {
+            return static_cast<uint16_t>(controller.impl_->cleanup_generation.load());
+        };
 
         if (row.fill_queue) {
             for (size_t i = 0; i < ProtocolTask::CONSUMER_COMMAND_BURST; ++i) {
-                ASSERT_TRUE(client.send_controller_command(play)) << "request " << i;
+                ASSERT_TRUE(client.send_controller_command(play, current_stamp()))
+                    << "request " << i;
             }
-            EXPECT_FALSE(client.send_controller_command(play))
+            EXPECT_FALSE(client.send_controller_command(play, current_stamp()))
                 << "a send past the consumer burst must be refused";
             EXPECT_FALSE(controller.send_command(play))
                 << "a controller command past the consumer burst must be refused";
@@ -1484,6 +1501,10 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
                 case Call::SEND_COMMAND:
                     ASSERT_TRUE(controller.send_command(play));
                     break;
+                case Call::TEAR_DOWN_CONTROLLER:
+                    // The bump a switchover's cleanup() makes before it admits the new owner.
+                    controller.impl_->cleanup_generation.fetch_add(1);
+                    break;
                 case Call::TICK:
                     (void) client.protocol_tick();
                     break;
@@ -1508,11 +1529,12 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
         // The drained queue takes sends again.
         offer_play();
         EXPECT_TRUE(controller.send_command(play));
-        EXPECT_TRUE(client.send_controller_command(play));
+        EXPECT_TRUE(client.send_controller_command(play, current_stamp()));
 
         silent.close();
         client.stop();
-        EXPECT_FALSE(client.send_controller_command(play)) << "a stopped client refuses";
+        EXPECT_FALSE(client.send_controller_command(play, current_stamp()))
+            << "a stopped client refuses";
     }
 }
 

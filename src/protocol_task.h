@@ -67,6 +67,13 @@ struct ProtocolCommand {
     /// ACCEPT_CONNECTION: the delivered connection.
     std::shared_ptr<SendspinConnection> connection{};
 
+    // 16-bit fields
+    /// SEND_CONTROLLER_COMMAND: the low 16 bits of the controller role's teardown generation the
+    /// command was validated under (SendspinClient::handle_command() drops it once the role has
+    /// been torn down since). With the type it fills the alignment padding after the pointer
+    /// fields, so a slot is no larger for it.
+    uint16_t controller_generation{0};
+
     // 8-bit fields
     ProtocolCommandType type{ProtocolCommandType::SEND_CONTROLLER_COMMAND};
 };

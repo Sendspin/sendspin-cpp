@@ -181,6 +181,7 @@ bool ProtocolTask::take_command(ProtocolCommand& out) {
 void ProtocolTask::clear_command(ProtocolCommand& command) {
     command.connection.reset();
     command.controller_command = {};
+    command.controller_generation = 0;
     command.type = ProtocolCommandType::SEND_CONTROLLER_COMMAND;
 }
 

@@ -271,6 +271,20 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
         SS_LOGD(TAG, "Dropping a controller command: the client is stopping");
         return;
     }
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    // roles/controller/v1.md "client/command controller object": only a command in the latest
+    // supported_commands. A command validated against an owner that a teardown replaced before
+    // this drain (a switchover that admitted a new owner later in the tick it was queued during)
+    // was never offered by the new one. cleanup() bumps the generation on this task too, so the
+    // comparison is exact.
+    if (this->controller_ != nullptr &&
+        command.controller_generation !=
+            static_cast<uint16_t>(
+                this->controller_->impl_->cleanup_generation.load(std::memory_order_acquire))) {
+        SS_LOGD(TAG, "Dropping a controller command: validated against a torn-down owner");
+        return;
+    }
+#endif
     // Formatted here rather than on the caller's thread so the document is built in the task's
     // JSON arena, and only once the role gate has passed, so a command no connection may receive
     // formats nothing.
