@@ -340,7 +340,12 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
     if (item == nullptr) {
         // A frame reassembled from Noise fragments or routed through the fallback buffer (longer
         // than the ring takes) is not in a ring item: copied into one, whole, keeping the
-        // transport's receive stamp.
+        // transport's receive stamp. A frame longer than the ring's largest item can never be
+        // copied in, which is logged apart from a momentarily full ring.
+        if (message.len > inbound.ring()->max_item_message_bytes()) {
+            inbound.note_drop("received a frame longer than the ring's largest item; dropping");
+            return;
+        }
         item = inbound.copy_local(message.data, message.len, message.receive_time_us, 0);
         if (item == nullptr) {
             inbound.note_drop("has no ring space to copy a frame into; dropping");
