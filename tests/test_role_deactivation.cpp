@@ -292,7 +292,7 @@ TEST(RoleDeactivation, RemovedVisualizerEndsTheStreamAndStopsDelivery) {
     pump_for(client, SETTLE_MS);
     EXPECT_EQ(visualizer_listener.loudness.load(), loudness_after_removal)
         << "frames were delivered for a role the activation removed";
-    EXPECT_TRUE(client.visualizer()->impl_->drain_task->items.is_empty())
+    EXPECT_TRUE(client.visualizer()->impl_->drain_task->inbound.items().is_empty())
         << "the removed role kept its buffered frames";
 
     EXPECT_EQ(player_listener.stream_ends, 0) << "a role the activation kept was torn down";
@@ -781,7 +781,7 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     // The sync task is idle and its item list drained, so anything the binary path still accepted
     // for the removed player would show up here rather than at the audio output.
     pump_until(client,
-               [&] { return client.player()->impl_->sync_task->encoded_items_.is_empty(); });
+               [&] { return client.player()->impl_->sync_task->inbound().items().is_empty(); });
 
     // The same traffic again, now for roles the server has removed.
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
@@ -813,7 +813,7 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     EXPECT_EQ(client.controller()->get_controller_state().volume, 0);
     EXPECT_EQ(player_listener.audio_writes.load(), writes_after_removal)
         << "a removed role's audio chunks were played";
-    EXPECT_TRUE(client.player()->impl_->sync_task->encoded_items_.is_empty())
+    EXPECT_TRUE(client.player()->impl_->sync_task->inbound().items().is_empty())
         << "a removed role's audio chunks were buffered";
     EXPECT_EQ(visualizer_listener.loudness.load(), loudness_after_removal)
         << "a removed role's frames were delivered";

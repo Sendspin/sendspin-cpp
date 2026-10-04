@@ -162,7 +162,6 @@ TEST(SharedRingBuffer, FullRingAcquirePolicies) {
         RingStorage storage(SMALL_RING);
         SharedRingBuffer ring;
         ASSERT_TRUE(ring.create(SMALL_RING, storage.data()));
-        EXPECT_EQ(ring.max_item_size(), SharedRingLayout::max_item_size(SMALL_RING));
         if (row.fill_first) {
             for (int i = 0; i < 3; ++i) {
                 void* item = ring.acquire(ITEM, 0);
@@ -243,12 +242,11 @@ TEST(SharedRingBuffer, AnUncompletedItemHoldsBackLaterCompletedOnes) {
     ring.complete(newer);
     size_t size = 0;
     EXPECT_EQ(ring.take(&size, 0), nullptr);
-    EXPECT_EQ(ring.items_waiting(), 1U);
 
     ring.complete(older);
     EXPECT_EQ(ring.take(&size, 0), older);
     EXPECT_EQ(ring.take(&size, 0), newer);
-    EXPECT_TRUE(ring.is_empty());
+    EXPECT_EQ(ring.take(&size, 0), nullptr);
 }
 
 // A producer waiting for room is released by the return that reclaims it. The join has no
@@ -411,7 +409,7 @@ TEST(SharedRingBuffer, ConcurrentProducersWithOutOfOrderReturns) {
         EXPECT_EQ(next_seq[p], ITEMS_PER_PRODUCER);
     }
     // Everything returned: the whole ring is reclaimed, so the largest item fits again.
-    EXPECT_NE(ring.acquire(ring.max_item_size(), 0), nullptr);
+    EXPECT_NE(ring.acquire(SharedRingLayout::max_item_size(RING_BYTES), 0), nullptr);
 }
 
 }  // namespace

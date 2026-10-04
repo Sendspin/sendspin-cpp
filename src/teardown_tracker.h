@@ -19,6 +19,7 @@
 
 #include "inbox.h"
 
+#include <atomic>
 #include <cstdint>
 
 namespace sendspin {
@@ -65,6 +66,33 @@ private:
     uint32_t completed_{0};
 };
 
+/**
+ * @brief A role's teardown state, shared by every role's Impl: its teardown generation, the
+ * check each point of effect makes against it, and its TeardownTracker
+ *
+ * cleanup() bumps cleanup_generation and stamps everything the role queues from then on with the
+ * new value: its events, its slot payloads, the items it hands a role thread. The gate in
+ * SendspinClient's role dispatch captures the generation once, before the handler it admits runs,
+ * and stop()'s teardown on the main loop can land in between, so each point of effect re-checks
+ * it with accepts(), invalidating the whole handler instead of only the part that ran before it.
+ * The drains apply the same check to a payload's stamp (event_is_current(), GenerationSlot), and
+ * a role thread to an item's (InboundConsumer::take()); a drain also uses it to detect a
+ * listener callback that re-entered teardown.
+ */
+struct RoleTeardown {
+    /// @brief Whether an effect admitted at `generation` may still be applied
+    /// @param generation The counter value captured when the message was admitted.
+    bool accepts(uint32_t generation) const {
+        return generation == this->cleanup_generation.load(std::memory_order_acquire);
+    }
+
+    TeardownTracker teardown;  ///< Main loop only.
+    /// Written by cleanup() on the protocol task, or on the main loop in SendspinClient::stop()
+    /// once the task is joined; read on the main loop, the protocol task, the role's own thread
+    /// and, for the controller, by send_command() on any thread.
+    std::atomic<uint32_t> cleanup_generation{0};
+};
+
 /// @brief Runs `role`'s main-loop teardown half, complete_teardown(), if `generation` is a
 /// teardown `role.teardown` has not caught up with. The one chokepoint every role's catch-up
 /// goes through. Main loop only.
@@ -73,6 +101,32 @@ void catch_up_teardown(RoleImpl& role, uint32_t generation) {
     if (role.teardown.advance(generation)) {
         role.complete_teardown();
     }
+}
+
+/// @brief The head of every slot role's drain: takes the role's GenerationSlot payload, catches
+/// the role up to its current teardown generation (catch_up_teardown()), then keeps the payload
+/// only if it is stamped with that generation, dropping an older one with a debug log
+///
+/// Taken before the catch-up: a teardown that ran before the take is caught up here (its clear
+/// fires first) and drops a payload stamped before it; one that runs after the take is caught up
+/// by the next drain, behind what this drain applies. The caller then checks
+/// `role.accepts(generation)`, which also catches a clear callback that re-entered teardown (a
+/// listener calling stop()). Main loop only.
+/// @param[out] have Whether `out` holds a payload stamped with the returned generation.
+/// @param what What the payload is, for the drop's log line.
+/// @return The role's generation the catch-up ran to.
+template <typename RoleImpl, typename T>
+uint32_t take_current_payload(RoleImpl& role, GenerationSlot<T>& slot, T& out, bool& have,
+                              const char* tag, const char* what) {
+    uint32_t stamp = 0;
+    have = slot.take(out, stamp);
+    const uint32_t generation = role.cleanup_generation.load(std::memory_order_acquire);
+    catch_up_teardown(role, generation);
+    if (have && stamp != generation) {
+        SS_LOGD(tag, "Dropping %s queued before the role was torn down", what);
+        have = false;
+    }
+    return generation;
 }
 
 }  // namespace sendspin

@@ -30,9 +30,9 @@
 // (on_pairing_message() / on_pair_abort() / on_server_activate(), the same entry points
 // process_json_message() calls on the protocol task), and pump() runs one protocol tick (the
 // queued commands such as confirm_pairing_window(), the watchdogs and the window lifetime)
-// followed by SendspinClient::loop(). Listener callbacks are NOT fired directly by
-// ConnectionManager; they are queued into SendspinClient::EventState and drained by loop(), so
-// every scenario below pumps and asserts on the RecordingListener rather than on
+// followed by SendspinClient::loop(). ConnectionManager never fires a listener callback itself:
+// the protocol task posts the event to the Inbox and loop()'s drain fires it on the test thread,
+// so every scenario below pumps and asserts on the RecordingListener rather than on
 // ConnectionManager state directly.
 
 #include "connection.h"
@@ -74,26 +74,6 @@
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
-
-// ============================================================================
-// Handler arguments
-// ============================================================================
-
-/// The arguments of one ConnectionManager::on_pairing_message() call, gathered so a helper can
-/// build the message before it delivers it.
-struct ServerPairingMessageEvent {
-    std::shared_ptr<SendspinConnection> conn;
-    PairingMessageKind kind{};
-    std::optional<std::array<uint8_t, 32>> nonce_a{};
-    std::array<uint8_t, 32> pake_msg_1{};
-    std::array<uint8_t, 64> server_kc{};
-};
-
-/// The arguments of one ConnectionManager::on_pair_abort() call.
-struct PairAbortEvent {
-    std::shared_ptr<SendspinConnection> conn;
-    PairAbortReason reason{};
-};
 
 // ============================================================================
 // FakeConnection: minimal SendspinConnection stand-in
@@ -282,8 +262,8 @@ public:
 // Minimal fake providers
 // ============================================================================
 
-/// Network provider that always reports "not ready", so ConnectionManager::loop() never
-/// starts the real WebSocket server: these tests inject connections directly and never
+/// Network provider that always reports "not ready", so the protocol task never starts the real
+/// WebSocket server: these tests inject connections directly and never
 /// exercise the transport or accept path.
 class FakeNetworkProvider : public SendspinNetworkProvider {
 public:
@@ -430,8 +410,8 @@ struct CodeEmissionResult {
 }  // namespace
 
 // ============================================================================
-// Test fixture: builds a SendspinClient, injects a FakeConnection as
-// current_connection_, and provides helpers to drive the pairing state machine.
+// Test fixture: builds a SendspinClient, injects a FakeConnection as the admitted connection,
+// and provides helpers to drive the pairing state machine.
 //
 // This file reaches ConnectionManager's and SendspinClient's private state
 // directly: tests/CMakeLists.txt compiles this one translation unit with
@@ -447,9 +427,9 @@ protected:
     void SetUp() override {
         // This harness exercises both dynamic and static pairing-code device flows, so the platform
         // capability flags gating their advertisement/admissibility default to both set (spec
-        // "PAKE"'s pairing-method admissibility check in ConnectionManager::loop() mirrors
-        // build_hello_message()'s gating exactly, including these). Tests that need a different
-        // capability shape call init_client() again with other flags.
+        // "PAKE"'s pairing-method admissibility check in ConnectionManager::on_server_activate()
+        // mirrors build_hello_message()'s gating exactly, including these). Tests that need a
+        // different capability shape call init_client() again with other flags.
         this->init_client(/*pairing_code_emission_supported=*/true,
                           /*pairing_window_supported=*/true);
     }
@@ -626,17 +606,9 @@ protected:
         this->client_->flush_pending_persistence();
     }
 
-    /// Returns the shared_ptr backing the injected current connection, for building
-    /// ServerPairingMessageEvent / PairAbortEvent conn fields (which require a shared_ptr).
-    /// Backed by the fixture's own owning reference (see inject_current_connection), not
-    /// ConnectionManager::current_connection_, so it stays valid even after an abort/cleanup
-    /// path has released ConnectionManager's slot.
-    std::shared_ptr<SendspinConnection> current_connection_sp() { return this->injected_conn_; }
-
     /// Returns the primary admitted connection (nullptr once dropped), through the
-    /// private-access seam. Unlike current_connection_sp() above, this reflects whether the
-    /// connection is still actually managed, not just whether the fixture's own reference is
-    /// still alive.
+    /// private-access seam. Unlike injected_conn_, this reflects whether the connection is still
+    /// actually managed, not just whether the fixture's own reference is still alive.
     SendspinConnection* current_connection() {
         AdmittedEntry* primary = this->client_->connection_manager_->primary();
         return primary != nullptr ? primary->conn.get() : nullptr;
@@ -645,23 +617,6 @@ protected:
     /// Drive ConnectionManager's real teardown path for `conn`, through the private-access seam.
     void drop_connection(SendspinConnection* conn, SendspinGoodbyeReason goodbye) {
         this->client_->connection_manager_->drop_connection(conn, goodbye);
-    }
-
-    /// Hand a server-to-client code pairing message to the state machine, the call
-    /// process_json_message() makes on the protocol task. The listener hears of it on the next
-    /// pump().
-    void schedule_pairing_message_event(const ServerPairingMessageEvent& event) {
-        ServerPairingMessage message;
-        message.kind = event.kind;
-        message.nonce_a = event.nonce_a;
-        message.pake_msg_1 = event.pake_msg_1;
-        message.server_kc = event.server_kc;
-        this->client_->connection_manager_->on_pairing_message(event.conn.get(), message);
-    }
-
-    /// Hand a pair/abort to the manager, the call process_json_message() makes.
-    void schedule_abort(const PairAbortEvent& event) {
-        this->client_->connection_manager_->on_pair_abort(event.conn.get(), event.reason);
     }
 
     /// Apply a server/activate on the injected current connection through the real activation
@@ -677,7 +632,7 @@ protected:
         message.active_roles = std::move(active_roles);
         message.pairing_method = pairing_method;
         message.pairing_format = pairing_format;
-        this->client_->connection_manager_->on_server_activate(this->current_connection_sp().get(),
+        this->client_->connection_manager_->on_server_activate(this->injected_conn_.get(),
                                                                std::move(message));
     }
 
@@ -808,11 +763,11 @@ protected:
             out.prs = pairing_code_digits_prs(out.emitted);
         }
 
-        ServerPairingMessageEvent pair_init_event;
-        pair_init_event.conn = this->current_connection_sp();
+        ServerPairingMessage pair_init_event;
         pair_init_event.kind = PairingMessageKind::PAIR_INIT;
         pair_init_event.nonce_a = out.nonce_a;
-        this->schedule_pairing_message_event(std::move(pair_init_event));
+        this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                               pair_init_event);
         this->pump();
 
         ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_CODE));
@@ -826,11 +781,11 @@ protected:
     /// own bogus server_kc instead and drives PAIR_AUTH inline (it never calls derive()/tag()).
     void drive_pair_auth(FakeConnection* conn, ServerStandIn& server,
                          std::array<uint8_t, CPACE_TAG_SIZE>& server_kc_out) {
-        ServerPairingMessageEvent pair_auth_event;
-        pair_auth_event.conn = this->current_connection_sp();
+        ServerPairingMessage pair_auth_event;
         pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
         pair_auth_event.pake_msg_1 = server.initiator.public_share();
-        this->schedule_pairing_message_event(std::move(pair_auth_event));
+        this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                               pair_auth_event);
         this->pump();
 
         ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
@@ -848,15 +803,16 @@ protected:
         server_kc_out = server_kc.value();
     }
 
-    /// Schedule a server/pair-confirm(server_kc) event for the injected connection and pump
-    /// loop(). Shared by every PAIR_CONFIRM step: the dispatch is identical whether server_kc
-    /// is genuine or a code-mismatch test's fabricated tag.
-    void schedule_pair_confirm(const std::array<uint8_t, CPACE_TAG_SIZE>& server_kc) {
-        ServerPairingMessageEvent pair_confirm_event;
-        pair_confirm_event.conn = this->current_connection_sp();
+    /// Hands a server/pair-confirm(server_kc) for the injected connection to
+    /// ConnectionManager::on_pairing_message(), then pumps. Shared by every PAIR_CONFIRM step:
+    /// the dispatch is identical whether server_kc is genuine or a code-mismatch test's
+    /// fabricated tag.
+    void send_pair_confirm(const std::array<uint8_t, CPACE_TAG_SIZE>& server_kc) {
+        ServerPairingMessage pair_confirm_event;
         pair_confirm_event.kind = PairingMessageKind::PAIR_CONFIRM;
         pair_confirm_event.server_kc = server_kc;
-        this->schedule_pairing_message_event(std::move(pair_confirm_event));
+        this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                               pair_confirm_event);
         this->pump();
     }
 
@@ -872,15 +828,15 @@ protected:
         this->client_->connection_manager_->pairing_rounds_since_verified_kc_ = rounds;
     }
 
-    /// Begin the next round of a dynamic attempt sitting in AWAIT_SERVER_PAIR_INIT after a
-    /// client/pair-retry. A retry round's server/pair-init carries no nonce_A: the binding
-    /// values, and so the pairing code the operator is looking at, do not move between rounds
-    /// (pairing.md "Rounds").
-    void schedule_retry_round_pair_init() {
-        ServerPairingMessageEvent event;
-        event.conn = this->current_connection_sp();
+    /// Begins the next round of a dynamic attempt sitting in AWAIT_SERVER_PAIR_INIT after a
+    /// client/pair-retry: hands a server/pair-init for the injected connection to
+    /// ConnectionManager::on_pairing_message(), then pumps. A retry round's server/pair-init
+    /// carries no nonce_A: the binding values, and so the pairing code the operator is looking at,
+    /// do not move between rounds (pairing.md "Rounds").
+    void send_retry_round_pair_init() {
+        ServerPairingMessage event;
         event.kind = PairingMessageKind::PAIR_INIT;
-        this->schedule_pairing_message_event(std::move(event));
+        this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(), event);
         this->pump();
     }
 
@@ -895,17 +851,17 @@ protected:
         ServerStandIn server;
         ASSERT_TRUE(server.start(display.prs, display.handshake_hash, /*pairing_index=*/1, round));
 
-        ServerPairingMessageEvent pair_auth_event;
-        pair_auth_event.conn = this->current_connection_sp();
+        ServerPairingMessage pair_auth_event;
         pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
         pair_auth_event.pake_msg_1 = server.initiator.public_share();
-        this->schedule_pairing_message_event(std::move(pair_auth_event));
+        this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                               pair_auth_event);
         this->pump();
         ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
 
         std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
         bogus_server_kc.fill(0xAB);
-        this->schedule_pair_confirm(bogus_server_kc);
+        this->send_pair_confirm(bogus_server_kc);
     }
 
     /// Run one whole static-pairing-code attempt on `conn` that the "server" fails deliberately.
@@ -924,17 +880,17 @@ protected:
                                  conn->pairing_session().handshake_hash, pairing_index,
                                  /*round=*/1));
 
-        ServerPairingMessageEvent pair_auth_event;
-        pair_auth_event.conn = this->current_connection_sp();
+        ServerPairingMessage pair_auth_event;
         pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
         pair_auth_event.pake_msg_1 = server.initiator.public_share();
-        this->schedule_pairing_message_event(std::move(pair_auth_event));
+        this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                               pair_auth_event);
         this->pump();
         ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
 
         std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
         bogus_server_kc.fill(0xCD);
-        this->schedule_pair_confirm(bogus_server_kc);
+        this->send_pair_confirm(bogus_server_kc);
         ASSERT_EQ(last_pair_abort_reason(conn->sent_text_), "pairing_code_mismatch");
     }
 
@@ -1070,7 +1026,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeHappyPath) {
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
 
-    this->schedule_pair_confirm(server_kc);
+    this->send_pair_confirm(server_kc);
 
     ASSERT_GE(conn->sent_text_.size(), 4u);
     ASSERT_NO_FATAL_FAILURE(
@@ -1113,7 +1069,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeQrFormatHappyPath) {
 
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
-    this->schedule_pair_confirm(server_kc);
+    this->send_pair_confirm(server_kc);
 
     ASSERT_NO_FATAL_FAILURE(
         this->verify_pair_confirm_frame(conn->sent_text_, /*expect_wrapped_nonce=*/true));
@@ -1139,7 +1095,7 @@ TEST_F(PairingStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyWithdrawnC
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
 
-    this->schedule_pair_confirm(server_kc);
+    this->send_pair_confirm(server_kc);
 
     // PAIR_CONFIRM succeeded: client/pair-finalize was sent, and the code was already dismissed
     // exactly once.
@@ -1149,10 +1105,8 @@ TEST_F(PairingStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyWithdrawnC
 
     // The server now aborts the exchange after the code was already dismissed (it can do this
     // any time before the attempt concludes, e.g. the operator cancelled on its side).
-    PairAbortEvent abort_event;
-    abort_event.conn = this->current_connection_sp();
-    abort_event.reason = PairAbortReason::USER_CANCELLED;
-    this->schedule_abort(std::move(abort_event));
+    this->client_->connection_manager_->on_pair_abort(this->injected_conn_.get(),
+                                                      PairAbortReason::USER_CANCELLED);
     this->pump();
 
     // The attempt now fails, but on_clear_pairing_code must NOT fire a second time:
@@ -1208,14 +1162,14 @@ TEST_F(PairingStateMachineTest, RetryRoundRunsTheNextRoundsSid) {
 
     // Round 2: the server sends server/pair-init again, without nonce_A, and runs CPace under
     // the sid whose round counter now reads 2.
-    this->schedule_retry_round_pair_init();
+    this->send_retry_round_pair_init();
     ServerStandIn server;
     ASSERT_TRUE(server.start(display.prs, display.handshake_hash, /*pairing_index=*/1,
                              /*round=*/2));
 
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
-    this->schedule_pair_confirm(server_kc);
+    this->send_pair_confirm(server_kc);
 
     // Only a second round derived over the round-2 sid produces a server_kc this client
     // verifies, so reaching pair-confirm at all is the assertion: the sid moved with the round.
@@ -1240,14 +1194,14 @@ TEST_F(PairingStateMachineTest, RetryRoundRejectsAReplayOfTheFirstRoundsSid) {
     ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, /*round=*/1));
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-retry");
 
-    this->schedule_retry_round_pair_init();
+    this->send_retry_round_pair_init();
     ServerStandIn server;
     ASSERT_TRUE(server.start(display.prs, display.handshake_hash, /*pairing_index=*/1,
                              /*round=*/1));
 
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
-    this->schedule_pair_confirm(server_kc);
+    this->send_pair_confirm(server_kc);
 
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-retry");
     EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-confirm"));
@@ -1269,7 +1223,7 @@ TEST_F(PairingStateMachineTest, RoundLimitEndsTheAttemptWithPairingCodeMismatch)
             break;
         }
         ASSERT_LT(round, 64u) << "the client must stop retrying at some point";
-        this->schedule_retry_round_pair_init();
+        this->send_retry_round_pair_init();
     }
 
     // pairing.md "Rounds" caps a dynamic pairing code at 20 rounds since the last verified
@@ -1481,11 +1435,11 @@ TEST_F(PairingStateMachineTest, StaticCodeAttemptClosesOnServerPairInit) {
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
     const size_t frames_before = conn->sent_text_.size();
 
-    ServerPairingMessageEvent pair_init_event;
-    pair_init_event.conn = this->current_connection_sp();
+    ServerPairingMessage pair_init_event;
     pair_init_event.kind = PairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = std::array<uint8_t, 32>{};
-    this->schedule_pairing_message_event(std::move(pair_init_event));
+    this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                           pair_init_event);
     this->pump();
 
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
@@ -1504,11 +1458,11 @@ TEST_F(PairingStateMachineTest, OutOfSequenceServerPairAuthClosesSilently) {
               SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT);
     const size_t frames_before = conn->sent_text_.size();
 
-    ServerPairingMessageEvent pair_auth_event;
-    pair_auth_event.conn = this->current_connection_sp();
+    ServerPairingMessage pair_auth_event;
     pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
     pair_auth_event.pake_msg_1 = std::array<uint8_t, 32>{};
-    this->schedule_pairing_message_event(std::move(pair_auth_event));
+    this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                           pair_auth_event);
     this->pump();
 
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
@@ -1528,7 +1482,7 @@ TEST_F(PairingStateMachineTest, OutOfSequenceServerPairConfirmClosesSilently) {
     const size_t frames_before = conn->sent_text_.size();
 
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
-    this->schedule_pair_confirm(server_kc);
+    this->send_pair_confirm(server_kc);
 
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
         << "a sequence violation sends no application-level message, pair/abort included";
@@ -1550,10 +1504,10 @@ TEST_F(PairingStateMachineTest, FirstRoundServerPairInitWithoutNonceClosesSilent
     ASSERT_EQ(conn->pairing_session().round, 0u);
     const size_t frames_before = conn->sent_text_.size();
 
-    ServerPairingMessageEvent pair_init_event;
-    pair_init_event.conn = this->current_connection_sp();
+    ServerPairingMessage pair_init_event;
     pair_init_event.kind = PairingMessageKind::PAIR_INIT;
-    this->schedule_pairing_message_event(std::move(pair_init_event));
+    this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                           pair_init_event);
     this->pump();
 
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
@@ -1580,11 +1534,11 @@ TEST_F(PairingStateMachineTest, RetryRoundServerPairInitCarryingNonceClosesSilen
     ASSERT_EQ(conn->pairing_session().round, 1u);
     const size_t frames_before = conn->sent_text_.size();
 
-    ServerPairingMessageEvent pair_init_event;
-    pair_init_event.conn = this->current_connection_sp();
+    ServerPairingMessage pair_init_event;
     pair_init_event.kind = PairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = display.nonce_a;
-    this->schedule_pairing_message_event(std::move(pair_init_event));
+    this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                           pair_init_event);
     this->pump();
 
     EXPECT_EQ(conn->sent_text_.size(), frames_before)
@@ -1636,15 +1590,13 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSile
         conn->connected_ = row.transport_open;
 
         if (row.malformed_frame) {
-            ServerPairingMessageEvent malformed_event;
-            malformed_event.conn = this->current_connection_sp();
+            ServerPairingMessage malformed_event;
             malformed_event.kind = PairingMessageKind::MALFORMED;
-            this->schedule_pairing_message_event(std::move(malformed_event));
+            this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                                   malformed_event);
         } else {
-            PairAbortEvent abort_event;
-            abort_event.conn = this->current_connection_sp();
-            abort_event.reason = PairAbortReason::CONCURRENT_ATTEMPT;
-            this->schedule_abort(std::move(abort_event));
+            this->client_->connection_manager_->on_pair_abort(this->injected_conn_.get(),
+                                                              PairAbortReason::CONCURRENT_ATTEMPT);
         }
         this->pump();
 
@@ -1668,11 +1620,10 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameWithNoActiveSessionIsIg
         this->inject_current_connection("server-dyn-5", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     ASSERT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::IDLE);
 
-    auto current_conn_sp = this->current_connection_sp();
-    ServerPairingMessageEvent malformed_event;
-    malformed_event.conn = current_conn_sp;
+    ServerPairingMessage malformed_event;
     malformed_event.kind = PairingMessageKind::MALFORMED;
-    this->schedule_pairing_message_event(std::move(malformed_event));
+    this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                           malformed_event);
     this->pump();
 
     EXPECT_TRUE(conn->sent_text_.empty());
@@ -1705,13 +1656,11 @@ TEST_F(PairingStateMachineTest, DynamicCodeDeriveFailureOnPairAuthClosesSilently
         nonce_a[i] = static_cast<uint8_t>(i + 3);
     }
 
-    auto current_conn_sp = this->current_connection_sp();
-
-    ServerPairingMessageEvent pair_init_event;
-    pair_init_event.conn = current_conn_sp;
+    ServerPairingMessage pair_init_event;
     pair_init_event.kind = PairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = nonce_a;
-    this->schedule_pairing_message_event(std::move(pair_init_event));
+    this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                           pair_init_event);
     this->pump();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_CODE));
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_AUTH);
@@ -1719,11 +1668,11 @@ TEST_F(PairingStateMachineTest, DynamicCodeDeriveFailureOnPairAuthClosesSilently
     // server/pair-auth with an all-zero pake_msg_1: a well-formed-length but low-order X25519
     // point, so CPace::derive() fails on the peer share itself (see
     // CPaceDeriveRejects.AllZeroPeerShare in test_cpace.cpp), independent of any code value.
-    ServerPairingMessageEvent pair_auth_event;
-    pair_auth_event.conn = current_conn_sp;
+    ServerPairingMessage pair_auth_event;
     pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
     pair_auth_event.pake_msg_1.fill(0);
-    this->schedule_pairing_message_event(std::move(pair_auth_event));
+    this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                           pair_auth_event);
     this->pump();
 
     // No pair/abort (or any other application-level message) beyond the earlier
@@ -1916,7 +1865,7 @@ TEST_F(PairingStateMachineTest, CompletedPairingClosesTheWindow) {
     ASSERT_TRUE(server.start(pairing_code_digits_prs(code), conn->pairing_session().handshake_hash));
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
-    this->schedule_pair_confirm(server_kc);
+    this->send_pair_confirm(server_kc);
 
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
     EXPECT_GT(this->window_deadline(), 0)
@@ -1959,7 +1908,7 @@ TEST_F(PairingStateMachineTest, WindowAdmitsOnlyTheConnectionItIsBoundTo) {
 
     // Hold the first connection alive so the second cannot reuse its address and pass the
     // binding check by accident.
-    auto keep_alive = this->current_connection_sp();
+    auto keep_alive = this->injected_conn_;
     FakeConnection* other = this->inject_current_connection("server-window-other",
                                                             SendspinPairMethod::STATIC_PAIRING_CODE);
     ASSERT_NE(other, bound);
@@ -2089,7 +2038,7 @@ TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
 
-    this->schedule_pair_confirm(server_kc);
+    this->send_pair_confirm(server_kc);
 
     // client/pair-confirm must carry client_kc and no opening: the static flow sends no
     // commit_B, so there is nothing to open.
@@ -2113,7 +2062,7 @@ TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
 
 // A device that first goes operational on an empty server/activate must still enter pairing
 // when the operator later triggers a SUBSEQUENT activate declaring [pairing].
-// ConnectionManager::loop() must enter pairing on ANY pairing activate on an already-admitted
+// on_server_activate() must enter pairing on ANY pairing activate on an already-admitted
 // connection, not only the first, or a later one is silently dropped as an ordinary "subsequent
 // activate" and the attempt never starts (messaging.md "server/activate": an activate may be
 // re-sent to change the pairing parameters). This holds for both pairing-code methods; what
@@ -2310,22 +2259,21 @@ TEST_F(PairingStateMachineTest, StaticCodeMismatchRecordsFailureAndAborts) {
     ServerStandIn server;
     ASSERT_TRUE(server.start(pairing_code_digits_prs("13572468"), handshake_hash));
 
-    auto current_conn_sp = this->current_connection_sp();
-    ServerPairingMessageEvent pair_auth_event;
-    pair_auth_event.conn = current_conn_sp;
+    ServerPairingMessage pair_auth_event;
     pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
     pair_auth_event.pake_msg_1 = server.initiator.public_share();
-    this->schedule_pairing_message_event(std::move(pair_auth_event));
+    this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                           pair_auth_event);
     this->pump();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
 
     std::array<uint8_t, 64> bogus_server_kc{};
     bogus_server_kc.fill(0xCD);
-    ServerPairingMessageEvent pair_confirm_event;
-    pair_confirm_event.conn = current_conn_sp;
+    ServerPairingMessage pair_confirm_event;
     pair_confirm_event.kind = PairingMessageKind::PAIR_CONFIRM;
     pair_confirm_event.server_kc = bogus_server_kc;
-    this->schedule_pairing_message_event(std::move(pair_confirm_event));
+    this->client_->connection_manager_->on_pairing_message(this->injected_conn_.get(),
+                                                           pair_confirm_event);
     this->pump();
 
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pairing_code_mismatch");
@@ -2441,10 +2389,8 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
 
     // The server aborts the exchange directly (pair/abort), which drives
     // ConnectionManager::handle_pair_abort() -> cleanup_connection_state() -> deferred note_*.
-    PairAbortEvent abort_event;
-    abort_event.conn = this->current_connection_sp();
-    abort_event.reason = PairAbortReason::USER_CANCELLED;
-    this->schedule_abort(std::move(abort_event));
+    this->client_->connection_manager_->on_pair_abort(this->injected_conn_.get(),
+                                                      PairAbortReason::USER_CANCELLED);
     this->pump();
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED))
@@ -2467,11 +2413,8 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupSta
     this->pump();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
 
-    auto current_conn_sp = this->current_connection_sp();
-    PairAbortEvent abort_event;
-    abort_event.conn = current_conn_sp;
-    abort_event.reason = PairAbortReason::USER_CANCELLED;
-    this->schedule_abort(std::move(abort_event));
+    this->client_->connection_manager_->on_pair_abort(this->injected_conn_.get(),
+                                                      PairAbortReason::USER_CANCELLED);
     this->pump();
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
@@ -2525,7 +2468,7 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
 // must keep incrementing across repeated pairing server/activate messages on the SAME
 // connection (e.g. the operator retries after a stalled attempt), not reset with each attempt.
 // It only resets on a fresh Noise handshake (initial or re-handshake). Driven through
-// post_activate(), so the bump under test is the production one in the activate_events loop
+// post_activate(), so the bump under test is the production one in on_server_activate()
 // rather than the enter_pairing() seam's stand-in for it.
 TEST_F(PairingStateMachineTest, PairingIndexIncrementsAcrossRepeatedPairingActivates) {
     FakeConnection* conn = this->inject_provisional_current_connection("server-dyn-idx");
@@ -2575,10 +2518,10 @@ TEST_F(PairingStateMachineTest, PairingIndexIncrementsAcrossRepeatedPairingActiv
 // pairing activate the pairing-method admissibility gate rejects (method_not_supported) must
 // still count. Unlike PairingIndexIncrementsAcrossRepeatedPairingActivates above (which drives
 // handle_enter_pairing() directly via the enter_pairing() test seam, bypassing the gate
-// entirely), this test goes through the REAL ConnectionManager::loop() admissibility gate via
-// post_activate()/schedule_activate(), the same code path a stray or drifted server activate
-// takes in production, to prove the bump in the activate_events loop (connection_manager.cpp,
-// before the pairing-method admissibility check) fires for a rejected activate too, so a second,
+// entirely), this test goes through the REAL on_server_activate() admissibility gate via
+// post_activate(), the same code path a stray or drifted server activate takes in production,
+// to prove the bump (ConnectionManager::on_server_activate(), before the pairing-method
+// admissibility check) fires for a rejected activate too, so a second,
 // admissible activate on the same connection is not left one behind the server's own count.
 TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     FakeConnection* conn = this->inject_provisional_current_connection("server-rejected-idx");
@@ -2643,11 +2586,8 @@ TEST_F(PairingStateMachineTest, PairAbortConcurrentAttemptStillClosesConnection)
     this->enter_pairing(conn);
     this->pump();
 
-    auto current_conn_sp = this->current_connection_sp();
-    PairAbortEvent abort_event;
-    abort_event.conn = current_conn_sp;
-    abort_event.reason = PairAbortReason::CONCURRENT_ATTEMPT;
-    this->schedule_abort(std::move(abort_event));
+    this->client_->connection_manager_->on_pair_abort(this->injected_conn_.get(),
+                                                      PairAbortReason::CONCURRENT_ATTEMPT);
     this->pump();
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
@@ -2673,11 +2613,8 @@ TEST_F(PairingStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
     const int disconnects_before = conn->disconnect_count_;
 
     // A pair/abort from the server races in AFTER the local abort already ended the attempt.
-    auto current_conn_sp = this->current_connection_sp();
-    PairAbortEvent stale_event;
-    stale_event.conn = current_conn_sp;
-    stale_event.reason = PairAbortReason::PAIRING_CODE_MISMATCH;
-    this->schedule_abort(std::move(stale_event));
+    this->client_->connection_manager_->on_pair_abort(this->injected_conn_.get(),
+                                                      PairAbortReason::PAIRING_CODE_MISMATCH);
     this->pump();
 
     EXPECT_EQ(this->listener_.events_.size(), events_before)
@@ -2686,15 +2623,16 @@ TEST_F(PairingStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
 }
 
 // ============================================================================
-// Re-proving watchdog (current_connection_ non-operational after a re-handshake or a
+// Re-proving watchdog (the admitted connection non-operational after a re-handshake or a
 // pair-finalize ack; see REPROVE_TIMEOUT_US in connection_manager.h)
 // ============================================================================
 
 // SendspinConnection::note_pairing_finalize_ack() resets first_activate_received_ (so
 // is_operational() goes false) and re-arms provisional_time_us_, anticipating the server's
-// follow-up in-band re-handshake. If the server goes silent instead, ConnectionManager::loop()
-// must eventually drop the connection rather than leave it wedged non-operational forever. The
-// nursery reaper cannot cover this: the connection is current_connection_, never a nursery member.
+// follow-up in-band re-handshake. If the server goes silent instead, the re-prove watchdog
+// (ConnectionManager::scan_admitted()) must eventually drop the connection rather than leave it
+// wedged non-operational forever. The nursery reaper cannot cover this: the connection is
+// admitted, never a nursery member.
 // Forces the deadline into the past instead of sleeping REPROVE_TIMEOUT_US (30 s) in a unit test,
 // matching the attempt_deadline_us pattern (e.g. DynamicCodeAttemptTimeout above).
 TEST_F(PairingStateMachineTest, ReproveWatchdogDropsConnectionAfterFinalizeAckGoesSilent) {
@@ -2717,7 +2655,7 @@ TEST_F(PairingStateMachineTest, ReproveWatchdogDropsConnectionAfterFinalizeAckGo
 }
 
 // Companion to the test above, proving the watchdog does NOT over-reap: a connection that is
-// operational (is_operational() == true, as a real promoted current_connection_ always is
+// operational (is_operational() == true, as a promoted admitted connection always is
 // outside the two re-proving windows; see promote_or_arbitrate_nursery_entry()) and legitimately
 // mid-pairing, awaiting a human to press a physical gesture with no fixed deadline of its
 // own, must survive even though its provisional_time_us_ is stale by far more than
@@ -2776,7 +2714,7 @@ TEST_F(PairingStateMachineTest, PairingAttemptTimeoutScanSuppressedDuringFinaliz
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
 
-    this->schedule_pair_confirm(server_kc);
+    this->send_pair_confirm(server_kc);
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
     ASSERT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_FINALIZE);
 
@@ -2801,13 +2739,11 @@ TEST_F(PairingStateMachineTest, PairingAttemptTimeoutScanSuppressedDuringFinaliz
 
 // The admitted flag must be cleared when the admitted connection is dropped.
 //
-// SendspinConnection::is_admitted() is what the protocol task's dispatch gate reads to decide
-// whether a connection may drive the roles (see requires_admitted_connection() in client.cpp).
-// drop_connection() moves the connection out of current_connection_ BEFORE calling
-// set_current_connection(nullptr), so the setter sees an already-null slot and cannot clear the
-// outgoing occupant; drop_connection() has to do it itself. The dropped connection outlives the
-// call (queue_deferred_release keeps it alive through the goodbye window), so a missed clear
-// leaves an object that still claims admission.
+// SendspinConnection::is_admitted() is what the transport routes on and what the protocol
+// task's dispatch gate reads to decide whether a connection may drive the roles.
+// drop_connection() empties the slot (ConnectionManager::vacate_admitted()), which must clear
+// the flag: the dropped connection can outlive the call (the fixture and, on ESP, the httpd
+// session keep it), so a missed clear leaves an object that still claims admission.
 //
 // Asserted on the flag directly rather than end to end: detach_inbound(), called a few
 // lines earlier in the same function, independently blocks dispatch from a dropped connection, so

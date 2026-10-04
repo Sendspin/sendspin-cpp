@@ -150,31 +150,10 @@ public:
         return this->event_flags_.is_created();
     }
 
-    /// @brief Whether the item list is bound to a ring (between start() and stop()), so the
-    /// protocol task may hand it items. Protocol task.
-    bool accepts_items() const {
-        return this->ring_.load(std::memory_order_acquire) != nullptr;
-    }
-
-    /// @brief The ring the item list is bound to, or nullptr outside a run. Protocol task.
-    InboundRing* ring() const {
-        return this->ring_.load(std::memory_order_acquire);
-    }
-
-    /// @brief Charges an item to the player's quota and appends it to the item list, waking the
-    /// thread. Protocol task only; requires accepts_items().
-    /// @param item_len The item's message length (see InboundMessage::item_len).
-    /// @return false, appending nothing, when the player is over quota: the caller returns the
-    ///         item and logs the drop.
-    bool hand_item(void* item, size_t item_len) {
-        return hand_inbound_item(*this->ring(), this->encoded_items_, InboundHolder::PLAYER, item,
-                                 item_len);
-    }
-
-    /// @brief Returns every item the thread has not taken yet to the ring. Protocol task, or the
-    /// main loop once the thread is joined.
-    void recall_items() {
-        this->encoded_items_.recall();
+    /// @brief The player's end of the inbound ring: the protocol task hands the thread encoded
+    /// chunks, codec headers and markers through it, bound to the ring between start() and stop()
+    InboundConsumer& inbound() {
+        return this->inbound_;
     }
 
     /// @brief Whether the sync task is actively decoding and syncing a stream; false when idle
@@ -273,16 +252,9 @@ protected:
     /// later stream's codec header, kept in `sync_context.next_header`.
     bool load_next_chunk(SyncContext& sync_context);
 
-    /// @brief Takes the next item from the list, returning to the ring any whose teardown
-    /// generation the player has moved past (it was appended for a stream a teardown ended)
-    /// @param timeout_ms As InboundItemList::take(), applied to the first take only.
-    /// @return The item, or nullptr: treat it as "re-check state and retry".
+    /// @brief Takes the next item of the player's current teardown generation
+    /// (InboundConsumer::take()). Sync thread.
     void* take_item(uint32_t timeout_ms);
-
-    /// @brief Returns an item to the ring
-    void return_item(void* item) const {
-        this->ring()->return_item(item);
-    }
 
     /// @brief Removes last decoded frame, blending into the second-to-last to minimize glitches
     /// Returns -1 if a frame was removed, 0 if preconditions not met.
@@ -348,16 +320,11 @@ protected:
     ShadowSlot<PlaybackProgress> playback_progress_slot_;
     std::thread sync_thread_;
 
-    /// The encoded chunks and markers the protocol task hands the thread (appended on the
-    /// protocol task, taken on the sync thread; recalled on the protocol task or, once the thread
-    /// is joined, on the main loop). No storage of its own: it links ring items.
-    InboundItemList encoded_items_;
+    /// See inbound(); InboundConsumer states its threads.
+    InboundConsumer inbound_;
 
     // Pointer fields
     PlayerRole::Impl* player_impl_{nullptr};
-    /// The ring the item list is bound to for the current run, or nullptr outside one. Written by
-    /// start() and stop() on the main loop, read by the protocol task and the sync thread.
-    std::atomic<InboundRing*> ring_{nullptr};
 
     // 16-bit fields
     /// The stream ordinal the main loop last acknowledged (signal_stream_start()). Written on the

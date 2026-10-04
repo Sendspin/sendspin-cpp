@@ -97,8 +97,8 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # display_slot under its slot_epochs) and queues a STREAM_START (enqueue_stream_event()) with an
 # old stamp, and reads cleanup_generation and the applied state (controller_state, metadata,
 # color, the player's stream_active, current_stream_params and volume); its player runs with the
-# sync thread stopped and the item list bound by hand (SyncTask's stop(), encoded_items_ and
-# ring_), so a STREAM_END never waits for a thread to go idle. The high-performance grant tables
+# sync thread stopped and the item list bound by hand (SyncTask's stop() and inbound_), so a
+# STREAM_END never waits for a thread to go idle. The high-performance grant tables
 # play the protocol task's run_time_sync() on a stand-in in the admitted slot (find_admitted(),
 # its high_performance_held) and read the stand-in's time_frame_tag_, the one trace of a time
 # frame written without a Noise session; the wake test restarts the protocol task
@@ -109,7 +109,8 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # task's item list and the player's sync-idle topic bit, and its clear row calls
 # handle_stream_clear() the same way. The next-stream header table plays the sync task itself on
 # the test thread, because no public call holds the task between its ACTIVE load and its next
-# IDLE wait: it calls SyncTask's wait_for_codec_header(), load_next_chunk() and return_item(),
+# IDLE wait: it calls SyncTask's wait_for_codec_header() and load_next_chunk() and returns items
+# through its inbound_,
 # resets the flags with event_flags_.clear_all() as start() would, sets and reads SyncContext's
 # active_ordinal and next_header, and reads PlayerRole::Impl::stream_ordinal.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
@@ -130,11 +131,11 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # handle_stream_clear(), handle_server_command(), cleanup(), recall_stale_items(), attach_inbox(),
 # drain_events(), volume, cleanup_generation and event_state's generation-stamped slots (one
 # written with a stamp from before a teardown, the payload a drain on the far side of it would
-# hold); SyncTask's encoded_items_ and ring_,
-# bound to a test ring the way start() binds them but with no thread, so what a handler handed
-# over (or, refused, did not) stays on the list to be read, and discard_to_clear_marker(), the
-# sync thread's stream/clear step. The inbound tests also bind a VisualizerRole::Impl to the same
-# ring, to show one holder's quota does not stop the other.
+# hold); SyncTask's inbound_ (and take_item()), bound to a test ring the way start() binds it but
+# with no thread, so what a handler handed over (or, refused, did not) stays on the list to be
+# read, and discard_to_clear_marker(), the sync thread's stream/clear step. The inbound tests
+# also bind a VisualizerRole::Impl to the same ring, to show one holder's quota does not stop the
+# other.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_inbound_ring.cpp sets InboundGate's private CONSUMED bit directly to stage a consume bit

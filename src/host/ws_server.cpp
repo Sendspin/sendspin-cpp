@@ -41,16 +41,6 @@ static const char* const TAG = "sendspin.ws_server";
 /// inherited from a dependency default an IXWebSocket upgrade could silently rescope.
 static constexpr int WS_HANDSHAKE_TIMEOUT_SECS = 3;
 
-namespace {
-
-/// @brief What one accepted socket's callbacks know about the connection delivered for it
-struct DeliveredConnection {
-    /// The delivered connection, observed: the manager is its long-term owner.
-    std::weak_ptr<SendspinServerConnection> conn;
-};
-
-}  // namespace
-
 SendspinWsServer::~SendspinWsServer() {
     this->stop();
 }
@@ -79,9 +69,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                 return;
             }
 
-            // Generate a synthetic sockfd from a monotonic counter for connection lookup.
-            // (A pointer-derived id could repeat when a freed ix::WebSocket's address is
-            // reused, briefly mis-routing close events to a live connection.)
+            // A synthetic sockfd from a monotonic counter names the socket in the logs.
             static std::atomic<int> next_synthetic_sockfd{1};
             int synthetic_sockfd = next_synthetic_sockfd.fetch_add(1);
             if (synthetic_sockfd <= 0) {
@@ -99,11 +87,12 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
             // (3 s) closes such sockets without ever surfacing an event. The manager only ever
             // learns about connections that reach Open.
             //
-            // Filled at Open so the Close event can report the connection by identity. A
+            // The connection delivered for this socket, observed (the manager is its long-term
+            // owner). Filled at Open so the Close event can report the connection by identity. A
             // never-delivered socket leaves it empty, and its Close is not reported (the manager
             // never knew the connection existed). Every callback below runs on this socket's
-            // own IXWebSocket thread, so the record needs no lock.
-            auto delivered = std::make_shared<DeliveredConnection>();
+            // own IXWebSocket thread, so it needs no lock.
+            auto delivered = std::make_shared<std::weak_ptr<SendspinServerConnection>>();
             ws->setOnMessageCallback([this, synthetic_sockfd, weak_ws,
                                       delivered](const ix::WebSocketMessagePtr& msg) {
                 int64_t receive_time = platform_time_us();
@@ -112,7 +101,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                     // The reference keeps the connection alive for the hand-off. A connection the
                     // manager rejected at delivery or has since released is detached, so its
                     // frames are dropped inside handle_message().
-                    auto conn = delivered->conn.lock();
+                    auto conn = delivered->lock();
                     if (conn == nullptr) {
                         SS_LOGD(TAG, "Dropping message for released sockfd %d", synthetic_sockfd);
                         return;
@@ -134,10 +123,10 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                         self_ws->close();
                         return;
                     }
-                    auto connection = std::make_shared<SendspinServerConnection>(std::move(self_ws),
-                                                                                 synthetic_sockfd);
+                    auto connection =
+                        std::make_shared<SendspinServerConnection>(std::move(self_ws));
                     connection->mark_ws_upgraded();
-                    delivered->conn = connection;
+                    *delivered = connection;
                     if (!this->new_connection_callback_(connection)) {
                         // Refused: close the socket. The connection is released here, after the
                         // delivery returned, when `connection` goes out of scope. Unlike ESP,
@@ -155,7 +144,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                     // released the connection; there is nothing left to notify it about.
                     // Otherwise the protocol task drops it once the messages before the close
                     // are processed.
-                    if (auto conn = delivered->conn.lock()) {
+                    if (auto conn = delivered->lock()) {
                         conn->notify_transport_closed();
                     }
                 } else if (msg->type == ix::WebSocketMessageType::Error) {

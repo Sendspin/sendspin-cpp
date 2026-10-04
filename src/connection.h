@@ -115,7 +115,8 @@ public:
     /// still takes for the connection, and retires the client/time frame in flight, so a
     /// server/time already being processed cannot claim it and overwrite the next connection's
     /// measurement. Protocol task (the connection manager when the connection leaves it, and
-    /// close_silently()), or the transport thread (fail_inbound()).
+    /// close_silently()); the transport thread (fail_inbound()); the thread delivering an accept
+    /// the command queue refused; or the main loop with the protocol task joined.
     ///
     /// A message the protocol task is already dispatching is not recalled: the drop that called
     /// this runs between two of the task's messages, and clears the admitted flag first.
@@ -251,13 +252,6 @@ public:
     /// buffer, and the pre-handshake text fallback builds the string it needs
     SsErr send_app_json(const char* json, size_t len, SendCompleteCallback cb = nullptr,
                         bool allow_before_hello = false);
-
-    /// @brief Gets the socket file descriptor for this connection
-    /// @return Socket fd for server connections, -1 for client connections.
-    /// @note Used by the hub to identify which connection closed when notified by the server.
-    virtual int get_sockfd() const {
-        return -1;
-    }
 
     /// @brief Returns this connection's process-unique instance id
     /// @return A monotonic id assigned at construction, never reused for the lifetime of the
@@ -637,20 +631,20 @@ public:
     // ========================================
 
     /// @brief Callback invoked on the protocol task for each complete JSON message
-    /// @param conn Pointer to this connection.
+    /// @param conn This connection.
     /// @param data Pointer to the message bytes, in a ring item or a buffer the connection owns.
     /// Valid only until the callback returns, so the callback must not retain it. Not
     /// null-terminated; use @p len.
     /// @param len Length of the message in bytes.
     /// @param timestamp The client time the transport received the message at.
-    std::function<void(SendspinConnection*, const char*, size_t, int64_t)> on_json_message_cb;
+    std::function<void(SendspinConnection&, const char*, size_t, int64_t)> on_json_message_cb;
 
     /// @brief Callback invoked on the protocol task for each complete binary role message
-    /// @param conn Pointer to this connection.
+    /// @param conn This connection.
     /// @param message The decrypted message: `data` points at its type byte. The callback may keep
     /// the ring item by clearing `message.item` (see InboundMessage); anything else is valid only
     /// until it returns.
-    std::function<void(SendspinConnection*, InboundMessage&)> on_binary_message_cb;
+    std::function<void(SendspinConnection&, InboundMessage&)> on_binary_message_cb;
 
     /// @brief Callback invoked when the transport connection is ready for messaging
     /// @param conn Pointer to this connection.
@@ -868,10 +862,8 @@ protected:
     enum class InboundRoute : uint8_t {
         RECEIVE,  ///< Receive the bytes into InboundTarget::data, then end the message
         /// Read and discard the bytes; the connection stays open (a detached connection, or an
-        /// admitted one's message that found no ring item or fallback buffer in time). For a
-        /// message longer than the ring takes, on the ESP server, which must drain the frame into
-        /// a discard buffer sized to the ring's longest message, the connection closes instead:
-        /// every admitted fallback drop closes on ESP.
+        /// admitted one's message that found no ring item or fallback buffer in time; see
+        /// route_to_fallback() for the ESP server's exception).
         DROP,
         CLOSE,  ///< Close the connection: fail_inbound() has already run
     };
@@ -882,22 +874,9 @@ protected:
         InboundRoute route{InboundRoute::DROP};
     };
 
-    /// @brief Starts a complete single-frame WebSocket message of `len` bytes. Transport thread.
-    ///
-    /// An admitted connection receives straight into a ring item it acquires here, waiting up to
-    /// INBOUND_ACQUIRE_TIMEOUT_MS for room, and drops the message with a warning when there is
-    /// none; a message longer than INBOUND_MAX_MESSAGE_BYTES closes the connection, since no
-    /// conforming peer sends one (the Noise layer fragments), and one longer than the ring takes
-    /// (InboundRing::max_message_bytes()) goes through the fallback buffer, in order with the ring
-    /// items, waiting up to INBOUND_ACQUIRE_TIMEOUT_MS for the previous one to be consumed and
-    /// dropped with a warning after it (route_to_fallback(); on the ESP server, which must drain
-    /// the frame into a discard buffer sized to the ring's longest message, the connection closes
-    /// instead: every admitted fallback drop closes on ESP). An unadmitted connection receives
-    /// into its fallback buffer once the previous pre-admission message is consumed, waiting up
-    /// to InboundGate::WRITABLE_WAIT_MS; a message over InboundGate::PRE_ADMISSION_MESSAGE_BYTES,
-    /// a wait that times out, or a buffer that cannot be allocated closes the connection. A
-    /// detached or unattached connection drops everything. A message arriving while a multi-frame
-    /// message is being assembled closes the connection (RFC 6455 section 5.4).
+    /// @brief Starts a complete single-frame WebSocket message of `len` bytes, routed by
+    /// route_inbound_message(). Transport thread. A message arriving while a multi-frame message
+    /// is being assembled closes the connection (RFC 6455 section 5.4).
     /// @param len Message length in bytes.
     /// @param is_text Whether the message arrived in a text frame.
     /// @param receive_time_us platform_time_us() when the transport received it.
@@ -940,28 +919,27 @@ protected:
     /// thread that joined it.
     void abandon_inbound_message();
 
-    /// @brief Whether a multi-frame message is being dropped: its continuation bytes are read
-    /// and discarded. Transport thread.
-    bool is_dropping_fragments() const {
-        return this->fragment_dropping_;
-    }
-
-    /// @brief Chooses the destination for a complete message of `len` bytes, as
-    /// begin_inbound_message() describes, without touching the liveness stamp or the fallback
-    /// buffer's lifetime: including the DROP of an admitted fallback message, which on the ESP
-    /// server closes the connection instead. Transport thread.
+    /// @brief Chooses the destination for a complete message of `len` bytes. Transport thread.
+    ///
+    /// An admitted connection receives straight into a ring item it acquires here, waiting up to
+    /// INBOUND_ACQUIRE_TIMEOUT_MS for room, and drops the message with a warning when there is
+    /// none; a message longer than INBOUND_MAX_MESSAGE_BYTES closes the connection, since no
+    /// conforming peer sends one (the Noise layer fragments), and one longer than the ring takes
+    /// (InboundRing::max_message_bytes()) goes to route_to_fallback(), as does every message of
+    /// an unadmitted connection; one over InboundGate::PRE_ADMISSION_MESSAGE_BYTES closes it. A
+    /// detached or unattached connection drops everything.
     InboundTarget route_inbound_message(size_t len, InboundKind kind, uint32_t stamp);
 
-    /// @brief Routes a complete message of `len` bytes to the fallback buffer, once the protocol
-    /// task has consumed the previous one, allocating the buffer when it is shorter. Transport
-    /// thread.
+    /// @brief Routes a complete message of `len` bytes to the fallback buffer, in order with the
+    /// connection's ring items, once the protocol task has consumed the previous one, allocating
+    /// the buffer when it is shorter. Transport thread.
     ///
     /// An unadmitted connection waits up to InboundGate::WRITABLE_WAIT_MS and is closed when the
     /// wait times out (wait_until_writable()). An admitted connection's message, one longer than
     /// the ring takes, waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and is then
-    /// dropped with the same throttled warning, the connection left open; on the ESP server,
-    /// which must drain the frame into a discard buffer sized to the ring's longest message, the
-    /// connection closes instead: every admitted fallback drop closes on ESP.
+    /// dropped with the same throttled warning, the connection left open; except on the ESP
+    /// server, which must drain the frame into a discard buffer sized to the longest message the
+    /// ring takes, so every admitted fallback drop closes the connection there.
     /// @return RECEIVE into the buffer; DROP or CLOSE as above; an allocation failure closes.
     InboundTarget route_to_fallback(size_t len, InboundKind kind, uint32_t stamp, bool admitted);
 
@@ -1126,8 +1104,8 @@ protected:
     /// Tag of the client/time frame in flight: the low 32 bits of the client_transmitted it
     /// carries, never 0 for a frame, and 0 once the frame is claimed or cancelled. A failed send
     /// leaves its tag, which no reply can echo. 32 bits because a 64-bit atomic takes a lock on
-    /// the ESP32 family. Written on the protocol task (send, claim and cancel) and by the
-    /// transport thread's fail_inbound() (cancel); read on the protocol task.
+    /// the ESP32 family. Written on the protocol task (send, claim and cancel) and, to cancel, by
+    /// any thread detach_inbound() names; read on the protocol task.
     std::atomic<uint32_t> time_frame_tag_{0};
 
     /// Low 32 bits of the client clock when the frame in flight was handed to the socket, seeded
@@ -1196,7 +1174,8 @@ protected:
     /// the protocol task, hence atomic. See mark_ws_upgraded().
     std::atomic<bool> ws_upgraded_{false};
 
-    /// Throttles the ring-acquire drop warning in route_inbound_message(). Transport thread only.
+    /// Throttles the drop warnings in route_inbound_message() and route_to_fallback(). Transport
+    /// thread only.
     InboundDropLog acquire_drop_log_;
 
     /// The kind of the message in fallback_buf_ (TEXT or BINARY: a continuation frame does not

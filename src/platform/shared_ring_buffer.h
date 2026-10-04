@@ -20,13 +20,10 @@
 /// Each item is one contiguous blob. A producer reserves it with acquire(), fills it in place,
 /// and publishes it with complete(); several producers may hold acquired items at once. The
 /// consumer takes items in ring (acquire) order with take(), and an item acquired earlier but
-/// not yet completed holds back the items behind it, with one exception on ESP: right after the
-/// consumer passes the filler that marks a wrap, FreeRTOS hands out the item at the start of the
-/// storage once the filler is passed, whether or not that item's producer has completed it
-/// (prvCheckItemAvail() checks the filler's flag, prvGetItemDefault() then wraps unchecked). The
-/// host implementation refuses that item until it is completed. A consumer that must never read
-/// an uncompleted item checks is_storage_head() on what it takes and confirms completion itself
-/// (InboundRing does). Any thread may hand a taken item back with return_item(), in any order.
+/// not yet completed holds back the items behind it, with one exception on ESP: the item at the
+/// start of the storage can be handed out right after a wrap before its producer completed it
+/// (InboundRing explains and guards it through is_storage_head()). Any thread may hand a taken
+/// item back with return_item(), in any order.
 ///
 /// Reclamation is in ring order. Returning an item marks it free, but its space becomes
 /// available to acquire() only once every item ahead of it in the ring has been returned too. An
@@ -91,6 +88,7 @@ struct SharedRingLayout {
 
 #ifdef ESP_PLATFORM
 
+#include "platform/time.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/ringbuf.h>
 #include <freertos/semphr.h>
@@ -105,10 +103,10 @@ namespace sendspin {
  * section, so concurrent producers each get disjoint space and may complete in any order (the
  * write pointer advances only over completed items, prvSendItemDoneNoSplit());
  * xRingbufferReceive() checks the completed flag of the header at the read position
- * (prvCheckItemAvail()), which after a wrap is the filler's, not the item's (see the file
- * comment); and vRingbufferReturnItem() takes the same critical section and accepts items in any
- * order, advancing the free pointer only over a run of returned items starting at the oldest
- * (prvReturnItemDefault()), which is the ring-order reclamation the file comment describes.
+ * (prvCheckItemAvail()); and vRingbufferReturnItem() takes the same critical section and accepts
+ * items in any order, advancing the free pointer only over a run of returned items starting at
+ * the oldest (prvReturnItemDefault()), which is the ring-order reclamation the file comment
+ * describes.
  *
  * The out-of-order returns need ESP-IDF v5.5.2 or later: before it, prvReturnItemDefault()
  * (esp_ringbuf ringbuf.c) clears the ring's full flag on a return that frees nothing (a newer item
@@ -167,7 +165,7 @@ public:
     }
 
     /// @brief Whether `item` is the item placed at the very start of the storage, the one item
-    /// take() can hand out before its producer completed it (see the file comment)
+    /// take() can hand out before its producer completed it (see InboundRing)
     bool is_storage_head(const void* item) const {
         return item == this->storage_ + SharedRingLayout::ITEM_HEADER_BYTES;
     }
@@ -177,34 +175,15 @@ public:
         return this->handle_ != nullptr;
     }
 
-    /// @brief Largest item acquire() accepts
-    size_t max_item_size() const {
-        return this->handle_ == nullptr ? 0 : xRingbufferGetMaxItemSize(this->handle_);
-    }
-
-    /// @brief Completed items not yet taken. Any thread.
-    size_t items_waiting() const {
-        if (this->handle_ == nullptr) {
-            return 0;
-        }
-        UBaseType_t items = 0;
-        vRingbufferGetInfo(this->handle_, nullptr, nullptr, nullptr, nullptr, &items);
-        return static_cast<size_t>(items);
-    }
-
-    /// @brief Whether no completed item is waiting for the consumer. Any thread.
-    bool is_empty() const {
-        return this->items_waiting() == 0;
-    }
-
     /// @brief Reserves `size` contiguous bytes for one item. Any producer thread, concurrently
     /// with other producers, the consumer and returns.
     /// @param timeout_ms Milliseconds to wait for room: 0 does not wait, UINT32_MAX waits
-    ///        indefinitely. An item larger than max_item_size() fails at once.
+    ///        indefinitely. An item larger than SharedRingLayout::max_item_size() fails at once.
     /// @return The item's bytes, to be filled and passed to complete(), or nullptr.
     void* acquire(size_t size, uint32_t timeout_ms) {
         void* ptr = nullptr;
-        if (xRingbufferSendAcquire(this->handle_, &ptr, size, to_ticks(timeout_ms)) != pdTRUE) {
+        if (xRingbufferSendAcquire(this->handle_, &ptr, size, platform_ms_to_ticks(timeout_ms)) !=
+            pdTRUE) {
             return nullptr;
         }
         return ptr;
@@ -222,7 +201,7 @@ public:
     /// @param timeout_ms As take(). The wait may also end on a token an earlier completion left.
     void wait_for_completion(uint32_t timeout_ms) {
         if (timeout_ms != 0) {
-            xSemaphoreTake(this->items_or_wake_sem_, to_ticks(timeout_ms));
+            xSemaphoreTake(this->items_or_wake_sem_, platform_ms_to_ticks(timeout_ms));
         }
     }
 
@@ -245,7 +224,7 @@ public:
         if (item != nullptr || timeout_ms == 0) {
             return item;
         }
-        if (xSemaphoreTake(this->items_or_wake_sem_, to_ticks(timeout_ms)) != pdTRUE) {
+        if (xSemaphoreTake(this->items_or_wake_sem_, platform_ms_to_ticks(timeout_ms)) != pdTRUE) {
             return nullptr;
         }
         return xRingbufferReceive(this->handle_, item_size, 0);
@@ -264,19 +243,6 @@ public:
     }
 
 private:
-    /// @brief Converts a millisecond timeout to ticks: UINT32_MAX waits indefinitely, and any
-    /// other non-zero timeout waits at least one tick, so a wait shorter than a tick period
-    /// blocks rather than polling. pdMS_TO_TICKS() rounds down, and a one-tick wait ends at the
-    /// next tick interrupt, which can come almost at once, so a timeout here is not a minimum;
-    /// a caller that needs one adds a tick.
-    static TickType_t to_ticks(uint32_t timeout_ms) {
-        if (timeout_ms == UINT32_MAX) {
-            return portMAX_DELAY;
-        }
-        const TickType_t ticks = pdMS_TO_TICKS(timeout_ms);
-        return (timeout_ms != 0 && ticks == 0) ? 1 : ticks;
-    }
-
     // Struct fields
     StaticRingbuffer_t structure_;
 
@@ -356,34 +322,17 @@ public:
         return this->storage_;
     }
 
-    /// @brief Whether `item` is the item placed at the very start of the storage (see the file
-    /// comment; the host never hands it out uncompleted)
+    /// @brief Whether `item` is the item placed at the very start of the storage (see
+    /// InboundRing; the host never hands it out uncompleted)
     bool is_storage_head(const void* item) const {
         std::lock_guard<std::mutex> lock(this->mtx_);
         return item == this->storage_ + SharedRingLayout::ITEM_HEADER_BYTES;
     }
 
-    /// @brief Largest item acquire() accepts
-    size_t max_item_size() const {
-        std::lock_guard<std::mutex> lock(this->mtx_);
-        return this->max_item_size_;
-    }
-
-    /// @brief Completed items not yet taken. Any thread.
-    size_t items_waiting() const {
-        std::lock_guard<std::mutex> lock(this->mtx_);
-        return this->items_waiting_;
-    }
-
-    /// @brief Whether no completed item is waiting for the consumer. Any thread.
-    bool is_empty() const {
-        return this->items_waiting() == 0;
-    }
-
     /// @brief Reserves `size` contiguous bytes for one item. Any producer thread, concurrently
     /// with other producers, the consumer and returns.
     /// @param timeout_ms Milliseconds to wait for room: 0 does not wait, UINT32_MAX waits
-    ///        indefinitely. An item larger than max_item_size() fails at once.
+    ///        indefinitely. An item larger than SharedRingLayout::max_item_size() fails at once.
     /// @return The item's bytes, to be filled and passed to complete(), or nullptr.
     void* acquire(size_t size, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);

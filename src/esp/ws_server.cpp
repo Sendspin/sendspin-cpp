@@ -14,6 +14,7 @@
 
 #include "ws_server.h"
 
+#include "constants.h"
 #include "lwip/sockets.h"  // for close()
 #include "platform/compiler.h"
 #include "platform/logging.h"
@@ -199,11 +200,7 @@ uint32_t SendspinWsServer::tick() {
                 static_cast<int>(WS_UPGRADE_TIMEOUT_US / (1000 * 1000)));
         conn->trigger_close();
     }
-    if (next_due_us == INT64_MAX) {
-        return UINT32_MAX;
-    }
-    // Rounded up so the wake is never early; at most WS_UPGRADE_TIMEOUT_US away.
-    return static_cast<uint32_t>((next_due_us - now_us + 999) / 1000);
+    return next_due_us == INT64_MAX ? UINT32_MAX : ms_until(next_due_us, now_us);
 }
 
 void SendspinWsServer::deliver_upgraded(int sockfd) {

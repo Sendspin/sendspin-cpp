@@ -122,19 +122,11 @@ void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& sta
 }
 
 void ControllerRole::Impl::drain_events() {
-    // Taken before the catch-up: whatever the slot held, a teardown that ran before the take is
-    // caught up below and drops a payload stamped before it, and one that runs after the take is
-    // caught up by the next drain, behind the state applied here.
     ServerStateControllerObject state;
-    uint32_t stamp = 0;
-    const bool taken = this->event_state->slot.take(state, stamp);
-    catch_up_teardown(*this, this->cleanup_generation.load(std::memory_order_acquire));
-    if (!taken) {
-        return;
-    }
-    // Also false once the clear callback above re-entered teardown (a listener calling stop()).
-    if (!this->accepts(stamp)) {
-        SS_LOGD(TAG, "Dropping controller state queued before the role was torn down");
+    bool have_state = false;
+    const uint32_t generation = take_current_payload(*this, this->event_state->slot, state,
+                                                     have_state, TAG, "controller state");
+    if (!have_state || !this->accepts(generation)) {
         return;
     }
     this->controller_state = std::move(state);
@@ -142,7 +134,8 @@ void ControllerRole::Impl::drain_events() {
     for (const auto command : this->controller_state.supported_commands) {
         mask |= command_bit(command);
     }
-    this->supported_commands.store(pack_supported_commands(stamp, mask), std::memory_order_release);
+    this->supported_commands.store(pack_supported_commands(generation, mask),
+                                   std::memory_order_release);
     if (this->listener) {
         this->listener->on_controller_state(this->controller_state);
     }

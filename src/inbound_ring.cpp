@@ -19,6 +19,8 @@
 #include "platform/time.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstring>
 #include <mutex>
 #include <utility>
 
@@ -27,10 +29,22 @@ namespace sendspin {
 static const char* const TAG = "sendspin.inbound";
 
 // ============================================================================
+// InboundDropLog
+// ============================================================================
+
+void InboundDropLog::end_run(const char* tag, const char* what) {
+    if (this->dropped_ != 0) {
+        SS_LOGW(tag, "Dropped %" PRIu32 " %s", this->dropped_, what);
+        this->dropped_ = 0;
+    }
+}
+
+// ============================================================================
 // InboundRing
 // ============================================================================
 
-bool InboundRing::create(size_t storage_bytes, MemoryLocation location) {
+bool InboundRing::create(size_t storage_bytes, MemoryLocation location,
+                         size_t largest_message_bytes) {
     if (!this->storage_.allocate(storage_bytes, location)) {
         SS_LOGE(TAG, "Failed to allocate %zu bytes for the inbound ring", storage_bytes);
         return false;
@@ -45,6 +59,7 @@ bool InboundRing::create(size_t storage_bytes, MemoryLocation location) {
         max_item > sizeof(InboundItemHeader)
             ? std::min(max_item - sizeof(InboundItemHeader), INBOUND_MAX_MESSAGE_BYTES)
             : 0;
+    this->largest_message_bytes_ = std::min(largest_message_bytes, this->max_message_bytes_);
     return true;
 }
 
@@ -174,9 +189,11 @@ void* InboundRing::take_pending(size_t* message_len, uint32_t timeout_ms) {
     return item;
 }
 
-bool InboundRing::charge(void* item, size_t message_len, InboundHolder holder) {
-    const size_t stored = SharedRingLayout::stored_size(sizeof(InboundItemHeader) + message_len);
-    if (!this->quota(holder).try_charge(stored)) {
+bool InboundRing::charge(void* item, size_t message_len, InboundHolder holder, bool exempt) {
+    // An exempt item still records its holder: its LOCAL returns are counted under that holder's
+    // list mutex. 0 is "uncharged" to return_item().
+    const size_t stored = exempt ? 0 : inbound_item_stored_bytes(message_len);
+    if (stored != 0 && !this->quota(holder).try_charge(stored)) {
         return false;
     }
     InboundItemHeader* header = inbound_item_header(item);
@@ -325,6 +342,95 @@ void* InboundItemList::pop() {
         this->tail_ = INBOUND_LIST_END;
     }
     return item;
+}
+
+// ============================================================================
+// InboundConsumer
+// ============================================================================
+
+bool InboundConsumer::bind(InboundRing* ring, InboundHolder holder) {
+    // Bound before the consumer thread and before the protocol task can hand anything over: the
+    // list links items by their offset in this run's ring storage.
+    if (!this->items_.create(ring, holder)) {
+        return false;
+    }
+    this->holder_ = holder;
+    this->ring_.store(ring, std::memory_order_release);
+    return true;
+}
+
+void InboundConsumer::unbind() {
+    // The consumer is joined and returned the item it held, so everything left on the list goes
+    // back to the ring and a restart replays nothing. Unbound until the next bind(): the ring is
+    // this run's, and the list must not stay registered with it.
+    this->items_.recall();
+    this->items_.unbind();
+    this->ring_.store(nullptr, std::memory_order_release);
+}
+
+void* InboundConsumer::take(uint32_t timeout_ms, const std::atomic<uint32_t>& generation) {
+    void* item = this->items_.take(timeout_ms);
+    while (item != nullptr &&
+           inbound_item_header(item)->generation != generation.load(std::memory_order_acquire)) {
+        // Handed over for a stream a teardown has since ended; the protocol task recalls such
+        // items on its next tick, and this catches one taken first.
+        this->return_item(item);
+        item = this->items_.take(0);
+    }
+    return item;
+}
+
+void* InboundConsumer::copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
+                                  uint32_t timeout_ms) {
+    InboundRing* ring = this->ring();
+    void* item = ring->acquire_local(len, timeout_ms);
+    if (item == nullptr) {
+        return nullptr;
+    }
+    if (len > 0) {
+        std::memcpy(inbound_item_bytes(item), data, len);
+    }
+    inbound_item_header(item)->receive_time_us = receive_time_us;
+    ring->complete(item);
+    return item;
+}
+
+bool InboundConsumer::hand(void* item, size_t item_len, uint32_t generation, bool exempt) {
+    InboundRing* ring = this->ring();
+    inbound_item_header(item)->generation = generation;
+    this->recall_stale(generation);
+    if (!ring->charge(item, item_len, this->holder_, exempt)) {
+        // Throttled: see InboundDropLog.
+        this->note_drop("over its buffer; dropping items until it drains");
+        ring->return_item(item);
+        return false;
+    }
+    this->items_.append(item);
+    this->drop_log_.end_run(TAG, this->dropped_items_name());
+    return true;
+}
+
+void InboundConsumer::recall_stale(uint32_t generation) {
+    if (generation == this->recalled_generation_ || this->ring() == nullptr) {
+        return;
+    }
+    // Every item on the list was handed over under an earlier generation: hand() under
+    // `generation` runs this first, so none of its items can be here yet.
+    this->recalled_generation_ = generation;
+    this->items_.recall();
+    // The stream the drops belonged to is gone, so no delivery will end their run.
+    this->drop_log_.end_run(TAG, this->dropped_items_name());
+}
+
+const char* InboundConsumer::dropped_items_name() const {
+    return this->holder_ == InboundHolder::PLAYER ? "player items" : "visualizer items";
+}
+
+void InboundConsumer::note_drop(const char* message) {
+    if (this->drop_log_.note_drop()) {
+        SS_LOGW(TAG, "%s %s", this->holder_ == InboundHolder::PLAYER ? "Player" : "Visualizer",
+                message);
+    }
 }
 
 }  // namespace sendspin

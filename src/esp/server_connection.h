@@ -119,12 +119,6 @@ public:
     /// Only the first call queues a close; later ones return (see close_triggered_).
     void trigger_close();
 
-    /// @brief Gets the socket file descriptor
-    /// @return The socket fd, or -1 if not connected.
-    int get_sockfd() const override {
-        return this->sockfd_;
-    }
-
     /// @brief Receives one WebSocket frame and hands it to the protocol task: a single-frame
     /// message straight into its ring item (or, before admission, the fallback buffer), a frame of
     /// a multi-frame message into the fallback buffer it is assembled in. On the httpd task.

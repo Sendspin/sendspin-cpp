@@ -479,7 +479,7 @@ TEST(NoiseTransport, ReceiveEncryptedBinary_JsonDispatch) {
 
     // Wire up a JSON dispatch callback
     std::string dispatched_json;
-    conn.on_json_message_cb = [&dispatched_json](SendspinConnection* /*c*/, const char* data,
+    conn.on_json_message_cb = [&dispatched_json](SendspinConnection& /*c*/, const char* data,
                                                   size_t len, int64_t /*ts*/) {
         dispatched_json = std::string(data, len);
     };
@@ -806,12 +806,12 @@ class FragmentReceiver {
 public:
     explicit FragmentReceiver(LoopbackResult& r) : server_send_(r.initiator.send_cs) {
         this->conn_.set_noise_session(std::move(r.responder_session));
-        this->conn_.on_json_message_cb = [this](SendspinConnection* /*c*/, const char* d, size_t n,
+        this->conn_.on_json_message_cb = [this](SendspinConnection& /*c*/, const char* d, size_t n,
                                                 int64_t /*t*/) {
             ++this->json_dispatched_;
             this->last_message_.assign(d, d + n);
         };
-        this->conn_.on_binary_message_cb = [this](SendspinConnection* /*c*/,
+        this->conn_.on_binary_message_cb = [this](SendspinConnection& /*c*/,
                                                   InboundMessage& message) {
             ++this->binary_dispatched_;
             this->last_message_.assign(message.data, message.data + message.len);
@@ -1267,7 +1267,7 @@ static void run_fragment_reassemble_receive(const std::string& suite) {
 
     std::string received;
     int calls = 0;
-    conn.on_json_message_cb = [&received, &calls](SendspinConnection* /*c*/, const char* d,
+    conn.on_json_message_cb = [&received, &calls](SendspinConnection& /*c*/, const char* d,
                                                   size_t n, int64_t /*t*/) {
         received.assign(d, n);
         ++calls;
@@ -1313,9 +1313,9 @@ TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     conn.set_noise_session(std::move(r->responder_session));
 
     int calls = 0;
-    conn.on_json_message_cb = [&calls](SendspinConnection* /*c*/, const char* /*d*/, size_t /*n*/,
+    conn.on_json_message_cb = [&calls](SendspinConnection& /*c*/, const char* /*d*/, size_t /*n*/,
                                        int64_t /*t*/) { ++calls; };
-    conn.on_binary_message_cb = [&calls](SendspinConnection* /*c*/,
+    conn.on_binary_message_cb = [&calls](SendspinConnection& /*c*/,
                                          InboundMessage& /*message*/) { ++calls; };
 
     std::string json = "{\"x\":1}";
@@ -1347,7 +1347,7 @@ TEST(NoiseTransport, CleartextFrameInTransportModeClosesSilently) {
     TestConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
     int calls = 0;
-    conn.on_json_message_cb = [&calls](SendspinConnection* /*c*/, const char* /*d*/, size_t /*n*/,
+    conn.on_json_message_cb = [&calls](SendspinConnection& /*c*/, const char* /*d*/, size_t /*n*/,
                                        int64_t /*t*/) { ++calls; };
 
     conn.inject_text_payload(R"({"type":"server/state","payload":{}})");
@@ -1958,7 +1958,8 @@ TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
         const std::vector<uint8_t> second(len, 0x0A);
 
         ASSERT_EQ(h.receive(first), TestConnection::InboundRoute::RECEIVE);
-        EXPECT_EQ(h.ring.items_waiting(), 0U) << "the message was written into the ring";
+        size_t taken_len = 0;
+        EXPECT_EQ(h.ring.take(&taken_len, 0), nullptr) << "the message was written into the ring";
         EXPECT_FALSE(h.conn.inbound_gate().may_write()) << "the first message is in flight";
 
         InboundMessage pending;

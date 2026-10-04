@@ -91,7 +91,7 @@ std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int64_t ar
                                                    int32_t display_offset_ms, int64_t now);
 
 /// @brief Private implementation of the visualizer role
-struct VisualizerRole::Impl {
+struct VisualizerRole::Impl : RoleTeardown {
     explicit Impl(VisualizerRoleConfig config, SendspinClient* client);
     ~Impl();
 
@@ -99,18 +99,12 @@ struct VisualizerRole::Impl {
     // Nested types
     // ========================================
 
-    /// @brief Persistent drain thread context and the item list the protocol task hands it frames
-    /// through
+    /// @brief Persistent drain thread context and the visualizer's end of the inbound ring,
+    /// through which the protocol task hands it frames and clear markers
     struct DrainTask {
-        /// Frames and clear markers: appended on the protocol task, taken on the drain thread,
-        /// recalled on the protocol task or, once the thread is joined, on the main loop. Links
-        /// shared inbound ring items; no storage of its own.
-        InboundItemList items;
+        InboundConsumer inbound;  ///< InboundConsumer states its threads.
         EventFlags event_flags;
         std::thread drain_thread;
-        /// The ring the list is bound to for the current run, or nullptr outside one. Written by
-        /// start() and stop() on the main loop; read by the protocol task and the drain thread.
-        std::atomic<InboundRing*> ring{nullptr};
     };
 
     /// @brief Deferred event state for the visualizer stream config, delivered to the main thread
@@ -156,15 +150,6 @@ struct VisualizerRole::Impl {
     /// stream events carry everything the listener hears. Main loop only, through
     /// catch_up_teardown().
     void complete_teardown() const;
-    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
-    ///
-    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
-    /// runs, and stop()'s teardown on the main loop can land in between. Re-checking at each point
-    /// of effect invalidates the whole handler instead of only the part that ran before it.
-    /// @param generation The counter value captured when the message was admitted.
-    bool accepts(uint32_t generation) const {
-        return generation == this->cleanup_generation.load(std::memory_order_acquire);
-    }
 
     /// @brief Stops the role and discards its state. Protocol task, or the main loop in
     /// SendspinClient::stop() once every other thread is joined.
@@ -185,12 +170,8 @@ struct VisualizerRole::Impl {
     bool signal_stop() const;
     /// @brief Joins the drain thread and returns every frame it had not taken to the ring
     void stop() const;
-    /// @brief Takes the next item from the drain list, returning to the ring any whose teardown
-    /// generation the role has moved past (it was appended for a stream a teardown ended; the
-    /// protocol task recalls such items on its next tick, and this catches one taken first).
-    /// Drain thread.
-    /// @param timeout_ms As InboundItemList::take(), applied to the first take only.
-    /// @return The item, or nullptr: treat it as "re-check the commands and retry".
+    /// @brief Takes the next item of the role's current teardown generation
+    /// (InboundConsumer::take()). Drain thread.
     void* take_item(uint32_t timeout_ms) const;
     /// @brief Returns every frame on the list to the ring. Drain thread, or the main loop once it
     /// is joined.
@@ -199,12 +180,11 @@ struct VisualizerRole::Impl {
     void signal_clear_marker(uint32_t generation);
     /// @brief Drain-thread side: returns frames up to and including the marker
     void discard_to_clear_marker() const;
-    /// @brief Recalls the frames the drain thread has not taken once a teardown has moved the
-    /// generation past the one they were appended under. Protocol task only: each tick, and
-    /// before each item it hands over.
+    /// @brief InboundConsumer::recall_stale() on the drain thread's list. Protocol task, each
+    /// tick.
     void recall_stale_items(uint32_t generation);
-    /// @brief Fills an item's consumer fields and hands it to the drain thread, returning it to
-    /// the ring with a warning when the visualizer is over quota. Protocol task only.
+    /// @brief Fills an item's consumer fields and hands it to the drain thread
+    /// (InboundConsumer::hand()). Protocol task only.
     bool hand_item(void* item, size_t item_len, uint8_t type, uint32_t data_len,
                    uint32_t generation);
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
@@ -228,27 +208,7 @@ struct VisualizerRole::Impl {
     Inbox* inbox{nullptr};
     VisualizerRoleListener* listener{nullptr};
 
-    TeardownTracker teardown;  ///< Main loop only.
-
-    /// Throttles the over-quota drop warning in hand_item(). Protocol task only.
-    InboundDropLog over_quota_log;
-    /// Throttles the warning for a frame that could not be copied into a ring item. Protocol task
-    /// only.
-    InboundDropLog copy_drop_log;
-
-    // 32-bit fields
-    /// The teardown generation the item list was last recalled for (recall_stale_items()).
-    /// Protocol task only.
-    uint32_t recalled_generation{0};
-
-    // Atomic fields (written by the protocol task, read by drain thread / cleanup)
-    /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event, config
-    /// payload and handed-over item queued afterwards. At the drain an event whose stamp no longer
-    /// matches is discarded, so it cannot act after the teardown (see event_is_current() in
-    /// inbox.h). Written on the protocol task (or the main loop in stop() once it is joined);
-    /// read on the main loop, the drain thread and the protocol task.
-    std::atomic<uint32_t> cleanup_generation{0};
-
+    // Atomic fields
     /// The negotiated stream's spectrum shape. Written by handle_stream_start() on the protocol
     /// task; read on the drain thread.
     std::atomic<uint8_t> spectrum_bin_count{0};

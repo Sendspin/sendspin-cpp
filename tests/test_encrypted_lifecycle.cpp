@@ -523,8 +523,9 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
 // server out of band (a pairing token; see crypto/pairing_token.h), so the server's initial
 // handshake resolves it directly to PskCategory::PAIRING (spec: "pairing.method MUST be
 // 'pairing_psk' if and only if the matched PSK IS the Pairing PSK". The client enforces this via
-// ConnectionManager::loop()'s pairing-method admissibility check, so a fake server that selected
-// pairing_psk over a Sentinel-matched connection is correctly rejected as method_not_supported).
+// ConnectionManager::on_server_activate()'s pairing-method admissibility check, so a fake server
+// that selected pairing_psk over a Sentinel-matched connection is correctly rejected as
+// method_not_supported).
 // The client generates a fresh long-term PSK client-side (CSPRNG) and sends it via
 // client/pair-finalize, the server acks, the client persists the record, and then, exactly like a
 // real server immediately rekeying onto the new PSK, the fake server triggers an in-band
@@ -614,9 +615,9 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     EXPECT_EQ(committed_at_success->psk_id, server.learned_psk_id().value());
 
     // The application must see the exchange begin before it sees it end. The ordering is
-    // structural (ConnectionManager::loop() swaps pending events out before draining lifecycle
-    // events, and SendspinClient::loop() drains the whole note batch each tick), so pin it here
-    // to catch a future reordering of either drain.
+    // structural (the protocol task queues the notes in the order the exchange runs, and
+    // SendspinClient::loop() drains the whole note batch each tick), so pin it here to catch a
+    // future reordering of either.
     ASSERT_TRUE(listener.pairing_started_seq().has_value());
     ASSERT_TRUE(listener.pairing_succeeded_seq().has_value());
     EXPECT_LT(listener.pairing_started_seq().value(), listener.pairing_succeeded_seq().value())
@@ -1877,7 +1878,7 @@ public:
         // the stamp, so do it here rather than stubbing the tick out.
         conn.last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                          std::memory_order_relaxed);
-        this->client_storage->process_json_message(&conn, json.data(), json.size(),
+        this->client_storage->process_json_message(conn, json.data(), json.size(),
                                                    platform_time_us());
     }
 
@@ -1929,7 +1930,9 @@ public:
 // any peer on the network can reach handshake-complete and sit in the nursery; whether its PSK
 // category may drive playback is decided by admission when server/activate arrives. Without the
 // gate, a peer could drive the roles by sending traffic ahead of server/activate, or never
-// sending one, for the whole nursery establish window.
+// sending one, for the whole nursery establish window. Control: the role traffic the server
+// sends right behind the activation that admits the connection is applied (a controller state,
+// so it cannot coalesce with the refused metadata and hide it).
 TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     SendspinClientConfig config;
     config.name = "Pre-Admission Role Traffic Test Client";
@@ -1948,6 +1951,14 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     };
     RecordingMetadataListener metadata_listener;
     client.add_metadata().set_listener(&metadata_listener);
+    struct RecordingControllerListener : ControllerRoleListener {
+        std::optional<uint8_t> volume;
+        void on_controller_state(const ServerStateControllerObject& state) override {
+            this->volume = state.volume;
+        }
+    };
+    RecordingControllerListener controller_listener;
+    client.add_controller().set_listener(&controller_listener);
 
     ASSERT_TRUE(bundle.start());
 
@@ -1957,12 +1968,18 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     // it while the connection is handshake-complete but still unadmitted.
     options.pre_activate_message =
         R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Pre-Admission Leak"}}})";
+    options.post_activate_message =
+        R"({"type":"server/state","payload":{"controller":{"supported_commands":[],"volume":37,)"
+        R"("muted":false}}})";
     FakeEncryptedServer server(server_url(PREADMISSION_ROLE_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                bundle.peer.record.psk_id, bundle.peer.psk, options);
 
-    pump_until(client, [&] { return client.is_connected(); });
-
+    // The state behind the activate arrives with no client message in between; a gate that
+    // dropped it leaves this waiting for the suite watchdog to name.
+    pump_until(client, [&] { return controller_listener.volume.has_value(); });
+    EXPECT_EQ(controller_listener.volume.value_or(0), 37);
+    pump_for(client, 20);
     // The pre-activate server/state must have been dropped on the floor.
     EXPECT_EQ(metadata_listener.updates, 0)
         << "Role traffic from an unadmitted connection reached the metadata role (last_title='"
@@ -2008,7 +2025,7 @@ TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
     HoldTestConnection unsolicited;
 
     auto deliver = [&client](SendspinConnection& conn, const std::string& json) {
-        client.process_json_message(&conn, json.data(), json.size(), platform_time_us());
+        client.process_json_message(conn, json.data(), json.size(), platform_time_us());
     };
     auto time_reply = [](int64_t echo) {
         return R"({"type":"server/time","payload":{"client_transmitted":)" +
@@ -2962,7 +2979,7 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
     const std::string playing = R"({"type":"group/update","payload":{"playback_state":"playing"}})";
     conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                       std::memory_order_relaxed);
-    client.process_json_message(conn.get(), playing.data(), playing.size(), platform_time_us());
+    client.process_json_message(*conn, playing.data(), playing.size(), platform_time_us());
     // Two ticks: a write requested by the group drain would land on the tick after it.
     tick(client);
     tick(client);

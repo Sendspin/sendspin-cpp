@@ -326,9 +326,10 @@ esp_err_t SendspinServerConnection::discard_frame_payload(httpd_req_t* req,
     }
     // httpd hands a frame's payload over only whole (httpd_ws_recv_frame() needs max_len >= the
     // frame length, httpd_ws.c), so a dropped message still needs room for its frame. The buffer
-    // holds the longest message a live connection drops: a ring item's, or a pre-admission
-    // message's. A longer frame is dropped only by a detached connection that is being torn down,
-    // or by an admitted one whose fallback buffer stayed full; it is closed instead.
+    // holds the longest message a conforming server sends a live connection (see
+    // SendspinWsServer::set_discard_capacity()). A longer frame (a detached connection's being
+    // torn down, an admitted one's that found its fallback buffer still full, or a ring drop of
+    // a message no enabled role needs) closes the connection instead.
     if (server == nullptr || ws_pkt.len > server->discard_capacity()) {
         SS_LOGW(TAG, "No room to drain a dropped %zu-byte frame; closing", ws_pkt.len);
         return ESP_FAIL;

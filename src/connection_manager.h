@@ -101,12 +101,6 @@ bool liveness_expired(int64_t now_us, uint32_t last_receive_us, int64_t timeout_
 /// @param timeout_us Liveness timeout in microseconds, positive.
 int64_t liveness_remaining_us(int64_t now_us, uint32_t last_receive_us, int64_t timeout_us);
 
-/// @brief Converts a deadline into the milliseconds a protocol-task wait may last, rounded up so
-/// the wake is never early; 0 when the deadline has passed.
-/// @param due_us The deadline, on the platform_time_us() clock.
-/// @param now_us The current time on the same clock.
-uint32_t ms_until(int64_t due_us, int64_t now_us);
-
 /// @brief Bound (milliseconds, per goodbye) on waiting for the shutdown goodbyes to be sent before
 /// the transports are torn down
 ///
@@ -256,6 +250,10 @@ struct PairingUiSnapshot {
     bool window_was_shown;
 };
 
+/// @brief Captures `conn`'s pairing-UI display flags, before any pairing-state cleanup (see
+/// PairingUiSnapshot). Protocol task, or the main loop once it is joined.
+PairingUiSnapshot snapshot_pairing_ui(SendspinConnection* conn);
+
 /**
  * @brief Manages WebSocket connection lifecycle.
  *
@@ -390,7 +388,7 @@ public:
     /// @brief Returns the time filter of the primary admitted connection (see primary()), or
     /// nullptr when none is admitted. Any thread.
     ///
-    /// Reads a slot of its own behind the leaf time_filter_mutex_, so a role thread converting
+    /// Reads published_ behind the leaf published_mutex_, so a role thread converting
     /// timestamps (the sync task per chunk, the visualizer drain per frame) never waits on the
     /// protocol task. Hands out the filter, never the connection: a connection's destructor can
     /// join its transport thread, which must not happen on a role thread, while the filter's last
@@ -399,7 +397,7 @@ public:
 
     /// @brief Returns a copy of the primary admitted connection's server information, or nullopt
     /// when none is admitted. Any thread: reads a slot written at admission and cleared on the
-    /// drop, behind the leaf server_info_mutex_.
+    /// drop, behind the leaf published_mutex_.
     std::optional<ServerInformationObject> server_information() const;
 
     // ========================================
@@ -448,8 +446,12 @@ public:
     /// (SendspinClient::send_text()).
     void send_role_text(SendspinRole role, const std::string& text) const;
 
-    /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window()).
-    void confirm_pairing_window();
+    /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window(), the operator
+    /// gesture). If an attempt is already waiting in AWAIT_PAIRING_WINDOW, the window admits it
+    /// immediately; otherwise it stands open for WINDOW_LIFETIME_US (5 minutes) awaiting a
+    /// pairing activate. The gesture is also the deliberate operator action that clears a
+    /// standing round limit (pairing.md "Rounds").
+    void open_pairing_window();
 
     /// @brief Closes the pairing window (SendspinClient::cancel_pairing_window()).
     void cancel_pairing_window();
@@ -552,11 +554,16 @@ public:
     /// @brief Waits, bounded, for the goodbyes refuse_accept() issued since the last wait.
     void flush_shutdown_goodbyes();
 
+    /// @brief Goodbyes `conn` with reason shutdown, counted in the bounded wait
+    /// flush_shutdown_goodbyes() makes, and keeps it for finish_stop() to close. Its gate must
+    /// be detached.
+    void goodbye_for_shutdown(std::shared_ptr<SendspinConnection> conn);
+
     // ========================================
     // Protocol task: role ownership
     // ========================================
 
-    /// @brief The admitted entry holding `conn`, or nullptr.
+    /// @brief The admitted entry holding `conn` (not null), or nullptr.
     AdmittedEntry* find_admitted(const SendspinConnection* conn);
 
     /// @brief Whether `conn` is admitted and owns `role`, the gate every role dispatch, the role
@@ -644,6 +651,12 @@ private:
     /// @brief Installs `conn` in a free admitted slot as the owner of `owned_roles`, marks it
     /// admitted, and refreshes the published slots. The slot must be free.
     void install_admitted(std::shared_ptr<SendspinConnection> conn, uint16_t owned_roles);
+
+    /// @brief Takes the connection out of an occupied admitted slot: detaches its inbound gate,
+    /// clears its admitted flag and time burst, releases the high-performance request its burst
+    /// held, and frees the slot. The caller refreshes the published slots and releases the
+    /// connection it returns.
+    std::shared_ptr<SendspinConnection> vacate_admitted(AdmittedEntry& entry);
 
     /// @brief Releases a nursery entry: erases it, then goodbyes and drops the connection.
     /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
@@ -859,12 +872,6 @@ private:
     /// lifetime).
     [[nodiscard]] bool pairing_window_open() const;
 
-    /// @brief Open the pairing window (operator gesture). If an attempt is already waiting in
-    /// AWAIT_PAIRING_WINDOW, the window admits it immediately; otherwise it stands open for
-    /// WINDOW_LIFETIME_US (5 minutes) awaiting a pairing activate. The gesture is also the
-    /// deliberate operator action that clears a standing round limit (pairing.md "Rounds").
-    void open_pairing_window();
-
     /// @brief Whether the dynamic-pairing-code round limit currently holds attempts back:
     /// PAIRING_ROUND_LIMIT rounds have run since the last verified server_kc
     /// (pairing.md "Rounds").
@@ -970,18 +977,17 @@ private:
     /// read from any thread.
     std::atomic<bool> connected_{false};
 
-    /// Guards time_filter_. A leaf (docs/conventions.md): held only to copy the pointer.
-    mutable std::mutex time_filter_mutex_;
-    /// The primary admitted connection's time filter. Written by the protocol task
-    /// (refresh_published_state()), read by role threads and the main loop.
-    std::shared_ptr<SendspinTimeFilter> time_filter_;
-
-    /// Guards server_information_. A leaf (docs/conventions.md): held only to copy the value.
-    mutable std::mutex server_info_mutex_;
-    /// The primary admitted connection's server information. Written by the protocol task
-    /// (refresh_published_state()), read from any thread
-    /// (SendspinClient::get_server_information()).
-    std::optional<ServerInformationObject> server_information_;
+    /// @brief What other threads read of the primary admitted connection, written together
+    struct PublishedPrimary {
+        std::shared_ptr<SendspinTimeFilter> time_filter;
+        std::optional<ServerInformationObject> server_information;
+    };
+    /// Guards published_. A leaf (docs/conventions.md): held only to copy or swap a member, so it
+    /// also serialises the role threads' time_filter() reads behind server_information() copies.
+    mutable std::mutex published_mutex_;
+    /// Written by the protocol task (refresh_published_state()); read from any thread
+    /// (time_filter(), server_information()): role threads, the main loop, the consumer.
+    PublishedPrimary published_;
 };
 
 }  // namespace sendspin

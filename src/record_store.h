@@ -207,9 +207,9 @@ public:
     /// @brief Erase the long-term record identified by psk_id from RAM, leaving the durable half
     /// (emptying its slot and rewriting the order) to a later persist_records(). No-op if absent.
     ///
-    /// For a revocation that must take effect before the caller's own lock is dropped: this takes
-    /// only mutex_, the innermost lock, so a protocol-task resolve_by_psk_id() misses the record
-    /// from here on even though the slot is emptied later.
+    /// For a revocation that must take effect at once: this takes only mutex_, a leaf lock, so a
+    /// protocol-task resolve_by_psk_id() misses the record from here on even though the slot is
+    /// emptied later.
     /// @param psk_id The record to erase.
     /// @return true when a record was erased, and the store therefore needs persisting.
     [[nodiscard]] bool note_record_removed(const std::string& psk_id);
@@ -224,9 +224,9 @@ public:
     /// persistence_keys::RECORD_ORDER, so recency survives a reboot at the cost of that one small
     /// write.
     ///
-    /// For a move that must take effect before the caller's own lock is dropped: this takes only
-    /// mutex_, the innermost lock, so a protocol-task eviction sees the new order from here on
-    /// even though the order blob is written later.
+    /// For a move that must take effect at once: this takes only mutex_, a leaf lock, so a
+    /// protocol-task eviction sees the new order from here on even though the order blob is
+    /// written later.
     /// @param psk_id The record to move.
     /// @return true when the order moved, and the store therefore needs persisting.
     [[nodiscard]] bool note_record_played(const std::string& psk_id);

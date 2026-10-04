@@ -23,6 +23,7 @@
 #ifdef ESP_PLATFORM
 
 // ESP-IDF: thin wrapper around FreeRTOS event group (uses direct task notifications)
+#include "platform/time.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 
@@ -115,24 +116,10 @@ public:
     /// @return The bit pattern at the time the wait completed or timed out.
     uint32_t wait(uint32_t bits_to_wait, bool wait_all, bool clear_on_exit, uint32_t timeout_ms) {
         return xEventGroupWaitBits(this->handle_, bits_to_wait, clear_on_exit ? pdTRUE : pdFALSE,
-                                   wait_all ? pdTRUE : pdFALSE, to_ticks(timeout_ms));
+                                   wait_all ? pdTRUE : pdFALSE, platform_ms_to_ticks(timeout_ms));
     }
 
 private:
-    /// @brief Converts a millisecond timeout to ticks: UINT32_MAX waits indefinitely, and any
-    /// other non-zero timeout waits at least one tick, so a wait shorter than a tick period
-    /// blocks rather than returning at once (the host arm waits the requested time either way).
-    /// pdMS_TO_TICKS() rounds down, and a one-tick wait ends at the next tick interrupt, which
-    /// can come almost at once, so a timeout here is not a minimum; a caller that needs one adds
-    /// a tick.
-    static TickType_t to_ticks(uint32_t timeout_ms) {
-        if (timeout_ms == UINT32_MAX) {
-            return portMAX_DELAY;
-        }
-        const TickType_t ticks = pdMS_TO_TICKS(timeout_ms);
-        return (timeout_ms != 0 && ticks == 0) ? 1 : ticks;
-    }
-
     /// The bits a FreeRTOS event group exposes: 24 with 32-bit ticks, 8 with 16-bit ticks. The
     /// upper bits are reserved by the kernel and must never be passed to the clear/set calls.
 #if configUSE_16_BIT_TICKS == 1

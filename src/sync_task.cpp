@@ -118,13 +118,10 @@ bool SyncTask::start(InboundRing* ring, bool task_stack_in_psram, unsigned prior
         return false;
     }
 
-    // Bound before the thread and before the protocol task can hand anything over: the list
-    // links items by their offset in this run's ring storage.
-    if (!this->encoded_items_.create(ring, InboundHolder::PLAYER)) {
+    if (!this->inbound_.bind(ring, InboundHolder::PLAYER)) {
         SS_LOGE(TAG, "Couldn't create the encoded item list");
         return false;
     }
-    this->ring_.store(ring, std::memory_order_release);
 
     // A fresh thread starts from a clean group: no stale task state and no command signalled
     // between the previous join and this start (cleanup() on a stopped task).
@@ -158,7 +155,7 @@ void SyncTask::signal_stream_end(uint16_t ordinal) {
     // wake an idle task would only notice at its next idle-receive timeout.
     this->ended_ordinal_.store(ordinal, std::memory_order_release);
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_END);
-    this->encoded_items_.wake_receiver();
+    this->inbound_.items().wake_receiver();
 }
 
 void SyncTask::signal_stream_clear() {
@@ -166,7 +163,7 @@ void SyncTask::signal_stream_clear() {
         return;
     }
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_CLEAR);
-    this->encoded_items_.wake_receiver();
+    this->inbound_.items().wake_receiver();
 }
 
 void SyncTask::signal_stream_start(uint16_t ordinal) {
@@ -179,7 +176,7 @@ void SyncTask::signal_stream_start(uint16_t ordinal) {
     // as stale and returns to idle (see wait_for_codec_header()).
     this->started_ordinal_.store(ordinal, std::memory_order_release);
     this->event_flags_.set(EventGroupBits::COMMAND_START);
-    this->encoded_items_.wake_receiver();
+    this->inbound_.items().wake_receiver();
 }
 
 bool SyncTask::is_pending_header(void* item) const {
@@ -201,16 +198,7 @@ int64_t SyncTask::server_timestamp(void* item) {
 }
 
 void* SyncTask::take_item(uint32_t timeout_ms) {
-    void* item = this->encoded_items_.take(timeout_ms);
-    while (item != nullptr &&
-           inbound_item_header(item)->generation !=
-               this->player_impl_->cleanup_generation.load(std::memory_order_acquire)) {
-        // Appended for a stream a teardown has since ended; the protocol task recalls such items
-        // on its next tick, and this catches one taken first.
-        this->return_item(item);
-        item = this->encoded_items_.take(0);
-    }
-    return item;
+    return this->inbound_.take(timeout_ms, this->player_impl_->cleanup_generation);
 }
 
 void SyncTask::notify_audio_played(uint32_t frames, int64_t timestamp) {
@@ -444,7 +432,7 @@ void SyncTask::fill_underflow_silence(SyncContext& sync_context) {
     // re-checks between blocks, so it stops after the current write once a chunk lands or a
     // lifecycle command fires.
     while (
-        (sync_context.silence_remaining > 0) && this->encoded_items_.is_empty() &&
+        (sync_context.silence_remaining > 0) && this->inbound_.items().is_empty() &&
         !(this->event_flags_.get() & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR))) {
         this->send_pending_silence(sync_context);
     }
@@ -572,7 +560,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
         chunk_type(sync_context.encoded_item) == CHUNK_TYPE_STREAM_CLEAR_MARKER) {
         // Reached the stream/clear marker before the inner loop noticed COMMAND_STREAM_CLEAR
         // (the marker was at the front of an otherwise-empty list). Apply the clear here.
-        this->return_item(sync_context.encoded_item);
+        this->inbound_.return_item(sync_context.encoded_item);
         sync_context.encoded_item = nullptr;
         this->apply_stream_clear(sync_context);
         return DecodeResult::SKIPPED;
@@ -613,7 +601,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                     needed, this->player_impl_->config.decode_buffer_location);
                 if (sync_context.decode_buffer == nullptr) {
                     SS_LOGE(TAG, "Failed to allocate decode buffer");
-                    this->return_item(sync_context.encoded_item);
+                    this->inbound_.return_item(sync_context.encoded_item);
                     sync_context.encoded_item = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
                 }
@@ -623,7 +611,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             } else if (needed > sync_context.decode_buffer->capacity()) {
                 if (!sync_context.decode_buffer->reallocate(needed)) {
                     SS_LOGE(TAG, "Failed to reallocate decode buffer");
-                    this->return_item(sync_context.encoded_item);
+                    this->inbound_.return_item(sync_context.encoded_item);
                     sync_context.encoded_item = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
                 }
@@ -640,13 +628,13 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
 
         if (client_timestamp < sync_context.new_audio_client_playtime - HARD_SYNC_THRESHOLD_US) {
             // This chunk will arrive too late to be played, skip it!
-            this->return_item(sync_context.encoded_item);
+            this->inbound_.return_item(sync_context.encoded_item);
             sync_context.encoded_item = nullptr;
             return DecodeResult::SKIPPED;
         }
 
         if (!decode_whole_chunk(sync_context)) {
-            this->return_item(sync_context.encoded_item);
+            this->inbound_.return_item(sync_context.encoded_item);
             sync_context.encoded_item = nullptr;
             return DecodeResult::FAILED;
         }
@@ -654,7 +642,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
     }
 
     // Return the encoded item to the ring
-    this->return_item(sync_context.encoded_item);
+    this->inbound_.return_item(sync_context.encoded_item);
     sync_context.encoded_item = nullptr;
 
     return DecodeResult::SUCCESS;
@@ -728,7 +716,7 @@ bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
             sync_context.encoded_item = item;
             return true;
         }
-        this->return_item(item);
+        this->inbound_.return_item(item);
     }
 
     while (!(this->event_flags_.get() & LEAVE_BITS)) {
@@ -752,7 +740,7 @@ bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
         }
         // Stale audio data, a leftover stream/clear marker, or the codec header of a stream that
         // ended before this task took it: discard it
-        this->return_item(item);
+        this->inbound_.return_item(item);
     }
     return false;
 }
@@ -825,11 +813,11 @@ void SyncTask::discard_to_clear_marker(SyncContext& sync_context) {
         const ChunkType type = chunk_type(item);
         if (this->is_pending_header(item)) {
             if (header != nullptr) {
-                this->return_item(header);
+                this->inbound_.return_item(header);
             }
             header = item;
         } else {
-            this->return_item(item);
+            this->inbound_.return_item(item);
         }
         if (type == CHUNK_TYPE_STREAM_CLEAR_MARKER || (this->event_flags_.get() & COMMAND_STOP)) {
             break;
@@ -849,7 +837,7 @@ void SyncTask::release_held_item(SyncContext& sync_context) {
     if (sync_context.next_header == nullptr && this->is_pending_header(item)) {
         sync_context.next_header = item;
     } else {
-        this->return_item(item);
+        this->inbound_.return_item(item);
     }
 }
 
@@ -920,7 +908,7 @@ void SyncTask::stop() {
     // take return, so this ordering guarantees it observes the stop no matter which
     // wait it was parked in (event flags or item list take).
     this->event_flags_.set(EventGroupBits::COMMAND_STOP);
-    this->encoded_items_.wake_receiver();
+    this->inbound_.items().wake_receiver();
     this->sync_thread_.join();
 
     // A stop mid-stream leaves TASK_RUNNING set (only the idle transition clears it). The player's
@@ -928,12 +916,7 @@ void SyncTask::stop() {
     // must read as idle or the stop-time on_stream_end() would wait for a thread that is gone.
     this->event_flags_.clear(EventGroupBits::TASK_RUNNING);
 
-    // The thread is joined and returned the item it held, so everything left on the list goes
-    // back to the ring, and a restart does not replay the old stream. Unbound until the next
-    // start(): the ring is this run's, and the list must not stay registered with it.
-    this->encoded_items_.recall();
-    this->encoded_items_.unbind();
-    this->ring_.store(nullptr, std::memory_order_release);
+    this->inbound_.unbind();
 }
 
 // ============================================================================
@@ -1074,7 +1057,7 @@ void SyncTask::thread_entry(void* params) {
     // hand it back so stop() leaves nothing borrowed.
     for (void** held : {&sync_context.encoded_item, &sync_context.next_header}) {
         if (*held != nullptr) {
-            this_task->return_item(*held);
+            this_task->inbound_.return_item(*held);
             *held = nullptr;
         }
     }

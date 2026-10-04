@@ -561,7 +561,7 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
         ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
         // The thread holds the first frame while it waits for its display time; the ones behind
         // it are the list content stop() must return to the ring.
-        auto& items = client.visualizer()->impl_->drain_task->items;
+        auto& items = client.visualizer()->impl_->drain_task->inbound.items();
         send_loudness_until(client, *server, OLD_FRAME_LEAD_US,
                             [&] { return two_or_more_linked(items); });
         client.stop();
@@ -709,7 +709,7 @@ protected:
                             [&] { return this->listener.frames.load() >= 1; });
         // Let the warm-up frames still queued behind the first one deliver, so a test's frames
         // reach an idle drain thread instead of waiting behind them.
-        auto& items = this->client().visualizer()->impl_->drain_task->items;
+        auto& items = this->client().visualizer()->impl_->drain_task->inbound.items();
         pump_until(this->client(), [&] { return items.is_empty(); });
         pump_for(this->client(), static_cast<int>(2 * VISUALIZER_LEAD_US / 1000));
     }
@@ -986,12 +986,14 @@ TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
     }
 }
 
-/// Fills the protocol task's accept slots with accepts that carry no connection, so the next
-/// delivery finds them all taken. The test thread plays the protocol task, so none is taken.
+/// Fills the protocol task's accept slots, so the next delivery finds them all taken. Each carries
+/// a connection, as every accept does: one with no transport, which stop() refuses at once. The
+/// test thread plays the protocol task, so none is taken.
 void fill_accept_slots(ProtocolTask& task) {
     for (;;) {
         ProtocolCommand command;
         command.type = ProtocolCommandType::ACCEPT_CONNECTION;
+        command.connection = std::make_shared<SendspinServerConnection>(nullptr);
         if (!task.push_command(std::move(command))) {
             return;
         }
@@ -1032,7 +1034,7 @@ TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
             client.protocol_task_->close_accepts();
         }
 
-        auto conn = std::make_shared<SendspinServerConnection>(nullptr, 1);
+        auto conn = std::make_shared<SendspinServerConnection>(nullptr);
         bool accepted = false;
         // The delivering thread stands in for the transport's.
         std::thread transport(
@@ -1628,17 +1630,14 @@ struct StateRoleClient {
         EXPECT_TRUE(this->client.start());
         this->client.protocol_task_->stop();
         SyncTask& sync = *this->client.player_->impl_->sync_task;
-        InboundRing* ring = sync.ring();
+        InboundRing* ring = sync.inbound().ring();
         sync.stop();
-        EXPECT_TRUE(sync.encoded_items_.create(ring, InboundHolder::PLAYER));
-        sync.ring_.store(ring);
+        EXPECT_TRUE(sync.inbound().bind(ring, InboundHolder::PLAYER));
     }
     ~StateRoleClient() {
         // Hands the list back as SyncTask::stop() would, before stop() releases the ring.
         SyncTask& sync = *this->client.player_->impl_->sync_task;
-        sync.encoded_items_.recall();
-        sync.encoded_items_.unbind();
-        sync.ring_.store(nullptr);
+        sync.inbound().unbind();
         this->client.stop();
     }
 
@@ -2231,7 +2230,7 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
                 // The sync task takes the header and waits; the end makes it return the header
                 // and go idle before the main loop acknowledges the start.
                 start();
-                wait_until([&] { return sync.encoded_items_.is_empty(); });
+                wait_until([&] { return sync.inbound().items().is_empty(); });
                 end();
                 wait_until([&] {
                     return (player.inbox->poll() & INBOX_TOPIC_PLAYER_SYNC_IDLE) != 0;
@@ -2241,9 +2240,9 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
                 // The sync task takes the header and waits; the clear reaches it there, and the
                 // stream it holds still plays once acknowledged.
                 start();
-                wait_until([&] { return sync.encoded_items_.is_empty(); });
+                wait_until([&] { return sync.inbound().items().is_empty(); });
                 player.handle_stream_clear(player.cleanup_generation.load());
-                wait_until([&] { return sync.encoded_items_.is_empty(); });
+                wait_until([&] { return sync.inbound().items().is_empty(); });
                 break;
             case Stage::START_END_START:
                 start();
@@ -2313,7 +2312,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         SyncContext context;
         ASSERT_TRUE(sync.wait_for_codec_header(context));
         context.active_ordinal = inbound_item_header(context.encoded_item)->serial;
-        sync.return_item(context.encoded_item);  // Decoded: the stream is playing
+        sync.inbound().return_item(context.encoded_item);  // Decoded: the stream is playing
         context.encoded_item = nullptr;
         if (row.end_first) {
             player.handle_stream_end(player.cleanup_generation.load());
@@ -2328,7 +2327,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         }
         for (void* held : {context.encoded_item, context.next_header}) {
             if (held != nullptr) {
-                sync.return_item(held);
+                sync.inbound().return_item(held);
             }
         }
     }
@@ -2434,7 +2433,7 @@ void drain_ring_as_protocol_task(InboundRing& ring, const ConnectionList& connec
 /// retries.
 void feed_marked_chunks(PlayerRole::Impl& impl, int64_t first_timestamp, int count) {
     SyncTask& sync_task = *impl.sync_task;
-    InboundRing* ring = sync_task.ring();
+    InboundRing* ring = sync_task.inbound().ring();
     constexpr size_t FRAME_OFFSET = 13;  // type byte, server timestamp, send_ahead
     std::vector<uint8_t> message(FRAME_OFFSET + SINK_CHUNK_BYTES, SINK_AUDIO_MARK);
     message[0] = SENDSPIN_BINARY_PLAYER_AUDIO;
@@ -2454,11 +2453,11 @@ void feed_marked_chunks(PlayerRole::Impl& impl, int64_t first_timestamp, int cou
         header->type = CHUNK_TYPE_ENCODED_AUDIO;
         header->data_offset = FRAME_OFFSET;
         header->data_len = static_cast<uint32_t>(SINK_CHUNK_BYTES);
-        header->generation = impl.cleanup_generation.load(std::memory_order_acquire);
         ring->complete(item);
-        if (!sync_task.hand_item(item, message.size())) {
-            ring->return_item(item);
-        }
+        // Over quota, hand() returns the item itself.
+        (void)sync_task.inbound().hand(item, message.size(),
+                                       impl.cleanup_generation.load(std::memory_order_acquire),
+                                       /*exempt=*/false);
         timestamp += 20 * 1000;
     }
 }
@@ -2481,7 +2480,7 @@ public:
         : thread_([&impl = *client.player_->impl_, &listener, server_offset_us,
                    connections = std::move(connections)] {
               while (!listener.decoded()) {
-                  drain_ring_as_protocol_task(*impl.sync_task->ring(), connections);
+                  drain_ring_as_protocol_task(*impl.sync_task->inbound().ring(), connections);
                   feed_marked_chunks(impl,
                                      platform_time_us() + server_offset_us + SINK_CHUNK_LEAD_US, 4);
                   std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -2735,7 +2734,7 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     play_protocol_task(*client);
 
     PlayerRole::Impl& impl = *client->player_->impl_;
-    InboundRing& ring = *impl.sync_task->ring();
+    InboundRing& ring = *impl.sync_task->inbound().ring();
     std::vector<uint8_t> chunk(13 + 4, 0x00);
     chunk[0] = SENDSPIN_BINARY_PLAYER_AUDIO;
     InboundMessage message;
@@ -2760,9 +2759,11 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
 // the ring is 25,000 + 5,568 held pass-through + 2 x 16,724 = 64,016 bytes; a visualizer
 // advertising a seventh of 140,000 bytes is sent messages of up to 20,016, and at 30 loudness
 // frames a second (2,040 stored bytes) holds its oldest for 69 s, which pins 69 s of state JSON
-// and 7 time bursts behind it (70,656 + 17,472 bytes). Controller and
-// metadata hold nothing, so they leave the no-role budget unchanged. Read from the ring the
-// client creates, so every role's figures have to reach the derivation.
+// and 7 time bursts behind it (70,656 + 17,472 bytes). Controller and metadata hold nothing, so
+// they leave the no-role budget unchanged. The time replies follow the configured burst cadence:
+// the default player syncing every second instead of every 10 s holds 88 bursts of 8 replies
+// (312 stored bytes each) behind its 87 s hold instead of 9. Read from the ring the client
+// creates, so every role's figures and the burst configuration have to reach the derivation.
 TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
     enum : uint8_t {
         PLAYER = 1 << 0,
@@ -2778,6 +2779,7 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         uint8_t roles;
         size_t expected_bytes;
         size_t expected_max_message_bytes;
+        int64_t burst_interval_ms{SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS};
     };
     const Row rows[] = {
         {"no roles: two JSON messages", 0, 32880, 16400},
@@ -2792,13 +2794,17 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         {"artwork capped at 40,000-byte images: still two maximal frames", SMALL_ARTWORK, 131152,
          INBOUND_MAX_MESSAGE_BYTES},
         {"Control: the default player", PLAYER, 1242704, INBOUND_MAX_MESSAGE_BYTES},
+        {"the default player, a time burst every second", PLAYER, 1439888,
+         INBOUND_MAX_MESSAGE_BYTES, 1000},
         {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1687004,
          INBOUND_MAX_MESSAGE_BYTES},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         TestNetworkProvider network;
-        SendspinClient client(make_config(0));
+        SendspinClientConfig config = make_config(0);
+        config.time_burst_interval_ms = row.burst_interval_ms;
+        SendspinClient client(config);
         client.set_network_provider(&network);
         if ((row.roles & (PLAYER | SMALL_PLAYER)) != 0) {
             PlayerRoleConfig player = make_pcm_player_config();
@@ -2832,39 +2838,6 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         EXPECT_EQ(client.inbound_ring_->max_message_bytes(), row.expected_max_message_bytes);
         client.stop();
     }
-}
-
-// The ring holds the time replies that arrive while the player holds its oldest chunk, so its
-// size follows the configured burst cadence: a client syncing ten times as often gets a larger
-// ring. Read from the ring the client creates, so the configuration has to reach the derivation.
-TEST(ClientLifecycle, TheInboundRingGrowsWithTheTimeBurstRate) {
-    const auto ring_bytes = [](int64_t interval_ms) {
-        TestNetworkProvider network;
-        SendspinClientConfig config = make_config(0);
-        config.time_burst_interval_ms = interval_ms;
-        SendspinClient client(config);
-        client.set_network_provider(&network);
-        client.add_player(make_pcm_player_config());
-        EXPECT_TRUE(client.start());
-        const size_t bytes = client.inbound_ring_->storage_.size();
-        client.stop();
-        return bytes;
-    };
-    const size_t default_bytes = ring_bytes(SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS);
-    InboundRingBudget budget;
-    budget.audio_hold_bytes = make_pcm_player_config().audio_buffer_capacity;
-    // The player advertises the share of its quota the smallest chunk's stored cost leaves for
-    // encoded bytes ((N - 1) / N, N = the smallest chunk's stored size over its overhead): its
-    // longest chunk.
-    constexpr size_t CHUNK_OVERHEAD =
-        INBOUND_ITEM_STORED_OVERHEAD_BYTES + INBOUND_AUDIO_CHUNK_HEADER_BYTES;
-    constexpr size_t DENOMINATOR =
-        (INBOUND_MIN_AUDIO_FRAME_BYTES + CHUNK_OVERHEAD) / CHUNK_OVERHEAD;
-    budget.largest_message_bytes = inbound_held_message_bytes(
-        make_pcm_player_config().audio_buffer_capacity * (DENOMINATOR - 1) / DENOMINATOR);
-    EXPECT_EQ(default_bytes, derive_inbound_ring_bytes(budget)) << "Control: the defaults";
-    EXPECT_GT(ring_bytes(SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS / 10), default_bytes)
-        << "the configured burst interval never reached the ring's derivation";
 }
 
 }  // namespace

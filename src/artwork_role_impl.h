@@ -151,7 +151,7 @@ struct ArtworkDisplayUpdate {
 };
 
 /// @brief Private implementation of the artwork role
-struct ArtworkRole::Impl {
+struct ArtworkRole::Impl : RoleTeardown {
     Impl(ArtworkRoleConfig config, SendspinClient* client);
     ~Impl();
 
@@ -216,15 +216,6 @@ struct ArtworkRole::Impl {
     /// channel for the frame_done() its clear is owed, and fires on_image_clear() for every
     /// configured channel. A stream/end's STREAM_END event and a teardown's catch-up. Main loop.
     void clear_every_channel();
-    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
-    ///
-    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
-    /// runs, and stop()'s teardown on the main loop can land in between. The dispatch captures this
-    /// counter with the gate and hands it back here at each point of effect, so a teardown inside
-    /// that window invalidates the whole handler instead of only the part that ran before it.
-    bool accepts(uint32_t generation) const {
-        return generation == this->cleanup_generation.load(std::memory_order_acquire);
-    }
 
     /// @brief Stops the role and discards its state. Protocol task, or the main loop in
     /// SendspinClient::stop() once every other thread is joined.
@@ -365,14 +356,6 @@ struct ArtworkRole::Impl {
     // a fresh announce) and the display must be dropped, since the protocol task cannot reach
     // the main-thread holds to cancel it. Main-thread only; see held_display_ts.
     uint32_t held_display_epoch[ARTWORK_MAX_SLOTS]{};
-    TeardownTracker teardown;  ///< Main loop only.
-
-    /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event and
-    /// display hand-off queued afterwards. At the drain an event or display whose stamp no longer
-    /// matches is discarded, so nothing queued before a teardown can act after it (see
-    /// event_is_current() in inbox.h). Written on the protocol task (or the main loop in stop()
-    /// once it is joined); read on the main loop and the protocol task.
-    std::atomic<uint32_t> cleanup_generation{0};
 
     /// @brief Per-channel delivery epoch, bumped whenever the channel's pending image is
     /// discarded: by a stream end or cleanup (every channel at once), by a stream/start (the

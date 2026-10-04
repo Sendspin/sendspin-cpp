@@ -808,7 +808,7 @@ private:
     /// @brief Parses and routes one JSON message from a connection. Protocol task only (it owns
     /// json_arena_). `data` is not null-terminated and is valid for the duration of the call
     /// only.
-    void process_json_message(SendspinConnection* conn, const char* data, size_t len,
+    void process_json_message(SendspinConnection& connection, const char* data, size_t len,
                               int64_t timestamp);
 
     /// @brief Hands a pairing message that failed to parse to the pairing state machine.
@@ -818,10 +818,10 @@ private:
     void report_malformed_pairing_message(SendspinConnection* conn, const char* type_name);
 
     /// @brief Processes a binary message from a connection. Protocol task only.
-    /// Every binary message is role-bound, so this is dropped unless `conn` is admitted and owns
-    /// the role. A player audio chunk or a visualizer frame is handed to its consumer by its ring
-    /// item when it has one (the role clears `message.item`).
-    void process_binary_message(SendspinConnection* conn, InboundMessage& message);
+    /// Every binary message is role-bound, so this is dropped unless `connection` is admitted and
+    /// owns the role. A player audio chunk or a visualizer frame is handed to its consumer by its
+    /// ring item when it has one (the role clears `message.item`).
+    void process_binary_message(SendspinConnection& connection, InboundMessage& message);
 
     // ========================================
     // State publishing

@@ -31,10 +31,12 @@ function(sendspin_get_sources BASE_DIR)
         # Connection base class
         ${BASE_DIR}/src/connection.cpp
 
-        # Connection management
+        # Connection management, and its pairing state machines
         ${BASE_DIR}/src/connection_manager.cpp
+        ${BASE_DIR}/src/connection_manager_pairing.cpp
 
-        # Protocol thread and its command queue; the shared inbound ring's per-consumer item list
+        # Protocol thread and its command queue; the shared inbound ring, its per-consumer item
+        # lists and consumers, and the per-connection inbound gate
         ${BASE_DIR}/src/protocol_task.cpp
         ${BASE_DIR}/src/inbound_ring.cpp
 

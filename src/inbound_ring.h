@@ -62,10 +62,11 @@ enum class InboundKind : uint8_t {
     /// once (a codec header, a stream boundary marker, or a message the task copied out of a
     /// reassembly or fallback buffer; see InboundRing::acquire_local()). Its place in the
     /// consumer's list is where the task appended it, not where it sits in the ring, so it is
-    /// returned by two parties: InboundRing::take() returns it on the protocol task's behalf when
-    /// it reaches it in ring order, and its holder returns it when done (InboundRing::
-    /// return_item(), which also releases the quota charge); whichever is second gives it back
-    /// to the ring (see InboundItemHeader::local_returns).
+    /// returned by two parties (LOCAL_ITEM_PARTIES): InboundRing::take() returns it on the
+    /// protocol task's behalf when it reaches it in ring order, and its holder returns it when
+    /// done (InboundRing::return_item(), which also releases the quota charge at once); whichever
+    /// is second gives it back to the ring. The count is InboundItemHeader::local_returns, kept
+    /// under the holder's InboundItemList mutex once the item is charged to that holder.
     LOCAL,
 };
 
@@ -83,12 +84,12 @@ static constexpr size_t INBOUND_HOLDER_COUNT = 2;
 /// @brief Throttles the warning at a drop site that can drop every message of a burst
 ///
 /// The first drop of a run logs (note_drop() returns true), the drops after it are only counted,
-/// and the next delivery at the site ends the run and returns the count, which the site logs. A
-/// run that no delivery follows (the stream or the connection ended) is ended where its site's
-/// owner tears down: a role's recall after a teardown, a connection's destructor. A drop is
-/// therefore never silent, and a sustained overrun costs two log lines rather than one per
-/// message. Not thread-safe: each instance belongs to the one thread that runs its site, or to
-/// whichever thread tears it down once that one is joined.
+/// and the next delivery at the site ends the run, logging its count (end_run()). A run that no
+/// delivery follows (the stream or the connection ended) is ended where its site's owner tears
+/// down: a role's recall after a teardown, a connection's destructor. A drop is therefore never
+/// silent, and a sustained overrun costs two log lines rather than one per message. Not
+/// thread-safe: each instance belongs to the one thread that runs its site, or to whichever
+/// thread tears it down once that one is joined.
 class InboundDropLog {
 public:
     /// @brief Counts a drop. @return true for the first drop of a run, which the site logs.
@@ -96,12 +97,8 @@ public:
         return this->dropped_++ == 0;
     }
 
-    /// @brief Ends a run of drops. @return How many it had, 0 when there was none.
-    uint32_t note_delivery() {
-        const uint32_t dropped = this->dropped_;
-        this->dropped_ = 0;
-        return dropped;
-    }
+    /// @brief Ends a run of drops, logging "Dropped <count> <what>" under `tag` when it had any.
+    void end_run(const char* tag, const char* what);
 
 private:
     uint32_t dropped_{0};
@@ -111,16 +108,14 @@ private:
 static constexpr uint32_t INBOUND_LIST_END = UINT32_MAX;
 
 /// Bound on a transport's InboundRing::acquire() for an admitted connection's message, after
-/// which the message is dropped with a warning. The ring holds every holder's quota plus a
-/// pass-through allowance (derive_inbound_ring_bytes()), so an acquire waits only while the
-/// protocol task is behind on taking items or while ring-order reclamation holds space behind the
-/// oldest held item. Sized at the bottom of the 100-200 ms stall budget the library's threads are
-/// held to:
-/// longer than a protocol tick that runs a Noise handshake's DH operations (tens of milliseconds
-/// on an ESP32), so a busy task does not cost a message, and short enough that a stalled one
-/// costs a dropped message rather than a parked transport. On ESP each timed-out acquire parks
-/// the one httpd task every inbound session shares, so every session waits behind it. The codec
-/// header and the stream markers wait the same bound for room (HEADER_SEND_TIMEOUT_MS).
+/// which the message is dropped with a warning; the protocol task's own acquires for a codec
+/// header or a marker wait the same bound. An acquire waits only while the protocol task is
+/// behind on taking items or ring-order reclamation holds space behind the oldest held item (see
+/// derive_inbound_ring_bytes()). Sized at the bottom of the 100-200 ms stall budget the library's
+/// threads are held to: longer than a tick running a Noise handshake's DH operations (tens of
+/// milliseconds on an ESP32), so a busy task does not cost a message, and short enough that a
+/// stalled one costs a dropped message rather than a parked transport, which on ESP is the httpd
+/// task every inbound session shares.
 static constexpr uint32_t INBOUND_ACQUIRE_TIMEOUT_MS = 100;
 
 /// The largest WebSocket message a conforming peer sends: one Noise transport frame, plaintext
@@ -156,8 +151,8 @@ static constexpr size_t INBOUND_ITEM_STORED_OVERHEAD_BYTES =
  */
 struct InboundItemHeader {
     // 32-bit fields
-    /// Storage offset of the next item in the same consumer list, or INBOUND_LIST_END. Written
-    /// by the protocol task under the list's mutex; read by the consumer under it.
+    /// Storage offset of the next item in the same consumer list, or INBOUND_LIST_END; guarded by
+    /// the list's mutex.
     uint32_t next;
     /// Low 32 bits of SendspinConnection::get_instance_id(): the connection the item arrived on.
     /// Instance ids are process-unique and monotonic, so the low word only repeats after 2^32
@@ -185,23 +180,18 @@ struct InboundItemHeader {
     /// Consumer-defined item type: the ChunkType for the player, the wire message type or a
     /// marker for the visualizer.
     uint8_t type;
-    /// The holder the item was charged to; meaningful only while holder_set is non-zero.
+    /// The holder the item was handed to; meaningful only while holder_set is non-zero.
     InboundHolder holder;
-    /// Returns counted against an InboundKind::LOCAL item: the protocol task's take and the
-    /// holder's return each add one, and the one that brings it to LOCAL_ITEM_PARTIES gives the
-    /// item back to the ring; zero and unused for every other kind. A plain field, never an
-    /// atomic: the ring may sit in external RAM, where the ESP32's compare-and-set cannot operate
-    /// (esp_cpu_compare_and_set() refuses it). Once holder_set is non-zero it is updated only
-    /// under the holder's InboundItemList mutex, which lives in internal RAM; before that both
-    /// parties are the protocol task.
+    /// The returns counted against an InboundKind::LOCAL item; zero and unused for every other
+    /// kind. A plain field, never an atomic: the ring may sit in external RAM, where the ESP32's
+    /// compare-and-set cannot operate (esp_cpu_compare_and_set() refuses it), so once holder_set
+    /// is non-zero it is updated only under the holder's InboundItemList mutex, which lives in
+    /// internal RAM; before that both parties are the protocol task.
     uint8_t local_returns;
-    /// Non-zero once InboundRing::charge() charged the item to `holder`. Written by the protocol
-    /// task before the item is appended to the holder's list; never cleared.
+    /// Non-zero once InboundRing::charge() assigned the item to `holder`; never cleared.
     uint8_t holder_set;
-    /// Consumer-defined sequence number, zeroed by acquire(): the player's stream ordinal on a
-    /// codec header item, 0 on every other item. Written on the protocol task
-    /// (PlayerRole::Impl::hand_item()) before the item is appended to the sync task's list; read
-    /// on the sync thread once it takes the item.
+    /// Consumer-defined sequence number: the player's stream ordinal on a codec header item, 0 on
+    /// every other item.
     uint16_t serial;
 };
 static_assert(std::is_trivially_copyable_v<InboundItemHeader> &&
@@ -214,8 +204,7 @@ static_assert(sizeof(InboundItemHeader) == INBOUND_ITEM_HEADER_BYTES,
 static_assert(std::has_unique_object_representations_v<InboundItemHeader>,
               "the header has no padding: every byte is a field acquire() zeroes");
 
-/// The two returns an InboundKind::LOCAL item needs before it goes back to the ring: the
-/// protocol task's take in ring order and the holder's return.
+/// The returns an InboundKind::LOCAL item needs before it goes back to the ring.
 static constexpr uint8_t LOCAL_ITEM_PARTIES = 2;
 
 /// @brief The header at the start of a ring item
@@ -271,11 +260,6 @@ public:
         this->limit_ = limit;
     }
 
-    /// @brief The budget in bytes
-    size_t limit() const {
-        return this->limit_;
-    }
-
     /// @brief Bytes charged and not yet released. Any thread.
     size_t outstanding() const {
         return this->outstanding_.load(std::memory_order_acquire);
@@ -322,13 +306,16 @@ class InboundItemList;
  * completed. The consumer is the protocol task (take()), which also charges what it hands to a
  * holder. Any thread returns items, always through return_item().
  *
- * take() never hands out an uncompleted item. SharedRingBuffer can, on ESP, hand out the item at
- * the start of the storage right after a wrap before its producer completes it (see
- * shared_ring_buffer.h), so the ring counts completions of items at the storage start and the
+ * take() never hands out an uncompleted item. On ESP, right after the consumer passes the filler
+ * that marks a wrap, FreeRTOS hands out the item at the start of the storage whether or not its
+ * producer has completed it (prvCheckItemAvail() checks the filler's flag, prvGetItemDefault()
+ * then wraps unchecked; the host SharedRingBuffer refuses that item instead). So the ring counts
+ * completions of items at the storage start (SharedRingBuffer::is_storage_head()) and the
  * protocol task counts its takes of them. An item there can only be acquired once the previous
  * one there was taken and returned, so the k-th such take is safe exactly when the k-th such
- * completion has happened; until then the item is held back as pending and nothing behind it is
- * taken. Stale bytes in reused storage cannot fake this, unlike a flag inside the item.
+ * completion has happened; until then the item is held back as pending (pending_), never
+ * returned early, and nothing behind it is taken. Stale bytes in reused storage cannot fake this,
+ * unlike a flag inside the item. The two counts are never reset and stay in step across reset().
  */
 class InboundRing {
 public:
@@ -342,8 +329,11 @@ public:
     /// runs.
     /// @param storage_bytes From derive_inbound_ring_bytes().
     /// @param location Placement preference for the storage.
+    /// @param largest_message_bytes The budget's InboundRingBudget::largest_message_bytes, which
+    ///        largest_message_bytes() reports.
     /// @return false when the storage cannot be allocated or the size is refused.
-    bool create(size_t storage_bytes, MemoryLocation location);
+    bool create(size_t storage_bytes, MemoryLocation location,
+                size_t largest_message_bytes = INBOUND_MAX_MESSAGE_BYTES);
 
     /// @brief Whether create() succeeded
     bool is_created() const {
@@ -358,6 +348,13 @@ public:
     /// any thread after it.
     size_t max_message_bytes() const {
         return this->max_message_bytes_;
+    }
+
+    /// @brief The longest message the derivation sized the ring for, at most
+    /// max_message_bytes(): no conforming server sends an admitted connection a longer one the
+    /// enabled roles need. Written by create(); read by any thread after it.
+    size_t largest_message_bytes() const {
+        return this->largest_message_bytes_;
     }
 
     /// @brief The ring's storage base, which InboundItemHeader::next offsets are relative to
@@ -397,40 +394,36 @@ public:
     /// @brief Publishes a filled item. The thread that acquired it.
     void complete(void* item);
 
-    /// @brief Takes the oldest completed item, returning DISCARD items to the ring on the way
-    /// without handing them out, and counting the protocol task's return of each LOCAL item it
-    /// passes (see InboundKind::LOCAL). Protocol task only.
+    /// @brief Takes the oldest completed item, returning DISCARD items and the protocol task's
+    /// party of each LOCAL item on the way without handing them out. Protocol task only.
     /// @param[out] message_len The length of the message bytes after the header.
     /// @param timeout_ms As SharedRingBuffer::take(), applied to each underlying take.
     /// @return The item, or nullptr: nothing completed in time, a wake_receiver() interruption,
     ///         or the oldest item still being written.
     void* take(size_t* message_len, uint32_t timeout_ms);
 
-    /// @brief Returns every item still in the ring, so a restart begins empty. Call only once
-    /// every producer has stopped (each acquired item is then completed) and every holder has
-    /// returned or recalled its items; the protocol task is the caller or is joined. A pending
-    /// item (see pending_) is returned only after its completion is confirmed.
+    /// @brief Returns every item still in the ring, so a restart begins empty, waiting for a
+    /// pending item's completion first. Call only once every producer has stopped (each acquired
+    /// item is then completed) and every holder has returned or recalled its items; the protocol
+    /// task is the caller or is joined.
     void reset();
 
-    /// @brief Charges a taken item to a holder's quota, recording the charge and the holder in
-    /// its header. Protocol task only, before the item is appended to the holder's list.
+    /// @brief Assigns a taken item to a holder, recording the holder and the charge against its
+    /// quota in the header. Protocol task only, before the item is appended to the holder's list.
     /// @param message_len The length take() reported for the item.
+    /// @param exempt Records the holder without charging its quota (see InboundConsumer::hand()).
     /// @return false when the holder is over quota: the caller returns the item and logs the drop.
-    bool charge(void* item, size_t message_len, InboundHolder holder);
+    bool charge(void* item, size_t message_len, InboundHolder holder, bool exempt);
 
     /// @brief Returns a taken item to the ring, releasing any quota charge it carries: the
     /// holder's return (the consumer, or the protocol task returning an item it did not hand
-    /// over or recalled). Any thread. A LOCAL item's charge is released here, and the item goes
-    /// back to the ring on the second of its two returns (see InboundKind::LOCAL).
+    /// over or recalled). Any thread.
     void return_item(void* item);
 
-    /// @brief Registers the list that holds `holder`'s items, which counts a LOCAL item's returns
-    /// under its own mutex once the item is charged to that holder; nullptr unregisters it.
-    ///
-    /// Lifetime: InboundItemList::create() registers the list before any item is charged, and
-    /// InboundItemList::unbind() unregisters it once the holder's consumer is joined and its
-    /// items recalled, before the list can be destroyed. With the list unregistered every thread
-    /// that returns items is joined, so the return count needs no lock (count_local_return()).
+    /// @brief Registers the list whose mutex counts the returns of a LOCAL item assigned to
+    /// `holder`; nullptr unregisters it. InboundItemList::create() registers it before any item
+    /// is charged, and InboundItemList::unbind() unregisters it once the holder's consumer is
+    /// joined and its items recalled, so with it unregistered the count needs no lock.
     void register_list(InboundHolder holder, InboundItemList* list) {
         this->lists_[static_cast<size_t>(holder)] = list;
     }
@@ -440,13 +433,9 @@ public:
         this->ring_.wake_receiver();
     }
 
-    /// @brief Completed items not yet taken. Any thread.
-    size_t items_waiting() const {
-        return this->ring_.items_waiting();
-    }
-
 private:
-    /// @brief Whether every item taken at the storage start has been completed
+    /// @brief Whether every item taken at the storage start has been completed (see the class
+    /// comment)
     bool head_takes_completed() const {
         const uint32_t completions = this->head_completions_.load(std::memory_order_acquire);
         return static_cast<int32_t>(completions - this->head_takes_) >= 0;
@@ -459,13 +448,11 @@ private:
     void* take_one(size_t* message_len, uint32_t timeout_ms);
 
     /// @brief The protocol task's ring-order return of a taken item that is not handed out: a
-    /// DISCARD item goes back at once, a LOCAL item counts its ring-order party (see
-    /// InboundKind::LOCAL).
+    /// DISCARD item goes back at once, a LOCAL item counts its ring-order party.
     void return_in_ring_order(void* item);
 
-    /// @brief Counts one of a LOCAL item's two returns: through its holder's registered list
-    /// once it was charged, otherwise directly (both parties are the protocol task, or every
-    /// thread is joined). @return true when this was the second.
+    /// @brief Counts one of a LOCAL item's returns, through its holder's registered list once it
+    /// has one. @return true when this was the last.
     bool count_local_return(InboundItemHeader* header, bool release_charge);
 
     // Struct fields
@@ -478,24 +465,22 @@ private:
     std::array<InboundItemList*, INBOUND_HOLDER_COUNT> lists_{};
 
     // Pointer fields
-    /// An item taken at the storage start before its completion was confirmed, with its message
-    /// length. Protocol task only. It is never returned to the ring before its completion is
-    /// confirmed: its producer may still be writing it, and returning it early would also put
-    /// head_takes_ out of step with head_completions_. reset() waits for that confirmation.
+    /// An item taken at the storage start before its completion was confirmed (see the class
+    /// comment), with its message length. Protocol task only.
     void* pending_{nullptr};
 
     // size_t fields
     size_t pending_len_{0};
-    /// See max_message_bytes(). Written by create() before any producer runs.
+    /// See max_message_bytes() and largest_message_bytes(). Written by create() before any
+    /// producer runs.
     size_t max_message_bytes_{0};
+    size_t largest_message_bytes_{0};
 
     // 32-bit fields
     /// Completions of items at the storage start. Incremented by transport threads before the
     /// item is published; read by the protocol task.
     std::atomic<uint32_t> head_completions_{0};
-    /// Takes of items at the storage start. Protocol task only. Never reset: it and
-    /// head_completions_ stay in step across reset(), since every item counted by one is counted
-    /// by the other once the pending item is confirmed.
+    /// Takes of items at the storage start. Protocol task only.
     uint32_t head_takes_{0};
 };
 
@@ -536,12 +521,10 @@ public:
     /// binds it again.
     void unbind();
 
-    /// @brief Counts one of a LOCAL item's two returns under this list's mutex, which guards the
-    /// count of every LOCAL item charged to the list's holder: the ring storage may be external
-    /// RAM, where the ESP32 cannot run an atomic (see InboundItemHeader::local_returns). The
-    /// holder's return also releases the item's charge against `quota`, outside the lock. Any
-    /// thread; called by InboundRing.
-    /// @return true when this was the second return.
+    /// @brief Counts one of a LOCAL item's returns under this list's mutex (see
+    /// InboundItemHeader::local_returns); the holder's return also releases the item's charge
+    /// against `quota`, outside the lock. Any thread; called by InboundRing.
+    /// @return true when this was the last return.
     bool count_local_return(InboundItemHeader* header, bool release_charge, InboundQuota& quota);
 
     /// @brief Appends a ring item and wakes the consumer. Protocol task only.
@@ -610,20 +593,116 @@ private:
     uint32_t tail_{INBOUND_LIST_END};
 };
 
-/// @brief Charges an item to a holder's quota and appends it to that holder's list. Protocol task
-/// only.
-/// @param message_len The item's message length, as take() reported it or acquire_local() was
-///        asked for.
-/// @return false, appending nothing, when the holder is over quota: the caller returns the item
-///         and logs the drop.
-inline bool hand_inbound_item(InboundRing& ring, InboundItemList& list, InboundHolder holder,
-                              void* item, size_t message_len) {
-    if (!ring.charge(item, message_len, holder)) {
-        return false;
+// ============================================================================
+// InboundConsumer
+// ============================================================================
+
+/**
+ * @brief One holder's end of the ring: the item list its consumer thread takes from, the ring it
+ * is bound to for a run, and the protocol task's side of handing items over
+ *
+ * Shared by the sync task (InboundHolder::PLAYER) and the visualizer drain thread
+ * (InboundHolder::VISUALIZER). Every item handed over carries the holder role's teardown
+ * generation (InboundItemHeader::generation): a teardown moves the role's `cleanup_generation`
+ * on, the protocol task recalls what the consumer has not taken (recall_stale()), and a
+ * consumer that takes such an item first returns it unprocessed (take()).
+ *
+ * Threads: bind() and unbind() run on the main loop with the consumer thread not running; the
+ * protocol task hands items over (copy_local(), hand(), recall_stale(), note_drop()); the
+ * consumer thread takes and returns them. ring() is read on all three.
+ */
+class InboundConsumer {
+public:
+    /// @brief Binds the item list to this run's ring as `holder`'s list. Main loop, before the
+    /// consumer thread starts. @return false when the list's event flags cannot be created.
+    bool bind(InboundRing* ring, InboundHolder holder);
+
+    /// @brief Returns every item left on the list and unbinds it from the ring. Main loop, once
+    /// the consumer thread is joined; bind() binds it again.
+    void unbind();
+
+    /// @brief The ring the list is bound to, or nullptr outside a run
+    InboundRing* ring() const {
+        return this->ring_.load(std::memory_order_acquire);
     }
-    list.append(item);
-    return true;
-}
+
+    /// @brief The item list itself, for a consumer that walks it (a clear marker's discard)
+    InboundItemList& items() {
+        return this->items_;
+    }
+    const InboundItemList& items() const {
+        return this->items_;
+    }
+
+    /// @brief Takes the next item whose stamp is still `generation`'s current value, returning
+    /// the stale ones before it to the ring. Consumer thread.
+    /// @param timeout_ms As InboundItemList::take(), applied to the first take only.
+    /// @return The item, or nullptr: treat it as "re-check state and retry".
+    void* take(uint32_t timeout_ms, const std::atomic<uint32_t>& generation);
+
+    /// @brief Returns an item to the ring. The consumer thread once it has taken an item; the
+    /// protocol task for an item hand() refuses over quota.
+    void return_item(void* item) {
+        this->ring()->return_item(item);
+    }
+
+    /// @brief Acquires a LOCAL item (InboundRing::acquire_local()), copies `len` bytes into it
+    /// and completes it. Protocol task, inside a run.
+    /// @return The item, ready for hand(), or nullptr when the ring had no room in time.
+    void* copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
+                     uint32_t timeout_ms);
+
+    /// @brief Stamps `item` with `generation`, recalls the list first if a teardown moved the
+    /// generation on (recall_stale()), then charges the item to the holder's quota and appends
+    /// it. Over quota the item is returned to the ring with a throttled warning: the server
+    /// overran the buffer_capacity the role advertises, which the quota covers at the role's
+    /// smallest message. Protocol task, inside a run; the caller fills the item's other consumer
+    /// fields first.
+    /// @param item_len The item's message length (InboundMessage::item_len, or what
+    ///        copy_local() was given).
+    /// @param exempt Hands the item over without charging the quota: a codec header or a
+    ///        stream boundary marker the protocol task writes itself, one per stream/start or
+    ///        stream/clear, so refusing it would end or blur a stream over a quota the server's
+    ///        data overran. Under ring-order reclamation a clear pins both its JSON item and its
+    ///        marker until the consumer returns the marker; that is no more than a JSON flood
+    ///        from an authenticated server already holds, inside the pass-through budget
+    ///        derive_inbound_ring_bytes() holds.
+    /// @return false when the item was returned instead of handed over.
+    bool hand(void* item, size_t item_len, uint32_t generation, bool exempt);
+
+    /// @brief Recalls every item not yet taken once `generation` differs from the one the list
+    /// was last recalled for. Protocol task: each tick, and from hand(), so no item stamped with
+    /// the current generation is ever recalled.
+    void recall_stale(uint32_t generation);
+
+    /// @brief Counts a drop of an item that never reached hand() in the same throttled run as
+    /// the over-quota drops, logging "<Holder> <message>" when it starts one. Protocol task.
+    void note_drop(const char* message);
+
+private:
+    /// @brief What end_run() calls the holder's dropped items
+    const char* dropped_items_name() const;
+
+    // Struct fields
+    /// Appended on the protocol task, taken on the consumer thread, recalled on the protocol task
+    /// or, once the consumer is joined, on the main loop.
+    InboundItemList items_;
+    /// Every drop of the holder's items. Protocol task only.
+    InboundDropLog drop_log_;
+
+    // Pointer fields
+    /// Written by bind() and unbind() on the main loop; read by the protocol task and the
+    /// consumer thread.
+    std::atomic<InboundRing*> ring_{nullptr};
+
+    // 32-bit fields
+    /// The teardown generation the list was last recalled for. Protocol task only.
+    uint32_t recalled_generation_{0};
+
+    // 8-bit fields
+    /// Written by bind() before the protocol task hands anything over.
+    InboundHolder holder_{InboundHolder::PLAYER};
+};
 
 // ============================================================================
 // InboundGate
@@ -638,30 +717,25 @@ inline bool hand_inbound_item(InboundRing& ring, InboundItemList& list, InboundH
  *    because items returned at once still stay unreclaimable behind held audio, so a peer that
  *    holds only the Sentinel PSK could otherwise fill the ring. It delivers each complete message
  *    through its own fallback buffer, of at most PRE_ADMISSION_MESSAGE_BYTES, one message at a
- *    time. A larger message closes the connection, which is tighter than the one-frame
- *    (INBOUND_MAX_MESSAGE_BYTES) limit an admitted connection has. An admitted connection uses
- *    the same hand-off for a message longer than the ring takes (InboundRing::
- *    max_message_bytes()), which the ring is not sized for when no enabled role needs a maximal
- *    frame;
+ *    time; a larger message closes the connection. An admitted connection uses the same hand-off
+ *    for a message longer than the ring takes (InboundRing::max_message_bytes());
  *  - the in-flight count of ring items the transport has begun writing and the protocol task
  *    has not yet taken;
  *  - the out-of-band close flag, honoured only once nothing of the connection is still queued
  *    (close_ready());
- *  - the detached flag, set once nothing reads the connection any more (it left the connection
- *    manager, or the protocol task closed it): the transport then writes nothing anywhere and
- *    drops what it receives, and a wait_until_writable() ends at once, so no transport thread a
- *    release joins is parked on this gate.
+ *  - the detached flag, set once nothing reads the connection any more: the transport then
+ *    writes nothing anywhere and drops what it receives, and a wait_until_writable() ends at
+ *    once, so no transport thread a release joins is parked on this gate.
  *
- * Ordering. While a message is pending in the fallback buffer the transport writes nowhere,
- * neither into the fallback buffer nor into the ring (may_write(), and begin_ring_write() and
- * publish_pending_message() refuse), and it waits for consume_pending_message() through
- * wait_until_writable(). The protocol task handles a connection's pending message only once every
- * ring item the connection wrote before it has been taken (in_flight() is 0; with the transport
- * writing nowhere the count can only fall), and before any ring item written after it. The
- * message that gets a connection admitted is therefore processed, and the admitted flag set,
- * before the transport routes its next message, which then goes to the ring; and an admitted
- * connection's long message routed through the fallback buffer keeps its place between its ring
- * items.
+ * Ordering. While a message is pending in the fallback buffer the transport writes nowhere
+ * (may_write() is false, and begin_ring_write() and publish_pending_message() refuse); it waits
+ * for consume_pending_message() through wait_until_writable(). The protocol task handles a
+ * connection's pending message only once every ring item the connection wrote before it has been
+ * taken (in_flight() is 0; with the transport writing nowhere the count can only fall), and
+ * before any ring item written after it. The message that gets a connection admitted is
+ * therefore processed, and the admitted flag set, before the transport routes its next message,
+ * which then goes to the ring; and an admitted connection's long message routed through the
+ * fallback buffer keeps its place between its ring items.
  *
  * Cost: one event group per connection for that wait (an xEventGroupCreate() heap allocation on
  * ESP, made in the constructor); is_created() reports whether it succeeded.
@@ -675,14 +749,11 @@ public:
     static constexpr size_t PRE_ADMISSION_MESSAGE_BYTES =
         MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES;
 
-    /// Bound on the transport's wait_until_writable() before it gives up on an unadmitted
-    /// connection and closes it. A protocol tick can wait on two things: the Noise handshake's
-    /// DH operations (tens of milliseconds on an ESP32), and up to two INBOUND_ACQUIRE_TIMEOUT_MS
-    /// waits for ring space for a codec header and a stream marker (200 ms). Every lock the
-    /// task takes is a leaf held for a copy, so nothing else stretches a tick. 500 ms covers
-    /// both with a margin; a task stalled beyond it closes the waiting connection rather than
-    /// parking the transport thread, which on ESP is the httpd task every inbound connection
-    /// shares.
+    /// Bound on the transport's wait_until_writable() before it closes an unadmitted connection:
+    /// a tick's Noise DH operations plus up to two INBOUND_ACQUIRE_TIMEOUT_MS waits for ring space
+    /// (a codec header and a stream marker, 200 ms), with a margin. Every lock the task takes is a
+    /// leaf held for a copy, so nothing else stretches a tick, and a task stalled beyond it closes
+    /// the waiting connection rather than parking the transport thread.
     static constexpr uint32_t WRITABLE_WAIT_MS = 500;
 
     InboundGate() {
@@ -700,29 +771,18 @@ public:
 
     // ---- Admission ----
 
-    /// @brief Records whether the connection holds an admitted slot. Written on the thread that
-    /// admits and drops connections.
     void set_admitted(bool admitted) {
         this->admitted_.store(admitted, std::memory_order_release);
     }
 
-    /// @brief Whether the connection holds an admitted slot. Any thread; the transport reads it
-    /// to choose between the ring and the fallback buffer.
     bool is_admitted() const {
         return this->admitted_.load(std::memory_order_acquire);
     }
 
     // ---- Fallback hand-off ----
 
-    /// @brief Whether a pre-admission message of `len` bytes is within the cap; the transport
-    /// closes the connection on one that is not
-    static constexpr bool pre_admission_message_fits(size_t len) {
-        return len <= PRE_ADMISSION_MESSAGE_BYTES;
-    }
-
-    /// @brief Whether the transport may write its next message anywhere: false while a
-    /// pre-admission message is pending. Transport thread; only the transport sets the pending
-    /// flag, so a true answer stays true until the transport itself publishes.
+    /// @brief Whether the transport may write its next message anywhere: false while a message
+    /// is pending. Only the transport publishes, so a true answer stays true until it does.
     bool may_write() const {
         return !this->message_pending_.load(std::memory_order_acquire);
     }
@@ -739,9 +799,8 @@ public:
     ///         gate is detached with a message still pending.
     bool wait_until_writable(uint32_t timeout_ms);
 
-    /// @brief Publishes the complete message now in the fallback buffer. Transport thread, after
-    /// writing it; the caller then wakes the protocol task.
-    /// @return false, publishing nothing, while an earlier message is still pending.
+    /// @brief Publishes the complete message now in the fallback buffer; the caller then wakes
+    /// the protocol task. @return false, publishing nothing, while an earlier one is pending.
     bool publish_pending_message() {
         if (!this->may_write()) {
             return false;
@@ -753,13 +812,12 @@ public:
         return true;
     }
 
-    /// @brief Whether a published message waits in the fallback buffer. Protocol task.
     bool has_pending_message() const {
         return this->message_pending_.load(std::memory_order_acquire);
     }
 
     /// @brief Hands the fallback buffer back to the transport and wakes it out of
-    /// wait_until_writable(). Protocol task, once it is done reading the message.
+    /// wait_until_writable(), once the protocol task is done reading the message
     void consume_pending_message() {
         this->message_pending_.store(false, std::memory_order_release);
         this->consumed_flags_.set(CONSUMED);
@@ -767,10 +825,8 @@ public:
 
     // ---- In-flight ring items ----
 
-    /// @brief Counts a ring item the transport is about to acquire. Transport thread, before
-    /// InboundRing::acquire().
-    /// @return false, counting nothing, while a pre-admission message is pending (see the class
-    ///         comment); the transport waits with wait_until_writable() and routes again.
+    /// @brief Counts a ring item the transport is about to acquire. @return false, counting
+    /// nothing, while a message is pending; the transport waits and routes again.
     bool begin_ring_write() {
         if (!this->may_write()) {
             return false;
@@ -780,60 +836,49 @@ public:
     }
 
     /// @brief Uncounts an item whose acquire failed, or a DISCARD item once it is completed
-    /// (InboundRing::take() returns those without the protocol task seeing them). Transport
-    /// thread.
+    /// (InboundRing::take() returns those without the protocol task seeing them)
     void abandon_ring_write() {
         this->in_flight_.fetch_sub(1, std::memory_order_acq_rel);
     }
 
-    /// @brief Uncounts an item the protocol task has taken from the ring. Protocol task.
+    /// @brief Uncounts an item the protocol task has taken from the ring
     void note_item_taken() {
         this->in_flight_.fetch_sub(1, std::memory_order_acq_rel);
     }
 
-    /// @brief Ring items begun and not yet taken. Any thread.
     uint32_t in_flight() const {
         return this->in_flight_.load(std::memory_order_acquire);
     }
 
     // ---- Close ----
 
-    /// @brief Records that the transport has closed. Transport thread, after its last item is
-    /// completed or its last message published; the caller then wakes the protocol task.
+    /// @brief Records that the transport has closed, after its last item is completed or its
+    /// last message published; the caller then wakes the protocol task
     void mark_transport_closed() {
         this->transport_closed_.store(true, std::memory_order_release);
-    }
-
-    /// @brief Whether the transport has closed, whether or not its messages are drained
-    bool is_transport_closed() const {
-        return this->transport_closed_.load(std::memory_order_acquire);
     }
 
     // ---- Detach ----
 
     /// @brief Records that nothing reads this connection any more and wakes a transport waiting
-    /// in wait_until_writable(). Any thread: the connection manager when the connection leaves
-    /// it, and the protocol task when it closes the connection. Never cleared.
+    /// in wait_until_writable(). Never cleared.
     void detach() {
         this->detached_.store(true, std::memory_order_release);
         this->consumed_flags_.set(CONSUMED);
     }
 
-    /// @brief Whether detach() ran. Any thread; the transport drops what it receives once it is
-    /// true, and the protocol task drops what it takes for the connection.
     bool is_detached() const {
         return this->detached_.load(std::memory_order_acquire);
     }
 
     /// @brief Whether the protocol task may honour the close: the transport has closed, and
-    /// every ring item it wrote has been taken and no pre-admission message waits, so acting on
-    /// the close now keeps "after every message" ordering. The flag is read first: once it reads
-    /// true the transport writes nothing more, so the counts read after it are final on the
-    /// transport's side. An acquired-but-uncompleted item of another connection can hold this
-    /// connection's completed items back in the ring, which is why the flag alone is not enough.
-    /// Protocol task.
+    /// every ring item it wrote has been taken and no message waits, so acting on the close now
+    /// keeps "after every message" ordering. The flag is read first: once it reads true the
+    /// transport writes nothing more, so the counts read after it are final on the transport's
+    /// side. An acquired-but-uncompleted item of another connection can hold this connection's
+    /// completed items back in the ring, which is why the flag alone is not enough.
     bool close_ready() const {
-        return this->is_transport_closed() && this->in_flight() == 0 &&
+        return this->transport_closed_.load(std::memory_order_acquire) && this->in_flight() == 0 &&
                !this->has_pending_message();
     }
 
@@ -842,25 +887,27 @@ private:
     static constexpr uint32_t CONSUMED = 1U << 0;
 
     // Struct fields
-    /// Set by the protocol task (consume_pending_message()), waited on and cleared by the
-    /// transport thread (wait_until_writable(), publish_pending_message()).
+    /// Set by the protocol task (consume_pending_message()) and by detach(); waited on and
+    /// cleared by the transport thread (wait_until_writable(), publish_pending_message()).
     EventFlags consumed_flags_;
 
     // 32-bit fields
-    /// in_flight counts the items the protocol task will be handed. The transport uncounts an
-    /// item it knows will never be handed over: a failed acquire at once, a DISCARD item only
-    /// after complete(). So close_ready() can never be true while the transport still holds an
-    /// uncompleted item. Incremented and uncounted by the transport thread; decremented by the
-    /// protocol task at take.
+    /// The items the protocol task will be handed. The transport uncounts an item it knows will
+    /// never be handed over: a failed acquire at once, a DISCARD item only after complete(), so
+    /// close_ready() can never be true while the transport still holds an uncompleted item.
+    /// Incremented and uncounted by the transport thread; decremented by the protocol task at
+    /// take.
     std::atomic<uint32_t> in_flight_{0};
 
     // 8-bit fields
-    /// Written by the thread that admits and drops connections; read by the transport thread and
-    /// any thread asking whether the connection is admitted.
+    /// Written by the protocol task as the connection enters and leaves an admitted slot; read
+    /// by the transport thread, to route a message, and the protocol task.
     std::atomic<bool> admitted_{false};
-    /// Set by the protocol task (the connection manager, or the receive path closing the
-    /// connection), or by stop() once it is joined; read by the transport thread and the protocol
-    /// task.
+    /// Set by the protocol task (the connection manager when the connection leaves it, the
+    /// receive path closing it); by the transport thread closing it (fail_inbound()); by the
+    /// thread delivering an accept the command queue refused; and by the main loop with the
+    /// protocol task joined (a late accept's refusal in stop(), ~ConnectionManager). Read by the
+    /// transport thread and the protocol task.
     std::atomic<bool> detached_{false};
     /// Set by the transport thread (publish), cleared by the protocol task (consume).
     std::atomic<bool> message_pending_{false};
@@ -1064,66 +1111,12 @@ static constexpr size_t inbound_frames_stored_bytes(size_t payload_bytes) {
            (remainder > 0 ? SharedRingLayout::stored_size(remainder + FRAME_OVERHEAD) : 0);
 }
 
-/// @brief The longest the player can hold its oldest item, in whole seconds: its quota filled
-/// with audio at the lowest budgeted rate (INBOUND_MIN_AUDIO_STORED_BYTES_PER_SECOND), rounded
-/// up. 0 without the player.
-static constexpr size_t inbound_max_hold_seconds(size_t audio_hold_bytes) {
-    return (audio_hold_bytes + INBOUND_MIN_AUDIO_STORED_BYTES_PER_SECOND - 1) /
-           INBOUND_MIN_AUDIO_STORED_BYTES_PER_SECOND;
-}
-
-/// @brief The longest the visualizer holds its oldest frame, in whole seconds, assuming the server
-/// fills its quota at the requested rate (visualizer_stored_bytes_per_second, every type at
-/// rate_max), rounded up. 0 without the visualizer.
-///
-/// rate_max is a cap, not a floor, so this is the shortest hold, a lower bound: a sparser stream
-/// (a beat-only stream at two frames a second against a rate_max of 30) fills the same quota
-/// over a far longer window and pins the pass-through traffic arriving meanwhile longer than
-/// budgeted. No minimum rate is assumed instead, since a sparse stream would derive an absurd
-/// ring; the symptom is the transport's "ring pinned behind held items" warning and the dropped
-/// messages it reports.
-static constexpr size_t inbound_visualizer_hold_seconds(const InboundRingBudget& budget) {
-    if (budget.visualizer_stored_bytes_per_second == 0) {
-        return 0;
-    }
-    return (budget.visualizer_hold_bytes + budget.visualizer_stored_bytes_per_second - 1) /
-           budget.visualizer_stored_bytes_per_second;
-}
-
-/// @brief The longest any holder keeps its oldest item, in whole seconds: the player's hold
-/// (inbound_max_hold_seconds()) or the visualizer's (inbound_visualizer_hold_seconds()),
-/// whichever is longer. Everything that arrives meanwhile stays unreclaimable behind that item.
-static constexpr size_t inbound_hold_seconds(const InboundRingBudget& budget) {
-    return std::max(inbound_max_hold_seconds(budget.audio_hold_bytes),
-                    inbound_visualizer_hold_seconds(budget));
-}
-
-/// @brief Pass-through traffic that can arrive during the longest hold window
-/// (inbound_hold_seconds()) and is returned at once, or at its display time, but stays
-/// unreclaimable behind the oldest held item: the state JSON budget and every time-burst reply
-/// in the window, and the visualizer frames the player's window carries. Within the visualizer's
-/// own window its frames are the ones its quota already holds.
-static constexpr size_t inbound_held_passthrough_bytes(const InboundRingBudget& budget) {
-    const size_t hold_seconds = inbound_hold_seconds(budget);
-    if (hold_seconds == 0) {
-        return 0;
-    }
-    const size_t bursts =
-        budget.time_burst_interval_ms > 0
-            ? hold_seconds * 1000 / static_cast<size_t>(budget.time_burst_interval_ms) + 1
-            : 0;
-    return hold_seconds * INBOUND_STATE_BYTES_PER_SECOND +
-           inbound_max_hold_seconds(budget.audio_hold_bytes) *
-               budget.visualizer_stored_bytes_per_second +
-           bursts * budget.time_burst_size * INBOUND_TIME_REPLY_STORED_BYTES;
-}
-
-/// @brief Artwork that can sit in the ring at once: one image per channel per track change
-/// within the longest hold window (INBOUND_MIN_TRACK_SECONDS), plus the set in flight, since
-/// an image returned at its display time is still pinned behind items held longer.
-static constexpr size_t inbound_artwork_bytes(const InboundRingBudget& budget) {
-    const size_t images = inbound_hold_seconds(budget) / INBOUND_MIN_TRACK_SECONDS + 1;
-    return images * budget.artwork_images_stored_bytes;
+/// @brief The longest a holder keeps its oldest item, in whole seconds: `held_bytes` of quota
+/// filled at `stored_bytes_per_second`, rounded up; 0 for a holder that is not enabled.
+static constexpr size_t inbound_hold_seconds(size_t held_bytes, size_t stored_bytes_per_second) {
+    return stored_bytes_per_second == 0
+               ? 0
+               : (held_bytes + stored_bytes_per_second - 1) / stored_bytes_per_second;
 }
 
 /**
@@ -1133,16 +1126,19 @@ static constexpr size_t inbound_artwork_bytes(const InboundRingBudget& budget) {
  * oldest held item is outstanding stays unreclaimable until it is returned: JSON, time replies,
  * visualizer frames and artwork returned at their display time, and dropped items alike. The
  * ring therefore holds:
- *  - the player's hold window (audio_hold_bytes),
- *  - the visualizer's quota (visualizer_hold_bytes), for the frames it holds before display,
- *  - the pass-through traffic arriving inside the longest hold window, the player's or the
- *    visualizer's (inbound_held_passthrough_bytes(): the state JSON and time-burst budget times
- *    inbound_hold_seconds(), and the visualizer's frame rate times the player's hold,
- *    inbound_max_hold_seconds()). A visualizer frame is returned at its display time, a few
- *    seconds after it arrives, but stays pinned behind audio received after it and held far
- *    longer, so its own quota does not bound it,
- *  - the artwork that window carries (inbound_artwork_bytes()), or INBOUND_PASSTHROUGH_MESSAGES
- *    items of largest_message_bytes without artwork,
+ *  - the player's quota (audio_hold_bytes) and the visualizer's (visualizer_hold_bytes);
+ *  - the pass-through traffic arriving inside the longest hold window: the state JSON budget and
+ *    every time-burst reply in it, and the visualizer frames the player's window carries, since a
+ *    frame returned at its display time stays pinned behind audio held far longer. The player
+ *    holds its oldest chunk for its quota at INBOUND_MIN_AUDIO_STORED_BYTES_PER_SECOND; the
+ *    visualizer its oldest frame for its quota at rate_max, a lower bound, since rate_max is a
+ *    cap: a sparser stream (a beat-only stream at two frames a second against a rate_max of 30)
+ *    pins the pass-through longer than budgeted, and assuming a minimum rate instead would
+ *    derive an absurd ring for a sparse stream. The codec headers and markers the protocol task
+ *    writes for the holders are uncharged (InboundConsumer::hand()) and fall inside this term;
+ *  - the artwork that window carries, one image per channel per INBOUND_MIN_TRACK_SECONDS plus
+ *    the set in flight, or INBOUND_PASSTHROUGH_MESSAGES items of largest_message_bytes without
+ *    artwork;
  * and never less than two items of largest_message_bytes (inbound_ring_min_storage_bytes()),
  * rounded up to the 4-byte multiple FreeRTOS requires. Unadmitted connections never write into
  * the ring (InboundGate), so they add nothing.
@@ -1150,37 +1146,45 @@ static constexpr size_t inbound_artwork_bytes(const InboundRingBudget& budget) {
  * The largest item follows the enabled roles (inbound_largest_message_bytes()): a maximal Noise
  * frame with the artwork role or a player advertising a buffer of a frame or more, which floors
  * the ring at 131,152 bytes; a 16 KiB JSON message with neither, which floors it at 32,880 bytes;
- * and the player's longest chunk in between. An admitted connection's
- * message longer than the ring takes (InboundRing::max_message_bytes()) goes through the
- * connection's fallback buffer, one at a time and in order with its ring items, and is processed
- * there: JSON and artwork as from a ring item, while a frame a consumer would hold (a visualizer
- * frame past every requested size) finds no room for its copy and is dropped with a warning. The
- * audio and visualizer frames the roles budget for always fit, so they are never copied.
+ * and the player's longest chunk in between. A longer message goes through the connection's
+ * fallback buffer (InboundGate), and a frame a consumer would hold that arrives that way (a
+ * visualizer frame past every requested size) finds no room for its copy and is dropped with a
+ * warning; the audio and visualizer frames the roles budget for always fit.
  *
- * Traffic beyond this budget (a burst of large JSON, a lower audio rate than budgeted, faster
- * track changes) waits in the transport's acquire and is dropped after
- * INBOUND_ACQUIRE_TIMEOUT_MS with a warning naming the held items. So does a visualizer stream
- * sparser than its rate_max (see inbound_visualizer_hold_seconds()).
- *
- * The derivation assumes a server's visualizer lead never exceeds its audio lead. If it did, the
- * audio returned as it plays would stay pinned behind the oldest visualizer frame, and nothing
- * in the configuration bounds how long that frame is held.
+ * Traffic beyond this budget (a burst of large JSON, a lower audio rate or a sparser visualizer
+ * stream than budgeted, faster track changes) waits in the transport's acquire and is dropped
+ * after INBOUND_ACQUIRE_TIMEOUT_MS with a warning naming the held items. The derivation assumes a
+ * server's visualizer lead never exceeds its audio lead: otherwise audio returned as it plays
+ * would stay pinned behind the oldest visualizer frame, which nothing in the configuration
+ * bounds.
  *
  * With the default configuration (a 1,000,000-byte player quota, no visualizer or artwork) this
  * is 1,000,000 + 111,552 held pass-through bytes (87 s at 1,024 B/s, plus 9 bursts of 8 time
- * replies at 312 stored bytes) + 131,152 for two maximal messages = 1,242,704 bytes. The separate
- * buffers it replaced held 1,000,000 bytes of encoded audio plus one maximal payload buffer per
- * open connection (1,065,535 bytes with one connection: MAX_TRANSPORT_PLAINTEXT + 16), and
- * advertised 800,000 bytes to the server against the 666,666 the player advertises now (see
- * PlayerRole's AUDIO_BUFFER_ADVERTISE_DENOMINATOR).
+ * replies at 312 stored bytes) + 131,152 for two maximal messages = 1,242,704 bytes, against
+ * separate buffers of 1,000,000 bytes of encoded audio plus one maximal payload buffer per open
+ * connection (1,065,535 bytes with one connection).
  */
 static constexpr size_t derive_inbound_ring_bytes(const InboundRingBudget& budget) {
-    const size_t allowance = budget.artwork_images_stored_bytes > 0
-                                 ? inbound_artwork_bytes(budget)
-                                 : INBOUND_PASSTHROUGH_MESSAGES *
-                                       inbound_item_stored_bytes(budget.largest_message_bytes);
-    const size_t total = budget.audio_hold_bytes + budget.visualizer_hold_bytes +
-                         inbound_held_passthrough_bytes(budget) + allowance;
+    const size_t player_hold_seconds =
+        inbound_hold_seconds(budget.audio_hold_bytes, INBOUND_MIN_AUDIO_STORED_BYTES_PER_SECOND);
+    const size_t hold_seconds = std::max(
+        player_hold_seconds, inbound_hold_seconds(budget.visualizer_hold_bytes,
+                                                  budget.visualizer_stored_bytes_per_second));
+    const size_t bursts =
+        hold_seconds > 0 && budget.time_burst_interval_ms > 0
+            ? hold_seconds * 1000 / static_cast<size_t>(budget.time_burst_interval_ms) + 1
+            : 0;
+    const size_t held_passthrough =
+        hold_seconds * INBOUND_STATE_BYTES_PER_SECOND +
+        player_hold_seconds * budget.visualizer_stored_bytes_per_second +
+        bursts * budget.time_burst_size * INBOUND_TIME_REPLY_STORED_BYTES;
+    const size_t allowance =
+        budget.artwork_images_stored_bytes > 0
+            ? (hold_seconds / INBOUND_MIN_TRACK_SECONDS + 1) * budget.artwork_images_stored_bytes
+            : INBOUND_PASSTHROUGH_MESSAGES *
+                  inbound_item_stored_bytes(budget.largest_message_bytes);
+    const size_t total =
+        budget.audio_hold_bytes + budget.visualizer_hold_bytes + held_passthrough + allowance;
     return SharedRingLayout::align(
         std::max(total, inbound_ring_min_storage_bytes(budget.largest_message_bytes)));
 }

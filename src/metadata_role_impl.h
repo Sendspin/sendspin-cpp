@@ -43,7 +43,7 @@ struct PendingMetadataStates {
 };
 
 /// @brief Private implementation of the metadata role
-struct MetadataRole::Impl {
+struct MetadataRole::Impl : RoleTeardown {
     explicit Impl(SendspinClient* client);
     ~Impl() = default;
 
@@ -76,16 +76,6 @@ struct MetadataRole::Impl {
     bool state_is_due(int64_t timestamp) const;
     /// Applies the held state and fires the listener once its server-clock deadline has passed.
     void apply_due_state();
-    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
-    ///
-    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
-    /// runs, and stop()'s teardown on the main loop can land in between. Re-checking at each point
-    /// of effect invalidates the whole handler instead of only the part that ran before it. The
-    /// drain applies the same check to a slot payload's stamp.
-    /// @param generation The counter value captured when the message was admitted.
-    bool accepts(uint32_t generation) const {
-        return generation == this->cleanup_generation.load(std::memory_order_acquire);
-    }
 
     /// @brief Stops the role and discards the state the protocol task can reach. Protocol task,
     /// or the main loop in SendspinClient::stop() once every other thread is joined.
@@ -117,19 +107,12 @@ struct MetadataRole::Impl {
     // State taken from the inbox slot, awaiting its server-clock deadline. Main-thread only:
     // written and read exclusively from drain_events()/complete_teardown() on the loop thread.
     std::optional<ServerMetadataStateObject> held_state;
-    TeardownTracker teardown;  ///< Main loop only.
 
     // Pointer fields
     SendspinClient* client;
     std::unique_ptr<EventState> event_state;
     Inbox* inbox{nullptr};
     MetadataRoleListener* listener{nullptr};
-
-    // 32-bit fields
-    /// @brief Teardown generation, bumped by cleanup() and re-checked at every point of effect
-    /// (see accepts()). Written on the protocol task (or the main loop in stop() once it is
-    /// joined); read on the main loop.
-    std::atomic<uint32_t> cleanup_generation{0};
 };
 
 }  // namespace sendspin

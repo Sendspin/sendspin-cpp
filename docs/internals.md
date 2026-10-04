@@ -34,8 +34,8 @@ The primitives other than the Inbox and the inbound ring live in `src/platform/`
 | Channel | Producer | Consumer |
 |---------|----------|----------|
 | `InboundRing` (`src/inbound_ring.h`, see [The Inbound Ring](#the-inbound-ring)) | Transport threads, each admitted connection's messages; the protocol task, the items it writes itself (codec headers, clear markers, copied chunks) | The protocol task, in arrival order; an item handed to a role is returned by that role's consumer thread |
-| The player's `InboundItemList` (`SyncTask::encoded_items_`) | Protocol task, appending the items it charges to the player's quota | Sync task, which takes and returns them; the protocol task recalls a torn-down stream's, and the main loop the rest once the thread is joined |
-| The visualizer's `InboundItemList` (`DrainTask::items`) | Protocol task, against the visualizer's quota | Visualizer drain thread, likewise |
+| The player's `InboundConsumer` (`SyncTask::inbound_`) | Protocol task, appending the items it charges to the player's quota | Sync task, which takes and returns them; the protocol task recalls a torn-down stream's, and the main loop the rest once the thread is joined |
+| The visualizer's `InboundConsumer` (`DrainTask::inbound`) | Protocol task, against the visualizer's quota | Visualizer drain thread, likewise |
 | `InboundGate`, one per connection | The connection's transport: the fallback message in flight, the count of ring items not yet taken, the out-of-band close | The protocol task, which takes and consumes them and detaches the gate; the connection manager detaches it when the connection leaves it, from any thread |
 | `ProtocolTask` command queue (`ProtocolCommand`) | Transport threads (accepts of upgraded inbound connections); any thread (`connect_to()`, `disconnect()`, `leave()`, the pairing-window gestures, `send_text()`, unpaired-access changes) | The protocol task; at `stop()`, the joining thread for what the final tick left |
 | `ProtocolTask` state slot (`publish_state()`) | Any thread, latest-wins `client/state` | The protocol task |
@@ -45,7 +45,7 @@ The primitives other than the Inbox and the inbound ring live in `src/platform/`
 | `ThreadSafeQueue` (the artwork notification queue) | Protocol task | Artwork decode thread |
 | `ShadowSlot` (sync-task playback progress) | The consumer's audio thread (`notify_audio_played()`) | Sync task |
 | `Inbox` (`src/inbox.h`, see [Inbox](#inbox)) | Protocol task, sync task, artwork decode thread | Main loop |
-| `ConnectionManager` time filter and server information slots | Protocol task (`refresh_published_state()`) | Any thread (`time_filter()`, `server_information()`) |
+| `ConnectionManager` published primary slot (time filter and server information) | Protocol task (`refresh_published_state()`) | Any thread (`time_filter()`, `server_information()`) |
 | Each connection's `SendspinTimeFilter` | Protocol task (its burst's measurements) | Sync task and visualizer drain thread, converting timestamps |
 | `RecordStore` | Protocol task (resolves and changes records) | Main loop (writes them to the provider) |
 
@@ -53,13 +53,13 @@ Plain atomics carry the rest: the `connected_` and `accepting_` flags on `Connec
 
 ### Locks
 
-Every library lock is a leaf: it is held only to copy or update its own state, never across a call that takes another library lock, a send, a listener or the persistence provider, so no two library locks are ever held at once and there is no lock order. The locks are the Inbox's `mutex_`; the inbound ring's own (`SharedRingBuffer::mtx_` on host, the FreeRTOS ring's internal lock on ESP); each `InboundItemList::mutex_`; `ProtocolTask::command_mutex_` (the command queue and the state slot); `ConnectionManager::time_filter_mutex_` and `server_info_mutex_`; `GoodbyeWait::mutex`; each `SendspinTimeFilter::state_mutex_`; `RecordStore::mutex_`; the artwork role's `DrainTask::slot_mutex`; each `ShadowSlot::mutex_`; the ESP server's `SendspinWsServer::pending_mutex_`; and, on host, the mutexes inside `EventFlags` and `ThreadSafeQueue`. Connection state has no lock at all: only the protocol task touches it, except the transport's own atomics, which state their writer and reader at their declaration.
+Every library lock is a leaf: it is held only to copy or update its own state, never across a call that takes another library lock, a send, a listener or the persistence provider, so no two library locks are ever held at once and there is no lock order. The locks are the Inbox's `mutex_`; the inbound ring's own (`SharedRingBuffer::mtx_` on host, the FreeRTOS ring's internal lock on ESP); each `InboundItemList::mutex_`; `ProtocolTask::command_mutex_` (the command queue and the state slot); `ConnectionManager::published_mutex_` (which also serialises the role threads' `time_filter()` reads behind `server_information()` copies); `GoodbyeWait::mutex`; each `SendspinTimeFilter::state_mutex_`; `RecordStore::mutex_`; the artwork role's `DrainTask::slot_mutex`; each `ShadowSlot::mutex_`; the ESP server's `SendspinWsServer::pending_mutex_`; and, on host, the mutexes inside `EventFlags` and `ThreadSafeQueue`. Connection state has no lock at all: only the protocol task touches it, except the transport's own atomics, which state their writer and reader at their declaration.
 
 ### The Inbound Ring
 
 One `InboundRing` serves every admitted connection, created by `start()` whatever roles are enabled. A transport receives each complete message of an admitted connection straight into an item it acquires; the protocol task decrypts it in place and either dispatches it and returns the item at once (JSON, time replies, artwork) or hands the item itself to a role's consumer thread through that role's item list (a player audio chunk, a visualizer frame), which returns it when done. An unadmitted connection never writes the ring: it delivers one message at a time through its fallback buffer (`InboundGate`), so an unauthenticated peer cannot pin ring space.
 
-Space is reclaimed in ring order, so everything received while the oldest held item is out stays allocated until it returns. Each holder's outstanding items are charged to its own `InboundQuota` on the protocol task: a role over its quota has the new item dropped and returned with a warning, and the other holder keeps flowing. `derive_inbound_ring_bytes()` (`src/inbound_ring.h`) sizes the ring from the quotas, the pass-through traffic that arrives during the longest hold (state JSON, time-burst replies, and visualizer frames behind held audio), and the artwork images that window carries, and never below two of the longest messages the enabled roles need in one item: a JSON message (`INBOUND_JSON_MESSAGE_BYTES`), the longest chunk the player's and the visualizer's advertised buffers allow, or a maximal Noise frame with artwork. A message longer than the ring takes (`InboundRing::max_message_bytes()`) goes through the connection's fallback buffer, in order behind the ring items the connection wrote before it.
+Space is reclaimed in ring order, so everything received while the oldest held item is out stays allocated until it returns. Each holder's outstanding items are charged to its own `InboundQuota` on the protocol task, all but the codec headers and stream markers the task writes itself: a role over its quota has the new item dropped and returned with a warning, and the other holder keeps flowing. `derive_inbound_ring_bytes()` (`src/inbound_ring.h`) sizes the ring from the quotas, the pass-through traffic that arrives during the longest hold (state JSON, time-burst replies, and visualizer frames behind held audio), and the artwork images that window carries, and never below two of the longest messages the enabled roles need in one item: a JSON message (`INBOUND_JSON_MESSAGE_BYTES`), the longest chunk the player's and the visualizer's advertised buffers allow, or a maximal Noise frame with artwork. A message longer than the ring takes (`InboundRing::max_message_bytes()`) goes through the connection's fallback buffer, in order behind the ring items the connection wrote before it.
 
 ### Inbox
 
@@ -109,8 +109,8 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
    the WebSocket server start once the network is ready
 9. ConnectionManager::run_time_sync(): each admitted, operational connection's time burst, and
    the client/state that waited for its first measurement
-10. ConnectionManager::refresh_published_state(): the time filter, server information and
-    connected slots other threads read
+10. ConnectionManager::refresh_published_state(): the published primary slot (time filter and
+    server information) and the connected flag other threads read
 ```
 
 The tick returns the milliseconds until the earliest of its timers: a nursery entry's hello retry or establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound, or one that freed a held-back fallback message, returns 0 and runs again at once. No timer is periodic except the network poll, which runs only while the server is down, so an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 6, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
@@ -209,8 +209,9 @@ Transport thread (IXWebSocket / esp_http_server / esp_websocket_client)
   │  message longer than the ring takes (InboundRing::max_message_bytes()) goes to the
   │  fallback buffer, waiting the same bound for the previous one to be consumed, else
   │  dropped with a warning; on the ESP server, which must drain the frame into a discard
-  │  buffer sized to the ring's longest message, the connection closes instead: every
-  │  admitted fallback drop closes on ESP
+  │  buffer sized to the longest message a conforming server sends
+  │  (InboundRing::largest_message_bytes()), the connection closes instead: every admitted
+  │  fallback drop closes on ESP
   ├─ Unadmitted connection: receives into its fallback buffer and publishes it as the one
   │  pending message (waits up to InboundGate::WRITABLE_WAIT_MS for the previous one, else
   │  closes); a message over InboundGate::PRE_ADMISSION_MESSAGE_BYTES closes
@@ -330,7 +331,7 @@ A later `server/activate` can remove roles. Each removed role runs the same `cle
 
 ### Time Filter Slot
 
-Role threads convert server timestamps through `SendspinClient::is_time_synced()` and `get_client_time()`: the sync task per chunk, the visualizer drain thread per frame. Both resolve the primary admitted connection's `SendspinTimeFilter` through `ConnectionManager::time_filter()`, which reads a slot of its own (`time_filter_`, under the leaf `time_filter_mutex_`) and never waits on the protocol task. `refresh_published_state()` writes the slot, with the server-information slot beside it, whenever the primary connection changes, so it always names the primary connection's filter; a role thread holding the filter never holds the connection, whose destructor can join a transport thread.
+Role threads convert server timestamps through `SendspinClient::is_time_synced()` and `get_client_time()`: the sync task per chunk, the visualizer drain thread per frame. Both resolve the primary admitted connection's `SendspinTimeFilter` through `ConnectionManager::time_filter()`, which reads the `PublishedPrimary` slot (`published_`, under the leaf `published_mutex_`) and never waits on the protocol task. `refresh_published_state()` writes that one slot, holding both the filter and the server information, whenever the primary connection changes, so it always names the primary connection's filter; a role thread holding the filter never holds the connection, whose destructor can join a transport thread.
 
 Each getter reads the slot once, so a caller that checks `is_time_synced()` and then calls `get_client_time()` can see two different connections across a server handoff. A drop or handoff commands the stream to end before it changes the slot, so the sync task leaves the stream before transferring such a chunk; the shutdown pass empties the slot before the role threads stop, and the 0 an empty slot returns reads as late.
 

@@ -21,7 +21,6 @@
 #include "sendspin/client.h"
 
 #include <algorithm>
-#include <cinttypes>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -351,31 +350,29 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t ge
         SS_LOGV(TAG, "Discarding audio chunk while unavailable");
         return;
     }
-    if (!this->sync_task->accepts_items()) {
+    InboundConsumer& inbound = this->sync_task->inbound();
+    if (inbound.ring() == nullptr) {
         SS_LOGW(TAG, "Failed to send audio chunk: the sync task is not running");
         return;
     }
-    if (message.item != nullptr) {
-        // The zero-copy path: the chunk stays in the ring item it was received and decrypted
-        // into, and the sync task decodes it from there.
-        void* item = std::exchange(message.item, nullptr);
-        this->hand_item(item, message.item_len, CHUNK_TYPE_ENCODED_AUDIO, AUDIO_FRAME_OFFSET,
-                        static_cast<uint32_t>(chunk->audio_len), generation);
-        return;
-    }
-    // A chunk reassembled from Noise fragments (one larger than a Noise frame) or delivered
-    // before admission is not in a ring item: copied into one, whole, so its timestamp stays
-    // at plaintext bytes 1-8. No wait: audio over a full ring is dropped, as above.
-    if (!this->hand_local_item(message.data, message.len, CHUNK_TYPE_ENCODED_AUDIO,
-                               AUDIO_FRAME_OFFSET, message.receive_time_us, 0, generation)) {
-        // Throttled like the over-quota drop (see InboundDropLog); an over-quota drop has
-        // already been counted there.
-        if (this->copy_drop_log.note_drop()) {
-            SS_LOGW(TAG, "Failed to copy an audio chunk into the inbound ring; dropping");
+    void* item = std::exchange(message.item, nullptr);
+    size_t item_len = message.item_len;
+    if (item == nullptr) {
+        // A chunk reassembled from Noise fragments (one larger than a Noise frame) or routed
+        // through the fallback buffer (longer than the ring takes) is not in a ring item: copied
+        // into one, whole, so its timestamp stays at plaintext bytes 1-8. No wait: audio over a
+        // full ring is dropped, like audio over the quota.
+        item = inbound.copy_local(message.data, message.len, message.receive_time_us, 0);
+        if (item == nullptr) {
+            inbound.note_drop("has no ring space to copy an audio chunk into; dropping");
+            return;
         }
-    } else if (const uint32_t dropped = this->copy_drop_log.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Dropped %" PRIu32 " audio chunks that could not be copied", dropped);
+        item_len = message.len;
     }
+    // Otherwise the zero-copy path: the chunk stays in the ring item it was received and
+    // decrypted into, and the sync task decodes it from there.
+    this->hand_item(item, item_len, CHUNK_TYPE_ENCODED_AUDIO, AUDIO_FRAME_OFFSET,
+                    static_cast<uint32_t>(chunk->audio_len), generation);
 }
 
 void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj,
@@ -403,10 +400,8 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
                                        ? CHUNK_TYPE_PCM_DUMMY_HEADER
                                        : CHUNK_TYPE_OPUS_DUMMY_HEADER;
 
-            header_sent = this->sync_task->accepts_items() &&
-                          this->hand_local_item(reinterpret_cast<const uint8_t*>(&header),
-                                                sizeof(DummyHeader), chunk_type, 0, 0,
-                                                HEADER_SEND_TIMEOUT_MS, generation);
+            header_sent = this->hand_local_item(reinterpret_cast<const uint8_t*>(&header),
+                                                sizeof(DummyHeader), chunk_type, generation);
             if (!header_sent) {
                 SS_LOGE(TAG, "Failed to send codec header");
             }
@@ -414,8 +409,7 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
             if (!player_obj.codec_header.has_value()) {
                 SS_LOGE(TAG, "FLAC codec header missing");
             } else {
-                header_sent = this->sync_task->accepts_items() &&
-                              this->hand_flac_header(player_obj.codec_header.value(), generation);
+                header_sent = this->hand_flac_header(player_obj.codec_header.value(), generation);
                 if (!header_sent) {
                     SS_LOGE(TAG, "Failed to send codec header");
                 }
@@ -466,10 +460,8 @@ void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
     // so the sync task starts draining (freeing ring space) before the marker is written.
     // No listener callback: a seek is not a stream lifecycle event for the consumer.
     this->sync_task->signal_stream_clear();
-    if (!this->sync_task->accepts_items() ||
-        !this->hand_local_item(nullptr, 0, CHUNK_TYPE_STREAM_CLEAR_MARKER, 0, 0,
-                               HEADER_SEND_TIMEOUT_MS, generation)) {
-        // The marker couldn't be appended (no ring space, or over quota). The sync task will
+    if (!this->hand_local_item(nullptr, 0, CHUNK_TYPE_STREAM_CLEAR_MARKER, generation)) {
+        // The marker couldn't be appended (no ring space). The sync task will
         // still drain to empty and apply the clear, but the pre-seek/post-seek boundary is lost,
         // so new audio may be discarded along with the old.
         SS_LOGW(TAG, "Failed to append stream/clear marker; seek boundary may be imprecise");
@@ -516,21 +508,14 @@ void PlayerRole::Impl::on_stream_ring_event(const InboxEvent& event) {
 }
 
 void PlayerRole::Impl::drain_events() {
-    // Taken before the catch-up, like every slot role's drain: a teardown that ran before the
-    // take is caught up below and drops a command stamped before it; one that runs after the take
-    // is caught up by the next drain. The sync-idle note is taken before is_running() is read
-    // below, so an idle transition after that read sets the bit again for the next drain.
-    ServerCommandMessage cmd_msg{};
-    uint32_t stamp = 0;
-    bool have_command = this->event_state->command_slot.take(cmd_msg, stamp);
+    // The sync-idle note is taken before is_running() is read below, so an idle transition after
+    // that read sets the bit again for the next drain.
     bool sync_idle_note = false;
     (void)this->event_state->sync_idle_slot.take(sync_idle_note);
-    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
-    catch_up_teardown(*this, generation);
-    if (have_command && stamp != generation) {
-        SS_LOGD(TAG, "Dropping a server command queued before the role was torn down");
-        have_command = false;
-    }
+    ServerCommandMessage cmd_msg{};
+    bool have_command = false;
+    const uint32_t generation = take_current_payload(*this, this->event_state->command_slot,
+                                                     cmd_msg, have_command, TAG, "server command");
 
     // --- Server command events (volume, mute, output delay) ---
     // Check each field independently since multiple command types may have been merged into one
@@ -728,20 +713,7 @@ void PlayerRole::Impl::complete_teardown() {
 // ============================================================================
 
 void PlayerRole::Impl::recall_stale_items(uint32_t generation) {
-    if (generation == this->recalled_generation || !this->sync_task->accepts_items()) {
-        return;
-    }
-    // Every item on the list was appended under an earlier generation: an append under
-    // `generation` runs this first, so none of its items can be here yet.
-    this->recalled_generation = generation;
-    this->sync_task->recall_items();
-    // The stream the drops belonged to is gone, so no delivery will end their runs.
-    if (const uint32_t dropped = this->over_quota_log.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Player dropped %" PRIu32 " items over its buffer", dropped);
-    }
-    if (const uint32_t dropped = this->copy_drop_log.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Dropped %" PRIu32 " audio chunks that could not be copied", dropped);
-    }
+    this->sync_task->inbound().recall_stale(generation);
 }
 
 bool PlayerRole::Impl::hand_item(void* item, size_t item_len, ChunkType chunk_type,
@@ -750,52 +722,35 @@ bool PlayerRole::Impl::hand_item(void* item, size_t item_len, ChunkType chunk_ty
     header->type = chunk_type;
     header->data_offset = data_offset;
     header->data_len = data_len;
-    header->generation = generation;
-    if (chunk_type != CHUNK_TYPE_ENCODED_AUDIO && chunk_type != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
+    const bool audio = chunk_type == CHUNK_TYPE_ENCODED_AUDIO;
+    if (!audio && chunk_type != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
         // A codec header numbers the stream it starts; handle_stream_start() computes the same
         // ordinal for its STREAM_START and adopts it once the header is handed over. Every other
         // item keeps acquire()'s 0.
         header->serial = static_cast<uint16_t>(this->stream_ordinal + 1);
     }
-    this->recall_stale_items(generation);
-    if (!this->sync_task->hand_item(item, item_len)) {
-        // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
-        // advertised buffer_capacity, which the quota covers at the smallest chunk size, so this
-        // is a server overrunning it. Throttled: see InboundDropLog.
-        if (this->over_quota_log.note_drop()) {
-            SS_LOGW(TAG, "Player over its %zu-byte buffer; dropping items until it drains",
-                    this->config.audio_buffer_capacity);
-        }
-        this->sync_task->ring()->return_item(item);
-        return false;
-    }
-    if (const uint32_t dropped = this->over_quota_log.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Player dropped %" PRIu32 " items over its buffer", dropped);
-    }
-    return true;
+    // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
+    // advertised buffer_capacity, which the quota covers at the smallest chunk size. A codec
+    // header and a clear marker are exempt (InboundConsumer::hand()).
+    return this->sync_task->inbound().hand(item, item_len, generation, /*exempt=*/!audio);
 }
 
 bool PlayerRole::Impl::hand_local_item(const uint8_t* data, size_t len, ChunkType chunk_type,
-                                       uint8_t data_offset, uint32_t receive_time_us,
-                                       uint32_t timeout_ms, uint32_t generation) {
-    if (len < data_offset) {
+                                       uint32_t generation) {
+    InboundConsumer& inbound = this->sync_task->inbound();
+    if (inbound.ring() == nullptr) {
         return false;
     }
-    InboundRing* ring = this->sync_task->ring();
-    void* item = ring->acquire_local(len, timeout_ms);
-    if (item == nullptr) {
-        return false;
-    }
-    if (len > 0) {
-        std::memcpy(inbound_item_bytes(item), data, len);
-    }
-    inbound_item_header(item)->receive_time_us = receive_time_us;
-    ring->complete(item);
-    return this->hand_item(item, len, chunk_type, data_offset,
-                           static_cast<uint32_t>(len - data_offset), generation);
+    void* item = inbound.copy_local(data, len, 0, HEADER_SEND_TIMEOUT_MS);
+    return item != nullptr &&
+           this->hand_item(item, len, chunk_type, 0, static_cast<uint32_t>(len), generation);
 }
 
 bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint32_t generation) {
+    InboundRing* ring = this->sync_task->inbound().ring();
+    if (ring == nullptr) {
+        return false;
+    }
     // Decoded straight into the item the sync task reads it from.
     const auto* input = reinterpret_cast<const unsigned char*>(codec_header.data());
     size_t decoded_len = 0;
@@ -804,7 +759,6 @@ bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint32_
         SS_LOGW(TAG, "FLAC codec header of %zu bytes is out of range", decoded_len);
         return false;
     }
-    InboundRing* ring = this->sync_task->ring();
     void* item = ring->acquire_local(decoded_len, HEADER_SEND_TIMEOUT_MS);
     if (item == nullptr) {
         return false;

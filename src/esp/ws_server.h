@@ -119,9 +119,11 @@ public:
     }
 
     /// @brief Sets the size of the buffer a dropped frame is read into (discard_buffer()): the
-    /// longest message a live connection can have dropped, max(InboundRing::max_message_bytes(),
-    /// InboundGate::PRE_ADMISSION_MESSAGE_BYTES). Call before start(); a frame longer than it is
-    /// closed rather than drained (SendspinServerConnection::discard_frame_payload()).
+    /// longest message a conforming server sends a live connection,
+    /// max(InboundRing::largest_message_bytes(), InboundGate::PRE_ADMISSION_MESSAGE_BYTES). Every
+    /// message an admitted connection routes through its fallback buffer is longer than the ring
+    /// takes and so than this. Call before start(); a frame longer than it is closed rather than
+    /// drained (SendspinServerConnection::discard_frame_payload()).
     void set_discard_capacity(size_t bytes) {
         this->discard_capacity_ = bytes;
         // A buffer a previous run left (stop() keeps it when httpd_stop() failed) may be shorter.
@@ -228,8 +230,9 @@ protected:
     /// @brief httpd control port override (0 = use ESP_HTTPD_DEF_CTRL_PORT + 1)
     uint16_t ctrl_port_{0};
 
-    /// @brief See set_discard_capacity(). Written by the protocol task before start(); read by
-    /// the httpd task, which start() creates after it.
+    /// @brief See set_discard_capacity(). Written before start() by the protocol task, or by the
+    /// main loop when ConnectionManager::start() starts the server at once; read by the httpd
+    /// task, which start() creates after it.
     size_t discard_capacity_{INBOUND_MAX_MESSAGE_BYTES};
 };
 

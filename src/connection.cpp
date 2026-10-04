@@ -24,7 +24,6 @@
 #include "time_filter.h"
 
 #include <algorithm>
-#include <cinttypes>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -36,6 +35,9 @@
 namespace sendspin {
 
 static const char* const TAG = "sendspin.connection";
+
+/// What acquire_drop_log_'s run reports.
+static const char* const DROPPED_MESSAGES = "messages for want of inbound space";
 
 // ============================================================================
 // Constructor / Destructor
@@ -52,9 +54,7 @@ SendspinConnection::SendspinConnection() {
 SendspinConnection::~SendspinConnection() {
     // The last reference is gone, so no transport callback can still run on this connection:
     // the drop log is this thread's now, and no delivery will end its run.
-    if (const uint32_t dropped = this->acquire_drop_log_.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Dropped %" PRIu32 " messages for want of inbound space", dropped);
-    }
+    this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
 }
 
 // ============================================================================
@@ -346,7 +346,7 @@ void SendspinConnection::dispatch_complete_noise_message(InboundMessage& message
         }
         if (this->on_json_message_cb) {
             this->on_json_message_cb(
-                this, reinterpret_cast<const char*>(message.data + 1), message.len - 1,
+                *this, reinterpret_cast<const char*>(message.data + 1), message.len - 1,
                 widen_time_stamp_us(message.receive_time_us, platform_time_us()));
         }
         return;
@@ -354,7 +354,7 @@ void SendspinConnection::dispatch_complete_noise_message(InboundMessage& message
 
     // All other types: route as binary role message (full type-prefixed plaintext).
     if (this->on_binary_message_cb) {
-        this->on_binary_message_cb(this, message);
+        this->on_binary_message_cb(*this, message);
     }
 }
 
@@ -520,7 +520,7 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
     }
 
     if (!this->inbound_gate_.is_admitted()) {
-        if (!InboundGate::pre_admission_message_fits(len)) {
+        if (len > InboundGate::PRE_ADMISSION_MESSAGE_BYTES) {
             SS_LOGW(TAG, "Pre-admission message of %zu bytes exceeds the %zu-byte cap; closing",
                     len, InboundGate::PRE_ADMISSION_MESSAGE_BYTES);
             this->fail_inbound();
@@ -578,9 +578,7 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
         }
         return {nullptr, InboundRoute::DROP};
     }
-    if (const uint32_t dropped = this->acquire_drop_log_.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Dropped %" PRIu32 " messages for want of inbound space", dropped);
-    }
+    this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
     InboundItemHeader* header = inbound_item_header(item);
     header->connection_id = static_cast<uint32_t>(this->instance_id);
     header->receive_time_us = stamp;
@@ -618,9 +616,7 @@ SendspinConnection::InboundTarget SendspinConnection::route_to_fallback(size_t l
         return {nullptr, InboundRoute::CLOSE};
     }
     if (admitted) {
-        if (const uint32_t dropped = this->acquire_drop_log_.note_delivery(); dropped != 0) {
-            SS_LOGW(TAG, "Dropped %" PRIu32 " messages for want of inbound space", dropped);
-        }
+        this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
     }
     this->fallback_len_ = len;
     this->fallback_kind_ = kind;

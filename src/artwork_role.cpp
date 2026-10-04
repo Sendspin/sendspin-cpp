@@ -655,12 +655,12 @@ void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
 }
 
 void ArtworkRole::Impl::clear_every_channel() {
-    // Called from the ring drain in SendspinClient::loop() before this role's drain_events()
-    // runs each tick, or from the catch-up that heads it, so dropping the holds here cancels
-    // every display that predates the end. A display still in display_slot is left to its slot
-    // epoch, which the end bumped (discard_all_pending()): one decoded before it is dropped by
-    // the deadline check, and one decoded after it belongs to the next stream and fires after
-    // these clears.
+    // Called from the ring drain in SendspinClient::drain_inbox() before this role's
+    // drain_events() runs each tick, or from the catch-up that heads it, so dropping the holds
+    // here cancels every display that predates the end. A display still in display_slot is left to
+    // its slot epoch, which the end bumped (discard_all_pending()): one decoded before it is
+    // dropped by the deadline check, and one decoded after it belongs to the next stream and fires
+    // after these clears.
     this->held_display_mask = 0;
     this->held_display_clear = 0;
     {
@@ -696,23 +696,12 @@ void ArtworkRole::Impl::drain_events() {
     // timestamps[i] is a fresher pending display than whatever (if anything) slot i already
     // held. A stream end or teardown drained this tick has already run clear_every_channel()
     // before this call, so it has already cleared held_display_mask before we get here.
-    //
-    // Taken before the catch-up, like every slot role's drain: a teardown that ran before the
-    // take is caught up below (dropping the holds) and drops a display decoded before it; one
-    // that runs after the take is caught up by the next drain.
     ArtworkDisplayUpdate update{};
-    uint32_t stamp = 0;
-    bool have_update = this->event_state->display_slot.take(update, stamp);
-    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
-    catch_up_teardown(*this, generation);
-    // Also refused once a clear the catch-up fired re-entered teardown (a listener calling
-    // stop()), whose own drain already settled this role.
+    bool have_update = false;
+    const uint32_t generation = take_current_payload(*this, this->event_state->display_slot, update,
+                                                     have_update, TAG, "artwork displays");
     if (!this->accepts(generation)) {
         return;
-    }
-    if (have_update && stamp != generation) {
-        SS_LOGD(TAG, "Dropping artwork displays decoded before the role was torn down");
-        have_update = false;
     }
     if (have_update) {
         for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {

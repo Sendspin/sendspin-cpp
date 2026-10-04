@@ -47,7 +47,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   main loop is on. State the main loop *reads* goes through the Inbox instead.
   The values read by several threads without being consumed, the primary
   admitted connection's time filter and server information, sit in
-  `ConnectionManager`'s own slots behind leaf mutexes (`time_filter()`,
+  `ConnectionManager`'s own slot behind a leaf mutex (`time_filter()`,
   `server_information()`), written by the protocol task; a flag read the same
   way is a plain atomic.
 - Event producers push through `push_event_or_log()` rather than hand-rolling
@@ -58,7 +58,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
   one with their count when they stop.
 - A consumer that holds items of the shared inbound ring holds them against a
   quota of its own (`InboundQuota`), charged on the protocol task before the
-  item is handed over: a holder over its quota has the new item dropped with
+  item is handed over (the codec headers and stream markers the task writes
+  itself excepted): a holder over its quota has the new item dropped with
   a warning, so no holder's backlog can starve another's, and a role's share
   of the ring is part of the ring's derivation (`derive_inbound_ring_bytes()`)
   rather than a separate buffer.
@@ -88,7 +89,11 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - A protocol-task step has a bounded wait or none: the Noise DH operations, a
   ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, a transport send
   bounded by the transport's own send timeout, and at shutdown the goodbye
-  flush bounded by `GOODBYE_FLUSH_TIMEOUT_MS` per goodbye. Its tick returns the
+  flush bounded by `GOODBYE_FLUSH_TIMEOUT_MS` per goodbye. Releasing an
+  outbound connection that is still connecting is a known longer wait on the
+  task: its destructor stops the transport synchronously, bounded on host by
+  `SendspinClientConnection::HANDSHAKE_TIMEOUT_SECS` and on ESP by
+  esp_websocket_client's `network_timeout_ms`. Its tick returns the
   time to its earliest deadline, or `ProtocolTask::NO_DEADLINE`, and never
   wakes on a fixed period. A transport's wait on the task is bounded too: an
   admitted connection waits at most `INBOUND_ACQUIRE_TIMEOUT_MS` for ring space
@@ -98,8 +103,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - Every library lock is a leaf: it is held only to copy or update its own
   state, never across a call that takes another library lock, a send, a
   listener or the persistence provider, so the library has no lock order to
-  cite. The leaves are `ConnectionManager::time_filter_mutex_` and
-  `server_info_mutex_`, `RecordStore::mutex_`, the Inbox mutex, each
+  cite. The leaves are `ConnectionManager::published_mutex_`,
+  `RecordStore::mutex_`, the Inbox mutex, each
   `SendspinTimeFilter`'s `state_mutex_`, the inbound ring's, item lists' and
   protocol task command queue's own locks, `GoodbyeWait`'s, the artwork role's
   slot mutex, `ShadowSlot`'s and the ESP server's pending-upgrade mutex. A

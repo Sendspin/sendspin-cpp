@@ -132,6 +132,14 @@ struct PersistRequest {
     std::optional<std::string> last_played{};
 };
 
+/// @brief Folds a later persist request into the one the drain has not taken yet: a newer
+/// last-played server replaces an older one.
+void merge_persist_request(PersistRequest& current, PersistRequest&& delta) {
+    if (delta.last_played.has_value()) {
+        current.last_played = std::move(delta.last_played);
+    }
+}
+
 /// @brief High-performance edges the protocol task queued for the main loop, which calls the
 /// listener. Two counts rather than a net value, so an acquire and a release queued inside one
 /// stalled main-loop tick still reach the listener as a request followed by its release. 32-bit:
@@ -170,7 +178,7 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
 ///
 /// A true verdict is only half the gate. The caller pairs it with the role's teardown generation,
 /// loaded right after this returns and passed into the handler, and each point of effect
-/// re-checks the captured value (see Impl::accepts() on each role). Protocol task only.
+/// re-checks the captured value (RoleTeardown::accepts()). Protocol task only.
 [[maybe_unused]] bool role_accepts_traffic(const ConnectionManager& manager,
                                            const SendspinConnection* conn, SendspinRole role) {
     if (manager.owns_role(conn, role)) {
@@ -540,8 +548,7 @@ PairingUiSnapshot SendspinClient::close_transports() {
     this->protocol_task_->close_accepts();
     ProtocolCommand command;
     while (this->protocol_task_->take_command(command)) {
-        if (command.type == ProtocolCommandType::ACCEPT_CONNECTION &&
-            command.connection != nullptr) {
+        if (command.type == ProtocolCommandType::ACCEPT_CONNECTION) {
             this->connection_manager_->refuse_accept(std::move(command.connection));
         }
     }
@@ -626,7 +633,8 @@ bool SendspinClient::create_inbound_ring() {
         inbound_largest_message_bytes(player_message_bytes, visualizer_message_bytes, artwork);
     const size_t storage_bytes = derive_inbound_ring_bytes(budget);
     auto ring = std::make_unique<InboundRing>();
-    if (!ring->create(storage_bytes, this->config_.inbound_ring_location)) {
+    if (!ring->create(storage_bytes, this->config_.inbound_ring_location,
+                      budget.largest_message_bytes)) {
         return false;
     }
     ring->quota(InboundHolder::PLAYER).set_limit(budget.audio_hold_bytes);
@@ -681,13 +689,7 @@ void SendspinClient::loop() {
 }
 
 void SendspinClient::request_persist() {
-    this->event_state_->persist_slot.merge(
-        [](PersistRequest& current, PersistRequest&& delta) {
-            if (delta.last_played.has_value()) {
-                current.last_played = std::move(delta.last_played);
-            }
-        },
-        PersistRequest{});
+    this->event_state_->persist_slot.merge(merge_persist_request, PersistRequest{});
 }
 
 void SendspinClient::flush_pending_persistence() {
@@ -776,7 +778,7 @@ void SendspinClient::drain_inbox() {
     // Catches each role up on a teardown: with `cleared` null, to the role's current generation;
     // otherwise only the role a *_CLEARED event names, to the generation it carries.
     // [[maybe_unused]]: with every role compiled out the body is empty.
-    const auto catch_up_roles = [this]([[maybe_unused]] const InboxEvent* cleared) {
+    const auto catch_up_roles = [&]([[maybe_unused]] const InboxEvent* cleared) {
         [[maybe_unused]] const auto catch_up = [cleared](auto& impl, InboxEventType type) {
             if (cleared == nullptr) {
                 catch_up_teardown(impl, impl.cleanup_generation.load(std::memory_order_acquire));
@@ -1466,8 +1468,6 @@ std::string SendspinClient::build_hello_message() {
 }
 
 // ============================================================================
-// Message processing
-// ============================================================================
 // Protocol task
 // ============================================================================
 
@@ -1503,7 +1503,7 @@ uint32_t SendspinClient::protocol_tick() {
     }
 
     // 4. A role torn down since the last tick hands back what its consumer has not taken
-    //    (InboundItemList::recall()); the consumer returns what it holds itself.
+    //    (InboundConsumer::recall_stale()); the consumer returns what it holds itself.
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         this->player_->impl_->recall_stale_items(
@@ -1612,9 +1612,7 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
     ConnectionManager& manager = *this->connection_manager_;
     switch (command.type) {
         case ProtocolCommandType::ACCEPT_CONNECTION:
-            if (command.connection != nullptr) {
-                manager.accept(std::move(command.connection));
-            }
+            manager.accept(std::move(command.connection));
             return;
         case ProtocolCommandType::CONNECT_TO:
         case ProtocolCommandType::DISCONNECT:
@@ -1647,7 +1645,7 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
             manager.cancel_pairing_window();
             break;
         case ProtocolCommandType::PAIRING_WINDOW_CONFIRM:
-            manager.confirm_pairing_window();
+            manager.open_pairing_window();
             break;
         case ProtocolCommandType::SEND_TEXT:
             manager.send_role_text(command.role, command.text);
@@ -1677,8 +1675,9 @@ void SendspinClient::report_malformed_pairing_message(SendspinConnection* conn,
     this->connection_manager_->on_pairing_message(conn, message);
 }
 
-void SendspinClient::process_json_message(SendspinConnection* conn, const char* data, size_t len,
-                                          int64_t timestamp) {
+void SendspinClient::process_json_message(SendspinConnection& connection, const char* data,
+                                          size_t len, int64_t timestamp) {
+    SendspinConnection* conn = &connection;
     // Every connection's messages are processed on the protocol task, one at a time, so the
     // shared arena, the parse and the handlers it dispatches to need no lock. Reusing the arena
     // is safe: the JsonDocument from the previous call was destroyed when that call returned.
@@ -1837,32 +1836,28 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             if (process_server_hello_message(root, &hello_msg)) {
                 // server_id comes from the Noise handshake result (already set on the
                 // connection); server/hello only carries the display name.
-                if (conn != nullptr) {
-                    ServerInformationObject info = conn->get_server_information();
-                    info.name = hello_msg.name;
-                    conn->set_server_information(std::move(info));
-                    // The nursery scan on this task observes is_handshake_complete() and
-                    // establishes the connection; nothing needs to be scheduled here.
-                    conn->set_server_hello_received(true);
+                ServerInformationObject info = conn->get_server_information();
+                info.name = hello_msg.name;
+                conn->set_server_information(std::move(info));
+                // The nursery scan on this task observes is_handshake_complete() and
+                // establishes the connection; nothing needs to be scheduled here.
+                conn->set_server_hello_received(true);
 
-                    SS_LOGD(TAG, "Connected to server '%s' (server_id=%s)", hello_msg.name.c_str(),
-                            conn->get_server_id().c_str());
-                }
+                SS_LOGD(TAG, "Connected to server '%s' (server_id=%s)", hello_msg.name.c_str(),
+                        conn->get_server_id().c_str());
             }
             break;
         }
         case SendspinServerToClientMessageType::SERVER_ACTIVATE: {
             ServerActivateMessage activate_msg;
             if (process_server_activate_message(root, &activate_msg)) {
-                if (conn != nullptr) {
-                    SS_LOGD(TAG, "server/activate received (activities_count=%zu)",
-                            activate_msg.activities.size());
-                    // Applied before the next message is parsed: trust enforcement, role
-                    // ownership and, for a nursery connection that is now operational, admission
-                    // all land here, so the role traffic the server sends behind this activate
-                    // meets the gate this activation set.
-                    this->connection_manager_->on_server_activate(conn, std::move(activate_msg));
-                }
+                SS_LOGD(TAG, "server/activate received (activities_count=%zu)",
+                        activate_msg.activities.size());
+                // Applied before the next message is parsed: trust enforcement, role
+                // ownership and, for a nursery connection that is now operational, admission
+                // all land here, so the role traffic the server sends behind this activate
+                // meets the gate this activation set.
+                this->connection_manager_->on_server_activate(conn, std::move(activate_msg));
             }
             break;
         }
@@ -1871,26 +1866,19 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             // thread that decrypts this connection's frames and sends on it, so the session swap
             // is ordered with the decrypt of the next frame and with every send
             // (connection.md "Re-handshake").
-            if (conn != nullptr) {
-                SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
-                if (!conn->handle_noise_rehandshake(std::string_view(data, len))) {
-                    SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
-                    // Do not leave a half-swapped session. UNAUTHORIZED is the closest available
-                    // reason for a crypto failure, though close_silently() never transmits it
-                    // (connection.md "Failure Handling": close without any application-level
-                    // message). disconnect() can block on a transport join, which close_silently()
-                    // avoids; see close_transport_now()'s doc comment in connection.h.
-                    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
-                }
+            SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
+            if (!conn->handle_noise_rehandshake(std::string_view(data, len))) {
+                SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
+                // Do not leave a half-swapped session. UNAUTHORIZED is the closest available
+                // reason for a crypto failure, though close_silently() never transmits it
+                // (connection.md "Failure Handling": close without any application-level
+                // message). disconnect() can block on a transport join, which close_silently()
+                // avoids; see close_transport_now()'s doc comment in connection.h.
+                conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
             }
             break;
         }
         case SendspinServerToClientMessageType::SERVER_TIME: {
-            if (conn == nullptr) {
-                SS_LOGW(TAG, "Received time message but no connection context");
-                break;
-            }
-
             ServerTimeMessage time_msg;
             if (!process_server_time_message(root, &time_msg)) {
                 break;
@@ -2000,113 +1988,101 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             // persistence provider is main-loop-only.
             // The payload is spec'd as empty; the message-type dispatch above is the only
             // validation this message needs.
-            if (conn != nullptr) {
-                auto record = conn->take_pending_pairing_record();
-                bool stored_record = false;
-                if (record.has_value() && this->record_store_ != nullptr) {
-                    // Logged before the store takes ownership of the record; a rejection warns
-                    // from inside store_record_superseding().
-                    SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
-                            record->psk_id.c_str());
-                    // store_record_superseding() mutates RAM only. At capacity it evicts the
-                    // least recently used record rather than failing, since a pairing never
-                    // fails for lack of record storage (pairing.md "Pairing Records"); the
-                    // psk_ids of every open connection are handed over so none of them is the
-                    // victim. A provider that later rejects the deferred write does not fail the
-                    // pairing: the record works for this boot and persist_records() warns that it
-                    // will not survive a reboot.
-                    //
-                    // The superseding form is correct here and only here: this PSK replaces
-                    // whatever this server held before, so the prior record for the same
-                    // server_id must be retired or the old PSK stays valid forever.
-                    if (this->record_store_->store_record_superseding(
-                            std::move(record.value()),
-                            this->connection_manager_->open_connection_psk_ids())) {
-                        stored_record = true;
-                    }
-                } else {
-                    SS_LOGI(TAG, "server/pair-finalize: no pending pairing record to store");
+            auto record = conn->take_pending_pairing_record();
+            bool stored_record = false;
+            if (record.has_value() && this->record_store_ != nullptr) {
+                // Logged before the store takes ownership of the record; a rejection warns
+                // from inside store_record_superseding().
+                SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
+                        record->psk_id.c_str());
+                // store_record_superseding() mutates RAM only. At capacity it evicts the
+                // least recently used record rather than failing, since a pairing never
+                // fails for lack of record storage (pairing.md "Pairing Records"); the
+                // psk_ids of every open connection are handed over so none of them is the
+                // victim. A provider that later rejects the deferred write does not fail the
+                // pairing: the record works for this boot and persist_records() warns that it
+                // will not survive a reboot.
+                //
+                // The superseding form is correct here and only here: this PSK replaces
+                // whatever this server held before, so the prior record for the same
+                // server_id must be retired or the old PSK stays valid forever.
+                if (this->record_store_->store_record_superseding(
+                        std::move(record.value()),
+                        this->connection_manager_->open_connection_psk_ids())) {
+                    stored_record = true;
                 }
-                if (stored_record) {
-                    // Before on_pairing_succeeded, so the drain that fires it flushes the write
-                    // first. Not fired for the capacity-rejection case.
-                    this->request_persist();
-                    this->connection_manager_->on_pairing_succeeded(conn);
-                }
-                // Re-arm the provisional timeout so the 30 s watchdog fires if the server
-                // acks but never sends the in-band re-handshake that follows pair-finalize.
-                conn->note_pairing_finalize_ack();
+            } else {
+                SS_LOGI(TAG, "server/pair-finalize: no pending pairing record to store");
             }
+            if (stored_record) {
+                // Before on_pairing_succeeded, so the drain that fires it flushes the write
+                // first. Not fired for the capacity-rejection case.
+                this->request_persist();
+                this->connection_manager_->on_pairing_succeeded(conn);
+            }
+            // Re-arm the provisional timeout so the 30 s watchdog fires if the server
+            // acks but never sends the in-band re-handshake that follows pair-finalize.
+            conn->note_pairing_finalize_ack();
             break;
         }
         case SendspinServerToClientMessageType::PAIR_ABORT: {
             // pair/abort: the server aborted the pairing exchange.
-            if (conn != nullptr) {
-                PairAbortMessage abort_msg;
-                if (process_pair_abort_message(root, &abort_msg)) {
-                    SS_LOGW(TAG, "pair/abort received: reason=%s", to_cstr(abort_msg.reason));
-                    this->connection_manager_->on_pair_abort(conn, abort_msg.reason);
-                } else {
-                    // pair/abort must trigger cleanup even when the reason is unrecognized.
-                    SS_LOGW(TAG, "Malformed pair/abort message; treating as abort with "
-                                 "method_not_supported");
-                    this->connection_manager_->on_pair_abort(conn,
-                                                             PairAbortReason::METHOD_NOT_SUPPORTED);
-                }
+            PairAbortMessage abort_msg;
+            if (process_pair_abort_message(root, &abort_msg)) {
+                SS_LOGW(TAG, "pair/abort received: reason=%s", to_cstr(abort_msg.reason));
+                this->connection_manager_->on_pair_abort(conn, abort_msg.reason);
+            } else {
+                // pair/abort must trigger cleanup even when the reason is unrecognized.
+                SS_LOGW(TAG, "Malformed pair/abort message; treating as abort with "
+                             "method_not_supported");
+                this->connection_manager_->on_pair_abort(conn,
+                                                         PairAbortReason::METHOD_NOT_SUPPORTED);
             }
             break;
         }
         case SendspinServerToClientMessageType::SERVER_UNPAIR: {
             // server/unpair. Trust gating (LONG_TERM only) happens in handle_server_unpair.
-            if (conn != nullptr) {
-                SS_LOGI(TAG, "server/unpair received (psk_id=%s)", conn->get_psk_id().c_str());
-                this->connection_manager_->on_server_unpair(conn);
-            }
+            SS_LOGI(TAG, "server/unpair received (psk_id=%s)", conn->get_psk_id().c_str());
+            this->connection_manager_->on_server_unpair(conn);
             break;
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_INIT: {
             // server/pair-init: nonce_A from the server (the emission format arrived in the
             // activation's pairing object).
-            if (conn != nullptr) {
-                ServerPairInitPayload payload;
-                if (process_server_pair_init_message(root, &payload)) {
-                    ServerPairingMessage message;
-                    message.kind = PairingMessageKind::PAIR_INIT;
-                    message.nonce_a = payload.nonce_a;
-                    this->connection_manager_->on_pairing_message(conn, message);
-                } else {
-                    this->report_malformed_pairing_message(conn, "server/pair-init");
-                }
+            ServerPairInitPayload payload;
+            if (process_server_pair_init_message(root, &payload)) {
+                ServerPairingMessage message;
+                message.kind = PairingMessageKind::PAIR_INIT;
+                message.nonce_a = payload.nonce_a;
+                this->connection_manager_->on_pairing_message(conn, message);
+            } else {
+                this->report_malformed_pairing_message(conn, "server/pair-init");
             }
             break;
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_AUTH: {
             // server/pair-auth: server CPace share.
-            if (conn != nullptr) {
-                ServerPairAuthPayload payload;
-                if (process_server_pair_auth_message(root, &payload)) {
-                    ServerPairingMessage message;
-                    message.kind = PairingMessageKind::PAIR_AUTH;
-                    message.pake_msg_1 = payload.pake_msg_1;
-                    this->connection_manager_->on_pairing_message(conn, message);
-                } else {
-                    this->report_malformed_pairing_message(conn, "server/pair-auth");
-                }
+            ServerPairAuthPayload payload;
+            if (process_server_pair_auth_message(root, &payload)) {
+                ServerPairingMessage message;
+                message.kind = PairingMessageKind::PAIR_AUTH;
+                message.pake_msg_1 = payload.pake_msg_1;
+                this->connection_manager_->on_pairing_message(conn, message);
+            } else {
+                this->report_malformed_pairing_message(conn, "server/pair-auth");
             }
             break;
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM: {
             // server/pair-confirm: server CPace confirmation tag.
-            if (conn != nullptr) {
-                ServerPairConfirmPayload payload;
-                if (process_server_pair_confirm_message(root, &payload)) {
-                    ServerPairingMessage message;
-                    message.kind = PairingMessageKind::PAIR_CONFIRM;
-                    message.server_kc = payload.server_kc;
-                    this->connection_manager_->on_pairing_message(conn, message);
-                } else {
-                    this->report_malformed_pairing_message(conn, "server/pair-confirm");
-                }
+            ServerPairConfirmPayload payload;
+            if (process_server_pair_confirm_message(root, &payload)) {
+                ServerPairingMessage message;
+                message.kind = PairingMessageKind::PAIR_CONFIRM;
+                message.server_kc = payload.server_kc;
+                this->connection_manager_->on_pairing_message(conn, message);
+            } else {
+                this->report_malformed_pairing_message(conn, "server/pair-confirm");
             }
             break;
         }
@@ -2116,8 +2092,9 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
     }
 }
 
-SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn,
+SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connection,
                                                    InboundMessage& message) {
+    SendspinConnection* conn = &connection;
     // One byte is enough to name the role that owns the message; how short a body that role
     // tolerates is the role's own rule (roles/artwork/v1.md, for one, closes the connection on a
     // message shorter than 2 bytes).
@@ -2127,7 +2104,7 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn,
 
     // Every binary message feeds a role, so only an admitted connection's reach one; each role
     // below also gates on the connection owning it (role_accepts_traffic()).
-    if (conn == nullptr || this->connection_manager_->find_admitted(conn) == nullptr) {
+    if (this->connection_manager_->find_admitted(conn) == nullptr) {
         SS_LOGW(TAG, "Ignoring binary message from a connection that is not admitted");
         return;
     }
@@ -2331,13 +2308,7 @@ void SendspinClient::note_last_played_server(const std::string& server_id) {
     this->connection_manager_->set_last_played_server_id(server_id);
     PersistRequest request;
     request.last_played = server_id;
-    this->event_state_->persist_slot.merge(
-        [](PersistRequest& current, PersistRequest&& delta) {
-            if (delta.last_played.has_value()) {
-                current.last_played = std::move(delta.last_played);
-            }
-        },
-        std::move(request));
+    this->event_state_->persist_slot.merge(merge_persist_request, std::move(request));
 }
 
 void SendspinClient::write_last_played_server(const std::string& server_id) {
@@ -2363,9 +2334,6 @@ void SendspinClient::write_last_played_server(const std::string& server_id) {
 // ============================================================================
 
 void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
-    if (conn == nullptr) {
-        return;
-    }
     // Entering the operational state structurally ends any pairing exchange: discard the pending
     // pairing record and reset the pairing session so a stale attempt timeout can never fire a
     // stray pair/abort on an operational connection. This is the one place every "connection is
@@ -2384,7 +2352,7 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     this->note_trust_changed(trust);
 }
 
-void SendspinClient::apply_role_removals(uint16_t removed_roles) {
+void SendspinClient::apply_role_removals([[maybe_unused]] uint16_t removed_roles) {
     // messaging.md "server/activate", "When applying a server/activate, the client MUST": every
     // removed server-to-client stream role stops its remaining output and clears its buffers, even
     // where an earlier stream/end had let buffered data finish, and every removed role with a
