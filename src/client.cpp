@@ -1317,10 +1317,6 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
         this->visualizer_->impl_->cleanup();
     }
 #endif
-
-    // The protocol task recalls the items the torn-down stream roles' consumers have not taken
-    // (on its own next tick when this runs on it).
-    this->protocol_task_->wake();
 }
 
 std::string SendspinClient::build_hello_message() {
@@ -1627,9 +1623,6 @@ void SendspinClient::apply_role_removals([[maybe_unused]] uint16_t removed_roles
         this->visualizer_->impl_->cleanup();
     }
 #endif
-    // The protocol task recalls the items a removed stream role's consumer has not taken, on
-    // its next tick.
-    this->protocol_task_->wake();
 }
 
 void SendspinClient::note_pairing_started(const std::string& server_id) {

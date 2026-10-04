@@ -114,8 +114,8 @@ void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::CONTROLLER);
 }
 
-void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& state,
-                                               uint32_t generation) const {
+void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& state) const {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     this->event_state->slot.write(std::move(state), generation);
 }
 

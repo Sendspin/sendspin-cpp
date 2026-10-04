@@ -123,8 +123,8 @@ void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::METADATA);
 }
 
-void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadata,
-                                             uint32_t generation) const {
+void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadata) const {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // messaging.md "server/state": each included metadata object is the role's full state, never
     // an overlay on the one before it (see coalesce_metadata_states).
     PendingMetadataStates arrival;

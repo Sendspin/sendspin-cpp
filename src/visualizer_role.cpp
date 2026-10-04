@@ -315,8 +315,8 @@ void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
 // Binary handling (protocol task)
 // ============================================================================
 
-void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& message,
-                                         uint32_t generation) {
+void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& message) {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     InboundConsumer& inbound = this->drain_task->inbound;
     if (!this->stream_active || inbound.ring() == nullptr) {
         return;
@@ -372,16 +372,12 @@ bool VisualizerRole::Impl::hand_item(void* item, size_t item_len, uint8_t type, 
     return this->drain_task->inbound.hand(item, item_len, generation, /*exempt=*/marker);
 }
 
-void VisualizerRole::Impl::recall_stale_items(uint32_t generation) const {
-    this->drain_task->inbound.recall_stale(generation);
-}
-
 // ============================================================================
 // Stream lifecycle (protocol task)
 // ============================================================================
 
-void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObject& stream,
-                                               uint32_t generation) {
+void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObject& stream) {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // Cache stream config for handle_binary (same thread) and the drain thread
     uint8_t bin_count = 0;
     uint8_t types_mask = 0;
@@ -437,7 +433,8 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
     this->enqueue_stream_event(VisualizerEventType::STREAM_START, generation);
 }
 
-void VisualizerRole::Impl::handle_stream_end(uint32_t generation) {
+void VisualizerRole::Impl::handle_stream_end() {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     this->stream_active = false;
     this->negotiated_types_mask = 0;
 
@@ -451,7 +448,8 @@ void VisualizerRole::Impl::handle_stream_end(uint32_t generation) {
     this->enqueue_stream_event(VisualizerEventType::STREAM_END, generation);
 }
 
-void VisualizerRole::Impl::handle_stream_clear(uint32_t generation) {
+void VisualizerRole::Impl::handle_stream_clear() {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // messaging.md "stream/clear" discards buffered data but the stream stays active; data
     // received after this message continues to flow. The marker separates the two: a blind
     // flush would race this thread and drop post-clear frames it has already appended.
@@ -520,9 +518,12 @@ void VisualizerRole::Impl::cleanup() {
     this->stream_active = false;
     this->negotiated_types_mask = 0;
 
+    // Return the frames the drain thread has not taken; one it takes before this carries the
+    // earlier stamp, which its take() discards.
+    this->drain_task->inbound.recall();
+
     if (this->drain_task->event_flags.is_created()) {
-        // Flag first, then wake, matching handle_stream_end(). The protocol task recalls the
-        // frames still on the list on its next tick (recall_stale_items()).
+        // Flag first, then wake, matching handle_stream_end().
         this->drain_task->event_flags.set(COMMAND_FLUSH);
         this->drain_task->inbound.items().wake_receiver();
     }

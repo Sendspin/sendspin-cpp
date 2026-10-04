@@ -615,26 +615,29 @@ private:
  * Shared by the sync task (InboundHolder::PLAYER) and the visualizer drain thread
  * (InboundHolder::VISUALIZER). Every item handed over carries the holder role's teardown
  * generation (InboundItemHeader::generation): a teardown moves the role's `cleanup_generation`
- * on, the protocol task recalls what the consumer has not taken (recall_stale()), and a
- * consumer that takes such an item first returns it unprocessed (take()).
+ * on and its cleanup() recalls what the consumer has not taken (recall()), and a consumer that
+ * takes such an item between the two returns it unprocessed (take()).
  *
- * Threads: bind() and unbind() run on the main loop with the consumer thread not running; the
- * protocol task hands items over (copy_local(), hand(), recall_stale(), note_drop()); the
- * consumer thread takes and returns them. ring() is read on all three.
+ * Threads: bind() and unbind() run on the main loop with neither the consumer thread nor the
+ * protocol task running: SendspinClient::start() binds before it starts the protocol task, and
+ * stop() (and a start() that fails part-way) unbinds after joining it. The protocol task hands
+ * items over and recalls them (copy_local(), hand(), recall(), note_drop()); the consumer thread
+ * takes and returns them. ring() is read on all three, ordered by those thread starts and joins.
  */
 class InboundConsumer {
 public:
     /// @brief Binds the item list to this run's ring as `holder`'s list. Main loop, before the
-    /// consumer thread starts. @return false when the list's event flags cannot be created.
+    /// consumer thread and the protocol task start. @return false when the list's event flags
+    /// cannot be created.
     bool bind(InboundRing* ring, InboundHolder holder);
 
     /// @brief Returns every item left on the list and unbinds it from the ring. Main loop, once
-    /// the consumer thread is joined; bind() binds it again.
+    /// the consumer thread and the protocol task are joined; bind() binds it again.
     void unbind();
 
     /// @brief The ring the list is bound to, or nullptr outside a run
     InboundRing* ring() const {
-        return this->ring_.load(std::memory_order_acquire);
+        return this->ring_;
     }
 
     /// @brief The item list itself, for a consumer that walks it (a clear marker's discard)
@@ -663,9 +666,8 @@ public:
     void* copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
                      uint32_t timeout_ms) const;
 
-    /// @brief Stamps `item` with `generation`, recalls the list first if a teardown moved the
-    /// generation on (recall_stale()), then charges the item to the holder's quota and appends
-    /// it. Over quota the item is returned to the ring with a throttled warning: the server
+    /// @brief Stamps `item` with `generation`, charges it to the holder's quota and appends it.
+    /// Over quota the item is returned to the ring with a throttled warning: the server
     /// overran the buffer_capacity the role advertises, which the quota covers at the role's
     /// smallest message. Protocol task, inside a run; the caller fills the item's other consumer
     /// fields first.
@@ -681,10 +683,12 @@ public:
     /// @return false when the item was returned instead of handed over.
     bool hand(void* item, size_t item_len, uint32_t generation, bool exempt);
 
-    /// @brief Recalls every item not yet taken once `generation` differs from the one the list
-    /// was last recalled for. Protocol task: each tick, and from hand(), so no item stamped with
-    /// the current generation is ever recalled.
-    void recall_stale(uint32_t generation);
+    /// @brief Returns every item the consumer has not taken to the ring and ends the drop log's
+    /// run, since the stream the drops belonged to is gone. The holder role's cleanup(), right
+    /// after its generation moves on: on the protocol task, the thread that hands items over, so
+    /// every item recalled carries an earlier generation. A no-op outside a run, where the
+    /// main loop's cleanup() in SendspinClient::stop() finds the list already unbound.
+    void recall();
 
     /// @brief Counts a drop of an item that never reached hand() in the same throttled run as
     /// the over-quota drops, logging "<Holder> <message>" when it starts one. Protocol task.
@@ -702,13 +706,10 @@ private:
     InboundDropLog drop_log_;
 
     // Pointer fields
-    /// Written by bind() and unbind() on the main loop; read by the protocol task and the
-    /// consumer thread.
-    std::atomic<InboundRing*> ring_{nullptr};
-
-    // 32-bit fields
-    /// The teardown generation the list was last recalled for. Protocol task only.
-    uint32_t recalled_generation_{0};
+    /// Written by bind() and unbind() on the main loop while neither the protocol task nor the
+    /// consumer thread runs; read by both, ordered by their start and join. A role that starts
+    /// while the protocol task runs would need this to be an atomic.
+    InboundRing* ring_{nullptr};
 
     // 8-bit fields
     /// Written by bind() before the protocol task hands anything over.

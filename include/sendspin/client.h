@@ -793,10 +793,10 @@ private:
     // ========================================
 
     /// @brief The protocol task's work, in order: the lifecycle requests and the command queue,
-    /// the shutdown pass once admission is closed, the client/state snapshot, the role lists'
-    /// recall check, the outbound handshakes, each managed connection's pending pre-admission
-    /// message, the inbound ring, the losses, the lifecycle scans, the time bursts, and the
-    /// published slots (docs/internals.md "The Protocol Task's Tick"). Protocol task only.
+    /// the shutdown pass once admission is closed, the client/state snapshot, the outbound
+    /// handshakes, each managed connection's pending pre-admission message, the inbound ring, the
+    /// losses, the lifecycle scans, the time bursts, and the published slots (docs/internals.md
+    /// "The Protocol Task's Tick"). Protocol task only.
     /// @return Milliseconds until the earliest of the task's timers, 0 to run again at once when
     ///         the ring was not drained within one pass, or ProtocolTask::NO_DEADLINE.
     uint32_t protocol_tick();

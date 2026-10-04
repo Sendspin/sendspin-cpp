@@ -73,9 +73,8 @@ namespace {
 /// "server/activate" requires the mirror of this of servers, so a role removal the peer has not
 /// yet seen never costs the connection.
 ///
-/// A true verdict is only half the gate. The caller pairs it with the role's teardown generation,
-/// loaded right after this returns and passed into the handler, which stamps what it queues with
-/// it for the drains to check (RoleTeardown). Protocol task only.
+/// The handler a true verdict admits loads the role's teardown generation itself and stamps what
+/// it queues with it for the drains to check (RoleTeardown). Protocol task only.
 [[maybe_unused]] bool role_accepts_traffic(const ConnectionManager& manager,
                                            const SendspinConnection* conn, SendspinRole role) {
     if (manager.owns_role(conn, role)) {
@@ -130,26 +129,11 @@ uint32_t SendspinClient::protocol_tick() {
         }
     }
 
-    // 4. A role torn down since the last tick hands back what its consumer has not taken
-    //    (InboundConsumer::recall_stale()); the consumer returns what it holds itself.
-#ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        this->player_->impl_->recall_stale_items(
-            this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_) {
-        this->visualizer_->impl_->recall_stale_items(
-            this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
-#endif
-
-    // 5. client/init on the outbound connections whose upgrade completed: the server says
+    // 4. client/init on the outbound connections whose upgrade completed: the server says
     //    nothing before it, so it goes ahead of the receive pass.
     manager.start_upgraded_handshakes();
 
-    // 6. The receive pass, over a snapshot of the managed connections: a handler below can drop
+    // 5. The receive pass, over a snapshot of the managed connections: a handler below can drop
     //    a connection from its slot, and the snapshot keeps it alive until the tick ends (see
     //    ConnectionManager::snapshot_connections()). Each connection's message pending in its
     //    fallback buffer comes before the ring items it wrote after it, and after the ones it
@@ -161,9 +145,9 @@ uint32_t SendspinClient::protocol_tick() {
         if (!conn->pending_message(message)) {
             continue;
         }
-        if (!conn->inbound_gate().is_detached()) {
-            this->process_inbound(*conn, message);
-        }
+        // A detached connection's message is dropped inside (process_inbound_message()); the
+        // buffer goes back to the transport either way.
+        this->process_inbound(*conn, message);
         conn->consume_pending_message();
     }
 
@@ -197,11 +181,9 @@ uint32_t SendspinClient::protocol_tick() {
             this->inbound_ring_->return_item(item);
             continue;
         }
+        // Counted before dispatch, which a detached connection's item skips (returned by
+        // process_inbound()).
         conn->inbound_gate().note_item_taken();
-        if (conn->inbound_gate().is_detached()) {
-            this->inbound_ring_->return_item(item);
-            continue;
-        }
         InboundMessage message;
         message.item = item;
         message.item_len = item_len;
@@ -212,20 +194,21 @@ uint32_t SendspinClient::protocol_tick() {
         this->process_inbound(*conn, message);
     }
 
-    // 7. Losses: a connection the receive path closed, one the manager released, or one whose
-    //    transport closed with every message it sent before the close processed, is dropped once
-    //    (a connection the manager no longer manages is a no-op there). A fallback message held
-    //    back behind ring items the pass above has now taken is due at once.
+    // 6. Losses: a connection the receive path closed, one the manager released, or one whose
+    //    transport closed with every message it sent before the close processed, is dropped. One
+    //    the manager already released this tick is a no-op there, and the next tick's snapshot
+    //    leaves it out. A fallback message held back behind ring items the pass above has now
+    //    taken is due at once.
     bool fallback_due = false;
     for (auto& conn : connections) {
         InboundGate& gate = conn->inbound_gate();
-        if ((gate.is_detached() || gate.close_ready()) && conn->mark_loss_reported()) {
+        if (gate.is_detached() || gate.close_ready()) {
             manager.on_connection_lost(conn.get());
         }
         fallback_due = fallback_due || (gate.has_pending_message() && gate.in_flight() == 0);
     }
 
-    // 8. The lifecycle scans and timers, 9. the time bursts, 10. what other threads read.
+    // 7. The lifecycle scans and timers, 8. the time bursts, 9. what other threads read.
     uint32_t next_deadline = manager.tick(platform_time_us());
     next_deadline = std::min(next_deadline, manager.run_time_sync());
     manager.refresh_published_state();
@@ -365,9 +348,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 #ifdef SENDSPIN_ENABLE_PLAYER
             if (this->player_ && stream_msg.player.has_value() &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                this->player_->impl_->handle_stream_start(
-                    stream_msg.player.value(),
-                    this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                this->player_->impl_->handle_stream_start(stream_msg.player.value());
             }
 #endif
 
@@ -381,9 +362,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
             if (this->visualizer_ && stream_msg.visualizer.has_value() &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
-                this->visualizer_->impl_->handle_stream_start(
-                    stream_msg.visualizer.value(),
-                    this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                this->visualizer_->impl_->handle_stream_start(stream_msg.visualizer.value());
             }
 #endif
             break;
@@ -413,16 +392,14 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 #ifdef SENDSPIN_ENABLE_PLAYER
                 if (this->player_ && end_player &&
                     role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                    this->player_->impl_->handle_stream_end(
-                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                    this->player_->impl_->handle_stream_end();
                 }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
                 if (this->artwork_ && end_artwork &&
                     role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
-                    this->artwork_->impl_->handle_stream_end(
-                        this->artwork_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                    this->artwork_->impl_->handle_stream_end();
                 }
 #endif
 
@@ -430,9 +407,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 if (this->visualizer_ && end_visualizer &&
                     role_accepts_traffic(*this->connection_manager_, conn,
                                          SendspinRole::VISUALIZER)) {
-                    this->visualizer_->impl_->handle_stream_end(
-                        this->visualizer_->impl_->cleanup_generation.load(
-                            std::memory_order_acquire));
+                    this->visualizer_->impl_->handle_stream_end();
                 }
 #endif
             }
@@ -462,8 +437,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 #ifdef SENDSPIN_ENABLE_PLAYER
                 if (this->player_ && clear_player &&
                     role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                    this->player_->impl_->handle_stream_clear(
-                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                    this->player_->impl_->handle_stream_clear();
                 }
 #endif
 
@@ -471,9 +445,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 if (this->visualizer_ && clear_visualizer &&
                     role_accepts_traffic(*this->connection_manager_, conn,
                                          SendspinRole::VISUALIZER)) {
-                    this->visualizer_->impl_->handle_stream_clear(
-                        this->visualizer_->impl_->cleanup_generation.load(
-                            std::memory_order_acquire));
+                    this->visualizer_->impl_->handle_stream_clear();
                 }
 #endif
             }
@@ -594,25 +566,19 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 
 #ifdef SENDSPIN_ENABLE_CONTROLLER
             if (controller_valid) {
-                this->controller_->impl_->handle_server_state(
-                    std::move(controller_state),
-                    this->controller_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                this->controller_->impl_->handle_server_state(std::move(controller_state));
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_METADATA
             if (metadata_valid) {
-                this->metadata_->impl_->handle_server_state(
-                    std::move(metadata_state),
-                    this->metadata_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                this->metadata_->impl_->handle_server_state(std::move(metadata_state));
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_COLOR
             if (color_valid) {
-                this->color_->impl_->handle_server_state(
-                    color_state,
-                    this->color_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                this->color_->impl_->handle_server_state(color_state);
             }
 #endif
             break;
@@ -623,9 +589,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
                 ServerCommandMessage cmd_msg;
                 if (parsed.extract<process_server_command_message>(&cmd_msg)) {
-                    this->player_->impl_->handle_server_command(
-                        cmd_msg,
-                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                    this->player_->impl_->handle_server_command(cmd_msg);
                 }
             }
 #endif
@@ -803,9 +767,7 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
 #ifdef SENDSPIN_ENABLE_VISUALIZER
         if (this->visualizer_ &&
             role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
-            this->visualizer_->impl_->handle_binary(
-                binary_type, message,
-                this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
+            this->visualizer_->impl_->handle_binary(binary_type, message);
         }
 #endif
         return;
@@ -818,9 +780,7 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
                 uint8_t slot = get_binary_slot(binary_type);
                 if (slot == 0) {
-                    this->player_->impl_->handle_binary(
-                        message,
-                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                    this->player_->impl_->handle_binary(message);
                 } else {
                     SS_LOGW(TAG, "Unknown player binary slot %d", slot);
                 }

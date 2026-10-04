@@ -413,8 +413,8 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
         return metadata_listener.updates == 1 && color_listener.updates == 1 &&
                controller_listener.updates == 1 && player_listener.stream_starts == 1;
     });
-    // The generation a live dispatch would load for a metadata handler right now, kept for the
-    // stale-stamp check at the end.
+    // The generation a metadata handler would stamp right now, kept for the stale-stamp check at
+    // the end.
     const uint32_t metadata_generation =
         client.metadata()->impl_->cleanup_generation.load(std::memory_order_acquire);
 
@@ -453,24 +453,25 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     EXPECT_EQ(player_listener.stream_ends, 0) << "a role the activation kept was torn down";
     stream_audio_until(client, *server, player_listener, 1);
 
-    // A state the handler stamps with the pre-removal generation, the payload a drain takes on the
-    // far side of the removal, is discarded at the drain: driving the handler directly is the same
-    // call the protocol task would make, with the interleaving forced rather than raced for.
+    // A state stamped with the pre-removal generation, the payload a drain takes on the far side
+    // of the removal, is discarded at the drain: writing the role's slot with that stamp forces
+    // the interleaving rather than racing for it.
     ServerMetadataStateObject overtaken;
     overtaken.timestamp = 1;
     overtaken.title = "Overtaken By The Removal";
-    client.metadata()->impl_->handle_server_state(std::move(overtaken), metadata_generation);
+    client.metadata()->impl_->event_state->slot.write(
+        PendingMetadataStates{.oldest = std::move(overtaken)}, metadata_generation);
     pump_for(client, SETTLE_MS);
     EXPECT_EQ(metadata_listener.updates, 1)
         << "a payload stamped with the pre-removal generation was applied";
 
-    // Control: the same call carrying the generation the role reports now is applied, so the
+    // Control: the same write carrying the generation the role reports now is applied, so the
     // refusal above came from the stale generation and nothing else.
     ServerMetadataStateObject current;
     current.timestamp = 1;
     current.title = "Current Generation";
-    client.metadata()->impl_->handle_server_state(
-        std::move(current),
+    client.metadata()->impl_->event_state->slot.write(
+        PendingMetadataStates{.oldest = std::move(current)},
         client.metadata()->impl_->cleanup_generation.load(std::memory_order_acquire));
     pump_until(client, [&] { return metadata_listener.updates == 2; });
 

@@ -203,12 +203,6 @@ std::unique_ptr<VisualizerRole::Impl> make_impl() {
     return impl;
 }
 
-// The generation a live dispatch loads with the gate check and a handler stamps on what it
-// queues, on a role that has not been torn down; a unit test driving a handler directly passes it.
-uint32_t live_generation(const VisualizerRole::Impl& impl) {
-    return impl.cleanup_generation.load(std::memory_order_acquire);
-}
-
 // The message handle_binary receives for wire type `type` carrying `data`: the type byte first.
 std::vector<uint8_t> frame_message(uint8_t type, const std::vector<uint8_t>& data) {
     std::vector<uint8_t> message{type};
@@ -217,11 +211,10 @@ std::vector<uint8_t> frame_message(uint8_t type, const std::vector<uint8_t>& dat
 }
 
 // Hands `data` to the role as wire type `type`, outside any ring item.
-void hand(VisualizerRole::Impl& impl, uint8_t type, const std::vector<uint8_t>& data,
-          uint32_t generation) {
+void hand(VisualizerRole::Impl& impl, uint8_t type, const std::vector<uint8_t>& data) {
     std::vector<uint8_t> bytes = frame_message(type, data);
     InboundMessage message = message_over(bytes);
-    impl.handle_binary(type, message, generation);
+    impl.handle_binary(type, message);
     take_in_ring_order(*impl.drain_task->inbound.ring());
 }
 
@@ -282,7 +275,7 @@ TEST(VisualizerHandleBinary, ForwardsTheMessageWithItsReceiveStamp) {
             row.in_ring_item ? receive_into_ring(ring, bytes, STAMP) : message_over(bytes, STAMP);
         const uint8_t* received_at = message.data;
 
-        impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, message, live_generation(*impl));
+        impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, message);
         take_in_ring_order(ring);
 
         Entry entry;
@@ -385,7 +378,7 @@ TEST(VisualizerHandleBinary, DropsMessageWithoutTimestamp) {
     auto impl = make_impl();
 
     std::vector<uint8_t> data(7, 0);  // fewer than the 8 timestamp bytes
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data, live_generation(*impl));
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
 
     Entry entry;
     EXPECT_FALSE(pop_entry(*impl, entry));
@@ -398,7 +391,7 @@ TEST(VisualizerHandleBinary, DropsWhenStreamInactive) {
     std::vector<uint8_t> data;
     put_be64(data, 1);
     put_be16(data, 0);
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data, live_generation(*impl));
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
 
     Entry entry;
     EXPECT_FALSE(pop_entry(*impl, entry));
@@ -415,14 +408,14 @@ TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
     put_be64(data, 1);
     put_be16(data, 0x0042);
 
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_BEAT, data, live_generation(*impl));
-    hand(*impl, 21, data, live_generation(*impl));  // reserved type
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_BEAT, data);
+    hand(*impl, 21, data);  // reserved type
 
     Entry entry;
     EXPECT_FALSE(pop_entry(*impl, entry));
 
     // Control: the negotiated type is still forwarded.
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data, live_generation(*impl));
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
     ASSERT_TRUE(pop_entry(*impl, entry));
     EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
 }
@@ -453,13 +446,14 @@ TEST(VisualizerStreamEvents, AStreamStartAppliesOnlyTheConfigOfItsOwnGeneration)
         auto impl = make_impl();
         StreamStartCounter listener;
         impl->listener = &listener;
-        const uint32_t before = live_generation(*impl);
+        const uint32_t before = impl->cleanup_generation.load();
         impl->cleanup();
         ServerVisualizerStreamObject config;
         config.types = {VisualizerDataType::BEAT};
-        impl->event_state->config_slot.write(config, row.stale ? before : live_generation(*impl));
+        const uint32_t current = impl->cleanup_generation.load();
+        impl->event_state->config_slot.write(config, row.stale ? before : current);
 
-        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, live_generation(*impl));
+        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, current);
 
         EXPECT_EQ(listener.starts, row.expected_starts);
     }
@@ -498,7 +492,7 @@ TEST(VisualizerSpectrumWiring, TheSpectrumTypeWithNoSpectrumObjectDeliversNothin
         if (row.has_object) {
             stream.spectrum = impl->config.stream.spectrum;
         }
-        impl->handle_stream_start(stream, live_generation(*impl));
+        impl->handle_stream_start(stream);
         take_in_ring_order(*impl->drain_task->inbound.ring());
 
         std::vector<uint16_t> bins;
@@ -516,7 +510,7 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 
     ServerVisualizerStreamObject stream;
     stream.types = {VisualizerDataType::BEAT};
-    impl->handle_stream_start(stream, live_generation(*impl));
+    impl->handle_stream_start(stream);
     take_in_ring_order(*impl->drain_task->inbound.ring());
 
     // stream/start appends a boundary marker, which carries no message bytes; consume it first.
@@ -528,11 +522,11 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
     put_be64(data, 1);
     data.push_back(0x01);
 
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_BEAT, data, live_generation(*impl));
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_BEAT, data);
     ASSERT_TRUE(pop_entry(*impl, entry));
     EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_BEAT);
 
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data, live_generation(*impl));
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
     EXPECT_FALSE(pop_entry(*impl, entry));
 }
 
@@ -544,7 +538,7 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 TEST(VisualizerClearMarker, StreamClearEnqueuesMarker) {
     auto impl = make_impl();
 
-    impl->handle_stream_clear(live_generation(*impl));
+    impl->handle_stream_clear();
 
     take_in_ring_order(*impl->drain_task->inbound.ring());
 
@@ -580,13 +574,13 @@ TEST(VisualizerClearMarker, AClearMarkerPassesAQuotaTheServersFramesExhausted) {
         ring.quota(InboundHolder::VISUALIZER).set_limit(0);
 
         if (row.marker) {
-            impl->handle_stream_clear(live_generation(*impl));
+            impl->handle_stream_clear();
             take_in_ring_order(ring);
         } else {
             std::vector<uint8_t> data;
             put_be64(data, 1);
             put_be16(data, 0x0001);
-            hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data, live_generation(*impl));
+            hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
         }
 
         Entry entry;
@@ -601,16 +595,16 @@ TEST(VisualizerClearMarker, DiscardPreservesPostClearFrames) {
     std::vector<uint8_t> pre;
     put_be64(pre, 1);
     put_be16(pre, 0x0001);
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, pre, live_generation(*impl));
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, pre);
 
-    impl->handle_stream_clear(live_generation(*impl));
+    impl->handle_stream_clear();
 
     take_in_ring_order(*impl->drain_task->inbound.ring());
 
     std::vector<uint8_t> post;
     put_be64(post, 2);
     put_be16(post, 0x0002);
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, post, live_generation(*impl));
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, post);
 
     impl->discard_to_clear_marker();
 
@@ -630,8 +624,8 @@ TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
     std::vector<uint8_t> data;
     put_be64(data, 1);
     put_be16(data, 0x0001);
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data, live_generation(*impl));
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data, live_generation(*impl));
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
 
     impl->discard_to_clear_marker();
 
@@ -640,22 +634,23 @@ TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
 }
 
 // A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and
-// the old stream's frames are never delivered: the protocol task's next tick recalls what the
-// drain thread has not taken, returning it and its quota charge to the shared ring, and a frame
-// the drain thread takes before that tick is dropped by its generation stamp and returned the
-// same way.
+// the old stream's frames are never delivered: cleanup() recalls what the drain thread has not
+// taken, returning it and its quota charge to the shared ring, and a frame the drain thread takes
+// between the generation bump and the recall is dropped by its generation stamp and returned the
+// same way. That window has no observable trigger, so its row moves the generation on directly,
+// leaving the frames listed.
 TEST(VisualizerClearMarker, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) {
+    enum class Teardown { NONE, CLEANUP, GENERATION_ONLY };
     struct Row {
         const char* name;
-        bool teardown;
-        bool recall_tick;
+        Teardown teardown;
         bool listed_before_take;
         size_t delivered;
     };
     const Row rows[] = {
-        {"Control: no teardown", false, true, true, 2},
-        {"torn down, recalled by the protocol task's tick", true, true, false, 0},
-        {"torn down, taken by the drain thread before the recall", true, false, true, 0},
+        {"Control: no teardown", Teardown::NONE, true, 2},
+        {"torn down, recalled by cleanup()", Teardown::CLEANUP, false, 0},
+        {"taken by the drain thread before the recall", Teardown::GENERATION_ONLY, true, 0},
     };
 
     for (const Row& row : rows) {
@@ -668,14 +663,12 @@ TEST(VisualizerClearMarker, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) 
         for (int i = 0; i < 2; ++i) {
             InboundMessage message = receive_into_ring(
                 ring, frame_message(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data), 0);
-            impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, message,
-                                live_generation(*impl));
+            impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, message);
         }
-        if (row.teardown) {
+        if (row.teardown == Teardown::CLEANUP) {
             impl->cleanup();
-        }
-        if (row.recall_tick) {
-            impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
+        } else if (row.teardown == Teardown::GENERATION_ONLY) {
+            impl->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
         }
 
         EXPECT_EQ(!impl->drain_task->inbound.items().is_empty(), row.listed_before_take);

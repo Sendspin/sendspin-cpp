@@ -64,7 +64,7 @@ struct ColorRole::Impl : RoleTeardown {
     // Takes a const reference, unlike the metadata and controller overloads: a
     // ServerColorStateObject holds only optional RGB triples and a timestamp, so there is nothing
     // for an rvalue reference to move out of.
-    void handle_server_state(const ServerColorStateObject& color, uint32_t generation) const;
+    void handle_server_state(const ServerColorStateObject& color) const;
     // True if a slot palette needs taking, or a palette already held from a prior tick (see
     // held_state) is still waiting out its server-clock deadline: the deadline itself sets no
     // inbox bit, so held_state must be polled every tick until it fires.

@@ -354,7 +354,7 @@ bool InboundConsumer::bind(InboundRing* ring, InboundHolder holder) {
         return false;
     }
     this->holder_ = holder;
-    this->ring_.store(ring, std::memory_order_release);
+    this->ring_ = ring;
     return true;
 }
 
@@ -364,15 +364,15 @@ void InboundConsumer::unbind() {
     // this run's, and the list must not stay registered with it.
     this->items_.recall();
     this->items_.unbind();
-    this->ring_.store(nullptr, std::memory_order_release);
+    this->ring_ = nullptr;
 }
 
 void* InboundConsumer::take(uint32_t timeout_ms, const std::atomic<uint32_t>& generation) {
     void* item = this->items_.take(timeout_ms);
     while (item != nullptr &&
            inbound_item_header(item)->generation != generation.load(std::memory_order_acquire)) {
-        // Handed over for a stream a teardown has since ended; the protocol task recalls such
-        // items on its next tick, and this catches one taken first.
+        // Handed over for a stream a teardown has since ended: one taken between the holder
+        // role's generation bump and its cleanup()'s recall().
         this->return_item(item);
         item = this->items_.take(0);
     }
@@ -397,7 +397,6 @@ void* InboundConsumer::copy_local(const uint8_t* data, size_t len, uint32_t rece
 bool InboundConsumer::hand(void* item, size_t item_len, uint32_t generation, bool exempt) {
     InboundRing* ring = this->ring();
     inbound_item_header(item)->generation = generation;
-    this->recall_stale(generation);
     if (!ring->charge(item, item_len, this->holder_, exempt)) {
         // Throttled: see InboundDropLog.
         this->note_drop("over its buffer; dropping items until it drains");
@@ -409,13 +408,12 @@ bool InboundConsumer::hand(void* item, size_t item_len, uint32_t generation, boo
     return true;
 }
 
-void InboundConsumer::recall_stale(uint32_t generation) {
-    if (generation == this->recalled_generation_ || this->ring() == nullptr) {
+void InboundConsumer::recall() {
+    // Outside a run: SendspinClient::stop() runs the role's cleanup() after unbind() returned
+    // every item.
+    if (this->ring() == nullptr) {
         return;
     }
-    // Every item on the list was handed over under an earlier generation: hand() under
-    // `generation` runs this first, so none of its items can be here yet.
-    this->recalled_generation_ = generation;
     this->items_.recall();
     // The stream the drops belonged to is gone, so no delivery will end their run.
     this->drop_log_.end_run(TAG, this->dropped_items_name());

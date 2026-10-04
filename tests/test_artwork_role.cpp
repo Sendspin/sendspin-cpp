@@ -70,12 +70,6 @@ std::vector<uint8_t> make_image(uint8_t marker, size_t length) {
     return image;
 }
 
-// The generation a live dispatch loads with the gate check and a handler stamps on what it
-// queues, on a role that has not been torn down; a unit test driving a handler directly passes it.
-uint32_t live_generation(const ArtworkRole::Impl& impl) {
-    return impl.cleanup_generation.load(std::memory_order_acquire);
-}
-
 // Returns what handle_binary() reported: false means the message is a protocol error and the
 // connection must be closed.
 bool feed(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t>& body) {
@@ -997,7 +991,7 @@ TEST(ArtworkTransfer, EveryEndOfTheStreamDropsTheTransferInFlight) {
         std::function<void(ArtworkRole::Impl&)> end_the_stream;
     };
     const Row rows[] = {
-        {"stream/end", [](ArtworkRole::Impl& impl) { impl.handle_stream_end(live_generation(impl)); }},
+        {"stream/end", [](ArtworkRole::Impl& impl) { impl.handle_stream_end(); }},
         {"a new stream/start",
          [](ArtworkRole::Impl& impl) {
              impl.handle_stream_start(ServerArtworkStreamObject{});
@@ -1566,7 +1560,7 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
 
     // Slot 1 keeps decoding every frame freely, ungated by slot 0's outstanding delivery. Each
     // send waits for its own decode before the next is sent: slot 1 is double-buffered like any
-    // other slot (see SlotBuffer::write_generation), so three back-to-back writes with nothing
+    // other slot (see SlotBuffer), so three back-to-back writes with nothing
     // draining them could legitimately overwrite an unclaimed buffer and drop a frame: a
     // real (and separately-covered) property of the double-buffering scheme, not of the ack
     // gate this test is about, so it must not be exercised here.
@@ -1830,7 +1824,7 @@ TEST(ArtworkDisplayHandOff, ADisplayStampedBeforeATeardownIsNotShown) {
         auto impl = make_impl(make_single_slot_config(false));
         RecordingListener listener;
         impl->listener = &listener;
-        const uint32_t before = live_generation(*impl);
+        const uint32_t before = impl->cleanup_generation.load();
         impl->cleanup();
         ArtworkDisplayUpdate delta{};
         delta.timestamps[0] = 1;
@@ -1838,7 +1832,7 @@ TEST(ArtworkDisplayHandOff, ADisplayStampedBeforeATeardownIsNotShown) {
         delta.valid_mask = 0x01;
         impl->event_state->display_slot.merge(ArtworkRole::Impl::merge_artwork_display_update,
                                               std::move(delta),
-                                              row.stale ? before : live_generation(*impl));
+                                              row.stale ? before : impl->cleanup_generation.load());
 
         impl->drain_events();
 

@@ -103,16 +103,16 @@ struct PlayerRole::Impl : RoleTeardown {
     /// arrives in several Noise frames and is copied into one. Inside a run only.
     size_t advertised_buffer_capacity() const;
     void build_state_fields(ClientStateMessage& msg) const;
-    // Each handler takes the teardown generation the receive gate loaded when it admitted the
-    // message and stamps what it queues with it; see RoleTeardown. All run on the protocol task.
+    // Each handler loads the role's teardown generation once at entry and stamps what it queues
+    // with it; see RoleTeardown. All run on the protocol task.
     /// @brief Hands an audio chunk to the sync task: by its ring item when it has one (clearing
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted chunk; `data` points at its message type byte.
-    void handle_binary(InboundMessage& message, uint32_t generation);
-    void handle_stream_start(const ServerPlayerStreamObject& player_obj, uint32_t generation);
-    void handle_stream_end(uint32_t generation) const;
-    void handle_stream_clear(uint32_t generation);
-    void handle_server_command(const ServerCommandMessage& cmd, uint32_t generation) const;
+    void handle_binary(InboundMessage& message);
+    void handle_stream_start(const ServerPlayerStreamObject& player_obj);
+    void handle_stream_end() const;
+    void handle_stream_clear();
+    void handle_server_command(const ServerCommandMessage& cmd) const;
     /// @brief Holds a PLAYER_STREAM event (code: PlayerStreamCallbackType; serial: a STREAM_START's
     /// stream ordinal) in awaiting_sync_idle_events. Main loop.
     void on_stream_ring_event(const InboxEvent& event);
@@ -151,9 +151,6 @@ struct PlayerRole::Impl : RoleTeardown {
     /// @brief Joins the sync task thread and returns its buffered audio to the inbound ring;
     /// no-op if not started.
     void stop() const;
-
-    /// @brief InboundConsumer::recall_stale() on the sync task's list. Protocol task, each tick.
-    void recall_stale_items(uint32_t generation) const;
 
     // ========================================
     // Consumer-facing method implementations

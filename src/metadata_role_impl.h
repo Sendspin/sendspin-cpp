@@ -60,7 +60,7 @@ struct MetadataRole::Impl : RoleTeardown {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerMetadataStateObject&& metadata, uint32_t generation) const;
+    void handle_server_state(ServerMetadataStateObject&& metadata) const;
     // True if a slot state needs taking, or a state already held from a prior tick (see
     // held_state) is still waiting out its server-clock deadline: the deadline itself sets no
     // inbox bit, so held_state must be polled every tick until it fires.

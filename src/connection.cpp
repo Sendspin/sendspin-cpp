@@ -138,9 +138,8 @@ int64_t SendspinConnection::send_time_message() {
     if (len == 0) {
         return 0;
     }
-    // Release: a claim that observes this seed also observes the previous frame's retirement.
     this->time_frame_sent_us_.store(time_frame_tag(now), std::memory_order_release);
-    this->time_frame_tag_.store(time_frame_tag(now), std::memory_order_release);
+    this->time_frame_tag_ = time_frame_tag(now);
 
     // No tag check: a connection's time frames reach the socket in send order, so a hook left
     // over from an earlier frame stores a time no later than the current frame's write. Capturing
@@ -156,14 +155,14 @@ int64_t SendspinConnection::send_time_message() {
 }
 
 std::optional<int64_t> SendspinConnection::claim_time_frame(int64_t client_transmitted) {
-    // Read before the exchange: a later frame's write time is published after this frame was
-    // retired, so observing it makes the exchange fail.
-    const uint32_t sent = this->time_frame_sent_us_.load(std::memory_order_acquire);
-    uint32_t tag = time_frame_tag(client_transmitted);
-    if (tag == 0 ||
-        !this->time_frame_tag_.compare_exchange_strong(tag, 0, std::memory_order_acq_rel)) {
+    const uint32_t tag = time_frame_tag(client_transmitted);
+    if (tag == 0 || tag != this->time_frame_tag_) {
         return std::nullopt;
     }
+    this->time_frame_tag_ = 0;
+    // The frame in flight is this one, so the write time is its seed or what its write hook (or
+    // an earlier frame's, see send_time_message()) stored since.
+    const uint32_t sent = this->time_frame_sent_us_.load(std::memory_order_acquire);
     // Wrapping subtraction, read as signed: a leftover hook that sampled the clock before the seed
     // reads as negative, and the frame then counts as written at the time it carries.
     const auto delay = static_cast<int32_t>(sent - tag);

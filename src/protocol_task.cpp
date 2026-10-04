@@ -236,17 +236,11 @@ void ProtocolTask::post_requests(LifecycleRequests requests) {
         waiting.leave = waiting.leave || requests.leave;
         waiting.unpaired_access_changed =
             waiting.unpaired_access_changed || requests.unpaired_access_changed;
-        // Relaxed: the requests cross under the lock, and a tick that misses the bit is followed
-        // by the wake below.
-        this->requests_pending_.store(true, std::memory_order_relaxed);
     }
     this->wake();
 }
 
 bool ProtocolTask::take_requests(LifecycleRequests& out) {
-    if (!this->requests_pending_.exchange(false, std::memory_order_relaxed)) {
-        return false;
-    }
     LifecycleRequests taken;
     {
         std::lock_guard<std::mutex> lock(this->command_mutex_);

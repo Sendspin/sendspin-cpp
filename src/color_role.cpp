@@ -72,8 +72,8 @@ void ColorRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::COLOR);
 }
 
-void ColorRole::Impl::handle_server_state(const ServerColorStateObject& color,
-                                          uint32_t generation) const {
+void ColorRole::Impl::handle_server_state(const ServerColorStateObject& color) const {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // messaging.md "server/state": each included color object is the role's full palette, never
     // an overlay on the one before it (see coalesce_color_states).
     PendingColorStates arrival;

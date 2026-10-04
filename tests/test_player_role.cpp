@@ -308,12 +308,6 @@ std::unique_ptr<PlayerRole::Impl> make_impl(InboundRing* ring = nullptr) {
     return impl;
 }
 
-// The generation a live dispatch loads and a handler stamps on what it queues, on a role that has
-// not been torn down.
-uint32_t live_generation(const PlayerRole::Impl& impl) {
-    return impl.cleanup_generation.load(std::memory_order_acquire);
-}
-
 // A stream/start player object the role can serve: PCM sends a synthesized codec header, so the
 // blocking header send succeeds and the handler publishes the stream.
 ServerPlayerStreamObject pcm_stream_params() {
@@ -347,9 +341,9 @@ std::vector<uint8_t> audio_chunk(uint8_t marker = 0xDE, int64_t server_timestamp
 }
 
 // Hands one chunk to the role outside any ring item, as for a reassembled chunk.
-void hand_copied_chunk(PlayerRole::Impl& impl, std::vector<uint8_t> chunk, uint32_t generation) {
+void hand_copied_chunk(PlayerRole::Impl& impl, std::vector<uint8_t> chunk) {
     InboundMessage message = message_over(chunk);
-    impl.handle_binary(message, generation);
+    impl.handle_binary(message);
     take_in_ring_order(*impl.sync_task->inbound().ring());
 }
 
@@ -381,7 +375,7 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
         bind_items(impl, ring);
         client.set_available(row.available_on_arrival);
 
-        hand_copied_chunk(impl, audio_chunk(), live_generation(impl));
+        hand_copied_chunk(impl, audio_chunk());
         EXPECT_EQ(!impl.sync_task->inbound().items().is_empty(), row.queued);
     }
 }
@@ -449,7 +443,7 @@ TEST(PlayerInboundHandOff, AChunkInARingItemIsDecodedInPlace) {
             row.in_ring_item ? receive_into_ring(ring, chunk, 7) : message_over(chunk, 7);
         const uint8_t* frame_in_message = message.data + 13;
 
-        impl->handle_binary(message, live_generation(*impl));
+        impl->handle_binary(message);
         take_in_ring_order(ring);
         EXPECT_EQ(message.item, nullptr) << "the role must take the item over, or never had one";
 
@@ -493,24 +487,23 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
         auto visualizer = make_visualizer(ring);
 
         InboundMessage first = receive_into_ring(ring, audio_chunk(0x01), 0);
-        player->handle_binary(first, live_generation(*player));
+        player->handle_binary(first);
         const size_t one_chunk = ring.quota(InboundHolder::PLAYER).outstanding();
         ASSERT_GT(one_chunk, 0U);
         ring.quota(InboundHolder::PLAYER).set_limit(row.player_quota_chunks * one_chunk);
 
         InboundMessage second = receive_into_ring(ring, audio_chunk(0x02), 0);
-        player->handle_binary(second, live_generation(*player));
+        player->handle_binary(second);
         if (row.header_and_marker) {
-            player->handle_stream_start(pcm_stream_params(), live_generation(*player));
-            player->handle_stream_clear(live_generation(*player));
+            player->handle_stream_start(pcm_stream_params());
+            player->handle_stream_clear();
             take_in_ring_order(ring);
         }
         EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(),
                   std::min<size_t>(row.player_items, row.player_quota_chunks) * one_chunk);
 
         InboundMessage frame = receive_into_ring(ring, loudness_frame(), 0);
-        visualizer->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, frame,
-                                  visualizer->cleanup_generation.load());
+        visualizer->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, frame);
         EXPECT_GT(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
             << "the player's quota stopped the visualizer";
         EXPECT_FALSE(visualizer->drain_task->inbound.items().is_empty());
@@ -541,13 +534,13 @@ TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
         auto impl = make_impl();
         InboundRing& ring = *impl->sync_task->inbound().ring();
         InboundMessage before = receive_into_ring(ring, audio_chunk(0x01), 0);
-        impl->handle_binary(before, live_generation(*impl));
+        impl->handle_binary(before);
         if (row.clear) {
-            impl->handle_stream_clear(live_generation(*impl));
+            impl->handle_stream_clear();
             take_in_ring_order(ring);
         }
         InboundMessage after = receive_into_ring(ring, audio_chunk(0x02), 0);
-        impl->handle_binary(after, live_generation(*impl));
+        impl->handle_binary(after);
 
         SyncContext context;
         impl->sync_task->discard_to_clear_marker(context);
@@ -556,21 +549,23 @@ TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
 }
 
 // A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and
-// the old stream's audio never plays: the protocol task's next tick recalls what the sync task has
-// not taken, returning it and its quota charge to the ring, and an item the sync task takes before
-// that tick is dropped by its generation stamp and returned the same way.
+// the old stream's audio never plays: cleanup() recalls what the sync task has not taken,
+// returning it and its quota charge to the ring, and an item the sync task takes between the
+// generation bump and the recall is dropped by its generation stamp and returned the same way.
+// That window has no observable trigger, so its row moves the generation on directly, leaving
+// the items listed.
 TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
+    enum class Teardown { NONE, CLEANUP, GENERATION_ONLY };
     struct Row {
         const char* name;
-        bool teardown;
-        bool recall_tick;
+        Teardown teardown;
         size_t listed_before_take;
         size_t delivered;
     };
     const Row rows[] = {
-        {"Control: no teardown", false, true, 2, 2},
-        {"torn down, recalled by the protocol task's tick", true, true, 0, 0},
-        {"torn down, taken by the sync task before the recall", true, false, 2, 0},
+        {"Control: no teardown", Teardown::NONE, 2, 2},
+        {"torn down, recalled by cleanup()", Teardown::CLEANUP, 0, 0},
+        {"taken by the sync task before the recall", Teardown::GENERATION_ONLY, 2, 0},
     };
 
     for (const Row& row : rows) {
@@ -579,13 +574,12 @@ TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
         InboundRing& ring = *impl->sync_task->inbound().ring();
         for (uint8_t marker : {0x01, 0x02}) {
             InboundMessage message = receive_into_ring(ring, audio_chunk(marker), 0);
-            impl->handle_binary(message, live_generation(*impl));
+            impl->handle_binary(message);
         }
-        if (row.teardown) {
+        if (row.teardown == Teardown::CLEANUP) {
             impl->cleanup();
-        }
-        if (row.recall_tick) {
-            impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
+        } else if (row.teardown == Teardown::GENERATION_ONLY) {
+            impl->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
         }
 
         EXPECT_EQ(impl->sync_task->inbound().items().is_empty(), row.listed_before_take == 0);
@@ -613,10 +607,10 @@ TEST(PlayerTeardownGeneration, ACommandStampedBeforeATeardownIsNotApplied) {
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        const uint32_t before = live_generation(*impl);
+        const uint32_t before = impl->cleanup_generation.load();
         impl->cleanup();
         impl->event_state->command_slot.write(volume_command(70),
-                                              row.stale ? before : live_generation(*impl));
+                                              row.stale ? before : impl->cleanup_generation.load());
 
         impl->drain_events();
 
@@ -746,7 +740,7 @@ TEST(PlayerRoleOutputDelay, SetOutputDelayCommandIsIgnoredUnlessAdvertised) {
         player_cmd.output_delay_ms = 300;
         ServerCommandMessage cmd;
         cmd.player = player_cmd;
-        impl->handle_server_command(cmd, live_generation(*impl));
+        impl->handle_server_command(cmd);
         impl->drain_events();
 
         EXPECT_EQ(listener.changes, adjustable ? std::vector<uint16_t>{300} : std::vector<uint16_t>{});

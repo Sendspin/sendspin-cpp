@@ -339,7 +339,8 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
                       .audio_len = len - AUDIO_CHUNK_HEADER_SIZE};
 }
 
-SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t generation) {
+SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
     if (!chunk.has_value()) {
         SS_LOGW(TAG, "Binary message too short for the audio chunk header");
@@ -390,8 +391,8 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t ge
                     static_cast<uint32_t>(chunk->audio_len), generation);
 }
 
-void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj,
-                                           uint32_t generation) {
+void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
     // This stream's ordinal: hand_item() numbers its codec header with the same
     // stream_ordinal + 1 and its STREAM_START carries it, so the sync task starts it only on its
@@ -450,12 +451,14 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation, ordinal);
 }
 
-void PlayerRole::Impl::handle_stream_end(uint32_t generation) const {
+void PlayerRole::Impl::handle_stream_end() const {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     this->sync_task->signal_stream_end(this->stream_ordinal);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation, 0);
 }
 
-void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
+void PlayerRole::Impl::handle_stream_clear() {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // stream/clear is a seek within the active stream: the server flushes our buffered audio and
     // immediately resumes sending new audio with the same codec/params (no new stream/start). Tell
     // the sync task to discard buffered audio, then append a marker so it knows exactly where the
@@ -471,8 +474,8 @@ void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
     }
 }
 
-void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
-                                             uint32_t generation) const {
+void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) const {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     if (!cmd.player.has_value()) {
         SS_LOGV(TAG, "Server command has no player commands");
         return;
@@ -677,6 +680,10 @@ void PlayerRole::Impl::cleanup() {
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
+    // Return the items the sync task has not taken; one it takes before this carries the earlier
+    // stamp, which its take() discards.
+    this->sync_task->inbound().recall();
+
     // End the current stream: the sync task drains and returns to idle. (Not signal_stream_clear():
     // that path is a seek within a live stream and expects a marker to follow.)
     this->sync_task->signal_stream_end(this->stream_ordinal);
@@ -711,10 +718,6 @@ void PlayerRole::Impl::complete_teardown() {
 // ============================================================================
 // Impl: Helpers
 // ============================================================================
-
-void PlayerRole::Impl::recall_stale_items(uint32_t generation) const {
-    this->sync_task->inbound().recall_stale(generation);
-}
 
 bool PlayerRole::Impl::hand_item(void* item, size_t item_len, ChunkType chunk_type,
                                  uint8_t data_offset, uint32_t data_len,

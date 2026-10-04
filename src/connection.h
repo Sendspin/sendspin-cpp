@@ -114,17 +114,15 @@ public:
 
     /// @brief Stops this connection's inbound traffic: detaches the inbound gate, so the
     /// transport drops everything it receives from here on and the protocol task drops what it
-    /// still takes for the connection, and retires the client/time frame in flight, so a
-    /// server/time already being processed cannot claim it and overwrite the next connection's
-    /// measurement. Protocol task (the connection manager when the connection leaves it, and
-    /// close_silently()); the transport thread (fail_inbound()); the thread delivering an accept
-    /// the command queue refused; or the main loop with the protocol task joined.
+    /// still takes for the connection. Protocol task (the connection manager when the connection
+    /// leaves it, and close_silently()); the transport thread (fail_inbound()); the thread
+    /// delivering an accept the command queue refused; or the main loop with the protocol task
+    /// joined.
     ///
     /// A message the protocol task is already dispatching is not recalled: the drop that called
     /// this runs between two of the task's messages, and clears the admitted flag first.
     void detach_inbound() {
         this->inbound_gate_.detach();
-        this->cancel_time_frame();
     }
 
     /// @brief Whether an application message may still be sent: the transport is connected and
@@ -313,9 +311,10 @@ public:
     ///         than the write, or nullopt if no frame in flight carries that value.
     std::optional<int64_t> claim_time_frame(int64_t client_transmitted);
 
-    /// @brief Retires the client/time frame in flight, so a late reply to it no longer matches
+    /// @brief Retires the client/time frame in flight, so a late reply to it is not claimed.
+    /// Protocol task (the burst's response timeout).
     void cancel_time_frame() {
-        this->time_frame_tag_.store(0, std::memory_order_release);
+        this->time_frame_tag_ = 0;
     }
 
     /// @brief Sends a binary WebSocket frame to the peer.
@@ -801,13 +800,6 @@ public:
         this->inbound_gate_.consume_pending_message();
     }
 
-    /// @brief Records that the protocol task reported this connection lost, so it reports it
-    /// once. Protocol task only.
-    /// @return true the first time, false afterwards.
-    bool mark_loss_reported() {
-        return !std::exchange(this->loss_reported_, true);
-    }
-
     /// @brief Records that the transport closed and wakes the protocol task, which honours the
     /// close once the connection's queued messages are drained (InboundGate::close_ready()).
     /// Transport thread, after its last message is completed or published.
@@ -1119,14 +1111,13 @@ protected:
 
     /// Tag of the client/time frame in flight: the low 32 bits of the client_transmitted it
     /// carries, never 0 for a frame, and 0 once the frame is claimed or cancelled. A failed send
-    /// leaves its tag, which no reply can echo. 32 bits because a 64-bit atomic takes a lock on
-    /// the ESP32 family. Written on the protocol task (send, claim and cancel) and, to cancel, by
-    /// any thread detach_inbound() names; read on the protocol task.
-    std::atomic<uint32_t> time_frame_tag_{0};
+    /// leaves its tag, which no reply can echo. Protocol task only.
+    uint32_t time_frame_tag_{0};
 
     /// Low 32 bits of the client clock when the frame in flight was handed to the socket, seeded
     /// with the tag on the protocol task until the write hook overwrites it on whichever thread
-    /// performs the write; read on the protocol task (claim_time_frame()).
+    /// performs the write (the ESP server's httpd worker); read on the protocol task
+    /// (claim_time_frame()). 32 bits because a 64-bit atomic takes a lock on the ESP32 family.
     std::atomic<uint32_t> time_frame_sent_us_{0};
 
     // 16-bit fields
@@ -1205,10 +1196,6 @@ protected:
     /// abandon_inbound_message(), whether it is being assembled or dropped: a continuation frame
     /// is accepted only while it is set. Transport thread only.
     bool fragment_assembly_open_{false};
-
-    /// Set once the protocol task has reported this connection lost (mark_loss_reported()).
-    /// Protocol task only.
-    bool loss_reported_{false};
 
     /// Whether server/hello arrived. Set by its handler and never cleared: a closed connection is
     /// not reused. Protocol task only.

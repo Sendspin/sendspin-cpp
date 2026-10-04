@@ -402,8 +402,9 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
 // This test drives a real Noise AEAD decrypt failure on that real outbound host connection (the
 // simplest of the three close_silently() triggers to produce from a fake peer): close_silently()
 // must use close_transport_now(), which never blocks or joins, so merely completing this test
-// without the process aborting is the primary assertion. It also checks that the connection
-// is reported lost exactly once and that no client/goodbye is sent (the close is silent, per spec).
+// without the process aborting is the primary assertion. It also checks that a repeat loss report
+// for the dropped connection is tolerated and that no client/goodbye is sent (the close is
+// silent, per spec).
 TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
     SendspinClientConfig config;
     config.name = "AEAD Failure Outbound Test Client";
@@ -2056,11 +2057,11 @@ TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
 
     constexpr uint32_t TAG = 5000;
     admitted.time_frame_sent_us_.store(TAG);
-    admitted.time_frame_tag_.store(TAG);
+    admitted.time_frame_tag_ = TAG;
     deliver(admitted, time_reply(TAG + 1));
-    EXPECT_EQ(admitted.time_frame_tag_.load(), TAG) << "a reply to another frame must not take it";
+    EXPECT_EQ(admitted.time_frame_tag_, TAG) << "a reply to another frame must not take it";
     deliver(admitted, time_reply(TAG));
-    EXPECT_EQ(admitted.time_frame_tag_.load(), 0U) << "the reply to the frame in flight takes it";
+    EXPECT_EQ(admitted.time_frame_tag_, 0U) << "the reply to the frame in flight takes it";
 
     client.stop();
 }

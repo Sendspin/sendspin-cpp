@@ -131,15 +131,15 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// count), for the ring's pass-through budget (InboundRingBudget).
     size_t stored_frame_bytes_per_second() const;
     void build_state_fields(ClientStateMessage& msg) const;
-    // Each handler takes the teardown generation the receive gate loaded when it admitted the
-    // message and stamps what it queues with it; see RoleTeardown. All run on the protocol task.
+    // Each handler loads the role's teardown generation once at entry and stamps what it queues
+    // with it; see RoleTeardown. All run on the protocol task.
     /// @brief Hands a frame to the drain thread: by its ring item when it has one (clearing
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted frame; `data` points at its message type byte.
-    void handle_binary(uint8_t binary_type, InboundMessage& message, uint32_t generation);
-    void handle_stream_start(const ServerVisualizerStreamObject& stream, uint32_t generation);
-    void handle_stream_end(uint32_t generation);
-    void handle_stream_clear(uint32_t generation);
+    void handle_binary(uint8_t binary_type, InboundMessage& message);
+    void handle_stream_start(const ServerVisualizerStreamObject& stream);
+    void handle_stream_end();
+    void handle_stream_clear();
     /// @brief Fires the listener callback for a current stream event. Main loop.
     /// @param generation The event's stamp: a STREAM_START applies only the config written with
     ///        the same stamp.
@@ -179,9 +179,6 @@ struct VisualizerRole::Impl : RoleTeardown {
     void signal_clear_marker(uint32_t generation) const;
     /// @brief Drain-thread side: returns frames up to and including the marker
     void discard_to_clear_marker() const;
-    /// @brief InboundConsumer::recall_stale() on the drain thread's list. Protocol task, each
-    /// tick.
-    void recall_stale_items(uint32_t generation) const;
     /// @brief Fills an item's consumer fields and hands it to the drain thread
     /// (InboundConsumer::hand()). Protocol task only.
     bool hand_item(void* item, size_t item_len, uint8_t type, uint32_t data_len,

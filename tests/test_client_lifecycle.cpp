@@ -1905,7 +1905,7 @@ public:
 /// keeps (`keeps_state`), so its rows expect no clear and A's value where a teardown clears.
 struct StateRoleAccess {
     const char* name;
-    void (*admit)(SendspinClient&, uint8_t value, uint32_t generation);
+    void (*admit)(SendspinClient&, uint8_t value);
     void (*restore)(SendspinClient&, uint8_t value, uint32_t generation);
     void (*teardown)(SendspinClient&);
     void (*drain)(SendspinClient&);
@@ -1972,8 +1972,8 @@ void write_artwork_display(SendspinClient& c, uint8_t value, uint32_t generation
 
 const StateRoleAccess STATE_ROLES[] = {
     {"controller",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.controller_->impl_->handle_server_state(controller_state_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.controller_->impl_->handle_server_state(controller_state_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.controller_->impl_->event_state->slot.write(controller_state_with(v), g);
@@ -1986,8 +1986,8 @@ const StateRoleAccess STATE_ROLES[] = {
      },
      true, false},
     {"metadata",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.metadata_->impl_->handle_server_state(metadata_state_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.metadata_->impl_->handle_server_state(metadata_state_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.metadata_->impl_->event_state->slot.write(
@@ -2001,8 +2001,8 @@ const StateRoleAccess STATE_ROLES[] = {
      },
      true, false},
     {"color",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.color_->impl_->handle_server_state(color_state_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.color_->impl_->handle_server_state(color_state_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.color_->impl_->event_state->slot.write(
@@ -2016,8 +2016,8 @@ const StateRoleAccess STATE_ROLES[] = {
      },
      true, false},
     {"player stream params",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.player_->impl_->handle_stream_start(player_stream_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.player_->impl_->handle_stream_start(player_stream_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          PlayerRole::Impl& impl = *c.player_->impl_;
@@ -2036,8 +2036,8 @@ const StateRoleAccess STATE_ROLES[] = {
      },
      true, false},
     {"player command",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.player_->impl_->handle_server_command(player_volume_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.player_->impl_->handle_server_command(player_volume_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.player_->impl_->event_state->command_slot.write(player_volume_with(v), g);
@@ -2048,8 +2048,8 @@ const StateRoleAccess STATE_ROLES[] = {
      [](SendspinClient& c, const StateRoleLog&) { return c.player_->impl_->volume; },
      false, true},
     {"visualizer stream config",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.visualizer_->impl_->handle_stream_start(visualizer_stream_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.visualizer_->impl_->handle_stream_start(visualizer_stream_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          VisualizerRole::Impl& impl = *c.visualizer_->impl_;
@@ -2065,7 +2065,9 @@ const StateRoleAccess STATE_ROLES[] = {
      [](SendspinClient&, const StateRoleLog& log) { return log.visualizer_rate; },
      true, false},
     {"artwork display",
-     write_artwork_display,
+     [](SendspinClient& c, uint8_t v) {
+         write_artwork_display(c, v, c.artwork_->impl_->cleanup_generation.load());
+     },
      write_artwork_display,
      [](SendspinClient& c) { c.artwork_->impl_->cleanup(); },
      [](SendspinClient& c) { c.artwork_->impl_->drain_events(); },
@@ -2157,7 +2159,7 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
             SendspinClient& client = harness.client;
 
             // Connection A's state, applied.
-            role.admit(client, 1, role.generation(client));
+            role.admit(client, 1);
             client.loop();
             ASSERT_EQ(log.calls, std::vector<std::string>{"state 1"});
             log.calls.clear();
@@ -2165,15 +2167,15 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
             const uint32_t a_generation = role.generation(client);
             switch (row.stage) {
                 case Stage::CONTROL:
-                    role.admit(client, 2, role.generation(client));
+                    role.admit(client, 2);
                     break;
                 case Stage::ONE_LOOP:
                     role.teardown(client);
-                    role.admit(client, 2, role.generation(client));
+                    role.admit(client, 2);
                     break;
                 case Stage::TAKEN_BEFORE_ITS_CLEARED:
                     role.teardown(client);
-                    role.admit(client, 2, role.generation(client));
+                    role.admit(client, 2);
                     role.drain(client);
                     break;
                 case Stage::STALE_ACROSS:
@@ -2297,15 +2299,13 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
             params.sample_rate = 48000;
             params.channels = 2;
             params.bit_depth = 16;
-            impl.handle_stream_start(params, impl.cleanup_generation.load());
+            impl.handle_stream_start(params);
             pump_until(client, [&] { return impl.sync_task->is_running(); });
-            impl.handle_stream_end(impl.cleanup_generation.load());
+            impl.handle_stream_end();
             pump_until(client, [&] { return !client.is_started(); });
         } else {
-            client.controller_->impl_->handle_server_state(
-                controller_state_with(11), client.controller_->impl_->cleanup_generation.load());
-            client.metadata_->impl_->handle_server_state(
-                metadata_state_with(5), client.metadata_->impl_->cleanup_generation.load());
+            client.controller_->impl_->handle_server_state(controller_state_with(11));
+            client.metadata_->impl_->handle_server_state(metadata_state_with(5));
             client.loop();
         }
 
@@ -2430,13 +2430,13 @@ public:
     }
 };
 
-/// How many client/time frames the burst has written: send_time_message() tags the frame in
-/// flight before handing it to the transport, and nothing in these tests answers or cancels it.
-/// The stand-in has no Noise session, so the frame goes no further than that; the tag is the one
-/// trace a written frame leaves, and the burst retries a refused frame only after
-/// SEND_RETRY_DELAY_MS, past the end of each row.
+/// How many client/time frames the burst has written: send_time_message() seeds the frame's
+/// write time (never 0) before handing it to the transport. The stand-in has no Noise session, so
+/// the frame goes no further than that; the seed is the one trace a written frame leaves that
+/// another thread may read (an atomic, unlike the frame's tag), and the burst retries a refused
+/// frame only after SEND_RETRY_DELAY_MS, past the end of each row.
 int time_frames_written(const SendspinConnection& conn) {
-    return conn.time_frame_tag_.load() != 0 ? 1 : 0;
+    return conn.time_frame_sent_us_.load() != 0 ? 1 : 0;
 }
 
 // A time burst requests the high-performance hold when it comes due and sends its first
@@ -2445,8 +2445,8 @@ int time_frames_written(const SendspinConnection& conn) {
 // reach the listener as a request followed by its release. The test thread plays the protocol
 // task (run_time_sync(), on a stand-in connection in the admitted slot) and the main loop
 // (loop()), so a frame that must not be sent yet is proven unsent by the tick having returned
-// without writing it, not by a wait; the stand-in's frame tag is read for the reason given at
-// time_frames_written(). The Control row's burst is not due, so nothing is requested.
+// without writing it, not by a wait; the stand-in's frame write time is read for the reason given
+// at time_frames_written(). The Control row's burst is not due, so nothing is requested.
 TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
     enum class Stage : uint8_t { NOT_DUE, WAITS_FOR_GRANT, RELEASE_NOT_GATED, STALLED_TICK };
     struct Row {
@@ -2686,9 +2686,9 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params, player.cleanup_generation.load());
+            player.handle_stream_start(params);
         };
-        const auto end = [&] { player.handle_stream_end(player.cleanup_generation.load()); };
+        const auto end = [&] { player.handle_stream_end(); };
 
         switch (row.stage) {
             case Stage::ONE_START:
@@ -2712,7 +2712,7 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
                 // stream to take.
                 start();
                 wait_until([&] { return sync.inbound().items().is_empty(); });
-                player.handle_stream_clear(player.cleanup_generation.load());
+                player.handle_stream_clear();
                 wait_until([&] { return (sync.event_flags_.get() & COMMAND_STREAM_CLEAR) == 0; });
                 break;
             case Stage::START_END_START:
@@ -2776,7 +2776,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params, player.cleanup_generation.load());
+            player.handle_stream_start(params);
         };
 
         start();
@@ -2786,7 +2786,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         sync.inbound().return_item(context.encoded_item);  // Decoded: the stream is playing
         context.encoded_item = nullptr;
         if (row.end_first) {
-            player.handle_stream_end(player.cleanup_generation.load());
+            player.handle_stream_end();
         }
         start();
 
@@ -3086,7 +3086,7 @@ void start_stream_on(SendspinClient& client, std::shared_ptr<ObservedConnection>
     play_protocol_task(client);
     (void) replace_admitted(*client.connection_manager_, std::move(conn));
     PlayerRole::Impl& impl = *client.player_->impl_;
-    impl.handle_stream_start(pcm_stream_params(), impl.cleanup_generation.load());
+    impl.handle_stream_start(pcm_stream_params());
     SyncTask& sync_task = *impl.sync_task;
     pump_until(client, [&] { return sync_task.is_running(); });
 }
@@ -3211,7 +3211,7 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     InboundMessage message;
     message.data = chunk.data();
     message.len = chunk.size();
-    impl.handle_binary(message, impl.cleanup_generation.load());
+    impl.handle_binary(message);
     ASSERT_GT(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
         << "the chunk never reached the sync task's list";
 

@@ -71,15 +71,14 @@ private:
  * check each drain makes against it, and its TeardownTracker
  *
  * cleanup() bumps cleanup_generation and stamps everything the role queues from then on with the
- * new value: its events, its slot payloads, the items it hands a role thread. The gate in
- * SendspinClient's role dispatch loads the generation once, before the handler it admits runs,
- * and the handler stamps what it queues with it. A teardown runs on the protocol task between two
- * handlers, or from stop() once that task is joined, so the generation stays current for the whole
- * handler and the handler does not check it. The stamp protects the threads that consume what the
- * handler queued: the drains check a payload's stamp with accepts() (event_is_current(),
- * GenerationSlot), and a role thread an item's (InboundConsumer::take()), so a teardown that runs
- * before they take it discards it; a drain also uses accepts() to detect a listener callback that
- * re-entered teardown.
+ * new value: its events, its slot payloads, the items it hands a role thread. Each protocol-task
+ * handler loads the generation once at entry and stamps what it queues with it. A teardown runs
+ * on the protocol task between two handlers, or from stop() once that task is joined, so the
+ * generation stays current for the whole handler and the handler does not check it. The stamp
+ * protects the threads that consume what the handler queued: the drains check a payload's stamp
+ * with accepts() (event_is_current(), GenerationSlot), and a role thread an item's
+ * (InboundConsumer::take()), so a teardown that runs before they take it discards it; a drain also
+ * uses accepts() to detect a listener callback that re-entered teardown.
  */
 struct RoleTeardown {
     /// @brief Whether an effect stamped with `generation` may still be applied

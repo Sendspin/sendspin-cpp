@@ -24,7 +24,6 @@
 #include "sendspin/controller_role.h"
 #include "sendspin/types.h"
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -302,12 +301,6 @@ private:
     size_t accepts_queued_{0};
 
     // 8-bit fields
-    /// Whether requests_ holds a post not yet taken. Set under command_mutex_ by
-    /// post_requests(), cleared by take_requests() before it takes the lock, so a tick with
-    /// nothing posted skips the lock; the requests themselves cross under the lock. A post that
-    /// lands between the clear and the lock is taken with the rest, and the bit it set leaves
-    /// the next take an empty slot to find.
-    std::atomic<bool> requests_pending_{false};
     /// Set by close_accepts(), cleared by open_accepts(); guarded by command_mutex_.
     bool accepts_closed_{false};
 };
