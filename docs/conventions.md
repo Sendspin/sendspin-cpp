@@ -22,7 +22,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
   idempotent latest-wins request (`connect_to()`, `disconnect()`, `leave()`,
   the pairing-window gestures, an unpaired-access change), posting it to the
   protocol task's request slot, which never refuses; a command that the full
-  queue refuses is reported to the caller (`send_text()` returns false) or
+  queue refuses is reported to the caller (`send_controller_command()`
+  returns false, and `ControllerRole::send_command()` with it) or
   logged, never dropped silently. A connection refused at delivery is left with
   the transport that delivered it, which releases it after the delivery
   returns (on ESP, with its httpd session), so no refusal destroys a connection

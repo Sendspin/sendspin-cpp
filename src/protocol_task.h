@@ -47,7 +47,6 @@ class SendspinConnection;
 enum class ProtocolCommandType : uint8_t {
     ACCEPT_CONNECTION,        ///< A platform server delivered a WebSocket-upgraded connection
     SEND_CONTROLLER_COMMAND,  ///< SendspinClient::send_controller_command()
-    SEND_TEXT,                ///< SendspinClient::send_text()
 };
 
 static_assert(std::is_trivially_copyable_v<ClientCommandControllerObject>,
@@ -60,8 +59,6 @@ static_assert(std::is_trivially_copyable_v<ClientCommandControllerObject>,
 /// by the thread joining it at stop(); the queue's lock hands it over.
 struct ProtocolCommand {
     // Struct fields
-    /// SEND_TEXT: the message.
-    std::string text{};
     /// SEND_CONTROLLER_COMMAND: the validated command, formatted on the protocol task. 24 bytes
     /// on a 32-bit target, in every queue slot: 384 bytes across the default queue
     /// (CONSUMER_COMMAND_BURST plus ACCEPT_SLOTS_PER_SOCKET for each of the default four sockets).
@@ -72,9 +69,7 @@ struct ProtocolCommand {
     std::shared_ptr<SendspinConnection> connection{};
 
     // 8-bit fields
-    ProtocolCommandType type{ProtocolCommandType::SEND_TEXT};
-    /// SEND_TEXT: the role the message belongs to.
-    SendspinRole role{SendspinRole::CONTROLLER};
+    ProtocolCommandType type{ProtocolCommandType::SEND_CONTROLLER_COMMAND};
 };
 
 // ============================================================================
@@ -144,16 +139,16 @@ public:
     static constexpr uint32_t NO_DEADLINE = UINT32_MAX;
 
     /// Queue slots for consumer sends, each a SEND_CONTROLLER_COMMAND
-    /// (ControllerRole::send_command()) or a SEND_TEXT (send_text()) issued between two drains
-    /// of the queue. A discrete gesture (play, next) is one send, but a volume slider sends one
-    /// per input event, about six in a 100 ms window at a 60 Hz input rate, which is the stall
-    /// this covers: eight holds such a window plus a gesture issued during it. A control that
-    /// sends faster than the task drains, such as a rotary encoder sending a step per detent
-    /// through a longer stall, still overruns it. A send past the burst is refused and
-    /// push_command() returns false, a drop the client must pass back to whoever called
-    /// send_command() or send_text() rather than swallow. A client/state snapshot
-    /// (publish_state()) and the lifecycle requests, connect_to() among them (post_requests()),
-    /// take no slot, and a transport close is out of band (InboundGate), so none of them counts.
+    /// (ControllerRole::send_command()) issued between two drains of the queue. A discrete
+    /// gesture (play, next) is one send, but a volume slider sends one per input event, about six
+    /// in a 100 ms window at a 60 Hz input rate, which is the stall this covers: eight holds such
+    /// a window plus a gesture issued during it. A control that sends faster than the task
+    /// drains, such as a rotary encoder sending a step per detent through a longer stall, still
+    /// overruns it. A send past the burst is refused and push_command() returns false, a drop the
+    /// client must pass back to whoever called send_command() rather than swallow. A client/state
+    /// snapshot (publish_state()) and the lifecycle requests, connect_to() among them
+    /// (post_requests()), take no slot, and a transport close is out of band (InboundGate), so
+    /// none of them counts.
     static constexpr size_t CONSUMER_COMMAND_BURST = 8;
 
     /// Accept slots reserved per socket of SendspinClientConfig::server_max_connections. A
@@ -230,7 +225,8 @@ public:
     /// @return false when the queue is empty.
     bool take_command(ProtocolCommand& out);
 
-    /// @brief Replaces the latest client/state snapshot and wakes the task. Any thread.
+    /// @brief Replaces the latest client/state snapshot and wakes the task. Main loop
+    /// (SendspinClient::publish_state() and start()).
     ///
     /// One slot beside the command queue: a snapshot is never refused, only the newest matters,
     /// and the one it replaces is destroyed outside the lock. The tick applies it after draining
@@ -284,7 +280,7 @@ private:
     /// nothing heap-backed is destroyed under it.
     std::mutex command_mutex_;
     EventFlags event_flags_;
-    /// The newest client/state snapshot not yet taken. Written from any thread, taken by the
+    /// The newest client/state snapshot not yet taken. Written by the main loop, taken by the
     /// protocol task; guarded by command_mutex_ and only ever swapped under it.
     std::optional<ClientStateMessage> latest_state_;
     std::thread thread_;

@@ -25,16 +25,16 @@
 #include <atomic>
 #include <cstdint>
 #include <future>
-#include <string>
 #include <thread>
 
 namespace sendspin {
 namespace {
 
-ProtocolCommand make_command(ProtocolCommandType type, std::string text = {}) {
+// A command whose controller-command volume tags it, so a take can tell which push it came from.
+ProtocolCommand make_command(ProtocolCommandType type, uint8_t tag = 0) {
     ProtocolCommand command;
     command.type = type;
-    command.text = std::move(text);
+    command.controller_command.volume = tag;
     return command;
 }
 
@@ -46,36 +46,31 @@ constexpr unsigned TEST_PRIORITY = 5;
 // Commands come out in the order they went in, accepts and consumer commands interleaved.
 TEST(ProtocolTaskCommands, TakesCommandsInPushOrder) {
     ProtocolTask task(MAX_CONNECTIONS);
-    ASSERT_TRUE(task.push_command(make_command(ProtocolCommandType::SEND_TEXT, "first")));
+    ASSERT_TRUE(task.push_command(make_command(ProtocolCommandType::SEND_CONTROLLER_COMMAND, 1)));
     ASSERT_TRUE(task.push_command(make_command(ProtocolCommandType::ACCEPT_CONNECTION)));
-    ASSERT_TRUE(task.push_command(make_command(ProtocolCommandType::SEND_TEXT, "hello")));
+    ASSERT_TRUE(task.push_command(make_command(ProtocolCommandType::SEND_CONTROLLER_COMMAND, 2)));
 
     ProtocolCommand out;
     ASSERT_TRUE(task.take_command(out));
-    EXPECT_EQ(out.type, ProtocolCommandType::SEND_TEXT);
-    EXPECT_EQ(out.text, "first");
+    EXPECT_EQ(out.type, ProtocolCommandType::SEND_CONTROLLER_COMMAND);
+    EXPECT_EQ(out.controller_command.volume, 1);
     ASSERT_TRUE(task.take_command(out));
     EXPECT_EQ(out.type, ProtocolCommandType::ACCEPT_CONNECTION);
     ASSERT_TRUE(task.take_command(out));
-    EXPECT_EQ(out.type, ProtocolCommandType::SEND_TEXT);
-    EXPECT_EQ(out.text, "hello");
+    EXPECT_EQ(out.type, ProtocolCommandType::SEND_CONTROLLER_COMMAND);
+    EXPECT_EQ(out.controller_command.volume, 2);
     EXPECT_FALSE(task.take_command(out));
 }
 
 // Consumer commands are bounded by CONSUMER_COMMAND_BURST, and a burst that fills them cannot
 // take an accept's reserved slot: every one of the ACCEPT_SLOTS accepts still queues. The push
-// past the burst is refused and leaves the command with its caller unchanged. Control: every push
-// within the bounds is accepted.
+// past either bound is refused. Control: every push within the bounds is accepted.
 TEST(ProtocolTaskCommands, ConsumerBurstIsBoundedAndAcceptsKeepTheirReservedSlots) {
     ProtocolTask task(MAX_CONNECTIONS);
     for (size_t i = 0; i < ProtocolTask::CONSUMER_COMMAND_BURST; ++i) {
-        ASSERT_TRUE(task.push_command(
-            make_command(ProtocolCommandType::SEND_TEXT, std::to_string(i))));
+        ASSERT_TRUE(task.push_command(make_command(ProtocolCommandType::SEND_CONTROLLER_COMMAND)));
     }
-    ProtocolCommand overflow = make_command(ProtocolCommandType::SEND_TEXT, "overflow");
-    EXPECT_FALSE(task.push_command(std::move(overflow)));
-    // NOLINTNEXTLINE(bugprone-use-after-move): a refused push does not move from it
-    EXPECT_EQ(overflow.text, "overflow") << "a refused command stays with its caller";
+    EXPECT_FALSE(task.push_command(make_command(ProtocolCommandType::SEND_CONTROLLER_COMMAND)));
 
     for (size_t i = 0; i < ACCEPT_SLOTS; ++i) {
         EXPECT_TRUE(task.push_command(make_command(ProtocolCommandType::ACCEPT_CONNECTION)));
@@ -120,7 +115,7 @@ TEST(ProtocolTaskCommands, StopLeavesQueuedCommandsForTheJoiningThread) {
     ASSERT_TRUE(task.start([] { return ProtocolTask::NO_DEADLINE; }, TEST_STACK, TEST_PRIORITY,
                            false));
     for (int i = 0; i < 3; ++i) {
-        ASSERT_TRUE(task.push_command(make_command(ProtocolCommandType::SEND_TEXT)));
+        ASSERT_TRUE(task.push_command(make_command(ProtocolCommandType::SEND_CONTROLLER_COMMAND)));
     }
     task.post_requests({.leave = true});
     task.publish_state(ClientStateMessage{});
@@ -147,6 +142,7 @@ TEST(ProtocolTaskCommands, StopLeavesQueuedCommandsForTheJoiningThread) {
 // deadline, so only the push's or the post's own wake can deliver it; the future has no timeout,
 // so one that does not wake the task hangs here and the watchdog names the test.
 TEST(ProtocolTaskCommands, CommandOrRequestFromAnotherThreadWakesTheTick) {
+    constexpr uint8_t PRODUCER_TAG = 42;
     for (const bool request : {false, true}) {
         SCOPED_TRACE(request ? "a lifecycle request" : "a queued command");
         ProtocolTask task(MAX_CONNECTIONS);
@@ -162,7 +158,7 @@ TEST(ProtocolTaskCommands, CommandOrRequestFromAnotherThreadWakesTheTick) {
                 ProtocolCommand command;
                 bool seen = false;
                 while (task.take_command(command)) {
-                    seen = seen || command.text == "from-producer";
+                    seen = seen || command.controller_command.volume == PRODUCER_TAG;
                 }
                 LifecycleRequests requests;
                 seen = seen || (task.take_requests(requests) && requests.leave);
@@ -179,7 +175,8 @@ TEST(ProtocolTaskCommands, CommandOrRequestFromAnotherThreadWakesTheTick) {
             if (request) {
                 task.post_requests({.leave = true});
             } else {
-                task.push_command(make_command(ProtocolCommandType::SEND_TEXT, "from-producer"));
+                task.push_command(
+                    make_command(ProtocolCommandType::SEND_CONTROLLER_COMMAND, PRODUCER_TAG));
             }
         });
         taken.get_future().get();

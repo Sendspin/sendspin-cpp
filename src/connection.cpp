@@ -59,8 +59,7 @@ SsErr SendspinConnection::send_transport_frame(const uint8_t* data, size_t len,
     if (before_write) {
         before_write();
     }
-    // allow_before_hello=true: Noise frames are transport-level and precede the app hello.
-    return this->send_binary_message(data, len, nullptr, /*allow_before_hello=*/true);
+    return this->send_binary_message(data, len, nullptr);
 }
 
 // ============================================================================
@@ -83,21 +82,19 @@ void SendspinConnection::wake_protocol_task() const {
 
 SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
                                               SendCompleteCallback on_complete) {
-    // Goodbye must be sent even when Noise transport is active; route through send_app_json
-    // so it is encrypted. allow_before_hello=true because goodbye can precede the hello (e.g.,
-    // when rejecting an excess connection before the handshake finishes).
+    // Routed through send_app_json() so it is encrypted once the Noise transport is active. A
+    // goodbye can precede the hello (e.g., when rejecting an excess connection before the
+    // handshake finishes).
     return this->send_app_json(format_client_goodbye_message(reason, *this->json_arena_),
-                               std::move(on_complete), /*allow_before_hello=*/true);
+                               std::move(on_complete));
 }
 
-SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCallback cb,
-                                        bool allow_before_hello) {
+SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCallback cb) {
     // Delegate to the pointer/length overload: same routing (see that overload).
-    return this->send_app_json(json.data(), json.size(), std::move(cb), allow_before_hello);
+    return this->send_app_json(json.data(), json.size(), std::move(cb));
 }
 
-SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendCompleteCallback cb,
-                                        bool allow_before_hello) {
+SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendCompleteCallback cb) {
     // Protocol task only, like the re-handshake swap, so the session cannot change between this
     // check and the encrypt.
     if (this->noise_transport_.is_active()) {
@@ -110,7 +107,7 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendComple
         return err;
     }
     // Pre-handshake cold path: the text-frame API takes a std::string.
-    return this->send_text_message(std::string(json, len), std::move(cb), allow_before_hello);
+    return this->send_text_message(std::string(json, len), std::move(cb));
 }
 
 // ============================================================================
@@ -195,7 +192,7 @@ void SendspinConnection::send_noise_client_init() {
     }
     std::string client_init = this->noise_handshake_->build_client_init();
     if (!client_init.empty()) {
-        this->send_text_message(client_init, nullptr, /*allow_before_hello=*/true);
+        this->send_text_message(client_init, nullptr);
     }
 }
 
@@ -205,7 +202,7 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
     }
 
     auto send_fn = [this](const std::string& msg) -> bool {
-        auto err = this->send_text_message(msg, nullptr, /*allow_before_hello=*/true);
+        auto err = this->send_text_message(msg, nullptr);
         return err == SsErr::OK;
     };
 

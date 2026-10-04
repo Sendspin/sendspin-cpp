@@ -340,9 +340,6 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
 }
 
 SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t generation) {
-    if (!this->accepts(generation)) {
-        return;
-    }
     auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
     if (!chunk.has_value()) {
         SS_LOGW(TAG, "Binary message too short for the audio chunk header");
@@ -444,20 +441,11 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     }
     this->stream_ordinal = ordinal;
 
-    // The codec-header write above waits up to HEADER_SEND_TIMEOUT_MS for ring space, which is the
-    // widest window a teardown can land in between the receive gate and this publication. One
-    // that did land has already ended the stream and queued its own STREAM_END, so publishing
-    // here would re-arm the sync task on the header just written with nothing behind it (the
-    // sync task discards that header too: it carries the generation the teardown left behind).
-    if (!this->accepts(generation)) {
-        return;
-    }
-
     // Write stream params to the inbox slot for the main thread, then signal. The high-performance
     // acquire for playback happens when the main loop drains the STREAM_START event, keeping
     // high_performance_requested_for_playback main-thread-only. Both carry `generation`, so a
-    // teardown that lands between the two Inbox writes (stop()'s, on the main loop) leaves a
-    // START the drain discards and params it never applies (see drain_events()).
+    // teardown that runs before the drain takes them leaves a START the drain discards and params
+    // it never applies (see drain_events()).
     this->event_state->stream_params_slot.write(player_obj, generation);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation, ordinal);
 }
@@ -468,9 +456,6 @@ void PlayerRole::Impl::handle_stream_end(uint32_t generation) const {
 }
 
 void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
-    if (!this->accepts(generation)) {
-        return;
-    }
     // stream/clear is a seek within the active stream: the server flushes our buffered audio and
     // immediately resumes sending new audio with the same codec/params (no new stream/start). Tell
     // the sync task to discard buffered audio, then append a marker so it knows exactly where the
@@ -488,9 +473,6 @@ void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
 
 void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
                                              uint32_t generation) const {
-    if (!this->accepts(generation)) {
-        return;
-    }
     if (!cmd.player.has_value()) {
         SS_LOGV(TAG, "Server command has no player commands");
         return;

@@ -1022,10 +1022,6 @@ static constexpr size_t inbound_ring_min_storage_bytes(size_t largest_message_by
     return 2 * inbound_item_stored_bytes(largest_message_bytes);
 }
 
-/// Ring storage the largest inbound item occupies.
-static constexpr size_t INBOUND_MAX_ITEM_STORED_BYTES =
-    inbound_item_stored_bytes(INBOUND_MAX_MESSAGE_BYTES);
-
 /// The floor of a ring that accepts a maximal message (131,152 bytes).
 static constexpr size_t INBOUND_RING_MIN_STORAGE_BYTES =
     inbound_ring_min_storage_bytes(INBOUND_MAX_MESSAGE_BYTES);

@@ -31,9 +31,6 @@ struct TimeResponse {
     int64_t offset{0};     ///< Server clock minus client clock (microseconds).
     int64_t max_error{0};  ///< Half the round-trip delay (microseconds).
     int64_t timestamp{0};  ///< When the reply arrived, on the client clock (microseconds).
-    /// get_instance_id() of the connection the reply arrived on; an id, not a pointer, so a freed
-    /// connection cannot ABA-match.
-    uint64_t source_id{0};
     /// The client_transmitted the reply echoed, identifying the client/time it answers.
     int64_t client_transmitted{0};
 };

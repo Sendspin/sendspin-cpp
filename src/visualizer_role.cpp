@@ -318,7 +318,7 @@ void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
 void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& message,
                                          uint32_t generation) {
     InboundConsumer& inbound = this->drain_task->inbound;
-    if (!this->accepts(generation) || !this->stream_active || inbound.ring() == nullptr) {
+    if (!this->stream_active || inbound.ring() == nullptr) {
         return;
     }
 
@@ -382,9 +382,6 @@ void VisualizerRole::Impl::recall_stale_items(uint32_t generation) const {
 
 void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObject& stream,
                                                uint32_t generation) {
-    if (!this->accepts(generation)) {
-        return;
-    }
     // Cache stream config for handle_binary (same thread) and the drain thread
     uint8_t bin_count = 0;
     uint8_t types_mask = 0;
@@ -455,9 +452,6 @@ void VisualizerRole::Impl::handle_stream_end(uint32_t generation) {
 }
 
 void VisualizerRole::Impl::handle_stream_clear(uint32_t generation) {
-    if (!this->accepts(generation)) {
-        return;
-    }
     // messaging.md "stream/clear" discards buffered data but the stream stays active; data
     // received after this message continues to flow. The marker separates the two: a blind
     // flush would race this thread and drop post-clear frames it has already appended.

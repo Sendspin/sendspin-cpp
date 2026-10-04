@@ -22,7 +22,6 @@
 #include "sendspin/metadata_role.h"
 #include "teardown_tracker.h"
 
-#include <atomic>
 #include <memory>
 #include <optional>
 

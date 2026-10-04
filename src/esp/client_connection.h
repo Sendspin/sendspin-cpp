@@ -95,13 +95,10 @@ public:
     }
 
     /// @brief Sends a text message to the server with a completion callback
-    SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
-                            bool allow_before_hello) override;
+    SsErr send_text_message(const std::string& message, SendCompleteCallback cb) override;
 
     /// @brief Sends a binary WebSocket frame to the server
-    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                              bool allow_before_hello) override;
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) override;
 
     // ========================================
     // Client connection-specific configuration

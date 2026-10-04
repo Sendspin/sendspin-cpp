@@ -191,9 +191,9 @@ struct ArtworkRole::Impl : RoleTeardown {
     /// @return false when the message is a protocol error per roles/artwork/v1.md "Artwork
     /// (Binary)" and the caller must close the connection; true when processed or ignored.
     bool handle_binary(uint8_t slot, const uint8_t* data, size_t len);
-    // The lifecycle handlers re-check the admitting generation where they take effect; see
-    // accepts().
-    void handle_stream_start(const ServerArtworkStreamObject& stream, uint32_t generation);
+    // handle_stream_end() stamps the events it queues with the admitting generation; see
+    // RoleTeardown.
+    void handle_stream_start(const ServerArtworkStreamObject& stream);
     void handle_stream_end(uint32_t generation);
     void handle_stream_ring_event(ArtworkEventType event);
     // True if this tick has drainable artwork work. The display-slot bit covers newly decoded

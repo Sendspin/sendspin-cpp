@@ -1523,8 +1523,9 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
 
     // The playback half: the connection is operational and publishes client/state, which only
     // the operational path does.
-    EXPECT_TRUE(client.is_connected())
-        << "a first combined activate must announce the connection operational";
+    // The flag rises at the end of the tick that admitted the connection, which may be the tick
+    // that sent the pair-init just observed.
+    pump_until(client, [&] { return client.is_connected(); });
     pump_until(client, [&] { return server.client_state_count() > 0; });
 
     // ...and its role is active, which is what active_roles surviving the pairing activity means
@@ -1602,7 +1603,9 @@ TEST(EncryptedLifecycle, ActivateThatLosesPlaybackCapabilityRemovesTheRoles) {
     pump_until(client, [&] { return metadata_listener.clears.load() == 1; });
     EXPECT_EQ(client.metadata()->get_track_duration_ms(), 0U);
     pump_until(client, [&] { return server.pair_init().has_value(); });
-    EXPECT_TRUE(client.is_connected()) << "an admissible activation closed the connection";
+    // Rises at the end of the admitting tick, which may be the one that sent the pair-init.
+    pump_until(client, [&] { return client.is_connected(); });
+    EXPECT_FALSE(server.closed()) << "an admissible activation closed the connection";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1651,8 +1654,9 @@ TEST(EncryptedLifecycle, CombinedActivateAfterARehandshakeGoesOperationalAndEnte
     EXPECT_EQ(server.pair_init()->pairing_index, 1U)
         << "a re-handshake resets the counter, so the activate that follows it is the first";
 
-    EXPECT_TRUE(client.is_connected())
-        << "the post-rekey combined activate must bring the connection back operational";
+    // The flag rises at the end of the tick that applied the post-rekey activate, which may be
+    // the tick that sent the pair-init just observed.
+    pump_until(client, [&] { return client.is_connected(); });
     pump_until(client, [&] { return server.client_state_count() > state_count_before_rekey; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -1812,13 +1816,13 @@ TEST(EncryptedLifecycle, RehandshakeWithoutAnActivateIsDroppedByTheReproveWatchd
 // A SendspinConnection that exists only to carry the connection's protocol state: nothing is sent,
 // and no transport is ever attached. It lets a test hand messages straight to the dispatch path
 // on the test thread, which plays the protocol task.
-class HoldTestConnection : public SendspinConnection {
+class DispatchTestConnection : public SendspinConnection {
 public:
     /// Applies the activation a real connection would have received before any role traffic
     /// reaches it: the client acts on a role's messages only while that role is active
     /// (messaging.md "server/activate"), so a connection with no applied activation would silence
     /// every role this fixture drives.
-    HoldTestConnection() {
+    DispatchTestConnection() {
         this->apply_server_activate({SendspinActivity::PLAYBACK},
                                     std::vector<std::string>{"player@v1", "controller@v1",
                                                              "metadata@v1", "color@v1",
@@ -1836,15 +1840,14 @@ public:
     bool is_connected() const override {
         return true;
     }
-    SsErr send_text_message(const std::string& /*msg*/, SendCompleteCallback cb,
-                            bool /*allow_before_hello*/) override {
+    SsErr send_text_message(const std::string& /*msg*/, SendCompleteCallback cb) override {
         if (cb) {
             cb(true);
         }
         return SsErr::OK;
     }
-    SsErr send_binary_message(const uint8_t* /*data*/, size_t /*len*/, SendCompleteCallback cb,
-                              bool /*allow_before_hello*/) override {
+    SsErr send_binary_message(const uint8_t* /*data*/, size_t /*len*/,
+                              SendCompleteCallback cb) override {
         if (cb) {
             cb(true);
         }
@@ -1852,11 +1855,12 @@ public:
     }
 };
 
-// A started client with a metadata role, and the one entry point the hold tests need: hand a JSON
+// A started client with a metadata, a player and a controller role, the admission of a stand-in
+// connection into the admitted array, and the entry point the dispatch tests need: hand a JSON
 // message to the dispatch path as the protocol task would.
-class HoldTestClient {
+class DispatchTestClient {
 public:
-    explicit HoldTestClient(
+    explicit DispatchTestClient(
         const char* name,
         size_t json_arena_size = SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE) {
         SendspinClientConfig config;
@@ -1867,7 +1871,7 @@ public:
         this->client_storage = std::make_unique<SendspinClient>(std::move(config));
         this->client_storage->set_network_provider(&this->network);
         this->client_storage->add_metadata().set_listener(&this->listener);
-        // The other roles a held message can be dispatched to, so the replay runs their real
+        // The other roles a delivered message can be dispatched to, so delivery runs their real
         // handlers. The player has no listener, so its sync task never starts and its stream
         // handlers take the no-op path through an uninitialized ring.
         PlayerRoleConfig player_config;
@@ -1880,7 +1884,7 @@ public:
         this->client_storage->protocol_task_->stop();
     }
 
-    ~HoldTestClient() {
+    ~DispatchTestClient() {
         this->client_storage->stop();
     }
 
@@ -1897,20 +1901,20 @@ public:
 
     /// A stand-in connection owned by the bundle, so it outlives every reference the client's
     /// connection manager takes to it.
-    HoldTestConnection& connection() {
-        this->connections.push_back(std::make_shared<HoldTestConnection>());
+    DispatchTestConnection& connection() {
+        this->connections.push_back(std::make_shared<DispatchTestConnection>());
         return *this->connections.back();
     }
 
     /// Admits `conn` the way a promotion does, owning the roles its activation made active.
-    void admit(HoldTestConnection& conn) {
+    void admit(DispatchTestConnection& conn) {
         this->admit_owning(conn, conn.get_active_role_mask());
     }
 
     /// Admits `conn` owning `owned_roles` (role_mask_bit() bits), as arbitration leaves a
     /// connection that shares the admitted array with another owner.
-    void admit_owning(HoldTestConnection& conn, uint16_t owned_roles) {
-        std::shared_ptr<HoldTestConnection> owned;
+    void admit_owning(DispatchTestConnection& conn, uint16_t owned_roles) {
+        std::shared_ptr<DispatchTestConnection> owned;
         for (const auto& candidate : this->connections) {
             if (candidate.get() == &conn) {
                 owned = candidate;
@@ -1934,7 +1938,7 @@ public:
     TestNetworkProvider network;
     RecordingMetadataListener listener;
     // Declared before the client, so the client (stopped first) is destroyed before them.
-    std::vector<std::shared_ptr<HoldTestConnection>> connections;
+    std::vector<std::shared_ptr<DispatchTestConnection>> connections;
     std::unique_ptr<SendspinClient> client_storage;
 };
 
@@ -2028,14 +2032,14 @@ TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
     CountingPlayerListener listener;
     client.add_player(make_pcm_player_config()).set_listener(&listener);
     ASSERT_TRUE(client.start());
-    // The test thread plays the protocol task, as in HoldTestClient.
+    // The test thread plays the protocol task, as in DispatchTestClient.
     client.protocol_task_->stop();
 
-    auto admitted_owner = std::make_shared<HoldTestConnection>();
-    HoldTestConnection& admitted = *admitted_owner;
+    auto admitted_owner = std::make_shared<DispatchTestConnection>();
+    DispatchTestConnection& admitted = *admitted_owner;
     client.connection_manager_->install_admitted(admitted_owner,
                                                  admitted_owner->get_active_role_mask());
-    HoldTestConnection unsolicited;
+    DispatchTestConnection unsolicited;
 
     auto deliver = [&client](SendspinConnection& conn, const std::string& json) {
         client.process_json_message(conn, json.data(), json.size(), platform_time_us());
@@ -2064,9 +2068,9 @@ TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
 // messaging.md "server/state": each metadata object carries the role's full state, so what a
 // later object leaves out is gone rather than carried forward from the object before it.
 TEST(EncryptedLifecycle, MetadataStateReplacesRatherThanMerges) {
-    HoldTestClient bundle("Metadata Full State Test Client");
+    DispatchTestClient bundle("Metadata Full State Test Client");
 
-    HoldTestConnection& conn = bundle.connection();
+    DispatchTestConnection& conn = bundle.connection();
     bundle.admit(conn);
     bundle.deliver(
         conn,
@@ -2314,11 +2318,11 @@ TEST(EncryptedLifecycle, ANewerScheduledColorPaletteReplacesThePendingOne) {
 }
 
 // Control: the harness itself delivers. An admitted connection's role message reaches the
-// metadata listener through the same dispatch entry point the hold tests use.
+// metadata listener through the same dispatch entry point the dispatch tests use.
 TEST(EncryptedLifecycle, RoleTrafficFromAnAdmittedConnectionIsApplied) {
-    HoldTestClient bundle("Admitted Role Traffic Test Client");
+    DispatchTestClient bundle("Admitted Role Traffic Test Client");
 
-    HoldTestConnection& conn = bundle.connection();
+    DispatchTestConnection& conn = bundle.connection();
     bundle.admit(conn);
     bundle.deliver(conn, metadata_state_json(1, "Admitted"));
     bundle.pump();
@@ -2329,9 +2333,9 @@ TEST(EncryptedLifecycle, RoleTrafficFromAnAdmittedConnectionIsApplied) {
 // Role traffic from a connection that is not admitted is dropped, not kept: it stays dropped even
 // once that connection reaches the admitted slot.
 TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsNotAppliedAtAdmission) {
-    HoldTestClient bundle("Pre-Activate Role Traffic Test Client");
+    DispatchTestClient bundle("Pre-Activate Role Traffic Test Client");
 
-    HoldTestConnection& conn = bundle.connection();
+    DispatchTestConnection& conn = bundle.connection();
     bundle.deliver(conn, metadata_state_json(1, "Before Any Activate"));
     bundle.pump();
     ASSERT_EQ(bundle.listener.updates, 0);
@@ -2349,9 +2353,9 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsNotAppliedAtAdmission) {
 // metadata title are what say the handlers ran rather than being walked past: a type whose arm
 // does nothing is invisible to the trailing message alone.
 TEST(EncryptedLifecycle, EveryRoleMessageTypeRunsThroughItsHandler) {
-    HoldTestClient bundle("Role Handler Test Client");
+    DispatchTestClient bundle("Role Handler Test Client");
 
-    HoldTestConnection& conn = bundle.connection();
+    DispatchTestConnection& conn = bundle.connection();
     bundle.admit(conn);
     for (const std::string& json :
          {std::string(R"({"type":"server/state","payload":{"controller":{"playback_state":)"
@@ -2395,8 +2399,8 @@ TEST(EncryptedLifecycle, RoleDispatchFollowsOwnership) {
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        HoldTestClient bundle("Role Ownership Dispatch Test Client");
-        HoldTestConnection& conn = bundle.connection();
+        DispatchTestClient bundle("Role Ownership Dispatch Test Client");
+        DispatchTestConnection& conn = bundle.connection();
         ASSERT_TRUE(conn.is_role_active(SendspinRole::METADATA));
         if (row.admitted) {
             bundle.admit_owning(conn, row.owned_roles);
@@ -2408,14 +2412,13 @@ TEST(EncryptedLifecycle, RoleDispatchFollowsOwnership) {
 }
 
 /// A stand-in that keeps every client/state it is asked to send.
-class StateCapturingConnection : public HoldTestConnection {
+class StateCapturingConnection : public DispatchTestConnection {
 public:
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb,
-                            bool allow_before_hello) override {
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
         if (msg.find("client/state") != std::string::npos) {
             this->states.push_back(msg);
         }
-        return HoldTestConnection::send_text_message(msg, std::move(cb), allow_before_hello);
+        return DispatchTestConnection::send_text_message(msg, std::move(cb));
     }
 
     std::vector<std::string> states;
@@ -2437,7 +2440,7 @@ TEST(EncryptedLifecycle, ClientStateCarriesOnlyTheOwnedRoles) {
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        HoldTestClient bundle("Owned Client State Test Client");
+        DispatchTestClient bundle("Owned Client State Test Client");
         auto conn = std::make_shared<StateCapturingConnection>();
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
@@ -2486,7 +2489,7 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
         smallest_reply_peak = alone.high_water();
     }
 
-    HoldTestClient bundle("Arena Release Test Client", ARENA_BYTES);
+    DispatchTestClient bundle("Arena Release Test Client", ARENA_BYTES);
     auto conn = std::make_shared<StateCapturingConnection>();
     // A paired server, whose playback activations are admissible (the stand-in's default Sentinel
     // category would have the activate dropped instead).
@@ -2516,14 +2519,13 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
 
 // A stand-in that records, for each client/state it is asked to send, whether it held the
 // admitted slot at that moment.
-class StateRecordingConnection : public HoldTestConnection {
+class StateRecordingConnection : public DispatchTestConnection {
 public:
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb,
-                            bool allow_before_hello) override {
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
         if (msg.find("client/state") != std::string::npos) {
             this->state_sent_while_admitted.push_back(this->is_admitted());
         }
-        return HoldTestConnection::send_text_message(msg, std::move(cb), allow_before_hello);
+        return DispatchTestConnection::send_text_message(msg, std::move(cb));
     }
 
     std::vector<bool> state_sent_while_admitted;
@@ -2556,7 +2558,7 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.label);
-        HoldTestClient bundle("State After Admission Test Client");
+        DispatchTestClient bundle("State After Admission Test Client");
         bundle.client_ref().set_unpaired_access_enabled(true);
         ConnectionManager& manager = *bundle.client_ref().connection_manager_;
 
@@ -2597,11 +2599,11 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
 }
 
 // A stand-in that records the goodbye a drop sends it.
-class GoodbyeRecordingConnection : public HoldTestConnection {
+class GoodbyeRecordingConnection : public DispatchTestConnection {
 public:
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
         this->goodbye = reason;
-        HoldTestConnection::disconnect(reason, std::move(on_complete));
+        DispatchTestConnection::disconnect(reason, std::move(on_complete));
     }
 
     std::optional<SendspinGoodbyeReason> goodbye;
@@ -2627,7 +2629,7 @@ TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.label);
-        HoldTestClient bundle("Liveness Tick Test Client");
+        DispatchTestClient bundle("Liveness Tick Test Client");
         bundle.client_ref().set_unpaired_access_enabled(true);
         SendspinClient& client = bundle.client_ref();
         ConnectionManager& manager = *client.connection_manager_;
@@ -2752,7 +2754,9 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
     pump_until(client, [&] { return server.closed(); });
     EXPECT_EQ(server.goodbye_reason().value_or(""), "unpaired");
 
-    // The record is gone for this boot: it no longer resolves a handshake at all.
+    // The record is gone for this boot: it no longer resolves a handshake at all. The resolve is
+    // protocol-task only, so the test thread takes the task's place before it calls it.
+    client.protocol_task_->stop();
     EXPECT_FALSE(client.record_store_->resolve_by_psk_id(unpairing_record.psk_id, PskCategory::LONG_TERM).has_value())
         << "server/unpair must revoke the matched record, not just end the session";
     auto bystander_resolved =
@@ -2802,7 +2806,7 @@ TEST(EncryptedLifecycle, SeveralRecordChangesInOneTickWriteEachTouchedKeyOnce) {
     ConnectionManager& manager = *client.connection_manager_;
     const size_t writes_before = record_writes(persistence);
 
-    HoldTestConnection conn;
+    DispatchTestConnection conn;
     conn.set_noise_handshake_result(unpairing_record.server_id, PskCategory::LONG_TERM,
                                     unpairing_record.psk_id);
     {
@@ -2856,7 +2860,7 @@ TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
     client.protocol_task_->stop();
     ConnectionManager& manager = *client.connection_manager_;
 
-    auto conn = std::make_shared<HoldTestConnection>();
+    auto conn = std::make_shared<DispatchTestConnection>();
     conn->set_noise_handshake_result(older.server_id, PskCategory::LONG_TERM, older.psk_id);
     conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                 std::nullopt);
@@ -2916,7 +2920,7 @@ TEST(EncryptedLifecycle, AnEvictionBeforeTheFlushSparesTheRecordJustPlayed) {
     client.protocol_task_->stop();
     ConnectionManager& manager = *client.connection_manager_;
 
-    auto conn = std::make_shared<HoldTestConnection>();
+    auto conn = std::make_shared<DispatchTestConnection>();
     conn->set_noise_handshake_result(played.server_id, PskCategory::LONG_TERM, played.psk_id);
     conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                 std::nullopt);
@@ -3034,11 +3038,11 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    // The test thread plays the protocol task, as in HoldTestClient.
+    // The test thread plays the protocol task, as in DispatchTestClient.
     client.protocol_task_->stop();
     ConnectionManager& manager = *client.connection_manager_;
 
-    auto conn = std::make_shared<HoldTestConnection>();
+    auto conn = std::make_shared<DispatchTestConnection>();
     conn->set_noise_handshake_result(server_identity.peer_id(), PskCategory::SENTINEL,
                                      /*psk_id=*/"");
     conn->apply_server_activate({}, std::nullopt, std::nullopt, std::nullopt);
@@ -3118,7 +3122,7 @@ TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
         client.protocol_task_->stop();
         ConnectionManager& manager = *client.connection_manager_;
 
-        auto conn = std::make_shared<HoldTestConnection>();
+        auto conn = std::make_shared<DispatchTestConnection>();
         conn->set_noise_handshake_result(older.server_id, PskCategory::LONG_TERM, older.psk_id);
         conn->apply_server_activate(row.activities, std::nullopt, std::nullopt, std::nullopt);
         {
@@ -3233,7 +3237,7 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     ConnectionManager& manager = *client.connection_manager_;
     reject_record_saves(persistence);
 
-    HoldTestConnection conn;
+    DispatchTestConnection conn;
     conn.set_noise_handshake_result(unpairing_record.server_id, PskCategory::LONG_TERM,
                                     unpairing_record.psk_id);
     {
@@ -3268,7 +3272,7 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
 // Driving the handler directly is what pins that: the resolve below runs before any flush, which
 // is where an erase deferred to the flush would still be resolvable.
 TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
-    HoldTestClient bundle("Unpair Revocation Window Test Client");
+    DispatchTestClient bundle("Unpair Revocation Window Test Client");
     SendspinClient& client = bundle.client_ref();
     ConnectionManager& manager = *client.connection_manager_;
 
@@ -3278,7 +3282,7 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     record.server_id = test_peer_id("unpair-window-server");
     ASSERT_TRUE(client.record_store_->store_record_superseding(record, {}));
 
-    HoldTestConnection conn;
+    DispatchTestConnection conn;
     conn.set_noise_handshake_result(record.server_id, PskCategory::LONG_TERM, record.psk_id);
     manager.handle_server_unpair(&conn);
     // The re-handshake's lookup, on the protocol task (this thread) right behind the handler.
@@ -3327,7 +3331,9 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     EXPECT_FALSE(server.goodbye_reason().has_value());
     EXPECT_TRUE(client.is_connected());
 
-    // The paired server's record is untouched: it was never what this session ran on.
+    // The paired server's record is untouched: it was never what this session ran on. The resolve
+    // is protocol-task only, so the test thread takes the task's place before it calls it.
+    client.protocol_task_->stop();
     EXPECT_TRUE(client.record_store_->resolve_by_psk_id(paired_record.psk_id, PskCategory::LONG_TERM).has_value());
     EXPECT_EQ(persisted_psk_ids(persistence), std::vector<std::string>{paired_record.psk_id});
 

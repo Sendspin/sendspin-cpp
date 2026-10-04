@@ -844,13 +844,13 @@ public:
     bool is_connected() const override {
         return true;
     }
-    SsErr send_binary_message(const uint8_t*, size_t, SendCompleteCallback cb, bool) override {
+    SsErr send_binary_message(const uint8_t*, size_t, SendCompleteCallback cb) override {
         if (cb) {
             cb(true);
         }
         return SsErr::OK;
     }
-    SsErr send_text_message(const std::string&, SendCompleteCallback cb, bool) override {
+    SsErr send_text_message(const std::string&, SendCompleteCallback cb) override {
         if (cb) {
             cb(true);
         }
@@ -865,7 +865,7 @@ public:
     explicit HelloCountingConnection(SsErr result) : result_(result) {}
 
     // No Noise session, so send_app_json() routes the hello here as raw text.
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb, bool) override {
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
         if (msg.find("client/hello") != std::string::npos) {
             ++this->hellos;
         }
@@ -1312,7 +1312,7 @@ public:
         StubConnection::disconnect(reason, std::move(on_complete));
     }
     // No Noise session, so send_app_json() routes a message here as raw text.
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb, bool) override {
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
         if (msg.find("client/leave") != std::string::npos) {
             this->events.emplace_back("leave");
         } else if (msg.find("client/command") != std::string::npos) {
@@ -1333,29 +1333,29 @@ std::string goodbye_event(SendspinGoodbyeReason reason) {
     return "goodbye " + std::to_string(static_cast<int>(reason));
 }
 
-// The command queue's consumer burst bounds the sends, never the lifecycle requests. Once the
-// burst is taken, send_text() and ControllerRole::send_command() report the request the protocol
-// task will never see by returning false, while connect_to(), disconnect(), leave(), the
+// The command queue's consumer burst bounds the sends, never the lifecycle requests. Once the burst
+// is taken, send_controller_command() and ControllerRole::send_command() report the request the
+// protocol task will never see by returning false, while connect_to(), disconnect(), leave(), the
 // pairing-window gestures and an unpaired-access change still reach the next tick, which applies
 // each once (a second tick repeats nothing, nor does a later post of another request). Each is
 // latest-wins: a confirm and a cancel resolve to the later, a second disconnect() replaces the
 // first's reason, a leave goes out ahead of the goodbye whatever order they were called in, and a
-// connect_to() and a disconnect() resolve by call order (a disconnect cancels an earlier connect,
-// a later connect opens after the goodbye). The requests go ahead of the sends queued with them,
-// so a controller command queued before a disconnect() is dropped rather than sent after the
-// goodbye, as is a client/state published before it, though the stand-in still reads as
-// connected, as an ESP server connection does until httpd closes it. Gap: the same detached check
-// in ConnectionManager::leave() has no row, since the tick applies a leave ahead of a disconnect.
-// A disconnect that only stop()'s final tick sees, once admission is closed, is dropped in favour
-// of the shutdown goodbye. The test thread plays the protocol task, so nothing
-// drains the queue between the calls; the closed-admission row runs the tick that stop() would.
-// The stand-in is an activated Sentinel connection with an active role, so withdrawing unpaired
-// access closes it, and the liveness check is off so silence does not. The controller's offered
-// command is seeded, stamped with the role's generation as the drain stamps a mask it applies, so
-// a command reaches the queue; a row that drops the stand-in tears the controller down, so it is
-// seeded again before the drained queue is tried. The outbound attempts dial a listener that never
-// answers, so an attempt opened stays in the nursery. Control: a confirm with room in the queue,
-// and a controller command and a state change with no disconnect behind them.
+// connect_to() and a disconnect() resolve by call order (a disconnect cancels an earlier connect, a
+// later connect opens after the goodbye). The requests go ahead of the sends queued with them, so a
+// controller command queued before a disconnect() is dropped rather than sent after the goodbye, as
+// is a client/state published before it, though the stand-in still reads as connected, as an ESP
+// server connection does until httpd closes it. Gap: the same detached check in
+// ConnectionManager::leave() has no row, since the tick applies a leave ahead of a disconnect. A
+// disconnect that only stop()'s final tick sees, once admission is closed, is dropped in favour of
+// the shutdown goodbye. The test thread plays the protocol task, so nothing drains the queue
+// between the calls; the closed-admission row runs the tick that stop() would. The stand-in is an
+// activated Sentinel connection with an active role, so withdrawing unpaired access closes it, and
+// the liveness check is off so silence does not. The controller's offered command is seeded,
+// stamped with the role's generation as the drain stamps a mask it applies, so a command reaches
+// the queue; a row that drops the stand-in tears the controller down, so it is seeded again before
+// the drained queue is tried. The outbound attempts dial a listener that never answers, so an
+// attempt opened stays in the nursery. Control: a confirm with room in the queue, and a controller
+// command and a state change with no disconnect behind them.
 TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
     enum class Call : uint8_t {
         CONFIRM,
@@ -1457,7 +1457,6 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
          false,
          {goodbye_event(SendspinGoodbyeReason::SHUTDOWN)}},
     };
-    const std::string text = R"({"type":"client/command","payload":{}})";
     const ClientCommandControllerObject play{.command = SendspinControllerCommand::PLAY};
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -1488,9 +1487,9 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
 
         if (row.fill_queue) {
             for (size_t i = 0; i < ProtocolTask::CONSUMER_COMMAND_BURST; ++i) {
-                ASSERT_TRUE(client.send_text(text, "controller")) << "request " << i;
+                ASSERT_TRUE(client.send_controller_command(play)) << "request " << i;
             }
-            EXPECT_FALSE(client.send_text(text, "controller"))
+            EXPECT_FALSE(client.send_controller_command(play))
                 << "a send past the consumer burst must be refused";
             EXPECT_FALSE(controller.send_command(play))
                 << "a controller command past the consumer burst must be refused";
@@ -1542,15 +1541,14 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
         (void) client.protocol_tick();
         EXPECT_EQ(conn->events, row.events) << "a second tick applied a request again";
 
-        // The drained queue takes sends again; a family that names no role is refused on its own.
+        // The drained queue takes sends again.
         offer_play();
         EXPECT_TRUE(controller.send_command(play));
-        EXPECT_TRUE(client.send_text(text, "controller"));
-        EXPECT_FALSE(client.send_text(text, "no-such-role"));
+        EXPECT_TRUE(client.send_controller_command(play));
 
         silent.close();
         client.stop();
-        EXPECT_FALSE(client.send_text(text, "controller")) << "a stopped client refuses";
+        EXPECT_FALSE(client.send_controller_command(play)) << "a stopped client refuses";
     }
 }
 

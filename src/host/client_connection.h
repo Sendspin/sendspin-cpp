@@ -78,16 +78,10 @@ public:
     void close_transport_now() override;
 
     /// @brief Sends a text message to the server
-    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
-    ///        pre-hello gate does not apply.
-    SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
-                            bool allow_before_hello) override;
+    SsErr send_text_message(const std::string& message, SendCompleteCallback cb) override;
 
     /// @brief Sends a binary message to the server
-    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
-    ///        pre-hello gate does not apply.
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                              bool allow_before_hello) override;
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) override;
 
     /// @brief No-op on host builds; task configuration is an ESP-IDF concept. Both parameters are
     /// accepted and ignored: the host build has no analogue of a FreeRTOS task priority or stack

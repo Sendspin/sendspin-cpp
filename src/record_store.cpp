@@ -220,13 +220,8 @@ void RecordStore::provision_pairing_psk_if_needed() {
 
 std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk_id,
                                                           PskCategory category) const {
-    // Runs on the protocol task; lock against main-loop mutations of records_/pairing_psk_.
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    return this->resolve_by_psk_id_locked(psk_id, category);
-}
-
-std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id_locked(const std::string& psk_id,
-                                                                 PskCategory category) const {
+    // No lock: this runs on the protocol task, which makes every change to records_, and the main
+    // loop's persist_records() only reads records_ (see the persistence locking note below).
     // Only the declared category's candidates are searched (connection.md "Pre-Shared Key"): the
     // same psk_id under another category is a lookup miss, which keeps a server from using, say, a
     // long-term PSK as though it were the Pairing PSK and inheriting that category's activities.
@@ -527,13 +522,12 @@ RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(const std::stri
 // the order blob, when the recency order moved). The next persist_records() encodes those writes
 // under mutex_ (take_dirty_writes_locked()), then drops the lock before handing each blob to the
 // provider (save_slot_write()). The provider write is an NVS commit on ESP, tens of milliseconds
-// per key, and resolve_by_psk_id() takes the same mutex on the protocol task for every
-// handshake.
+// per key, and the protocol-task mutators take the same mutex.
 //
 // The two halves need not be atomic: persist_records() is main-loop-only, so blobs cannot land
-// out of order, and the one writer that can slip into the gap (store_record_superseding, on the
-// protocol task) is RAM-only and its caller schedules a flush, which redoes whatever slot it
-// dirtied.
+// out of order, and the writers that can slip into the gap (the protocol-task mutators
+// store_record_superseding, note_record_removed and note_record_played) are RAM-only and their
+// callers schedule a flush, which redoes whatever slot they dirtied.
 // A resolve in the gap sees the new RAM state, which is the authority for the boot; the blobs
 // only decide what survives a reboot.
 std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {

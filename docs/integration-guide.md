@@ -995,7 +995,7 @@ controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .o
 
 Fields that do not match the command are ignored when the message is serialized. The client drops, with a warning, a command missing from the latest controller state's `supported_commands`, and one without the field it requires (`volume` in 0-100, `muted`, `position_ms`, `offset_ms`); gate your UI on `supported_commands` so such calls are not made. The server clamps seeks to the seekable range.
 
-A command is sent only to the admitted connection that owns the controller role, and only while the server has `controller@v1` among that connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. `send_command()` checks the command against `supported_commands` and its parameter on the calling thread, then queues the command itself to the protocol task, which formats the `client/command`, applies the gate and sends it. It returns `false` for a command it drops itself (not in `supported_commands`, or a missing parameter) and when the request never reached the task: the client is not running, or the request queue is full. A consumer that formats its own role message hands it to `SendspinClient::send_text()` with the role family (`"controller"`), which is queued and gated the same way and returns `false` for the same reasons, or when the family names no role; the client's own messages do not use it. The queue holds a small fixed burst of consumer requests (eight, shared by controller commands and `send_text()`; `connect_to()`, `disconnect()`, `leave()`, the pairing-window gestures and unpaired-access changes never take a slot and are never refused), so a control that fires faster than the protocol task drains it, such as a rotary encoder sending a volume step per detent, sees `send_command()` return `false` and should coalesce and retry. A `false` for an unsupported command or a missing parameter is not one a retry can fix: retry only on a full queue, and gate the UI on `supported_commands` for the rest. `true` means queued, not sent.
+A command is sent only to the admitted connection that owns the controller role, and only while the server has `controller@v1` among that connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. `send_command()` checks the command against `supported_commands` and its parameter on the calling thread, then queues the command itself to the protocol task, which formats the `client/command`, applies the gate and sends it. It returns `false` for a command it drops itself (not in `supported_commands`, or a missing parameter) and when the request never reached the task: the client is not running, or the request queue is full. The queue holds a small fixed burst of controller commands (eight; `connect_to()`, `disconnect()`, `leave()`, the pairing-window gestures and unpaired-access changes never take a slot and are never refused), so a control that fires faster than the protocol task drains it, such as a rotary encoder sending a volume step per detent, sees `send_command()` return `false` and should coalesce and retry. A `false` for an unsupported command or a missing parameter is not one a retry can fix: retry only on a full queue, and gate the UI on `supported_commands` for the rest. `true` means queued, not sent.
 
 ## Accessing Roles
 
@@ -1132,12 +1132,12 @@ called from any thread and must be cheap and non-blocking.
 
 `SendspinClient::send_controller_command()` is callable from any thread too, but it is the controller role's own route to the protocol task and assumes the role's checks already ran: call `ControllerRole::send_command()` instead.
 
-Callable from any thread: `connect_to()`, `disconnect()`, `leave()`, `send_text()`,
+Callable from any thread: `connect_to()`, `disconnect()`, `leave()`,
 `confirm_pairing_window()`, `cancel_pairing_window()`, `set_unpaired_access_enabled()` and the
 getters `is_started()`, `is_connected()`, `is_time_synced()`, `get_client_time()`,
 `get_server_information()`, `get_current_trust()` and `is_unpaired_access_enabled()`. The
 requests take effect on the protocol task's next tick; the getters read what that task last
-published. `send_text()` and controller commands are queued, so a burst of them can fill the
+published. Controller commands are queued, so a burst of them can fill the
 queue (see [Sending Commands](#sending-commands)); `connect_to()`, `disconnect()`, `leave()`,
 the pairing-window gestures and `set_unpaired_access_enabled()` are posted instead, never
 refused, and each holds only its latest call (the latest URL, the latest disconnect reason, the

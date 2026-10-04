@@ -143,16 +143,15 @@ set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS
 set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_player_role.cpp drives PlayerRole::Impl directly - no connected server, no sync-task
-# thread - which is the only way to see the client/state player object and the only way to hand
-# a handler a stale teardown generation. Reached: Impl's handle_stream_start(), handle_binary(),
+# thread - which is the only way to see the client/state player object and the only way to stage
+# a slot payload stamped before a teardown. Reached: Impl's handle_stream_start(), handle_binary(),
 # handle_stream_clear(), handle_server_command(), cleanup(), recall_stale_items(), attach_inbox(),
 # drain_events(), volume, cleanup_generation and event_state's generation-stamped slots (one
 # written with a stamp from before a teardown, the payload a drain on the far side of it would
 # hold); SyncTask's inbound_ (and take_item()), bound to a test ring the way start() binds it but
-# with no thread, so what a handler handed over (or, refused, did not) stays on the list to be
-# read, and discard_to_clear_marker(), the sync thread's stream/clear step. The inbound tests
-# also bind a VisualizerRole::Impl to the same ring, to show one holder's quota does not stop the
-# other.
+# with no thread, so what a handler handed over (or dropped) stays on the list to be read, and
+# discard_to_clear_marker(), the sync thread's stream/clear step. The inbound tests also bind a
+# VisualizerRole::Impl to the same ring, to show one holder's quota does not stop the other.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_json_arena.cpp reads SendspinArenaAllocator's base_, cap_ and offset_: where the bump
@@ -256,8 +255,7 @@ if(ENABLE_SANITIZERS)
 endif()
 
 # ThreadSanitizer, configured separately from ASan/UBSan (the two cannot be combined). The
-# concurrency tests only report a data race when the binary is built this way; see
-# RecordStoreConcurrency in test_record_store.cpp.
+# concurrency tests only report a data race when the binary is built this way.
 if(ENABLE_TSAN)
     target_compile_options(sendspin_tests PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
     target_link_options(sendspin_tests PRIVATE -fsanitize=thread)

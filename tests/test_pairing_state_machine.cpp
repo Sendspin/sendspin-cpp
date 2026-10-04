@@ -103,8 +103,7 @@ public:
     }
     bool is_connected() const override { return this->connected_; }
 
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb,
-                            bool /*allow_before_hello*/) override {
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
         sent_text_.push_back(msg);
         if (cb) {
             cb(true);
@@ -112,8 +111,7 @@ public:
         return SsErr::OK;
     }
 
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                              bool /*allow_before_hello*/) override {
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) override {
         sent_binary_.push_back(std::vector<uint8_t>(data, data + len));
         if (cb) {
             cb(true);

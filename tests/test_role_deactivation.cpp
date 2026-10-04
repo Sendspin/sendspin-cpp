@@ -281,7 +281,8 @@ TEST(RoleDeactivation, RemovedVisualizerEndsTheStreamAndStopsDelivery) {
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1"])")));
     pump_until(client, [&] { return visualizer_listener.stream_ends == 1; });
-    EXPECT_FALSE(client.visualizer()->impl_->stream_active.load())
+    // A plain protocol-task field: the stream end pumped through the Inbox mutex orders this read.
+    EXPECT_FALSE(client.visualizer()->impl_->stream_active)
         << "the visualizer still accepts frames for a role the activation removed";
 
     const size_t loudness_after_removal = visualizer_listener.loudness.load();
@@ -412,8 +413,8 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
         return metadata_listener.updates == 1 && color_listener.updates == 1 &&
                controller_listener.updates == 1 && player_listener.stream_starts == 1;
     });
-    // What the receive gate would hand a metadata handler admitted right now, kept for the
-    // overtaken-handler check at the end.
+    // The generation a live dispatch would load for a metadata handler right now, kept for the
+    // stale-stamp check at the end.
     const uint32_t metadata_generation =
         client.metadata()->impl_->cleanup_generation.load(std::memory_order_acquire);
 
@@ -452,16 +453,16 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     EXPECT_EQ(player_listener.stream_ends, 0) << "a role the activation kept was torn down";
     stream_audio_until(client, *server, player_listener, 1);
 
-    // The gate is checked once on the protocol task while the handler it admits runs on, so a
-    // teardown can land in between. The handler re-checks the generation the gate captured, which
-    // a state admitted before this removal no longer carries: driving it directly is the same call
-    // the protocol task would make, with the interleaving forced rather than raced for.
+    // A state the handler stamps with the pre-removal generation, the payload a drain takes on the
+    // far side of the removal, is discarded at the drain: driving the handler directly is the same
+    // call the protocol task would make, with the interleaving forced rather than raced for.
     ServerMetadataStateObject overtaken;
     overtaken.timestamp = 1;
     overtaken.title = "Overtaken By The Removal";
     client.metadata()->impl_->handle_server_state(std::move(overtaken), metadata_generation);
     pump_for(client, SETTLE_MS);
-    EXPECT_EQ(metadata_listener.updates, 1) << "a state a teardown overtook was applied";
+    EXPECT_EQ(metadata_listener.updates, 1)
+        << "a payload stamped with the pre-removal generation was applied";
 
     // Control: the same call carrying the generation the role reports now is applied, so the
     // refusal above came from the stale generation and nothing else.

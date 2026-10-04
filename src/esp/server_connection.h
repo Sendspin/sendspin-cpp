@@ -94,14 +94,12 @@ public:
     }
 
     /// @brief Sends a text message to the server with a completion callback
-    SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
-                            bool allow_before_hello) override;
+    SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
 
     /// @brief Sends a binary WebSocket frame to the connected client (async, via httpd worker)
     /// @param on_complete Optional completion callback (best-effort; may be skipped on teardown).
-    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
-                              bool allow_before_hello) override;
+    SsErr send_binary_message(const uint8_t* data, size_t len,
+                              SendCompleteCallback on_complete) override;
 
     /// @brief Triggers the underlying socket to close
     ///
@@ -144,10 +142,9 @@ protected:
     /// @param len               Number of bytes in `data`.
     /// @param type              HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY.
     /// @param on_complete       Completion callback, if any.
-    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
     /// @param before_write      Run by the worker immediately before the write, if set.
     SsErr queue_async_send(const uint8_t* data, size_t len, httpd_ws_type_t type,
-                           SendCompleteCallback on_complete, bool allow_before_hello,
+                           SendCompleteCallback on_complete,
                            const NoiseTransport::FrameWriteHook& before_write);
 
     /// @brief Receives the payload of the frame whose header `ws_pkt` holds into `dest`, which has

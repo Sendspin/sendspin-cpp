@@ -58,16 +58,11 @@ public:
     bool is_connected() const override;
 
     /// @brief Sends a text message to the connected client
-    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
-    ///        pre-hello gate does not apply.
-    SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
-                            bool allow_before_hello) override;
+    SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
 
     /// @brief Sends a binary message to the connected client
-    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
-    ///        pre-hello gate does not apply.
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
-                              bool allow_before_hello) override;
+    SsErr send_binary_message(const uint8_t* data, size_t len,
+                              SendCompleteCallback on_complete) override;
 
     /// @brief Requests the WebSocket connection to close
     void trigger_close();

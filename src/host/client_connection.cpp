@@ -108,15 +108,13 @@ void SendspinClientConnection::close_transport_now() {
 }
 
 SsErr SendspinClientConnection::send_text_message(const std::string& message,
-                                                  SendCompleteCallback cb,
-                                                  bool /*allow_before_hello*/) {
+                                                  SendCompleteCallback cb) {
     return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
                                message.size(), cb);
 }
 
 SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len,
-                                                    SendCompleteCallback cb,
-                                                    bool /*allow_before_hello*/) {
+                                                    SendCompleteCallback cb) {
     return this->send_ws_frame(true, data, len, cb);
 }
 
@@ -179,8 +177,6 @@ void SendspinClientConnection::setup_callbacks() {
             case ix::WebSocketMessageType::Close:
                 SS_LOGD(TAG, "WebSocket disconnected from %s", this->url_.c_str());
                 this->connected_ = false;
-                this->client_hello_sent_ = false;
-                this->server_hello_received_ = false;
                 // The protocol task reports the loss once the messages before it are processed.
                 this->notify_transport_closed();
                 break;

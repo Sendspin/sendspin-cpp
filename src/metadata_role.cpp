@@ -125,9 +125,6 @@ void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
 
 void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadata,
                                              uint32_t generation) const {
-    if (!this->accepts(generation)) {
-        return;
-    }
     // messaging.md "server/state": each included metadata object is the role's full state, never
     // an overlay on the one before it (see coalesce_metadata_states).
     PendingMetadataStates arrival;
@@ -202,7 +199,7 @@ void MetadataRole::Impl::drain_events() {
 }
 
 void MetadataRole::Impl::cleanup() {
-    // Bumped first: it invalidates any handler the gate already admitted (see accepts()).
+    // Bumped first, so the drain discards a payload stamped before it (see RoleTeardown).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();

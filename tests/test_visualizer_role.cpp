@@ -203,9 +203,8 @@ std::unique_ptr<VisualizerRole::Impl> make_impl() {
     return impl;
 }
 
-// The generation the receive gate hands a handler on a role that has not been torn down. The
-// dispatch captures it with the gate check and every point of effect re-checks it, so a unit test
-// driving a handler directly passes the live one.
+// The generation a live dispatch loads with the gate check and a handler stamps on what it
+// queues, on a role that has not been torn down; a unit test driving a handler directly passes it.
 uint32_t live_generation(const VisualizerRole::Impl& impl) {
     return impl.cleanup_generation.load(std::memory_order_acquire);
 }
@@ -257,7 +256,7 @@ bool pop_entry(VisualizerRole::Impl& impl, Entry& out) {
 // The frame reaches the drain thread whole, with the transport's receive stamp, which the drain
 // thread widens into the arrival time it judges staleness against (not when it takes the item).
 // A frame received into a ring item stays in it; one outside any (reassembled from Noise
-// fragments, or replayed) is copied into an item of its own.
+// fragments, or received through the fallback buffer) is copied into an item of its own.
 TEST(VisualizerHandleBinary, ForwardsTheMessageWithItsReceiveStamp) {
     struct Row {
         const char* name;
@@ -426,55 +425,6 @@ TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
     hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data, live_generation(*impl));
     ASSERT_TRUE(pop_entry(*impl, entry));
     EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
-}
-
-// A teardown that lands after the receive gate admitted a message, while its handler is still
-// running, invalidates the whole handler: the generation the dispatch captured no longer matches.
-// Nothing here is timing-based: the captured value is taken first and the teardown applied by
-// hand, which is the interleaving the protocol task can otherwise produce on a live connection.
-TEST(VisualizerHandleBinary, HandlersRefuseAGenerationATeardownOvertook) {
-    auto impl = make_impl();
-    impl->stream_active = false;
-    impl->negotiated_types_mask = 0;
-
-    ServerVisualizerStreamObject stream;
-    stream.types = {VisualizerDataType::BEAT};
-    std::vector<uint8_t> data;
-    put_be64(data, 1);
-    data.push_back(0x01);
-    Entry entry;
-
-    // Run a live stream first and capture its generation, then tear the role down. Without the
-    // live stream, handle_binary's !stream_active term alone would drop the stale frame below
-    // and the generation check would never be the deciding one.
-    impl->handle_stream_start(stream, live_generation(*impl));
-    take_in_ring_order(*impl->drain_task->inbound.ring());
-    ASSERT_TRUE(impl->stream_active.load());
-    ASSERT_TRUE(pop_entry(*impl, entry));  // the stream/start boundary marker
-    const uint32_t captured = live_generation(*impl);
-
-    impl->cleanup();
-
-    impl->handle_stream_start(stream, captured);
-
-    take_in_ring_order(*impl->drain_task->inbound.ring());
-    EXPECT_FALSE(impl->stream_active.load()) << "a stopped role was re-armed by a stale handler";
-    EXPECT_EQ(impl->negotiated_types_mask.load(), 0U);
-
-    // Re-arm under the generation the role now reports, as a re-added role does, so the only
-    // thing left that can refuse the captured generation's frame is the gate under test.
-    impl->handle_stream_start(stream, live_generation(*impl));
-    take_in_ring_order(*impl->drain_task->inbound.ring());
-    ASSERT_TRUE(impl->stream_active.load());
-    ASSERT_TRUE(pop_entry(*impl, entry));  // the stream/start boundary marker
-
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_BEAT, data, captured);
-    EXPECT_FALSE(pop_entry(*impl, entry)) << "a stale frame reached the drain list";
-
-    // Control: the same frame with the generation the role now reports is forwarded.
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_BEAT, data, live_generation(*impl));
-    ASSERT_TRUE(pop_entry(*impl, entry));
-    EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_BEAT);
 }
 
 /// Counts on_visualizer_stream_start() calls.

@@ -257,19 +257,18 @@ public:
     /// like every send on a connection. On an ESP outbound connection the transport send blocks
     /// for up to its 10 ms send timeout (src/esp/client_connection.cpp), once per frame.
     /// @return SsErr::OK if queued/sent, error code otherwise.
-    SsErr send_app_json(const std::string& json, SendCompleteCallback cb = nullptr,
-                        bool allow_before_hello = false);
+    SsErr send_app_json(const std::string& json, SendCompleteCallback cb = nullptr);
 
     /// @brief Pointer/length form of send_app_json(); encrypts straight from the caller's
     /// buffer, and the pre-handshake text fallback builds the string it needs
-    SsErr send_app_json(const char* json, size_t len, SendCompleteCallback cb = nullptr,
-                        bool allow_before_hello = false);
+    SsErr send_app_json(const char* json, size_t len, SendCompleteCallback cb = nullptr);
 
     /// @brief Returns this connection's process-unique instance id
     /// @return A monotonic id assigned at construction, never reused for the lifetime of the
-    ///         process. Used to identify a connection across a thread-safe queue without a raw
-    ///         pointer, which could ABA-collide with a later connection allocated at the same
-    ///         address. Ids start at 1, so 0 is a safe "no connection" sentinel.
+    ///         process. Identifies a connection without a raw pointer, which could ABA-collide
+    ///         with a later connection allocated at the same address: an inbound ring item's
+    ///         connection_id (its low 32 bits) and ConnectionManager's published primary id.
+    ///         Ids start at 1, so 0 is a safe "no connection" sentinel.
     uint64_t get_instance_id() const {
         return this->instance_id;
     }
@@ -295,15 +294,11 @@ public:
     /// @brief Sends a text message to the server with a completion callback
     /// @param message The message string to send.
     /// @param cb Callback invoked with the send result. On asynchronous transports it is not
-    ///        guaranteed to fire: if the connection is torn down before the queued send runs, or
-    ///        the message is dropped by the pre-hello gate, the callback is skipped. Treat it as a
-    ///        best-effort completion notification, not an unconditional "send finished" signal.
-    /// @param allow_before_hello Lets the message precede this connection's client/hello (used by
-    ///        the hello itself and by goodbye). Otherwise asynchronous transports drop it, which
-    ///        is what keeps "hello is always first". Synchronous transports ignore the flag.
+    ///        guaranteed to fire: if the connection is torn down before the queued send runs, the
+    ///        callback is skipped. Treat it as a best-effort completion notification, not an
+    ///        unconditional "send finished" signal.
     /// @return SsErr::OK if queued successfully, error code otherwise.
-    virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
-                                    bool allow_before_hello = false) = 0;
+    virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb) = 0;
 
     /// @brief Sends a client/time message and records it as the frame in flight (see
     /// time_frame_tag_). Needs the Noise transport, which is_operational() implies. Protocol task
@@ -327,12 +322,8 @@ public:
     /// @param data   Pointer to the binary payload bytes.
     /// @param len    Number of bytes to send.
     /// @param cb     Optional completion callback (best-effort, may be skipped on teardown).
-    /// @param allow_before_hello  If true, bypasses the pre-hello send gate (mirrors the
-    ///               same flag on send_text_message; binary frames should not precede the
-    ///               Noise handshake, so the default is false).
     /// @return SsErr::OK if queued/sent, error code otherwise.
-    virtual SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                                      bool allow_before_hello = false) = 0;
+    virtual SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) = 0;
 
     /// @brief Sends a goodbye message with completion callback
     /// @param reason The reason for disconnecting.
@@ -1185,11 +1176,10 @@ protected:
     /// Protocol task only.
     bool pairing_finalized_{false};
 
-    /// Hello handshake state. Set on the protocol task by the hello send's completion, which the
-    /// encrypted send path runs inline, and cleared by the outbound transports' disconnect
-    /// handlers (transport thread). Read by is_handshake_complete() on the protocol task and by the
-    /// ESP server's pre-hello send gate on the httpd worker, hence atomic.
-    std::atomic<bool> client_hello_sent_{false};
+    /// Whether client/hello went out. Set by the hello send's completion, which the encrypted
+    /// send path runs inline, and never cleared: a closed connection is not reused. Protocol task
+    /// only.
+    bool client_hello_sent_{false};
 
     /// True once the Noise transport handshake has completed. Protocol task only.
     bool noise_handshake_complete_{false};
@@ -1220,9 +1210,9 @@ protected:
     /// Protocol task only.
     bool loss_reported_{false};
 
-    /// Set by the server/hello handler on the protocol task, cleared by the outbound transports'
-    /// disconnect handlers (transport thread), read on the protocol task; atomic for that clear.
-    std::atomic<bool> server_hello_received_{false};
+    /// Whether server/hello arrived. Set by its handler and never cleared: a closed connection is
+    /// not reused. Protocol task only.
+    bool server_hello_received_{false};
 
     /// True after the first server/activate message has been received and applied, until a
     /// re-handshake or a pairing-finalize ack rewinds it. Protocol task only.

@@ -513,8 +513,7 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 // Stream lifecycle (protocol task)
 // ============================================================================
 
-void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream,
-                                            uint32_t generation) {
+void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream) {
     if (stream.channels.has_value()) {
         const auto& server_channels = stream.channels.value();
         if (server_channels.size() != this->artwork_channels.size()) {
@@ -572,12 +571,6 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         // Protocol messages are serialized on the protocol task, so this runs before any of the
         // new stream's handle_binary() calls.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        // The stream is marked active inside this lock: cleanup() bumps the generation before
-        // taking the same lock to discard, so a teardown that overtook this handler is seen
-        // here, and one that lands afterwards clears what this sets.
-        if (!this->accepts(generation)) {
-            return;
-        }
         this->stream_active = true;
         const uint8_t changed = this->changed_channel_mask(stream);
         this->streamed_channels = stream.channels;

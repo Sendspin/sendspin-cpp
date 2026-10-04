@@ -501,7 +501,7 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
 
 void ConnectionManager::leave() {
     // messaging.md "client/leave". Not a role message, so it does not route through
-    // send_role_text(). It still shares the activation gate every outbound message has: nothing
+    // role_send_target(). It still shares the activation gate every outbound message has: nothing
     // may be sent before the connection is admitted and its server/activate has arrived.
     // Admission does not imply the latter: an in-band re-handshake rewinds the connection to
     // awaiting its next activation while it keeps the admitted slot.
@@ -513,13 +513,6 @@ void ConnectionManager::leave() {
     }
     SS_LOGI(TAG, "Leaving the group (client/leave)");
     conn->send_app_json(format_client_leave_message(this->json_arena()), nullptr);
-}
-
-void ConnectionManager::send_role_text(SendspinRole role, const std::string& text) const {
-    SendspinConnection* conn = this->role_send_target(role);
-    if (conn != nullptr) {
-        conn->send_app_json(text, nullptr);
-    }
 }
 
 SendspinConnection* ConnectionManager::role_send_target(SendspinRole role) const {
@@ -1574,19 +1567,16 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
     // post-handshake message. The hello is only ever armed once the Noise handshake completes,
     // so the transport send_app_json routes to is always active here, and that path runs the
     // completion inline, on this task.
-    SsErr err = conn->send_app_json(
-        hello_message,
-        [conn](bool success) {
-            // Setting the flag is all that is needed: admission is level-triggered, so the
-            // nursery scan observes is_handshake_complete() even when the peer's server/hello
-            // raced ahead of this send.
-            if (!success) {
-                SS_LOGW(TAG, "Hello message send failed");
-                return;
-            }
-            conn->set_client_hello_sent(true);
-        },
-        /*allow_before_hello=*/true);
+    SsErr err = conn->send_app_json(hello_message, [conn](bool success) {
+        // Setting the flag is all that is needed: admission is level-triggered, so the
+        // nursery scan observes is_handshake_complete() even when the peer's server/hello
+        // raced ahead of this send.
+        if (!success) {
+            SS_LOGW(TAG, "Hello message send failed");
+            return;
+        }
+        conn->set_client_hello_sent(true);
+    });
 
     if (err == SsErr::OK) {
         return true;  // Successfully queued

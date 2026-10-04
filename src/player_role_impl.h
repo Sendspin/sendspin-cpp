@@ -103,8 +103,8 @@ struct PlayerRole::Impl : RoleTeardown {
     /// arrives in several Noise frames and is copied into one. Inside a run only.
     size_t advertised_buffer_capacity() const;
     void build_state_fields(ClientStateMessage& msg) const;
-    // Each handler takes the teardown generation the receive gate captured when it admitted the
-    // message and re-checks it where it takes effect; see accepts(). All run on the protocol task.
+    // Each handler takes the teardown generation the receive gate loaded when it admitted the
+    // message and stamps what it queues with it; see RoleTeardown. All run on the protocol task.
     /// @brief Hands an audio chunk to the sync task: by its ring item when it has one (clearing
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted chunk; `data` points at its message type byte.

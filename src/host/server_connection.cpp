@@ -70,15 +70,13 @@ bool SendspinServerConnection::is_connected() const {
 }
 
 SsErr SendspinServerConnection::send_text_message(const std::string& message,
-                                                  SendCompleteCallback on_complete,
-                                                  bool /*allow_before_hello*/) {
+                                                  SendCompleteCallback on_complete) {
     return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
                                message.size(), on_complete);
 }
 
 SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
-                                                    SendCompleteCallback on_complete,
-                                                    bool /*allow_before_hello*/) {
+                                                    SendCompleteCallback on_complete) {
     return this->send_ws_frame(true, data, len, on_complete);
 }
 

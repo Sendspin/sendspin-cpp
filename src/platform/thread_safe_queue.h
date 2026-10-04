@@ -17,7 +17,7 @@
 /// a mutex/condition-variable deque on host
 ///
 /// Blocking send() and receive() wait up to a caller-specified timeout when the queue is full or
-/// empty; a non-blocking overwrite() path serves single-item mailbox use.
+/// empty.
 ///
 /// A blocking receive() can be interrupted from any thread with wake_receiver(), so callers must
 /// treat a false return as "re-check state and retry", not as proof the timeout elapsed. Blocking
@@ -127,20 +127,6 @@ public:
         xSemaphoreGive(this->items_or_wake_sem_);
     }
 
-    /// @brief Peeks at the front item without removing it; returns false if empty
-    bool peek(T& item) const {
-        return xQueuePeek(this->handle_, &item, 0) == pdTRUE;
-    }
-
-    /// @brief Overwrites the back item (or enqueues if empty); never blocks
-    bool overwrite(const T& item) {
-        bool ok = xQueueOverwrite(this->handle_, &item) == pdTRUE;
-        if (ok) {
-            xSemaphoreGive(this->items_or_wake_sem_);
-        }
-        return ok;
-    }
-
     /// @brief Discards all items in the queue
     void reset() {
         xQueueReset(this->handle_);
@@ -149,7 +135,7 @@ public:
 private:
     // Pointer fields
     QueueHandle_t handle_{nullptr};
-    // Given by every send()/overwrite() and by wake_receiver(); receive() blocks on this
+    // Given by every send() and by wake_receiver(); receive() blocks on this
     // instead of on the queue so it stays interruptible.
     SemaphoreHandle_t items_or_wake_sem_{nullptr};
 };
@@ -254,28 +240,6 @@ public:
         this->cv_.notify_all();
     }
 
-    /// @brief Peeks at the front item without removing it; returns false if empty
-    bool peek(T& item) const {
-        std::lock_guard<std::mutex> lock(this->mtx_);
-        if (this->items_.empty()) {
-            return false;
-        }
-        item = this->items_.front();
-        return true;
-    }
-
-    /// @brief Overwrites the back item (or enqueues if empty); never blocks
-    bool overwrite(const T& item) {
-        std::lock_guard<std::mutex> lock(this->mtx_);
-        if (this->items_.empty()) {
-            this->items_.push_back(item);
-        } else {
-            this->items_.back() = item;
-        }
-        this->cv_.notify_all();
-        return true;
-    }
-
     /// @brief Discards all items in the queue
     void reset() {
         std::lock_guard<std::mutex> lock(this->mtx_);
@@ -287,7 +251,7 @@ private:
     // Struct fields
     std::condition_variable cv_;
     std::deque<T> items_;
-    mutable std::mutex mtx_;
+    std::mutex mtx_;
 
     // size_t fields
     size_t max_depth_{0};

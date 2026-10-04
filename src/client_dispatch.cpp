@@ -74,8 +74,8 @@ namespace {
 /// yet seen never costs the connection.
 ///
 /// A true verdict is only half the gate. The caller pairs it with the role's teardown generation,
-/// loaded right after this returns and passed into the handler, and each point of effect
-/// re-checks the captured value (RoleTeardown::accepts()). Protocol task only.
+/// loaded right after this returns and passed into the handler, which stamps what it queues with
+/// it for the drains to check (RoleTeardown). Protocol task only.
 [[maybe_unused]] bool role_accepts_traffic(const ConnectionManager& manager,
                                            const SendspinConnection* conn, SendspinRole role) {
     if (manager.owns_role(conn, role)) {
@@ -281,36 +281,22 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
             manager.accept(std::move(command.connection));
             return;
         case ProtocolCommandType::SEND_CONTROLLER_COMMAND:
-        case ProtocolCommandType::SEND_TEXT:
             break;
     }
     // A consumer request that reaches the task once admission is closed belongs to a run that
     // is ending: the shutdown pass goodbyes every peer, so acting on it could only open or
     // address a connection that is about to be closed.
     if (!manager.is_accepting()) {
-        SS_LOGD(TAG, "Dropping protocol command of type %d: the client is stopping",
-                static_cast<int>(command.type));
+        SS_LOGD(TAG, "Dropping a controller command: the client is stopping");
         return;
     }
-    switch (command.type) {
-        case ProtocolCommandType::SEND_CONTROLLER_COMMAND: {
-            // Formatted here rather than on the caller's thread so the document is built in the
-            // task's JSON arena, and only once the gate a "controller" send_text() meets has
-            // passed, so a command no connection may receive formats nothing.
-            SendspinConnection* conn = manager.role_send_target(SendspinRole::CONTROLLER);
-            if (conn != nullptr) {
-                conn->send_app_json(
-                    format_client_command_message(command.controller_command, *this->json_arena_),
-                    nullptr);
-            }
-            break;
-        }
-        case ProtocolCommandType::SEND_TEXT:
-            manager.send_role_text(command.role, command.text);
-            break;
-        case ProtocolCommandType::ACCEPT_CONNECTION:
-            // Handled above.
-            break;
+    // Formatted here rather than on the caller's thread so the document is built in the task's
+    // JSON arena, and only once the role gate has passed, so a command no connection may receive
+    // formats nothing.
+    SendspinConnection* conn = manager.role_send_target(SendspinRole::CONTROLLER);
+    if (conn != nullptr) {
+        conn->send_app_json(
+            format_client_command_message(command.controller_command, *this->json_arena_), nullptr);
     }
 }
 
@@ -388,9 +374,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 #ifdef SENDSPIN_ENABLE_ARTWORK
             if (this->artwork_ && stream_msg.artwork.has_value() &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
-                this->artwork_->impl_->handle_stream_start(
-                    stream_msg.artwork.value(),
-                    this->artwork_->impl_->cleanup_generation.load(std::memory_order_acquire));
+                this->artwork_->impl_->handle_stream_start(stream_msg.artwork.value());
             }
 #endif
 
@@ -564,7 +548,6 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             compute_time_exchange(time_msg, client_sent.value(), timestamp, &response.offset,
                                   &response.max_error);
             response.timestamp = timestamp;
-            response.source_id = conn->get_instance_id();
             response.client_transmitted = time_msg.client_transmitted;
             conn->time_burst().on_time_response(conn, response);
             break;

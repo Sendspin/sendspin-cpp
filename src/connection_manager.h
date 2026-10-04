@@ -193,7 +193,7 @@ struct NurseryEntry {
 /// @brief One admitted connection and the roles it owns
 ///
 /// Every role this client drives has at most one owner among the admitted connections: role
-/// dispatch, role-message routing (send_role_text()) and the client/state role objects all gate
+/// dispatch, role-message routing (role_send_target()) and the client/state role objects all gate
 /// on ownership rather than on admission alone. Protocol task only.
 struct AdmittedEntry {
     /// The admitted connection; null for a free slot.
@@ -492,15 +492,10 @@ public:
     /// @brief Sends client/leave to the primary admitted connection (SendspinClient::leave()).
     void leave();
 
-    /// @brief Sends a role message to the admitted connection that owns `role`
-    /// (SendspinClient::send_text(), and the controller commands
-    /// SendspinClient::send_controller_command() queues).
-    void send_role_text(SendspinRole role, const std::string& text) const;
-
     /// @brief The connection a role message goes to: the admitted, connected owner of `role`
     /// once its server/activate has arrived, or nullptr (logged) when the message must be dropped.
-    /// The gate send_role_text() applies, for a caller that builds the message only once it knows
-    /// it will be sent. Protocol task only.
+    /// The caller builds the message only once it knows it will be sent (the controller commands
+    /// SendspinClient::send_controller_command() queues). Protocol task only.
     SendspinConnection* role_send_target(SendspinRole role) const;
 
     /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window(), the operator

@@ -474,11 +474,11 @@ private:
  * @brief InboxSlot whose payload carries the teardown generation of the role it was admitted
  * under
  *
- * A role's protocol-task handler writes its main-loop payload with the generation the receive
- * gate captured (see each role's accepts()), and the role's drain takes the payload together
- * with that stamp: it catches its own teardown half up to the role's current generation first,
- * then applies only a payload whose stamp is still current (see teardown_tracker.h). This is the
- * one place a stamp is attached, so no producer can write a payload without one.
+ * A role's protocol-task handler writes its main-loop payload with the generation the receive gate
+ * loaded (see RoleTeardown in teardown_tracker.h), and the role's drain takes the payload together
+ * with that stamp: it catches its own teardown half up to the role's current generation first, then
+ * applies only a payload whose stamp is still current (see teardown_tracker.h). This is the one
+ * place a stamp is attached, so no producer can write a payload without one.
  *
  * Every write and merge keeps the newest generation's content: a delta stamped with a later
  * generation than the pending content replaces it, and one stamped with an earlier generation

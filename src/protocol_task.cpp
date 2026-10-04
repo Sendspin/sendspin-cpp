@@ -180,11 +180,8 @@ bool ProtocolTask::take_command(ProtocolCommand& out) {
 
 void ProtocolTask::clear_command(ProtocolCommand& command) {
     command.connection.reset();
-    command.text.clear();
-    command.text.shrink_to_fit();
     command.controller_command = {};
-    command.type = ProtocolCommandType::SEND_TEXT;
-    command.role = SendspinRole::CONTROLLER;
+    command.type = ProtocolCommandType::SEND_CONTROLLER_COMMAND;
 }
 
 // ============================================================================

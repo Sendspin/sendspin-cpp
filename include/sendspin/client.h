@@ -26,7 +26,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -385,7 +384,7 @@ public:
     /// refused, and a second call before the task takes it replaces the reason rather than
     /// adding a second disconnect. With connect_to() it resolves by call order (see
     /// connect_to()). The task applies it ahead of the commands queued since its last tick: a
-    /// send_text() or controller command queued before it in that window is dropped rather than
+    /// controller command queued before it in that window is dropped rather than
     /// sent after the goodbye, while a connection a server delivered before it still enters the
     /// nursery, since a disconnect addresses the current connections, not a newcomer. An outbound
     /// attempt still connecting is released the same way connect_to() releases one it replaces,
@@ -687,39 +686,20 @@ public:
     /// the roles that connection owns. Ignored unless the client is running.
     void publish_state();
 
-    /// @brief Sends a role-originated text message to the connection that owns the role
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    /// @brief Queues a controller command for the protocol task, which formats it as a
+    /// client/command and sends it to the admitted connection that owns the controller role
     ///
-    /// Every message sent on a role's behalf carries the role it belongs to, so the activation
-    /// gate cannot be forgotten at a call site. The client's own messages do not come through
-    /// here.
-    ///
-    /// The message is queued to the protocol task, which sends it to the admitted connection that
-    /// owns the role, and drops it there unless that connection has the role active:
+    /// The protocol task drops the command unless that connection has the role active:
     /// messaging.md "server/activate" tolerates inactive-role objects server-side because a client
     /// that received the role removal stops sending them. The activation test is on the
     /// versioned name, the same test the receive path applies. Also dropped, like client/state,
     /// while a re-handshake awaits the server/activate that follows it.
     ///
-    /// Callable from any thread.
-    /// @param text The text message to send
-    /// @param role_family Role family the message belongs to, without the version suffix
-    ///                    (e.g. "controller")
-    /// @return false when the message was refused before it reached the protocol task: the
-    ///         client is not running, the family names no role this library implements, or the
-    ///         command queue is full (ProtocolTask::CONSUMER_COMMAND_BURST requests, logged). true
-    ///         means queued, not sent: the protocol task's role gate can still drop it.
-    bool send_text(const std::string& text, const std::string& role_family);
-
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    /// @brief Queues a controller command for the protocol task, which formats it as a
-    /// client/command and sends it like send_text() sends a "controller" message (same role
-    /// gate, same drops)
-    ///
-    /// A role service, like send_text() and publish_state(): consumers call
-    /// ControllerRole::send_command(), which checks the command against the server's
-    /// supported_commands and its parameter before calling this. This assumes those checks ran
-    /// and repeats neither. The command crosses to the protocol task as the struct, so the
-    /// message is built in the task's JSON arena.
+    /// A role service, like publish_state(): consumers call ControllerRole::send_command(), which
+    /// checks the command against the server's supported_commands and its parameter before
+    /// calling this. This assumes those checks ran and repeats neither. The command crosses to
+    /// the protocol task as the struct, so the message is built in the task's JSON arena.
     ///
     /// Callable from any thread.
     /// @param cmd The command, already validated by the controller role.
@@ -1047,9 +1027,8 @@ private:
     /// and cleanup_connection_state()), and by stop()'s cleanup once it is joined; read from any
     /// thread (get_current_trust()).
     std::atomic<ConnectionTrust> current_trust_{ConnectionTrust::NONE};
-    /// High-performance requests applied and not yet released. Main loop only; atomic for the
-    /// destructor's release loop.
-    std::atomic<uint8_t> high_performance_ref_count_{0};
+    /// High-performance requests applied and not yet released. Main loop only.
+    uint8_t high_performance_ref_count_{0};
     /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;
     /// atomic so is_started() can be read from any thread. STOPPING covers the whole of stop():
     /// start() is refused and stop()/connect_to()/disconnect() are ignored while it is set, so a

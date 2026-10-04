@@ -252,7 +252,7 @@ SendspinClient::~SendspinClient() {
         // Every high-performance hold ends with the client. Requests the protocol task queued are
         // dropped, and the holds the main loop applied are released.
         this->event_state_->high_performance_slot.reset();
-        while (this->high_performance_ref_count_.load() > 0) {
+        while (this->high_performance_ref_count_ > 0) {
             this->release_high_performance();
         }
     }
@@ -1173,8 +1173,8 @@ void SendspinClient::set_available(bool available) {
 }
 
 void SendspinClient::leave() {
-    // messaging.md "client/leave". Not a role message, so it does not route through send_text().
-    // The protocol task applies the activation gate every outbound message has
+    // messaging.md "client/leave". Not a role message, so it is not routed to a role owner. The
+    // protocol task applies the activation gate every outbound message has
     // (ConnectionManager::leave()).
     if (!this->is_started()) {
         SS_LOGW(TAG, "client/leave ignored: client is not running");
@@ -1220,35 +1220,10 @@ ClientStateMessage SendspinClient::build_client_state() const {
     return state_msg;
 }
 
-bool SendspinClient::send_text(const std::string& text, const std::string& role_family) {
-    // Choke point for every role-originated message a consumer formats itself; a controller
-    // command takes send_controller_command(), the same route for the struct. Pairing messages
-    // are protocol-internal: connection_manager.cpp sends them via
-    // SendspinConnection::send_app_json() directly. A declared PAIRING activity is not a gate:
-    // pairing.md "Entering and leaving pairing" says an activate that adds it does not by itself
-    // affect active_roles, so an active role keeps driving its own traffic across the attempt.
-    if (!this->is_started()) {
-        SS_LOGD(TAG, "Dropping a %s message: client is not running", role_family.c_str());
-        return false;
-    }
-    // The family names the role this library implements; the protocol task tests ownership and
-    // the exact versioned name on the owning connection (ConnectionManager::send_role_text()).
-    const std::optional<SendspinRole> role = role_for_family(role_family);
-    if (!role.has_value()) {
-        SS_LOGD(TAG, "Dropping a %s message: no such role", role_family.c_str());
-        return false;
-    }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::SEND_TEXT;
-    command.role = role.value();
-    command.text = text;
-    return this->protocol_task_->push_command(std::move(command));
-}
-
 #ifdef SENDSPIN_ENABLE_CONTROLLER
 bool SendspinClient::send_controller_command(const ClientCommandControllerObject& cmd) {
-    // The send_text() path for a command the controller role validated, carried as the struct so
-    // the protocol task builds the message in its JSON arena (handle_command()).
+    // The command the controller role validated, carried as the struct so the protocol task
+    // builds the message in its JSON arena and applies the role gate (handle_command()).
     if (!this->is_started()) {
         SS_LOGD(TAG, "Dropping a controller command: client is not running");
         return false;
@@ -1261,21 +1236,18 @@ bool SendspinClient::send_controller_command(const ClientCommandControllerObject
 #endif
 
 void SendspinClient::acquire_high_performance() {
-    if (this->high_performance_ref_count_.fetch_add(1) == 0 && this->listener_) {
+    if (this->high_performance_ref_count_++ == 0 && this->listener_) {
         this->listener_->on_request_high_performance();
     }
 }
 
 void SendspinClient::release_high_performance() {
-    // Compare-exchange loop so a release at count 0 cannot underflow the counter.
-    uint8_t count = this->high_performance_ref_count_.load();
-    while (count != 0) {
-        if (this->high_performance_ref_count_.compare_exchange_weak(count, count - 1)) {
-            if (count == 1 && this->listener_) {
-                this->listener_->on_release_high_performance();
-            }
-            return;
-        }
+    // A release at count 0 is ignored rather than underflowing the counter.
+    if (this->high_performance_ref_count_ == 0) {
+        return;
+    }
+    if (--this->high_performance_ref_count_ == 0 && this->listener_) {
+        this->listener_->on_release_high_performance();
     }
 }
 

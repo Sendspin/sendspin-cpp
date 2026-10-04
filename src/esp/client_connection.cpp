@@ -162,8 +162,7 @@ bool SendspinClientConnection::is_connected() const {
 }
 
 SsErr SendspinClientConnection::send_text_message(const std::string& message,
-                                                  SendCompleteCallback cb,
-                                                  bool /*allow_before_hello*/) {
+                                                  SendCompleteCallback cb) {
     if (!this->is_connected()) {
         if (cb) {
             cb(false);
@@ -190,8 +189,7 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
 }
 
 SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len,
-                                                    SendCompleteCallback cb,
-                                                    bool /*allow_before_hello*/) {
+                                                    SendCompleteCallback cb) {
     if (!this->is_connected()) {
         if (cb) {
             cb(false);
@@ -262,8 +260,6 @@ void SendspinClientConnection::handle_connected() {
 void SendspinClientConnection::handle_disconnected() {
     SS_LOGD(TAG, "WebSocket disconnected from %s", this->url_.c_str());
     this->connected_ = false;
-    this->client_hello_sent_ = false;
-    this->server_hello_received_ = false;
     this->chunk_dest_ = nullptr;
     this->abandon_inbound_message();
     // The protocol task reports the loss once the messages before it are processed.

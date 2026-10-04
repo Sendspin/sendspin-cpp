@@ -92,8 +92,7 @@ public:
     }
     bool is_connected() const override { return true; }
 
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb,
-                            bool /*allow_before_hello*/) override {
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
         sent_text_.push_back(msg);
         if (cb) {
             cb(true);
@@ -101,8 +100,7 @@ public:
         return SsErr::OK;
     }
 
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                              bool /*allow_before_hello*/) override {
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) override {
         sent_binary_.push_back(std::vector<uint8_t>(data, data + len));
         if (cb) {
             cb(true);
@@ -432,7 +430,7 @@ TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
 
     // Before a session: send_app_json must send a raw TEXT frame.
     const std::string pre = "{\"type\":\"client/init\"}";
-    EXPECT_EQ(conn.send_app_json(pre, nullptr, /*allow_before_hello=*/true), SsErr::OK);
+    EXPECT_EQ(conn.send_app_json(pre, nullptr), SsErr::OK);
     ASSERT_EQ(conn.sent_text_.size(), 1u);
     EXPECT_EQ(conn.sent_text_[0], pre);
     EXPECT_TRUE(conn.sent_binary_.empty());
@@ -1708,11 +1706,10 @@ TEST(NoiseTransport, SendJsonWriteHookRidesTheLastFrame) {
 TEST(NoiseTransport, SendTransportFrameRunsTheHookBeforeTheWrite) {
     class OrderRecordingConnection : public TestConnection {
     public:
-        SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                                  bool allow_before_hello) override {
+        SsErr send_binary_message(const uint8_t* data, size_t len,
+                                  SendCompleteCallback cb) override {
             this->events_.emplace_back("write");
-            return TestConnection::send_binary_message(data, len, std::move(cb),
-                                                       allow_before_hello);
+            return TestConnection::send_binary_message(data, len, std::move(cb));
         }
         std::vector<std::string> events_;
     };

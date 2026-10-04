@@ -102,12 +102,13 @@ struct ResolvedPsk {
 
 /// @brief In-memory client pairing record store.
 ///
-/// Thread-safety: `records_` and its dirty-slot bookkeeping are guarded by `mutex_`. Cross-thread
-/// access goes through `resolve_by_psk_id` (protocol task, Noise handshake and re-handshake) or
-/// the one protocol-task mutator, `store_record_superseding`, which is RAM-only and defers its
-/// provider flush, `persist_records`, to the main loop. `pairing_psk_` is set by the constructor
-/// and never written afterwards, so it is read without the lock. No provider call is ever made
-/// under `mutex_`.
+/// Thread-safety: every change to `records_` is made on the protocol task, by the RAM-only
+/// mutators (`store_record_superseding`, `note_record_removed`, `note_record_played`), which defer
+/// their provider flush, `persist_records`, to the main loop. `mutex_` guards `records_` and its
+/// dirty-slot bookkeeping between those mutators and the main loop's flush; `resolve_by_psk_id`
+/// (protocol task, Noise handshake and re-handshake) only reads `records_` on the thread that
+/// changes it, so it takes no lock. `pairing_psk_` is set by the constructor and never written
+/// afterwards, so it is read without the lock. No provider call is ever made under `mutex_`.
 class RecordStore {
 public:
     /// @brief Default cap on retained long-term records; mirrors
@@ -149,6 +150,7 @@ public:
     /// different category is a lookup miss rather than a match.
     /// @param psk_id   The psk_id from the Noise message 1 payload.
     /// @param category The category the server declared it is using that PSK as.
+    /// Protocol task only.
     /// @return The matching PSK, or nullopt if this client holds no such PSK in that category.
     [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id(const std::string& psk_id,
                                                                PskCategory category) const;
@@ -207,9 +209,9 @@ public:
     /// @brief Erase the long-term record identified by psk_id from RAM, leaving the durable half
     /// (emptying its slot and rewriting the order) to a later persist_records(). No-op if absent.
     ///
-    /// For a revocation that must take effect at once: this takes only mutex_, a leaf lock, so a
-    /// protocol-task resolve_by_psk_id() misses the record from here on even though the slot is
-    /// emptied later.
+    /// For a revocation that must take effect at once: protocol task only, like
+    /// resolve_by_psk_id(), which misses the record from here on even though the slot is emptied
+    /// later.
     /// @param psk_id The record to erase.
     /// @return true when a record was erased, and the store therefore needs persisting.
     [[nodiscard]] bool note_record_removed(const std::string& psk_id);
@@ -335,12 +337,8 @@ private:
     /// @param slot The slot to write.
     void mark_slot_dirty_locked(uint8_t slot);
 
-    /// @brief Body of resolve_by_psk_id(); call with mutex_ held.
-    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id_locked(const std::string& psk_id,
-                                                                      PskCategory category) const;
-
-    /// @brief The long-term record for psk_id, or nullptr. Call with mutex_ held; the pointer
-    /// does not survive a mutation of records_.
+    /// @brief The long-term record for psk_id, or nullptr. Call with mutex_ held, or on the
+    /// protocol task; the pointer does not survive a mutation of records_.
     [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(const std::string& psk_id) const;
 
     /// @brief The record bound to server_id, or nullptr. Same rules.
@@ -372,7 +370,7 @@ private:
     bool save_slot_write(SlotWrite& write);
 
     // Struct fields
-    /// Mutable so the const `resolve_by_psk_id` can lock it.
+    /// Mutable so the const `has_pending_writes` can lock it.
     mutable std::mutex mutex_;
 
     std::optional<SendspinPairingPsk> pairing_psk_;

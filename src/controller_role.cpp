@@ -116,9 +116,6 @@ void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
 
 void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& state,
                                                uint32_t generation) const {
-    if (!this->accepts(generation)) {
-        return;
-    }
     this->event_state->slot.write(std::move(state), generation);
 }
 
@@ -143,8 +140,8 @@ void ControllerRole::Impl::drain_events() {
 }
 
 void ControllerRole::Impl::cleanup() {
-    // Bumped first: it invalidates any handler the gate already admitted (see accepts()) and the
-    // supported-commands mask (see supported_commands).
+    // Bumped first, so the drain discards a payload stamped before it (see RoleTeardown), and it
+    // invalidates the supported-commands mask (see supported_commands).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();

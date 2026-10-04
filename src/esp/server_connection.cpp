@@ -57,9 +57,6 @@ struct AsyncRespArg {
     /// Frame type (HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY) the worker sends this as.
     httpd_ws_type_t type{HTTPD_WS_TYPE_TEXT};
     bool has_callback{false};
-    /// When true the frame may be sent before client/hello (the hello itself and goodbye); when
-    /// false the worker drops it unless the hello has already been sent on this connection.
-    bool allow_before_hello{false};
     SendCompleteCallback on_complete;
     /// Run immediately before the write, if set.
     NoiseTransport::FrameWriteHook before_write;
@@ -141,29 +138,24 @@ bool SendspinServerConnection::is_connected() const {
 }
 
 SsErr SendspinServerConnection::send_text_message(const std::string& message,
-                                                  SendCompleteCallback on_complete,
-                                                  bool allow_before_hello) {
+                                                  SendCompleteCallback on_complete) {
     return this->queue_async_send(reinterpret_cast<const uint8_t*>(message.data()), message.size(),
-                                  HTTPD_WS_TYPE_TEXT, std::move(on_complete), allow_before_hello,
-                                  nullptr);
+                                  HTTPD_WS_TYPE_TEXT, std::move(on_complete), nullptr);
 }
 
 SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
-                                                    SendCompleteCallback on_complete,
-                                                    bool allow_before_hello) {
-    return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, std::move(on_complete),
-                                  allow_before_hello, nullptr);
+                                                    SendCompleteCallback on_complete) {
+    return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, std::move(on_complete), nullptr);
 }
 
 SsErr SendspinServerConnection::send_transport_frame(
     const uint8_t* data, size_t len, const NoiseTransport::FrameWriteHook& before_write) {
-    return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, nullptr,
-                                  /*allow_before_hello=*/true, before_write);
+    return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, nullptr, before_write);
 }
 
 SsErr SendspinServerConnection::queue_async_send(
     const uint8_t* data, size_t len, httpd_ws_type_t type, SendCompleteCallback on_complete,
-    bool allow_before_hello, const NoiseTransport::FrameWriteHook& before_write) {
+    const NoiseTransport::FrameWriteHook& before_write) {
     const bool is_text = (type == HTTPD_WS_TYPE_TEXT);
 
     if (!this->is_connected()) {
@@ -201,7 +193,6 @@ SsErr SendspinServerConnection::queue_async_send(
 
     resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
     resp_arg->pool = pool;
-    resp_arg->allow_before_hello = allow_before_hello;
     resp_arg->payload = reinterpret_cast<uint8_t*>(block) + sizeof(AsyncRespArg);
     resp_arg->len = len;
     resp_arg->type = type;
@@ -353,16 +344,11 @@ void SendspinServerConnection::async_send_frame(void* arg) {
 
     // Resolve the originating connection. weak_ptr.lock() yields the exact conn that queued this
     // work (or null if it has been destroyed), so a recycled sockfd can never redirect the frame
-    // onto a different connection. Non-handshake frames are gated on client_hello_sent_ so nothing
-    // can precede the client/hello; allow_before_hello opts the pre-transport handshake frames, the
-    // Noise transport frames, and the client/hello and client/goodbye out of that gate.
-    // The completion callback fires only when the frame is sent: it is skipped both when the gate
-    // blocks the frame and when the connection is already gone (lock() is null).
-    // allow_before_hello bypasses the gate but not the conn-alive requirement, so callers must not
-    // rely on the callback as an unconditional "send finished" signal.
+    // onto a different connection. The completion callback fires only when the frame is sent: it
+    // is skipped when the connection is already gone (lock() is null) or closed, so callers must
+    // not rely on it as an unconditional "send finished" signal.
     auto conn = resp_arg->conn.lock();
-    if (conn && conn->is_connected() &&
-        (resp_arg->allow_before_hello || conn->client_hello_sent_)) {
+    if (conn && conn->is_connected()) {
         if (resp_arg->before_write) {
             resp_arg->before_write();
         }

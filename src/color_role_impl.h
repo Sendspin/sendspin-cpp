@@ -22,7 +22,6 @@
 #include "sendspin/color_role.h"
 #include "teardown_tracker.h"
 
-#include <atomic>
 #include <memory>
 #include <optional>
 
