@@ -91,31 +91,22 @@ public:
     // Interface stubs
 
     void start() override {}
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
+    void disconnect(SendspinGoodbyeReason reason) override {
         this->last_disconnect_reason_ = reason;
         this->disconnect_count_++;
-        if (on_complete) {
-            on_complete();
-        }
     }
     void close_transport_now() override {
         this->close_transport_now_count_++;
     }
     bool is_connected() const override { return this->connected_; }
 
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
+    SsErr send_text_message(const std::string& msg) override {
         sent_text_.push_back(msg);
-        if (cb) {
-            cb(true);
-        }
         return SsErr::OK;
     }
 
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) override {
+    SsErr send_binary_message(const uint8_t* data, size_t len) override {
         sent_binary_.push_back(std::vector<uint8_t>(data, data + len));
-        if (cb) {
-            cb(true);
-        }
         return SsErr::OK;
     }
 

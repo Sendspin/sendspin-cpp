@@ -81,30 +81,21 @@ public:
     // --- Interface stubs ---
 
     void start() override {}
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
+    void disconnect(SendspinGoodbyeReason reason) override {
         disconnect_calls_.push_back(reason);
-        if (on_complete) {
-            on_complete();
-        }
     }
     void close_transport_now() override {
         this->close_transport_now_calls_++;
     }
     bool is_connected() const override { return true; }
 
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
+    SsErr send_text_message(const std::string& msg) override {
         sent_text_.push_back(msg);
-        if (cb) {
-            cb(true);
-        }
         return SsErr::OK;
     }
 
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) override {
+    SsErr send_binary_message(const uint8_t* data, size_t len) override {
         sent_binary_.push_back(std::vector<uint8_t>(data, data + len));
-        if (cb) {
-            cb(true);
-        }
         return SsErr::OK;
     }
 
@@ -430,7 +421,7 @@ TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
 
     // Before a session: send_app_json must send a raw TEXT frame.
     const std::string pre = "{\"type\":\"client/init\"}";
-    EXPECT_EQ(conn.send_app_json(pre, nullptr), SsErr::OK);
+    EXPECT_EQ(conn.send_app_json(pre), SsErr::OK);
     ASSERT_EQ(conn.sent_text_.size(), 1u);
     EXPECT_EQ(conn.sent_text_[0], pre);
     EXPECT_TRUE(conn.sent_binary_.empty());
@@ -438,7 +429,7 @@ TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
     // After installing a session: send_app_json must encrypt (binary frame), no new TEXT frame.
     conn.set_noise_session(std::move(r->responder_session));
     const std::string post = "{\"type\":\"client/state\",\"value\":7}";
-    EXPECT_EQ(conn.send_app_json(post, nullptr), SsErr::OK);
+    EXPECT_EQ(conn.send_app_json(post), SsErr::OK);
     EXPECT_EQ(conn.sent_text_.size(), 1u);  // unchanged
     ASSERT_EQ(conn.sent_binary_.size(), 1u);
 
@@ -1706,10 +1697,9 @@ TEST(NoiseTransport, SendJsonWriteHookRidesTheLastFrame) {
 TEST(NoiseTransport, SendTransportFrameRunsTheHookBeforeTheWrite) {
     class OrderRecordingConnection : public TestConnection {
     public:
-        SsErr send_binary_message(const uint8_t* data, size_t len,
-                                  SendCompleteCallback cb) override {
+        SsErr send_binary_message(const uint8_t* data, size_t len) override {
             this->events_.emplace_back("write");
-            return TestConnection::send_binary_message(data, len, std::move(cb));
+            return TestConnection::send_binary_message(data, len);
         }
         std::vector<std::string> events_;
     };

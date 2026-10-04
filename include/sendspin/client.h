@@ -329,20 +329,19 @@ public:
 
     /// @brief Stops the client and returns only once it is fully stopped
     ///
-    /// Sends a client/goodbye (reason shutdown) to every peer, waits a short bound for those
-    /// sends to complete, joins the protocol task, then closes the server and every connection
-    /// regardless, joins the role threads, resets every role, and delivers the roles' clear
-    /// callbacks (on_stream_end(),
-    /// on_image_clear(), on_metadata_clear(), ...) before returning. A pairing prompt still
-    /// showing is dismissed the same way (on_clear_pairing_code() / on_close_pairing_window()),
-    /// and every provider write still owed is performed before returning. No-op when stopped.
-    /// Calling start() afterwards restarts on the same identity and record store, unless the
-    /// persistence provider changed in between. Start/stop cycles may be repeated indefinitely.
+    /// Sends a client/goodbye (reason shutdown) to every peer and closes each connection behind
+    /// it, joins the protocol task, then closes the server and every connection still open,
+    /// joins the role threads, resets every role, and delivers the roles' clear callbacks
+    /// (on_stream_end(), on_image_clear(), on_metadata_clear(), ...) before returning. A pairing
+    /// prompt still showing is dismissed the same way (on_clear_pairing_code() /
+    /// on_close_pairing_window()), and every provider write still owed is performed before
+    /// returning. No-op when stopped. Calling start() afterwards restarts on the same identity and
+    /// record store, unless the persistence provider changed in between. Start/stop cycles may be
+    /// repeated indefinitely.
     ///
-    /// Blocking is bounded by the goodbye wait, the transports' own close, and any listener
-    /// callback already running on a role thread, which the join cannot interrupt. The
-    /// per-transport bounds are described in docs/integration-guide.md (Stopping and
-    /// Restarting).
+    /// Blocking is bounded by the transports' own send and close, and any listener callback
+    /// already running on a role thread, which the join cannot interrupt. The per-transport
+    /// bounds are described in docs/integration-guide.md (Stopping and Restarting).
     ///
     /// Listener callbacks fire from inside this call, after every role has been reset, so the
     /// state they observe through the getters is the stopped state. One that calls start() has

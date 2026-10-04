@@ -24,7 +24,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 
@@ -47,22 +46,21 @@ public:
     /// @brief No-op on server connections; the transport is already established when this is called
     void start() override;
 
-    /// @brief Sends a goodbye message and closes the connection
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
+    /// @brief Sends a goodbye message, then closes the connection
+    void disconnect(SendspinGoodbyeReason reason) override;
 
     /// @brief Closes the transport immediately without blocking (see base class doc comment).
-    /// Delegates to trigger_close(), the same async primitive disconnect() already uses.
+    /// Delegates to trigger_close(), the same async primitive disconnect() closes with.
     void close_transport_now() override;
 
     /// @brief Whether the underlying WebSocket connection is open
     bool is_connected() const override;
 
     /// @brief Sends a text message to the connected client
-    SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
+    SsErr send_text_message(const std::string& message) override;
 
     /// @brief Sends a binary message to the connected client
-    SsErr send_binary_message(const uint8_t* data, size_t len,
-                              SendCompleteCallback on_complete) override;
+    SsErr send_binary_message(const uint8_t* data, size_t len) override;
 
     /// @brief Requests the WebSocket connection to close
     void trigger_close();
@@ -79,8 +77,7 @@ protected:
     /// @param is_binary Sends as an IX binary frame when true, text frame when false.
     /// @param data      Payload bytes to send.
     /// @param len       Number of bytes in `data`.
-    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
-                        const SendCompleteCallback& on_complete);
+    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len);
 
     // Pointer fields
 

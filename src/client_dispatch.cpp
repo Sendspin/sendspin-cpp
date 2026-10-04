@@ -112,13 +112,11 @@ uint32_t SendspinClient::protocol_tick() {
         }
     }
 
-    // 2. Once admission is closed: the shutdown pass, and the bounded wait for the goodbyes the
-    //    commands above refused. Every slot is empty afterwards, so the steps below find no
-    //    connection and the ring pass only returns the items still in flight.
+    // 2. Once admission is closed: the shutdown pass. Every slot is empty afterwards, so the
+    //    steps below find no connection and the ring pass only returns the items still in
+    //    flight.
     if (manager.shutdown_pending()) {
         manager.shutdown();
-    } else {
-        manager.flush_shutdown_goodbyes();
     }
 
     // 3. The newest client/state snapshot, sent to every admitted connection it changes.
@@ -279,7 +277,7 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
     SendspinConnection* conn = manager.role_send_target(SendspinRole::CONTROLLER);
     if (conn != nullptr) {
         conn->send_app_json(
-            format_client_command_message(command.controller_command, *this->json_arena_), nullptr);
+            format_client_command_message(command.controller_command, *this->json_arena_));
     }
 }
 

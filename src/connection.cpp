@@ -59,7 +59,7 @@ SsErr SendspinConnection::send_transport_frame(const uint8_t* data, size_t len,
     if (before_write) {
         before_write();
     }
-    return this->send_binary_message(data, len, nullptr);
+    return this->send_binary_message(data, len);
 }
 
 // ============================================================================
@@ -80,34 +80,27 @@ void SendspinConnection::wake_protocol_task() const {
 // Message sending
 // ============================================================================
 
-SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
-                                              SendCompleteCallback on_complete) {
+SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason) {
     // Routed through send_app_json() so it is encrypted once the Noise transport is active. A
     // goodbye can precede the hello (e.g., when rejecting an excess connection before the
     // handshake finishes).
-    return this->send_app_json(format_client_goodbye_message(reason, *this->json_arena_),
-                               std::move(on_complete));
+    return this->send_app_json(format_client_goodbye_message(reason, *this->json_arena_));
 }
 
-SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCallback cb) {
+SsErr SendspinConnection::send_app_json(const std::string& json) {
     // Delegate to the pointer/length overload: same routing (see that overload).
-    return this->send_app_json(json.data(), json.size(), std::move(cb));
+    return this->send_app_json(json.data(), json.size());
 }
 
-SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendCompleteCallback cb) {
+SsErr SendspinConnection::send_app_json(const char* json, size_t len) {
     // Protocol task only, like the re-handshake swap, so the session cannot change between this
     // check and the encrypt.
     if (this->noise_transport_.is_active()) {
-        // Post-handshake: encrypt straight from the caller's buffer. The transport's send path
-        // takes no callback, so fire cb here on the encrypt result (best-effort).
-        SsErr err = this->send_encrypted_text(json, len);
-        if (cb) {
-            cb(err == SsErr::OK);
-        }
-        return err;
+        // Post-handshake: encrypt straight from the caller's buffer.
+        return this->send_encrypted_text(json, len);
     }
     // Pre-handshake cold path: the text-frame API takes a std::string.
-    return this->send_text_message(std::string(json, len), std::move(cb));
+    return this->send_text_message(std::string(json, len));
 }
 
 // ============================================================================
@@ -191,7 +184,7 @@ void SendspinConnection::send_noise_client_init() {
     }
     std::string client_init = this->noise_handshake_->build_client_init();
     if (!client_init.empty()) {
-        this->send_text_message(client_init, nullptr);
+        this->send_text_message(client_init);
     }
 }
 
@@ -201,7 +194,7 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
     }
 
     auto send_fn = [this](const std::string& msg) -> bool {
-        auto err = this->send_text_message(msg, nullptr);
+        auto err = this->send_text_message(msg);
         return err == SsErr::OK;
     };
 

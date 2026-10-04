@@ -54,7 +54,7 @@ Plain atomics carry the rest: the `connected_` and `accepting_` flags on `Connec
 
 ### Locks
 
-Every library lock is a leaf: it is held only to copy or update its own state, never across a call that takes another library lock, a send, a listener or the persistence provider, so no two library locks are ever held at once and there is no lock order. The locks are the Inbox's `mutex_`; the inbound ring's own (`SharedRingBuffer::mtx_` on host, the FreeRTOS ring's internal lock on ESP); each `InboundItemList::mutex_`; `ProtocolTask::command_mutex_` (the command queue, the state slot and the request slot); `ConnectionManager::published_mutex_` (which also serialises the role threads' `time_filter()` reads behind `server_information()` copies); `GoodbyeWait::mutex`; each `SendspinTimeFilter::state_mutex_`; `RecordStore::mutex_`; the artwork role's `DrainTask::slot_mutex`; each `ShadowSlot::mutex_`; the ESP server's `SendspinWsServer::pending_mutex_`; and, on host, the mutexes inside `EventFlags` and `ThreadSafeQueue`. Connection state has no lock at all: only the protocol task touches it, except the transport's own atomics, which state their writer and reader at their declaration.
+Every library lock is a leaf: it is held only to copy or update its own state, never across a call that takes another library lock, a send, a listener or the persistence provider, so no two library locks are ever held at once and there is no lock order. The locks are the Inbox's `mutex_`; the inbound ring's own (`SharedRingBuffer::mtx_` on host, the FreeRTOS ring's internal lock on ESP); each `InboundItemList::mutex_`; `ProtocolTask::command_mutex_` (the command queue, the state slot and the request slot); `ConnectionManager::published_mutex_` (which also serialises the role threads' `time_filter()` reads behind `server_information()` copies); each `SendspinTimeFilter::state_mutex_`; `RecordStore::mutex_`; the artwork role's `DrainTask::slot_mutex`; each `ShadowSlot::mutex_`; the ESP server's `SendspinWsServer::pending_mutex_`; and, on host, the mutexes inside `EventFlags` and `ThreadSafeQueue`. Connection state has no lock at all: only the protocol task touches it, except the transport's own atomics, which state their writer and reader at their declaration.
 
 ### The Inbound Ring
 
@@ -102,8 +102,7 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
    queued before a disconnect finds its connection detached and is dropped, while an accept
    queued before it still enters the nursery: a disconnect addresses the connections it finds,
    not a newcomer
-2. Once admission is closed: the shutdown pass (ConnectionManager::shutdown()); otherwise the
-   bounded wait for goodbyes refused accepts were sent
+2. Once admission is closed: the shutdown pass (ConnectionManager::shutdown())
 3. The newest client/state snapshot, sent to every admitted connection
 4. client/init on outbound connections whose WebSocket upgrade completed
 5. The receive pass over a snapshot of the managed connections: each connection's message
@@ -126,7 +125,7 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
    drain); a loss lowers it at once
 ```
 
-The tick returns the milliseconds until the earliest of its timers: a nursery entry's hello retry or establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a released outbound connection's reaping deadline, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound, or one that freed a held-back fallback message, returns 0 and runs again at once. No timer is periodic except the network poll, which runs only while the server is down, so an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 5, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
+The tick returns the milliseconds until the earliest of its timers: a nursery entry's establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a released outbound connection's reaping deadline, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound, or one that freed a held-back fallback message, returns 0 and runs again at once. No timer is periodic except the network poll, which runs only while the server is down, so an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 5, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
 
 ## One Main Loop Drain
 
@@ -325,7 +324,7 @@ Every slot belongs to the protocol task; nothing else reads or writes it.
 | `admitted_` | The admitted connections, `MAX_ADMITTED` entries (one today), each with the roles it owns (`AdmittedEntry`) |
 | `nursery_` | Unproven connections (inbound or outbound) awaiting establishment, bounded by `MAX_NURSERY_ENTRIES` |
 | `reaping_` | Released outbound connections whose transport may still be connecting, bounded by `REAPING_CAPACITY` (`ReapEntry`) |
-| `closing_` | Connections the shutdown pass took out of the slots, kept for `finish_stop()` to close |
+| `closing_` | Connections the shutdown pass took out of the slots and closed, kept for `finish_stop()` to release |
 
 All hold `std::shared_ptr<SendspinConnection>`. On the ESP server path these are observers; see [Server Connection Ownership (ESP)](#server-connection-ownership-esp). The other holders of a connection reference are the protocol task's per-tick snapshot (`snapshot_connections()`), an accept waiting in the command queue, and the ESP platform server (the httpd session slot, the owner on ESP). No reference leaves the protocol task for a consumer or role thread: what they read about the connection goes through the published slots.
 
@@ -369,12 +368,12 @@ Each getter reads the slot once, so a caller that checks `is_time_synced()` and 
    its push, on the delivering thread, and its transport closes it without a goodbye
 3. ProtocolTask::stop(): the final tick acts on the commands queued and the requests posted so
    far (an accept already queued is refused with a shutdown goodbye) and runs the shutdown pass
-   (snapshot the pairing-UI flags, detach every connection, goodbye each with reason shutdown,
-   wait up to the flush bound per goodbye still outstanding), then the join
-4. ConnectionManager::finish_stop(): close every transport the shutdown pass kept and every
-   released outbound connection still parked for reaping, stop the ws_server (joining its
-   transport threads), release those connections; then drop any command still queued and any
-   request still posted
+   (snapshot the pairing-UI flags, detach every connection, goodbye and close each with reason
+   shutdown), then the join
+4. ConnectionManager::finish_stop(): close every released outbound connection still parked for
+   reaping, stop the ws_server (joining its transport threads), release those connections and
+   the ones the shutdown pass kept; then drop any command still queued and any request still
+   posted
 5. Join all role threads; each then returns its items to the ring or discards its queue
    content, and the emptied inbound ring is released
 6. Bump drain_generation, cleanup_connection_state() for every role (the protocol-task halves
@@ -388,6 +387,8 @@ Each getter reads the slot once, so a caller that checks `is_time_synced()` and 
 ```
 
 The library's last reference to a connection is therefore dropped on the protocol task, or on the main loop in step 4 once the task is joined, never on a role thread. An ESP inbound connection, owned by its httpd session, is destroyed by its transport when the session is freed, and a host connection the client refused at delivery by its transport's open handler once the delivery has returned (see [Server Connection Ownership (ESP)](#server-connection-ownership-esp)). The client destructor performs steps 1 to 4, drops the high-performance requests no drain applied (they were never granted, so the listener never heard them) and releases the holds the main loop applied, its only listener call; it dispatches no teardown or clear callback, and performs the provider writes still owed once the connection manager is gone; the roles' destructors then join their threads, so listeners must outlive the client.
+
+On the ESP server, each shutdown-pass `disconnect()` posts two messages to httpd's control socket (the queued goodbye and the close), so a stop with many peers posts a burst there that lwIP's UDP receive mailbox must hold; a stop with `server_max_connections` peers is on the on-device checklist.
 
 ### Server Connection Ownership (ESP)
 

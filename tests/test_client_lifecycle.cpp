@@ -23,7 +23,7 @@
 #include "artwork_role_impl.h"  // The display slot and its epochs; private, see CMakeLists
 #include "color_role_impl.h"       // The applied palette and its slot; private, see CMakeLists
 #include "connection.h"  // StubConnection stands in for a real connection
-#include "connection_manager.h"  // GoodbyeWait, GOODBYE_FLUSH_TIMEOUT_MS
+#include "connection_manager.h"
 #include "controller_role_impl.h"  // The applied controller state and its slot
 #include "crypto/constants.h"
 #include "crypto/keys.h"
@@ -214,38 +214,6 @@ public:
 
 std::string group_update_playing_json() {
     return R"({"type":"group/update","payload":{"playback_state":"playing"}})";
-}
-
-// ============================================================================
-// GoodbyeWait: the bound stop() relies on
-// ============================================================================
-
-// A goodbye whose completion never arrives (an ESP session that closes before its worker runs
-// reports nothing) must not hold stop() open: wait() returns false once the bound elapses.
-// Deleting the bound turns this into a hang the suite watchdog reports.
-TEST(GoodbyeWait, BoundElapsesWhenACompletionNeverArrives) {
-    GoodbyeWait wait;
-    wait.add_pending();
-    EXPECT_FALSE(wait.wait(GOODBYE_FLUSH_TIMEOUT_MS));
-}
-
-// Control: with every registered goodbye completed (from another thread, as a transport worker
-// would) wait() reports success, and with nothing registered it never blocks.
-TEST(GoodbyeWait, CompletionsSatisfyTheWait) {
-    GoodbyeWait idle;
-    EXPECT_TRUE(idle.wait(UINT32_MAX)) << "a wait with nothing registered must not block";
-
-    GoodbyeWait wait;
-    wait.add_pending();
-    wait.add_pending();
-    std::thread worker([&] {
-        wait.complete_one();
-        wait.complete_one();
-    });
-    // No bound: a lost completion hangs here and the watchdog reports it, rather than the
-    // elapsed time deciding the verdict.
-    EXPECT_TRUE(wait.wait(UINT32_MAX));
-    worker.join();
 }
 
 // ============================================================================
@@ -829,72 +797,68 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
 // ============================================================================
 
 /// Connection stand-in with every transport override inert: nothing is sent anywhere, a send
-/// completes inline and reports success, and the connection always reads as connected. Tests that
-/// install one in the manager's slot derive from it and override only the one call they are about
-/// to observe.
+/// reports success, and the connection always reads as connected. Tests that install one in the
+/// manager's slot derive from it and override only the one call they are about to observe.
 class StubConnection : public SendspinConnection {
 public:
     void start() override {}
-    void disconnect(SendspinGoodbyeReason, std::function<void()> on_complete) override {
-        if (on_complete) {
-            on_complete();
-        }
-    }
+    void disconnect(SendspinGoodbyeReason) override {}
     void close_transport_now() override {}
     bool is_connected() const override {
         return true;
     }
-    SsErr send_binary_message(const uint8_t*, size_t, SendCompleteCallback cb) override {
-        if (cb) {
-            cb(true);
-        }
+    SsErr send_binary_message(const uint8_t*, size_t) override {
         return SsErr::OK;
     }
-    SsErr send_text_message(const std::string&, SendCompleteCallback cb) override {
-        if (cb) {
-            cb(true);
-        }
+    SsErr send_text_message(const std::string&) override {
         return SsErr::OK;
     }
 };
 
-/// Counts client/hello sends; `result` is what each send returns. The completion fires inline with
-/// the send's outcome, as the encrypted send_app_json() path reports it.
+/// Counts client/hello sends, `result` being what each returns, and records the goodbye a drop
+/// sends and the transport closes.
 class HelloCountingConnection : public StubConnection {
 public:
     explicit HelloCountingConnection(SsErr result) : result_(result) {}
 
     // No Noise session, so send_app_json() routes the hello here as raw text.
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
+    SsErr send_text_message(const std::string& msg) override {
         if (msg.find("client/hello") != std::string::npos) {
             ++this->hellos;
-        }
-        if (cb) {
-            cb(this->result_ == SsErr::OK);
         }
         return this->result_;
     }
 
+    void disconnect(SendspinGoodbyeReason reason) override {
+        this->goodbye = reason;
+    }
+
+    void close_transport_now() override {
+        ++this->closes;
+    }
+
     int hellos{0};
+    int closes{0};
+    std::optional<SendspinGoodbyeReason> goodbye;
 
 private:
     SsErr result_;
 };
 
-// A nursery connection's client/hello is armed once, when its Noise handshake completes, and never
-// again: a hello the transport refuses, or one whose attempts run out, is left for the close event
-// or the establish deadline rather than re-armed with a fresh set of attempts. Every tick forces
-// the next attempt due, so the backoff delays do not stretch the test (and are not pinned by it).
-TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
+// A nursery connection's client/hello is sent once, when its Noise handshake completes, and never
+// again. A send that fails on a connected transport cannot be retried (the Noise send nonce is
+// spent by then), so the connection is closed without a goodbye and dropped; one the transport
+// refuses as no longer connected is left for its close event or the establish deadline.
+TEST(ClientLifecycle, NurseryHelloIsSentOnceAndAFailedSendDropsTheConnection) {
     struct Row {
         const char* name;
         SsErr send_result;
-        int expected_hellos;
+        bool dropped;
     };
     const Row rows[] = {
-        {"Control: queued", SsErr::OK, 1},
-        {"refused by the transport", SsErr::INVALID_STATE, 1},
-        {"every attempt fails", SsErr::FAIL, NurseryEntry::MAX_HELLO_ATTEMPTS},
+        {"Control: sent", SsErr::OK, false},
+        {"refused by the transport", SsErr::INVALID_STATE, false},
+        {"the send fails", SsErr::FAIL, true},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -910,13 +874,17 @@ TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
         conn->set_provisional_time_us(platform_time_us());
         manager.nursery_.push_back(NurseryEntry{.conn = conn, .client_init_sent = true});
 
-        for (int tick = 0; tick < NurseryEntry::MAX_HELLO_ATTEMPTS + 3; ++tick) {
+        for (int tick = 0; tick < 3; ++tick) {
             (void) manager.scan_nursery(platform_time_us());
-            for (auto& entry : manager.nursery_) {
-                entry.hello_due_us = 0;
-            }
         }
-        EXPECT_EQ(conn->hellos, row.expected_hellos);
+        EXPECT_EQ(conn->hellos, 1);
+        const bool in_nursery =
+            std::any_of(manager.nursery_.begin(), manager.nursery_.end(),
+                        [&conn](const NurseryEntry& entry) { return entry.conn == conn; });
+        EXPECT_EQ(in_nursery, !row.dropped);
+        EXPECT_EQ(conn->closes, row.dropped ? 1 : 0);
+        EXPECT_FALSE(conn->goodbye.has_value())
+            << "goodbye sent with reason " << static_cast<int>(*conn->goodbye);
 
         client.stop();
     }
@@ -1307,21 +1275,17 @@ TEST(ClientLifecycle, AnOpenedOutboundConnectionIsNotHeldForReaping) {
 /// sent on it.
 class RecordingConnection : public StubConnection {
 public:
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
+    void disconnect(SendspinGoodbyeReason reason) override {
         this->events.push_back("goodbye " + std::to_string(static_cast<int>(reason)));
-        StubConnection::disconnect(reason, std::move(on_complete));
     }
     // No Noise session, so send_app_json() routes a message here as raw text.
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
+    SsErr send_text_message(const std::string& msg) override {
         if (msg.find("client/leave") != std::string::npos) {
             this->events.emplace_back("leave");
         } else if (msg.find("client/command") != std::string::npos) {
             this->events.emplace_back("command");
         } else if (msg.find("client/state") != std::string::npos) {
             this->events.emplace_back("state");
-        }
-        if (cb) {
-            cb(true);
         }
         return SsErr::OK;
     }
@@ -1665,7 +1629,6 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         REPROVE,
         ATTEMPT,
         NURSERY,
-        HELLO_RETRY,
         WINDOW,
         WINDOW_AND_LIVENESS,
         NETWORK_POLL,
@@ -1686,7 +1649,6 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         {"the pairing attempt deadline", Stage::ATTEMPT, 2000},
         {"the nursery establish deadline", Stage::NURSERY,
          static_cast<uint32_t>(NURSERY_ESTABLISH_TIMEOUT_US / 1000)},
-        {"a hello retry, due ahead of the establish deadline", Stage::HELLO_RETRY, 200},
         {"the pairing window", Stage::WINDOW, 5000},
         {"the earliest of two", Stage::WINDOW_AND_LIVENESS, 5000},
         {"the network poll while the server is down", Stage::NETWORK_POLL,
@@ -1736,13 +1698,6 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
             case Stage::NURSERY:
                 conn->set_provisional_time_us(NOW_US);
                 manager.nursery_.push_back(NurseryEntry{.conn = conn});
-                break;
-            case Stage::HELLO_RETRY:
-                // A refused hello backed off: the next attempt is armed 200 ms out.
-                conn->set_provisional_time_us(NOW_US);
-                manager.nursery_.push_back(NurseryEntry{.conn = conn,
-                                                        .hello_due_us = NOW_US + 200'000,
-                                                        .hello_step = HelloStep::SENDING});
                 break;
             case Stage::WINDOW:
                 manager.pairing_window_open_until_us_ = NOW_US + 5'000'000;
@@ -3030,11 +2985,8 @@ public:
     }
 
     // Counts what the wire would carry: one disconnect() is one goodbye frame.
-    void disconnect(SendspinGoodbyeReason, std::function<void()> on_complete) override {
+    void disconnect(SendspinGoodbyeReason) override {
         this->obs_->goodbyes.fetch_add(1);
-        if (on_complete) {
-            on_complete();
-        }
     }
 
 private:

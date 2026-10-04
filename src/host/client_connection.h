@@ -25,7 +25,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 
@@ -67,8 +66,8 @@ public:
     /// @brief Initiates the WebSocket connection to the server
     void start() override;
 
-    /// @brief Sends a goodbye message and closes the connection
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
+    /// @brief Sends a goodbye message, then stops the transport (a join of IX's worker thread)
+    void disconnect(SendspinGoodbyeReason reason) override;
 
     /// @brief Closes the transport immediately without blocking (see base class doc comment).
     /// Safe to call from IX's own worker thread, unlike disconnect() -> ws_->stop(). An attempt
@@ -78,10 +77,10 @@ public:
     void close_transport_now() override;
 
     /// @brief Sends a text message to the server
-    SsErr send_text_message(const std::string& message, SendCompleteCallback cb) override;
+    SsErr send_text_message(const std::string& message) override;
 
     /// @brief Sends a binary message to the server
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) override;
+    SsErr send_binary_message(const uint8_t* data, size_t len) override;
 
     /// @brief No-op on host builds; task configuration is an ESP-IDF concept. Both parameters are
     /// accepted and ignored: the host build has no analogue of a FreeRTOS task priority or stack
@@ -112,9 +111,7 @@ protected:
     /// @param is_binary Sends as an IX binary frame when true, text frame when false.
     /// @param data      Payload bytes to send.
     /// @param len       Number of bytes in `data`.
-    /// @param cb        Callback invoked after send completes.
-    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
-                        const SendCompleteCallback& cb);
+    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len);
 
     // ========================================
     // Member variables

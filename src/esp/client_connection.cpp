@@ -121,29 +121,17 @@ void SendspinClientConnection::start() {
 // SendspinConnection interface implementation
 // ============================================================================
 
-void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
-                                          std::function<void()> on_complete) {
+void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason) {
     if (!this->is_connected()) {
-        // Not connected: invoke completion callback immediately if provided
-        if (on_complete) {
-            on_complete();
-        }
         return;
     }
 
-    // Send goodbye message and then stop client
-    // For client connections, send_text_message is synchronous, so callback fires immediately
-    this->send_goodbye_reason(reason, [this, on_complete](bool success) {
-        // Stop the client regardless of send success
-        if (this->client_ != nullptr) {
-            esp_websocket_client_stop(this->client_);
-        }
-
-        // Invoke user-provided completion callback if provided
-        if (on_complete) {
-            on_complete();
-        }
-    });
+    // The send is synchronous (bounded by WEBSOCKET_SEND_TIMEOUT_MS), so the goodbye has been
+    // written or has failed before the stop, which runs regardless of the send's result.
+    this->send_goodbye_reason(reason);
+    if (this->client_ != nullptr) {
+        esp_websocket_client_stop(this->client_);
+    }
 }
 
 void SendspinClientConnection::close_transport_now() {
@@ -161,26 +149,15 @@ bool SendspinClientConnection::is_connected() const {
     return this->connected_;
 }
 
-SsErr SendspinClientConnection::send_text_message(const std::string& message,
-                                                  SendCompleteCallback cb) {
+SsErr SendspinClientConnection::send_text_message(const std::string& message) {
     if (!this->is_connected()) {
-        if (cb) {
-            cb(false);
-        }
         return SsErr::INVALID_STATE;
     }
 
     // esp_websocket_client_send_text is synchronous in the current task
     int sent = esp_websocket_client_send_text(this->client_, message.c_str(), message.length(),
                                               pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
-
-    bool success = (sent >= 0);
-
-    if (cb) {
-        cb(success);
-    }
-
-    if (!success) {
+    if (sent < 0) {
         SS_LOGE(TAG, "Failed to send text message (timeout or error): %d", sent);
         return SsErr::FAIL;
     }
@@ -188,26 +165,15 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     return SsErr::OK;
 }
 
-SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len,
-                                                    SendCompleteCallback cb) {
+SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len) {
     if (!this->is_connected()) {
-        if (cb) {
-            cb(false);
-        }
         return SsErr::INVALID_STATE;
     }
 
     int sent = esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char*>(data),
                                              static_cast<int>(len),
                                              pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
-
-    bool success = (sent >= 0);
-
-    if (cb) {
-        cb(success);
-    }
-
-    if (!success) {
+    if (sent < 0) {
         SS_LOGE(TAG, "Failed to send binary message (timeout or error): %d", sent);
         return SsErr::FAIL;
     }

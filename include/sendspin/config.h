@@ -227,9 +227,9 @@ struct SendspinClientConfig {
     // (ESPHome's runs about 100 to 250 bytes deeper than newlib's vprintf chain); noise-c's
     // alloca extras off the worst path; ArduinoJson's virtual allocator chain (about 4.2 KB, under
     // the bound) and its nesting limit of 10 at 64 bytes a level; the shared_ptr disposal when
-    // the tick's connection snapshot drops; std::function send completions; the few assembly
-    // and unused newlib stub functions the script reports as frameless. The on-device high-water
-    // check of each task is still owed.
+    // the tick's connection snapshot drops; the few assembly and unused newlib stub functions
+    // the script reports as frameless. The on-device high-water check of each task is still
+    // owed.
 
     /// @brief Default HTTP server task stack size in bytes (ESP-IDF only). The task runs no Noise
     /// or protocol work (the protocol task does), only esp_http_server itself, the frame receive
@@ -274,11 +274,11 @@ struct SendspinClientConfig {
     /// @brief Default protocol task stack size in bytes (ESP-IDF only). The protocol task runs
     /// every Noise handshake (X25519, SHA-256), the pairing exchange (CPace, SHA-512, HMAC), the
     /// JSON parse, the role handlers and every send. Deepest chain from the task entry, noise-c and
-    /// libsodium included: 5,808 bytes at -Os, a pairing message whose handler drops the
-    /// connection and queues its goodbye through httpd_queue_work() into the shared tail; 6,464 at
+    /// libsodium included: 5,776 bytes at -Os, a pairing message whose handler drops the
+    /// connection and queues its goodbye through httpd_queue_work() into the shared tail; 6,480 at
     /// -Og, a stream/start message, whose parse frame is 1,312 bytes at -Og (464 at -Os), whose
     /// string conversion fails to allocate into libstdc++'s terminate and the shared tail.
-    /// 6,464 + 384 = 6,848, rounded up (see the task stack derivation above).
+    /// 6,480 + 384 = 6,864, rounded up (see the task stack derivation above).
     static constexpr size_t DEFAULT_PROTOCOL_TASK_STACK_SIZE = 7168U;
 
     size_t protocol_task_stack_size{

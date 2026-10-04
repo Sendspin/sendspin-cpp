@@ -126,9 +126,8 @@ protected:
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;
     static constexpr int64_t DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
     /// Wait before sending again after the transport refused a client/time: a full send queue or
-    /// a closing socket, neither of which clears at once. The hello's first backoff
-    /// (NurseryEntry::INITIAL_HELLO_RETRY_DELAY_MS) answers the same refusal, and it keeps the
-    /// protocol task from re-ticking at once for a send that cannot succeed.
+    /// a closing socket, neither of which clears at once. It keeps the protocol task from
+    /// re-ticking at once for a send that cannot succeed.
     static constexpr int64_t SEND_RETRY_DELAY_MS = 100;
 
     // 64-bit fields

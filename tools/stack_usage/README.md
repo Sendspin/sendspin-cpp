@@ -109,5 +109,5 @@ those on the deepest path. The ones the current tree reaches, and how deep each 
 The result is a static upper bound over the call graph, not a measured high-water mark. It does
 not include: recursion deeper than one pass (`--cycles` above), a second interrupt frame, an
 `esp_log_set_vprintf()` hook deeper than newlib's `vprintf()`, noise-c's `alloca` extras off
-the worst path, ArduinoJson's virtual allocator chain, `std::function` send completions, or the
-`shared_ptr` disposal at the end of a protocol tick. `config.h` lists the figures; the on-device high-water check is still owed.
+the worst path, ArduinoJson's virtual allocator chain, or the `shared_ptr` disposal at the end
+of a protocol tick. `config.h` lists the figures; the on-device high-water check is still owed.

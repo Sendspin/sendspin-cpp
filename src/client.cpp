@@ -509,13 +509,12 @@ PairingUiSnapshot SendspinClient::close_transports() {
 
     // 3. The protocol task: its final tick acts on the commands queued and the requests posted
     //    so far (refusing every accept with a shutdown goodbye), runs the shutdown pass (detach
-    //    every connection, goodbye each with reason shutdown, wait up to the flush bound), then
-    //    the join.
+    //    every connection, goodbye and close each with reason shutdown), then the join.
     this->protocol_task_->stop();
 
-    // 4. Close every transport the shutdown pass kept, and every released outbound connection
-    //    still parked for reaping, and stop the server, joining every transport thread, then
-    //    release those connections here.
+    // 4. Close every released outbound connection still parked for reaping, and stop the
+    //    server, joining every transport thread, then release those connections and the ones the
+    //    shutdown pass kept here.
     const PairingUiSnapshot pairing_ui = this->connection_manager_->finish_stop();
 
     // Commands and requests a consumer pushed meanwhile are dropped here, outside any run.
@@ -1435,7 +1434,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // after a server/activate carries them all.
     const ClientStateMessage state_msg =
         client_state_for_roles(snapshot, entry->owned_roles & conn->get_active_role_mask());
-    conn->send_app_json(format_client_state_message(&state_msg, *this->json_arena_), nullptr);
+    conn->send_app_json(format_client_state_message(&state_msg, *this->json_arena_));
 }
 
 void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {

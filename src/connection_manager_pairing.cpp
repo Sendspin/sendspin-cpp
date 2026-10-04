@@ -270,7 +270,7 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
                 "server_id=%s",
                 to_cstr(ps.method), server_id.c_str());
         conn->send_app_json(
-            format_client_pair_pending_message(ps.pairing_index, this->json_arena()), nullptr);
+            format_client_pair_pending_message(ps.pairing_index, this->json_arena()));
 
         // Surface the pairing-window prompt to the operator, but only when the platform
         // implements the gesture UI (on_open_pairing_window's contract is that it fires only
@@ -311,8 +311,7 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
     // server response. pair-init starts the attempt and carries the pairing index alone; the
     // PSK flow has no PAKE round and so no commit_B.
     SS_LOGI(TAG, "Sending client/pair-init (pairing_psk) for server_id=%s", server_id.c_str());
-    conn->send_app_json(format_client_pair_init_message(pairing_index, this->json_arena()),
-                        nullptr);
+    conn->send_app_json(format_client_pair_init_message(pairing_index, this->json_arena()));
     conn->pairing_session().attempt_deadline_us = platform_time_us() + PAIRING_ATTEMPT_TIMEOUT_US;
 
     // Send client/pair-finalize with the long-term PSK (base64url-encoded, 43 chars).
@@ -320,7 +319,7 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
     // Named local rather than a temporary so the serialized message, which carries the raw
     // base64 long-term PSK, can be wiped once it has been handed to the transport.
     std::string finalize_msg = format_client_pair_finalize_message(outcome.psk, this->json_arena());
-    conn->send_app_json(finalize_msg, nullptr);
+    conn->send_app_json(finalize_msg);
     secure_zero(finalize_msg.data(), finalize_msg.size());
 
     // Hold the pending record: committed to the RecordStore by the server/pair-finalize handler
@@ -381,7 +380,7 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
 
     if (wire_abort_reason.has_value()) {
         conn->send_app_json(
-            format_pair_abort_message(wire_abort_reason.value(), this->json_arena()), nullptr);
+            format_pair_abort_message(wire_abort_reason.value(), this->json_arena()));
     }
 
     // On the admitted path drop_connection() -> cleanup_connection_state() clears the queued
@@ -571,7 +570,7 @@ void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
 
     // Send client/pair-auth (pake_msg_2 = client CPace share) before deriving.
     const auto& client_share = ps.cpace.public_share();
-    conn->send_app_json(format_client_pair_auth_message(client_share, this->json_arena()), nullptr);
+    conn->send_app_json(format_client_pair_auth_message(client_share, this->json_arena()));
 
     // Derive the MAC key from the server's share (pake_msg_1).
     // A derive failure means the peer share has the wrong length or encodes a
@@ -639,7 +638,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
                 "handle_pairing_message: server_kc verification failed (pairing-code mismatch) "
                 "for server_id=%s after round %u; sending client/pair-retry",
                 server_id.c_str(), static_cast<unsigned>(ps.round));
-        conn->send_app_json(format_client_pair_retry_message(this->json_arena()), nullptr);
+        conn->send_app_json(format_client_pair_retry_message(this->json_arena()));
         ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT;
         return;
     }
@@ -673,7 +672,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     // client/pair-confirm").
     if (ps.method == SendspinPairMethod::STATIC_PAIRING_CODE) {
         conn->send_app_json(
-            format_client_pair_confirm_message(client_kc_opt.value(), this->json_arena()), nullptr);
+            format_client_pair_confirm_message(client_kc_opt.value(), this->json_arena()));
     } else {
         auto wrapped_nonce =
             wrap_value(NONCE_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), ps.nonce_b);
@@ -684,8 +683,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
             return;
         }
         conn->send_app_json(format_client_pair_confirm_message(
-                                client_kc_opt.value(), wrapped_nonce.value(), this->json_arena()),
-                            nullptr);
+            client_kc_opt.value(), wrapped_nonce.value(), this->json_arena()));
     }
 
     // Reset both flags immediately after dismissing: clear_pairing_state() does not run on this
@@ -718,7 +716,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     // but the two finalize paths are kept identical so neither drifts.
     std::string finalize_msg =
         format_client_pair_finalize_wrapped_message(wrapped.value(), this->json_arena());
-    conn->send_app_json(finalize_msg, nullptr);
+    conn->send_app_json(finalize_msg);
     secure_zero(finalize_msg.data(), finalize_msg.size());
     conn->set_pending_pairing_record(std::move(outcome.record));
 
@@ -794,9 +792,8 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
 
         SS_LOGI(TAG, "Sending client/pair-init (dynamic_pairing_code) for server_id=%s",
                 server_id.c_str());
-        conn->send_app_json(
-            format_client_pair_init_message(commit_b.value(), ps.pairing_index, this->json_arena()),
-            nullptr);
+        conn->send_app_json(format_client_pair_init_message(commit_b.value(), ps.pairing_index,
+                                                            this->json_arena()));
 
         ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT;
         ps.attempt_deadline_us = platform_time_us() + PAIRING_ATTEMPT_TIMEOUT_US;
@@ -816,8 +813,7 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
     // static flow carries no commit_B.
     SS_LOGI(TAG, "Sending client/pair-init (static_pairing_code) for server_id=%s",
             server_id.c_str());
-    conn->send_app_json(format_client_pair_init_message(ps.pairing_index, this->json_arena()),
-                        nullptr);
+    conn->send_app_json(format_client_pair_init_message(ps.pairing_index, this->json_arena()));
 
     // The static flow has no rounds: its single CPace run is round 1 (pairing.md "PAKE").
     ps.round = 1;

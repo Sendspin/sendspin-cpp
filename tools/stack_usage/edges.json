@@ -215,7 +215,7 @@
   "sendspin::TimeBurstResult sendspin::SendspinTimeBurst::loop(": [
    "int64_t sendspin::SendspinConnection::send_time_message()"
   ],
-  "static void sendspin::ConnectionManager::release_connection(": [
+  "void sendspin::ConnectionManager::release_connection(": [
    "SendspinServerConnection::disconnect(",
    "SendspinClientConnection::disconnect(",
    "SendspinClientConnection::~SendspinClientConnection()",
@@ -228,7 +228,6 @@
    "sym:SendspinClient13protocol_tickEv$"
   ],
   "sym:SendspinServerConnection16async_send_frame": [
-   "sym:_Function_handlerIFvbEZN8sendspin.*M_invoke",
    "sym:_Function_handlerIFvvEZN8sendspin.*M_invoke"
   ],
   "sym:_State_impl.*ProtocolTask.*_M_runEv": [

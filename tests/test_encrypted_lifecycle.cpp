@@ -1832,26 +1832,15 @@ public:
     }
 
     void start() override {}
-    void disconnect(SendspinGoodbyeReason /*reason*/, std::function<void()> on_complete) override {
-        if (on_complete) {
-            on_complete();
-        }
-    }
+    void disconnect(SendspinGoodbyeReason /*reason*/) override {}
     void close_transport_now() override {}
     bool is_connected() const override {
         return true;
     }
-    SsErr send_text_message(const std::string& /*msg*/, SendCompleteCallback cb) override {
-        if (cb) {
-            cb(true);
-        }
+    SsErr send_text_message(const std::string& /*msg*/) override {
         return SsErr::OK;
     }
-    SsErr send_binary_message(const uint8_t* /*data*/, size_t /*len*/,
-                              SendCompleteCallback cb) override {
-        if (cb) {
-            cb(true);
-        }
+    SsErr send_binary_message(const uint8_t* /*data*/, size_t /*len*/) override {
         return SsErr::OK;
     }
 };
@@ -2415,11 +2404,11 @@ TEST(EncryptedLifecycle, RoleDispatchFollowsOwnership) {
 /// A stand-in that keeps every client/state it is asked to send.
 class StateCapturingConnection : public DispatchTestConnection {
 public:
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
+    SsErr send_text_message(const std::string& msg) override {
         if (msg.find("client/state") != std::string::npos) {
             this->states.push_back(msg);
         }
-        return DispatchTestConnection::send_text_message(msg, std::move(cb));
+        return DispatchTestConnection::send_text_message(msg);
     }
 
     std::vector<std::string> states;
@@ -2522,11 +2511,11 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
 // admitted slot at that moment.
 class StateRecordingConnection : public DispatchTestConnection {
 public:
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb) override {
+    SsErr send_text_message(const std::string& msg) override {
         if (msg.find("client/state") != std::string::npos) {
             this->state_sent_while_admitted.push_back(this->is_admitted());
         }
-        return DispatchTestConnection::send_text_message(msg, std::move(cb));
+        return DispatchTestConnection::send_text_message(msg);
     }
 
     std::vector<bool> state_sent_while_admitted;
@@ -2561,6 +2550,9 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
         SCOPED_TRACE(row.label);
         DispatchTestClient bundle("State After Admission Test Client");
         bundle.client_ref().set_unpaired_access_enabled(true);
+        // Applied before the stand-in enters the nursery: applied with its hello already sent, the
+        // change would restart it (ConnectionManager::apply_unpaired_access_change()).
+        tick(bundle.client_ref());
         ConnectionManager& manager = *bundle.client_ref().connection_manager_;
 
         auto conn = std::make_shared<StateRecordingConnection>();
@@ -2602,9 +2594,8 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
 // A stand-in that records the goodbye a drop sends it.
 class GoodbyeRecordingConnection : public DispatchTestConnection {
 public:
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
+    void disconnect(SendspinGoodbyeReason reason) override {
         this->goodbye = reason;
-        DispatchTestConnection::disconnect(reason, std::move(on_complete));
     }
 
     std::optional<SendspinGoodbyeReason> goodbye;
@@ -2632,6 +2623,9 @@ TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
         SCOPED_TRACE(row.label);
         DispatchTestClient bundle("Liveness Tick Test Client");
         bundle.client_ref().set_unpaired_access_enabled(true);
+        // Applied before the stand-in enters the nursery: applied with its hello already sent, the
+        // change would restart it (ConnectionManager::apply_unpaired_access_change()).
+        tick(bundle.client_ref());
         SendspinClient& client = bundle.client_ref();
         ConnectionManager& manager = *client.connection_manager_;
         // What the tick itself compares against.

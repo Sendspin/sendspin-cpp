@@ -49,10 +49,6 @@ namespace sendspin {
 class ProtocolTask;
 class SendspinArenaAllocator;
 
-/// @brief Callback type for message send completion
-/// @param success True if the message was sent successfully, false otherwise.
-using SendCompleteCallback = std::function<void(bool)>;
-
 /**
  * @brief Abstract base class for Sendspin connections (server-initiated or client-initiated)
  *
@@ -74,14 +70,10 @@ public:
     /// processing)
     virtual void start() = 0;
 
-    /// @brief Disconnects from the server with a goodbye message
+    /// @brief Sends a goodbye message, then closes the transport, whether or not the send
+    /// succeeded. Protocol task only, like every send on a connection.
     /// @param reason The reason for disconnecting (e.g., shutdown, another server).
-    /// @param on_complete Optional callback invoked after goodbye is sent (or send fails/times
-    /// out).
-    ///                    For ESP server connections, invoked on the httpd worker thread, so it
-    ///                    must be safe there. Otherwise invoked synchronously in the calling
-    ///                    thread.
-    virtual void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) = 0;
+    virtual void disconnect(SendspinGoodbyeReason reason) = 0;
 
     /// @brief Closes the underlying transport immediately, without blocking and without ever
     /// joining/stopping the calling thread.
@@ -255,11 +247,11 @@ public:
     /// like every send on a connection. On an ESP outbound connection the transport send blocks
     /// for up to its 10 ms send timeout (src/esp/client_connection.cpp), once per frame.
     /// @return SsErr::OK if queued/sent, error code otherwise.
-    SsErr send_app_json(const std::string& json, SendCompleteCallback cb = nullptr);
+    SsErr send_app_json(const std::string& json);
 
     /// @brief Pointer/length form of send_app_json(); encrypts straight from the caller's
     /// buffer, and the pre-handshake text fallback builds the string it needs
-    SsErr send_app_json(const char* json, size_t len, SendCompleteCallback cb = nullptr);
+    SsErr send_app_json(const char* json, size_t len);
 
     /// @brief Returns this connection's process-unique instance id
     /// @return A monotonic id assigned at construction, never reused for the lifetime of the
@@ -289,14 +281,10 @@ public:
         return this->last_receive_time_us_.load(std::memory_order_relaxed);
     }
 
-    /// @brief Sends a text message to the server with a completion callback
+    /// @brief Sends a text message to the peer.
     /// @param message The message string to send.
-    /// @param cb Callback invoked with the send result. On asynchronous transports it is not
-    ///        guaranteed to fire: if the connection is torn down before the queued send runs, the
-    ///        callback is skipped. Treat it as a best-effort completion notification, not an
-    ///        unconditional "send finished" signal.
-    /// @return SsErr::OK if queued successfully, error code otherwise.
-    virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb) = 0;
+    /// @return SsErr::OK if queued/sent, error code otherwise.
+    virtual SsErr send_text_message(const std::string& message) = 0;
 
     /// @brief Sends a client/time message and records it as the frame in flight (see
     /// time_frame_tag_). Needs the Noise transport, which is_operational() implies. Protocol task
@@ -320,15 +308,13 @@ public:
     /// @brief Sends a binary WebSocket frame to the peer.
     /// @param data   Pointer to the binary payload bytes.
     /// @param len    Number of bytes to send.
-    /// @param cb     Optional completion callback (best-effort, may be skipped on teardown).
     /// @return SsErr::OK if queued/sent, error code otherwise.
-    virtual SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) = 0;
+    virtual SsErr send_binary_message(const uint8_t* data, size_t len) = 0;
 
-    /// @brief Sends a goodbye message with completion callback
+    /// @brief Sends a goodbye message.
     /// @param reason The reason for disconnecting.
-    /// @param on_complete Callback invoked after the goodbye message is sent (or fails).
-    /// @return SsErr::OK if sent successfully, error code otherwise.
-    SsErr send_goodbye_reason(SendspinGoodbyeReason reason, SendCompleteCallback on_complete);
+    /// @return SsErr::OK if queued/sent, error code otherwise.
+    SsErr send_goodbye_reason(SendspinGoodbyeReason reason);
 
     /// @brief Closes the connection without sending any application-level message.
     ///
@@ -1167,9 +1153,8 @@ protected:
     /// Protocol task only.
     bool pairing_finalized_{false};
 
-    /// Whether client/hello went out. Set by the hello send's completion, which the encrypted
-    /// send path runs inline, and never cleared: a closed connection is not reused. Protocol task
-    /// only.
+    /// Whether client/hello went out. Set when the hello send returns OK, and never cleared: a
+    /// closed connection is not reused. Protocol task only.
     bool client_hello_sent_{false};
 
     /// True once the Noise transport handshake has completed. Protocol task only.

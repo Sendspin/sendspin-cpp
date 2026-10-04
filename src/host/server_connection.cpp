@@ -40,28 +40,20 @@ void SendspinServerConnection::start() {
     // Open event, so the transport is already established and upgraded by the time it exists.
 }
 
-void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
-                                          std::function<void()> on_complete) {
+void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason) {
     if (!this->is_connected()) {
-        if (on_complete) {
-            on_complete();
-        }
         return;
     }
 
-    // Send goodbye message, then close
-    this->send_goodbye_reason(reason, [this, on_complete](bool /*success*/) {
-        this->trigger_close();
-        if (on_complete) {
-            on_complete();
-        }
-    });
+    // The send is synchronous, so the goodbye has been written (or failed) before the close.
+    this->send_goodbye_reason(reason);
+    this->trigger_close();
 }
 
 void SendspinServerConnection::close_transport_now() {
     // trigger_close() -> ws_->close() is already async/non-blocking (the same primitive
-    // disconnect() uses in its completion callback), so it is safe from any thread. The resulting
-    // Close event reaches notify_transport_closed() through the ws_server.
+    // disconnect() closes with), so it is safe from any thread. The resulting Close event reaches
+    // notify_transport_closed() through the ws_server.
     this->trigger_close();
 }
 
@@ -69,35 +61,23 @@ bool SendspinServerConnection::is_connected() const {
     return this->ws_ && this->ws_->getReadyState() == ix::ReadyState::Open;
 }
 
-SsErr SendspinServerConnection::send_text_message(const std::string& message,
-                                                  SendCompleteCallback on_complete) {
+SsErr SendspinServerConnection::send_text_message(const std::string& message) {
     return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
-                               message.size(), on_complete);
+                               message.size());
 }
 
-SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
-                                                    SendCompleteCallback on_complete) {
-    return this->send_ws_frame(true, data, len, on_complete);
+SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len) {
+    return this->send_ws_frame(true, data, len);
 }
 
-SsErr SendspinServerConnection::send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
-                                              const SendCompleteCallback& on_complete) {
+SsErr SendspinServerConnection::send_ws_frame(bool is_binary, const uint8_t* data, size_t len) {
     if (!this->is_connected()) {
-        if (on_complete) {
-            on_complete(false);
-        }
         return SsErr::INVALID_STATE;
     }
 
     std::string buf(reinterpret_cast<const char*>(data), len);
     auto info = is_binary ? this->ws_->sendBinary(buf) : this->ws_->send(buf);
-    bool success = info.success;
-
-    if (on_complete) {
-        on_complete(success);
-    }
-
-    if (!success) {
+    if (!info.success) {
         if (is_binary) {
             SS_LOGE(TAG, "Failed to send binary message");
         } else {
