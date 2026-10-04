@@ -334,10 +334,8 @@ public:
     /// do not overlap. These sites still assume one admitted connection and must be revisited
     /// first:
     /// - SendspinClient::cleanup_connection_state() resets the client-wide state (event ring,
-    ///   group, time-sync report, pairing notes, trust) only when the teardown covers every role,
+    ///   group, time-sync report, pairing notes) only when the teardown covers every role,
     ///   which is keyed on no remaining connection owning one.
-    /// - SendspinClient::current_trust_ is one value, overwritten by any connection's handshake
-    ///   and not recomputed for the survivors when one is dropped.
     /// - The time filter and server information slots follow primary() (the player's owner, else
     ///   the first admitted), so a role owned by another connection converts with the wrong clock.
     /// - group/update, leave() and get_server_information() are singular: they follow primary().
@@ -427,8 +425,8 @@ public:
     /// @brief Returns true if an admitted connection is connected, has completed its handshake
     /// and has its latest server/activate applied. Any thread: reads a flag the protocol task
     /// raises only at the end of a tick (publish_connected()), after every handler of that tick
-    /// has run, so a reader that sees it true also sees the trust the activation stored
-    /// (SendspinClient::get_current_trust()); refresh_published_state() lowers it at once.
+    /// has run, so a reader that sees it true sees the tick's whole effect (the published slots
+    /// and the events it queued for the drain); refresh_published_state() lowers it at once.
     bool is_connected() const {
         return this->connected_.load(std::memory_order_acquire);
     }
@@ -588,8 +586,8 @@ public:
 
     /// @brief Publishes the connected flag (is_connected()) as it stands, raising it as well as
     /// lowering it. Called only at the end of the tick, after refresh_published_state(): raised
-    /// mid-handler it would read true before the handler that made the connection operational
-    /// has stored the trust a reader checks next.
+    /// mid-handler it would read true before the tick's whole effect (the published slots and
+    /// the events queued for the drain) is in place.
     void publish_connected();
 
     /// @brief Whether admission is open: false from close_admission() until the next start().

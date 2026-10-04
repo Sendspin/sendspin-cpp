@@ -558,15 +558,6 @@ public:
         return this->group_state_;
     }
 
-    /// @brief Returns the trust level of the active connection. Any thread.
-    /// The same value SendspinClientListener::on_trust_changed reports, queryable at any time; it
-    /// changes on the protocol task, so it can lead the callback by a loop() tick.
-    /// @return The active connection's ConnectionTrust; ConnectionTrust::NONE when no
-    ///         connection is active or the handshake has not completed
-    ConnectionTrust get_current_trust() const {
-        return this->current_trust_.load(std::memory_order_acquire);
-    }
-
     // ========================================
     // State updates
     // ========================================
@@ -720,8 +711,8 @@ public:
 
 private:
     /// @brief The protocol-task half of a teardown: when `teardown_roles` covers every role, wipes
-    /// the event ring, the pending group and time-sync slots, the pairing notes other than a
-    /// dismissal already owed, and the trust level; and runs cleanup() on each role in
+    /// the event ring, the pending group and time-sync slots, and the pairing notes other than a
+    /// dismissal already owed; and runs cleanup() on each role in
     /// `teardown_roles`, each of which queues its stamped clear for the main loop. Protocol task,
     /// or the main loop in stop() once every other thread is joined. Each role's main-loop half
     /// runs in drain_inbox() before anything stamped with the new generation is acted on
@@ -1023,10 +1014,6 @@ private:
     /// set_unpaired_access_enabled(). Written by the setter on any thread, read by the protocol
     /// task.
     std::atomic<bool> unpaired_access_enabled_{false};
-    /// Trust level of the active connection. Written on the protocol task (on_handshake_complete()
-    /// and cleanup_connection_state()), and by stop()'s cleanup once it is joined; read from any
-    /// thread (get_current_trust()).
-    std::atomic<ConnectionTrust> current_trust_{ConnectionTrust::NONE};
     /// High-performance requests applied and not yet released. Main loop only.
     uint8_t high_performance_ref_count_{0};
     /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;

@@ -1285,10 +1285,6 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
             retain_delivered_dismissals(current);
             return !current.empty();
         });
-
-        // The trust level is per-connection state: with no active connection there is nothing to
-        // trust, so the getter reports NONE until the next handshake completes.
-        this->current_trust_.store(ConnectionTrust::NONE, std::memory_order_release);
     }
 
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -1583,7 +1579,6 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     ConnectionTrust trust = (conn->get_psk_category() == PskCategory::LONG_TERM)
                                 ? ConnectionTrust::USER
                                 : ConnectionTrust::NONE;
-    this->current_trust_.store(trust, std::memory_order_release);
     this->note_trust_changed(trust);
 }
 

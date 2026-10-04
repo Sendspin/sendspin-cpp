@@ -256,6 +256,11 @@ public:
         this->pairing_failed_reason_ = reason;
     }
 
+    /// The trust reported last, or NONE before any report.
+    ConnectionTrust last_trust() const {
+        return this->trust_history_.empty() ? ConnectionTrust::NONE : this->trust_history_.back();
+    }
+
     bool trust_ever_reached(ConnectionTrust trust) const {
         for (const auto& t : this->trust_history_) {
             if (t == trust) {
@@ -641,8 +646,8 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     pump_until(client, [&] {
         return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
     });
-    EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER)
-        << "get_current_trust() must report the rekeyed connection's trust";
+    EXPECT_EQ(listener.last_trust(), ConnectionTrust::USER)
+        << "the rekeyed connection's trust must be the one reported last";
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
@@ -650,8 +655,6 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
-    EXPECT_EQ(client.get_current_trust(), ConnectionTrust::NONE)
-        << "get_current_trust() must reset to NONE once the connection is torn down";
 }
 
 // Regression test for the "re-pair an already-connected client" bug: Music Assistant can
@@ -714,12 +717,9 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                long_term_peer.record.psk_id, long_term_peer.psk, options);
 
-    // Admission publishes is_connected() before the trust level is stored, so the wait also
-    // covers the trust callback, which is queued only after the getter's value is set.
     pump_until(client, [&] {
         return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
     });
-    EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER);
 
     // Becoming operational the first time legitimately sends one client/state; only traffic
     // AFTER this point is what the regression check below cares about. Pump a little longer to
@@ -848,7 +848,7 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     pump_until(client, [&] {
         return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
     });
-    EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER)
+    EXPECT_EQ(listener.last_trust(), ConnectionTrust::USER)
         << "Trust must upgrade to USER on the RAM-committed record";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);

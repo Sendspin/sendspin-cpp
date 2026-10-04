@@ -923,7 +923,8 @@ Pairing an already-connected server therefore delivers the callback twice: once 
 `ConnectionTrust::NONE` at admission, then again with `ConnectionTrust::USER` once the
 post-pairing rekey completes. Connections that are rejected (e.g., an unpaired server
 declaring playback or active roles while unpaired access is disabled) do not fire this
-callback.
+callback. The last reported trust describes the connection only while `is_connected()` is
+true: a disconnect fires no `on_trust_changed`.
 
 ### Unpaired Access
 
@@ -1084,7 +1085,6 @@ The client and roles expose query methods for polling state in your main loop or
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
 const GroupUpdateObject& group = client.get_group_state();   // Group id, name, playback state (all optional)
-ConnectionTrust trust = client.get_current_trust();          // Active connection's trust; NONE when no connection is active or the handshake has not completed
 
 // Player state
 uint8_t vol = player.get_volume();
@@ -1135,7 +1135,7 @@ called from any thread and must be cheap and non-blocking.
 Callable from any thread: `connect_to()`, `disconnect()`, `leave()`,
 `confirm_pairing_window()`, `cancel_pairing_window()`, `set_unpaired_access_enabled()` and the
 getters `is_started()`, `is_connected()`, `is_time_synced()`, `get_client_time()`,
-`get_server_information()`, `get_current_trust()` and `is_unpaired_access_enabled()`. The
+`get_server_information()` and `is_unpaired_access_enabled()`. The
 requests take effect on the protocol task's next tick; the getters read what that task last
 published. Controller commands are queued, so a burst of them can fill the
 queue (see [Sending Commands](#sending-commands)); `connect_to()`, `disconnect()`, `leave()`,
