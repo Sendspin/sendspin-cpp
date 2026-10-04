@@ -543,12 +543,13 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
         this->inbound_gate_.abandon_ring_write();
         // A frame the transport never decrypts leaves the Noise receive nonce behind, so the
         // connection cannot continue past it and is closed here rather than at its next frame.
-        // Reclamation is in ring order, so with the player or the visualizer holding items the
+        // Reclamation is in ring order, so with a role's consumer thread holding items the
         // space behind the oldest of them is what ran out (see derive_inbound_ring_bytes()):
         // said so, to tell that limit from a stalled protocol task (docs/internals.md "The
         // Inbound Ring").
         const size_t held = this->inbound_ring_->quota(InboundHolder::PLAYER).outstanding() +
-                            this->inbound_ring_->quota(InboundHolder::VISUALIZER).outstanding();
+                            this->inbound_ring_->quota(InboundHolder::VISUALIZER).outstanding() +
+                            this->inbound_ring_->quota(InboundHolder::ARTWORK).outstanding();
         if (held > 0) {
             SS_LOGW(TAG,
                     "No inbound ring space for a %zu-byte message within %u ms: ring pinned "

@@ -36,6 +36,7 @@ inline void create_test_ring(InboundRing& ring) {
     ASSERT_TRUE(ring.create(TEST_INBOUND_RING_BYTES, MemoryLocation::PREFER_EXTERNAL));
     ring.quota(InboundHolder::PLAYER).set_limit(TEST_INBOUND_RING_BYTES);
     ring.quota(InboundHolder::VISUALIZER).set_limit(TEST_INBOUND_RING_BYTES);
+    ring.quota(InboundHolder::ARTWORK).set_limit(TEST_INBOUND_RING_BYTES);
 }
 
 /// A message received into a ring item and taken off the ring, as the protocol task hands it to

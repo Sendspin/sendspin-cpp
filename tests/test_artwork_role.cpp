@@ -14,6 +14,7 @@
 
 #include "artwork_role_impl.h"
 #include "constants.h"
+#include "inbound_test_helpers.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 #include <ArduinoJson.h>
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,8 +45,8 @@ namespace {
 constexpr uint8_t FLAG_CANCEL = 0x01;
 constexpr uint8_t FLAG_ANNOUNCE = 0x02;
 
-// Builds an announce body: everything the role sees of `[type][flags][timestamp][total_size]`
-// once the caller has stripped the type byte.
+// Builds an announce body: `[flags][timestamp][total_size]`, everything of the message behind its
+// type byte.
 std::vector<uint8_t> announce_body(int64_t timestamp, uint32_t total_size) {
     std::vector<uint8_t> data{FLAG_ANNOUNCE};
     put_be64(data, timestamp);
@@ -70,10 +72,50 @@ std::vector<uint8_t> make_image(uint8_t marker, size_t length) {
     return image;
 }
 
-// Returns what handle_binary() reported: false means the message is a protocol error and the
-// connection must be closed.
+// The inbound ring each Impl from make_impl() hands its items through: what start() binds the
+// decode thread's list to, as SendspinClient::start() binds it to the client's.
+InboundRing& ring_of(const ArtworkRole::Impl& impl);
+
+// The message a transport receives for an artwork `body` on `slot`: the type byte, then the body.
+std::vector<uint8_t> artwork_message(uint8_t slot, const std::vector<uint8_t>& body) {
+    std::vector<uint8_t> message{static_cast<uint8_t>(SENDSPIN_BINARY_ARTWORK_IMAGE + slot)};
+    message.insert(message.end(), body.begin(), body.end());
+    return message;
+}
+
+// A message received into a ring item and taken off the ring, as the protocol task hands it to
+// handle_binary(). Unlike receive_into_ring() the acquire waits for room: the decode thread
+// returns the items it copied out asynchronously, and a ring that never frees is a regression the
+// suite watchdog reports.
+InboundMessage receive_waiting(InboundRing& ring, const std::vector<uint8_t>& bytes) {
+    InboundMessage message;
+    void* item = ring.acquire(bytes.size(), UINT32_MAX);
+    std::memcpy(inbound_item_bytes(item), bytes.data(), bytes.size());
+    inbound_item_header(item)->kind = InboundKind::BINARY;
+    ring.complete(item);
+    size_t item_len = 0;
+    void* taken = ring.take(&item_len, UINT32_MAX);
+    EXPECT_EQ(taken, item);
+    message.item = taken;
+    message.data = inbound_item_bytes(taken);
+    message.item_len = item_len;
+    message.len = item_len;
+    return message;
+}
+
+// Plays the protocol task for one artwork message: receives `body` on `slot` into a ring item,
+// runs handle_binary(), returns the item if the role did not keep it, and takes the role's LOCAL
+// items in ring order as the task's next tick would. Returns what handle_binary() reported: false
+// means the message is a protocol error and the connection must be closed.
 bool feed(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t>& body) {
-    return impl.handle_binary(slot, body.data(), body.size());
+    InboundRing& ring = ring_of(impl);
+    InboundMessage message = receive_waiting(ring, artwork_message(slot, body));
+    const bool accepted = impl.handle_binary(slot, message);
+    if (message.item != nullptr) {
+        ring.return_item(message.item);
+    }
+    take_in_ring_order(ring);
+    return accepted;
 }
 
 // Announces `image` on `slot` and sends it as `parts` equal-sized parts (the last one taking the
@@ -286,15 +328,105 @@ ArtworkRoleConfig make_two_slot_config() {
 // connection, so get_client_time() always returns 0: drain_events() then treats every pending
 // display as immediately due instead of honoring a server-clock deadline (see the comment at its
 // call site in artwork_role.cpp), which is exactly what these tests want.
+//
+// Each Impl also gets an inbound ring of its own with the same lifetime, which start() binds its
+// decode thread's list to (see start()). The quotas cover the whole ring.
+std::map<const ArtworkRole::Impl*, InboundRing*>& rings_by_impl() {
+    static std::map<const ArtworkRole::Impl*, InboundRing*> rings;
+    return rings;
+}
+
+InboundRing& ring_of(const ArtworkRole::Impl& impl) {
+    return *rings_by_impl().at(&impl);
+}
+
 std::unique_ptr<ArtworkRole::Impl> make_impl(ArtworkRoleConfig config) {
     static std::deque<SendspinClient> clients;
     static std::deque<Inbox> inboxes;
+    static std::deque<InboundRing> rings;
 
     clients.emplace_back(SendspinClientConfig{});
     auto impl = std::make_unique<ArtworkRole::Impl>(std::move(config), &clients.back());
     inboxes.emplace_back();
     impl->attach_inbox(inboxes.back());
+    InboundRing& ring = rings.emplace_back();
+    create_test_ring(ring);
+    rings_by_impl()[impl.get()] = &ring;
     return impl;
+}
+
+// Starts the decode thread with its list bound to the Impl's ring, as SendspinClient::start()
+// does with the client's.
+bool start(ArtworkRole::Impl& impl) {
+    return impl.start(&ring_of(impl));
+}
+
+// Binds the decode thread's list to the Impl's ring and allocates the assembly buffers the way
+// start() does, without starting the thread, so what the protocol-task handlers hand over stays
+// on the list to be read, and the decode thread's step (process_next_item()) can be run on the
+// test thread. Undone by the guard: the decode thread's exit (every image dropped) and stop()'s
+// unbind.
+struct ThreadlessBinding {
+    explicit ThreadlessBinding(ArtworkRole::Impl& impl) : impl(impl) {
+        for (size_t i = 0; i < impl.config.preferred_formats.size(); ++i) {
+            const uint32_t cap = impl.config.preferred_formats[i].max_image_bytes;
+            EXPECT_TRUE(cap == 0 || impl.drain_task->assemblies[i].buffer.allocate(cap));
+        }
+        EXPECT_TRUE(impl.drain_task->inbound.bind(&ring_of(impl), InboundHolder::ARTWORK));
+    }
+    ~ThreadlessBinding() {
+        for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+            this->impl.drop_assembly(slot);
+        }
+        this->impl.drain_task->inbound.unbind();
+    }
+    ThreadlessBinding(const ThreadlessBinding&) = delete;
+    ThreadlessBinding& operator=(const ThreadlessBinding&) = delete;
+
+    ArtworkRole::Impl& impl;
+};
+
+// One item read off the decode thread's list: its type, the channel (or a marker's channel mask)
+// it names, and the bytes it hands over (an announce's ArtworkAnnounce, a part's image data).
+struct ListEntry {
+    ArtworkItemType type{ArtworkItemType::ANNOUNCE};
+    uint16_t serial{0};
+    std::vector<uint8_t> data;
+    const uint8_t* bytes{nullptr};
+};
+
+// Takes every item off the list (no thread takes from it), returning each to the ring.
+std::vector<ListEntry> take_list(ArtworkRole::Impl& impl) {
+    std::vector<ListEntry> entries;
+    InboundConsumer& inbound = impl.drain_task->inbound;
+    void* item = nullptr;
+    while ((item = inbound.items().take(0)) != nullptr) {
+        const InboundItemHeader* header = inbound_item_header(item);
+        const uint8_t* data = inbound_item_data(item);
+        entries.push_back({static_cast<ArtworkItemType>(header->type), header->serial,
+                           std::vector<uint8_t>(data, data + header->data_len),
+                           inbound_item_bytes(item)});
+        inbound.return_item(item);
+    }
+    return entries;
+}
+
+std::vector<ArtworkItemType> list_types(ArtworkRole::Impl& impl) {
+    std::vector<ArtworkItemType> types;
+    for (const ListEntry& entry : take_list(impl)) {
+        types.push_back(entry.type);
+    }
+    return types;
+}
+
+void discard_list(ArtworkRole::Impl& impl) {
+    (void)take_list(impl);
+}
+
+// Runs the decode thread's step on the test thread until the list is empty.
+void run_decode_steps(ArtworkRole::Impl& impl) {
+    while (impl.process_next_item(0)) {
+    }
 }
 
 // Sends one fake frame to `slot` as a complete single-part transfer; `marker` is the image's
@@ -346,22 +478,6 @@ bool poll_drain_never(ArtworkRole::Impl& impl, Pred pred, std::chrono::milliseco
     return !pred();
 }
 
-// Polls until `pred` (evaluated under impl.drain_task->slot_mutex) is true. No timeout: a
-// regression hangs here and the CTest TIMEOUT reports it. Used only where a parsed field has no
-// observable counterpart; the ack gate itself is exercised through the listener.
-template <typename Pred>
-void wait_slot_state(ArtworkRole::Impl& impl, Pred pred) {
-    for (;;) {
-        {
-            std::lock_guard<std::mutex> lock(impl.drain_task->slot_mutex);
-            if (pred()) {
-                return;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-}
-
 }  // namespace
 
 // ============================================================================
@@ -373,7 +489,7 @@ TEST(ArtworkTransfer, AnnounceThenPartsCompletesOneImage) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "The concatenated data of all parts is the encoded image": the decoded bytes must be the
@@ -395,7 +511,7 @@ TEST(ArtworkTransfer, TransferDeliversNothingUntilItCompletes) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     const std::vector<uint8_t> image = make_image('A', 100);
@@ -414,7 +530,7 @@ TEST(ArtworkTransfer, EmptyImageCompletesAtItsAnnounce) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "An announce with total_size 0 completes immediately, with no parts": nothing is left in
@@ -431,7 +547,7 @@ TEST(ArtworkTransfer, CancelAbandonsTheTransferInFlight) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
@@ -454,7 +570,7 @@ TEST(ArtworkTransfer, CancelDiscardsThePendingImage) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // A complete image whose display has not been drained yet is the channel's pending image, and
@@ -478,7 +594,7 @@ TEST(ArtworkTransfer, AnnounceDiscardsThePendingImage) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "An announce discards that channel's pending image": A is complete but not yet displayed,
@@ -500,26 +616,16 @@ TEST(ArtworkTransfer, AnnounceDiscardsThePendingImage) {
 
 // The announce's timestamp is the only parsed field with no observable effect in this fixture:
 // it schedules the display against the server clock, and a never-started client reports no
-// connection, so every notification is due immediately and its timestamp never reaches the
-// listener. The parked notification is read directly because nothing else distinguishes a
-// timestamp read at the wrong offset, or byte-swapped, from a correct one.
+// connection, so every display is due immediately and its timestamp never reaches the listener.
+// The parse is therefore checked directly: nothing else distinguishes a timestamp read at the
+// wrong offset, or byte-swapped, from a correct one.
 TEST(ArtworkTransfer, AnnounceTimestampIsReadAsSignedBigEndian) {
-    RecordingListener listener;
-    auto impl = make_impl(make_single_slot_config(true));
-    impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{});
-
-    // The gated slot holds the first delivery un-acked, so the second image's notification parks
-    // where the test can read it. A negative value pins the sign as well as the byte order.
+    // A negative value pins the sign as well as the byte order.
     constexpr int64_t TIMESTAMP = -0x0102030405060708;
-    ASSERT_TRUE(send_image(*impl, 0, make_image('A', 8)));
-    listener.wait_until([&] { return listener.decodes.size() >= 1; });
-    ASSERT_TRUE(send_image(*impl, 0, make_image('B', 37), /*parts=*/3, TIMESTAMP));
-
-    wait_slot_state(*impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; });
-    std::lock_guard<std::mutex> lock(impl->drain_task->slot_mutex);
-    EXPECT_EQ(impl->drain_task->slot_buffers[0].parked.timestamp, TIMESTAMP);
+    const std::vector<uint8_t> body = announce_body(TIMESTAMP, 0x01020304);
+    const ArtworkAnnounce announce = ArtworkRole::Impl::parse_announce(body.data());
+    EXPECT_EQ(announce.timestamp, TIMESTAMP);
+    EXPECT_EQ(announce.total_size, 0x01020304U);
 }
 
 // ============================================================================
@@ -531,7 +637,7 @@ TEST(ArtworkMalformedSequence, AnnounceWhileATransferIsInFlightCloses) {
     RecordingListener listener;
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
@@ -545,7 +651,7 @@ TEST(ArtworkMalformedSequence, AnnounceAfterTheTransferCompletesIsAccepted) {
     RecordingListener listener;
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Control for AnnounceWhileATransferIsInFlightCloses: the same two announces, with the first
@@ -559,7 +665,7 @@ TEST(ArtworkMalformedSequence, PartWithNoTransferInFlightCloses) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     EXPECT_FALSE(feed(*impl, 0, part_body(make_image('A', 20))));
@@ -569,7 +675,7 @@ TEST(ArtworkMalformedSequence, PartOnAnotherChannelCloses) {
     RecordingListener listener;
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
@@ -580,7 +686,7 @@ TEST(ArtworkMalformedSequence, PartPastTotalSizeCloses) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
@@ -593,7 +699,7 @@ TEST(ArtworkMalformedSequence, PartThatExactlyFillsTheImageIsAccepted) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Control for PartPastTotalSizeCloses: one byte fewer is the last part of a complete image.
@@ -607,7 +713,7 @@ TEST(ArtworkMalformedSequence, SequenceRulesOnlyApplyWithinAnActiveStream) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
 
     // "Servers MUST NOT send artwork messages outside an active artwork stream." A well-formed
     // message that arrives anyway is ignored, not closed on: the sequence rules are scoped to an
@@ -627,12 +733,11 @@ TEST(ArtworkMalformedMessage, MessageShorterThanTwoBytesCloses) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
-    // A message of just its type byte: nothing is left once the caller strips it.
-    const uint8_t* no_body = nullptr;
-    EXPECT_FALSE(impl->handle_binary(0, no_body, 0));
+    // A message of just its type byte.
+    EXPECT_FALSE(feed(*impl, 0, {}));
     // Control: two bytes is the shortest legal message, a cancel.
     EXPECT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
 }
@@ -641,7 +746,7 @@ TEST(ArtworkMalformedMessage, AnnounceThatIsNotFourteenBytesCloses) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     std::vector<uint8_t> short_announce = announce_body(1, 20);
@@ -652,7 +757,7 @@ TEST(ArtworkMalformedMessage, AnnounceThatIsNotFourteenBytesCloses) {
     long_announce.push_back(0);
     EXPECT_FALSE(feed(*impl, 0, long_announce));
 
-    // Control: exactly 14 bytes on the wire (13 here, the type byte stripped).
+    // Control: exactly 14 bytes on the wire (13 of body behind the type byte).
     EXPECT_TRUE(feed(*impl, 0, announce_body(1, 0)));
 }
 
@@ -660,7 +765,7 @@ TEST(ArtworkMalformedMessage, CancelWithABodyCloses) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     EXPECT_FALSE(feed(*impl, 0, {FLAG_CANCEL, 0x00}));
@@ -672,7 +777,7 @@ TEST(ArtworkMalformedMessage, ReservedFlagBitsClose) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "Bits 2-7 are reserved and MUST be zero", on every message shape.
@@ -695,7 +800,7 @@ TEST(ArtworkMalformedMessage, CancelAndAnnounceFlagsTogetherClose) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     std::vector<uint8_t> both = announce_body(1, 0);
@@ -709,7 +814,7 @@ TEST(ArtworkMalformedMessage, MessagePastTheSizeCapCloses) {
     RecordingListener listener;
     auto impl = make_impl(make_large_slot_config());
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "An artwork message MUST NOT exceed 65519 bytes": a part carries at most 65517 data bytes.
@@ -725,7 +830,7 @@ TEST(ArtworkMalformedMessage, ShapeRulesApplyWithNoStreamActive) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
 
     // Unlike the sequence rules, "Malformed messages are protocol errors" is not scoped to an
     // active stream: the bytes are indefensible whenever they arrive.
@@ -744,7 +849,7 @@ TEST(ArtworkImageCap, ImageOverTheCapIsDiscardedAndItsSequenceTracked) {
     RecordingListener listener;
     auto impl = make_impl(make_capped_slot_config(SMALL_IMAGE_CAP));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "clients discarding image data MUST still process announces and cancels and count each
@@ -773,7 +878,7 @@ TEST(ArtworkImageCap, AnUnsetBudgetIsTheDocumentedDefault) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(send_image(*impl, 0, make_image('A', DEFAULT_CAP + 1), /*parts=*/3));
@@ -791,31 +896,30 @@ TEST(ArtworkImageCap, RoleWithNoListenerHoldsNothing) {
     // Declared ahead of the Impl like every other test's, though only bound for the control below.
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
-    ASSERT_TRUE(impl->start());
+    ThreadlessBinding binding(*impl);
     impl->handle_stream_start(ServerArtworkStreamObject{});
+    discard_list(*impl);
 
-    // Nowhere to deliver an image, so the role takes the discarding path rather than allocating
-    // a buffer for it, while still following the transfer to its end. Not holding the image is
-    // the whole point and has no observable counterpart, so the slot's buffers are read directly.
+    // Nowhere to deliver an image, so the role takes the discarding path, handing the decode
+    // thread only the marker that drops the channel's pending image, while still following the
+    // transfer to its end. Not holding the image is the whole point and has no observable
+    // counterpart, so the decode thread's list is read directly, with no thread taking from it.
     EXPECT_TRUE(send_image(*impl, 0, make_image('A', 4096), /*parts=*/2));
-    {
-        std::lock_guard<std::mutex> lock(impl->drain_task->slot_mutex);
-        EXPECT_EQ(impl->drain_task->slot_buffers[0].buffers[0].data(), nullptr);
-        EXPECT_EQ(impl->drain_task->slot_buffers[0].buffers[1].data(), nullptr);
-    }
+    EXPECT_EQ(list_types(*impl), (std::vector<ArtworkItemType>{ArtworkItemType::DISCARD}));
 
-    // Control: with a listener the same image is held and delivered.
+    // Control: with a listener the same image is handed over whole.
     impl->listener = &listener;
     EXPECT_TRUE(send_image(*impl, 0, make_image('B', 4096), /*parts=*/2));
-    listener.wait_until([&] { return listener.decodes.size() >= 1; });
-    EXPECT_EQ(listener.decodes[0].payload.size(), 4096U);
+    EXPECT_EQ(list_types(*impl),
+              (std::vector<ArtworkItemType>{ArtworkItemType::ANNOUNCE, ArtworkItemType::PART,
+                                            ArtworkItemType::PART}));
 }
 
 TEST(ArtworkImageCap, ChannelTheRoleDidNotConfigureHoldsNothing) {
     RecordingListener listener;
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Channel 2 was never declared in client/state, so the role holds no image for it and does
@@ -891,7 +995,7 @@ TEST(ArtworkStreamStart, PendingImagesSurviveOnlyUnchangedChannels) {
         RecordingListener listener;
         auto impl = make_impl(make_two_ungated_slot_config());
         impl->listener = &listener;
-        ASSERT_TRUE(impl->start());
+        ASSERT_TRUE(start(*impl));
         impl->handle_stream_start(two_channel_stream(100, 100));
 
         size_t decoded = 0;
@@ -931,7 +1035,7 @@ TEST(ArtworkStreamStart, TransferInFlightSurvivesOnlyAnUnchangedChannel) {
         RecordingListener listener;
         auto impl = make_impl(make_two_ungated_slot_config());
         impl->listener = &listener;
-        ASSERT_TRUE(impl->start());
+        ASSERT_TRUE(start(*impl));
         impl->handle_stream_start(two_channel_stream(100, 100));
 
         const std::vector<uint8_t> image = make_image('A', 100);
@@ -962,7 +1066,7 @@ void expect_transfer_dropped_by(const std::function<void(ArtworkRole::Impl&)>& e
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
@@ -1017,7 +1121,7 @@ TEST(ArtworkFrameDoneGate, GateHoldsSecondFrame) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
@@ -1040,7 +1144,7 @@ TEST(ArtworkFrameDoneGate, GateHoldsThroughDisplay) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
@@ -1063,7 +1167,7 @@ TEST(ArtworkFrameDoneGate, SupersedeKeepsNewestParked) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
@@ -1102,7 +1206,7 @@ TEST(ArtworkFrameDoneGate, ClearIsADeliveryAndDropsParked) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
@@ -1137,7 +1241,7 @@ TEST(ArtworkFrameDoneGate, ClearGateHoldsNextStreamFirstFrame) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
@@ -1183,7 +1287,7 @@ TEST(ArtworkChannelClear, EmptyPayloadFiresExactlyOneClear) {
         RecordingListener listener;
         auto impl = make_impl(make_single_slot_config(false));
         impl->listener = &listener;
-        ASSERT_TRUE(impl->start());
+        ASSERT_TRUE(start(*impl));
         impl->handle_stream_start(ServerArtworkStreamObject{});
 
         if (row.display_a_frame_first) {
@@ -1211,7 +1315,7 @@ TEST(ArtworkChannelClear, ClearOnlyAffectsItsOwnSlot) {
     RecordingListener listener;
     auto impl = make_impl(make_two_slot_config());
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Slot 1 (ungated) is cleared; slot 0 (gated) must be left alone entirely: a stream-level
@@ -1233,7 +1337,7 @@ TEST(ArtworkChannelClear, GatedClearParksBehindUnackedFrame) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
@@ -1262,7 +1366,7 @@ TEST(ArtworkChannelClear, GatedClearOwesExactlyOneAck) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_clear(*impl, 0);
@@ -1286,7 +1390,7 @@ TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
@@ -1320,7 +1424,7 @@ TEST(ArtworkChannelClear, StreamEndOnTopOfUnackedChannelClearFiresAgain) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // A per-channel clear is delivered and left un-acked, e.g. the consumer is running a fade-out.
@@ -1349,7 +1453,7 @@ TEST(ArtworkChannelClear, ClearIgnoredWithoutActiveStream) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
 
     // No stream/start yet, so handle_binary()'s stream_active guard rejects the message before any
     // clear-specific handling runs. That guard is not new, so unlike the tests above this one does
@@ -1370,7 +1474,7 @@ TEST(ArtworkFrameDoneGate, FrameDoneNoOpWhenIdle) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Nothing outstanding: both calls must be safe no-ops (including the out-of-range slot).
@@ -1390,7 +1494,7 @@ TEST(ArtworkFrameDoneGate, RestartReleasesUndisplayedDecode) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
@@ -1416,7 +1520,7 @@ TEST(ArtworkFrameDoneGate, RestartKeepsPresentedGate) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
@@ -1468,29 +1572,29 @@ private:
 
 }  // namespace
 
-// stop() joins the decode thread and discards the notifications it never took, and start()
-// clears the stop command, so a restarted role decodes fresh frames without replaying the
-// previous session's. The thread is held inside frame A's decode while frame B is queued behind
-// it and the stop is signalled; on release it exits at its command check without taking B. The
+// stop() joins the decode thread and returns the items it never took, and start() clears the
+// stop command, so a restarted role decodes fresh frames without replaying the previous
+// session's. The thread is held inside frame A's decode while frame B is handed over behind it
+// and the stop is signalled; on release it exits at its command check without taking B. The
 // stream is deliberately not restarted after start(): a stream restart bumps the epoch that
-// would make a replayed B stale on its own, and this test is about the queue reset.
+// would make a replayed B stale on its own, and this test is about the list's return.
 TEST(ArtworkRestart, StopDiscardsQueuedFramesAndStartDecodesNewOnes) {
     BlockingListener listener;
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });  // Thread parked in A
-    send_frame(*impl, 1, 'B');                                          // Queued behind A
+    send_frame(*impl, 1, 'B');                                          // Handed behind A
 
     ASSERT_TRUE(impl->signal_stop());
     listener.release();
     impl->stop();
     EXPECT_EQ(listener.decode_count(), 1U);
 
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     // B was discarded with the old session, not replayed by the new thread.
     EXPECT_TRUE(
         listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
@@ -1512,7 +1616,7 @@ TEST(ArtworkFrameDoneGate, FrameDoneReentrantFromDisplay) {
     listener.frame_done_on_display = true;
     listener.impl = impl.get();
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Each image is displayed before the next is announced, so neither is discarded as the
@@ -1538,7 +1642,7 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
     RecordingListener listener;
     auto impl = make_impl(make_two_slot_config());
     impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
+    ASSERT_TRUE(start(*impl));
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // wait_until()'s predicate runs under RecordingListener::mutex (via condition_variable's
@@ -1559,11 +1663,10 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
     listener.wait_until([&] { return count_for_slot(0) >= 1; });
 
     // Slot 1 keeps decoding every frame freely, ungated by slot 0's outstanding delivery. Each
-    // send waits for its own decode before the next is sent: slot 1 is double-buffered like any
-    // other slot (see SlotBuffer), so three back-to-back writes with nothing
-    // draining them could legitimately overwrite an unclaimed buffer and drop a frame: a
-    // real (and separately-covered) property of the double-buffering scheme, not of the ack
-    // gate this test is about, so it must not be exercised here.
+    // send waits for its own decode before the next is sent: an announce discards its channel's
+    // pending image, so a frame the decode thread had not reached before the next announce could
+    // legitimately be skipped, a property of the announce (AnnounceDiscardsThePendingImage), not
+    // of the ack gate this test is about.
     send_frame(*impl, 1, 'X');
     listener.wait_until([&] { return count_for_slot(1) >= 1; });
     send_frame(*impl, 1, 'Y');
@@ -1584,7 +1687,7 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
 
 namespace {
 
-// A single-slot delta shaped like the one process_notification() publishes.
+// A single-slot delta shaped like the one deliver() publishes.
 ArtworkDisplayUpdate make_delta(uint8_t slot, int64_t timestamp, uint32_t epoch, bool is_clear) {
     ArtworkDisplayUpdate delta{};
     const auto bit = static_cast<uint8_t>(1U << slot);
@@ -1837,5 +1940,279 @@ TEST(ArtworkDisplayHandOff, ADisplayStampedBeforeATeardownIsNotShown) {
         impl->drain_events();
 
         EXPECT_EQ(listener.display_count(), row.expected_displays);
+    }
+}
+
+// ============================================================================
+// Hand-off to the decode thread: the protocol task hands each image over on the decode thread's
+// item list in message order (the announce, then each part in its ring item), with a marker
+// wherever a channel's pending image is discarded, so list position alone orders them
+// ============================================================================
+
+namespace {
+
+// Two ungated channels, the first capped small enough to cross.
+ArtworkRoleConfig make_handoff_config() {
+    ArtworkRoleConfig config = make_two_ungated_slot_config();
+    config.preferred_formats[0].max_image_bytes = SMALL_IMAGE_CAP;
+    return config;
+}
+
+ArtworkAnnounce announce_of(const ListEntry& entry) {
+    ArtworkAnnounce announce;
+    EXPECT_EQ(entry.data.size(), sizeof(announce));
+    std::memcpy(&announce, entry.data.data(), std::min(entry.data.size(), sizeof(announce)));
+    return announce;
+}
+
+}  // namespace
+
+TEST(ArtworkHandOff, ItemsReachTheDecodeThreadInMessageOrder) {
+    using T = ArtworkItemType;
+    struct Expected {
+        T type;
+        uint16_t serial;
+        /// A part's image bytes, or an announce's total_size as its one element; empty for a
+        /// marker.
+        std::vector<uint32_t> data;
+    };
+    struct Row {
+        const char* name;
+        std::function<void(ArtworkRole::Impl&)> messages;
+        std::vector<Expected> expected;
+    };
+    const std::vector<Row> rows = {
+        {"Control: an announce, then each part",
+         [](ArtworkRole::Impl& impl) {
+             ASSERT_TRUE(feed(impl, 0, announce_body(1, 4)));
+             ASSERT_TRUE(feed(impl, 0, part_body({1, 2})));
+             ASSERT_TRUE(feed(impl, 0, part_body({3, 4})));
+         },
+         {{T::ANNOUNCE, 0, {4}}, {T::PART, 0, {1, 2}}, {T::PART, 0, {3, 4}}}},
+        {"a cancel: its marker follows the part handed before it",
+         [](ArtworkRole::Impl& impl) {
+             ASSERT_TRUE(feed(impl, 1, announce_body(1, 4)));
+             ASSERT_TRUE(feed(impl, 1, part_body({1, 2})));
+             ASSERT_TRUE(feed(impl, 1, {FLAG_CANCEL}));
+         },
+         {{T::ANNOUNCE, 1, {4}}, {T::PART, 1, {1, 2}}, {T::DISCARD, 0x02, {}}}},
+        {"an empty image: its announce alone",
+         [](ArtworkRole::Impl& impl) { ASSERT_TRUE(feed(impl, 0, announce_body(1, 0))); },
+         {{T::ANNOUNCE, 0, {0}}}},
+        {"an image over the cap: a marker and none of its parts",
+         [](ArtworkRole::Impl& impl) {
+             ASSERT_TRUE(send_image(impl, 0, make_image('A', SMALL_IMAGE_CAP + 1), 2));
+         },
+         {{T::DISCARD, 0x01, {}}}},
+        {"a part over the quota: a marker in its place and none of the parts behind it",
+         [](ArtworkRole::Impl& impl) {
+             ASSERT_TRUE(feed(impl, 0, announce_body(1, 4)));
+             ring_of(impl).quota(InboundHolder::ARTWORK).set_limit(0);
+             ASSERT_TRUE(feed(impl, 0, part_body({1, 2})));
+             ASSERT_TRUE(feed(impl, 0, part_body({3, 4})));
+         },
+         {{T::ANNOUNCE, 0, {4}}, {T::DISCARD, 0x01, {}}}},
+        {"a stream/start reconfiguring channel 1: a marker for it alone",
+         [](ArtworkRole::Impl& impl) { impl.handle_stream_start(two_channel_stream(100, 200)); },
+         {{T::RECONFIGURE, 0x02, {}}}},
+        {"a stream end: one marker for every channel",
+         [](ArtworkRole::Impl& impl) { impl.handle_stream_end(); },
+         {{T::DISCARD, 0x0F, {}}}},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordingListener listener;
+        auto impl = make_impl(make_handoff_config());
+        impl->listener = &listener;
+        ThreadlessBinding binding(*impl);
+        impl->handle_stream_start(two_channel_stream(100, 100));
+        discard_list(*impl);
+
+        row.messages(*impl);
+        take_in_ring_order(ring_of(*impl));
+
+        const std::vector<ListEntry> entries = take_list(*impl);
+        ASSERT_EQ(entries.size(), row.expected.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            SCOPED_TRACE(i);
+            const Expected& expected = row.expected[i];
+            EXPECT_EQ(entries[i].type, expected.type);
+            EXPECT_EQ(entries[i].serial, expected.serial);
+            if (expected.type == T::ANNOUNCE) {
+                EXPECT_EQ(announce_of(entries[i]).total_size, expected.data.at(0));
+            } else {
+                EXPECT_EQ(std::vector<uint32_t>(entries[i].data.begin(), entries[i].data.end()),
+                          expected.data);
+            }
+        }
+    }
+}
+
+// A part reaches the decode thread, which copies it out and returns it, in the ring item it was
+// received and decrypted into; one outside any (reassembled from Noise fragments, or received
+// through the fallback buffer) is copied into an item of its own, whole.
+TEST(ArtworkHandOff, APartIsHandedInTheRingItemItArrivedIn) {
+    struct Row {
+        const char* name;
+        bool in_ring_item;
+    };
+    const Row rows[] = {{"received into a ring item", true},
+                        {"Control: outside a ring item, copied", false}};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordingListener listener;
+        auto impl = make_impl(make_single_slot_config(false));
+        impl->listener = &listener;
+        ThreadlessBinding binding(*impl);
+        InboundRing& ring = ring_of(*impl);
+        impl->handle_stream_start(ServerArtworkStreamObject{});
+        ASSERT_TRUE(feed(*impl, 0, announce_body(1, 3)));
+        discard_list(*impl);
+
+        std::vector<uint8_t> bytes = artwork_message(0, part_body({7, 8, 9}));
+        InboundMessage message =
+            row.in_ring_item ? receive_waiting(ring, bytes) : message_over(bytes);
+        const uint8_t* received_at = message.data;
+        ASSERT_TRUE(impl->handle_binary(0, message));
+        EXPECT_EQ(message.item, nullptr) << "the part's ring item was left with the caller";
+        take_in_ring_order(ring);
+
+        const std::vector<ListEntry> entries = take_list(*impl);
+        ASSERT_EQ(entries.size(), 1U);
+        EXPECT_EQ(entries[0].type, ArtworkItemType::PART);
+        EXPECT_EQ(entries[0].data, (std::vector<uint8_t>{7, 8, 9}));
+        EXPECT_TRUE(in_ring_storage(ring, entries[0].bytes));
+        EXPECT_EQ(entries[0].bytes == received_at, row.in_ring_item)
+            << "the part was copied out of the item it arrived in";
+    }
+}
+
+// The decode thread adds a part only to the image its channel is assembling: a marker that
+// discards the channel's image between its announce and a part leaves the part nothing to join,
+// and it is returned unused. Staged by handing the marker by hand between the two messages,
+// since the protocol task itself closes the connection on a part after a cancel; the decode
+// thread's step runs on the test thread.
+TEST(ArtworkHandOff, APartAfterAMarkerForItsChannelIsDropped) {
+    struct Row {
+        const char* name;
+        bool marker;
+        size_t expected_decodes;
+    };
+    const Row rows[] = {{"Control: no marker between the announce and the part", false, 1},
+                        {"a marker for the channel between them", true, 0}};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordingListener listener;
+        auto impl = make_impl(make_single_slot_config(false));
+        impl->listener = &listener;
+        ThreadlessBinding binding(*impl);
+        InboundRing& ring = ring_of(*impl);
+        impl->handle_stream_start(ServerArtworkStreamObject{});
+        run_decode_steps(*impl);
+
+        ASSERT_TRUE(feed(*impl, 0, announce_body(1, 3)));
+        if (row.marker) {
+            impl->hand_marker(ArtworkItemType::DISCARD, 0x01, impl->cleanup_generation.load());
+            take_in_ring_order(ring);
+        }
+        ASSERT_TRUE(feed(*impl, 0, part_body({7, 8, 9})));
+        run_decode_steps(*impl);
+
+        EXPECT_EQ(listener.decode_count(), row.expected_decodes);
+        EXPECT_EQ(ring.quota(InboundHolder::ARTWORK).outstanding(), 0U)
+            << "the part was held rather than returned";
+    }
+}
+
+// An item handed over before a teardown, which the decode thread takes after the teardown moved
+// the role's generation on but before its recall, is returned by its take unprocessed. Staged by
+// moving cleanup_generation on directly, as cleanup() does first, with the decode thread's step
+// run on the test thread: no public call stops a teardown between its bump and its recall.
+TEST(ArtworkHandOff, AnItemStampedBeforeATeardownIsDiscardedAtItsTake) {
+    struct Row {
+        const char* name;
+        bool stale;
+        size_t expected_decodes;
+    };
+    const Row rows[] = {{"Control: stamped with the current generation", false, 1},
+                        {"stamped before the teardown", true, 0}};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordingListener listener;
+        auto impl = make_impl(make_single_slot_config(false));
+        impl->listener = &listener;
+        ThreadlessBinding binding(*impl);
+        InboundRing& ring = ring_of(*impl);
+        impl->handle_stream_start(ServerArtworkStreamObject{});
+        run_decode_steps(*impl);
+
+        ASSERT_TRUE(send_image(*impl, 0, make_image('A', 3)));
+        if (row.stale) {
+            impl->cleanup_generation.fetch_add(1);
+        }
+        run_decode_steps(*impl);
+
+        EXPECT_EQ(listener.decode_count(), row.expected_decodes);
+        EXPECT_TRUE(impl->drain_task->inbound.items().is_empty());
+        EXPECT_EQ(ring.quota(InboundHolder::ARTWORK).outstanding(), 0U);
+    }
+}
+
+// roles/artwork/v1.md "Artwork (Binary)" allows a channel one current image and at most one
+// pending one, and an announce discards the pending one. So a part taken while the channel's gate
+// holds an un-acked delivery is copied into the channel's buffer and its item returned at once,
+// like any other: the complete image parks there, the channel's pending image, until frame_done()
+// reopens the gate, and a newer announce discards it. The decode thread's step runs on the test
+// thread, so the artwork quota, the one observable of whether a part is still in its item, is
+// read between steps.
+TEST(ArtworkHandOff, APartTakenBehindAClosedGateIsCopiedAndTheImageParks) {
+    struct Row {
+        const char* name;
+        bool replaced;
+        size_t expected_decodes;
+    };
+    const Row rows[] = {{"Control: frame_done() reopens the gate and the parked image decodes",
+                         false, 2},
+                        {"a newer announce discards the parked image", true, 1}};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordingListener listener;
+        auto impl = make_impl(make_single_slot_config(true));
+        impl->listener = &listener;
+        ThreadlessBinding binding(*impl);
+        const InboundQuota& quota = ring_of(*impl).quota(InboundHolder::ARTWORK);
+        impl->handle_stream_start(ServerArtworkStreamObject{});
+        run_decode_steps(*impl);
+
+        send_frame(*impl, 0, 'A');
+        run_decode_steps(*impl);
+        ASSERT_EQ(listener.decode_count(), 1U);
+
+        // A's delivery is un-acked, so B parks behind it, already copied.
+        send_frame(*impl, 0, 'B');
+        run_decode_steps(*impl);
+        EXPECT_EQ(listener.decode_count(), 1U) << "B was decoded through a closed gate";
+        EXPECT_EQ(quota.outstanding(), 0U) << "B's part was kept in its item past its copy";
+        {
+            std::lock_guard<std::mutex> lock(impl->drain_task->slot_mutex);
+            EXPECT_TRUE(impl->drain_task->slot_gates[0].has_parked) << "B is not parked";
+        }
+
+        if (row.replaced) {
+            ASSERT_TRUE(feed(*impl, 0, announce_body(1, 3)));
+            run_decode_steps(*impl);
+            // Discarded at the announce, not merely skipped by its stale epoch once the gate
+            // reopens.
+            std::lock_guard<std::mutex> lock(impl->drain_task->slot_mutex);
+            EXPECT_FALSE(impl->drain_task->slot_gates[0].has_parked)
+                << "the newer announce left B parked";
+        }
+        impl->frame_done(0);
+        impl->sweep_parked();
+        EXPECT_EQ(listener.decode_count(), row.expected_decodes);
+        if (!row.replaced) {
+            EXPECT_EQ(listener.decode_marker_at(1), 'B');
+        }
     }
 }

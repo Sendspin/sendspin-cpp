@@ -11,11 +11,11 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `SendspinClient` (`client.h`): main orchestration class; owns the protocol task, the connection manager, the inbound ring and the message routing. Its protocol-task half (the tick, the command handler, the JSON and binary dispatch) is in `client_dispatch.cpp`
 - `ProtocolTask` (`protocol_task.h`): the `SsProto` thread, its bounded command queue, the latest client/state slot and the never-refused lifecycle-request slot; ticks through `SendspinClient::protocol_tick()` to its next deadline
 - `ConnectionManager` (`connection_manager.h`): the admitted array with role ownership, the nursery, the reaping list, admission and arbitration, time bursts, watchdogs and the published time filter and server information; pairing state machines in `connection_manager_pairing.cpp`
-- `InboundRing` / `InboundItemList` / `InboundConsumer` / `InboundGate` (`inbound_ring.h`): the shared ring every admitted transport receives into (over `SharedRingBuffer`), the intrusive per-role item lists that hand audio and visualizer frames to their consumer threads in place, and the per-connection transport/protocol-task hand-off
+- `InboundRing` / `InboundItemList` / `InboundConsumer` / `InboundGate` (`inbound_ring.h`): the shared ring every admitted transport receives into (over `SharedRingBuffer`), the intrusive per-role item lists that hand audio, visualizer frames and artwork image parts to their consumer threads in place, and the per-connection transport/protocol-task hand-off
 - `PlayerRole` (`player_role.h`): audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
 - `ControllerRole` (`controller_role.h`): sends playback commands to the server
 - `MetadataRole` (`metadata_role.h`): receives track metadata and progress
-- `ArtworkRole` (`artwork_role.h`): receives album artwork images
+- `ArtworkRole` (`artwork_role.h`): receives album artwork images; its decode thread takes each image's announce, parts and discard markers from its item list, copies each part into one buffer per channel and returns its item at once, and parks a complete image there while the channel's `frame_done()` gate is closed
 - `VisualizerRole` (`visualizer_role.h`): receives spectrum/beat visualization data
 - `ColorRole` (`color_role.h`): receives audio-derived RGB color palette from the server
 - `SyncTask` (`sync_task.h`): decodes encoded audio from its item list in place, synchronizes to server timestamps, writes PCM via audio write callback
@@ -80,7 +80,6 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `network_info.h`: best-effort lookup of the local network interface MAC address
 - `types.h`: platform type abstractions
 - `shared_ring_buffer.h`: multi-producer ring buffer with acquire/complete writes, one ordered consumer, any-order returns and ring-order reclamation (ESP: FreeRTOS no-split `xRingbuffer`, host: mutex/condition variable over the same layout)
-- `thread_safe_queue.h`: thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
 - `event_flags.h`: event flag group (ESP: FreeRTOS event group, host: mutex/condition variable)
 - `shadow_slot.h`: mutex-protected single-writer/single-reader slot between two threads (the sync task's playback-progress slot); state the main loop reads goes through the inbox (`inbox.h`) instead
 

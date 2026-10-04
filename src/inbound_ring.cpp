@@ -420,13 +420,32 @@ void InboundConsumer::recall() {
 }
 
 const char* InboundConsumer::dropped_items_name() const {
-    return this->holder_ == InboundHolder::PLAYER ? "player items" : "visualizer items";
+    switch (this->holder_) {
+        case InboundHolder::PLAYER:
+            return "player items";
+        case InboundHolder::VISUALIZER:
+            return "visualizer items";
+        case InboundHolder::ARTWORK:
+            break;
+    }
+    return "artwork items";
+}
+
+const char* InboundConsumer::holder_name() const {
+    switch (this->holder_) {
+        case InboundHolder::PLAYER:
+            return "Player";
+        case InboundHolder::VISUALIZER:
+            return "Visualizer";
+        case InboundHolder::ARTWORK:
+            break;
+    }
+    return "Artwork";
 }
 
 void InboundConsumer::note_drop(const char* message) {
     if (this->drop_log_.note_drop()) {
-        SS_LOGW(TAG, "%s %s", this->holder_ == InboundHolder::PLAYER ? "Player" : "Visualizer",
-                message);
+        SS_LOGW(TAG, "%s %s", this->holder_name(), message);
     }
 }
 

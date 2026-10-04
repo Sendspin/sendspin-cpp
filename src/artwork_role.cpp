@@ -23,7 +23,7 @@
 
 #include <algorithm>
 #include <cstring>
-#include <iterator>
+#include <utility>
 
 static const char* const TAG = "sendspin.artwork";
 
@@ -43,10 +43,21 @@ static constexpr uint8_t ARTWORK_FLAG_CANCEL = 0x01;
 static constexpr uint8_t ARTWORK_FLAG_ANNOUNCE = 0x02;
 static constexpr uint8_t ARTWORK_FLAGS_RESERVED = 0xFC;
 
-/// @brief Fallback wakeup interval for the decode thread's blocking queue receive. Stop and
-/// parked-slot rechecks wake the receive immediately via wake_receiver(), so this is only a
-/// safety net against a missed wake: long enough to keep an idle thread asleep, short enough
-/// that a wake bug degrades to a slow reaction rather than a hang.
+/// @brief Offset of a part's image data in its message: the type byte, then the flags byte
+static constexpr uint8_t ARTWORK_PART_DATA_OFFSET = 2;
+
+/// @brief Every channel's bit, the mask of a stream end's DISCARD marker
+static constexpr uint8_t ARTWORK_ALL_CHANNELS = (1U << sendspin::ARTWORK_MAX_SLOTS) - 1U;
+
+/// @brief Bound on waiting for inbound ring space for an announce or a marker (see
+/// sendspin::INBOUND_ACQUIRE_TIMEOUT_MS): the role's consumer threads free space as they return
+/// items.
+static constexpr uint32_t ITEM_SEND_TIMEOUT_MS = sendspin::INBOUND_ACQUIRE_TIMEOUT_MS;
+
+/// @brief Fallback wakeup interval for the decode thread's blocking take. Stop, teardown and
+/// parked-slot rechecks wake the take immediately via wake_receiver(), so this is only a safety
+/// net against a missed wake: long enough to keep an idle thread asleep, short enough that a wake
+/// bug degrades to a slow reaction rather than a hang.
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 5000U;
 
 // Event flag bits for decode thread signaling
@@ -102,7 +113,6 @@ ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
             SS_LOGW(TAG, "Artwork channel %zu holds no image: max_image_bytes is 0", i);
         }
     }
-    this->drain_task->notify_queue.create(8);
 }
 
 ArtworkRole::Impl::~Impl() {
@@ -114,11 +124,7 @@ void ArtworkRole::Impl::attach_inbox(Inbox& inbox) {
     this->event_state->display_slot.bind(inbox, INBOX_TOPIC_ARTWORK_DISPLAY);
 }
 
-bool ArtworkRole::Impl::start() {
-    if (!this->drain_task || !this->drain_task->notify_queue.is_created()) {
-        SS_LOGE(TAG, "Failed to start artwork: decode task not initialized");
-        return false;
-    }
+bool ArtworkRole::Impl::start(InboundRing* ring) {
     if (this->drain_task->drain_thread.joinable()) {
         return true;  // Already running
     }
@@ -127,9 +133,35 @@ bool ArtworkRole::Impl::start() {
         return false;
     }
 
+    // One assembly buffer per configured channel, at its cap, held for the run: each image is
+    // copied into it part by part and decoded from it, so nothing is allocated per image. Image
+    // data prefers SPIRAM, where it is decoded from once and never touched on a timing-critical
+    // path. stop() hands the buffers back, so a stopped role holds no image memory.
+    auto release_buffers = [this]() {
+        for (auto& assembly : this->drain_task->assemblies) {
+            assembly.buffer = PlatformBuffer{};
+        }
+    };
+    for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
+        const uint32_t cap = this->config.preferred_formats[i].max_image_bytes;
+        if (cap > 0 && !this->drain_task->assemblies[i].buffer.allocate(
+                           cap, MemoryLocation::PREFER_EXTERNAL)) {
+            SS_LOGE(TAG, "Failed to allocate the %" PRIu32 " byte artwork buffer for channel %zu",
+                    cap, i);
+            release_buffers();
+            return false;
+        }
+    }
+    if (!this->drain_task->inbound.bind(ring, InboundHolder::ARTWORK)) {
+        SS_LOGE(TAG, "Failed to create the artwork item list");
+        release_buffers();
+        return false;
+    }
+
     // The flags survive a stop()/start() cycle, and a command signalled between the join and this
     // start (cleanup() on a stopped role) is still set. Clear the whole group so the new thread's
-    // first wait() starts from a clean command state whatever bits the role defines.
+    // first wait() starts from a clean command state whatever bits the role defines (stop()
+    // already emptied the list).
     this->drain_task->event_flags.clear_all();
 
     platform_configure_thread("SsArt", 4096, static_cast<int>(this->config.priority),
@@ -144,9 +176,9 @@ bool ArtworkRole::Impl::signal_stop() const {
     }
     // Set the flag before waking: the thread re-checks its command flags at the top of every
     // loop iteration, so this ordering guarantees it observes the stop as soon as the wake
-    // pulls it out of its blocking queue receive.
+    // pulls it out of its blocking take.
     this->drain_task->event_flags.set(COMMAND_STOP);
-    this->drain_task->notify_queue.wake_receiver();
+    this->drain_task->inbound.items().wake_receiver();
     return true;
 }
 
@@ -156,37 +188,11 @@ void ArtworkRole::Impl::stop() const {
     }
     this->drain_task->drain_thread.join();
 
-    // Joined, so this is the queue's only consumer: discard notifications the old thread never
-    // took, so a restart does not decode the previous session's images.
-    this->drain_task->notify_queue.reset();
-
-    // ...and the only reader of the image buffers, so every one of them is idle now.
-    {
-        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        for (auto& sb : this->drain_task->slot_buffers) {
-            sb.drain_active = false;
-        }
-    }
-    this->release_idle_slot_buffers();
-}
-
-void ArtworkRole::Impl::release_idle_slot_buffers() const {
-    // Two buffers per slot, each grown to the largest image that channel ever received and held
-    // until the role is destroyed unless they are handed back here: 2 * max_image_bytes per
-    // configured channel, 1 MiB at the defaults. A stopped or deactivated role is not showing
-    // anything, so it holds nothing; the next stream/start re-announces every channel and
-    // begin_transfer() allocates once per channel, off any timing-critical path.
-    //
-    // The buffer the decode thread is reading is left alone: drain_active/drain_buf_idx name it
-    // under this mutex, and it is released by the next call, once that decode has finished.
-    std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-    for (auto& sb : this->drain_task->slot_buffers) {
-        for (size_t i = 0; i < std::size(sb.buffers); ++i) {
-            if (sb.drain_active && sb.drain_buf_idx == i) {
-                continue;
-            }
-            sb.buffers[i] = PlatformBuffer{};
-        }
+    // Joined: the thread returns every item as soon as it has read it, so what is left on the
+    // list goes back to the ring here, and a restart does not decode the previous session's images.
+    this->drain_task->inbound.unbind();
+    for (auto& assembly : this->drain_task->assemblies) {
+        assembly.buffer = PlatformBuffer{};
     }
 }
 
@@ -267,7 +273,11 @@ bool ArtworkRole::Impl::ack_enabled(uint8_t slot) const {
 }
 
 void ArtworkRole::Impl::wake_drain_thread() const {
-    this->drain_task->notify_queue.wake_receiver();
+    // Read on the thread that binds and unbinds the list (the main loop), or on the protocol
+    // task, which runs only inside a run.
+    if (this->drain_task->inbound.ring() != nullptr) {
+        this->drain_task->inbound.items().wake_receiver();
+    }
 }
 
 // ============================================================================
@@ -289,17 +299,49 @@ SendspinImageFormat ArtworkRole::Impl::image_format(uint8_t slot) const {
     return this->config.preferred_formats[slot].format;
 }
 
-void ArtworkRole::Impl::enqueue_notification(const ArtworkNotification& notif) const {
-    ArtworkNotification stamped = notif;
-    stamped.teardown_generation = this->cleanup_generation.load(std::memory_order_acquire);
-    if (!this->drain_task->notify_queue.send(stamped, 0)) {
-        SS_LOGW(TAG, "Artwork notify queue full; dropping %s for slot %u",
-                notif.data_length > 0 ? "image" : "clear", notif.slot);
+ArtworkAnnounce ArtworkRole::Impl::parse_announce(const uint8_t* body) {
+    ArtworkAnnounce announce;
+    announce.timestamp = be64_to_host(body + 1);
+    announce.total_size = be32_to_host(body + 1 + 8);
+    return announce;
+}
+
+bool ArtworkRole::Impl::hand_item(void* item, size_t item_len, ArtworkItemType type,
+                                  uint16_t serial, uint8_t data_offset, uint32_t data_len,
+                                  uint32_t generation, bool exempt) {
+    InboundItemHeader* header = inbound_item_header(item);
+    header->type = static_cast<uint8_t>(type);
+    header->serial = serial;
+    header->data_offset = data_offset;
+    header->data_len = data_len;
+    return this->drain_task->inbound.hand(item, item_len, generation, exempt);
+}
+
+bool ArtworkRole::Impl::hand_local_item(const void* data, size_t len, ArtworkItemType type,
+                                        uint16_t serial, uint32_t generation) {
+    InboundConsumer& inbound = this->drain_task->inbound;
+    if (inbound.ring() == nullptr) {
+        return false;
+    }
+    void* item =
+        inbound.copy_local(static_cast<const uint8_t*>(data), len, 0, ITEM_SEND_TIMEOUT_MS);
+    // An announce and a marker are exempt from the quota (InboundConsumer::hand()), so the hand
+    // itself cannot refuse them.
+    return item != nullptr && this->hand_item(item, len, type, serial, 0,
+                                              static_cast<uint32_t>(len), generation, true);
+}
+
+void ArtworkRole::Impl::hand_marker(ArtworkItemType type, uint8_t mask, uint32_t generation) {
+    if (this->drain_task->inbound.ring() == nullptr) {
+        return;
+    }
+    if (!this->hand_local_item(nullptr, 0, type, mask, generation)) {
+        // The slot epochs, already moved on, still keep a discarded image from being delivered.
+        SS_LOGW(TAG, "Failed to append an artwork marker");
     }
 }
 
 void ArtworkRole::Impl::discard_all_pending() {
-    std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     this->streamed_channels.reset();
     this->transfer = ArtworkTransfer{};
     for (auto& epoch : this->slot_epochs) {
@@ -308,150 +350,145 @@ void ArtworkRole::Impl::discard_all_pending() {
 }
 
 void ArtworkRole::Impl::discard_pending(uint8_t slot) {
-    std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     if (this->transfer.in_flight && this->transfer.slot == slot) {
         this->transfer = ArtworkTransfer{};
     }
     this->slot_epochs[slot].fetch_add(1, std::memory_order_relaxed);
 }
 
-ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
-    uint8_t slot, const uint8_t* body, ArtworkNotification& complete) {
-    const int64_t timestamp = be64_to_host(body + 1);
-    const uint32_t total_size = be32_to_host(body + 1 + 8);
+bool ArtworkRole::Impl::begin_transfer(uint8_t slot, const uint8_t* body, uint32_t generation) {
+    ArtworkAnnounce announce = parse_announce(body);
 
-    std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     // roles/artwork/v1.md "Artwork (Binary)": "The server MUST NOT announce an image, on any
     // channel, while a transfer is in flight".
     if (this->transfer.in_flight) {
         SS_LOGW(TAG, "Artwork announce for slot %u while slot %u is mid-transfer", slot,
                 this->transfer.slot);
-        return TransferOutcome::MALFORMED;
+        return false;
     }
 
-    // "An announce discards that channel's pending image."
-    this->slot_epochs[slot].fetch_add(1, std::memory_order_relaxed);
-    const uint32_t epoch = this->slot_epochs[slot].load(std::memory_order_relaxed);
+    // "An announce discards that channel's pending image." The decode thread drops the image in
+    // the channel's buffer when it takes the announce (or the marker below) handed after it.
+    announce.epoch = this->slot_epochs[slot].fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint8_t mask = static_cast<uint8_t>(1U << slot);
 
     // "An announce with total_size 0 completes immediately, with no parts", and is how the server
-    // clears a channel. There are no bytes to stage, so no buffer is claimed and the notification
-    // travels with data_length == 0 (see ArtworkNotification).
-    if (total_size == 0) {
-        complete = ArtworkNotification{slot, 0, 0, timestamp, this->image_format(slot), epoch, 0};
-        return TransferOutcome::COMPLETED;
+    // clears a channel. Its announce is all the decode thread needs.
+    if (announce.total_size == 0) {
+        if (!this->hand_local_item(&announce, sizeof(announce), ArtworkItemType::ANNOUNCE, slot,
+                                   generation) &&
+            this->drain_task->inbound.ring() != nullptr) {
+            SS_LOGW(TAG, "Failed to append an artwork clear for slot %u; dropping it", slot);
+        }
+        return true;
     }
 
     // "During an active stream, unavailable clients SHOULD discard otherwise valid image data and
-    // MUST NOT close solely for its arrival": an image the role will not hold is refused here,
-    // before a byte of it is allocated, and the transfer runs to its end holding nothing. A role
-    // with no listener has nowhere to put an image either, so it takes the same path.
+    // MUST NOT close solely for its arrival": an image the role will not hold is refused here and
+    // the transfer runs to its end handing nothing over. A role with no listener has nowhere to
+    // put an image either, so it takes the same path.
     const uint32_t cap = this->image_cap(slot);
-    if (total_size > cap || this->listener == nullptr) {
-        if (this->listener != nullptr) {
-            SS_LOGW(TAG,
-                    "Artwork image of %" PRIu32 " bytes for slot %u exceeds its %" PRIu32
-                    " byte cap",
-                    total_size, slot, cap);
+    bool holds = announce.total_size <= cap && this->listener != nullptr;
+    if (announce.total_size > cap && this->listener != nullptr) {
+        SS_LOGW(TAG,
+                "Artwork image of %" PRIu32 " bytes for slot %u exceeds its %" PRIu32 " byte cap",
+                announce.total_size, slot, cap);
+    }
+    if (holds && !this->hand_local_item(&announce, sizeof(announce), ArtworkItemType::ANNOUNCE,
+                                        slot, generation)) {
+        if (this->drain_task->inbound.ring() != nullptr) {
+            SS_LOGW(TAG, "Failed to append an artwork announce for slot %u; dropping its image",
+                    slot);
         }
-        this->transfer = ArtworkTransfer{.timestamp = timestamp,
-                                         .total_size = total_size,
-                                         .in_flight = true,
-                                         .slot = slot,
-                                         .discarding = true};
-        return TransferOutcome::ACCEPTED;
+        holds = false;
     }
-
-    auto& sb = this->drain_task->slot_buffers[slot];
-    uint8_t write_idx = sb.write_idx;
-    // Claim the other buffer if the decode thread is reading this one.
-    if (sb.drain_active && sb.drain_buf_idx == write_idx) {
-        write_idx ^= 1;
+    if (!holds) {
+        this->hand_marker(ArtworkItemType::DISCARD, mask, generation);
     }
-
-    // allocate() rather than realloc(): none of the buffer's contents survive a transfer, so
-    // there is nothing to copy forward. The buffer is only ever grown, so a channel settles at
-    // its largest image and later transfers reuse it without touching the allocator. Image data
-    // prefers SPIRAM, where it is decoded from once and never touched on a timing-critical
-    // path.
-    auto& buf = sb.buffers[write_idx];
-    if (buf.size() < total_size && !buf.allocate(total_size, MemoryLocation::PREFER_EXTERNAL)) {
-        SS_LOGE(TAG, "Failed to allocate artwork buffer for slot %u (%" PRIu32 " bytes)", slot,
-                total_size);
-        this->transfer = ArtworkTransfer{.timestamp = timestamp,
-                                         .total_size = total_size,
-                                         .in_flight = true,
-                                         .slot = slot,
-                                         .discarding = true};
-        return TransferOutcome::ACCEPTED;
-    }
-
-    // A notification naming this buffer from an earlier transfer is stale by the epoch bumped
-    // above. Flip write_idx so the next transfer on this slot claims the other buffer and leaves
-    // this one to the decode thread.
-    sb.write_idx = write_idx ^ 1;
-    this->transfer = ArtworkTransfer{.timestamp = timestamp,
-                                     .total_size = total_size,
-                                     .in_flight = true,
-                                     .slot = slot,
-                                     .buffer_idx = write_idx};
-    return TransferOutcome::ACCEPTED;
+    this->transfer = ArtworkTransfer{
+        .total_size = announce.total_size, .in_flight = true, .slot = slot, .discarding = !holds};
+    return true;
 }
 
-ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::append_part(uint8_t slot, const uint8_t* part,
-                                                                  size_t part_len,
-                                                                  ArtworkNotification& complete) {
-    // Hold the slot mutex across the whole read-modify-write, the memcpy included, so the decode
-    // thread can never observe a buffer mid-write (torn image) and can never have a buffer stolen
-    // out from under it while it still owns the notification for that epoch.
-    std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+bool ArtworkRole::Impl::hand_part(uint8_t slot, InboundMessage& message, uint32_t generation) {
     auto& t = this->transfer;
     // roles/artwork/v1.md "Artwork (Binary)": "a part received with no transfer in flight or on
     // a channel other than the in-flight transfer's" is a malformed sequence.
     if (!t.in_flight || t.slot != slot) {
         SS_LOGW(TAG, "Artwork part for slot %u with no transfer in flight on it", slot);
-        return TransferOutcome::MALFORMED;
+        return false;
     }
     // "a part whose data would extend past total_size" is a malformed sequence.
+    const size_t part_len = message.len - ARTWORK_PART_DATA_OFFSET;
     if (part_len > static_cast<size_t>(t.total_size - t.received)) {
         SS_LOGW(TAG, "Artwork part of %zu bytes overruns the %" PRIu32 " byte image on slot %u",
                 part_len, t.total_size, slot);
-        return TransferOutcome::MALFORMED;
-    }
-
-    if (!t.discarding) {
-        std::memcpy(this->drain_task->slot_buffers[slot].buffers[t.buffer_idx].data() + t.received,
-                    part, part_len);
+        return false;
     }
     t.received += static_cast<uint32_t>(part_len);
-    if (t.received < t.total_size) {
-        return TransferOutcome::ACCEPTED;
+    const bool last = t.received == t.total_size;
+
+    if (!t.discarding) {
+        // The part goes over in the ring item it was received and decrypted into, and the decode
+        // thread copies it out from there. A part reassembled from Noise fragments or routed
+        // through the fallback buffer (longer than the ring takes) is not in a ring item: copied
+        // into one, whole, without waiting, like an audio chunk.
+        InboundConsumer& inbound = this->drain_task->inbound;
+        void* item = std::exchange(message.item, nullptr);
+        size_t item_len = message.item_len;
+        bool handed = false;
+        if (item == nullptr) {
+            if (message.len > inbound.ring()->max_item_message_bytes()) {
+                inbound.note_drop("received an image part longer than the ring's largest item; "
+                                  "dropping its image");
+            } else {
+                item = inbound.copy_local(message.data, message.len, message.receive_time_us, 0);
+                item_len = message.len;
+                if (item == nullptr) {
+                    inbound.note_drop("has no ring space to copy an image part into; dropping "
+                                      "its image");
+                }
+            }
+        }
+        if (item != nullptr) {
+            // Charged to the artwork quota, which bounds the parts waiting for the decode thread
+            // to copy them (INBOUND_ARTWORK_IN_FLIGHT_IMAGES); over it the part is dropped with a
+            // warning.
+            handed = this->hand_item(item, item_len, ArtworkItemType::PART, slot,
+                                     ARTWORK_PART_DATA_OFFSET, static_cast<uint32_t>(part_len),
+                                     generation, false);
+        }
+        if (!handed) {
+            // The image cannot be completed without this part, so the rest of its transfer is
+            // followed without handing anything over, and the decode thread drops what it has.
+            t.discarding = true;
+            this->hand_marker(ArtworkItemType::DISCARD, static_cast<uint8_t>(1U << slot),
+                              generation);
+        }
     }
 
     // "the transfer is complete when the received data reaches total_size".
-    const bool discarding = t.discarding;
-    complete = ArtworkNotification{slot,
-                                   t.buffer_idx,
-                                   t.total_size,
-                                   t.timestamp,
-                                   this->image_format(slot),
-                                   this->slot_epochs[slot].load(std::memory_order_relaxed),
-                                   0};
-    t = ArtworkTransfer{};
-    return discarding ? TransferOutcome::ACCEPTED : TransferOutcome::COMPLETED;
+    if (last) {
+        t = ArtworkTransfer{};
+    }
+    return true;
 }
 
-bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
+bool ArtworkRole::Impl::handle_binary(uint8_t slot, InboundMessage& message) {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // roles/artwork/v1.md "Artwork (Binary)" splits its closing rules in two. The
     // malformed-message rules judge the shape of the bytes alone and are not scoped to a stream,
     // so they run first; the malformed-sequence rules are scoped to an active artwork stream and
     // run below the stream gate.
-    if (len < 1 || len + 1 > ARTWORK_MAX_MESSAGE_SIZE) {
-        SS_LOGW(TAG, "Artwork message of %zu bytes is outside the 2 to %zu byte range", len + 1,
+    if (message.len < 2 || message.len > ARTWORK_MAX_MESSAGE_SIZE) {
+        SS_LOGW(TAG, "Artwork message of %zu bytes is outside the 2 to %zu byte range", message.len,
                 ARTWORK_MAX_MESSAGE_SIZE);
         return false;
     }
 
-    const uint8_t flags = data[0];
+    // The message from its flags byte on.
+    const uint8_t* body = message.data + 1;
+    const uint8_t flags = body[0];
     if ((flags & ARTWORK_FLAGS_RESERVED) != 0) {
         SS_LOGW(TAG, "Artwork message sets reserved flag bits (0x%02X)", flags);
         return false;
@@ -462,13 +499,13 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
         SS_LOGW(TAG, "Artwork message sets both the cancel and announce flags");
         return false;
     }
-    if (is_announce && len + 1 != ARTWORK_ANNOUNCE_SIZE) {
-        SS_LOGW(TAG, "Artwork announce of %zu bytes is not %zu bytes", len + 1,
+    if (is_announce && message.len != ARTWORK_ANNOUNCE_SIZE) {
+        SS_LOGW(TAG, "Artwork announce of %zu bytes is not %zu bytes", message.len,
                 ARTWORK_ANNOUNCE_SIZE);
         return false;
     }
-    if (is_cancel && len != 1) {
-        SS_LOGW(TAG, "Artwork cancel of %zu bytes carries a body", len + 1);
+    if (is_cancel && message.len != 2) {
+        SS_LOGW(TAG, "Artwork cancel of %zu bytes carries a body", message.len);
         return false;
     }
 
@@ -487,22 +524,11 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
         // "Cancel message: ... It discards the channel's pending image, taking effect
         // immediately; the current image is unaffected."
         this->discard_pending(slot);
+        this->hand_marker(ArtworkItemType::DISCARD, static_cast<uint8_t>(1U << slot), generation);
         return true;
     }
-
-    ArtworkNotification complete{};
-    const TransferOutcome outcome = is_announce
-                                        ? this->begin_transfer(slot, data, complete)
-                                        : this->append_part(slot, data + 1, len - 1, complete);
-    if (outcome == TransferOutcome::MALFORMED) {
-        return false;
-    }
-    if (outcome == TransferOutcome::COMPLETED) {
-        // Enqueued outside the slot mutex: the decode thread takes that mutex as soon as it
-        // dequeues, so handing off under it would make the two threads contend needlessly.
-        this->enqueue_notification(complete);
-    }
-    return true;
+    return is_announce ? this->begin_transfer(slot, body, generation)
+                       : this->hand_part(slot, message, generation);
 }
 
 // ============================================================================
@@ -510,6 +536,7 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 // ============================================================================
 
 void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream) {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     if (stream.channels.has_value()) {
         const auto& server_channels = stream.channels.value();
         if (server_channels.size() != this->artwork_channels.size()) {
@@ -544,57 +571,43 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
     // including the unchanged ones this stream/start must leave alone. A display published by
     // the decode thread carries the epoch it was decoded under, so drain_events() drops the ones
     // whose channel moved on whether or not they have been folded into the main-thread holds yet.
-    {
-        // roles/artwork/v1.md "stream/start artwork object": "A stream/start that changes a
-        // channel's configuration likewise discards that channel's pending image, and the server
-        // re-sends the image if it still applies." A channel the server left alone keeps the
-        // image it already scheduled, which the server will neither cancel nor re-send. Bumping
-        // the changed channels' epochs is the discard (see slot_epochs), and it also makes any
-        // notification still queued for them stale to the decode thread.
-        //
-        // The comparison and the store of the new array are inside the lock because
-        // streamed_channels is also cleared by cleanup(), which stop() runs on the main loop and
-        // the decode thread's slot reads share.
-        //
-        // A transfer in flight ends here only if its channel changed; the server cancels those
-        // first (roles/artwork/v1.md "Artwork (Binary)"), and one on an unchanged channel
-        // continues.
-        //
-        // Release a changed channel's DECODE_DELIVERED ack gate: its epoch was just bumped, so
-        // that decode's eventual display can no longer fire, and leaving the gate armed would
-        // wedge the slot forever. PRESENTED must stay armed: that delivery has already reached
-        // the consumer, which may still be mid-fade on it and owes the frame_done() that says so.
-        // Protocol messages are serialized on the protocol task, so this runs before any of the
-        // new stream's handle_binary() calls.
-        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        this->stream_active = true;
-        const uint8_t changed = this->changed_channel_mask(stream);
-        this->streamed_channels = stream.channels;
-        if ((changed & static_cast<uint8_t>(1U << this->transfer.slot)) != 0) {
-            this->transfer = ArtworkTransfer{};
-        }
-        for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
-            if ((changed & static_cast<uint8_t>(1U << slot)) == 0) {
-                continue;
-            }
+    //
+    // roles/artwork/v1.md "stream/start artwork object": "A stream/start that changes a channel's
+    // configuration likewise discards that channel's pending image, and the server re-sends the
+    // image if it still applies." A channel the server left alone keeps the image it already
+    // scheduled, which the server will neither cancel nor re-send. Bumping the changed channels'
+    // epochs is the discard (see slot_epochs); the RECONFIGURE marker has the decode thread drop
+    // the image it assembles or parks for them, and release a changed channel's DECODE_DELIVERED
+    // ack gate: its epoch was just bumped, so that decode's eventual display can no longer fire,
+    // and leaving the gate armed would wedge the slot forever. PRESENTED stays armed: that delivery
+    // has already reached the consumer, which may still be mid-fade on it and owes the
+    // frame_done() that says so. The marker precedes every item of the new stream on the decode
+    // thread's list.
+    //
+    // A transfer in flight ends here only if its channel changed; the server cancels those first
+    // (roles/artwork/v1.md "Artwork (Binary)"), and one on an unchanged channel continues.
+    this->stream_active = true;
+    const uint8_t changed = this->changed_channel_mask(stream);
+    this->streamed_channels = stream.channels;
+    if ((changed & static_cast<uint8_t>(1U << this->transfer.slot)) != 0) {
+        this->transfer = ArtworkTransfer{};
+    }
+    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+        if ((changed & static_cast<uint8_t>(1U << slot)) != 0) {
             this->slot_epochs[slot].fetch_add(1, std::memory_order_relaxed);
-            auto& sb = this->drain_task->slot_buffers[slot];
-            sb.has_parked = false;
-            if (sb.ack_state == SlotAckState::DECODE_DELIVERED) {
-                sb.ack_state = SlotAckState::IDLE;
-            }
         }
+    }
+    if (changed != 0) {
+        this->hand_marker(ArtworkItemType::RECONFIGURE, changed, generation);
     }
 }
 
 uint8_t ArtworkRole::Impl::changed_channel_mask(const ServerArtworkStreamObject& stream) const {
-    // Caller holds slot_mutex; see streamed_channels.
-    constexpr uint8_t ALL_CHANNELS = (1U << ARTWORK_MAX_SLOTS) - 1U;
     // Without a channel array on one side or the other there is nothing to compare, so every
     // channel counts as changed. That covers the first stream/start of a connection, where no
     // channel has a pending image to lose anyway.
     if (!this->streamed_channels.has_value() || !stream.channels.has_value()) {
-        return ALL_CHANNELS;
+        return ARTWORK_ALL_CHANNELS;
     }
     const auto& before = this->streamed_channels.value();
     const auto& now = stream.channels.value();
@@ -623,6 +636,9 @@ void ArtworkRole::Impl::handle_stream_end() {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     this->stream_active = false;
     this->discard_all_pending();
+    // The decode thread drops every channel's parked or half-assembled image when it reaches the
+    // marker; the main loop's STREAM_END clears what is parked behind a gate and the channels.
+    this->hand_marker(ArtworkItemType::DISCARD, ARTWORK_ALL_CHANNELS, generation);
 
     this->enqueue_stream_event(ArtworkEventType::STREAM_END, generation);
 }
@@ -653,24 +669,30 @@ void ArtworkRole::Impl::clear_every_channel() {
     // after these clears.
     this->held_display_mask = 0;
     this->held_display_clear = 0;
+    bool dropped_parked = false;
     {
         // A clear is itself a delivery that must be acked: it may drive a fade-out, and it
         // supersedes any un-acked frame for the slot, so exactly one frame_done() is owed
         // afterward regardless of what ack_state held before (a decode whose display will never
-        // fire included). Drop any notification parked behind an un-acked frame: it is superseded
-        // by the clear. Released before firing the callbacks below so a listener calling
-        // frame_done() from inside on_image_clear() does not deadlock on this same mutex.
+        // fire included). Drop any image parked behind an un-acked frame: it is superseded by the
+        // clear, and the decode thread, woken below, drops it from its buffer. Released before
+        // firing the callbacks below so a listener calling frame_done() from inside
+        // on_image_clear() does not deadlock on this same mutex.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        // Sweep the whole fixed-size slot_buffers array (ARTWORK_MAX_SLOTS), matching
-        // handle_stream_start(): ack_enabled() already gates the PRESENTED arm to configured ack
-        // slots, and clearing has_parked on any others is a harmless reset (they never park).
+        // Sweep the whole fixed-size slot_gates array (ARTWORK_MAX_SLOTS): ack_enabled() already
+        // gates the PRESENTED arm to configured ack slots, and clearing has_parked on any others
+        // is a harmless reset (they never park).
         for (size_t i = 0; i < ARTWORK_MAX_SLOTS; ++i) {
-            auto& sb = this->drain_task->slot_buffers[i];
-            sb.has_parked = false;
+            auto& gate = this->drain_task->slot_gates[i];
+            dropped_parked = dropped_parked || gate.has_parked;
+            gate.has_parked = false;
             if (this->ack_enabled(static_cast<uint8_t>(i))) {
-                sb.ack_state = SlotAckState::PRESENTED;
+                gate.ack_state = SlotAckState::PRESENTED;
             }
         }
+    }
+    if (dropped_parked) {
+        this->wake_drain_thread();
     }
     if (this->listener) {
         // Array index is the authoritative slot number; see the Impl constructor.
@@ -740,15 +762,15 @@ void ArtworkRole::Impl::drain_events() {
                 bool should_wake = false;
                 {
                     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-                    auto& sb = this->drain_task->slot_buffers[slot];
+                    auto& gate = this->drain_task->slot_gates[slot];
                     // The consumer got a decode whose display will never fire now; release the
                     // gate so the slot does not wedge on this stream restart. PRESENTED is left
                     // untouched: a delivery that already reached on_image_display()/
                     // on_image_clear() still owes its frame_done() regardless of epoch.
-                    if (sb.ack_state == SlotAckState::DECODE_DELIVERED) {
-                        sb.ack_state = SlotAckState::IDLE;
+                    if (gate.ack_state == SlotAckState::DECODE_DELIVERED) {
+                        gate.ack_state = SlotAckState::IDLE;
                     }
-                    should_wake = sb.has_parked;
+                    should_wake = gate.has_parked;
                 }
                 if (should_wake) {
                     this->wake_drain_thread();
@@ -775,7 +797,7 @@ void ArtworkRole::Impl::drain_events() {
             // on_image_display()/on_image_clear(), which would deadlock if this mutex were still
             // held.
             std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-            this->drain_task->slot_buffers[slot].ack_state = SlotAckState::PRESENTED;
+            this->drain_task->slot_gates[slot].ack_state = SlotAckState::PRESENTED;
         }
         if (this->listener) {
             if (is_clear) {
@@ -810,9 +832,11 @@ void ArtworkRole::Impl::cleanup() {
     this->stream_active = false;
     this->discard_all_pending();
 
-    // discard_all_pending() bumped every slot epoch, so no transfer is in flight and nothing
-    // that is still decoding can deliver.
-    this->release_idle_slot_buffers();
+    // Return the items the decode thread has not taken; one it takes before this carries the
+    // earlier stamp, which its take() discards. The wake has it drop the images it parks or
+    // assembles for the stream this teardown ends (see DrainTask::assembly_generation).
+    this->drain_task->inbound.recall();
+    this->wake_drain_thread();
 
     push_event_or_log(this->inbox, InboxEventType::ARTWORK_CLEARED, 0, TAG, "artwork cleared event",
                       generation);
@@ -830,14 +854,14 @@ void ArtworkRole::Impl::frame_done(uint8_t slot) const {
     bool should_wake = false;
     {
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        auto& sb = this->drain_task->slot_buffers[slot];
-        if (sb.ack_state == SlotAckState::IDLE) {
+        auto& gate = this->drain_task->slot_gates[slot];
+        if (gate.ack_state == SlotAckState::IDLE) {
             // Safe no-op: nothing un-acked for this slot, whether because require_frame_done is
             // disabled, the delivery was already acked, or a clear already acked it for us.
             return;
         }
-        sb.ack_state = SlotAckState::IDLE;
-        should_wake = sb.has_parked;
+        gate.ack_state = SlotAckState::IDLE;
+        should_wake = gate.has_parked;
     }
     if (should_wake) {
         this->wake_drain_thread();
@@ -848,68 +872,145 @@ void ArtworkRole::Impl::frame_done(uint8_t slot) const {
 // Decode thread
 // ============================================================================
 
-void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
-    uint8_t slot = notif.slot;
-    uint8_t buf_idx = notif.buffer_idx;
-
-    // A per-channel clear (see handle_binary) names no buffer, so it skips the buffer validation
-    // and the decode callback below. Everything else is deliberately shared with a frame: the same
-    // slot-epoch staleness check, the same ack gate (a clear is a delivery owing exactly one
-    // frame_done()), and the same timestamp-scheduled hand-off to the main loop, which fires
-    // on_image_clear() rather than on_image_display() when the deadline is reached.
-    const bool is_clear = notif.data_length == 0;
-
-    uint8_t* decode_data = nullptr;
-    size_t decode_length = 0;
-    {
-        // Validate the notification is still current before touching the buffer: a newer
-        // transfer, the only thing that writes the buffer again, moved the slot epoch on first,
-        // so this notification is stale and the bytes it names may have already been overwritten
-        // by the protocol task, or are about to be. A fresher notification for the same slot is
-        // already queued or has itself been parked.
-        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        auto& sb = this->drain_task->slot_buffers[slot];
-
-        if (notif.epoch != this->slot_epochs[slot].load(std::memory_order_relaxed)) {
-            return;
-        }
-        if (!is_clear && sb.buffers[buf_idx].data() == nullptr) {
-            return;
-        }
-
-        // Ack gate: a slot with require_frame_done set allows only one un-acked delivery in
-        // flight. If one is already outstanding, park this (newer) notification instead of
-        // decoding it now: overwriting any previously parked notification is latest-wins by
-        // design. Otherwise arm the gate (DECODE_DELIVERED) before decoding, so any later
-        // notification for this slot parks instead of decoding concurrently with this un-acked
-        // delivery. Arming gates on ack_enabled() alone, matching drain_events() and
-        // clear_every_channel(); the listener is set before start() (see set_listener) so it
-        // is non-null here, and the callback invocation below is the crash-guard for that pointer.
-        if (this->ack_enabled(slot) && sb.ack_state != SlotAckState::IDLE) {
-            sb.parked = notif;
-            sb.has_parked = true;
-            return;
-        }
-        if (this->ack_enabled(slot)) {
-            sb.ack_state = SlotAckState::DECODE_DELIVERED;
-        }
-
-        if (!is_clear) {
-            // Mark this buffer as in-use so the protocol task avoids it while we decode.
-            sb.drain_buf_idx = buf_idx;
-            sb.drain_active = true;
-            decode_data = sb.buffers[buf_idx].data();
-            decode_length = notif.data_length;
+bool ArtworkRole::Impl::process_next_item(uint32_t timeout_ms) {
+    InboundConsumer& inbound = this->drain_task->inbound;
+    void* item = inbound.take(timeout_ms, this->cleanup_generation);
+    if (item == nullptr) {
+        return false;
+    }
+    const InboundItemHeader* header = inbound_item_header(item);
+    this->adopt_generation(header->generation);
+    // The protocol task names a channel 0-3 on every announce and part, and a mask of them on a
+    // marker.
+    const auto serial = static_cast<uint8_t>(header->serial);
+    switch (static_cast<ArtworkItemType>(header->type)) {
+        case ArtworkItemType::ANNOUNCE:
+            this->begin_assembly(serial, item);
+            break;
+        case ArtworkItemType::PART:
+            this->add_part(serial, item);
+            break;
+        case ArtworkItemType::DISCARD:
+        case ArtworkItemType::RECONFIGURE: {
+            const bool reconfigure =
+                static_cast<ArtworkItemType>(header->type) == ArtworkItemType::RECONFIGURE;
+            inbound.return_item(item);
+            for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+                if ((serial & (1U << slot)) != 0) {
+                    this->drop_assembly(slot, reconfigure);
+                }
+            }
+            break;
         }
     }
+    return true;
+}
 
-    if (!is_clear) {
-        if (this->listener) {
-            this->listener->on_image_decode(slot, decode_data, decode_length, notif.format);
-        }
+void ArtworkRole::Impl::adopt_generation(uint32_t generation) {
+    // A teardown since the decode thread last took an item: what it parks and assembles belongs
+    // to the stream that teardown ended.
+    if (generation == this->drain_task->assembly_generation) {
+        return;
+    }
+    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+        this->drop_assembly(slot);
+    }
+    this->drain_task->assembly_generation = generation;
+}
 
+void ArtworkRole::Impl::begin_assembly(uint8_t slot, void* item) {
+    // roles/artwork/v1.md "Artwork (Binary)": "An announce discards that channel's pending
+    // image." A channel has one current image and at most one pending one, and only the pending
+    // one can be in the buffer (a READY image, or one still assembling), so the new image takes
+    // the buffer over.
+    this->drop_assembly(slot);
+
+    const InboundItemHeader* header = inbound_item_header(item);
+    ArtworkAnnounce announce;
+    std::memcpy(&announce, inbound_item_data(item), sizeof(announce));
+    ArtworkAssembly& assembly = this->drain_task->assemblies[slot];
+    assembly.timestamp = announce.timestamp;
+    assembly.total_size = announce.total_size;
+    assembly.received = 0;
+    assembly.epoch = announce.epoch;
+    assembly.generation = header->generation;
+    this->drain_task->inbound.return_item(item);
+
+    assembly.state = ArtworkAssembly::State::ASSEMBLING;
+    // An empty image is complete at its announce.
+    if (announce.total_size == 0) {
+        this->deliver(slot);
+    }
+}
+
+void ArtworkRole::Impl::add_part(uint8_t slot, void* item) {
+    ArtworkAssembly& assembly = this->drain_task->assemblies[slot];
+    // Copied out whatever the channel's gate says, and the item returned at once: a complete
+    // image whose gate is closed parks in the buffer (deliver()).
+    if (assembly.state == ArtworkAssembly::State::ASSEMBLING) {
+        // The protocol task bounds every part by the announced total_size, which it bounds by
+        // the channel's max_image_bytes, the buffer's size.
+        const uint32_t len = inbound_item_header(item)->data_len;
+        std::memcpy(assembly.buffer.data() + assembly.received, inbound_item_data(item), len);
+        assembly.received += len;
+    }
+    // Otherwise no image is in progress on the channel: a marker or a newer announce dropped the
+    // one this part belonged to, and the part is returned unused.
+    this->drain_task->inbound.return_item(item);
+    if (assembly.state == ArtworkAssembly::State::ASSEMBLING &&
+        assembly.received == assembly.total_size) {
+        this->deliver(slot);
+    }
+}
+
+void ArtworkRole::Impl::drop_assembly(uint8_t slot, bool release_delivered) {
+    this->drain_task->assemblies[slot].state = ArtworkAssembly::State::IDLE;
+    std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+    auto& gate = this->drain_task->slot_gates[slot];
+    gate.has_parked = false;
+    if (release_delivered && gate.ack_state == SlotAckState::DECODE_DELIVERED) {
+        gate.ack_state = SlotAckState::IDLE;
+    }
+}
+
+void ArtworkRole::Impl::deliver(uint8_t slot) {
+    ArtworkAssembly& assembly = this->drain_task->assemblies[slot];
+    // The channel moved past this image after its announce (a cancel, a newer announce, a stream
+    // restart or end) and the marker that says so is still behind it on the list: dropped
+    // undecoded, as it would have been had the marker come first.
+    if (assembly.epoch != this->slot_epochs[slot].load(std::memory_order_relaxed)) {
+        assembly.state = ArtworkAssembly::State::IDLE;
+        return;
+    }
+    {
+        // Ack gate: a slot with require_frame_done set allows only one un-acked delivery in
+        // flight. If one is outstanding the complete image parks here (READY), latest-wins,
+        // until the gate reopens; otherwise the gate is armed (DECODE_DELIVERED) before the
+        // decode, so a later image for this slot parks rather than delivering behind this
+        // un-acked one. Arming gates on ack_enabled() alone, matching drain_events() and
+        // clear_every_channel(); the listener is set before start() (see set_listener), and the
+        // callback below is the crash-guard for that pointer.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        this->drain_task->slot_buffers[slot].drain_active = false;
+        auto& gate = this->drain_task->slot_gates[slot];
+        if (this->ack_enabled(slot)) {
+            if (gate.ack_state != SlotAckState::IDLE) {
+                assembly.state = ArtworkAssembly::State::READY;
+                gate.has_parked = true;
+                return;
+            }
+            gate.ack_state = SlotAckState::DECODE_DELIVERED;
+        }
+    }
+    assembly.state = ArtworkAssembly::State::IDLE;
+
+    // A per-channel clear (an empty image) has nothing to decode. Everything else is deliberately
+    // shared with a frame: the same slot-epoch staleness check, the same ack gate (a clear is a
+    // delivery owing exactly one frame_done()), and the same timestamp-scheduled hand-off to the
+    // main loop, which fires on_image_clear() rather than on_image_display() at the deadline.
+    const bool is_clear = assembly.total_size == 0;
+    if (!is_clear && this->listener) {
+        this->listener->on_image_decode(slot, assembly.buffer.data(), assembly.total_size,
+                                        this->image_format(slot));
     }
 
     // Hand off the timestamp to the main loop. Skip if the stream ended while we were
@@ -918,24 +1019,53 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
     // main loop hasn't drained out of display_slot yet.
     if (this->stream_active.load(std::memory_order_acquire)) {
         ArtworkDisplayUpdate delta{};
-        delta.timestamps[slot] = notif.timestamp;
+        delta.timestamps[slot] = assembly.timestamp;
         // The epoch this decode was validated under: lets the main-loop deadline check drop
         // the display if the stream is replaced after this hand-off (see held_display_epoch).
-        delta.epochs[slot] = notif.epoch;
+        delta.epochs[slot] = assembly.epoch;
         delta.valid_mask = static_cast<uint8_t>(1U << slot);
         if (is_clear) {
             delta.clear_mask = static_cast<uint8_t>(1U << slot);
         }
         // NOLINTNEXTLINE(performance-move-const-arg): merge() takes the delta as T&&
         this->event_state->display_slot.merge(merge_artwork_display_update, std::move(delta),
-                                              notif.teardown_generation);
+                                              assembly.generation);
+    }
+}
+
+void ArtworkRole::Impl::sweep_parked() {
+    // Every gate that reopens (frame_done() or an epoch-mismatch release in drain_events()) and
+    // every park the main loop drops (a stream end's clear) wakes this thread, so one pass per
+    // wake finds them all.
+    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+        if (this->drain_task->assemblies[slot].state != ArtworkAssembly::State::READY) {
+            continue;
+        }
+        bool dropped = false;
+        bool open = false;
+        {
+            std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+            auto& gate = this->drain_task->slot_gates[slot];
+            // The main loop clearing has_parked drops the parked image.
+            dropped = !gate.has_parked;
+            open = !dropped && gate.ack_state == SlotAckState::IDLE;
+            if (open) {
+                gate.has_parked = false;
+            }
+        }
+        if (dropped) {
+            this->drop_assembly(slot);
+        } else if (open) {
+            // Revalidated like any delivery: a since-stale epoch drops it, and a gate closed
+            // again parks it once more.
+            this->deliver(slot);
+        }
     }
 }
 
 void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
     SS_LOGD(TAG, "Decode thread started");
 
-    auto& queue = self->drain_task->notify_queue;
     auto& flags = self->drain_task->event_flags;
 
     while (true) {
@@ -945,47 +1075,20 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
             break;
         }
 
-        // Replay any parked notification whose slot's gate has reopened (ack_state back to
-        // IDLE via frame_done() or an epoch-mismatch release in drain_events()).
-        // process_notification() revalidates the notification itself, so a since-stale
-        // epoch is simply skipped: correct, since a fresher notification is either
-        // already queued or has itself been freshly parked. Loop until no parked slot is ready
-        // so one wakeup can drain several slots without waiting on separate receive timeouts.
-        while (true) {
-            ArtworkNotification parked_notif{};
-            bool found = false;
-            {
-                std::lock_guard<std::mutex> lock(self->drain_task->slot_mutex);
-                for (auto& sb : self->drain_task->slot_buffers) {
-                    if (sb.has_parked && sb.ack_state == SlotAckState::IDLE) {
-                        parked_notif = sb.parked;
-                        sb.has_parked = false;
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if (!found) {
-                break;
-            }
-            self->process_notification(parked_notif);
-        }
+        // A teardown woke the thread: drop what it assembles for the stream that ended.
+        self->adopt_generation(self->cleanup_generation.load(std::memory_order_acquire));
+        self->sweep_parked();
 
-        // Blocking receive; returns early (false) when wake_receiver() signals a stop or a
-        // parked-slot recheck. The timeout is only a safety net against a missed wake (see
-        // DRAIN_RECEIVE_TIMEOUT_MS); a timeout return simply re-runs the sweep above.
-        ArtworkNotification notif{};
-        if (!queue.receive(notif, DRAIN_RECEIVE_TIMEOUT_MS)) {
-            continue;
-        }
-
-        if (notif.slot >= ARTWORK_MAX_SLOTS) {
-            continue;
-        }
-
-        self->process_notification(notif);
+        // Blocking take; returns early (nullptr) when wake_receiver() signals a stop, a teardown
+        // or a parked-slot recheck. The timeout is only a safety net against a missed wake (see
+        // DRAIN_RECEIVE_TIMEOUT_MS); a timeout return simply re-runs the checks above.
+        self->process_next_item(DRAIN_RECEIVE_TIMEOUT_MS);
     }
 
+    // A restart begins with nothing assembled or parked: stop() releases the buffers.
+    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+        self->drop_assembly(slot);
+    }
     SS_LOGD(TAG, "Decode thread stopped");
 }
 

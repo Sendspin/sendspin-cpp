@@ -70,8 +70,6 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   offset round-trip, convergence).
 - `test_audio_stream_info.cpp`: byte/frame/sample/duration conversions.
 - `test_network_info.cpp`: local interface MAC lookup is well-formed or absent.
-- `test_thread_safe_queue.cpp`: `ThreadSafeQueue`'s `wake_receiver()` contract: a wake unblocks
-  a parked receive, is held pending, is consumed once, and never drops a queued item.
 - `test_inline_vector.cpp`: `InlineVector` order-preserving erase, element release at removal,
   and swap.
 - `test_fixed_block_pool.cpp`: `FixedBlockPool` claims each block once until released, also
@@ -97,7 +95,8 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   negotiation and dispatch, the receive stamp a frame carries, and the recall after a teardown.
 - `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: announce/part/cancel
   transfers and the messages and sequences that close the connection, the per-channel image cap,
-  decode thread, slot gating, `frame_done()` acks, and stream restart/clear.
+  the inbound ring hand-off (item order, markers, the stale-stamp discard), decode thread, slot
+  gating, `frame_done()` acks, and stream restart/clear.
 - `test_connection_lifecycle.cpp`: the connection nursery (prove-then-admit) over real loopback
   sockets: junk probes, slow peers, capacity, and the liveness timeout (its derivation and
   expiry predicate as tables, and a silent peer dropped, or kept with the check disabled, end

@@ -29,8 +29,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
   returns (on ESP, with its httpd session), so no refusal destroys a connection
   inside the delivery. Payload validation and
   decoding happen on the drain or worker thread that consumes the data, following the pattern the player and artwork
-  roles establish; the protocol task hands audio and visualizer frames over in
-  the ring item they arrived in rather than copying them.
+  roles establish; the protocol task hands audio, visualizer frames and artwork
+  image parts over in the ring item they arrived in rather than copying them.
 - All main-loop-bound cross-thread state goes through the `Inbox`
   (`src/inbox.h`). `loop()` runs the Inbox drain and nothing else: do not add
   mutex-protected endpoints or atomics that `loop()` polls for work. The
@@ -62,8 +62,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
   one with their count when they stop.
 - A consumer that holds items of the shared inbound ring holds them against a
   quota of its own (`InboundQuota`), charged on the protocol task before the
-  item is handed over (the codec headers and stream markers the task writes
-  itself excepted): a holder over its quota has the new item dropped with
+  item is handed over (the codec headers, artwork announces and stream markers
+  the task writes itself excepted): a holder over its quota has the new item dropped with
   a warning, so no holder's backlog can starve another's, and a role's share
   of the ring is part of the ring's derivation (`derive_inbound_ring_bytes()`)
   rather than a separate buffer.

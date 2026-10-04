@@ -20,10 +20,10 @@
 /// Every inbound WebSocket message of an admitted connection lands in one ring item: an
 /// InboundItemHeader followed by the message bytes as received, which the protocol task decrypts
 /// in place. An item the protocol task hands to a consumer (a player audio chunk, a visualizer
-/// frame, or a marker it writes itself) stays in the ring and is linked onto that consumer's
-/// InboundItemList through its own header, so no descriptor storage exists outside the ring
-/// items. The consumer returns the item when it is done with it. An unadmitted connection never
-/// writes into the ring (see InboundGate).
+/// frame, an artwork image part, or an item it writes itself) stays in the ring and is linked onto
+/// that consumer's InboundItemList through its own header, so no descriptor storage exists outside
+/// the ring items. The consumer returns the item when it is done with it. An unadmitted connection
+/// never writes into the ring (see InboundGate).
 
 #pragma once
 
@@ -72,14 +72,15 @@ enum class InboundKind : uint8_t {
 
 /// @brief The roles that hold ring items after the protocol task has routed them, each against
 /// its own InboundQuota. Every other message is returned to the ring as soon as it is processed,
-/// or copied out first (artwork), so it is never charged.
+/// so it is never charged.
 enum class InboundHolder : uint8_t {
     PLAYER,      ///< Encoded audio chunks and markers held by the sync task
     VISUALIZER,  ///< Frames and markers held by the visualizer drain thread
+    ARTWORK,     ///< Image parts, announces and markers held by the artwork decode thread
 };
 
 /// Number of InboundHolder values.
-static constexpr size_t INBOUND_HOLDER_COUNT = 2;
+static constexpr size_t INBOUND_HOLDER_COUNT = 3;
 
 /// @brief Throttles the warning at a drop site that can drop every message of a burst
 ///
@@ -179,7 +180,7 @@ struct InboundItemHeader {
     uint8_t data_offset;
     InboundKind kind;
     /// Consumer-defined item type: the ChunkType for the player, the wire message type or a
-    /// marker for the visualizer.
+    /// marker for the visualizer, the ArtworkItemType for artwork.
     uint8_t type;
     /// The holder the item was handed to; meaningful only while holder_set is non-zero.
     InboundHolder holder;
@@ -191,8 +192,8 @@ struct InboundItemHeader {
     uint8_t local_returns;
     /// Non-zero once InboundRing::charge() assigned the item to `holder`; never cleared.
     uint8_t holder_set;
-    /// Consumer-defined sequence number: the player's stream ordinal on a codec header item, 0 on
-    /// every other item.
+    /// Consumer-defined: the player's stream ordinal on a codec header item, the artwork channel
+    /// (or, on a marker, the channel mask) on an artwork item, 0 on every other item.
     uint16_t serial;
 };
 static_assert(std::is_trivially_copyable_v<InboundItemHeader> &&
@@ -505,7 +506,8 @@ private:
  * The link lives in each item's InboundItemHeader::next, so the list has no capacity of its
  * own: it holds exactly the items the ring holds and cannot overflow independently.
  * Back-pressure is the ring itself plus the per-role quotas. Single producer (the protocol task,
- * append()), single consumer (the sync task or the visualizer drain thread, take()); recall()
+ * append()), single consumer (the sync task, the visualizer drain thread or the artwork decode
+ * thread, take()); recall()
  * may run on the protocol task, or on any thread once the consumer is joined.
  *
  * mutex_ guards head_, tail_ and every next link of a linked item, and the return count of a
@@ -612,8 +614,9 @@ private:
  * @brief One holder's end of the ring: the item list its consumer thread takes from, the ring it
  * is bound to for a run, and the protocol task's side of handing items over
  *
- * Shared by the sync task (InboundHolder::PLAYER) and the visualizer drain thread
- * (InboundHolder::VISUALIZER). Every item handed over carries the holder role's teardown
+ * Shared by the sync task (InboundHolder::PLAYER), the visualizer drain thread
+ * (InboundHolder::VISUALIZER) and the artwork decode thread (InboundHolder::ARTWORK). Every item
+ * handed over carries the holder role's teardown
  * generation (InboundItemHeader::generation): a teardown moves the role's `cleanup_generation`
  * on and its cleanup() recalls what the consumer has not taken (recall()), and a consumer that
  * takes such an item between the two returns it unprocessed (take()).
@@ -673,13 +676,13 @@ public:
     /// fields first.
     /// @param item_len The item's message length (InboundMessage::item_len, or what
     ///        copy_local() was given).
-    /// @param exempt Hands the item over without charging the quota: a codec header or a
-    ///        stream boundary marker the protocol task writes itself, one per stream/start or
-    ///        stream/clear, so refusing it would end or blur a stream over a quota the server's
-    ///        data overran. Under ring-order reclamation a clear pins both its JSON item and its
-    ///        marker until the consumer returns the marker; that is no more than a JSON flood
-    ///        from an authenticated server already holds, inside the pass-through budget
-    ///        derive_inbound_ring_bytes() holds.
+    /// @param exempt Hands the item over without charging the quota: a codec header, an artwork
+    ///        announce or a stream boundary marker the protocol task writes itself, one per
+    ///        stream/start, stream/clear or image, so refusing it would end or blur a stream over
+    ///        a quota the server's data overran. Under ring-order reclamation a clear pins both its
+    ///        JSON item and its marker until the consumer returns the marker; that is no more than
+    ///        a JSON flood from an authenticated server already holds, inside the pass-through
+    ///        budget derive_inbound_ring_bytes() holds.
     /// @return false when the item was returned instead of handed over.
     bool hand(void* item, size_t item_len, uint32_t generation, bool exempt);
 
@@ -697,6 +700,8 @@ public:
 private:
     /// @brief What end_run() calls the holder's dropped items
     const char* dropped_items_name() const;
+    /// @brief The holder's name, leading note_drop()'s warning
+    const char* holder_name() const;
 
     // Struct fields
     /// Appended on the protocol task, taken on the consumer thread, recalled on the protocol task
@@ -761,11 +766,17 @@ public:
     static constexpr size_t PRE_ADMISSION_MESSAGE_BYTES =
         MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES;
 
-    /// Bound on the transport's wait_until_writable() before it closes an unadmitted connection:
-    /// a tick's Noise DH operations plus up to two INBOUND_ACQUIRE_TIMEOUT_MS waits for ring space
-    /// (a codec header and a stream marker, 200 ms), with a margin. Every lock the task takes is a
-    /// leaf held for a copy, so nothing else stretches a tick, and a task stalled beyond it closes
-    /// the waiting connection rather than parking the transport thread.
+    /// Bound on the transport's wait_until_writable() before it closes an unadmitted connection,
+    /// which waits for the one message the protocol task is handling ahead of the pending one: the
+    /// Noise DH operations of a handshake message, or the INBOUND_ACQUIRE_TIMEOUT_MS waits for
+    /// ring space one message can make. A stream/start makes the most, three (the player's codec
+    /// header, the visualizer's marker and the artwork role's RECONFIGURE marker, 300 ms). An
+    /// artwork announce, cancel or stream/end makes one, as does an image part dropped over the
+    /// artwork quota (the DISCARD marker in its place) and the announce of an image over its cap
+    /// (the marker alone); an announce makes two only when handing the announce itself fails and
+    /// its marker follows. Every lock the task takes is a
+    /// leaf held for a copy, so nothing else stretches a message, and a task stalled beyond the
+    /// bound closes the waiting connection rather than parking the transport thread.
     static constexpr uint32_t WRITABLE_WAIT_MS = 500;
 
     InboundGate() {
@@ -1034,9 +1045,9 @@ static_assert(
         sizeof(InboundItemHeader) + INBOUND_JSON_MESSAGE_BYTES,
     "the minimum JSON-only ring must accept a maximal JSON message");
 
-/// Pass-through allowance without the artwork role, on top of the per-second budget below:
-/// largest messages (JSON, or a protocol message the task returns at once) that can arrive behind
-/// a held item. Two lets one arrive while the previous is still being processed.
+/// The baseline pass-through allowance every configuration pays, on top of the per-second budget
+/// below: largest messages (JSON, or a protocol message the task returns at once) that can arrive
+/// behind a held item. Two lets one arrive while the previous is still being processed.
 static constexpr size_t INBOUND_PASSTHROUGH_MESSAGES = 2;
 
 /// Upper bound on the bytes a role message spends ahead of its payload inside one frame (the
@@ -1084,6 +1095,15 @@ static constexpr size_t INBOUND_STATE_BYTES_PER_SECOND = 1024;
 /// reports as "ring pinned behind held items" when it closes the connection.
 static constexpr size_t INBOUND_MIN_TRACK_SECONDS = 30;
 
+/// Images per artwork channel the artwork decode thread's quota covers: one in flight. The decode
+/// thread copies each part into its channel's assembly buffer as it takes it and returns the item
+/// at once, gate open or closed, so its parts wait in the ring only while the thread is busy (in
+/// on_image_decode()), and the server sends one transfer at a time. The quota is one image: if a
+/// second image for a channel arrives behind a complete one still queued while the thread is
+/// inside a long decode, its parts go over the quota and it is dropped, and the channel keeps its
+/// current image until the server sends the next one.
+static constexpr size_t INBOUND_ARTWORK_IN_FLIGHT_IMAGES = 1;
+
 /// @brief The configuration figures the ring size is derived from
 ///
 /// A holder's quota counts each item's stored overhead (SharedRingLayout::ITEM_HEADER_BYTES,
@@ -1105,6 +1125,9 @@ struct InboundRingBudget {
     /// inbound_frames_stored_bytes(ImageSlotPreference::max_image_bytes). 0 without the artwork
     /// role.
     size_t artwork_images_stored_bytes{0};
+    /// The artwork role's quota: INBOUND_ARTWORK_IN_FLIGHT_IMAGES * artwork_images_stored_bytes. 0
+    /// without the artwork role.
+    size_t artwork_hold_bytes{0};
     /// SendspinClientConfig::time_burst_size: server/time replies per burst.
     size_t time_burst_size{SendspinClientConfig::DEFAULT_BURST_SIZE};
     /// SendspinClientConfig::time_burst_interval_ms: milliseconds between bursts.
@@ -1140,9 +1163,11 @@ static constexpr size_t inbound_hold_seconds(size_t held_bytes, size_t stored_by
  *
  * Reclamation is in ring order (see shared_ring_buffer.h), so every byte that arrives while the
  * oldest held item is outstanding stays unreclaimable until it is returned: JSON, time replies,
- * visualizer frames and artwork returned at their display time, and dropped items alike. The
- * ring therefore holds:
- *  - the player's quota (audio_hold_bytes) and the visualizer's (visualizer_hold_bytes);
+ * visualizer frames returned at their display time, artwork parts returned once copied, and
+ * dropped items alike. The ring therefore holds:
+ *  - the player's quota (audio_hold_bytes), the visualizer's (visualizer_hold_bytes) and the
+ *    artwork role's (artwork_hold_bytes, one image per channel in flight to its decode thread;
+ *    see INBOUND_ARTWORK_IN_FLIGHT_IMAGES);
  *  - the pass-through traffic arriving inside the longest hold window: the state JSON budget and
  *    every time-burst reply in it, and the visualizer frames the player's window carries, since a
  *    frame returned at its display time stays pinned behind audio held far longer. The player
@@ -1152,9 +1177,10 @@ static constexpr size_t inbound_hold_seconds(size_t held_bytes, size_t stored_by
  *    pins the pass-through longer than budgeted, and assuming a minimum rate instead would
  *    derive an absurd ring for a sparse stream. The codec headers and markers the protocol task
  *    writes for the holders are uncharged (InboundConsumer::hand()) and fall inside this term;
- *  - the artwork that window carries, one image per channel per INBOUND_MIN_TRACK_SECONDS plus
- *    the set in flight, or INBOUND_PASSTHROUGH_MESSAGES items of largest_message_bytes without
- *    artwork;
+ *  - the baseline, INBOUND_PASSTHROUGH_MESSAGES items of largest_message_bytes, which can always
+ *    arrive and sit behind a held item, whatever the holders' windows;
+ *  - with the artwork role, the artwork that window carries: one image per channel per
+ *    INBOUND_MIN_TRACK_SECONDS, copied out and returned but pinned behind the held items;
  * and never less than two items of largest_message_bytes (inbound_ring_min_storage_bytes()),
  * rounded up to the 4-byte multiple FreeRTOS requires. Unadmitted connections never write into
  * the ring (InboundGate), so they add nothing.
@@ -1197,13 +1223,12 @@ static constexpr size_t derive_inbound_ring_bytes(const InboundRingBudget& budge
         hold_seconds * INBOUND_STATE_BYTES_PER_SECOND +
         player_hold_seconds * budget.visualizer_stored_bytes_per_second +
         bursts * budget.time_burst_size * INBOUND_TIME_REPLY_STORED_BYTES;
-    const size_t allowance =
-        budget.artwork_images_stored_bytes > 0
-            ? (hold_seconds / INBOUND_MIN_TRACK_SECONDS + 1) * budget.artwork_images_stored_bytes
-            : INBOUND_PASSTHROUGH_MESSAGES *
-                  inbound_item_stored_bytes(budget.largest_message_bytes);
-    const size_t total =
-        budget.audio_hold_bytes + budget.visualizer_hold_bytes + held_passthrough + allowance;
+    const size_t baseline =
+        INBOUND_PASSTHROUGH_MESSAGES * inbound_item_stored_bytes(budget.largest_message_bytes);
+    const size_t artwork_window =
+        hold_seconds / INBOUND_MIN_TRACK_SECONDS * budget.artwork_images_stored_bytes;
+    const size_t total = budget.audio_hold_bytes + budget.visualizer_hold_bytes +
+                         budget.artwork_hold_bytes + held_passthrough + baseline + artwork_window;
     return SharedRingLayout::align(
         std::max(total, inbound_ring_min_storage_bytes(budget.largest_message_bytes)));
 }
