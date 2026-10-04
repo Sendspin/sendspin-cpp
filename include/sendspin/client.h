@@ -346,14 +346,6 @@ public:
         return this->lifecycle_.load(std::memory_order_acquire) == LifecycleState::RUNNING;
     }
 
-    /// @brief Starts the client
-    /// @deprecated Use start(). Kept as an alias for existing consumers; removal is planned for
-    /// v0.9.0.
-    /// @return See start().
-    [[deprecated("Use start()")]] bool start_server() {
-        return this->start();
-    }
-
     /// @brief Initiates a client connection to a Sendspin server at the given URL
     ///
     /// Ignored (with a warning) unless the client is running, including from a callback fired

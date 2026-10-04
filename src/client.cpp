@@ -715,7 +715,7 @@ void SendspinClient::drain_inbox() {
             // Set when a re-entrant teardown bumps the generation, abandoning the rest of the
             // batch.
             bool notes_aborted = false;
-            // Checked once for the whole batch: the listener is set before start_server() and
+            // Checked once for the whole batch: the listener is set before start() and
             // must outlive the client (see set_listener), so it cannot become null mid-dispatch.
             if (this->listener_ != nullptr) {
                 // Grouped by type in PairingNoteType declaration order, not queue order, firing

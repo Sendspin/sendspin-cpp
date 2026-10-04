@@ -733,8 +733,6 @@ while (running) {
 client.stop();
 ```
 
-`start_server()` is a deprecated alias of `start()`.
-
 ## Stopping and Restarting
 
 `stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer, waits up to a short bound (50 ms per peer) for those sends to complete, then closes the server and every connection regardless, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
