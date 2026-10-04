@@ -35,6 +35,7 @@
 #include "platform/crypto.h"
 #include "record_store.h"
 #include "sendspin/config.h"
+#include "test_util.h"
 
 #include <gtest/gtest.h>
 
@@ -97,7 +98,8 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
     rs.store_record_superseding(std::move(rec), {});
 
     // Run initial handshake via NoiseHandshake state machine
-    NoiseHandshake nh(r.client_id, rs, suite_name);
+    TestArena arena;
+    NoiseHandshake nh(r.client_id, rs, suite_name, arena);
     std::string client_init = nh.build_client_init();
     if (client_init.empty()) { return std::nullopt; }
 
@@ -216,7 +218,7 @@ static std::optional<RehandshakeResult> run_rehandshake(
     }
 
     auto result = run_rehandshake_msg1(msg1_json, init.server_id.peer_id(), init.client_id, rs,
-                                       suite_name, prior_h);
+                                       suite_name, prior_h, TestArena());
     if (!result.has_value()) {
         ADD_FAILURE() << "run_rehandshake_msg1 returned nullopt";
         return std::nullopt;
@@ -378,7 +380,7 @@ TEST(NoiseRehandshake, UnknownPskIdAborts) {
 
     // run_rehandshake_msg1 must return nullopt (unknown psk_id).
     auto result = run_rehandshake_msg1(msg1_json, init.server_id.peer_id(), init.client_id,
-                                       empty_rs, suite, prior_h);
+                                       empty_rs, suite, prior_h, TestArena());
     EXPECT_FALSE(result.has_value())
         << "run_rehandshake_msg1 should fail with an unknown psk_id";
 }
@@ -417,12 +419,12 @@ TEST(NoiseRehandshake, RehandshakeEnvelopeTypeIsChecked) {
     serializeJson(doc, relabeled);
 
     EXPECT_FALSE(run_rehandshake_msg1(relabeled, init.server_id.peer_id(), init.client_id, rs,
-                                      suite, prior_h)
+                                      suite, prior_h, TestArena())
                      .has_value());
 
     // Control: the same msg1 under its own type completes, so the rejection is the type and not
     // the message.
     EXPECT_TRUE(run_rehandshake_msg1(msg1_json, init.server_id.peer_id(), init.client_id, rs,
-                                     suite, prior_h)
+                                     suite, prior_h, TestArena())
                     .has_value());
 }

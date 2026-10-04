@@ -236,6 +236,7 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
         case ProtocolCommandType::LEAVE:
         case ProtocolCommandType::PAIRING_WINDOW_CANCEL:
         case ProtocolCommandType::PAIRING_WINDOW_CONFIRM:
+        case ProtocolCommandType::SEND_CONTROLLER_COMMAND:
         case ProtocolCommandType::SEND_TEXT:
         case ProtocolCommandType::SET_UNPAIRED_ACCESS:
             break;
@@ -264,6 +265,18 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
         case ProtocolCommandType::PAIRING_WINDOW_CONFIRM:
             manager.open_pairing_window();
             break;
+        case ProtocolCommandType::SEND_CONTROLLER_COMMAND: {
+            // Formatted here rather than on the caller's thread so the document is built in the
+            // task's JSON arena, and only once the gate a "controller" send_text() meets has
+            // passed, so a command no connection may receive formats nothing.
+            SendspinConnection* conn = manager.role_send_target(SendspinRole::CONTROLLER);
+            if (conn != nullptr) {
+                conn->send_app_json(
+                    format_client_command_message(command.controller_command, *this->json_arena_),
+                    nullptr);
+            }
+            break;
+        }
         case ProtocolCommandType::SEND_TEXT:
             manager.send_role_text(command.role, command.text);
             break;
@@ -277,6 +290,12 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
 }
 
 void SendspinClient::process_inbound(SendspinConnection& conn, InboundMessage& message) {
+    // One reset per inbound message of any kind, the Noise handshake frames included, reclaiming
+    // what the documents of the previous one stranded (see SendspinArenaAllocator). Safe: this is
+    // called only from the tick's top level, where no arena document is live; every document the
+    // task parsed or built since the last reset was destroyed before its parser or builder
+    // returned.
+    this->json_arena_->reset();
     conn.process_inbound_message(message);
     if (message.item != nullptr) {
         this->inbound_ring_->return_item(message.item);
@@ -296,13 +315,10 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                                           size_t len, int64_t timestamp) {
     SendspinConnection* conn = &connection;
     // Every connection's messages are processed on the protocol task, one at a time, so the
-    // shared arena, the parse and the handlers it dispatches to need no lock. Reusing the arena
-    // is safe: the JsonDocument from the previous call was destroyed when that call returned.
-    if (this->json_arena_) {
-        this->json_arena_->reset();
-    }
-    JsonDocument doc =
-        this->json_arena_ ? make_json_document(*this->json_arena_) : make_json_document();
+    // shared arena, the parse and the handlers it dispatches to need no lock. process_inbound()
+    // reset the arena before this message; the messages the handlers below build sit above this
+    // document and drain back down to it.
+    JsonDocument doc = make_json_document(*this->json_arena_);
     DeserializationError error = deserializeJson(doc, data, len);
     if (error || doc.isNull()) {
         SS_LOGW(TAG, "Failed to parse JSON message");

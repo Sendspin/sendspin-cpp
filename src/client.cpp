@@ -232,12 +232,9 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
     : config_(std::move(config)),
       connection_manager_(std::make_unique<ConnectionManager>(this)),
       event_state_(std::make_unique<EventState>()),
+      json_arena_(std::make_unique<SendspinArenaAllocator>(this->config_.json_arena_size)),
       protocol_task_(std::make_unique<ProtocolTask>(this->config_.server_max_connections)),
-      task_state_(std::make_unique<TaskState>()) {
-    if (this->config_.json_arena_size > 0) {
-        this->json_arena_ = std::make_unique<SendspinArenaAllocator>(this->config_.json_arena_size);
-    }
-}
+      task_state_(std::make_unique<TaskState>()) {}
 
 SendspinClient::~SendspinClient() {
     // Transport-only teardown: goodbye and close every peer in the same order as stop(), but
@@ -1228,7 +1225,8 @@ ClientStateMessage SendspinClient::build_client_state() const {
 }
 
 bool SendspinClient::send_text(const std::string& text, const std::string& role_family) {
-    // Single choke point for every role-originated send (controller commands). Pairing messages
+    // Choke point for every role-originated message a consumer formats itself; a controller
+    // command takes send_controller_command(), the same route for the struct. Pairing messages
     // are protocol-internal: connection_manager.cpp sends them via
     // SendspinConnection::send_app_json() directly. A declared PAIRING activity is not a gate:
     // pairing.md "Entering and leaving pairing" says an activate that adds it does not by itself
@@ -1250,6 +1248,21 @@ bool SendspinClient::send_text(const std::string& text, const std::string& role_
     command.text = text;
     return this->protocol_task_->push_command(std::move(command));
 }
+
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+bool SendspinClient::send_controller_command(const ClientCommandControllerObject& cmd) {
+    // The send_text() path for a command the controller role validated, carried as the struct so
+    // the protocol task builds the message in its JSON arena (handle_command()).
+    if (!this->is_started()) {
+        SS_LOGD(TAG, "Dropping a controller command: client is not running");
+        return false;
+    }
+    ProtocolCommand command;
+    command.type = ProtocolCommandType::SEND_CONTROLLER_COMMAND;
+    command.controller_command = cmd;
+    return this->protocol_task_->push_command(std::move(command));
+}
+#endif
 
 void SendspinClient::acquire_high_performance() {
     if (this->high_performance_ref_count_.fetch_add(1) == 0 && this->listener_) {
@@ -1425,7 +1438,7 @@ std::string SendspinClient::build_hello_message() {
     }
 #endif
 
-    return format_client_hello_message(&msg);
+    return format_client_hello_message(&msg, *this->json_arena_);
 }
 
 // ============================================================================
@@ -1462,7 +1475,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // after a server/activate carries them all.
     const ClientStateMessage state_msg =
         client_state_for_roles(snapshot, entry->owned_roles & conn->get_active_role_mask());
-    conn->send_app_json(format_client_state_message(&state_msg), nullptr);
+    conn->send_app_json(format_client_state_message(&state_msg, *this->json_arena_), nullptr);
 }
 
 void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {

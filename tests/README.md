@@ -61,6 +61,8 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_protocol.cpp`: wire-protocol parsing/formatting: enum round-trips, message dispatch, the
   full-state metadata/color objects, and the hand-rolled `client/time` formatter checked against
   `snprintf`.
+- `test_json_arena.cpp`: `SendspinArenaAllocator` wipes every block it frees, shrinks or moves,
+  and a message built on a live parsed document leaves it intact and drains back down to it.
 - `test_time_filter.cpp`: `SendspinTimeFilter` invariants (monotonic-timestamp rejection, reset,
   offset round-trip, convergence).
 - `test_audio_stream_info.cpp`: byte/frame/sample/duration conversions.

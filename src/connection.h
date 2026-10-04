@@ -48,6 +48,7 @@
 namespace sendspin {
 
 class ProtocolTask;
+class SendspinArenaAllocator;
 
 /// @brief Callback type for message send completion
 /// @param success True if the message was sent successfully, false otherwise.
@@ -832,6 +833,15 @@ public:
         this->noise_transport_.set_buffer_location(location);
     }
 
+    /// @brief Sets the client's JSON arena, which every JSON document this connection parses or
+    /// builds is allocated from: the Noise handshake and re-handshake frames and the goodbye.
+    /// @param arena The client's arena; outlives the connection.
+    /// @note Must be called before the connection reaches the protocol task, as the manager does
+    /// alongside the buffer locations.
+    void set_json_arena(SendspinArenaAllocator& arena) {
+        this->json_arena_ = &arena;
+    }
+
 protected:
     // ========================================
     // Transport frames
@@ -1022,6 +1032,11 @@ protected:
     /// Retained for re-handshake: pointer to the RecordStore supplied at
     /// init_noise_handshake(). Lifetime is owned by SendspinClient (outlives connections).
     const RecordStore* noise_record_store_{nullptr};
+
+    /// The client's JSON arena, from set_json_arena(). Written once before the connection reaches
+    /// the protocol task (on the transport's delivery thread for an inbound one, published to the
+    /// task by the accept command); read on the protocol task only, which the arena belongs to.
+    SendspinArenaAllocator* json_arena_{nullptr};
 
     /// The shared inbound ring and the protocol task, from attach_inbound(). Written once before
     /// the transport can deliver; read by the transport thread. Owned by SendspinClient: the

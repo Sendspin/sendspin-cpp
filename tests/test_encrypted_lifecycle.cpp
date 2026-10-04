@@ -840,8 +840,9 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     ASSERT_TRUE(learned_psk.has_value() && learned_psk_id.has_value());
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
-    // The protocol task can publish is_connected() before it stores the trust level, so the wait
-    // also covers the trust callback, which is queued only after the getter's value is set.
+    // Waited for with no timeout: is_connected() still reads true from before the re-handshake
+    // until a tick refreshes it, so only the trust the re-activation reports tells the new session
+    // apart, and a trust that is never upgraded hangs here for the suite watchdog to name.
     pump_until(client, [&] {
         return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
     });
@@ -1087,24 +1088,31 @@ TEST(EncryptedLifecycle, ControllerCommandsNeedAnOfferedCommandAndItsParameter) 
     offer_controller_commands(client, *server, controller,
                               R"(["play","volume","mute","seek","seek_relative"])");
 
-    // `sent_as` is the command's wire name when it goes out, null when it must be dropped.
+    // `sent_as` is the controller object a command goes out as, null when it must be dropped.
+    // The protocol task formats each command it is handed, so the object shows the parameter
+    // crossed to it with the command.
     using Cmd = SendspinControllerCommand;
     struct Row {
         ClientCommandControllerObject cmd;
         const char* sent_as;
     };
     const Row rows[] = {
-        {{.command = Cmd::PLAY}, "play"},  // Control:
-        {{.command = Cmd::NEXT}, nullptr},  // not offered
+        {{.command = Cmd::PLAY}, R"({"command":"play"})"},  // Control:
+        {{.command = Cmd::NEXT}, nullptr},                   // not offered
         {{.command = Cmd::VOLUME}, nullptr},
         {{.command = Cmd::VOLUME, .volume = 101}, nullptr},
-        {{.command = Cmd::VOLUME, .volume = 100}, "volume"},  // Control:
+        // Control:
+        {{.command = Cmd::VOLUME, .volume = 100}, R"({"command":"volume","volume":100})"},
         {{.command = Cmd::MUTE}, nullptr},
-        {{.command = Cmd::MUTE, .muted = true}, "mute"},  // Control:
+        // Control:
+        {{.command = Cmd::MUTE, .muted = true}, R"({"command":"mute","mute":true})"},
         {{.command = Cmd::SEEK}, nullptr},
-        {{.command = Cmd::SEEK, .position_ms = 1000}, "seek"},  // Control:
+        // Control:
+        {{.command = Cmd::SEEK, .position_ms = 1000}, R"({"command":"seek","position_ms":1000})"},
         {{.command = Cmd::SEEK_RELATIVE}, nullptr},
-        {{.command = Cmd::SEEK_RELATIVE, .offset_ms = -5000}, "seek_relative"},  // Control:
+        // Control:
+        {{.command = Cmd::SEEK_RELATIVE, .offset_ms = -5000},
+         R"({"command":"seek_relative","offset_ms":-5000})"},
     };
 
     std::vector<std::string> expected;
@@ -1116,9 +1124,9 @@ TEST(EncryptedLifecycle, ControllerCommandsNeedAnOfferedCommandAndItsParameter) 
         }
     }
     // Commands go out in order, so once the last one sent has arrived every dropped one would have.
-    pump_until(client, [&] { return server->controller_commands().size() >= expected.size(); });
+    pump_until(client, [&] { return server->controller_objects().size() >= expected.size(); });
     pump_for(client, 100);
-    EXPECT_EQ(server->controller_commands(), expected);
+    EXPECT_EQ(server->controller_objects(), expected);
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

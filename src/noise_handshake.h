@@ -54,6 +54,8 @@
 
 namespace sendspin {
 
+class SendspinArenaAllocator;
+
 /// @brief Outcome of a successful Noise handshake (initial or re-handshake).
 struct NoiseHandshakeResult {
     /// The cipher session ready for transport-mode encrypt/decrypt.
@@ -97,14 +99,14 @@ enum class HandshakeFrameResult : uint8_t {
 /// @param record_store   Record store for psk_id resolution (read-only on protocol task).
 /// @param suite_name     Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
 /// @param prior_h        32-byte handshake hash from the prior session (used as prologue).
+/// @param arena          The client's JSON arena: the msg1 envelope and payload are parsed and
+///                       the msg2 envelope built in it.
 /// @return Populated NoiseHandshakeResult (session + msg2_text to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
-std::optional<NoiseHandshakeResult> run_rehandshake_msg1(std::string_view msg1_json,
-                                                         const std::string& server_id,
-                                                         const Identity& identity,
-                                                         const RecordStore& record_store,
-                                                         const std::string& suite_name,
-                                                         const std::array<uint8_t, 32>& prior_h);
+std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
+    std::string_view msg1_json, const std::string& server_id, const Identity& identity,
+    const RecordStore& record_store, const std::string& suite_name,
+    const std::array<uint8_t, 32>& prior_h, SendspinArenaAllocator& arena);
 
 // ============================================================================
 // NoiseHandshake class (initial handshake state machine)
@@ -123,8 +125,10 @@ public:
     /// @brief Construct the handshake driver.
     /// @param record_store Record store for psk_id resolution (read-only on protocol task).
     /// @param suite_name   Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
+    /// @param arena        The client's JSON arena, which every frame the handshake parses or
+    ///                     builds is allocated from; outlives the handshake.
     NoiseHandshake(const Identity& identity, const RecordStore& record_store,
-                   const std::string& suite_name);
+                   const std::string& suite_name, SendspinArenaAllocator& arena);
 
     ~NoiseHandshake() = default;
 
@@ -209,6 +213,7 @@ private:
     // Pointer fields
     // Reference members, grouped with pointers: both are non-owning indirections to
     // another object.
+    SendspinArenaAllocator& arena_;
     const Identity& identity_;
     const RecordStore& record_store_;
 

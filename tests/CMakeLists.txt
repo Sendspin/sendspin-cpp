@@ -28,6 +28,7 @@ add_executable(sendspin_tests
     test_encrypted_lifecycle.cpp
     test_time_filter.cpp
     test_protocol.cpp
+    test_json_arena.cpp
     test_network_info.cpp
     test_thread_safe_queue.cpp
     test_shared_ring_buffer.cpp
@@ -142,6 +143,11 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # also bind a VisualizerRole::Impl to the same ring, to show one holder's quota does not stop the
 # other.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
+
+# test_json_arena.cpp reads SendspinArenaAllocator's base_, cap_ and offset_: where the bump
+# pointer stands and whether a freed block's bytes, still inside the backing buffer, were wiped
+# are the allocator's whole contract, and nothing on its public surface reports either.
+set_source_files_properties(test_json_arena.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_inbound_ring.cpp sets InboundGate's private CONSUMED bit directly to stage a consume bit
 # that lands after the transport has published its next message, an interleaving of two threads

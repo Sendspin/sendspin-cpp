@@ -13,10 +13,14 @@
 // limitations under the License.
 
 /// @file test_util.h
-/// @brief Shared test helpers: hex encoding/decoding for KAT comparisons, and the big-endian
-/// appenders the binary role messages are built with.
+/// @brief Shared test helpers: hex encoding/decoding for KAT comparisons, the big-endian
+/// appenders the binary role messages are built with, and the JSON arena the message builders
+/// take.
 
 #pragma once
+
+#include "platform/json_arena.h"
+#include "sendspin/config.h"
 
 #include <algorithm>
 #include <array>
@@ -85,3 +89,18 @@ inline void put_be32(std::vector<uint8_t>& out, uint32_t val) {
         out.push_back(static_cast<uint8_t>((val >> (8 * i)) & 0xFF));
     }
 }
+
+/// A fresh arena sized like the client's default, for the message builders (the format_*()
+/// family) and the Noise handshake. Used as a temporary for one builder call
+/// (`format_client_leave_message(TestArena())`) or as a local where the arena must outlive the
+/// call (a NoiseHandshake keeps a reference), so no two tests share one. Anything that keeps the
+/// reference must take a named TestArena: the conversion operator would bind it to a temporary
+/// destroyed at the end of the full expression.
+struct TestArena {
+    sendspin::SendspinArenaAllocator arena{sendspin::SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE};
+
+    // NOLINTNEXTLINE(google-explicit-constructor): stands in for the arena at every call site.
+    operator sendspin::SendspinArenaAllocator&() {
+        return this->arena;
+    }
+};

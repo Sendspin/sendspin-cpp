@@ -40,6 +40,7 @@
 namespace sendspin {
 
 // Forward declarations
+class SendspinArenaAllocator;
 class SendspinClient;
 class SendspinConnection;
 class SendspinServerConnection;
@@ -192,8 +193,8 @@ struct NurseryEntry {
 /// @brief One admitted connection and the roles it owns
 ///
 /// Every role this client drives has at most one owner among the admitted connections: role
-/// dispatch, send_text() routing and the client/state role objects all gate on ownership rather
-/// than on admission alone. Protocol task only.
+/// dispatch, role-message routing (send_role_text()) and the client/state role objects all gate
+/// on ownership rather than on admission alone. Protocol task only.
 struct AdmittedEntry {
     /// The admitted connection; null for a free slot.
     std::shared_ptr<SendspinConnection> conn;
@@ -490,8 +491,15 @@ public:
     void leave();
 
     /// @brief Sends a role message to the admitted connection that owns `role`
-    /// (SendspinClient::send_text()).
+    /// (SendspinClient::send_text(), and the controller commands
+    /// SendspinClient::send_controller_command() queues).
     void send_role_text(SendspinRole role, const std::string& text) const;
+
+    /// @brief The connection a role message goes to: the admitted, connected owner of `role`
+    /// once its server/activate has arrived, or nullptr (logged) when the message must be dropped.
+    /// The gate send_role_text() applies, for a caller that builds the message only once it knows
+    /// it will be sent. Protocol task only.
+    SendspinConnection* role_send_target(SendspinRole role) const;
 
     /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window(), the operator
     /// gesture). If an attempt is already waiting in AWAIT_PAIRING_WINDOW, the window admits it
@@ -686,6 +694,12 @@ private:
     // ========================================
     // Connection setup
     // ========================================
+
+    /// @brief The client's JSON arena, which every message the manager builds is built in. The
+    /// arena lives as long as the client, so handing out the reference is safe from any thread
+    /// (on_new_connection() gives it to an inbound connection on its delivery thread); building
+    /// in it is protocol task only.
+    SendspinArenaAllocator& json_arena() const;
 
     /// @brief Attaches message callbacks and the inbound ring to a connection.
     void setup_connection_callbacks(SendspinConnection* conn);

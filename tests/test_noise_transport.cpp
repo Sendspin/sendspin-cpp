@@ -39,6 +39,7 @@
 #include "sendspin/config.h"
 #include "sendspin/types.h"
 #include "time_burst.h"
+#include "test_util.h"
 
 #include <gtest/gtest.h>
 
@@ -256,7 +257,8 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     // -----------------------------------------------------------------
     // Create the NoiseHandshake (our responder driver)
     // -----------------------------------------------------------------
-    NoiseHandshake nh(client_id, rs, suite_name);
+    TestArena arena;
+    NoiseHandshake nh(client_id, rs, suite_name, arena);
 
     // Step 1: client sends client/init
     std::string client_init = nh.build_client_init();
@@ -510,7 +512,8 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     rec.server_id = other_server.peer_id();  // bound to other_server
     rs.store_record_superseding(std::move(rec), {});
 
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    TestArena arena;
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY), arena);
 
     std::string client_init = nh.build_client_init();
     std::string server_init_text = make_server_init(server_id.peer_id());
@@ -573,7 +576,8 @@ Msg1Outcome run_msg1_with_payload(
         rs.store_record_superseding(std::move(rec), {});
     }
 
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    TestArena arena;
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY), arena);
     const std::string client_init = nh.build_client_init();
     const std::string server_init_text = make_server_init(server_id.peer_id());
     const std::string prologue_str = client_init + server_init_text;
@@ -703,7 +707,8 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingServerInitAborts) {
     Identity client_id = Identity::generate().value();
     RecordStore rs(nullptr);
 
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    TestArena arena;
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY), arena);
     nh.build_client_init();
 
     auto r = nh.on_text_frame(R"({"type":"server/error","payload":{"reason":"unsupported_suite"}})",
@@ -718,7 +723,8 @@ TEST(NoiseHandshakeDriver, AbortWithoutServerErrorReportsNoReason) {
     Identity client_id = Identity::generate().value();
     RecordStore rs(nullptr);
 
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    TestArena arena;
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY), arena);
     nh.build_client_init();
 
     auto r = nh.on_text_frame(R"({"type":"server/init","payload":{"version":99}})",
@@ -734,7 +740,8 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
     Identity server_id = Identity::generate().value();
     RecordStore rs(nullptr);
 
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    TestArena arena;
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY), arena);
     nh.build_client_init();
     ASSERT_EQ(nh.on_text_frame(make_server_init(server_id.peer_id()),
                                [](const std::string&) { return true; }),
@@ -780,7 +787,8 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
         Identity server_id = Identity::generate().value();
         RecordStore rs(nullptr);
 
-        NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+        TestArena arena;
+        NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY), arena);
         nh.build_client_init();
 
         std::string peer_id = server_id.peer_id();
@@ -1162,7 +1170,9 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     Identity server_id = Identity::generate().value();
     RecordStore rs(nullptr);
 
+    TestArena arena;  // Declared before the connection, which keeps a pointer to it.
     TestConnection conn;
+    conn.set_json_arena(arena);
     conn.init_noise_handshake(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
     conn.send_noise_client_init();
     ASSERT_EQ(conn.sent_text_.size(), 1u);
@@ -1615,7 +1625,8 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
         Identity server_id = Identity::generate().value();
         RecordStore rs(nullptr);
 
-        NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+        TestArena arena;
+        NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY), arena);
         const std::string client_init = nh.build_client_init();
         const std::string server_init_text = make_server_init(server_id.peer_id());
         auto send_fn = [](const std::string&) { return true; };

@@ -179,6 +179,7 @@ void ProtocolTask::clear_command(ProtocolCommand& command) {
     command.connection.reset();
     command.text.clear();
     command.text.shrink_to_fit();
+    command.controller_command = {};
     command.type = ProtocolCommandType::SEND_TEXT;
     command.reason = SendspinGoodbyeReason::SHUTDOWN;
     command.role = SendspinRole::CONTROLLER;
