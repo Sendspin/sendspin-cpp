@@ -426,7 +426,9 @@ public:
 
     /// @brief Returns true if an admitted connection is connected, has completed its handshake
     /// and has its latest server/activate applied. Any thread: reads a flag the protocol task
-    /// refreshes at the end of every tick (refresh_published_state()).
+    /// raises only at the end of a tick (publish_connected()), after every handler of that tick
+    /// has run, so a reader that sees it true also sees the trust the activation stored
+    /// (SendspinClient::get_current_trust()); refresh_published_state() lowers it at once.
     bool is_connected() const {
         return this->connected_.load(std::memory_order_acquire);
     }
@@ -584,9 +586,16 @@ public:
     uint32_t run_time_sync();
 
     /// @brief Refreshes what other threads read without a protocol-task lock: the time filter and
-    /// server-information slots (from primary()) and the connected flag. Called at the end of
-    /// every tick and after every change to the admitted array.
+    /// server-information slots (from primary()), and lowers the connected flag when no admitted
+    /// connection is operational. Called at the end of every tick and after every change to the
+    /// admitted array.
     void refresh_published_state();
+
+    /// @brief Publishes the connected flag (is_connected()) as it stands, raising it as well as
+    /// lowering it. Called only at the end of the tick, after refresh_published_state(): raised
+    /// mid-handler it would read true before the handler that made the connection operational
+    /// has stored the trust a reader checks next.
+    void publish_connected();
 
     /// @brief Whether admission is open: false from close_admission() until the next start().
     bool is_accepting() const {
@@ -628,6 +637,10 @@ public:
     /// owner of the player role, or the first admitted connection when no connection owns it.
     /// With MAX_ADMITTED 1 that is the admitted connection. nullptr when none is admitted.
     AdmittedEntry* primary();
+
+    /// @brief Whether an admitted connection is connected and operational: what is_connected()
+    /// publishes.
+    bool has_operational_connection() const;
 
     /// @brief The roles owned by every admitted connection but the one `except` holds (all of
     /// them for nullptr).
@@ -1052,8 +1065,8 @@ private:
     /// task, which refuses every accept and runs the shutdown pass once it reads false.
     std::atomic<bool> accepting_{false};
 
-    /// What is_connected() reports. Written by the protocol task (refresh_published_state()),
-    /// read from any thread.
+    /// What is_connected() reports. Written by the protocol task (raised by publish_connected(),
+    /// lowered by refresh_published_state() too), read from any thread.
     std::atomic<bool> connected_{false};
 
     /// @brief What other threads read of the primary admitted connection, written together

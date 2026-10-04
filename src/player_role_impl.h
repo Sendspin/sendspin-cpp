@@ -92,9 +92,15 @@ struct PlayerRole::Impl : RoleTeardown {
     /// @param ring The client's inbound ring for this run, which the sync task's item list links.
     bool start(SendspinPersistenceProvider* persistence, InboundRing* ring);
     void build_hello_fields(ClientHelloMessage& msg);
-    /// @brief The buffer_capacity client/hello advertises: the share of the quota that holds
-    /// encoded frames at the smallest frame size (see AUDIO_BUFFER_ADVERTISE_DENOMINATOR in
-    /// player_role.cpp), which also bounds the longest chunk the server sends.
+    /// @brief The share of the quota that holds encoded frames at the smallest frame size (see
+    /// AUDIO_BUFFER_ADVERTISE_DENOMINATOR in player_role.cpp): what the inbound ring's derivation
+    /// sizes the player's longest chunk from (SendspinClient::create_inbound_ring()), before the
+    /// ring, and so the bound advertised_buffer_capacity() applies, exists.
+    size_t buffer_capacity_share() const;
+    /// @brief The buffer_capacity client/hello advertises, which also bounds the longest chunk
+    /// the server sends: buffer_capacity_share(), at most the run's largest ring item
+    /// (largest_ring_item_bytes), so any one chunk the server may send fits an item even when it
+    /// arrives in several Noise frames and is copied into one. Inside a run only.
     size_t advertised_buffer_capacity() const;
     void build_state_fields(ClientStateMessage& msg) const;
     // Each handler takes the teardown generation the receive gate captured when it admitted the
@@ -207,6 +213,12 @@ struct PlayerRole::Impl : RoleTeardown {
     PlayerRoleListener* listener{nullptr};
     SendspinPersistenceProvider* persistence{nullptr};
     std::unique_ptr<SyncTask> sync_task;
+
+    // size_t fields
+    /// This run's InboundRing::max_item_message_bytes(), which caps advertised_buffer_capacity().
+    /// Written by start() on the main loop whether or not the sync task starts (a player with no
+    /// listener still advertises a buffer), before the protocol task that reads it starts.
+    size_t largest_ring_item_bytes{0};
 
     // 16-bit fields
     /// Written on the main loop (a server or consumer change, load_output_delay()); read there

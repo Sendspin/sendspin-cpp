@@ -18,9 +18,12 @@ checklists in `.claude/skills/` apply these standards to a diff.
   admission, role ownership, pairing, watchdogs, time bursts) and every send
   run there, so no connection state needs a lock (the transport's own atomics
   state their writer and reader at their declaration). Any other thread
-  reaches a connection only by queueing a `ProtocolCommand`; a request that
-  the full queue refuses is reported to the caller (`send_text()` returns
-  false) or logged, never dropped silently. A connection refused at delivery is left with
+  reaches a connection only by queueing a `ProtocolCommand` or, for an
+  idempotent latest-wins request (`connect_to()`, `disconnect()`, `leave()`,
+  the pairing-window gestures, an unpaired-access change), posting it to the
+  protocol task's request slot, which never refuses; a command that the full
+  queue refuses is reported to the caller (`send_text()` returns false) or
+  logged, never dropped silently. A connection refused at delivery is left with
   the transport that delivered it, which releases it after the delivery
   returns (on ESP, with its httpd session), so no refusal destroys a connection
   inside the delivery. Payload validation and
@@ -102,7 +105,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   time to its earliest deadline, or `ProtocolTask::NO_DEADLINE`, and never
   wakes on a fixed period. A transport's wait on the task is bounded too: an
   admitted connection waits at most `INBOUND_ACQUIRE_TIMEOUT_MS` for ring space
-  and drops the message with a warning, and an unadmitted one waits at most
+  and is closed with a warning, and an unadmitted one waits at most
   `InboundGate::WRITABLE_WAIT_MS` for its previous message to be consumed and
   is closed if it is not.
 - Every library lock is a leaf: it is held only to copy or update its own

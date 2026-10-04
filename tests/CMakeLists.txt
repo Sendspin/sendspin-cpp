@@ -80,21 +80,32 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # and SendspinConnection's noise_handshake_complete_ (a stand-in's finished handshake) and its
 # transport side, begin_inbound_message() and end_inbound_message() (a stand-in's transport writing
 # a ring item and a fallback message). The ring-size tables read SendspinClient::inbound_ring_ and
-# InboundRing::storage_, the ring a start() created, whose size no public call reports. The
+# InboundRing::storage_, the ring a start() created, whose size no public call reports, and build
+# the player_'s and visualizer_'s client/hello fields through their impl_, the buffer_capacity a
+# hello advertises, which no public call returns. The
 # next-deadline tables also stage each timer state against a fixed clock, which no public call can
 # do: ConnectionManager's liveness_timeout_us_, pairing_window_open_until_us_,
 # ws_server_start_retry_time_us_ and tick(); SendspinTimeBurst's burst_index_,
 # last_burst_complete_time_, pending_embedded_, current_message_sent_time_, send_retry_after_ms_
 # and pending_burst_completed_; and SendspinConnection's first_activate_received_ and
-# last_receive_time_us_. The stale-command and refused-delivery tests reach the queue through
-# protocol_task_ to push a command, or close admission, the way a race or stop() would. The reap
+# last_receive_time_us_. The stale-command and refused-delivery tests reach the queue and the
+# request slot through protocol_task_ to push a command or post a request, or close admission, the
+# way a race or stop() would, and read ConnectionManager::pairing_window_open() to see a posted
+# confirm applied. The reap
 # test releases an outbound attempt on the test thread (ConnectionManager's connect_to(),
 # disconnect() and scan_nursery()) and reads reaping_ and nursery_ right after, since only a
 # release no tick follows shows whether the release itself destroyed the connection, then
 # restarts the protocol task (protocol_task_->start()) for the request it takes from another
 # thread; its sibling for an opened connection reads the same two members around a release. The
-# full queue test seeds the controller's supported_commands word (stamped with its
-# cleanup_generation) so a send_command() reaches the queue. The teardown reorder table interleaves the protocol task
+# full queue table seeds the controller's supported_commands word (stamped with its
+# cleanup_generation) so a send_command() reaches the queue, turns the liveness check off
+# (liveness_timeout_us_) so its stand-in's silence does not close it, closes admission
+# (close_admission()) for the row that runs the tick stop() would, and reads
+# ConnectionManager::pairing_window_open(), nursery_ and reaping_ to see which pairing-window
+# gesture won and whether an outbound attempt opened or was released. The connected-flag test
+# calls SendspinClient::on_handshake_complete() and ConnectionManager::drop_connection() on its
+# stand-in, the two halves of an activation and a loss, to read is_connected() between them and
+# the end of the tick, which no public call can stop at. The teardown reorder table interleaves the protocol task
 # (and, for artwork, the decode thread) with the main loop, which no public call does on demand:
 # it calls each role's handler or teardown (the controller, metadata and color roles'
 # handle_server_state(), the player's handle_stream_start() and handle_server_command(), the

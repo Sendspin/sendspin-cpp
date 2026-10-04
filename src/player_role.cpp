@@ -254,6 +254,7 @@ bool PlayerRole::Impl::start(SendspinPersistenceProvider* persistence, InboundRi
     }
 
     this->persistence = persistence;
+    this->largest_ring_item_bytes = ring->max_item_message_bytes();
     this->load_output_delay();
 
     // A player with no listener has nowhere to write audio, so the sync task is not started and
@@ -285,7 +286,7 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::PLAYER);
 
     // Advertise the share of the quota that holds encoded frames at the smallest frame size, so
-    // the server's fill never overruns the quota
+    // the server's fill never overruns the quota, capped so its longest chunk fits one ring item
     PlayerSupportObject player_support = {
         .supported_formats = this->config.audio_formats,
         .buffer_capacity = this->advertised_buffer_capacity(),
@@ -293,9 +294,18 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.player_v1_support = std::move(player_support);
 }
 
-size_t PlayerRole::Impl::advertised_buffer_capacity() const {
+size_t PlayerRole::Impl::buffer_capacity_share() const {
     return this->config.audio_buffer_capacity * (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
            AUDIO_BUFFER_ADVERTISE_DENOMINATOR;
+}
+
+size_t PlayerRole::Impl::advertised_buffer_capacity() const {
+    // roles/player/v1.md "Player Buffer Accounting" lets the server send one chunk as long as the
+    // advertised capacity. One longer than a Noise frame arrives in fragments and is copied whole
+    // into a ring item (handle_binary()), which the ring's largest item bounds; with a large quota
+    // that bound is below the share (about 621 KB against 666,666 bytes by default), so the
+    // advertisement stops there rather than the ring growing for a chunk no stream needs.
+    return std::min(this->buffer_capacity_share(), this->largest_ring_item_bytes);
 }
 
 void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
@@ -362,8 +372,9 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t ge
         // through the fallback buffer (longer than the ring takes) is not in a ring item: copied
         // into one, whole, so its timestamp stays at plaintext bytes 1-8. No wait: audio over a
         // full ring is dropped, like audio over the quota. A chunk longer than the ring's largest
-        // item (half the storage) can never be copied in, which is a sizing fact, not a full
-        // ring, and is logged apart so a device log tells the two apart.
+        // item (half the storage) can never be copied in; only a server over the capacity the
+        // role advertises (advertised_buffer_capacity()) sends one, which is not a full ring, and
+        // it is logged apart so a device log tells the two apart.
         if (message.len > inbound.ring()->max_item_message_bytes()) {
             inbound.note_drop("received an audio chunk longer than the ring's largest item; "
                               "dropping");

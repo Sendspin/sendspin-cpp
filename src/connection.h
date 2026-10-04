@@ -127,6 +127,15 @@ public:
         this->cancel_time_frame();
     }
 
+    /// @brief Whether an application message may still be sent: the transport is connected and
+    /// the connection is not detached. A connection the manager releases (disconnect(), a drop)
+    /// is detached before its goodbye while its transport can still read as connected (the ESP
+    /// server's closed flag is set by httpd asynchronously), so this keeps a message the task
+    /// sends later from reaching the wire after the goodbye. Protocol task only.
+    bool accepts_app_sends() const {
+        return this->is_connected() && !this->inbound_gate_.is_detached();
+    }
+
     /// @brief Checks if the hello handshake has completed successfully
     /// @return true if handshake complete (hello exchange done), false otherwise.
     bool is_handshake_complete() const {
@@ -873,9 +882,8 @@ protected:
     /// begin_inbound_fragment() was asked about
     enum class InboundRoute : uint8_t {
         RECEIVE,  ///< Receive the bytes into InboundTarget::data, then end the message
-        /// Read and discard the bytes; the connection stays open (a detached connection, or an
-        /// admitted one's message that found no ring item or fallback buffer in time; see
-        /// route_to_fallback() for the ESP server's exception).
+        /// Read and discard the bytes (a detached or unattached connection, or the rest of a
+        /// multi-frame message one of those began)
         DROP,
         CLOSE,  ///< Close the connection: fail_inbound() has already run
     };
@@ -934,9 +942,10 @@ protected:
     /// @brief Chooses the destination for a complete message of `len` bytes. Transport thread.
     ///
     /// An admitted connection receives straight into a ring item it acquires here, waiting up to
-    /// INBOUND_ACQUIRE_TIMEOUT_MS for room, and drops the message with a warning when there is
-    /// none; a message longer than INBOUND_MAX_MESSAGE_BYTES closes the connection, since no
-    /// conforming peer sends one (the Noise layer fragments), and one longer than the ring takes
+    /// INBOUND_ACQUIRE_TIMEOUT_MS for room, and is closed with a warning when there is none,
+    /// since a frame never decrypted leaves the Noise receive nonce behind; a message longer than
+    /// INBOUND_MAX_MESSAGE_BYTES closes the connection, since no conforming peer sends one (the
+    /// Noise layer fragments), and one longer than the ring takes
     /// (InboundRing::max_message_bytes()) goes to route_to_fallback(), as does every message of
     /// an unadmitted connection; one over InboundGate::PRE_ADMISSION_MESSAGE_BYTES closes it. A
     /// detached or unattached connection drops everything.
@@ -948,10 +957,9 @@ protected:
     ///
     /// An unadmitted connection waits up to InboundGate::WRITABLE_WAIT_MS and is closed when the
     /// wait times out (wait_until_writable()). An admitted connection's message, one longer than
-    /// the ring takes, waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and is then
-    /// dropped with the same throttled warning, the connection left open; except on the ESP
-    /// server, which must drain the frame into a discard buffer sized to the longest message the
-    /// ring takes, so every admitted fallback drop closes the connection there.
+    /// the ring takes, waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and then
+    /// closes the connection with a warning, for the same reason a full ring does (a detached
+    /// connection's message is dropped instead).
     /// @return RECEIVE into the buffer; DROP or CLOSE as above; an allocation failure closes.
     InboundTarget route_to_fallback(size_t len, InboundKind kind, uint32_t stamp, bool admitted);
 
@@ -1190,10 +1198,6 @@ protected:
     /// Written from the transport connected callback (transport thread), read by the manager on
     /// the protocol task, hence atomic. See mark_ws_upgraded().
     std::atomic<bool> ws_upgraded_{false};
-
-    /// Throttles the drop warnings in route_inbound_message() and route_to_fallback(). Transport
-    /// thread only.
-    InboundDropLog acquire_drop_log_;
 
     /// The kind of the message in fallback_buf_ (TEXT or BINARY: a continuation frame does not
     /// carry the type its message started with). Same threads as fallback_len_.

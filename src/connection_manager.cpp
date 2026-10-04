@@ -507,7 +507,7 @@ void ConnectionManager::leave() {
     // awaiting its next activation while it keeps the admitted slot.
     AdmittedEntry* entry = this->primary();
     SendspinConnection* conn = entry != nullptr ? entry->conn.get() : nullptr;
-    if (conn == nullptr || !conn->is_connected() || !conn->first_activate_received()) {
+    if (conn == nullptr || !conn->accepts_app_sends() || !conn->first_activate_received()) {
         SS_LOGW(TAG, "client/leave ignored: no activated connection with a group to leave");
         return;
     }
@@ -529,7 +529,7 @@ SendspinConnection* ConnectionManager::role_send_target(SendspinRole role) const
     // activate that adds it does not by itself affect active_roles, so an active role keeps
     // driving its own traffic across the attempt.
     SendspinConnection* conn = this->role_owner(role);
-    if (conn == nullptr || !conn->is_connected()) {
+    if (conn == nullptr || !conn->accepts_app_sends()) {
         SS_LOGD(TAG, "Dropping a %s message: no admitted connection owns the role", to_cstr(role));
         return nullptr;
     }
@@ -1050,14 +1050,24 @@ void ConnectionManager::refresh_published_state() {
         }
     }
 
-    bool connected = false;
+    // Only ever lowered here: a loss is reported as soon as the slots stop naming the connection,
+    // while connected is raised by publish_connected() at the end of the tick.
+    if (!this->has_operational_connection()) {
+        this->connected_.store(false, std::memory_order_release);
+    }
+}
+
+void ConnectionManager::publish_connected() {
+    this->connected_.store(this->has_operational_connection(), std::memory_order_release);
+}
+
+bool ConnectionManager::has_operational_connection() const {
     for (const auto& entry : this->admitted_) {
         if (entry.conn != nullptr && entry.conn->is_connected() && entry.conn->is_operational()) {
-            connected = true;
-            break;
+            return true;
         }
     }
-    this->connected_.store(connected, std::memory_order_release);
+    return false;
 }
 
 void ConnectionManager::shutdown() {

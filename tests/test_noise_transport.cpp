@@ -1937,10 +1937,11 @@ struct InboundHarness {
 // flight before the protocol task has consumed it. An unadmitted connection, which never writes
 // into the shared ring, waits up to InboundGate::WRITABLE_WAIT_MS for that and is then closed
 // rather than parking the transport thread. An admitted connection's message longer than the ring
-// takes waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and is then dropped like
-// one, the connection left open. The Control rows consume the first message in time. The two
-// rows that leave the first message pending wait out those bounds (about 600 ms together): the
-// bound running out is the behavior under test.
+// takes waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and then closes the
+// connection too: a frame never received and decrypted would leave the Noise receive nonce
+// behind. Either way the message in flight is kept. The Control rows consume the first message in
+// time. The two rows that leave the first message pending wait out those bounds (about 600 ms
+// together): the bound running out is the behavior under test.
 TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
     struct Row {
         const char* name;
@@ -1956,7 +1957,7 @@ TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
         {"Control: admitted, consumed before the next arrives", true, true,
          TestConnection::InboundRoute::RECEIVE},
         {"admitted, the next arrives while the first is pending", true, false,
-         TestConnection::InboundRoute::DROP},
+         TestConnection::InboundRoute::CLOSE},
     };
 
     for (const Row& row : rows) {
@@ -1985,6 +1986,51 @@ TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
         EXPECT_EQ(std::vector<uint8_t>(pending.data, pending.data + pending.len), expected)
             << "the message in flight was overwritten or lost";
         const bool closed = row.second_route == TestConnection::InboundRoute::CLOSE;
+        EXPECT_EQ(h.conn.close_transport_now_calls_, closed ? 1 : 0);
+        EXPECT_EQ(h.conn.inbound_gate().is_detached(), closed);
+    }
+}
+
+// An admitted connection's message that finds no ring item within INBOUND_ACQUIRE_TIMEOUT_MS
+// closes the connection rather than being dropped: a frame never received and decrypted would
+// leave the Noise receive nonce behind. Messages of the longest size the ring takes arrive with
+// nothing taken until one finds no room; the Control row takes and returns each item, as the
+// protocol task does, so the ring never fills. The closing row waits out the bound once (about
+// 100 ms): the bound running out is the behavior under test.
+TEST(InboundReceive, AnAdmittedMessageWithNoRingSpaceClosesTheConnection) {
+    struct Row {
+        const char* name;
+        bool take_each;
+        TestConnection::InboundRoute last_route;
+    };
+    const Row rows[] = {
+        {"Control: each item taken before the next arrives", true,
+         TestConnection::InboundRoute::RECEIVE},
+        {"nothing taken until the ring is full", false, TestConnection::InboundRoute::CLOSE},
+    };
+    constexpr int MAX_MESSAGES = 8;
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h(inbound_ring_min_storage_bytes(INBOUND_JSON_MESSAGE_BYTES));
+        h.conn.set_admitted(true);
+        const std::vector<uint8_t> message(h.ring.max_message_bytes(), 0x5A);
+        TestConnection::InboundRoute route = TestConnection::InboundRoute::RECEIVE;
+        int received = 0;
+        for (; received < MAX_MESSAGES; ++received) {
+            route = h.receive(message);
+            if (route != TestConnection::InboundRoute::RECEIVE) {
+                break;
+            }
+            if (row.take_each) {
+                size_t taken_len = 0;
+                void* item = h.ring.take(&taken_len, 0);
+                ASSERT_NE(item, nullptr) << "message " << received << " never reached the ring";
+                h.conn.inbound_gate().note_item_taken();
+                h.ring.return_item(item);
+            }
+        }
+        EXPECT_EQ(route, row.last_route) << "after " << received << " messages";
+        const bool closed = row.last_route == TestConnection::InboundRoute::CLOSE;
         EXPECT_EQ(h.conn.close_transport_now_calls_, closed ? 1 : 0);
         EXPECT_EQ(h.conn.inbound_gate().is_detached(), closed);
     }

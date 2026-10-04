@@ -108,14 +108,15 @@ private:
 static constexpr uint32_t INBOUND_LIST_END = UINT32_MAX;
 
 /// Bound on a transport's InboundRing::acquire() for an admitted connection's message, after
-/// which the message is dropped with a warning; the protocol task's own acquires for a codec
-/// header or a marker wait the same bound. An acquire waits only while the protocol task is
-/// behind on taking items or ring-order reclamation holds space behind the oldest held item (see
-/// derive_inbound_ring_bytes()). Sized at the bottom of the 100-200 ms stall budget the library's
-/// threads are held to: longer than a tick running a Noise handshake's DH operations (tens of
-/// milliseconds on an ESP32), so a busy task does not cost a message, and short enough that a
-/// stalled one costs a dropped message rather than a parked transport, which on ESP is the httpd
-/// task every inbound session shares.
+/// which the connection is closed with a warning (a frame never decrypted leaves the Noise receive
+/// nonce behind, so the connection could not continue past it); the protocol task's own acquires
+/// for a codec header or a marker wait the same bound. An acquire waits only while the protocol
+/// task is behind on taking items or ring-order reclamation holds space behind the oldest held item
+/// (see derive_inbound_ring_bytes()). Sized at the bottom of the 100-200 ms stall budget the
+/// library's threads are held to: longer than a tick running a Noise handshake's DH operations
+/// (tens of milliseconds on an ESP32), so a busy task does not cost a connection, and short enough
+/// that a stalled one costs the connection rather than a parked transport, which on ESP is the
+/// httpd task every inbound session shares.
 static constexpr uint32_t INBOUND_ACQUIRE_TIMEOUT_MS = 100;
 
 /// The largest WebSocket message a conforming peer sends: one Noise transport frame, plaintext
@@ -994,9 +995,11 @@ static constexpr size_t inbound_held_message_bytes(size_t advertised_capacity) {
 /// the player's and the visualizer's longest message (inbound_held_message_bytes()); with the
 /// artwork role a maximal Noise frame, since its images arrive in maximal frames
 /// (roles/artwork/v1.md "Artwork (Binary)").
-/// @param player_message_bytes inbound_held_message_bytes() of the player's advertised capacity,
-///        0 without the player.
-/// @param visualizer_message_bytes The same for the visualizer.
+/// @param player_message_bytes inbound_held_message_bytes() of the player's share of its quota
+///        (PlayerRole::Impl::buffer_capacity_share(), which the capacity it advertises never
+///        exceeds), 0 without the player.
+/// @param visualizer_message_bytes inbound_held_message_bytes() of the visualizer's advertised
+///        capacity, 0 without the visualizer.
 /// @param artwork Whether the artwork role is enabled.
 static constexpr size_t inbound_largest_message_bytes(size_t player_message_bytes,
                                                       size_t visualizer_message_bytes,
@@ -1081,7 +1084,7 @@ static constexpr size_t INBOUND_STATE_BYTES_PER_SECOND = 1024;
 /// The shortest track the artwork budget assumes: one track change, and so one new image per
 /// artwork channel, every 30 seconds. An assumption about listening, not a protocol bound: a
 /// listener skipping tracks faster than this pins more images than budgeted, which the transport
-/// reports as "ring pinned behind held items".
+/// reports as "ring pinned behind held items" when it closes the connection.
 static constexpr size_t INBOUND_MIN_TRACK_SECONDS = 30;
 
 /// @brief The configuration figures the ring size is derived from
@@ -1165,15 +1168,17 @@ static constexpr size_t inbound_hold_seconds(size_t held_bytes, size_t stored_by
  * and the player's longest chunk in between. A longer message goes through the connection's
  * fallback buffer (InboundGate). A chunk or frame not in a ring item is copied into one bounded
  * by the ring's largest item alone (InboundRing::max_item_message_bytes(), half the storage):
- * audio and visualizer messages up to one Noise frame always fit, and one reassembled from
- * several frames that is longer than half the ring is dropped with a warning naming that.
+ * audio and visualizer messages up to one Noise frame always fit, and each stream role
+ * advertises a buffer of at most that bound (PlayerRole::Impl::advertised_buffer_capacity()), so
+ * only a server over its advertised buffer sends one reassembled from several frames that is
+ * longer, which is dropped with a warning naming that.
  *
  * Traffic beyond this budget (a burst of large JSON, a lower audio rate or a sparser visualizer
- * stream than budgeted, faster track changes) waits in the transport's acquire and is dropped
- * after INBOUND_ACQUIRE_TIMEOUT_MS with a warning naming the held items. The derivation assumes a
- * server's visualizer lead never exceeds its audio lead: otherwise audio returned as it plays
- * would stay pinned behind the oldest visualizer frame, which nothing in the configuration
- * bounds.
+ * stream than budgeted, faster track changes) waits in the transport's acquire and, after
+ * INBOUND_ACQUIRE_TIMEOUT_MS, closes the connection with a warning naming the held items. The
+ * derivation assumes a server's visualizer lead never exceeds its audio lead: otherwise audio
+ * returned as it plays would stay pinned behind the oldest visualizer frame, which nothing in the
+ * configuration bounds.
  *
  * With the default configuration (a 1,000,000-byte player quota, no visualizer or artwork) this
  * is 1,000,000 + 111,552 held pass-through bytes (87 s at 1,024 B/s, plus 9 bursts of 8 time

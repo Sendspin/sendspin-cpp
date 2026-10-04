@@ -36,9 +36,6 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.connection";
 
-/// What acquire_drop_log_'s run reports.
-static const char* const DROPPED_MESSAGES = "messages for want of inbound space";
-
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -51,11 +48,7 @@ SendspinConnection::SendspinConnection() {
         });
 }
 
-SendspinConnection::~SendspinConnection() {
-    // The last reference is gone, so no transport callback can still run on this connection:
-    // the drop log is this thread's now, and no delivery will end its run.
-    this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
-}
+SendspinConnection::~SendspinConnection() = default;
 
 // ============================================================================
 // Transport frames
@@ -559,27 +552,28 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
     void* item = this->inbound_ring_->acquire(len, INBOUND_ACQUIRE_TIMEOUT_MS);
     if (item == nullptr) {
         this->inbound_gate_.abandon_ring_write();
-        // Throttled: see InboundDropLog. Reclamation is in ring order, so with the player or the
-        // visualizer holding items the space behind the oldest of them is what ran out (see
-        // derive_inbound_ring_bytes()): said so, to tell that limit from a stalled protocol task.
-        if (this->acquire_drop_log_.note_drop()) {
-            const size_t held = this->inbound_ring_->quota(InboundHolder::PLAYER).outstanding() +
-                                this->inbound_ring_->quota(InboundHolder::VISUALIZER).outstanding();
-            if (held > 0) {
-                SS_LOGW(TAG,
-                        "No inbound ring space for a %zu-byte message within %u ms: ring pinned "
-                        "behind held items (%zu bytes held); dropping until there is",
-                        len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), held);
-            } else {
-                SS_LOGW(TAG,
-                        "No inbound ring space for a %zu-byte message within %u ms; dropping "
-                        "until there is",
-                        len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS));
-            }
+        // A frame the transport never decrypts leaves the Noise receive nonce behind, so the
+        // connection cannot continue past it and is closed here rather than at its next frame.
+        // Reclamation is in ring order, so with the player or the visualizer holding items the
+        // space behind the oldest of them is what ran out (see derive_inbound_ring_bytes()):
+        // said so, to tell that limit from a stalled protocol task (docs/internals.md "The
+        // Inbound Ring").
+        const size_t held = this->inbound_ring_->quota(InboundHolder::PLAYER).outstanding() +
+                            this->inbound_ring_->quota(InboundHolder::VISUALIZER).outstanding();
+        if (held > 0) {
+            SS_LOGW(TAG,
+                    "No inbound ring space for a %zu-byte message within %u ms: ring pinned "
+                    "behind held items (%zu bytes held); closing the connection",
+                    len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), held);
+        } else {
+            SS_LOGW(TAG,
+                    "No inbound ring space for a %zu-byte message within %u ms; closing the "
+                    "connection",
+                    len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS));
         }
-        return {nullptr, InboundRoute::DROP};
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
     }
-    this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
     InboundItemHeader* header = inbound_item_header(item);
     header->connection_id = static_cast<uint32_t>(this->instance_id);
     header->receive_time_us = stamp;
@@ -594,15 +588,20 @@ SendspinConnection::InboundTarget SendspinConnection::route_to_fallback(size_t l
                                                                         bool admitted) {
     if (admitted) {
         // An admitted connection's message waits for the buffer no longer than one waits for
-        // ring space, and is dropped rather than the connection closed, as a full ring drops it.
+        // ring space, and then closes the connection, as a full ring does: a frame the transport
+        // never decrypts leaves the Noise receive nonce behind, so the connection cannot continue
+        // past it and is closed here rather than at its next frame. A detached connection's
+        // message is dropped, its connection already on its way out.
         if (!this->inbound_gate_.wait_until_writable(INBOUND_ACQUIRE_TIMEOUT_MS)) {
-            if (!this->inbound_gate_.is_detached() && this->acquire_drop_log_.note_drop()) {
-                SS_LOGW(TAG,
-                        "Fallback buffer still holds the previous message after %u ms; dropping "
-                        "a %zu-byte message until it is free",
-                        static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), len);
+            if (this->inbound_gate_.is_detached()) {
+                return {nullptr, InboundRoute::DROP};
             }
-            return {nullptr, InboundRoute::DROP};
+            SS_LOGW(TAG,
+                    "Fallback buffer still holds the previous message after %u ms; closing the "
+                    "connection for a %zu-byte message",
+                    static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), len);
+            this->fail_inbound();
+            return {nullptr, InboundRoute::CLOSE};
         }
     } else {
         const InboundRoute waited = this->wait_until_writable();
@@ -615,9 +614,6 @@ SendspinConnection::InboundTarget SendspinConnection::route_to_fallback(size_t l
         SS_LOGE(TAG, "Failed to allocate %zu bytes for a fallback message; closing", len);
         this->fail_inbound();
         return {nullptr, InboundRoute::CLOSE};
-    }
-    if (admitted) {
-        this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
     }
     this->fallback_len_ = len;
     this->fallback_kind_ = kind;

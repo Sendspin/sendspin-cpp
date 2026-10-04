@@ -297,6 +297,9 @@ void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
 }
 
 size_t VisualizerRole::Impl::advertised_buffer_capacity() const {
+    // Unlike the player's, never capped at the ring's largest item, since it never reaches it:
+    // the ring holds the whole quota (derive_inbound_ring_bytes()), so its largest item, half the
+    // storage, is over half the quota, while this is a seventh of it.
     return this->visualizer_support.buffer_capacity / BUFFER_ADVERTISE_DIVISOR;
 }
 

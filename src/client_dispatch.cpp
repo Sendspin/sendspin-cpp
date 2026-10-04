@@ -94,9 +94,19 @@ namespace {
 uint32_t SendspinClient::protocol_tick() {
     ConnectionManager& manager = *this->connection_manager_;
 
-    // 1. Commands, in the order they were queued. Each command's resources (a connection, a
-    //    lease) are released as the next take replaces it.
+    // 1. The lifecycle requests posted since the last tick, then the commands in the order they
+    //    were queued. A request and a command arriving between the same two ticks are not
+    //    ordered against each other, since a request is a slot rather than a queue entry; the
+    //    requests go first. A send queued ahead of a disconnect() is therefore dropped, since the
+    //    disconnect detaches the connection it addresses (ConnectionManager::role_send_target()),
+    //    while an accept queued ahead of it still enters the nursery: a disconnect addresses the
+    //    connections it finds, not a newcomer. Each command's connection is released as the next
+    //    take replaces it.
     {
+        LifecycleRequests requests;
+        if (this->protocol_task_->take_requests(requests)) {
+            this->apply_lifecycle_requests(requests);
+        }
         ProtocolCommand command;
         while (this->protocol_task_->take_command(command)) {
             this->handle_command(command);
@@ -219,11 +229,49 @@ uint32_t SendspinClient::protocol_tick() {
     uint32_t next_deadline = manager.tick(platform_time_us());
     next_deadline = std::min(next_deadline, manager.run_time_sync());
     manager.refresh_published_state();
+    manager.publish_connected();
     if (!ring_drained || fallback_due) {
         next_deadline = 0;
     }
     // The snapshot's references drop here; see ConnectionManager::snapshot_connections().
     return next_deadline;
+}
+
+void SendspinClient::apply_lifecycle_requests(const LifecycleRequests& requests) {
+    ConnectionManager& manager = *this->connection_manager_;
+    // The gate handle_command() applies to every consumer command, for the same reason.
+    if (!manager.is_accepting()) {
+        SS_LOGD(TAG, "Dropping lifecycle requests: the client is stopping");
+        return;
+    }
+    // Ahead of the disconnect, which leaves no connection for the others to act on: the setting
+    // and the window are applied to the connections as they stand, and the client/leave reaches
+    // the server before the goodbye that follows it. The connect comes last: a connect waiting
+    // beside a disconnect was posted after it (LifecycleRequests), so it opens the new attempt
+    // the disconnect must not release.
+    if (requests.unpaired_access_changed) {
+        manager.apply_unpaired_access_change(
+            this->unpaired_access_enabled_.load(std::memory_order_acquire));
+    }
+    switch (requests.pairing_window) {
+        case PairingWindowRequest::NONE:
+            break;
+        case PairingWindowRequest::CONFIRM:
+            manager.open_pairing_window();
+            break;
+        case PairingWindowRequest::CANCEL:
+            manager.cancel_pairing_window();
+            break;
+    }
+    if (requests.leave) {
+        manager.leave();
+    }
+    if (requests.disconnect.has_value()) {
+        manager.disconnect(requests.disconnect.value());
+    }
+    if (requests.connect_to.has_value()) {
+        manager.connect_to(requests.connect_to.value());
+    }
 }
 
 void SendspinClient::handle_command(ProtocolCommand& command) {
@@ -232,14 +280,8 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
         case ProtocolCommandType::ACCEPT_CONNECTION:
             manager.accept(std::move(command.connection));
             return;
-        case ProtocolCommandType::CONNECT_TO:
-        case ProtocolCommandType::DISCONNECT:
-        case ProtocolCommandType::LEAVE:
-        case ProtocolCommandType::PAIRING_WINDOW_CANCEL:
-        case ProtocolCommandType::PAIRING_WINDOW_CONFIRM:
         case ProtocolCommandType::SEND_CONTROLLER_COMMAND:
         case ProtocolCommandType::SEND_TEXT:
-        case ProtocolCommandType::SET_UNPAIRED_ACCESS:
             break;
     }
     // A consumer request that reaches the task once admission is closed belongs to a run that
@@ -251,21 +293,6 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
         return;
     }
     switch (command.type) {
-        case ProtocolCommandType::CONNECT_TO:
-            manager.connect_to(command.text);
-            break;
-        case ProtocolCommandType::DISCONNECT:
-            manager.disconnect(command.reason);
-            break;
-        case ProtocolCommandType::LEAVE:
-            manager.leave();
-            break;
-        case ProtocolCommandType::PAIRING_WINDOW_CANCEL:
-            manager.cancel_pairing_window();
-            break;
-        case ProtocolCommandType::PAIRING_WINDOW_CONFIRM:
-            manager.open_pairing_window();
-            break;
         case ProtocolCommandType::SEND_CONTROLLER_COMMAND: {
             // Formatted here rather than on the caller's thread so the document is built in the
             // task's JSON arena, and only once the gate a "controller" send_text() meets has
@@ -280,9 +307,6 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
         }
         case ProtocolCommandType::SEND_TEXT:
             manager.send_role_text(command.role, command.text);
-            break;
-        case ProtocolCommandType::SET_UNPAIRED_ACCESS:
-            manager.apply_unpaired_access_change(command.enabled);
             break;
         case ProtocolCommandType::ACCEPT_CONNECTION:
             // Handled above.

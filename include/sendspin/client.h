@@ -248,6 +248,7 @@ enum class LogLevel : uint8_t {
 class ConnectionManager;
 class InboundRing;
 struct InboundMessage;
+struct LifecycleRequests;
 struct PairingUiSnapshot;
 struct ProtocolCommand;
 class ProtocolTask;
@@ -364,21 +365,31 @@ public:
     ///
     /// Ignored (with a warning) unless the client is running, including from a callback fired
     /// inside stop(). start() is where the identity and record store the Noise handshake needs
-    /// are created. Any thread: the request is queued to the library's protocol task, which
-    /// replaces any earlier outbound attempt; a full queue refuses it with a warning. Replacing an
-    /// attempt that is still connecting does not wait for its transport: the attempt is closed
-    /// without blocking and freed once its transport has finished, at the latest once its connect
-    /// bound has passed (30 s on host; on ESP-IDF three connect steps of 10 s each, plus whatever
-    /// a DNS lookup, which has no bound of its own, takes).
+    /// are created. Any thread: the request is posted to the library's protocol task, which
+    /// replaces any earlier outbound attempt. It is never refused, and a second call before the
+    /// task takes it replaces the URL. With disconnect(), the pair resolves by call order: a
+    /// connect_to() after a disconnect() opens the new attempt once the goodbyes are sent, and a
+    /// disconnect() after a connect_to() the task has not taken cancels it, so nothing opens. The
+    /// task applies both ahead of the sends queued since its last tick. Replacing an attempt that
+    /// is still connecting does not wait for its transport: the attempt is closed without
+    /// blocking and freed once its transport has finished, at the latest once its connect bound
+    /// has passed (30 s on host; on ESP-IDF three connect steps of 10 s each, plus whatever a DNS
+    /// lookup, which has no bound of its own, takes).
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
     /// @brief Disconnects from the current server with the given reason
     ///
     /// Ignored unless the client is running, including from a callback fired inside stop(). Any
-    /// thread: the request is queued to the protocol task, which sends the goodbyes; a full
-    /// queue refuses it with a warning. An outbound attempt still connecting is released the
-    /// same way connect_to() releases one it replaces, without waiting for its transport.
+    /// thread: the request is posted to the protocol task, which sends the goodbyes. It is never
+    /// refused, and a second call before the task takes it replaces the reason rather than
+    /// adding a second disconnect. With connect_to() it resolves by call order (see
+    /// connect_to()). The task applies it ahead of the commands queued since its last tick: a
+    /// send_text() or controller command queued before it in that window is dropped rather than
+    /// sent after the goodbye, while a connection a server delivered before it still enters the
+    /// nursery, since a disconnect addresses the current connections, not a newcomer. An outbound
+    /// attempt still connecting is released the same way connect_to() releases one it replaces,
+    /// without waiting for its transport.
     /// @param reason The goodbye reason to send
     void disconnect(SendspinGoodbyeReason reason);
 
@@ -576,7 +587,8 @@ public:
     }
 
     /// @brief Leaves the current group with messaging.md "client/leave". Any thread: the request
-    /// is queued to the protocol task.
+    /// is posted to the protocol task, never refused, and calls before the task takes it send one
+    /// client/leave.
     ///
     /// The client no longer wants to take part in its group's playback, for example while
     /// playing a local source. The
@@ -595,8 +607,11 @@ public:
     // ========================================
 
     /// @brief Signals that the operator performed the device pairing-window gesture.
-    /// Any thread: queued to the protocol task; ignored unless the client is running. Opens a
-    /// pairing window (pairing.md "Pairing Window"): a gesture-gated attempt
+    /// Any thread: posted to the protocol task, never refused; ignored unless the client is
+    /// running. With cancel_pairing_window(), whichever of the two is called last before the
+    /// task takes them is the one applied: a confirm then a cancel between two ticks does
+    /// nothing, not even the round-limit reset, and a cancel then a confirm starts a waiting
+    /// attempt. Opens a pairing window (pairing.md "Pairing Window"): a gesture-gated attempt
     /// already waiting proceeds immediately; otherwise the window stands open for 5 minutes and
     /// admits pairing attempts on one connection without a further gesture. It closes before
     /// those 5 minutes are up when a pairing under it succeeds, when the connection it is bound
@@ -605,16 +620,18 @@ public:
     void confirm_pairing_window();
 
     /// @brief Signals that the operator cancelled the pairing window.
-    /// Any thread: queued to the protocol task; ignored unless the client is running. Closes any
-    /// open window, one of the closing events pairing.md "Pairing Window"
-    /// defines, so the next gesture-gated attempt waits for a fresh gesture. An attempt still
-    /// withheld for that gesture ends with pair/abort reason user_cancelled; one already under
-    /// way runs to its own end.
+    /// Any thread: posted to the protocol task like confirm_pairing_window(), and the later of
+    /// the two called between two ticks is the only one applied (see confirm_pairing_window());
+    /// ignored unless the client is running. Closes any open window, one of the closing events
+    /// pairing.md "Pairing Window" defines, so the next gesture-gated attempt waits for a fresh
+    /// gesture. An attempt still withheld for that gesture ends with pair/abort reason
+    /// user_cancelled; one already under way runs to its own end.
     void cancel_pairing_window();
 
     /// @brief Turns unpaired access on or off; it is off until this is called. Any thread: the
     /// value takes effect at once for the next client/hello and admission, and the connections it
-    /// no longer fits are closed by the protocol task.
+    /// no longer fits are closed by the protocol task. Calls between two of its ticks collapse to
+    /// the latest: the task applies the value the last one set, once.
     ///
     /// pairing.md "Unpaired Access": servers with no pairing record may declare playback and
     /// activate roles only while it is on. Turning it off closes every connection that relies on
@@ -804,14 +821,18 @@ private:
     // Protocol task
     // ========================================
 
-    /// @brief The protocol task's work, in order: the command queue, the shutdown pass once
-    /// admission is closed, the client/state snapshot, the role lists' recall check, the
-    /// outbound handshakes, each managed connection's pending pre-admission message, the inbound
-    /// ring, the losses, the lifecycle scans, the time bursts, and the published slots
-    /// (docs/internals.md "The Protocol Task's Tick"). Protocol task only.
+    /// @brief The protocol task's work, in order: the lifecycle requests and the command queue,
+    /// the shutdown pass once admission is closed, the client/state snapshot, the role lists'
+    /// recall check, the outbound handshakes, each managed connection's pending pre-admission
+    /// message, the inbound ring, the losses, the lifecycle scans, the time bursts, and the
+    /// published slots (docs/internals.md "The Protocol Task's Tick"). Protocol task only.
     /// @return Milliseconds until the earliest of the task's timers, 0 to run again at once when
     ///         the ring was not drained within one pass, or ProtocolTask::NO_DEADLINE.
     uint32_t protocol_tick();
+
+    /// @brief Acts on the lifecycle requests taken from the protocol task's request slot.
+    /// Protocol task only.
+    void apply_lifecycle_requests(const LifecycleRequests& requests);
 
     /// @brief Acts on one command from the queue. Protocol task only.
     void handle_command(ProtocolCommand& command);
@@ -994,8 +1015,8 @@ private:
 #ifdef SENDSPIN_ENABLE_PLAYER
     std::unique_ptr<PlayerRole> player_;
 #endif
-    /// The protocol thread, its command queue and its state slot. Created with the client and
-    /// started/stopped by start()/stop(), so a transport may wake it at any time.
+    /// The protocol thread, its command queue, its state slot and its request slot. Created with
+    /// the client and started/stopped by start()/stop(), so a transport may wake it at any time.
     std::unique_ptr<ProtocolTask> protocol_task_;
     /// In-memory pairing record store (PSK resolution). Set in start();
     /// outlives every connection the manager hands it out to.

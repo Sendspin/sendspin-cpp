@@ -735,10 +735,12 @@ TEST(PlayerTeardownGeneration, ACommandStampedBeforeATeardownIsNotApplied) {
 
 // roles/player/v1.md "client/hello player@v1 support object": the server fills buffer_capacity
 // with encoded frames, and each frame costs the quota its stored size in the inbound ring, so the
-// player advertises the share that holds frames at the smallest chunk size: two thirds of its
-// quota (a 160-byte frame stores in 232 bytes). The server's flow control is sized from this
-// number, so the share is spelled out rather than bounded.
-TEST(PlayerHello, AdvertisesTheShareOfItsQuotaThatHoldsEncodedFrames) {
+// player's advertisement starts from the share that holds frames at the smallest chunk size: two
+// thirds of its quota (a 160-byte frame stores in 232 bytes). The server's flow control is sized
+// from this number, so the share is spelled out rather than bounded. The hello advertises it
+// capped at the ring's largest item, which only a run has; ClientLifecycle's ring-size table
+// covers the capped value.
+TEST(PlayerHello, TheAdvertisedShareOfTheQuotaHoldsEncodedFrames) {
     struct Row {
         const char* name;
         size_t quota;
@@ -754,11 +756,7 @@ TEST(PlayerHello, AdvertisesTheShareOfItsQuotaThatHoldsEncodedFrames) {
         PlayerRoleConfig config = make_player_config();
         config.audio_buffer_capacity = row.quota;
         PlayerRole::Impl& impl = *client.add_player(std::move(config)).impl_;
-
-        ClientHelloMessage hello;
-        impl.build_hello_fields(hello);
-        ASSERT_TRUE(hello.player_v1_support.has_value());
-        EXPECT_EQ(hello.player_v1_support->buffer_capacity, row.advertised);
+        EXPECT_EQ(impl.buffer_capacity_share(), row.advertised);
     }
 }
 

@@ -397,9 +397,9 @@ bool SendspinClient::start() {
         return false;
     }
 
-    // A command queued after the last stop() finished (a request racing it on another thread)
-    // belongs to the run that ended; this run begins with an empty queue. Accepts reopen with
-    // admission, in connection_manager_->start() below.
+    // A command queued or a request posted after the last stop() finished (a call racing it on
+    // another thread) belongs to the run that ended; this run begins with an empty queue and no
+    // request waiting. Accepts reopen with admission, in connection_manager_->start() below.
     this->protocol_task_->drop_commands();
 
     // The first client/state snapshot, taken by the protocol task's first tick: every
@@ -445,8 +445,9 @@ void SendspinClient::stop() {
         return;
     }
     // From here the client reads as stopped: is_started() is false, loop() is a no-op, and
-    // start()/stop() and every request that queues a command are refused, so a listener callback
-    // fired below cannot recurse into the teardown, restart the server, or reach a connection.
+    // start()/stop() and every request that queues a command or posts a request are refused, so
+    // a listener callback fired below cannot recurse into the teardown, restart the server, or
+    // reach a connection.
     this->lifecycle_.store(LifecycleState::STOPPING, std::memory_order_release);
 
     // 1-4. Signal the drain roles, close admission, join the protocol task (its final tick
@@ -506,9 +507,10 @@ PairingUiSnapshot SendspinClient::close_transports() {
     //    transport closes it.
     this->connection_manager_->close_admission();
 
-    // 3. The protocol task: its final tick acts on the commands queued so far (refusing every
-    //    accept with a shutdown goodbye), runs the shutdown pass (detach every connection,
-    //    goodbye each with reason shutdown, wait up to the flush bound), then the join.
+    // 3. The protocol task: its final tick acts on the commands queued and the requests posted
+    //    so far (refusing every accept with a shutdown goodbye), runs the shutdown pass (detach
+    //    every connection, goodbye each with reason shutdown, wait up to the flush bound), then
+    //    the join.
     this->protocol_task_->stop();
 
     // 4. Close every transport the shutdown pass kept, and every released outbound connection
@@ -516,7 +518,7 @@ PairingUiSnapshot SendspinClient::close_transports() {
     //    release those connections here.
     const PairingUiSnapshot pairing_ui = this->connection_manager_->finish_stop();
 
-    // Commands a consumer pushed meanwhile are dropped here, outside any run.
+    // Commands and requests a consumer pushed meanwhile are dropped here, outside any run.
     this->protocol_task_->drop_commands();
     return pairing_ui;
 }
@@ -566,8 +568,10 @@ bool SendspinClient::create_inbound_ring() {
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         budget.audio_hold_bytes = this->player_->impl_->config.audio_buffer_capacity;
+        // The uncapped share: the cap advertised_buffer_capacity() applies is the ring's own
+        // largest item, which this derivation sets.
         player_message_bytes =
-            inbound_held_message_bytes(this->player_->impl_->advertised_buffer_capacity());
+            inbound_held_message_bytes(this->player_->impl_->buffer_capacity_share());
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
@@ -619,10 +623,7 @@ void SendspinClient::connect_to(const std::string& url) {
         SS_LOGW(TAG, "connect_to() ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::CONNECT_TO;
-    command.text = url;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.connect_to = url});
 }
 
 void SendspinClient::disconnect(SendspinGoodbyeReason reason) {
@@ -632,10 +633,7 @@ void SendspinClient::disconnect(SendspinGoodbyeReason reason) {
         SS_LOGD(TAG, "disconnect() ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::DISCONNECT;
-    command.reason = reason;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.disconnect = reason});
 }
 
 void SendspinClient::loop() {
@@ -1182,9 +1180,7 @@ void SendspinClient::leave() {
         SS_LOGW(TAG, "client/leave ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::LEAVE;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.leave = true});
 }
 
 // ============================================================================
@@ -1450,7 +1446,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // roles this connection owns.
     AdmittedEntry* entry = this->connection_manager_->find_admitted(conn);
     const std::optional<ClientStateMessage>& client_state = this->task_state_->client_state;
-    if (entry == nullptr || !conn->is_connected() || !conn->is_operational() ||
+    if (entry == nullptr || !conn->accepts_app_sends() || !conn->is_operational() ||
         !client_state.has_value()) {
         return;
     }
@@ -1712,9 +1708,7 @@ void SendspinClient::confirm_pairing_window() {
         SS_LOGD(TAG, "confirm_pairing_window() ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::PAIRING_WINDOW_CONFIRM;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.pairing_window = PairingWindowRequest::CONFIRM});
 }
 
 void SendspinClient::cancel_pairing_window() {
@@ -1722,9 +1716,7 @@ void SendspinClient::cancel_pairing_window() {
         SS_LOGD(TAG, "cancel_pairing_window() ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::PAIRING_WINDOW_CANCEL;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.pairing_window = PairingWindowRequest::CANCEL});
 }
 
 void SendspinClient::set_unpaired_access_enabled(bool enabled) {
@@ -1732,14 +1724,13 @@ void SendspinClient::set_unpaired_access_enabled(bool enabled) {
         return;
     }
     // The new value reaches the next client/hello through the flag. The connections the change
-    // no longer fits are closed by the protocol task; with the client stopped there are none.
+    // no longer fits are closed by the protocol task, which reads the flag when it applies the
+    // request, so a change and its reversal before that tick apply as the value they end on;
+    // with the client stopped there are none.
     if (!this->is_started()) {
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::SET_UNPAIRED_ACCESS;
-    command.enabled = enabled;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.unpaired_access_changed = true});
 }
 
 bool SendspinClient::is_unpaired_access_enabled() const {

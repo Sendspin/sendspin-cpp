@@ -24,6 +24,7 @@
 #include "sendspin/controller_role.h"
 #include "sendspin/types.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -45,115 +46,22 @@ class SendspinConnection;
 /// @brief What a ProtocolCommand asks the protocol task to do
 enum class ProtocolCommandType : uint8_t {
     ACCEPT_CONNECTION,        ///< A platform server delivered a WebSocket-upgraded connection
-    CONNECT_TO,               ///< SendspinClient::connect_to()
-    DISCONNECT,               ///< SendspinClient::disconnect()
-    LEAVE,                    ///< SendspinClient::leave()
-    PAIRING_WINDOW_CANCEL,    ///< SendspinClient::cancel_pairing_window()
-    PAIRING_WINDOW_CONFIRM,   ///< SendspinClient::confirm_pairing_window()
     SEND_CONTROLLER_COMMAND,  ///< SendspinClient::send_controller_command()
     SEND_TEXT,                ///< SendspinClient::send_text()
-    SET_UNPAIRED_ACCESS,      ///< SendspinClient::set_unpaired_access_enabled()
-};
-
-/**
- * @brief A buffer a command hands to the protocol task, returned to its owner through a hook
- *
- * Move-only. The owner's release hook runs exactly once: when the protocol task calls reset()
- * after it is done with the bytes, or when the lease is destroyed still holding them, which is
- * what returns a buffer whose command was dropped (a full queue, or a stop() that discards what
- * is queued) without any caller having to remember to.
- *
- * This is the hand-off point for a producer thread's send slot: the producer fills a slot it
- * owns, leases it to the protocol task inside a command, and the protocol task encrypts it in
- * place, hands it to the transport, and resets the lease, whose hook marks the slot free again.
- * The hook runs on whichever thread drops the lease, under no library lock, so it must be safe
- * from any thread.
- */
-class CommandLease {
-public:
-    /// @brief Returns a leased buffer to its owner
-    /// @param owner The owner pointer the lease was created with.
-    /// @param data The leased buffer.
-    using ReleaseHook = void (*)(void* owner, uint8_t* data);
-
-    CommandLease() = default;
-    CommandLease(uint8_t* data, size_t size, ReleaseHook release, void* owner)
-        : data_(data), owner_(owner), release_(release), size_(size) {}
-    ~CommandLease() {
-        this->reset();
-    }
-
-    CommandLease(CommandLease&& other) noexcept
-        : data_(other.data_), owner_(other.owner_), release_(other.release_), size_(other.size_) {
-        other.data_ = nullptr;
-        other.release_ = nullptr;
-        other.size_ = 0;
-    }
-    CommandLease& operator=(CommandLease&& other) noexcept {
-        if (this != &other) {
-            this->reset();
-            this->data_ = other.data_;
-            this->owner_ = other.owner_;
-            this->release_ = other.release_;
-            this->size_ = other.size_;
-            other.data_ = nullptr;
-            other.release_ = nullptr;
-            other.size_ = 0;
-        }
-        return *this;
-    }
-    CommandLease(const CommandLease&) = delete;
-    CommandLease& operator=(const CommandLease&) = delete;
-
-    /// @brief Runs the release hook if the lease still holds a buffer, and empties it
-    void reset() {
-        if (this->release_ != nullptr && this->data_ != nullptr) {
-            this->release_(this->owner_, this->data_);
-        }
-        this->data_ = nullptr;
-        this->release_ = nullptr;
-        this->size_ = 0;
-    }
-
-    /// @brief The leased bytes, or nullptr for an empty lease
-    uint8_t* data() const {
-        return this->data_;
-    }
-
-    /// @brief Number of leased bytes
-    size_t size() const {
-        return this->size_;
-    }
-
-    /// @brief Whether the lease holds a buffer
-    explicit operator bool() const {
-        return this->data_ != nullptr;
-    }
-
-private:
-    // Pointer fields
-    uint8_t* data_{nullptr};
-    void* owner_{nullptr};
-    ReleaseHook release_{nullptr};
-
-    // size_t fields
-    size_t size_{0};
 };
 
 static_assert(std::is_trivially_copyable_v<ClientCommandControllerObject>,
               "a controller command crosses to the protocol task by copy");
 
-/// @brief One request handed to the protocol task. Only the fields its type names are set.
-/// Move-only, since it may carry a connection reference and a lease. A client/state snapshot is
-/// not a command: it goes through ProtocolTask::publish_state(). Written by the pushing thread
-/// (any thread for a consumer request, a transport's delivery thread for an accept) and read by
-/// the protocol task, or by the thread joining it at stop(); the queue's lock hands it over.
+/// @brief One request handed to the protocol task. Only the fields its type names are set. A
+/// client/state snapshot is not a command (ProtocolTask::publish_state()), nor is a lifecycle
+/// request (ProtocolTask::post_requests()). Written by the pushing thread (any thread for a
+/// consumer request, a transport's delivery thread for an accept) and read by the protocol task, or
+/// by the thread joining it at stop(); the queue's lock hands it over.
 struct ProtocolCommand {
     // Struct fields
-    /// CONNECT_TO: the URL. SEND_TEXT: the message.
+    /// SEND_TEXT: the message.
     std::string text{};
-    /// A buffer handed over with the command (see CommandLease).
-    CommandLease lease{};
     /// SEND_CONTROLLER_COMMAND: the validated command, formatted on the protocol task. 24 bytes
     /// on a 32-bit target, in every queue slot: 384 bytes across the default queue
     /// (CONSUMER_COMMAND_BURST plus ACCEPT_SLOTS_PER_SOCKET for each of the default four sockets).
@@ -165,12 +73,47 @@ struct ProtocolCommand {
 
     // 8-bit fields
     ProtocolCommandType type{ProtocolCommandType::SEND_TEXT};
-    /// DISCONNECT: the goodbye reason.
-    SendspinGoodbyeReason reason{SendspinGoodbyeReason::SHUTDOWN};
     /// SEND_TEXT: the role the message belongs to.
     SendspinRole role{SendspinRole::CONTROLLER};
-    /// SET_UNPAIRED_ACCESS: the new setting.
-    bool enabled{false};
+};
+
+// ============================================================================
+// Lifecycle requests
+// ============================================================================
+
+/// @brief The pairing-window gesture a LifecycleRequests carries. Confirm and cancel are
+/// opposites, so one value holds whichever of the two came last.
+enum class PairingWindowRequest : uint8_t {
+    NONE,     ///< No gesture since the last take
+    CONFIRM,  ///< SendspinClient::confirm_pairing_window()
+    CANCEL,   ///< SendspinClient::cancel_pairing_window()
+};
+
+/// @brief The consumer's lifecycle requests not yet applied by the protocol task
+///
+/// Each request is idempotent, latest-wins state rather than a step, so it is held in this one
+/// slot beside the command queue (ProtocolTask::post_requests()) instead of taking a queue entry:
+/// it is never refused, a repeat before the task takes it collapses into one application, and a
+/// burst of sends cannot crowd it out. A default-constructed value requests nothing; a field left
+/// at its default in a post leaves the waiting request of that kind as it was.
+///
+/// disconnect() and connect_to() resolve by call order, as two steps would: the task applies a
+/// waiting disconnect before a waiting connect, so a connect_to() posted after a disconnect()
+/// keeps both, while a disconnect() posted after a connect_to() drops the waiting connect, the
+/// attempt it would have released.
+struct LifecycleRequests {
+    /// SendspinClient::connect_to(): the URL of the latest call, unless a later disconnect()
+    /// dropped it.
+    std::optional<std::string> connect_to{};
+    /// SendspinClient::disconnect(): the goodbye reason of the latest call.
+    std::optional<SendspinGoodbyeReason> disconnect{};
+    /// The later of confirm_pairing_window() and cancel_pairing_window().
+    PairingWindowRequest pairing_window{PairingWindowRequest::NONE};
+    /// SendspinClient::leave().
+    bool leave{false};
+    /// SendspinClient::set_unpaired_access_enabled(): apply the setting the client's flag holds
+    /// when the task takes the request, which the call stored before posting.
+    bool unpaired_access_changed{false};
 };
 
 // ============================================================================
@@ -181,34 +124,36 @@ struct ProtocolCommand {
  * @brief The thread that owns every connection and performs all protocol work
  *
  * Runs the tick the client hands to start() whenever it is woken (a command, a state snapshot,
- * an inbound ring item, a transport close) and when the tick's own next deadline passes. The
- * tick returns the milliseconds until its earliest timer deadline, or NO_DEADLINE, and the task
- * waits for a wake for that long, so an idle task with no timer pending does not run at all.
+ * a lifecycle request, an inbound ring item, a transport close) and when the tick's own next
+ * deadline passes. The tick returns the milliseconds until its earliest timer deadline, or
+ * NO_DEADLINE, and the task waits for a wake for that long, so an idle task with no timer pending
+ * does not run at all.
  *
  * Lifecycle matches the role threads: start() clears every flag and spawns the thread; stop()
- * sets COMMAND_STOP, wakes the wait, lets the thread run one final tick so commands queued
- * before the stop are seen by the task, and joins it. Commands pushed after that final tick stay
- * queued for the joining thread, which takes them (take_command()) or drops them
- * (drop_commands()).
+ * sets COMMAND_STOP, wakes the wait, lets the thread run one final tick so the commands queued
+ * and the lifecycle requests posted before the stop are seen by the task, and joins it. Commands
+ * pushed and requests posted after that final tick stay for the joining thread, which takes
+ * them (take_command(), take_requests()) or drops them (drop_commands()).
  */
 class ProtocolTask {
 public:
     /// What a tick returns when none of its timers is pending: the task then waits for a wake
-    /// alone. Every source of work wakes the task (wake(), push_command(), publish_state()), and
-    /// every timer-driven step reports its own deadline, the network-readiness poll included, so
-    /// no periodic re-evaluation is needed.
+    /// alone. Every source of work wakes the task (wake(), push_command(), publish_state(),
+    /// post_requests()), and every timer-driven step reports its own deadline, the
+    /// network-readiness poll included, so no periodic re-evaluation is needed.
     static constexpr uint32_t NO_DEADLINE = UINT32_MAX;
 
-    /// Queue slots for consumer commands: the gestures one main-loop tick can issue, each
-    /// meaningful at most once per tick (connect_to(), disconnect(), leave(),
-    /// confirm_pairing_window(), cancel_pairing_window(), set_unpaired_access_enabled()), plus
-    /// two controller commands, each a SEND_CONTROLLER_COMMAND (ControllerRole::send_command())
-    /// or a SEND_TEXT (send_text()). That last term is an assumption: it holds for a handler that
-    /// sends a volume change and a play, not for a rotary encoder that issues a volume step per
-    /// detent faster than the protocol task drains the queue. A command past the burst is refused
-    /// and push_command() returns false, a drop the client must pass back to whoever called
-    /// send_command() or send_text() rather than swallow. A client/state snapshot takes no slot
-    /// (publish_state()), and a transport close is out of band (InboundGate), so neither counts.
+    /// Queue slots for consumer sends, each a SEND_CONTROLLER_COMMAND
+    /// (ControllerRole::send_command()) or a SEND_TEXT (send_text()) issued between two drains
+    /// of the queue. A discrete gesture (play, next) is one send, but a volume slider sends one
+    /// per input event, about six in a 100 ms window at a 60 Hz input rate, which is the stall
+    /// this covers: eight holds such a window plus a gesture issued during it. A control that
+    /// sends faster than the task drains, such as a rotary encoder sending a step per detent
+    /// through a longer stall, still overruns it. A send past the burst is refused and
+    /// push_command() returns false, a drop the client must pass back to whoever called
+    /// send_command() or send_text() rather than swallow. A client/state snapshot
+    /// (publish_state()) and the lifecycle requests, connect_to() among them (post_requests()),
+    /// take no slot, and a transport close is out of band (InboundGate), so none of them counts.
     static constexpr size_t CONSUMER_COMMAND_BURST = 8;
 
     /// Accept slots reserved per socket of SendspinClientConfig::server_max_connections. A
@@ -244,12 +189,14 @@ public:
     bool start(Tick tick, size_t stack_size, unsigned priority, bool stack_in_psram);
 
     /// @brief Signals the thread, waits for its final tick and joins it, then drops the state
-    /// snapshot still waiting. Commands stay queued for the caller (take_command(),
-    /// drop_commands()). No-op when the thread is not running. Main loop only.
+    /// snapshot still waiting. Commands and lifecycle requests stay for the caller
+    /// (take_command(), take_requests(), drop_commands()). No-op when the thread is not running.
+    /// Main loop only.
     void stop();
 
-    /// @brief Drops every queued command, one at a time, outside the queue lock. Main loop only,
-    /// with the thread joined; the destructor runs it too.
+    /// @brief Drops every queued command, one at a time, outside the queue lock, and the
+    /// lifecycle requests still waiting. Main loop only, with the thread joined; the destructor
+    /// runs it too.
     void drop_commands();
 
     /// @brief Refuses every later ACCEPT_CONNECTION push (push_command() returns false). Set
@@ -273,8 +220,8 @@ public:
     /// @brief Queues a command and wakes the task. Any thread.
     /// @return false when the command's slots are all taken (consumer commands share
     ///         CONSUMER_COMMAND_BURST slots, accepts their reserved ones): the refusal is logged
-    ///         and the command is left with the caller unchanged, so destroying it releases any
-    ///         lease it carries on the caller's thread, outside the queue lock.
+    ///         and the command is left with the caller unchanged, so the connection an accept
+    ///         carries is released on the caller's thread, outside the queue lock.
     bool push_command(ProtocolCommand&& command);
 
     /// @brief Takes the oldest queued command. Protocol task only, or the thread that joined it.
@@ -297,6 +244,24 @@ public:
     /// @return false when no snapshot is waiting.
     bool take_state(ClientStateMessage& out);
 
+    /// @brief Merges lifecycle requests into the waiting ones and wakes the task. Any thread.
+    ///
+    /// One slot beside the command queue, like publish_state(): a request is never refused. Each
+    /// field `requests` sets replaces the waiting request of its kind (the latest URL, the
+    /// latest disconnect reason, the latter of a confirm and a cancel), and a disconnect drops a
+    /// waiting connect (see LifecycleRequests); one left at its default leaves it as it was. The
+    /// URL a post replaces or drops is destroyed outside the lock. The tick applies the requests
+    /// ahead of the queued commands (SendspinClient::protocol_tick()).
+    /// @param requests The requests to add, usually one field set with a designated initializer.
+    void post_requests(LifecycleRequests requests);
+
+    /// @brief Takes the waiting lifecycle requests, if any were posted since the last take, and
+    /// empties the slot, so each post is applied at most once. Protocol task only, or the thread
+    /// that joined it.
+    /// @param[out] out Receives the requests.
+    /// @return false when no request is waiting; out is then left as it was.
+    bool take_requests(LifecycleRequests& out);
+
 private:
     /// Event flag bits
     static constexpr uint32_t COMMAND_STOP = 1U << 0;
@@ -315,8 +280,8 @@ private:
     /// moved into while empty (moved-from or default), so no heap memory is freed under the
     /// lock.
     std::unique_ptr<ProtocolCommand[]> commands_;
-    /// Guards commands_, the counts and latest_state_. A leaf: no lock is taken and nothing
-    /// heap-backed is destroyed under it.
+    /// Guards commands_, the counts, latest_state_ and requests_. A leaf: no lock is taken and
+    /// nothing heap-backed is destroyed under it.
     std::mutex command_mutex_;
     EventFlags event_flags_;
     /// The newest client/state snapshot not yet taken. Written from any thread, taken by the
@@ -325,6 +290,9 @@ private:
     std::thread thread_;
     /// The protocol work, set by start() before the thread exists and read only by the thread.
     Tick tick_;
+    /// The lifecycle requests posted since the last take. Merged from any thread, taken by the
+    /// protocol task; guarded by command_mutex_.
+    LifecycleRequests requests_;
 
     // size_t fields
     /// Slots reserved for ACCEPT_CONNECTION: ACCEPT_SLOTS_PER_SOCKET per socket. Fixed at
@@ -338,6 +306,12 @@ private:
     size_t accepts_queued_{0};
 
     // 8-bit fields
+    /// Whether requests_ holds a post not yet taken. Set under command_mutex_ by
+    /// post_requests(), cleared by take_requests() before it takes the lock, so a tick with
+    /// nothing posted skips the lock; the requests themselves cross under the lock. A post that
+    /// lands between the clear and the lock is taken with the rest, and the bit it set leaves
+    /// the next take an empty slot to find.
+    std::atomic<bool> requests_pending_{false};
     /// Set by close_accepts(), cleared by open_accepts(); guarded by command_mutex_.
     bool accepts_closed_{false};
 };

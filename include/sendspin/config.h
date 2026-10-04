@@ -386,6 +386,11 @@ struct PlayerRoleConfig {
     /// support object"). Opus may be listed in addition, but only in a build with the Opus decoder
     /// (SENDSPIN_ENABLE_OPUS, on by default). SendspinClient::start() fails and logs otherwise.
     std::vector<AudioSupportedFormatObject> audio_formats{};
+    /// @brief Bytes of the shared inbound ring the player may hold as encoded audio: its quota,
+    /// which the ring is sized to include. The client advertises the two thirds of it that hold
+    /// encoded frames at the smallest chunk size to the server as buffer_capacity. The advertised
+    /// value is at most the ring's largest item so that any single chunk the server may send
+    /// fits.
     size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
     int32_t fixed_delay_us{0};
     uint16_t initial_output_delay_ms{0};
@@ -586,7 +591,9 @@ struct VisualizerSupportObject {
     /// budget holds actual wire data. The client advertises that effective capacity to the
     /// server, not this raw budget, so the server's flow control does not overrun the quota.
     /// VisualizerRole's start fails below 70 bytes, the smallest budget that advertises one
-    /// smallest frame, the default 0 included.
+    /// smallest frame, the default 0 included. The advertised value is at most the ring's largest
+    /// item so that any single chunk the server may send fits, which a seventh of the quota
+    /// always is.
     size_t buffer_capacity{};
 };
 

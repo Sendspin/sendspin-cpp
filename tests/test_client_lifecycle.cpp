@@ -1072,14 +1072,25 @@ TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
     }
 }
 
-// A command left in the queue after a stop() (a request that raced it on another thread) belongs
-// to the run that ended: the next start() begins with an empty queue, so the stale connect_to()
-// opens nothing. The command is pushed straight onto the stopped client's queue, the state such a
-// race leaves, since the public entry points refuse while stopped. The Control row pushes the same
-// command after start() and sees it acted on.
+// A lifecycle request left in its slot after a stop() (a call that raced it on another thread)
+// belongs to the run that ended: the next start() begins with no request waiting, so a stale
+// connect_to() opens nothing and a stale confirm opens no pairing window. Each is posted straight
+// to the stopped client's task, the state such a race leaves, since the public entry points refuse
+// while stopped. The Control rows post the same after start() and see it acted on.
 TEST(ClientLifecycle, AStaleCommandIsNotCarriedIntoTheNextRun) {
-    for (const bool stale : {true, false}) {
-        SCOPED_TRACE(stale ? "pushed while stopped" : "Control: pushed while running");
+    struct Row {
+        const char* name;
+        bool stale;
+        bool request;
+    };
+    const Row rows[] = {
+        {"a connect_to() posted while stopped", true, false},
+        {"Control: a connect_to() posted while running", false, false},
+        {"a confirm posted while stopped", true, true},
+        {"Control: a confirm posted while running", false, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
         SilentListener silent;
         ASSERT_NE(silent.port(), 0);
         TestNetworkProvider network;
@@ -1088,22 +1099,30 @@ TEST(ClientLifecycle, AStaleCommandIsNotCarriedIntoTheNextRun) {
         ASSERT_TRUE(client.start());
         client.stop();
 
-        ProtocolCommand command;
-        command.type = ProtocolCommandType::CONNECT_TO;
-        // The attempt waits in the nursery: the listener never answers or closes.
-        command.text = "ws://127.0.0.1:" + std::to_string(silent.port()) + "/sendspin";
-        if (stale) {
-            ASSERT_TRUE(client.protocol_task_->push_command(std::move(command)));
+        auto push = [&] {
+            if (row.request) {
+                client.protocol_task_->post_requests(
+                    {.pairing_window = PairingWindowRequest::CONFIRM});
+                return;
+            }
+            // The attempt waits in the nursery: the listener never answers or closes.
+            client.protocol_task_->post_requests(
+                {.connect_to = "ws://127.0.0.1:" + std::to_string(silent.port()) + "/sendspin"});
+        };
+        if (row.stale) {
+            push();
         }
         ASSERT_TRUE(client.start());
         // The test thread plays the protocol task from here, so the nursery is read where it is
         // written.
         client.protocol_task_->stop();
-        if (!stale) {
-            ASSERT_TRUE(client.protocol_task_->push_command(std::move(command)));
+        if (!row.stale) {
+            push();
         }
         (void) client.protocol_tick();
-        EXPECT_EQ(client.connection_manager_->nursery_.size(), stale ? 0U : 1U);
+        const bool acted_on = row.request ? client.connection_manager_->pairing_window_open()
+                                          : client.connection_manager_->nursery_.size() == 1U;
+        EXPECT_EQ(acted_on, !row.stale);
         silent.close();
         client.stop();
     }
@@ -1284,40 +1303,295 @@ TEST(ClientLifecycle, AnOpenedOutboundConnectionIsNotHeldForReaping) {
     }
 }
 
-// send_text() and ControllerRole::send_command() report a request the protocol task will never
-// see: once the consumer burst of the command queue is taken, the next request is refused with
-// false rather than dropped silently. The test thread plays the protocol task, so nothing drains
-// the queue between the requests. The controller's offered command is seeded, stamped with the
-// role's generation as the drain stamps a mask it applies, so the request reaches the queue.
-TEST(ClientLifecycle, SendTextIsRefusedWhenTheCommandQueueIsFull) {
-    TestNetworkProvider network;
-    SendspinClient client(make_config(0));
-    client.set_network_provider(&network);
-    ControllerRole& controller = client.add_controller();
-    ASSERT_TRUE(client.start());
-    client.protocol_task_->stop();
-    controller.impl_->supported_commands =
-        (controller.impl_->cleanup_generation.load() << 16) |
-        (1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY));
-    const ClientCommandControllerObject play{.command = SendspinControllerCommand::PLAY};
-
-    const std::string command = R"({"type":"client/command","payload":{}})";
-    for (size_t i = 0; i < ProtocolTask::CONSUMER_COMMAND_BURST; ++i) {
-        EXPECT_TRUE(client.send_text(command, "controller")) << "Control: request " << i;
+/// Records, in order, the client/leave, client/command and client/state messages and the goodbyes
+/// sent on it.
+class RecordingConnection : public StubConnection {
+public:
+    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
+        this->events.push_back("goodbye " + std::to_string(static_cast<int>(reason)));
+        StubConnection::disconnect(reason, std::move(on_complete));
     }
-    EXPECT_FALSE(client.send_text(command, "controller"))
-        << "a request past the consumer burst must be refused";
-    EXPECT_FALSE(controller.send_command(play))
-        << "a controller command past the consumer burst must be refused";
-    // Control: once the task drains the queue, requests are taken again.
-    (void) client.protocol_tick();
-    EXPECT_TRUE(controller.send_command(play)) << "the drained queue takes commands";
-    EXPECT_TRUE(client.send_text(command, "controller")) << "the drained queue takes requests";
-    // A family that names no role is refused on its own, queue or not.
-    EXPECT_FALSE(client.send_text(command, "no-such-role"));
+    // No Noise session, so send_app_json() routes a message here as raw text.
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb, bool) override {
+        if (msg.find("client/leave") != std::string::npos) {
+            this->events.emplace_back("leave");
+        } else if (msg.find("client/command") != std::string::npos) {
+            this->events.emplace_back("command");
+        } else if (msg.find("client/state") != std::string::npos) {
+            this->events.emplace_back("state");
+        }
+        if (cb) {
+            cb(true);
+        }
+        return SsErr::OK;
+    }
 
-    client.stop();
-    EXPECT_FALSE(client.send_text(command, "controller")) << "a stopped client refuses";
+    std::vector<std::string> events;
+};
+
+std::string goodbye_event(SendspinGoodbyeReason reason) {
+    return "goodbye " + std::to_string(static_cast<int>(reason));
+}
+
+// The command queue's consumer burst bounds the sends, never the lifecycle requests. Once the
+// burst is taken, send_text() and ControllerRole::send_command() report the request the protocol
+// task will never see by returning false, while connect_to(), disconnect(), leave(), the
+// pairing-window gestures and an unpaired-access change still reach the next tick, which applies
+// each once (a second tick repeats nothing, nor does a later post of another request). Each is
+// latest-wins: a confirm and a cancel resolve to the later, a second disconnect() replaces the
+// first's reason, a leave goes out ahead of the goodbye whatever order they were called in, and a
+// connect_to() and a disconnect() resolve by call order (a disconnect cancels an earlier connect,
+// a later connect opens after the goodbye). The requests go ahead of the sends queued with them,
+// so a controller command queued before a disconnect() is dropped rather than sent after the
+// goodbye, as is a client/state published before it, though the stand-in still reads as
+// connected, as an ESP server connection does until httpd closes it. Gap: the same detached check
+// in ConnectionManager::leave() has no row, since the tick applies a leave ahead of a disconnect.
+// A disconnect that only stop()'s final tick sees, once admission is closed, is dropped in favour
+// of the shutdown goodbye. The test thread plays the protocol task, so nothing
+// drains the queue between the calls; the closed-admission row runs the tick that stop() would.
+// The stand-in is an activated Sentinel connection with an active role, so withdrawing unpaired
+// access closes it, and the liveness check is off so silence does not. The controller's offered
+// command is seeded, stamped with the role's generation as the drain stamps a mask it applies, so
+// a command reaches the queue; a row that drops the stand-in tears the controller down, so it is
+// seeded again before the drained queue is tried. The outbound attempts dial a listener that never
+// answers, so an attempt opened stays in the nursery. Control: a confirm with room in the queue,
+// and a controller command and a state change with no disconnect behind them.
+TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
+    enum class Call : uint8_t {
+        CONFIRM,
+        CANCEL,
+        LEAVE,
+        DISCONNECT,
+        DISCONNECT_AGAIN,
+        UNPAIRED_OFF,
+        CONNECT,
+        SEND_COMMAND,
+        TICK,
+        CLOSE_ADMISSION,
+        SET_UNAVAILABLE,
+    };
+    struct Row {
+        const char* name;
+        bool fill_queue;
+        std::vector<Call> calls;
+        bool window_open;
+        std::vector<std::string> events;
+        size_t attempts{0};
+        bool owns_controller{false};
+        /// Whether the stand-in has finished its hello exchange, so a client/state reaches it.
+        bool operational{false};
+    };
+    const std::string user_goodbye = goodbye_event(SendspinGoodbyeReason::USER_REQUEST);
+    const Row rows[] = {
+        {"Control: a confirm with room in the queue", false, {Call::CONFIRM}, true, {}},
+        {"a confirm behind a full queue", true, {Call::CONFIRM}, true, {}},
+        {"a confirm then a cancel end cancelled", true, {Call::CONFIRM, Call::CANCEL}, false, {}},
+        {"a cancel then a confirm end confirmed", true, {Call::CANCEL, Call::CONFIRM}, true, {}},
+        {"a leave behind a full queue", true, {Call::LEAVE}, false, {"leave"}},
+        {"a leave, a tick, then a confirm: the leave is not repeated",
+         false,
+         {Call::LEAVE, Call::TICK, Call::CONFIRM},
+         true,
+         {"leave"}},
+        {"a second disconnect replaces the first's reason",
+         true,
+         {Call::DISCONNECT, Call::DISCONNECT_AGAIN},
+         false,
+         {goodbye_event(SendspinGoodbyeReason::ANOTHER_SERVER)}},
+        {"a disconnect then a leave: the leave goes out first",
+         true,
+         {Call::DISCONNECT, Call::LEAVE},
+         false,
+         {"leave", user_goodbye}},
+        {"unpaired access withdrawn behind a full queue",
+         true,
+         {Call::UNPAIRED_OFF},
+         false,
+         {goodbye_event(SendspinGoodbyeReason::PAIRING_REQUIRED)}},
+        {"a connect_to behind a full queue opens an attempt", true, {Call::CONNECT}, false, {}, 1},
+        {"a connect_to then a disconnect: the attempt is cancelled",
+         false,
+         {Call::CONNECT, Call::DISCONNECT},
+         false,
+         {user_goodbye},
+         0},
+        {"a disconnect then a connect_to: the attempt opens after the goodbye",
+         false,
+         {Call::DISCONNECT, Call::CONNECT},
+         false,
+         {user_goodbye},
+         1},
+        {"Control: a controller command is sent",
+         false,
+         {Call::SEND_COMMAND},
+         false,
+         {"command"},
+         0,
+         true},
+        {"a controller command queued before a disconnect is not sent",
+         false,
+         {Call::SEND_COMMAND, Call::DISCONNECT},
+         false,
+         {user_goodbye},
+         0,
+         true},
+        {"Control: a state change is published",
+         false,
+         {Call::SET_UNAVAILABLE},
+         false,
+         {"state"},
+         0,
+         false,
+         true},
+        {"a state change published before a disconnect is not sent",
+         false,
+         {Call::SET_UNAVAILABLE, Call::DISCONNECT},
+         false,
+         {user_goodbye},
+         0,
+         false,
+         true},
+        {"a disconnect only the final tick sees: the shutdown goodbye instead",
+         false,
+         {Call::DISCONNECT, Call::CLOSE_ADMISSION},
+         false,
+         {goodbye_event(SendspinGoodbyeReason::SHUTDOWN)}},
+    };
+    const std::string text = R"({"type":"client/command","payload":{}})";
+    const ClientCommandControllerObject play{.command = SendspinControllerCommand::PLAY};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SilentListener silent;
+        ASSERT_NE(silent.port(), 0);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ControllerRole& controller = client.add_controller();
+        client.set_unpaired_access_enabled(true);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+        manager.liveness_timeout_us_ = 0;
+        auto conn = std::make_shared<RecordingConnection>();
+        conn->apply_server_activate({}, std::vector<std::string>{"player@v1", "controller@v1"},
+                                    std::nullopt, std::nullopt);
+        conn->set_client_hello_sent(row.operational);
+        conn->set_server_hello_received(row.operational);
+        manager.install_admitted(
+            conn, row.owns_controller ? role_mask_bit(SendspinRole::CONTROLLER) : 0);
+        auto offer_play = [&controller] {
+            controller.impl_->supported_commands =
+                (controller.impl_->cleanup_generation.load() << 16) |
+                (1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY));
+        };
+        offer_play();
+
+        if (row.fill_queue) {
+            for (size_t i = 0; i < ProtocolTask::CONSUMER_COMMAND_BURST; ++i) {
+                ASSERT_TRUE(client.send_text(text, "controller")) << "request " << i;
+            }
+            EXPECT_FALSE(client.send_text(text, "controller"))
+                << "a send past the consumer burst must be refused";
+            EXPECT_FALSE(controller.send_command(play))
+                << "a controller command past the consumer burst must be refused";
+        }
+        for (const Call call : row.calls) {
+            switch (call) {
+                case Call::CONFIRM:
+                    client.confirm_pairing_window();
+                    break;
+                case Call::CANCEL:
+                    client.cancel_pairing_window();
+                    break;
+                case Call::LEAVE:
+                    client.leave();
+                    break;
+                case Call::DISCONNECT:
+                    client.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+                    break;
+                case Call::DISCONNECT_AGAIN:
+                    client.disconnect(SendspinGoodbyeReason::ANOTHER_SERVER);
+                    break;
+                case Call::UNPAIRED_OFF:
+                    client.set_unpaired_access_enabled(false);
+                    break;
+                case Call::CONNECT:
+                    client.connect_to(loopback_url(silent.port()));
+                    break;
+                case Call::SEND_COMMAND:
+                    ASSERT_TRUE(controller.send_command(play));
+                    break;
+                case Call::TICK:
+                    (void) client.protocol_tick();
+                    break;
+                case Call::CLOSE_ADMISSION:
+                    // What stop() does before the final tick it joins.
+                    manager.close_admission();
+                    break;
+                case Call::SET_UNAVAILABLE:
+                    client.set_available(false);
+                    break;
+            }
+        }
+
+        (void) client.protocol_tick();
+        EXPECT_EQ(manager.pairing_window_open(), row.window_open);
+        EXPECT_EQ(conn->events, row.events);
+        EXPECT_EQ(manager.nursery_.size(), row.attempts) << "outbound attempts in the nursery";
+        EXPECT_TRUE(manager.reaping_.empty()) << "an attempt was opened and then released";
+        (void) client.protocol_tick();
+        EXPECT_EQ(conn->events, row.events) << "a second tick applied a request again";
+
+        // The drained queue takes sends again; a family that names no role is refused on its own.
+        offer_play();
+        EXPECT_TRUE(controller.send_command(play));
+        EXPECT_TRUE(client.send_text(text, "controller"));
+        EXPECT_FALSE(client.send_text(text, "no-such-role"));
+
+        silent.close();
+        client.stop();
+        EXPECT_FALSE(client.send_text(text, "controller")) << "a stopped client refuses";
+    }
+}
+
+// is_connected() is raised only at the end of a tick, after every handler of that tick has run,
+// so a thread that sees it true also sees the trust the activation stored: a connection admitted
+// (install_admitted(), which refreshes the published slots mid-handler) and made operational
+// (on_handshake_complete(), which stores the trust) reads as not yet connected until the tick
+// ends, while its trust already reads USER. A loss lowers the flag at once, without a tick: the
+// drop row refreshes and reads false. The test thread plays the protocol task. The stand-in is a
+// LONG_TERM connection with its hellos and its activation done; the liveness check is off.
+TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
+    for (const bool drop : {false, true}) {
+        SCOPED_TRACE(drop ? "a drop lowers the flag without a tick" : "an admission raises it");
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+        manager.liveness_timeout_us_ = 0;
+        auto conn = std::make_shared<StubConnection>();
+        conn->set_noise_handshake_result("server", PskCategory::LONG_TERM, "psk");
+        conn->set_client_hello_sent(true);
+        conn->set_server_hello_received(true);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::vector<std::string>{},
+                                    std::nullopt, std::nullopt);
+
+        manager.install_admitted(conn, 0);
+        EXPECT_FALSE(client.is_connected()) << "raised by the refresh inside the handler";
+        client.on_handshake_complete(conn.get());
+        EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER);
+        EXPECT_FALSE(client.is_connected()) << "raised before the tick ended";
+        (void) client.protocol_tick();
+        ASSERT_TRUE(client.is_connected()) << "the end of the tick did not raise it";
+
+        if (drop) {
+            manager.drop_connection(conn.get(), std::nullopt);
+            EXPECT_FALSE(client.is_connected()) << "a loss waited for the end of a tick";
+        }
+        client.stop();
+    }
 }
 
 // ============================================================================
@@ -2963,6 +3237,11 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
 // the default player syncing every second instead of every 10 s holds 88 bursts of 8 replies
 // (312 stored bytes each) behind its 87 s hold instead of 9. Read from the ring the client
 // creates, so every role's figures and the burst configuration have to reach the derivation.
+// Each row also reads the buffer_capacity the stream roles' client/hello advertises, which never
+// exceeds the ring's largest item, so any one chunk the server may send fits an item: the default
+// player's two-thirds share (666,666 bytes) is capped at the default ring's 621,312, while the
+// 25,000-byte player's 16,666, the default player's share in the larger rings and the
+// visualizer's seventh stay as derived.
 TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
     enum : uint8_t {
         PLAYER = 1 << 0,
@@ -2978,25 +3257,30 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         uint8_t roles;
         size_t expected_bytes;
         size_t expected_max_message_bytes;
+        /// The buffer_capacity each stream role's client/hello advertises; 0 without the role.
+        size_t expected_player_advertised;
+        size_t expected_visualizer_advertised;
         int64_t burst_interval_ms{SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS};
     };
     const Row rows[] = {
-        {"no roles: two JSON messages", 0, 32880, 16400},
-        {"controller and metadata: the no-role budget", CONTROLLER_METADATA, 32880, 16400},
+        {"no roles: two JSON messages", 0, 32880, 16400, 0, 0},
+        {"controller and metadata: the no-role budget", CONTROLLER_METADATA, 32880, 16400, 0, 0},
         {"visualizer only: its 4,096-byte quota, 3 s of pass-through, the JSON floor", VISUALIZER,
-         42544, 21232},
+         42544, 21232, 0, 585},
         {"a 140,000-byte visualizer: 69 s of pass-through, two 20,016-byte messages",
-         LARGE_VISUALIZER, 268240, INBOUND_MAX_MESSAGE_BYTES},
-        {"a 25,000-byte player: two of its longest chunks", SMALL_PLAYER, 64016, 31968},
+         LARGE_VISUALIZER, 268240, INBOUND_MAX_MESSAGE_BYTES, 0, 20000},
+        {"a 25,000-byte player: two of its longest chunks, its share advertised uncapped",
+         SMALL_PLAYER, 64016, 31968, 16666, 0},
         {"artwork only: one default image, above two maximal frames", ARTWORK, 131292,
-         INBOUND_MAX_MESSAGE_BYTES},
+         INBOUND_MAX_MESSAGE_BYTES, 0, 0},
         {"artwork capped at 40,000-byte images: still two maximal frames", SMALL_ARTWORK, 131152,
-         INBOUND_MAX_MESSAGE_BYTES},
-        {"Control: the default player", PLAYER, 1242704, INBOUND_MAX_MESSAGE_BYTES},
-        {"the default player, a time burst every second", PLAYER, 1439888,
-         INBOUND_MAX_MESSAGE_BYTES, 1000},
+         INBOUND_MAX_MESSAGE_BYTES, 0, 0},
+        {"Control: the default player, its advertised share capped at the ring's largest item",
+         PLAYER, 1242704, INBOUND_MAX_MESSAGE_BYTES, 621312, 0},
+        {"the default player, a time burst every second: its share fits the larger ring", PLAYER,
+         1439888, INBOUND_MAX_MESSAGE_BYTES, 666666, 0, 1000},
         {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1687004,
-         INBOUND_MAX_MESSAGE_BYTES},
+         INBOUND_MAX_MESSAGE_BYTES, 666666, 585},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -3039,6 +3323,17 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         // received messages only.
         EXPECT_EQ(client.inbound_ring_->max_item_message_bytes(),
                   SharedRingLayout::max_item_size(row.expected_bytes) - sizeof(InboundItemHeader));
+        ClientHelloMessage hello;
+        if (client.player_) {
+            client.player_->impl_->build_hello_fields(hello);
+        }
+        if (client.visualizer_) {
+            client.visualizer_->impl_->build_hello_fields(hello);
+        }
+        EXPECT_EQ(hello.player_v1_support ? hello.player_v1_support->buffer_capacity : 0U,
+                  row.expected_player_advertised);
+        EXPECT_EQ(hello.visualizer_support ? hello.visualizer_support->buffer_capacity : 0U,
+                  row.expected_visualizer_advertised);
         client.stop();
     }
 }

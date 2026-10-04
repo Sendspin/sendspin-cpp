@@ -85,7 +85,8 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   append/take/recall/wake, the one-in-flight fallback hand-off, its release by a consume or a
   detach, the close rule, and the ring size derivation.
 - `test_protocol_task.cpp`: `ProtocolTask`'s command queue (order, the consumer burst and the
-  reserved accept slots, lease release), the latest-state slot, the wakes, and stop/restart.
+  reserved accept slots), the latest-state slot, the lifecycle-request slot's wake and its
+  hand-off at stop, the wakes, and stop/restart.
 - `test_player_role.cpp`: the player's `client/state` timing parameters and the
   supported-format validation, driven through the role's `Impl` without a server, and its
   inbound ring hand-off: a chunk decoded in place, per-role quotas, the stream/clear marker,
@@ -109,9 +110,10 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   stamp it reads, persistence written from the main loop, and controller command validation.
 - `test_client_lifecycle.cpp`: `start()`/`stop()`/restart: goodbyes, clear callbacks delivered
   inside `stop()`, re-entrancy from callbacks, role start rollback, accepts refused at `stop()`,
-  the command queue's refusals, the protocol task's next deadline, the teardown reorder
-  guarantee for every role with main-loop state, stream starts acknowledged by number, the
-  high-performance grant, the time filter slot, and the inbound ring's size.
+  the command queue's refusals and the lifecycle requests it never refuses, the protocol task's
+  next deadline, the teardown reorder guarantee for every role with main-loop state, stream
+  starts acknowledged by number, the high-performance grant, the time filter slot, and the
+  inbound ring's size.
 - `test_client_teardown.cpp`: destroying a running client joins every threaded role.
 - `test_role_deactivation.cpp`: a later `server/activate` that removes a role: output stopped,
   buffers and state dropped, the roles it keeps left alone, and a removed role added back.
