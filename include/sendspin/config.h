@@ -274,7 +274,7 @@ struct SendspinClientConfig {
     /// @brief Default protocol task stack size in bytes (ESP-IDF only). The protocol task runs
     /// every Noise handshake (X25519, SHA-256), the pairing exchange (CPace, SHA-512, HMAC), the
     /// JSON parse, the role handlers and every send. Deepest chain from the task entry, noise-c and
-    /// libsodium included: 5,744 bytes at -Os, a pairing message whose handler drops the
+    /// libsodium included: 5,808 bytes at -Os, a pairing message whose handler drops the
     /// connection and queues its goodbye through httpd_queue_work() into the shared tail; 6,464 at
     /// -Og, a stream/start message, whose parse frame is 1,312 bytes at -Og (464 at -Os), whose
     /// string conversion fails to allocate into libstdc++'s terminate and the shared tail.
@@ -335,23 +335,22 @@ struct SendspinClientConfig {
     /// capacity, so PREFER_EXTERNAL keeps it out of internal RAM.
     MemoryLocation noise_buffer_location{MemoryLocation::PREFER_EXTERNAL};
 
-    /// @brief Default arena size: one steady-state incoming protocol message, including the FLAC
-    /// stream-start header. Not enough for a message built on top of a parsed one (see
-    /// json_arena_size).
+    /// @brief Default arena size: one steady-state protocol message, including the FLAC
+    /// stream-start header (see json_arena_size).
     static constexpr size_t DEFAULT_JSON_ARENA_SIZE = 2048;
 
     /// @brief Size in bytes of an internal-RAM scratch arena for the protocol's JSON documents.
     /// Every JSON document the protocol task works with, the parse of each incoming message and
     /// every message it builds, is allocated from a fixed internal-RAM buffer of this size
-    /// instead of PSRAM, cutting PSRAM traffic on the protocol task; a document that does not fit
-    /// falls back to PSRAM. On a 32-bit target ArduinoJson allocates each variant pool as one
-    /// 1,024-byte block (128 slots of 8 bytes), and the parsed message's pool cannot shrink back,
-    /// since its strings sit above it, so at the 2048 default any message built inside a handler,
-    /// on top of the parsed message, puts its pool in PSRAM whatever the incoming message's size:
-    /// the client/state after a server/activate or a stream/start, every pairing reply, a
-    /// re-handshake's msg2, the pair/abort refusing an activation. About 4 KB avoids those spills.
-    /// On host the pool is 4 KB and never fits the default. Every freed block is wiped either way.
-    /// Costs this many bytes of internal RAM permanently; smaller values just fall back more often.
+    /// instead of PSRAM, cutting PSRAM traffic on the protocol task. The arena holds one document
+    /// at a time: a parsed message is released before the reply it triggers (a client/state after
+    /// a server/activate, a pairing reply, a re-handshake's msg2) is built. The 2048 default
+    /// covers one steady-state protocol message, including the FLAC stream-start header; a
+    /// document larger than the budget on its own, such as a large track-metadata message, falls
+    /// back to PSRAM. That holds on a 32-bit target, where ArduinoJson allocates each variant pool
+    /// as one 1,024-byte block; on host a variant pool alone is 4 KB, so the default fits no
+    /// document's pool there. Every freed block is wiped, in the arena or in PSRAM. Costs this
+    /// many bytes of internal RAM permanently; smaller values just fall back more often.
     /// Set to 0 to send every document to PSRAM. On host there is no PSRAM distinction and the
     /// arena is a plain scratch buffer. Used by the protocol task only.
     size_t json_arena_size{DEFAULT_JSON_ARENA_SIZE};

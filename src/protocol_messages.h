@@ -907,11 +907,12 @@ struct ServerPairConfirmPayload {
 // ============================================================================
 
 // Every process_*() below takes the parsed JSON object and fills the caller-owned output it is
-// handed, returning false on a missing or malformed required field. Every format_*() that returns
-// a std::string builds its document in the `arena` it is handed (the client's, on the protocol
-// task) and destroys it before it returns (a document that fits one variant pool frees the arena
-// back down to where it found it; see SendspinArenaAllocator). It never resets the arena, so a
-// message built inside a handler leaves the parsed message below it intact.
+// handed, returning false on a missing or malformed required field; the output holds copies, never
+// a view into the document, so the caller can release the document before acting on it
+// (ParsedJsonMessage::extract()). Every format_*() that returns a std::string builds its document
+// in the `arena` it is handed (the client's, on the protocol task) and destroys it before it
+// returns (a document that fits one variant pool frees the arena back down to where it found it;
+// see SendspinArenaAllocator). It never resets the arena.
 
 /// @brief Determines the message type of an incoming server-to-client JSON message; UNKNOWN if
 /// not recognized

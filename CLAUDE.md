@@ -76,7 +76,7 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `base64.h`: base64 encoding/decoding
 - `compiler.h`: compiler hints and platform-specific macros
 - `crypto.h`: SHA-256/SHA-512, HMAC-SHA-512, X25519, one-shot ChaChaPoly AEAD, CSPRNG, constant-time compare and secure zero
-- `json_arena.h`: bounded internal-RAM bump-arena ArduinoJson allocator with PSRAM fallback that wipes every block it frees; backs every JSON document the protocol task parses or builds
+- `json_arena.h`: bounded internal-RAM bump-arena ArduinoJson allocator with PSRAM fallback that wipes every block it frees; backs every JSON document the protocol task parses or builds, plus `ParsedJsonMessage`, the extract-then-release reader every parsed inbound message goes through
 - `network_info.h`: best-effort lookup of the local network interface MAC address
 - `types.h`: platform type abstractions
 - `shared_ring_buffer.h`: multi-producer ring buffer with acquire/complete writes, one ordered consumer, any-order returns and ring-order reclamation (ESP: FreeRTOS no-split `xRingbuffer`, host: a mutex/condition-variable reimplementation of its layout)

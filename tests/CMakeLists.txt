@@ -213,6 +213,10 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     liveness_timeout_us_: a stand-in connection handed to the nursery is promoted by one
 #     protocol tick, which decides when the first client/state leaves relative to admission and
 #     whether the liveness scan drops the connection.
+#   - SendspinClient::json_arena_ and SendspinArenaAllocator::offset_ and high_water_: whether a
+#     reply a handler builds shares the arena with the parse that triggered it shows only in where
+#     the parse leaves the bump pointer and in the arena's peak, which is rewound so it measures
+#     one delivery; nothing a peer receives depends on either.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

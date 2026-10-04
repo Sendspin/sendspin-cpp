@@ -32,8 +32,9 @@
 ///
 /// Re-handshake (in-band key rotation):
 ///   The server may initiate a new KKpsk2 handshake after transport is active.
-///   The re-handshake msg1 arrives as a decrypted noise/handshake JSON envelope.
-///   The prologue is the prior handshake hash `h` rather than init-text concatenation.
+///   The re-handshake msg1 arrives as a decrypted noise/handshake JSON envelope, which the
+///   message dispatch reads (read_noise_handshake_data()) and releases before the re-handshake
+///   runs. The prologue is the prior handshake hash `h` rather than init-text concatenation.
 ///   Use run_rehandshake_msg1() which applies the same deferred-PSK-binding sequence.
 
 #pragma once
@@ -49,8 +50,8 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace sendspin {
 
@@ -77,13 +78,29 @@ enum class HandshakeFrameResult : uint8_t {
 };
 
 // ============================================================================
+// noise/handshake envelope
+// ============================================================================
+
+/// @brief Reads the Noise message bytes a noise/handshake envelope carries: its payload.data,
+/// base64url-decoded.
+///
+/// The one reader of the envelope for both the initial handshake's msg1 frame and the in-band
+/// re-handshake's, so the caller can release the parsed envelope before the handshake runs.
+/// @param envelope    Parsed noise/handshake envelope; its type is the caller's to check.
+/// @param log_context Prefix for the failure log line.
+/// @return The decoded bytes, or nullopt (logged) when data is missing, empty or not base64url.
+std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst envelope,
+                                                              const char* log_context);
+
+// ============================================================================
 // Re-handshake helper
 // ============================================================================
 
 /// @brief Run the responder side of an in-band Noise KKpsk2 re-handshake.
 ///
 /// Called on the protocol task when a decrypted noise/handshake JSON arrives
-/// after transport mode is already active.  The prologue for the re-handshake
+/// after transport mode is already active, with the msg1 bytes read from it
+/// (read_noise_handshake_data()).  The prologue for the re-handshake
 /// is the 32-byte handshake hash `h` from the PRIOR handshake.
 ///
 /// The same deferred-PSK-binding sequence used by the initial handshake applies here:
@@ -93,18 +110,18 @@ enum class HandshakeFrameResult : uint8_t {
 ///   4. Bind the resolved PSK onto the same session (NoiseSession::set_psk).
 ///   5. Write msg2 and split -> new session.
 ///
-/// @param msg1_json      Decrypted noise/handshake JSON string (the re-handshake msg1 envelope).
+/// @param msg1_bytes     The re-handshake msg1 (Noise bytes, decoded from the envelope).
 /// @param server_id      Known server peer_id (43-char base64url) from the prior handshake.
 /// @param identity       Our static X25519 identity.
 /// @param record_store   Record store for psk_id resolution (read-only on protocol task).
 /// @param suite_name     Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
 /// @param prior_h        32-byte handshake hash from the prior session (used as prologue).
-/// @param arena          The client's JSON arena: the msg1 envelope and payload are parsed and
-///                       the msg2 envelope built in it.
+/// @param arena          The client's JSON arena: msg1's payload is parsed and the msg2 envelope
+///                       built in it, one after the other.
 /// @return Populated NoiseHandshakeResult (session + msg2_text to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    std::string_view msg1_json, const std::string& server_id, const Identity& identity,
+    const std::vector<uint8_t>& msg1_bytes, const std::string& server_id, const Identity& identity,
     const RecordStore& record_store, const std::string& suite_name,
     const std::array<uint8_t, 32>& prior_h, SendspinArenaAllocator& arena);
 
@@ -181,16 +198,18 @@ private:
     /// @param log_context Handshake state to name in the log line.
     void take_server_error(JsonObjectConst root, const char* log_context);
 
-    /// @brief Validate the parsed server/init frame.
-    /// @param root Parsed envelope.
-    /// @param text Exact received bytes, retained for the handshake prologue.
-    bool handle_server_init(JsonObjectConst root, const std::string& text);
+    /// @brief Validate the fields read from a server/init frame.
+    /// @param version   payload.version (0 when absent).
+    /// @param server_id payload.server_id (empty when absent).
+    /// @param text      Exact received bytes, retained for the handshake prologue.
+    bool handle_server_init(int version, std::string server_id, const std::string& text);
 
-    /// @brief Authenticate and respond to the parsed noise/handshake msg1 frame.
-    /// @param root    Parsed envelope.
-    /// @param send_fn Sends the msg2 frame back to the peer.
+    /// @brief Authenticate and respond to the noise/handshake msg1.
+    /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data()).
+    /// @param send_fn    Sends the msg2 frame back to the peer.
     /// @return true when msg1 authenticated and msg2 was sent.
-    bool handle_msg1(JsonObjectConst root, const std::function<bool(const std::string&)>& send_fn);
+    bool handle_msg1(const std::vector<uint8_t>& msg1_bytes,
+                     const std::function<bool(const std::string&)>& send_fn);
 
     // Struct fields
     /// Exact bytes of the client/init frame we sent (retained for prologue).

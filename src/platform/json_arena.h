@@ -27,6 +27,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
+#include <type_traits>
+#include <utility>
 
 namespace sendspin {
 
@@ -47,13 +50,17 @@ namespace sendspin {
  * newest first, then the variant pools oldest first. A parse copies its first key before it
  * allocates its first pool, so that key is stranded below the pool, and a document with several
  * pools strands every pool but the last. A single-pool document whose first member is a linked
- * literal allocates its pool first and so drains completely. The messages the library builds
- * start with the literal "type" key, so one that fits a pool and is built while a parsed message
- * is live (inside a handler) sits above it and drains back down to where the parse left the
- * arena. ArduinoJson::Allocator has no "document destroyed"
+ * literal allocates its pool first and so drains completely; the messages the library builds
+ * start with the literal "type" key. ArduinoJson::Allocator has no "document destroyed"
  * hook, so the owner calls reset() before each inbound message, with no document live, to
  * reclaim what was stranded; nothing else resets it. It does not touch blocks that escaped to
  * PSRAM. Not thread-safe: the client's instance is used by the protocol task only.
+ *
+ * The arena holds one document at a time, never a parse and a reply together: a parsed message
+ * is read through ParsedJsonMessage, which destroys it once its fields are copied out and before
+ * anything acts on them, so the reply a handler builds starts from an arena holding only what
+ * the parse stranded (its first key, for a single-pool message). A document falls back to the
+ * heap only when it exceeds what the budget has left after what the parse stranded.
  *
  * Every block is wiped as it is freed, with the bytes a top block's shrinking reallocate() returns
  * to free space and the old copy a moving one leaves behind, so a document that held key material
@@ -266,5 +273,70 @@ private:
 inline JsonDocument make_json_document(SendspinArenaAllocator& arena) {
     return JsonDocument(&arena);
 }
+
+/**
+ * @brief A parsed inbound JSON message, read once and released before anything acts on it
+ *
+ * Extract, then release, then act: extract() hands the root to a callable that copies what the
+ * caller needs into plain values, then destroys the document, so no handler ever receives the
+ * JsonObject and a reply the handler builds fits the arena beside nothing (see
+ * SendspinArenaAllocator). read() looks at the root without releasing it, for a step that only
+ * decides which extraction applies (a message type); release() drops a document whose payload
+ * the caller does not read. None of them may be called after the document is released.
+ *
+ * The document is destroyed rather than clear()ed: JsonDocument::clear() frees the variant pools
+ * before the strings above them, which strands the parse's pool in the arena until reset().
+ */
+class ParsedJsonMessage {
+public:
+    /// @brief Creates an empty message whose document allocates from @p arena (must outlive it)
+    explicit ParsedJsonMessage(SendspinArenaAllocator& arena) : doc_(std::in_place, &arena) {}
+
+    /// @brief Parses @p len bytes of JSON text, copying its strings into the document
+    /// @return false on a parse error or an empty (null) document
+    bool parse(const char* data, size_t len) {
+        return !deserializeJson(*this->doc_, data, len) && !this->doc_->isNull();
+    }
+
+    /// @brief Calls @p reader with the root object and returns its result, keeping the document
+    template <typename Reader>
+    auto read(Reader&& reader) {
+        return reader(this->doc_->as<JsonObject>());
+    }
+
+    /// @brief Calls @p extractor with the root object, releases the document, then returns what
+    /// @p extractor returned
+    template <typename Extractor>
+    auto extract(Extractor&& extractor) {
+        if constexpr (std::is_void_v<std::invoke_result_t<Extractor&, JsonObject>>) {
+            extractor(this->doc_->as<JsonObject>());
+            this->release();
+        } else {
+            auto extracted = extractor(this->doc_->as<JsonObject>());
+            this->release();
+            return extracted;
+        }
+    }
+
+    /// @brief extract() through one of the protocol's process_*() parsers: fills @p out and
+    /// returns whether the message was valid. The parser is a template argument so the call to
+    /// it is direct, which keeps it visible to the static stack analysis (tools/stack_usage/)
+    template <auto Parser, typename T>
+    bool extract(T* out) {
+        const bool valid = Parser(this->doc_->as<JsonObject>(), out);
+        this->release();
+        return valid;
+    }
+
+    /// @brief Destroys the document, wiping and freeing its blocks
+    void release() {
+        this->doc_.reset();
+    }
+
+private:
+    // Struct fields
+    /// Engaged from construction until release().
+    std::optional<JsonDocument> doc_;
+};
 
 }  // namespace sendspin

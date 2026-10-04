@@ -34,7 +34,9 @@
 #include "inbox.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/crypto.h"
+#include "platform/json_arena.h"
 #include "platform/logging.h"
+#include "protocol_messages.h"
 #include "protocol_task.h"
 #include "record_store.h"
 #include "sendspin/client.h"
@@ -1854,11 +1856,14 @@ public:
 // message to the dispatch path as the protocol task would.
 class HoldTestClient {
 public:
-    explicit HoldTestClient(const char* name) {
+    explicit HoldTestClient(
+        const char* name,
+        size_t json_arena_size = SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE) {
         SendspinClientConfig config;
         config.name = name;
         // Port 0: an ephemeral listener nothing connects to; every message is delivered directly.
         config.server_port = 0;
+        config.json_arena_size = json_arena_size;
         this->client_storage = std::make_unique<SendspinClient>(std::move(config));
         this->client_storage->set_network_provider(&this->network);
         this->client_storage->add_metadata().set_listener(&this->listener);
@@ -2449,6 +2454,64 @@ TEST(EncryptedLifecycle, ClientStateCarriesOnlyTheOwnedRoles) {
         EXPECT_FALSE(doc["payload"]["available"].as<bool>());
         EXPECT_EQ(!doc["payload"]["player"].isNull(), row.expect_player);
     }
+}
+
+// Extract, then release, then act, at the dispatch: a later server/activate that moves an
+// operational connection's active roles is answered with a client/state built inside its handler
+// (messaging.md "client/state"). The activate's document is released before that handler runs, so
+// the arena's peak across the delivery stays below where the activate's parse leaves the arena
+// plus the peak of the smallest message the library builds (client/leave), each measured alone on
+// a fresh arena: a reply built on top of the live parse starts there and reaches at least that
+// sum. The client's arena is sized so both would fit at once (a host variant pool alone is 4 KB),
+// so a nested build shows as the sum rather than spilling to the heap. The arena is reached
+// through -fno-access-control (SendspinClient::json_arena_, the parse's end offset_, and
+// high_water_ rewound so the peak is the delivery's alone): the arena's peak is the claim under
+// test, and nothing the peer receives depends on it.
+TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
+    constexpr size_t ARENA_BYTES = 16 * 1024;
+    const std::string activate =
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["metadata@v1"]}})";
+    size_t parse_end = 0;
+    {
+        SendspinArenaAllocator alone(ARENA_BYTES);
+        ParsedJsonMessage parsed(alone);
+        ASSERT_TRUE(parsed.parse(activate.data(), activate.size()));
+        parse_end = alone.offset_;
+    }
+    size_t smallest_reply_peak = 0;
+    {
+        SendspinArenaAllocator alone(ARENA_BYTES);
+        format_client_leave_message(alone);
+        smallest_reply_peak = alone.high_water();
+    }
+
+    HoldTestClient bundle("Arena Release Test Client", ARENA_BYTES);
+    auto conn = std::make_shared<StateCapturingConnection>();
+    // A paired server, whose playback activations are admissible (the stand-in's default Sentinel
+    // category would have the activate dropped instead).
+    conn->set_noise_handshake_result(test_peer_id("arena-release-server"), PskCategory::LONG_TERM,
+                                     "arena-release-psk-id");
+    conn->set_client_hello_sent(true);
+    conn->set_server_hello_received(true);
+    conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
+                                      std::memory_order_relaxed);
+    bundle.client_ref().connection_manager_->install_admitted(conn, ALL_ROLES_MASK);
+    // Unavailable, so a player's state does not wait for the clock.
+    bundle.client_ref().set_available(false);
+    bundle.pump();
+    ASSERT_FALSE(conn->states.empty()) << "the connection never became operational";
+    const size_t states_before = conn->states.size();
+
+    SendspinArenaAllocator& arena = *bundle.client_ref().json_arena_;
+    arena.reset();  // As process_inbound() does before each inbound message.
+    arena.high_water_ = 0;
+    bundle.deliver(*conn, activate);
+
+    ASSERT_GT(conn->states.size(), states_before)
+        << "the activate's handler built no client/state, so nothing was measured";
+    EXPECT_LT(arena.high_water(), parse_end + smallest_reply_peak)
+        << "parse end " << parse_end << ", smallest reply peak " << smallest_reply_peak;
 }
 
 // A stand-in that records, for each client/state it is asked to send, whether it held the

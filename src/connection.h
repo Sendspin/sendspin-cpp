@@ -41,7 +41,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -209,20 +208,21 @@ public:
     ///
     /// Called on the protocol task when a decrypted noise/handshake JSON message arrives after
     /// transport is already active (routed here from the dispatch for the "noise/handshake"
-    /// message type). Runs the deferred-PSK-binding msg1 read with prologue = the current
-    /// NoiseTransport's handshake_hash(), then commits the new session via
-    /// NoiseTransport::send_msg2_and_swap() (msg2 sent under the OLD session, then the swap; every
-    /// send runs on this task, so no encrypt falls between the two).
+    /// message type, which reads msg1 out of the envelope and releases it first). Runs the
+    /// deferred-PSK-binding msg1 read with prologue = the current NoiseTransport's
+    /// handshake_hash(), then commits the new session via NoiseTransport::send_msg2_and_swap()
+    /// (msg2 sent under the OLD session, then the swap; every send runs on this task, so no
+    /// encrypt falls between the two).
     ///
     /// Resets first_activate_received_ so the connection waits for the post-swap
     /// server/activate that connection.md "Re-handshake" makes the server's first message under
     /// the new keys; neither hello is re-sent, and the manager's nursery is not involved (the
     /// connection stays current/established throughout, with no drop/reconnect).
     ///
-    /// @param msg1_json  The decrypted noise/handshake JSON string (msg1 envelope).
+    /// @param msg1_bytes  The re-handshake msg1 Noise bytes (read_noise_handshake_data()).
     /// @return true on success (session swapped; a post-swap server/activate is expected next).
     ///         false on any failure (caller should close the WebSocket).
-    bool handle_noise_rehandshake(std::string_view msg1_json);
+    bool handle_noise_rehandshake(const std::vector<uint8_t>& msg1_bytes);
 
     /// @brief Encrypt and send a JSON string as a Noise transport binary frame.
     /// Thin delegate to NoiseTransport::send_json().

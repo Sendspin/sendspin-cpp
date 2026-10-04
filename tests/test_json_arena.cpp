@@ -13,8 +13,8 @@
 // limitations under the License.
 
 /// @file test_json_arena.cpp
-/// @brief Tests for SendspinArenaAllocator: every freed block is wiped, and a message built on
-/// top of a live parsed document leaves it intact and drains back down to it.
+/// @brief Tests for SendspinArenaAllocator and ParsedJsonMessage: every freed block is wiped, and
+/// a parsed message released before its reply is built leaves the arena to the reply.
 
 #include "platform/json_arena.h"
 #include "protocol_messages.h"
@@ -22,6 +22,7 @@
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -167,43 +168,63 @@ TEST(JsonArena, FreedBytesAreWiped) {
 }
 
 // ============================================================================
-// Nested documents
+// One document at a time
 // ============================================================================
 
-// A message built while a parsed message is live (a client/state built inside a stream/start
-// handler) sits above the parsed document in the arena: the builder never resets the arena, so
-// the parsed document's strings survive the build, and the build frees back down to where the
-// parse left the arena. The parse itself need not drain to where it started: ArduinoJson frees a
-// document's strings before its variant pools, so a key copied before the first pool was
-// allocated is stranded below it, which is what the reset before each inbound message is for. The arena is
-// sized so both documents fit (a host variant pool alone is 4 KB). offset_ is read through
-// -fno-access-control: where the bump pointer stands is the claim under test.
-TEST(JsonArena, MessageBuiltOnAParsedMessageLeavesItIntactAndDrainsBackDown) {
-    SendspinArenaAllocator arena(16 * 1024);
-    const size_t before_parse = arena.offset_;
-
+// Extract, then release, then act: a parsed message read through ParsedJsonMessage::extract() is
+// destroyed before the reply it triggers is built (a client/state after a stream/start), so the
+// arena holds one or the other, never both. The arena's peak across the sequence is the larger
+// of the two documents' own peaks, each measured alone on a fresh arena, not their sum, and the
+// release leaves only the parse's first key stranded: ArduinoJson copies that key before its
+// variant pool, and a release that freed the pool before the strings above it (clear() rather
+// than destruction) would strand the pool as well. The arena is sized so both documents fit at
+// once (a host variant pool alone is 4 KB), so a build on top of a live parse would show as the
+// sum rather than spilling to the heap. offset_ is read through -fno-access-control: where the
+// bump pointer stands after the release is the claim under test.
+TEST(JsonArena, ParsedMessageIsReleasedBeforeItsReplyIsBuilt) {
+    constexpr size_t ARENA_BYTES = 16 * 1024;
+    // The parse's stranded first key ("type"): a block header and a short string node, against a
+    // variant pool of kilobytes.
+    constexpr size_t FIRST_KEY_BOUND = 64;
     const std::string stream_start =
         R"({"type":"stream/start","payload":{"player":{"codec":"flac","sample_rate":48000,)"
         R"("channels":2,"bit_depth":16,"codec_header":"ZkxhQwAAACIQABAAAAANAAAN"}}})";
+    ClientStateMessage state;
+    state.available = true;
+    state.player = ClientPlayerStateObject{};
+
+    size_t parse_peak = 0;
     {
-        JsonDocument parsed = make_json_document(arena);
-        ASSERT_FALSE(deserializeJson(parsed, stream_start.data(), stream_start.size()));
-        const size_t after_parse = arena.offset_;
-        ASSERT_GT(after_parse, before_parse) << "the parse must be in the arena";
-
-        ClientStateMessage state;
-        state.available = true;
-        state.player = ClientPlayerStateObject{};
-        const std::string built = format_client_state_message(&state, arena);
-        EXPECT_NE(built.find(R"("type":"client/state")"), std::string::npos);
-        EXPECT_GT(arena.high_water(), after_parse) << "the build must be above the parse";
-
-        // Asserted before the parsed document is read: one the build overwrote can hold a member
-        // list that loops.
-        ASSERT_EQ(arena.offset_, after_parse) << "the build drains back down to the parse";
-        JsonObjectConst player = parsed["payload"]["player"];
-        EXPECT_STREQ(player["codec"] | "", "flac");
-        EXPECT_STREQ(player["codec_header"] | "", "ZkxhQwAAACIQABAAAAANAAAN");
-        EXPECT_EQ(player["sample_rate"] | 0, 48000);
+        SendspinArenaAllocator alone(ARENA_BYTES);
+        ParsedJsonMessage parsed(alone);
+        ASSERT_TRUE(parsed.parse(stream_start.data(), stream_start.size()));
+        parse_peak = alone.high_water();
     }
+    size_t build_peak = 0;
+    {
+        SendspinArenaAllocator alone(ARENA_BYTES);
+        format_client_state_message(&state, alone);
+        build_peak = alone.high_water();
+    }
+    ASSERT_GT(parse_peak, 0U) << "the parse must be in the arena";
+    ASSERT_GT(build_peak, 0U) << "the build must be in the arena";
+
+    SendspinArenaAllocator arena(ARENA_BYTES);
+    ParsedJsonMessage parsed(arena);
+    ASSERT_TRUE(parsed.parse(stream_start.data(), stream_start.size()));
+    StreamStartMessage stream_msg;
+    ASSERT_TRUE(parsed.extract<process_stream_start_message>(&stream_msg));
+    ASSERT_TRUE(stream_msg.player.has_value());
+    EXPECT_EQ(stream_msg.player->sample_rate.value_or(0), 48000U) << "the fields outlive the release";
+
+    const size_t after_release = arena.offset_;
+    EXPECT_LE(after_release, FIRST_KEY_BOUND)
+        << "the release must leave only the first key stranded, not the variant pool";
+
+    const std::string built = format_client_state_message(&state, arena);
+    EXPECT_NE(built.find(R"("type":"client/state")"), std::string::npos);
+    EXPECT_EQ(arena.high_water(), std::max(parse_peak, after_release + build_peak))
+        << "parse peak " << parse_peak << ", build peak " << build_peak;
+    EXPECT_LT(arena.high_water(), parse_peak + build_peak)
+        << "the reply must not be built on top of the live parse";
 }
