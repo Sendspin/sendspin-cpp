@@ -501,13 +501,22 @@ void SendspinConnection::fail_inbound() {
 
 SS_HOT SendspinConnection::InboundTarget SendspinConnection::begin_inbound_message(
     size_t len, bool is_text, int64_t receive_time_us) {
-    // Any complete data message proves the peer is alive, including an empty one or one that is
-    // dropped below.
-    this->last_receive_time_us_.store(static_cast<uint32_t>(receive_time_us),
-                                      std::memory_order_relaxed);
+    if (this->fragment_assembly_open_) {
+        // RFC 6455 section 5.4: the fragments of one message are not interleaved with another
+        // data message. Failing here also keeps the assembly's continuations off a fallback
+        // buffer this message would publish.
+        SS_LOGW(TAG, "Data frame inside a fragmented message; closing");
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
+    }
     const InboundTarget target =
         this->route_inbound_message(len, is_text ? InboundKind::TEXT : InboundKind::BINARY,
                                     static_cast<uint32_t>(receive_time_us));
+    if (target.route == InboundRoute::DROP) {
+        // A dropped message is read and discarded without holding anything, so its start
+        // stands in for its completion as proof the peer is alive.
+        this->note_message_completed();
+    }
     // An admitted connection receives into the ring from here on and nothing is pending once a
     // ring write began, so the fallback buffer goes back to the heap.
     if (this->inbound_item_ != nullptr && this->fallback_buf_.data() != nullptr) {
@@ -608,7 +617,15 @@ SendspinConnection::InboundRoute SendspinConnection::wait_until_writable() {
     return InboundRoute::CLOSE;
 }
 
+void SendspinConnection::note_message_completed() {
+    this->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
+                                      std::memory_order_relaxed);
+}
+
 void SendspinConnection::end_inbound_message(bool received) {
+    if (received) {
+        this->note_message_completed();
+    }
     if (this->inbound_item_ != nullptr) {
         void* item = std::exchange(this->inbound_item_, nullptr);
         if (received) {
@@ -637,15 +654,22 @@ void SendspinConnection::abandon_inbound_message() {
     }
     this->inbound_to_fallback_ = false;
     this->fragment_dropping_ = false;
+    this->fragment_assembly_open_ = false;
 }
 
 SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
     size_t len, bool first, bool is_text, int64_t receive_time_us) {
     // The rare path (see the declaration): a multi-frame WebSocket message is assembled in the
     // fallback buffer whatever the admission state, and routed when its last bytes arrive.
-    this->last_receive_time_us_.store(static_cast<uint32_t>(receive_time_us),
-                                      std::memory_order_relaxed);
+    if (first && this->fragment_assembly_open_) {
+        // RFC 6455 section 5.4: a fragmented message ends with its final continuation frame
+        // before another data message starts.
+        SS_LOGW(TAG, "New fragmented message inside an open one; closing");
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
+    }
     if (first) {
+        this->fragment_assembly_open_ = true;
         this->fragment_dropping_ = false;
         if (this->inbound_ring_ == nullptr || this->inbound_gate_.is_detached()) {
             this->fragment_dropping_ = true;
@@ -656,10 +680,21 @@ SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
             }
             this->fragment_dropping_ = waited == InboundRoute::DROP;
         }
-        // The buffer is the transport's from here: nothing is pending.
-        this->fallback_len_ = 0;
-        this->fallback_kind_ = is_text ? InboundKind::TEXT : InboundKind::BINARY;
-        this->fallback_receive_time_us_ = static_cast<uint32_t>(receive_time_us);
+        if (!this->fragment_dropping_) {
+            // The buffer is the transport's from here: nothing is pending. A dropped message
+            // leaves the fields alone, since the protocol task may still be reading a detached
+            // connection's pending message through them.
+            this->fallback_len_ = 0;
+            this->fallback_kind_ = is_text ? InboundKind::TEXT : InboundKind::BINARY;
+            this->fallback_receive_time_us_ = static_cast<uint32_t>(receive_time_us);
+        }
+    } else if (!this->fragment_assembly_open_) {
+        // RFC 6455 section 5.4: a continuation frame continues a fragmented message, so one with
+        // none open is a protocol error. It never reaches the fallback buffer, which may hold a
+        // pending message the protocol task is reading.
+        SS_LOGW(TAG, "Continuation frame with no fragmented message open; closing");
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
     }
     if (this->fragment_dropping_ || this->inbound_gate_.is_detached()) {
         this->fragment_dropping_ = true;
@@ -687,6 +722,10 @@ SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
 }
 
 void SendspinConnection::end_inbound_fragment(size_t len, bool last) {
+    if (last) {
+        this->fragment_assembly_open_ = false;
+        this->note_message_completed();
+    }
     if (this->fragment_dropping_) {
         if (last) {
             this->fragment_dropping_ = false;

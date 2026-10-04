@@ -994,7 +994,8 @@ protected:
     /// into its fallback buffer once the previous pre-admission message is consumed, waiting up
     /// to InboundGate::WRITABLE_WAIT_MS; a message over InboundGate::PRE_ADMISSION_MESSAGE_BYTES,
     /// a wait that times out, or a buffer that cannot be allocated closes the connection. A
-    /// detached or unattached connection drops everything.
+    /// detached or unattached connection drops everything. A message arriving while a multi-frame
+    /// message is being assembled closes the connection (RFC 6455 section 5.4).
     /// @param len Message length in bytes.
     /// @param is_text Whether the message arrived in a text frame.
     /// @param receive_time_us platform_time_us() when the transport received it.
@@ -1014,6 +1015,9 @@ protected:
     /// at most INBOUND_MAX_MESSAGE_BYTES. The completed message costs one copy more than the
     /// single-frame path: from the fallback buffer into a ring item for an admitted connection.
     /// The routes and caps are those of begin_inbound_message(), applied to the running total.
+    /// Bytes that are not `first` with no message being assembled (a stray continuation frame),
+    /// or `first` bytes while one is, close the connection (RFC 6455 section 5.4) and never touch
+    /// the fallback buffer.
     /// @param len Bytes this frame (or this chunk of it) carries.
     /// @param first Whether these are the first bytes of the message.
     /// @param is_text Whether the message's first frame is a text frame; read when `first`.
@@ -1051,6 +1055,11 @@ protected:
     /// @return RECEIVE when the transport may write, DROP when the connection is detached, CLOSE
     ///         when the wait timed out and closed it.
     InboundRoute wait_until_writable();
+
+    /// @brief Stamps last_receive_time_us_ with the current time. Transport thread, when a
+    /// message is complete: a peer that stalls part-way through one stops refreshing the stamp,
+    /// so the liveness watchdog bounds how long it can hold a ring item uncompleted.
+    void note_message_completed();
 
     /// @brief Closes the connection over a receive failure the transport detected (an oversize
     /// message, a stalled protocol task, an allocation failure): detaches the inbound gate, closes
@@ -1178,9 +1187,10 @@ protected:
 
     // 32-bit fields
 
-    /// Low 32 bits of platform_time_us() at the last complete inbound message. Atomic because it
-    /// is written on the transport thread and read by the main-loop liveness check; 32 bits because
-    /// it is stored per message and a 64-bit atomic is not lock-free on the ESP32 family.
+    /// Low 32 bits of platform_time_us() at the last complete inbound message, or at the start of
+    /// one the transport drops (see note_message_completed()). Atomic because it is written on
+    /// the transport thread and read by the main-loop liveness check; 32 bits because it is
+    /// stored per message and a 64-bit atomic is not lock-free on the ESP32 family.
     std::atomic<uint32_t> last_receive_time_us_{0};
 
     /// Low 32 bits of the receive time of the message in fallback_buf_. Same threads as
@@ -1341,6 +1351,11 @@ protected:
     /// True while the rest of a multi-frame message is being read and discarded. Transport thread
     /// only.
     bool fragment_dropping_{false};
+
+    /// True from a multi-frame message's first bytes until its last bytes or
+    /// abandon_inbound_message(), whether it is being assembled or dropped: a continuation frame
+    /// is accepted only while it is set. Transport thread only.
+    bool fragment_assembly_open_{false};
 
     /// Set once the protocol task has reported this connection lost (mark_loss_reported()).
     /// Protocol task only.

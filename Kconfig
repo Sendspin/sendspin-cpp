@@ -10,6 +10,11 @@ menu "sendspin-cpp"
         # and this select is silently ignored, which is fine: those versions dispatch the upgrade
         # GET to the URI handler natively, so there is nothing to enable.
         select HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+        # esp_websocket_client's own symbol (default n; ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS, default
+        # 2000, sits under it). Without it sends take the lock the client task holds while it runs
+        # the receive handler, which can park waiting for inbound ring space, so the protocol
+        # task's sends fail on their short timeout instead of going out.
+        select ESP_WS_CLIENT_SEPARATE_TX_LOCK
 
     config SENDSPIN_ENABLE_PLAYER
         bool "Enable player role (audio decode/playback)"

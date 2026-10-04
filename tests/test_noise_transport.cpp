@@ -2221,3 +2221,181 @@ TEST(InboundReceive, AnAbandonedRingItemIsNeverHandedToTheProtocolTask) {
         EXPECT_EQ(h.conn.inbound_gate().in_flight(), 0U);
     }
 }
+
+// RFC 6455 section 5.4: a continuation frame continues an open fragmented message, and the
+// fragments of one message are not interleaved with another data message. The ESP transports
+// track no fragment state and pass either violation on, so the connection closes over it rather
+// than append to a fallback buffer that may hold a message the protocol task is reading.
+TEST(InboundReceive, AFrameOutOfFragmentSequenceClosesTheConnection) {
+    // What the connection's fallback buffer holds when the second frame arrives: a pending
+    // single-frame message, the first fragment of an open message, or a pending message
+    // assembled from fragments.
+    enum class Before : uint8_t { PENDING_SINGLE, OPEN_ASSEMBLY, PENDING_ASSEMBLED };
+    enum class Second : uint8_t { CONTINUATION, SINGLE_FRAME, FIRST_FRAGMENT };
+    struct Row {
+        const char* name;
+        Before before;
+        Second second;
+        TestConnection::InboundRoute route;
+    };
+    const Row rows[] = {
+        {"Control: continuation after a first fragment", Before::OPEN_ASSEMBLY,
+         Second::CONTINUATION, TestConnection::InboundRoute::RECEIVE},
+        {"continuation with no fragmented message open", Before::PENDING_SINGLE,
+         Second::CONTINUATION, TestConnection::InboundRoute::CLOSE},
+        {"continuation after a fragmented message ended", Before::PENDING_ASSEMBLED,
+         Second::CONTINUATION, TestConnection::InboundRoute::CLOSE},
+        {"single-frame message inside a fragmented message", Before::OPEN_ASSEMBLY,
+         Second::SINGLE_FRAME, TestConnection::InboundRoute::CLOSE},
+        {"fragmented message started inside another", Before::OPEN_ASSEMBLY,
+         Second::FIRST_FRAGMENT, TestConnection::InboundRoute::CLOSE},
+    };
+    const std::vector<uint8_t> single{0x01, 0x02, 0x03};
+    const std::vector<uint8_t> first{0x11, 0x12};
+    const std::vector<uint8_t> second{0x21, 0x22, 0x23, 0x24};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+
+        // An unadmitted connection's message waits in the fallback buffer for the protocol task.
+        if (row.before == Before::PENDING_SINGLE) {
+            ASSERT_EQ(h.receive(single), TestConnection::InboundRoute::RECEIVE);
+        } else {
+            const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
+                first.size(), /*first=*/true, /*is_text=*/false, platform_time_us());
+            ASSERT_EQ(target.route, TestConnection::InboundRoute::RECEIVE);
+            std::memcpy(target.data, first.data(), first.size());
+            h.conn.end_inbound_fragment(first.size(), row.before == Before::PENDING_ASSEMBLED);
+        }
+        InboundMessage pending;
+        const uint8_t* pending_data = nullptr;
+        if (row.before != Before::OPEN_ASSEMBLY) {
+            ASSERT_TRUE(h.conn.pending_message(pending));
+            pending_data = pending.data;
+        }
+
+        TestConnection::InboundRoute route;
+        if (row.second != Second::SINGLE_FRAME) {
+            const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
+                second.size(), /*first=*/row.second == Second::FIRST_FRAGMENT,
+                /*is_text=*/false, platform_time_us());
+            route = target.route;
+            if (route == TestConnection::InboundRoute::RECEIVE) {
+                std::memcpy(target.data, second.data(), second.size());
+                h.conn.end_inbound_fragment(second.size(), /*last=*/true);
+            }
+        } else {
+            route = h.receive(second);
+        }
+        EXPECT_EQ(route, row.route);
+        const bool closed = row.route == TestConnection::InboundRoute::CLOSE;
+        EXPECT_EQ(h.conn.close_transport_now_calls_, closed ? 1 : 0);
+        EXPECT_EQ(h.conn.inbound_gate().is_detached(), closed);
+
+        if (row.before == Before::OPEN_ASSEMBLY) {
+            if (!closed) {
+                std::vector<uint8_t> assembled = first;
+                assembled.insert(assembled.end(), second.begin(), second.end());
+                ASSERT_TRUE(h.conn.pending_message(pending));
+                EXPECT_EQ(std::vector<uint8_t>(pending.data, pending.data + pending.len),
+                          assembled);
+            }
+            continue;
+        }
+        // The message the protocol task holds is neither moved nor overwritten.
+        const std::vector<uint8_t>& held = row.before == Before::PENDING_SINGLE ? single : first;
+        ASSERT_TRUE(h.conn.pending_message(pending));
+        EXPECT_EQ(pending.data, pending_data) << "the pending message's buffer moved";
+        EXPECT_EQ(std::vector<uint8_t>(pending.data, pending.data + pending.len), held);
+    }
+}
+
+// The liveness stamp is taken when a message is complete, not when its first bytes arrive: a
+// transport stalled part-way through a message holds a ring item every later item waits behind,
+// and the liveness watchdog is what bounds that hold.
+TEST(InboundReceive, TheLivenessStampIsTakenWhenAMessageCompletes) {
+    enum class Shape : uint8_t { SINGLE_FRAME, MULTI_FRAME };
+    struct Row {
+        const char* name;
+        bool admitted;
+        bool detached;  // the transport drops the message rather than receiving it
+        Shape shape;
+        bool complete;  // the transport delivers the message's last bytes
+        bool stamped;
+    };
+    const Row rows[] = {
+        {"Control: admitted single frame, completed", true, false, Shape::SINGLE_FRAME, true,
+         true},
+        {"admitted single frame, ring item acquired and not completed", true, false,
+         Shape::SINGLE_FRAME, false, false},
+        {"Control: unadmitted single frame, completed", false, false, Shape::SINGLE_FRAME, true,
+         true},
+        {"unadmitted single frame, begun and not completed", false, false, Shape::SINGLE_FRAME,
+         false, false},
+        {"Control: multi-frame message, last fragment in", true, false, Shape::MULTI_FRAME, true,
+         true},
+        {"multi-frame message, first fragment only", true, false, Shape::MULTI_FRAME, false,
+         false},
+        // A dropped single frame holds nothing, so its start stands in for its completion.
+        {"dropped single frame, stamped at its start", true, true, Shape::SINGLE_FRAME, false,
+         true},
+        {"Control: dropped multi-frame message, last fragment in", true, true, Shape::MULTI_FRAME,
+         true, true},
+        {"dropped multi-frame message, first fragment only", true, true, Shape::MULTI_FRAME, false,
+         false},
+    };
+    const std::vector<uint8_t> bytes{0x31, 0x32, 0x33, 0x34};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+        h.conn.set_admitted(row.admitted);
+        if (row.detached) {
+            h.conn.inbound_gate().detach();
+        }
+        const TestConnection::InboundRoute route = row.detached
+                                                       ? TestConnection::InboundRoute::DROP
+                                                       : TestConnection::InboundRoute::RECEIVE;
+        ASSERT_EQ(h.conn.get_last_receive_time_us(), 0U);
+
+        if (row.shape == Shape::SINGLE_FRAME) {
+            const TestConnection::InboundTarget target =
+                h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+            ASSERT_EQ(target.route, route);
+            if (target.route == TestConnection::InboundRoute::RECEIVE) {
+                std::memcpy(target.data, bytes.data(), bytes.size());
+                EXPECT_EQ(h.conn.get_last_receive_time_us(), 0U) << "stamped before completion";
+                if (row.complete) {
+                    h.conn.end_inbound_message(true);
+                }
+            }
+        } else {
+            const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
+                bytes.size(), /*first=*/true, /*is_text=*/false, platform_time_us());
+            ASSERT_EQ(target.route, route);
+            size_t received = 0;
+            if (target.route == TestConnection::InboundRoute::RECEIVE) {
+                std::memcpy(target.data, bytes.data(), bytes.size());
+                received = bytes.size();
+            }
+            h.conn.end_inbound_fragment(received, /*last=*/false);
+            EXPECT_EQ(h.conn.get_last_receive_time_us(), 0U) << "stamped before completion";
+            if (row.complete) {
+                const TestConnection::InboundTarget last = h.conn.begin_inbound_fragment(
+                    0, /*first=*/false, /*is_text=*/false, platform_time_us());
+                ASSERT_EQ(last.route, route);
+                h.conn.end_inbound_fragment(0, /*last=*/true);
+            }
+        }
+        EXPECT_EQ(h.conn.get_last_receive_time_us() != 0U, row.stamped);
+
+        // Every acquired item is completed (see InboundRing::acquire()).
+        h.conn.abandon_inbound_message();
+        size_t len = 0;
+        while (void* item = h.ring.take(&len, 0)) {
+            h.conn.inbound_gate().note_item_taken();
+            h.ring.return_item(item);
+        }
+    }
+}

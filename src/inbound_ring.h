@@ -362,7 +362,10 @@ public:
     /// Every item acquired must be completed: FreeRTOS cannot cancel an acquire, an uncompleted
     /// item holds back every item behind it, and the storage-start count take() relies on counts
     /// completions. A transport whose receive fails after acquiring marks the item
-    /// InboundKind::DISCARD and completes it.
+    /// InboundKind::DISCARD and completes it. A peer that stalls part-way through a message
+    /// keeps its item uncompleted until the liveness watchdog drops the connection, since the
+    /// liveness stamp is taken when a message completes (see
+    /// SendspinConnection::note_message_completed()).
     /// @param timeout_ms As SharedRingBuffer::acquire().
     /// @return The item (header first), or nullptr.
     void* acquire(size_t message_len, uint32_t timeout_ms);

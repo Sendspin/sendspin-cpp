@@ -141,8 +141,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v5.5 is the minimum declared in idf_component.yml
-        idf: [v5.5.5, v6.0.3]
+        # v5.5.2 is the minimum declared in idf_component.yml
+        idf: [v5.5.2, v5.5.5, v6.0.3]
         config:
           - name: default
             sdkconfig_defaults: sdkconfig.defaults

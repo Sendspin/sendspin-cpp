@@ -110,6 +110,11 @@ namespace sendspin {
  * order, advancing the free pointer only over a run of returned items starting at the oldest
  * (prvReturnItemDefault()), which is the ring-order reclamation the file comment describes.
  *
+ * The out-of-order returns need ESP-IDF v5.5.2 or later: before it, prvReturnItemDefault()
+ * (esp_ringbuf ringbuf.c) clears the ring's full flag on a return that frees nothing (a newer item
+ * returned while the oldest is still held on a full ring), and acquire() then hands out space
+ * older items still occupy.
+ *
  * vRingbufferReturnItem() unblocks one producer waiting in acquire() (the host wakes them all),
  * so with several producers waiting a bounded acquire() can time out while room it could use
  * exists; callers treat a timed-out acquire as "no room in time", never as a full ring.

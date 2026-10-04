@@ -1832,7 +1832,7 @@ public:
     }
 
     void deliver(SendspinConnection& conn, const std::string& json) {
-        // A complete message off a transport proves the peer alive (begin_inbound_message()),
+        // A complete message off a transport proves the peer alive (end_inbound_message()),
         // and loop()'s liveness tick reaps a current connection whose last arrival is older than
         // the timeout. Handing the JSON straight to the dispatch entry point skips the stamp, so
         // do it here rather than stubbing the tick out.

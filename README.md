@@ -41,7 +41,7 @@ dependencies:
   sendspin/sendspin-cpp: ">=0.1.2"
 ```
 
-Requires ESP-IDF v5.1 or later.
+Requires ESP-IDF v5.5.2 or later, the first release whose ring buffer reclaims space correctly when items are returned out of order.
 
 ## Examples
 

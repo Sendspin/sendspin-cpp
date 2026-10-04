@@ -1214,6 +1214,8 @@ CONFIG_SENDSPIN_ENABLE_VISUALIZER=y
 CONFIG_SENDSPIN_ENABLE_COLOR=y
 ```
 
+The component also selects esp_websocket_client's `ESP_WS_CLIENT_SEPARATE_TX_LOCK`, so sends on an outbound connection (`connect_to()`) take their own lock rather than the one the client task holds while the receive handler waits for inbound ring space.
+
 ### Effect on the API
 
 When a role is disabled, its `add_*()` method, accessor method, and backing member are removed from `client.h` via `#ifdef` guards. Attempting to call `client.add_player()` when `SENDSPIN_ENABLE_PLAYER` is `OFF` produces a compile error. The corresponding role header can still be included (it defines protocol types and the listener interface), but the role class cannot be instantiated.

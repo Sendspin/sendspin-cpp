@@ -30,6 +30,12 @@
 namespace sendspin {
 
 static const char* const TAG = "sendspin.client_connection";
+// The component's Kconfig selects ESP_WS_CLIENT_SEPARATE_TX_LOCK, so this timeout is spent only
+// on other sends, not on the lock the client task holds while handle_data() waits for inbound
+// ring space. The exception is a failed write: esp_websocket_client then takes that lock with no
+// timeout to abort the connection, so the send waits out the handler's park (bounded by its
+// inbound waits, InboundGate::WRITABLE_WAIT_MS and INBOUND_ACQUIRE_TIMEOUT_MS, plus the rest of
+// the frame) rather than deadlocking.
 static constexpr uint32_t WEBSOCKET_SEND_TIMEOUT_MS = 10U;
 
 // WebSocket frame opcodes (RFC 6455)
