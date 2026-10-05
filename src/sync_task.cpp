@@ -707,9 +707,7 @@ DecodeResult SyncTask::decode_whole_chunk(SyncContext& sync_context) {
 }
 
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
-    // Wait for a codec header to arrive on the item list, discarding stale audio chunks. Stop and
-    // stream commands wake the receive immediately via wake_receiver(), so the timeout is only a
-    // safety net against a missed wake (INBOUND_CONSUMER_FALLBACK_WAKE_MS).
+    // Waits for a codec header on the item list, discarding stale audio chunks.
 
     // The next stream's codec header, taken while the stream before it was still active
     // (load_next_chunk()). Its stream may have ended since.

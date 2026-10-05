@@ -374,8 +374,8 @@ void InboundConsumer::unbind() {
     this->items_.recall();
     this->items_.unbind();
     this->ring_ = nullptr;
-    // The role's cleanup() runs after this, when recall() is a no-op, so the run ends here
-    // rather than carrying its count into the next one.
+    // The role's cleanup() calls recall() only after this, when it is a no-op, so the run ends
+    // here.
     this->drop_log_.end_run(TAG, this->dropped_items_name());
 }
 
@@ -504,11 +504,10 @@ const char* InboundConsumer::item_noun() const {
 }
 
 void InboundConsumer::note_drop(DropReason reason) {
-    // Outside a run no recall() would end the run, so nothing counts.
     if (this->ring() == nullptr) {
         return;
     }
-    // Throttled: only the first drop of a run logs (see InboundDropLog).
+    // Only a run's first drop logs (InboundDropLog).
     if (!this->drop_log_.note_drop()) {
         return;
     }

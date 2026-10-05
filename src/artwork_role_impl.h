@@ -185,8 +185,7 @@ struct ArtworkRole::Impl : RoleTeardown {
     /// @brief Persistent decode thread context and the artwork role's end of the inbound ring,
     /// through which the protocol task hands it announces, image parts and markers
     struct DrainTask {
-        /// InboundConsumer states its threads. Its item list's flags also carry the decode
-        /// thread's command bit (InboundItemList::signal()).
+        /// Its item list's flags also carry the decode thread's command bit.
         InboundConsumer inbound;
         std::thread drain_thread;
         /// Decode thread only; see ArtworkAssembly.

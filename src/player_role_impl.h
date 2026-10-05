@@ -164,9 +164,9 @@ struct PlayerRole::Impl : RoleTeardown {
     // Helpers
     // ========================================
 
-    /// @brief Base64-decodes a FLAC codec header straight into an item the protocol task
-    /// acquires (waiting up to INBOUND_ACQUIRE_TIMEOUT_MS for ring space) and hands it to the
-    /// sync task numbered with `ordinal`, its stream's. Protocol task only.
+    /// @brief Base64-decodes a FLAC codec header straight into a ring item (waiting up to
+    /// INBOUND_ACQUIRE_TIMEOUT_MS for space) and hands it to the sync task numbered with
+    /// `ordinal`. Protocol task only.
     /// @return false when the sync task is not running, the header does not decode, or the ring
     ///         had no room in time.
     bool hand_flac_header(const std::string& codec_header, uint16_t ordinal,

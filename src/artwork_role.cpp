@@ -146,8 +146,7 @@ bool ArtworkRole::Impl::start(InboundRing* ring) {
         return false;
     }
 
-    // The list's flags survive a stop()/start() cycle. Clear them so the new thread starts from a
-    // clean command state (stop() already emptied the list).
+    // So a restart inherits no command from the previous run.
     this->drain_task->inbound.items().clear_signals();
 
     platform_configure_thread("SsArt", 4096, static_cast<int>(this->config.priority),
@@ -160,9 +159,6 @@ bool ArtworkRole::Impl::signal_stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
         return false;
     }
-    // signal() sets the bit before it wakes: the thread re-checks its command bits at the top of
-    // every loop iteration, so it observes the stop as soon as the wake pulls it out of its
-    // blocking take.
     this->drain_task->inbound.items().signal(COMMAND_STOP);
     return true;
 }
@@ -292,8 +288,7 @@ ArtworkAnnounce ArtworkRole::Impl::parse_announce(const uint8_t* body) {
 }
 
 void ArtworkRole::Impl::hand_marker(ArtworkItemType type, uint8_t mask, uint32_t generation) const {
-    // Exempt from the quota (InboundConsumer::hand()). A role that is not running hands nothing
-    // and has nothing to warn about.
+    // A role that is not running hands nothing and has nothing to warn about.
     InboundConsumer& inbound = this->drain_task->inbound;
     if (!inbound.hand_local(
             nullptr, 0,
@@ -335,7 +330,6 @@ bool ArtworkRole::Impl::begin_transfer(uint8_t slot, const uint8_t* body, uint32
     // the channel's buffer when it takes the announce (or the marker below) handed after it.
     announce.epoch = this->slot_epochs[slot].fetch_add(1, std::memory_order_relaxed) + 1;
     const uint8_t mask = static_cast<uint8_t>(1U << slot);
-    // An announce is exempt from the quota (InboundConsumer::hand()).
     InboundConsumer& inbound = this->drain_task->inbound;
     const InboundItemFields announce_fields{.data_len = sizeof(announce),
                                             .serial = slot,
@@ -397,11 +391,8 @@ bool ArtworkRole::Impl::hand_part(uint8_t slot, InboundMessage& message, uint32_
     const bool last = t.received == t.total_size;
 
     if (!t.discarding) {
-        // The part goes over in the ring item it was received and decrypted into, and the decode
-        // thread copies it out from there; a part not in a ring item is copied into one whole,
-        // without waiting, like an audio chunk (InboundConsumer::hand_message()). Charged to the
-        // artwork quota, which bounds the parts waiting for the decode thread to copy them
-        // (INBOUND_ARTWORK_IN_FLIGHT_IMAGES); over it the part is dropped with a warning.
+        // The artwork quota bounds the parts waiting for the decode thread to copy them out
+        // (INBOUND_ARTWORK_IN_FLIGHT_IMAGES).
         const bool handed = this->drain_task->inbound.hand_message(
             message,
             {.data_len = static_cast<uint32_t>(part_len),
@@ -1030,10 +1021,8 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
         self->adopt_generation(self->cleanup_generation.load(std::memory_order_acquire));
         self->sweep_parked();
 
-        // Blocking take; returns early (nullptr) when signal() raises a stop, or wake_receiver()
-        // a teardown or a parked-slot recheck. The timeout is only a safety net against a missed
-        // wake (see INBOUND_CONSUMER_FALLBACK_WAKE_MS); a timeout return simply re-runs the checks
-        // above.
+        // A stop, a teardown or a parked-slot recheck ends the take early; any return re-runs the
+        // checks above.
         self->process_next_item(INBOUND_CONSUMER_FALLBACK_WAKE_MS);
     }
 

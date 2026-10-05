@@ -568,32 +568,27 @@ public:
         this->flags_.set(WAKE);
     }
 
-    /// The lowest bit a consumer defines for signal() and take_signals(). The list's flags are
-    /// its consumer's one event group: the bits below this one are the list's own
-    /// (ITEMS_APPENDED, WAKE), and a consumer's command bits start here, staying inside
-    /// EventFlags::USABLE_BITS.
+    /// The lowest consumer command bit; the bits below it are the list's own (ITEMS_APPENDED,
+    /// WAKE).
     static constexpr uint32_t FIRST_CONSUMER_BIT = 1U << 2;
-    /// The highest bit a consumer may define: the eighth, the last bit every platform's group
-    /// exposes (a FreeRTOS event group with 16-bit ticks has 8 usable bits, see
-    /// EventFlags::USABLE_BITS). Each consumer static_asserts its command bits against it.
+    /// The highest consumer command bit: the eighth, the last every platform's group exposes
+    /// (EventFlags::USABLE_BITS).
     static constexpr uint32_t LAST_CONSUMER_BIT = 1U << 7;
 
-    /// @brief Sets consumer `bits` (FIRST_CONSUMER_BIT and up), then wakes a blocking take(), so
-    /// the consumer sees them at its next take_signals(). Any thread, once the list is created.
+    /// @brief Sets consumer `bits` and wakes a blocking take(). Any thread, once the list is
+    /// created.
     void signal(uint32_t bits) {
         this->flags_.set(bits | WAKE);
     }
 
-    /// @brief Waits up to `timeout_ms` for any of consumer `bits` and clears the ones set.
-    /// Consumer only. A wake signal() left behind makes the next blocking take() return nullptr
-    /// once, which take() already reports as a retry.
+    /// @brief Waits up to `timeout_ms` for any of consumer `bits`, clearing those set. Consumer
+    /// only.
     /// @return The bits among `bits` that were set; 0 on timeout.
     uint32_t take_signals(uint32_t bits, uint32_t timeout_ms) {
         return this->flags_.wait(bits, false, true, timeout_ms) & bits;
     }
 
-    /// @brief Clears every bit, the consumer's and the list's own. Before the consumer thread
-    /// starts, while the list is empty, so a restart inherits no signal from the previous run.
+    /// @brief Clears every bit. Before the consumer thread starts, while the list is empty.
     void clear_signals() {
         this->flags_.clear_all();
     }
@@ -624,8 +619,8 @@ private:
     }
 
     // Struct fields
-    /// Set by append(), wake_receiver() and signal(); a blocking take() waits on the list's own
-    /// bits, take_signals() on the consumer's (see FIRST_CONSUMER_BIT).
+    /// Set by append(), wake_receiver() and signal(); take() waits on the list's own bits,
+    /// take_signals() on the consumer's.
     EventFlags flags_;
     /// Guards head_, tail_ and the links of linked items; a leaf lock (see the class comment).
     mutable std::mutex mutex_;
@@ -650,25 +645,16 @@ private:
 // InboundConsumer
 // ============================================================================
 
-/// Fallback wakeup interval for a consumer thread's blocking take (the sync task while idle, the
-/// visualizer drain thread, the artwork decode thread). A stop, the stream commands and a
-/// teardown wake the take at once (InboundItemList::wake_receiver() or signal()), as does every
-/// path that reopens an artwork channel's gate for the decode thread's parked-slot recheck; each
-/// thread also re-runs its checks (the decode thread's parked-slot sweep among them) whenever this
-/// timeout expires. So it is only a safety net against a missed wake: long enough to keep an idle
-/// thread asleep, short enough that a wake bug degrades to a slow reaction rather than a hang.
+/// Fallback wake for a consumer thread's blocking take (the sync task while idle, the visualizer
+/// drain thread, the artwork decode thread). Every command, teardown and artwork gate reopening
+/// wakes the take at once, so this only turns a missed wake into a slow reaction, not a hang.
 static constexpr uint32_t INBOUND_CONSUMER_FALLBACK_WAKE_MS = 5000;
 
-/// @brief The consumer-defined InboundItemHeader fields every hand-over fills
+/// @brief The consumer-defined InboundItemHeader fields every hand-over fills (documented there)
 struct InboundItemFields {
-    /// InboundItemHeader::data_len: how many bytes the consumer reads.
     uint32_t data_len;
-    /// InboundItemHeader::serial: the player's stream ordinal on a codec header, the visualizer's
-    /// boundary sequence on a frame, the artwork channel or channel mask, 0 otherwise.
     uint16_t serial;
-    /// InboundItemHeader::type: the consumer-defined item type.
     uint8_t type;
-    /// InboundItemHeader::data_offset: where the consumer's bytes start in the message bytes.
     uint8_t data_offset;
 };
 
@@ -730,9 +716,8 @@ public:
     /// @brief Fills `item`'s consumer fields, stamps it with `generation`, charges it to the
     /// holder's quota and appends it. Over quota the item is returned to the ring with a
     /// throttled warning: the server overran the buffer_capacity the role advertises, which the
-    /// quota covers at the role's smallest message. Protocol task, inside a run. hand_message()
-    /// and hand_local() end here; a caller that fills an item it acquired itself (a FLAC codec
-    /// header decoded straight into its item) calls it directly.
+    /// quota covers at the role's smallest message. Protocol task, inside a run. Called directly
+    /// only for an item the caller acquired itself (a FLAC codec header decoded into its item).
     /// @param item_len The item's message length (InboundMessage::item_len, or the length the
     ///        item was acquired for).
     /// @param exempt Hands the item over without charging the quota: a codec header, an artwork
@@ -746,21 +731,16 @@ public:
     bool hand(void* item, size_t item_len, InboundItemFields fields, uint32_t generation,
               bool exempt);
 
-    /// @brief Hands a received message over, charged to the quota: its ring item itself, which
-    /// the call takes over (clearing message.item), or, for a message not in a ring item (one
-    /// reassembled from Noise fragments, or routed through the fallback buffer as longer than
-    /// the ring takes), a LOCAL copy of the whole message keeping its receive stamp. The copy
-    /// does not wait: a message over a full ring is dropped like one over the quota, and one
-    /// longer than the ring's largest item (InboundRing::max_item_message_bytes()), which only a
-    /// server over the role's advertised capacity sends, is dropped with a warning of its own so
-    /// a device log tells the two apart. Every drop joins the throttled run. Protocol task,
-    /// inside a run.
+    /// @brief Hands a received message over, charged to the quota: its ring item in place
+    /// (clearing message.item), or else a LOCAL copy of the whole message keeping its receive
+    /// stamp. The copy does not wait; a message with no ring space, or longer than the ring's
+    /// largest item, is dropped. Protocol task, inside a run.
     /// @return false when the message was dropped instead of handed over.
     bool hand_message(InboundMessage& message, InboundItemFields fields, uint32_t generation);
 
     /// @brief Copies `len` bytes (a codec header, an artwork announce, or none for a marker)
     /// into a LOCAL item, waiting up to INBOUND_ACQUIRE_TIMEOUT_MS for ring space, and hands it
-    /// over exempt from the quota (see hand()). Protocol task. A no-op outside a run.
+    /// over exempt from the quota (see hand()). Protocol task.
     /// @return false when the consumer is not bound to a ring or the ring had no room in time.
     bool hand_local(const void* data, size_t len, InboundItemFields fields, uint32_t generation);
 
@@ -779,11 +759,9 @@ public:
         TOO_SHORT,   ///< The role's handler: too short for the holder's message header
     };
 
-    /// @brief Counts a drop in the throttled run (InboundDropLog), logging the warning for
-    /// `reason` when the drop starts one, so a run's warning names its first cause. Protocol
-    /// task: the hand-overs call it, and so does a role handler that drops a malformed message
-    /// before handing it over, so a burst of them shares the run's two log lines. A no-op
-    /// outside a run: nothing counts there, since recall() cannot end a run while unbound.
+    /// @brief Counts a drop in the throttled run (InboundDropLog), logging `reason`'s warning
+    /// when the drop starts one. Protocol task: the hand-overs, and a role handler dropping a
+    /// malformed message. A no-op outside a run.
     void note_drop(DropReason reason);
 
 private:
@@ -797,7 +775,7 @@ private:
     const char* dropped_items_name() const;
     /// @brief The holder's name, leading every drop warning
     const char* holder_name() const;
-    /// @brief One of the holder's messages, in the warnings of the drops note_drop() logs
+    /// @brief One of the holder's messages, for the drop warnings
     const char* item_noun() const;
 
     // Struct fields

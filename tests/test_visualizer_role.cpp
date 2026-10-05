@@ -530,15 +530,11 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 // boundary sequence on, and the drain thread takes only frames stamped with the latest one.
 // ============================================================================
 
-// The drain thread's take_item() returns the frames listed before the latest boundary and takes
-// the first one listed after it, so however many boundaries the drain thread sees in one wait,
-// only the frames sent after the latest survive. roles/visualizer/v1.md "stream/end": an end
-// leaves nothing to deliver, even when a start and its frames came before it in the same wait.
-// messaging.md "stream/clear": frames sent after the clear survive it. The rows drive the
-// protocol-task handlers with no drain thread, as if it saw every boundary in one wait.
-// The held frame each boundary returns from the drain thread's wait is covered end to end by
-// ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime; the teardown
-// row here passes on recall() alone. Gap: a current held frame's resumed wait is not covered.
+// take_item() returns the frames listed before the latest boundary, so only frames sent after it
+// survive (roles/visualizer/v1.md "stream/end", messaging.md "stream/clear"). The rows drive the
+// handlers with no drain thread, as if it saw every boundary in one wait; the held frame is
+// covered by ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime.
+// Gap: a current held frame's resumed wait.
 TEST(VisualizerBoundary, ATakeSkipsTheFramesABoundaryMadeStale) {
     enum class Step { END, START, CLEAR, CLEANUP, FRAME };
     struct Row {

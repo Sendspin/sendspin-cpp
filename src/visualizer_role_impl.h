@@ -101,8 +101,7 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// @brief Persistent drain thread context and the visualizer's end of the inbound ring,
     /// through which the protocol task hands it frames
     struct DrainTask {
-        /// InboundConsumer states its threads. Its item list's flags also carry the drain
-        /// thread's command bits (InboundItemList::signal()).
+        /// Its item list's flags also carry the drain thread's command bits.
         InboundConsumer inbound;
         std::thread drain_thread;
     };
@@ -169,12 +168,11 @@ struct VisualizerRole::Impl : RoleTeardown {
     bool signal_stop() const;
     /// @brief Joins the drain thread and returns every frame it had not taken to the ring
     void stop() const;
-    /// @brief Takes the next item of the role's current teardown generation
-    /// (InboundConsumer::take()) and boundary sequence, returning the stale ones before it to the
-    /// ring. Drain thread.
+    /// @brief Takes the next item of the current teardown generation and boundary sequence,
+    /// returning the stale ones before it. Drain thread.
     void* take_item(uint32_t timeout_ms) const;
-    /// @brief Moves boundary_sequence on, making every listed frame stale, then flags and wakes
-    /// the drain thread. Protocol task, or the main loop in stop() after the join.
+    /// @brief Moves boundary_sequence on, making every listed frame stale, and signals the drain
+    /// thread when one is running.
     void signal_boundary();
     /// @brief Whether a boundary has passed since `item` was listed. Drain thread.
     bool is_stale(void* item) const;
@@ -204,14 +202,12 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// task; read on the drain thread.
     std::atomic<uint8_t> spectrum_bin_count{0};
     std::atomic<bool> tracks_downbeats{false};
-    /// Counts the stream boundaries (stream/start, stream/end, stream/clear, a teardown), wrapping.
-    /// handle_binary() stamps each frame with it (InboundItemHeader::serial) before listing it,
-    /// and a frame whose stamp does not match it belongs to a stream or a stretch before a clear
-    /// that a boundary ended: sequence equality, not a marker item, bounds a stream on the list.
-    /// Equality alone suffices: a frame could only pass for current again after 65,536 boundaries
-    /// while it stayed listed, and the drain thread, woken by every boundary, returns the stale
-    /// frames at its next take. Written by signal_boundary() on the protocol task (or the main
-    /// loop in stop(), once it is joined), with release; read with acquire on the drain thread.
+    /// Counts stream boundaries (stream/start, stream/end, stream/clear, a teardown), wrapping.
+    /// handle_binary() stamps each frame with it (InboundItemHeader::serial); a frame whose stamp
+    /// differs is stale. Equality suffices: a stale frame passes for current only after 65,536
+    /// boundaries, and each one wakes the drain thread to return it. Written by
+    /// signal_boundary() on the protocol task (or the main loop in stop() after the join), with
+    /// release; read with acquire on the drain thread.
     std::atomic<uint16_t> boundary_sequence{0};
 
     // 8-bit fields

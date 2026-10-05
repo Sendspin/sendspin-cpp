@@ -555,12 +555,10 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     client.stop();
 }
 
-// A stream/end, a stream/clear and a teardown each return the frame the drain thread holds for
-// its display time at once, with the frames listed behind it, and the held frame is never
-// delivered. The frames are stamped an hour ahead, so a held frame the wait does not return keeps
-// its quota outstanding and the pump never ends (the watchdog names it); the stop() that ends each
-// row joins the thread, so a frame delivered on its way out is counted. Control: the frames were
-// charged to the visualizer's quota before the boundary.
+// stream/end, stream/clear and a teardown each return the frame the drain thread holds for its
+// display time, and those listed behind it, undelivered. Stamped an hour ahead, a held frame left
+// waiting hangs the pump; stop() joins the thread before the count is read. Control: the frames
+// were charged before the boundary.
 TEST(ClientLifecycle, AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime) {
     constexpr int64_t HELD_FRAME_LEAD_US = 3600LL * 1000 * 1000;
     enum class Boundary : uint8_t { END, CLEAR, TEARDOWN };

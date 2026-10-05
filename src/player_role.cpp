@@ -340,15 +340,12 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     InboundConsumer& inbound = this->sync_task->inbound();
     if (inbound.ring() == nullptr) {
-        // Verbose because this is the per-chunk path: a player with no listener runs no sync
-        // task, which start() warned about once.
+        // Verbose on the per-chunk path: start() already warned once.
         SS_LOGV(TAG, "Discarding audio chunk: the sync task is not running");
         return;
     }
     auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
     if (!chunk.has_value()) {
-        // Joins the hand-overs' throttled drop run, so a burst costs two log lines. note_drop()
-        // counts only inside a run, which the ring check above already established.
         inbound.note_drop(InboundConsumer::DropReason::TOO_SHORT);
         return;
     }
@@ -364,9 +361,6 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
         SS_LOGV(TAG, "Discarding audio chunk while unavailable");
         return;
     }
-    // The zero-copy path: the chunk stays in the ring item it was received and decrypted into,
-    // and the sync task decodes it from there; a chunk not in a ring item is copied into one
-    // whole, so its timestamp stays at plaintext bytes 1-8 (InboundConsumer::hand_message()).
     // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
     // advertised buffer_capacity, which the quota covers at the smallest chunk size.
     (void)inbound.hand_message(message,
@@ -380,9 +374,8 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
 void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
-    // This stream's ordinal: it numbers the stream's codec header (InboundItemHeader::serial) and
-    // its STREAM_START carries it, so the sync task starts it only on its own acknowledgement.
-    // Adopted once the header is handed over.
+    // Numbers the codec header and the STREAM_START, so the sync task starts the stream only on
+    // its own acknowledgement. Adopted once the header is handed over.
     const auto ordinal = static_cast<uint16_t>(this->stream_ordinal + 1);
 
     if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
@@ -720,8 +713,7 @@ bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint16_
     if (ring == nullptr) {
         return false;
     }
-    // Decoded straight into the item the sync task reads it from, rather than through
-    // InboundConsumer::hand_local(), which would cost a second buffer and a copy.
+    // Decoded straight into the item, saving hand_local()'s second buffer and copy.
     const auto* input = reinterpret_cast<const unsigned char*>(codec_header.data());
     size_t decoded_len = 0;
     platform_base64_decode(nullptr, 0, &decoded_len, input, codec_header.size());
@@ -746,7 +738,7 @@ bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint16_
         ring->return_item(item);
         return false;
     }
-    // Exempt, like every codec header (InboundConsumer::hand()).
+    // Exempt, like every codec header.
     return inbound.hand(item, decoded_len,
                         {.data_len = static_cast<uint32_t>(written),
                          .serial = ordinal,

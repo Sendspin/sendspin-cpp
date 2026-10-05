@@ -406,11 +406,9 @@ TEST(InboundItemList, WakeReceiverEndsABlockingTake) {
     EXPECT_EQ(got, nullptr);
 }
 
-// The list's flags are its consumer's one event group: signal() sets a consumer bit and ends a
-// blocking take with nothing, and the bit stays pending for the consumer's own take_signals(),
-// which reports it once. The list's own bits are not consumer signals, and clear_signals() (a
-// start) drops a pending one. The blocking take has no timeout: a signal that does not wake it
-// hangs here and the watchdog names it.
+// signal() ends a blocking take with nothing and take_signals() reports it once; an append is not
+// a consumer signal, and clear_signals() drops a pending one. The take has no timeout, so a
+// signal that does not wake it hangs here.
 TEST(InboundItemList, ASignalEndsATakeAndStaysPendingForItsOwnWait) {
     constexpr uint32_t BIT = InboundItemList::FIRST_CONSUMER_BIT;
     enum class Step { NONE, SIGNAL, APPEND, SIGNAL_THEN_CLEAR };
@@ -449,10 +447,8 @@ TEST(InboundItemList, ASignalEndsATakeAndStaysPendingForItsOwnWait) {
     }
 }
 
-// A blocking take_signals() waits for the consumer's own bits only: an append and a
-// wake_receiver() while it waits leave it waiting (the visualizer's delivery-time wait relies on
-// it), and the signal that follows ends it. The wait has no timeout, so a correct wait cannot
-// return early; one that wakes on the list's bits returns 0 instead of the signal.
+// A blocking take_signals() ignores an append and a wake_receiver() (the visualizer's
+// delivery-time wait relies on it) and ends on its signal; one woken by the list's bits returns 0.
 TEST(InboundItemList, ABlockingSignalWaitIgnoresTheListsOwnBits) {
     constexpr uint32_t BIT = InboundItemList::FIRST_CONSUMER_BIT;
     Fixture f(1024);
@@ -537,12 +533,10 @@ TEST(InboundItemList, AppendAfterRecallStartsAFreshList) {
     EXPECT_EQ(f.list.take(0), item);
 }
 
-// InboundConsumer's hand-overs: hand_message() takes a received message's ring item over in place
-// (no copy) and copies only a message that is not in a ring item, into a LOCAL item keeping its
-// receive stamp; it charges the quota and drops, returning false with nothing charged or listed,
-// a message too long for any item or over the quota. hand_local() hands its copy over exempt from
-// the quota, and hands nothing while the consumer is bound to no ring (the bound row beside it is
-// its control). Every handed item carries the caller's fields and generation.
+// hand_message() hands a ring item in place and copies any other message into a LOCAL item
+// keeping its receive stamp; one too long for any item or over the quota is dropped with nothing
+// charged or listed. hand_local() is exempt from the quota and hands nothing while unbound.
+// Every handed item carries the caller's fields and generation.
 TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
     constexpr size_t RING_BYTES = 1024;
     constexpr size_t LEN = 40;
@@ -636,10 +630,9 @@ TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
     }
 }
 
-// unbind() ends the drop log's run: stop() unbinds before the role's cleanup(), whose recall()
-// then finds the consumer unbound, so a run left open there would carry its count into the next
-// run and swallow that run's first warning (the run's count is private, hence
-// -fno-access-control for this file). Control: the drop over the quota opened a run.
+// unbind() ends the drop run, since the role's cleanup() recall() after it is a no-op; an open run
+// would swallow the next run's first warning (the count is private, hence -fno-access-control).
+// Control: the over-quota drop opened a run.
 TEST(InboundConsumer, UnbindEndsTheDropRun) {
     InboundRing ring;
     ASSERT_TRUE(ring.create(1024, MemoryLocation::PREFER_EXTERNAL));
