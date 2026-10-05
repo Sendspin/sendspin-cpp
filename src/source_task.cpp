@@ -166,7 +166,7 @@ bool SourceTask::write_audio(const uint8_t* data, size_t len, int64_t capture_ti
         return false;
     }
     if (capture_time_us == 0) {
-        // The write's last frame was captured about now, so its first one a write earlier
+        // The write ends about now, so its first frame was captured one write duration earlier
         capture_time_us = platform_time_us() - source_frames_to_us(len / this->bytes_per_frame_,
                                                                    this->role_->config.sample_rate);
     }

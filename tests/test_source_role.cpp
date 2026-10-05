@@ -1026,6 +1026,48 @@ TEST(SourceStream, StopEndsAnOpenStreamAheadOfTheGoodbye) {
     EXPECT_FALSE(rig.source->write_audio(piece.data(), piece.size(), 0)) << "accepted when stopped";
 }
 
+// docs/internals.md "Re-entrant Teardown During Callback Dispatch": a listener that
+// stops the client from on_streaming_stopped() finds the stream's hold released by the time
+// stop() returns, since the nested teardown has no stream left to release.
+TEST(SourceStream, StopFromTheStoppedCallbackFindsTheHoldReleased) {
+    class ReleaseCounter : public SendspinClientListener {
+    public:
+        void on_release_high_performance() override {
+            ++this->releases;
+        }
+        int releases{0};
+    };
+    class StoppingListener : public SourceRoleListener {
+    public:
+        void on_streaming_stopped() override {
+            this->client->stop();
+            this->ref_count_after_stop = this->client->high_performance_ref_count_;
+            this->releases_after_stop = this->counter->releases;
+        }
+        SendspinClient* client{nullptr};
+        ReleaseCounter* counter{nullptr};
+        int ref_count_after_stop{-1};
+        int releases_after_stop{-1};
+    };
+    ReleaseCounter counter;
+    StoppingListener stopping;
+    SourceStandIn rig;
+    rig.client->set_listener(&counter);
+    stopping.client = rig.client.get();
+    stopping.counter = &counter;
+    rig.source->set_listener(&stopping);
+    rig.deliver(source_command_json("start"));
+    rig.tick();
+    ASSERT_EQ(rig.client->high_performance_ref_count_, 1);
+
+    rig.deliver(source_command_json("stop"));
+    rig.tick();
+    EXPECT_FALSE(rig.client->is_started());
+    EXPECT_EQ(stopping.ref_count_after_stop, 0);
+    EXPECT_EQ(stopping.releases_after_stop, 1);
+    EXPECT_EQ(counter.releases, 1);
+}
+
 // ============================================================================
 // Wire behavior (loopback)
 // ============================================================================

@@ -106,7 +106,7 @@ public:
     ///        across all channels) is rejected as a whole.
     /// @param capture_time_us Local-clock capture time (platform time, the domain of
     ///        SendspinClient::get_client_time()) of the FIRST sample in data, or 0 to stamp the
-    ///        write's last sample with the current time.
+    ///        write as ending at the current time (its first sample one write duration earlier).
     /// @return true if the audio was accepted; false when the stream is not open, the write is
     ///         not whole frames, or the capture buffer is full (the write is dropped, and the
     ///         stream resumes from live capture once the buffer drains).
