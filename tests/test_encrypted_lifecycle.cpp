@@ -1852,7 +1852,8 @@ class DispatchTestClient {
 public:
     explicit DispatchTestClient(
         const char* name,
-        size_t json_arena_size = SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE) {
+        size_t json_arena_size = SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE,
+        PlayerRoleListener* player_listener = nullptr) {
         SendspinClientConfig config;
         config.name = name;
         // Port 0: an ephemeral listener nothing connects to; every message is delivered directly.
@@ -1862,11 +1863,14 @@ public:
         this->client_storage->set_network_provider(&this->network);
         this->client_storage->add_metadata().set_listener(&this->listener);
         // The other roles a delivered message can be dispatched to, so delivery runs their real
-        // handlers. The player has no listener, so its sync task never starts and its stream
-        // handlers take the no-op path through an uninitialized ring.
+        // handlers. Without a player listener the sync task never starts and the player's stream
+        // handlers find no item list to hand their codec header to.
         PlayerRoleConfig player_config;
         player_config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
-        this->client_storage->add_player(std::move(player_config));
+        PlayerRole& player = this->client_storage->add_player(std::move(player_config));
+        if (player_listener != nullptr) {
+            player.set_listener(player_listener);
+        }
         this->client_storage->add_controller();
         EXPECT_TRUE(this->client_storage->start());
         // The test thread plays the protocol task: deliver() calls its entry point directly, and
@@ -2320,36 +2324,22 @@ TEST(EncryptedLifecycle, RoleTrafficFromAnAdmittedConnectionIsApplied) {
     EXPECT_EQ(bundle.listener.last_title, "Admitted");
 }
 
-// Role traffic from a connection that is not admitted is dropped, not kept: it stays dropped even
-// once that connection reaches the admitted slot.
-TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsNotAppliedAtAdmission) {
-    DispatchTestClient bundle("Pre-Activate Role Traffic Test Client");
-
-    DispatchTestConnection& conn = bundle.connection();
-    bundle.deliver(conn, metadata_state_json(1, "Before Any Activate"));
-    bundle.pump();
-    ASSERT_EQ(bundle.listener.updates, 0);
-
-    bundle.admit(conn);
-    bundle.pump();
-    EXPECT_EQ(bundle.listener.updates, 0)
-        << "role traffic that preceded the admission must not be applied (last_title='"
-        << bundle.listener.last_title << "')";
-}
-
-// Control: every role message type runs its real handler to completion on an admitted
-// connection. One message of each type, back to back, so a handler that throws the dispatch off
-// (or blocks in it) takes the metadata message behind it down with it. The group name and the
-// metadata title are what say the handlers ran rather than being walked past: a type whose arm
-// does nothing is invisible to the trailing message alone.
+// Every role message type runs its real handler to completion on an admitted connection. One
+// message of each type, back to back, so a handler that throws the dispatch off (or blocks in it)
+// takes the metadata message behind it down with it, and each arm leaves its own outcome: the
+// controller state, the player volume, one stream start and its end, the group update. The
+// stream/clear between them has no consumer-visible outcome (a seek fires no callback), so its
+// arm is covered only by the dispatch running on past it.
 TEST(EncryptedLifecycle, EveryRoleMessageTypeRunsThroughItsHandler) {
-    DispatchTestClient bundle("Role Handler Test Client");
+    CountingPlayerListener player_listener;
+    DispatchTestClient bundle("Role Handler Test Client",
+                              SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE, &player_listener);
 
     DispatchTestConnection& conn = bundle.connection();
     bundle.admit(conn);
     for (const std::string& json :
-         {std::string(R"({"type":"server/state","payload":{"controller":{"playback_state":)"
-                      R"("playing"}}})"),
+         {std::string(R"({"type":"server/state","payload":{"controller":{"supported_commands":)"
+                      R"(["play"],"volume":37,"muted":false}}})"),
           std::string(R"({"type":"server/command","payload":{"player":{"command":"volume",)"
                       R"("volume":42}}})"),
           std::string(R"({"type":"stream/start","payload":{"player":{"codec":"pcm",)"
@@ -2357,13 +2347,23 @@ TEST(EncryptedLifecycle, EveryRoleMessageTypeRunsThroughItsHandler) {
           std::string(R"({"type":"stream/clear","payload":{}})"),
           std::string(R"({"type":"stream/end","payload":{}})"),
           std::string(R"({"type":"group/update","payload":{"group_name":"Kitchen"}})"),
-          metadata_state_json(1, "Replayed")}) {
+          metadata_state_json(1, "Trailing")}) {
         bundle.deliver(conn, json);
     }
 
     bundle.pump();
+    // The end is delivered once the sync task has left the stream.
+    pump_until(bundle.client_ref(), [&] { return player_listener.stream_ends > 0; });
     EXPECT_EQ(bundle.listener.updates, 1) << "the dispatch did not run to completion";
-    EXPECT_EQ(bundle.listener.last_title, "Replayed");
+    EXPECT_EQ(bundle.listener.last_title, "Trailing");
+    ASSERT_NE(bundle.client_ref().controller(), nullptr);
+    EXPECT_EQ(bundle.client_ref().controller()->get_controller_state().volume, 37)
+        << "the server/state never reached the controller";
+    ASSERT_NE(bundle.client_ref().player(), nullptr);
+    EXPECT_EQ(bundle.client_ref().player()->get_volume(), 42)
+        << "the server/command never reached the player";
+    EXPECT_EQ(player_listener.stream_starts, 1) << "the stream/start never reached the player";
+    EXPECT_EQ(player_listener.stream_ends, 1);
     ASSERT_TRUE(bundle.client_ref().get_group_state().group_name.has_value())
         << "the group/update never reached its handler";
     EXPECT_EQ(*bundle.client_ref().get_group_state().group_name, "Kitchen");
@@ -2372,7 +2372,8 @@ TEST(EncryptedLifecycle, EveryRoleMessageTypeRunsThroughItsHandler) {
 // Role traffic reaches a role only from the admitted connection that owns it, not from any
 // connection that merely has the role active: with more than one admitted connection, each role
 // has one owner, and the others' traffic for it is ignored. Every row's connection has the
-// metadata role active.
+// metadata role active. Traffic from a connection that is not admitted is dropped, not kept: the
+// not-admitted row then admits the connection and finds nothing applied.
 TEST(EncryptedLifecycle, RoleDispatchFollowsOwnership) {
     const uint16_t without_metadata =
         static_cast<uint16_t>(ALL_ROLES_MASK & ~role_mask_bit(SendspinRole::METADATA));
@@ -2398,6 +2399,13 @@ TEST(EncryptedLifecycle, RoleDispatchFollowsOwnership) {
         bundle.deliver(conn, metadata_state_json(1, "Owned"));
         bundle.pump();
         EXPECT_EQ(bundle.listener.updates, row.expected_updates);
+        if (!row.admitted) {
+            bundle.admit(conn);
+            bundle.pump();
+            EXPECT_EQ(bundle.listener.updates, 0)
+                << "role traffic that preceded the admission was applied at it (last_title='"
+                << bundle.listener.last_title << "')";
+        }
     }
 }
 

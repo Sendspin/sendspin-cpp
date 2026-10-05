@@ -323,6 +323,11 @@ std::optional<ServerInformationObject> ConnectionManager::server_information() c
 // ============================================================================
 
 bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerConnection>& conn) {
+    // Refused unattached, so its transport drops everything and never waits on the gate.
+    if (!conn->inbound_gate().is_created()) {
+        SS_LOGE(TAG, "No event group for a new connection's inbound gate; refusing it");
+        return false;
+    }
     // On the transport's delivery thread, ahead of the connection's first frame and before the
     // protocol task can reach the connection: the push below publishes these writes to the task.
     conn->init_time_filter();
@@ -405,6 +410,10 @@ void ConnectionManager::connect_to(const std::string& url) {
     SS_LOGI(TAG, "Initiating client connection to: %s", url.c_str());
 
     auto client_conn = std::make_shared<SendspinClientConnection>(url);
+    if (!client_conn->inbound_gate().is_created()) {
+        SS_LOGE(TAG, "No event group for the connection's inbound gate; not connecting");
+        return;
+    }
     client_conn->set_task_config(this->client_->config_.websocket_priority,
                                  this->client_->config_.websocket_stack_size);
     client_conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
@@ -880,7 +889,13 @@ void ConnectionManager::on_pairing_succeeded(SendspinConnection* conn) {
 
 void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
     if (this->find_admitted(conn) != nullptr) {
-        SS_LOGI(TAG, "Admitted connection lost");
+        // Every close the client makes (a disconnect(), a protocol error it logged) detaches the
+        // gate first; a loss the peer caused reaches this pass with the gate attached.
+        if (conn->inbound_gate().is_detached()) {
+            SS_LOGD(TAG, "Admitted connection closed by the client");
+        } else {
+            SS_LOGI(TAG, "Admitted connection lost");
+        }
     } else if (this->find_in_nursery(conn) != this->nursery_.end()) {
         SS_LOGD(TAG, "Nursery connection lost");
     }
@@ -1260,8 +1275,9 @@ uint32_t ConnectionManager::reap_released(int64_t now_us) {
     for (auto it = this->reaping_.begin(); it != this->reaping_.end();) {
         // The transport's close flag, not close_ready(): nothing takes a released connection's
         // ring items any more, so its in-flight count need not reach zero. An attempt that opened
-        // after its release is done connecting too, so its destructor's stop is the short close
-        // of an open transport; the transport's upgrade report wakes the task for it.
+        // after its release is done connecting too, so its destructor's stop is that of an open
+        // transport (on ESP up to the websocket task's one-second read poll, see
+        // release_connection()); the transport's upgrade report wakes the task for it.
         const bool closed = it->conn->inbound_gate().is_transport_closed();
         const bool opened = it->conn->is_ws_upgraded();
         if (!closed && !opened && now_us < it->deadline_us) {
@@ -1275,9 +1291,9 @@ uint32_t ConnectionManager::reap_released(int64_t now_us) {
                     static_cast<unsigned>(SendspinClientConnection::CONNECT_TIMEOUT_MS));
         }
         // The erase drops the list's reference; the destructor's transport join is short once the
-        // transport has closed or opened, and bounded by what remains of its connect otherwise: at
-        // the deadline, on ESP, at most the rest of a slow DNS lookup (CONNECT_TIMEOUT_MS says how
-        // long lwIP's resolver can take).
+        // transport has closed, at most the read poll once it has opened, and bounded by what
+        // remains of its connect otherwise: at the deadline, on ESP, at most the rest of a slow
+        // DNS lookup (CONNECT_TIMEOUT_MS says how long lwIP's resolver can take).
         it = this->reaping_.erase(it);
     }
     return next;
@@ -1466,10 +1482,12 @@ void ConnectionManager::release_connection(std::shared_ptr<SendspinConnection> c
     }
     // An outbound connection still connecting has a destructor that joins its transport for the
     // rest of the connect, so it is parked rather than released here. One whose upgrade completed
-    // is released here: its destructor's stop is the short close of an open transport (after a
-    // goodbye, disconnect() above has already stopped it), a wait the protocol task pays. An
-    // inbound one's destructor joins nothing (on ESP its httpd session owns it). The caller's
-    // reference drops here in both cases.
+    // is released here, and the protocol task pays its transport's stop: on host IXWebSocket's
+    // close; on ESP esp_websocket_client_stop(), which waits for the websocket task to leave its
+    // read poll, up to a second on an open, idle socket. After a goodbye, disconnect() above has
+    // already stopped it, usually at once since the peer closes on the goodbye. An inbound one's
+    // destructor joins nothing (on ESP its httpd session owns it). The caller's reference drops
+    // here in both cases.
     if (conn->is_outbound() && !conn->is_ws_upgraded()) {
         this->park_for_reaping(std::move(conn));
     }
@@ -1732,8 +1750,10 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
         SS_LOGI(TAG, "Pairing activate received (%s): entering pairing for server_id=%s",
                 to_cstr(pairing_method.value()), admitted->get_server_id().c_str());
         this->handle_enter_pairing(admitted);
-        if (!contains_activity(activities, SendspinActivity::PLAYBACK) &&
-            !admitted->get_active_roles().empty() && this->find_admitted(admitted) != nullptr) {
+        // handle_enter_pairing() may have dropped the connection: checked first.
+        if (this->find_admitted(admitted) != nullptr &&
+            !contains_activity(activities, SendspinActivity::PLAYBACK) &&
+            !admitted->get_active_roles().empty()) {
             this->client_->publish_client_state(admitted);
         }
     }

@@ -82,9 +82,11 @@ list means a component is missing from the build or a function needs an entry in
 indirect call on a task's path (a new virtual send, a new callback), add its targets to
 `edges.json`, or the measurement stops at it. An edge source or target that matches nothing is
 reported on stderr, and a source none of whose targets match is not marked `covered`. Expected
-there: the source `httpd_send_all$isra$0`, which exists only at `-Os`, and the target
-`httpd_parse_req`, which `-Os` inlines into `httpd_req_new`; any other name means a table entry
-has gone stale.
+there: the source `httpd_send_all$isra$0`, which exists only at `-Os`; the target
+`httpd_parse_req`, which `-Os` inlines into `httpd_req_new`; and the two `std::function` call
+operators keyed by their mangled names (the new-connection and on-connected callbacks), inlined
+at `-Os`, where the edges keyed on their callers (`deliver_upgraded()`, `handle_connected()`)
+stand in for them. Any other name means a table entry has gone stale.
 
 Every run counts, on stderr, the call cycles each task reaches; `--cycles` lists them, marking
 those on the deepest path. The ones the current tree reaches, and how deep each really goes:

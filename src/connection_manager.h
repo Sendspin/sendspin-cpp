@@ -156,8 +156,8 @@ struct AdmittedEntry {
 /// connection here instead; the reap pass (ConnectionManager::reap_released()) drops it once its
 /// inbound gate reports the transport closed or its upgrade completes, when the destructor's join
 /// is short, or at `deadline_us`. A connection whose upgrade had completed when it was released
-/// is not parked: its destructor's stop is the short close of an open transport. Protocol task
-/// only.
+/// is not parked: its destructor's stop is that of an open transport, on ESP up to the websocket
+/// task's one-second read poll (see ConnectionManager::release_connection()). Protocol task only.
 struct ReapEntry {
     /// The released connection; detached, its transport closed without blocking.
     std::shared_ptr<SendspinConnection> conn;
@@ -298,14 +298,15 @@ public:
     /// @brief Released outbound connections parked at once, waiting for their transports to finish
     /// (see ReapEntry).
     ///
-    /// One pass can release every connection the manager holds (a disconnect(), an arbitration
-    /// that drops the incumbents), so the bound is the whole nursery plus every admitted slot.
-    /// Only outbound attempts still connecting are parked, and one replaces the previous one,
+    /// A release parks at most the one connection it releases, and only an outbound attempt still
+    /// connecting is parked (connect_to() keeps one in the nursery, replacing the previous one),
     /// so the list fills only when attempts are released faster than their transports finish
-    /// (connect_to() called repeatedly against a listener that never answers); a release that
-    /// finds it full logs a warning and drops the entry parked longest, whose destructor's join
-    /// is then paid on the protocol task: the shortest of the parked ones, since its attempt is
-    /// the furthest along, and at most what remains of its connect timeout.
+    /// (connect_to() called repeatedly against a listener that never answers). The capacity, the
+    /// whole nursery plus every admitted slot, is headroom for that case rather than a bound one
+    /// pass can reach. A release that finds it full logs a warning and drops the entry parked
+    /// longest, whose destructor's join is then paid on the protocol task: the shortest of the
+    /// parked ones, since its attempt is the furthest along, and at most what remains of its
+    /// connect timeout.
     static constexpr size_t REAPING_CAPACITY = MAX_NURSERY_ENTRIES + MAX_ADMITTED;
 
     /// @brief Every managed connection at one moment: the admitted ones and the nursery.
@@ -391,8 +392,9 @@ public:
     /// thread). Wires the connection to the inbound ring and the protocol task ahead of its first
     /// frame, then queues an ACCEPT_CONNECTION command; the task admits it into the nursery or
     /// refuses it with a goodbye (accept()).
-    /// @return false when the command queue refused the accept: every accept slot is taken, or
-    ///         admission is closed (close_admission()). The connection
+    /// @return false when the connection's inbound gate has no event group
+    ///         (InboundGate::is_created()), or the command queue refused the accept: every accept
+    ///         slot is taken, or admission is closed (close_admission()). The connection
     ///         is then left with the caller, which closes its socket and releases it on its own
     ///         close path (see SendspinWsServer::NewConnectionCallback), so it is never destroyed
     ///         inside this call.
@@ -412,13 +414,15 @@ public:
     void accept(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Initiates an outbound connection to a Sendspin server (SendspinClient::connect_to()).
+    /// Logs an error and connects nothing when the connection's inbound gate has no event group
+    /// (InboundGate::is_created()).
     /// @param url WebSocket URL of the server to connect to.
     void connect_to(const std::string& url);
 
     /// @brief Goodbyes every connected managed connection (SendspinClient::disconnect()). An
-    /// admitted or nursery connection leaves its slot once its close is processed; an outbound
-    /// attempt still connecting is released at once, without waiting for its transport (see
-    /// ReapEntry).
+    /// admitted or nursery connection is detached here and dropped by the next loss pass, which
+    /// sees its detached gate; an outbound attempt still connecting is released at once, without
+    /// waiting for its transport (see ReapEntry).
     /// @param reason The goodbye reason to send before closing.
     void disconnect(SendspinGoodbyeReason reason);
 
@@ -729,6 +733,8 @@ private:
     /// incoming side is always operational; an incumbent may be in its re-proving window, where
     /// its activities are still rank-correct, so arbitration on them stays valid. On the winning
     /// outcome, notifies the client, publishes state, and records playback activity.
+    /// Runs inside the protocol tick, whose ConnectionSnapshot keeps the connection alive when a
+    /// step here drops it.
     /// @param it Valid iterator into nursery_ whose connection satisfies is_operational().
     /// @return Iterator to the entry after the erased one (for use in a scanning loop).
     NurseryEntry* promote_or_arbitrate_nursery_entry(NurseryEntry* it);

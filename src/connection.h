@@ -916,7 +916,9 @@ protected:
     /// INBOUND_MAX_MESSAGE_BYTES closes the connection, since no conforming peer sends one (the
     /// Noise layer fragments), and one longer than the ring takes
     /// (InboundRing::max_message_bytes()) goes to route_to_fallback(), as does every message of
-    /// an unadmitted connection; one over InboundGate::PRE_ADMISSION_MESSAGE_BYTES closes it. A
+    /// an unadmitted connection; one over InboundGate::PRE_ADMISSION_MESSAGE_BYTES first waits for
+    /// the message still pending to be consumed (it may be the one that admits the connection,
+    /// wait_until_writable()) and closes the connection if it is still unadmitted then. A
     /// detached or unattached connection drops everything.
     InboundTarget route_inbound_message(size_t len, InboundKind kind, uint32_t stamp);
 

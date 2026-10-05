@@ -52,7 +52,7 @@ enum class DecodeResult : uint8_t {
     SUCCESS,            // Audio decoded successfully (or header processed)
     SKIPPED,            // Chunk skipped because it cannot be played in time
     FAILED,             // Decoder failed to decode the chunk
-    ALLOCATION_FAILED,  // Buffer allocation failed; task should stop
+    ALLOCATION_FAILED,  // Decode buffer allocation failed; the stream is abandoned
 };
 
 /// @brief Working state shared across the sync task's inner decode/sync/transfer loop
@@ -97,6 +97,7 @@ struct SyncContext {
                           // aligning are expected and are not a loss of sync.
     bool sync_lost{false};  // True between an unexpected hard sync and the next in-tolerance
                             // sync; edge-triggers the lost/regained log lines.
+    bool abandoned{false};  // Set by abandon_stream(); ends the active stream at the next check
 };
 
 /// @brief Event flag bits used for sync task lifecycle and command signaling
@@ -107,7 +108,6 @@ enum EventGroupBits : uint16_t {
     COMMAND_START = (1 << 3),  // Wake: a stream start was acknowledged (see started_ordinal_)
     TASK_RUNNING = (1 << 8),   // Task is actively processing a stream
     TASK_STOPPED = (1 << 10),  // Task thread has exited
-    TASK_ERROR = (1 << 11),    // Task encountered a fatal error
     TASK_IDLE = (1 << 12),     // Task is idle, waiting for a new stream
 };
 
@@ -271,7 +271,9 @@ protected:
     /// @brief Decodes all of the current encoded chunk into the decode buffer, growing it as the
     /// decoder asks. On failure the buffer is left as it was. Reads and writes only
     /// `sync_context`.
-    static bool decode_whole_chunk(SyncContext& sync_context);
+    /// @return SUCCESS; ALLOCATION_FAILED when the buffer could not grow (the caller abandons
+    ///         the stream); FAILED for a chunk that does not decode.
+    static DecodeResult decode_whole_chunk(SyncContext& sync_context);
 
     /// @brief Waits in IDLE for a pending codec header (is_pending_header()), starting from
     /// `sync_context.next_header` and discarding everything else
@@ -301,6 +303,13 @@ protected:
     /// sync logic re-align on its own. The caller re-enters the loop at INITIAL_SYNC so unfinished
     /// priming resumes.
     void apply_stream_clear(SyncContext& sync_context);
+
+    /// @brief Gives up the active stream after a decode buffer allocation failure: frees the
+    /// decode buffer and the codec state so nothing stays allocated, and marks the stream
+    /// abandoned so the inner loop leaves for IDLE. IDLE returns the stream's remaining chunks as
+    /// it takes them, so none stays charged to the player, and starts again on a later stream's
+    /// codec header.
+    void abandon_stream(SyncContext& sync_context);
 
     /// @brief Leaves `encoded_item` empty on the way to IDLE: a still-pending codec header moves
     /// to `next_header` for IDLE to start from, anything else goes back to the ring

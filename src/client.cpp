@@ -723,10 +723,11 @@ void SendspinClient::post_time_sync_error(double error) {
 void SendspinClient::drain_inbox() {
     // Process deferred events: all state mutations and user callbacks happen here, on the main
     // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
-    // inbox_bits (here) gates the high-performance requests, the provider writes, the time-sync
-    // report and the event-ring drain immediately following it; slot_bits (taken after that drain
-    // completes, below) gates the pairing notes, the role drains and the group-update drain, since
-    // a slot can be written by a producer between this snapshot and that one.
+    // inbox_bits (here) gates the high-performance requests, the time-sync report and the
+    // event-ring drain immediately following it; slot_bits (taken after that drain completes,
+    // below) gates the pairing notes, the role drains and the group-update drain, since a slot can
+    // be written by a producer between this snapshot and that one. The provider writes poll for
+    // themselves right before the pairing notes.
     auto& es = *this->event_state_;
     // A listener callback below may call stop(), which tears every role down and runs a drain of
     // its own; everything this frame has not delivered by then is abandoned (see
@@ -790,13 +791,6 @@ void SendspinClient::drain_inbox() {
     // --- High-performance requests (time bursts) ---
     if (inbox_bits & INBOX_TOPIC_HIGH_PERFORMANCE) {
         this->apply_high_performance_requests();
-    }
-
-    // --- Deferred provider writes ---
-    // Ahead of the pairing-note dispatch below, so on_pairing_succeeded finds the record
-    // committed.
-    if (inbox_bits & INBOX_TOPIC_PERSIST) {
-        this->flush_pending_persistence();
     }
 
     // --- Time sync report ---
@@ -917,14 +911,19 @@ void SendspinClient::drain_inbox() {
     // comment above for the staleness argument, which applies identically here.
     const uint32_t slot_bits = es.inbox.poll();
 
-    // --- Pairing/trust notifications ---
+    // --- Pairing/trust notifications, and the deferred provider writes ---
     // After the event ring, so a role's clear can precede a pairing note queued before it. The
-    // two never describe the same listener state (role state against the pairing UI and trust),
-    // and the one ordering that matters, a record's provider write ahead of
-    // on_pairing_succeeded, is the provider step above.
-    if ((slot_bits & INBOX_TOPIC_PAIRING) && es.drain_generation == drain_generation) {
-        std::vector<PairingNote> notes;
-        if (es.pairing_slot.take(notes) && this->listener_ != nullptr) {
+    // two never describe the same listener state (role state against the pairing UI and trust).
+    // The one ordering that matters is a record's provider write ahead of on_pairing_succeeded:
+    // the protocol task requests the write before it queues the PAIRING_SUCCEEDED note, so the
+    // flush (which polls for itself) runs after the notes are taken and before they are
+    // dispatched, and every note taken finds its write performed.
+    std::vector<PairingNote> notes;
+    const bool notes_taken = (slot_bits & INBOX_TOPIC_PAIRING) != 0 &&
+                             es.drain_generation == drain_generation && es.pairing_slot.take(notes);
+    this->flush_pending_persistence();
+    if (notes_taken && es.drain_generation == drain_generation) {
+        if (this->listener_ != nullptr) {
             // Set when a re-entrant stop() bumps the generation, abandoning the rest of the
             // batch.
             bool notes_aborted = false;

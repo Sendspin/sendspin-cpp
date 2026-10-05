@@ -2172,8 +2172,12 @@ TEST_F(PairingStateMachineTest, UnofferedFormatOnActivationIsRejected) {
 
 // A pairing activate that names no method (absent, or a method string the parser did not
 // recognize) starts nothing, so the client must say so instead of ignoring the message: an
-// unanswered pairing activate leaves the server waiting on the device indefinitely.
+// unanswered pairing activate leaves the server waiting on the device indefinitely. A refused
+// activate applies none of what it declares: the active_roles it names stay off the connection.
+// Control: the same roles on an accepted activate are applied.
 TEST_F(PairingStateMachineTest, PairingActivateWithoutMethodIsAborted) {
+    // A Sentinel connection may carry roles only with unpaired access on.
+    this->enable_unpaired_access();
     FakeConnection* conn = this->inject_provisional_current_connection("server-no-method");
 
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
@@ -2189,6 +2193,20 @@ TEST_F(PairingStateMachineTest, PairingActivateWithoutMethodIsAborted) {
     EXPECT_EQ(last_frame_type(conn->sent_text_), "pair/abort");
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
     EXPECT_EQ(conn->disconnect_count_, 0) << "the connection must stay open after the abort";
+
+    // The same refusal with roles declared beside the pairing activity.
+    const std::vector<std::string> roles{"metadata@v1"};
+    this->post_activate({SendspinActivity::PAIRING}, roles, std::nullopt);
+    this->pump();
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
+    EXPECT_TRUE(conn->get_active_roles().empty()) << "a refused activate applied its active_roles";
+    EXPECT_EQ(conn->get_active_role_mask(), 0U);
+
+    this->post_activate({SendspinActivity::PLAYBACK}, roles, std::nullopt);
+    this->pump();
+    EXPECT_EQ(conn->get_active_roles(), roles) << "Control: an accepted activate applies its roles";
+    EXPECT_NE(conn->get_active_role_mask(), 0U);
 }
 
 // A pairing method the device does not currently offer is refused the same way an unoffered

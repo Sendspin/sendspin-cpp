@@ -1130,8 +1130,6 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 `SendspinPersistenceProvider` section above). `SendspinNetworkProvider::is_network_ready()` is
 called from any thread and must be cheap and non-blocking.
 
-`SendspinClient::send_controller_command()` is callable from any thread too, but it is the controller role's own route to the protocol task and assumes the role's checks already ran: call `ControllerRole::send_command()` instead.
-
 Callable from any thread: `connect_to()`, `disconnect()`, `leave()`,
 `confirm_pairing_window()`, `cancel_pairing_window()`, `set_unpaired_access_enabled()` and the
 getters `is_started()`, `is_connected()`, `is_time_synced()`, `get_client_time()`,
@@ -1153,7 +1151,7 @@ the attempt is closed without blocking and freed once its transport has finished
 once its connect bound has passed (30 s on host; on ESP-IDF three connect steps of 10 s each,
 plus the DNS lookup, which lwIP's resolver bounds at 7 s per configured DNS server), so the
 requests behind it are not held up, except that on ESP-IDF an attempt dropped at that bound
-while its DNS lookup is still running holds the protocol task until the lookup gives up. Everything else (`start()`, `stop()`, `loop()`, the setters and role registration) belongs
+while its DNS lookup is still running holds the protocol task until the lookup gives up. Everything else (`start()`, `stop()`, `loop()`, the listener, provider and role setters, and role registration) belongs
 to the main loop.
 
 The pairing exchange (CPace and SHA-512) runs on the protocol task with the Noise handshakes, so

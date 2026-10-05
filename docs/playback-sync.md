@@ -63,7 +63,8 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 │  │  • Decode initial codec header     │                  │
 │  │  • Run inner state machine loop    │                  │
 │  └────────────┬───────────────────────┘                  │
-│               │ STOP/END, or the next stream's header    │
+│               │ STOP/END, the next stream's header, or   │
+│               │ a decode buffer allocation failure       │
 │               ▼                                          │
 │  ┌────────────────────────────────────┐                  │
 │  │  Return the held ring item         │──────→ loop back │
@@ -71,7 +72,7 @@ The sync task (`SyncTask::thread_entry()`, `src/sync_task.cpp`) turns encoded ch
 └──────────────────────────────────────────────────────────┘
 ```
 
-The WAIT FOR CLIENT ACK step is the sync task's half of the stream end/start handshake with the main loop (`docs/internals.md`, "Stream End and Start"). The main loop acknowledges a stream by its ordinal (`SyncTask::signal_stream_start()`, with `COMMAND_START` as the wake), and the task starts a header only on an acknowledgement that has reached the header's ordinal. An acknowledgement for an earlier stream belongs to a stream the task already left (stream events the main loop drained together): with a later header held, the task notes idle and keeps waiting; with no header pending, it loops back through IDLE, which notes the same. Either way the main loop's held STREAM_END for that stream is released, and the next stream waits for its own start. A `stream/end` records the ordinal it ended (`SyncTask::signal_stream_end()`), so a header of an ended stream that the task takes only after that end is discarded rather than started. The same ordinal settles a header the task takes while ACTIVE: once the active stream's ordinal has ended, the header belongs to the next stream, so the task keeps it (`SyncContext::next_header`) instead of decoding it into the ended one, leaves, and IDLE starts from it.
+The WAIT FOR CLIENT ACK step is the sync task's half of the stream end/start handshake with the main loop (`docs/internals.md`, "Stream End and Start"). The main loop acknowledges a stream by its ordinal (`SyncTask::signal_stream_start()`, with `COMMAND_START` as the wake), and the task starts a header only on an acknowledgement that has reached the header's ordinal. An acknowledgement for an earlier stream belongs to a stream the task already left (stream events the main loop drained together): with a later header held, the task notes idle and keeps waiting; with no header pending, it loops back through IDLE, which notes the same. Either way the main loop's held STREAM_END for that stream is released, and the next stream waits for its own start. A `stream/end` records the ordinal it ended (`SyncTask::signal_stream_end()`), so a header of an ended stream that the task takes only after that end is discarded rather than started. The same ordinal settles a header the task takes while ACTIVE: once the active stream's ordinal has ended, the header belongs to the next stream, so the task keeps it (`SyncContext::next_header`) instead of decoding it into the ended one, leaves, and IDLE starts from it. A decode buffer that cannot be allocated abandons the active stream (`SyncTask::abandon_stream()`): the task frees the buffer and the codec state and returns to IDLE, which returns the stream's remaining chunks as it takes them and plays again from a later stream's codec header.
 
 ### Inner Loop
 
