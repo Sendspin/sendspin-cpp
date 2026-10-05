@@ -370,7 +370,7 @@ struct SendspinClientConfig {
 // Player config types
 // ============================================================================
 
-/// @brief Audio codec format for a player stream
+/// @brief Audio codec format for an audio stream (player playback or source capture)
 enum class SendspinCodecFormat : uint8_t {
     FLAC,         // FLAC lossless audio
     OPUS,         // Opus compressed audio

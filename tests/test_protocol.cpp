@@ -24,6 +24,7 @@
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
+#include "sendspin/source_role.h"
 #include "sendspin/types.h"
 #include "sendspin/visualizer_role.h"
 #include "test_util.h"
@@ -138,6 +139,31 @@ TEST(Protocol, EnumWireStringsRoundTrip) {
                    std::pair{PairAbortReason::USER_CANCELLED, "user_cancelled"},
                },
                pair_abort_reason_from_string, "not_a_reason");
+
+    // Roles are read back from server/activate's active_roles through active_role_mask().
+    {
+        SCOPED_TRACE("SendspinRole");
+        const std::array roles{
+            std::pair{SendspinRole::PLAYER, "player@v1"},
+            std::pair{SendspinRole::CONTROLLER, "controller@v1"},
+            std::pair{SendspinRole::METADATA, "metadata@v1"},
+            std::pair{SendspinRole::ARTWORK, "artwork@v1"},
+            std::pair{SendspinRole::VISUALIZER, "visualizer@v1"},
+            std::pair{SendspinRole::COLOR, "color@v1"},
+            std::pair{SendspinRole::SOURCE, "source@v1"},
+        };
+        for (const auto& [role, wire] : roles) {
+            SCOPED_TRACE(wire);
+            EXPECT_STREQ(to_cstr(role), wire);
+            EXPECT_EQ(active_role_mask({wire}), role_mask_bit(role));
+        }
+        EXPECT_EQ(active_role_mask({"source@v2"}), 0U);
+    }
+
+    emitted_as("SourceSignal", std::array{
+                                   std::pair{SourceSignal::PRESENT, "present"},
+                                   std::pair{SourceSignal::ABSENT, "absent"},
+                               });
 
     emitted_as("SendspinGoodbyeReason",
                std::array{
@@ -548,8 +574,8 @@ TEST(Protocol, GroupUpdatePlaybackStateValidation) {
     }
 }
 
-// Under the encrypted protocol, server/hello carries only the server's display name (server_id
-// comes from the Noise handshake result instead); a message missing "name" is rejected.
+// messaging.md "server/hello": name is required, so a message without it is rejected; server_id
+// comes from the Noise handshake result.
 TEST(Protocol, ServerHelloRequiresName) {
     JsonDocument doc;
     JsonObject root;
@@ -564,6 +590,51 @@ TEST(Protocol, ServerHelloRequiresName) {
     ServerHelloMessage ok;
     ASSERT_TRUE(process_server_hello_message(root_ok, &ok));
     EXPECT_EQ(ok.name, "srv");
+}
+
+// roles/source/v1.md "server/hello source@v1 support object": the codecs the server accepts in
+// client-stream/start, which must include pcm and flac, with unrecognized identifiers ignored. A
+// malformed object rejects only itself, never the hello.
+TEST(Protocol, ServerHelloSourceSupportListsAcceptedCodecs) {
+    constexpr uint8_t PCM_FLAC =
+        source_codec_bit(SendspinCodecFormat::PCM) | source_codec_bit(SendspinCodecFormat::FLAC);
+    struct Row {
+        const char* payload;
+        std::optional<uint8_t> codecs;
+    };
+    const Row rows[] = {
+        // Control: a listed codec set parses.
+        {R"("source@v1_support":{"supported_codecs":["pcm","flac","opus"]})",
+         PCM_FLAC | source_codec_bit(SendspinCodecFormat::OPUS)},
+        // An unrecognized identifier is dropped, the rest kept.
+        {R"("source@v1_support":{"supported_codecs":["pcm","mp3","flac"]})", PCM_FLAC},
+        // A repeated identifier names its codec once.
+        {R"("source@v1_support":{"supported_codecs":["pcm","flac","pcm"]})", PCM_FLAC},
+        // A non-string entry rejects the object.
+        {R"("source@v1_support":{"supported_codecs":["pcm",7,"flac"]})", std::nullopt},
+        // A list without both pcm and flac rejects the object.
+        {R"("source@v1_support":{"supported_codecs":[]})", std::nullopt},
+        {R"("source@v1_support":{"supported_codecs":["mp3"]})", std::nullopt},
+        {R"("source@v1_support":{"supported_codecs":["pcm","opus"]})", std::nullopt},
+        {R"("source@v1_support":{"supported_codecs":["opus"]})", std::nullopt},
+        // No support object: the server does not support source@v1.
+        {R"("languages":["en"])", std::nullopt},
+        // A support object without a codec array is rejected as a whole.
+        {R"("source@v1_support":{})", std::nullopt},
+        {R"("source@v1_support":{"supported_codecs":"pcm"})", std::nullopt},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.payload);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"server/hello","payload":{"name":"srv",)") +
+                              row.payload + "}}",
+                          doc, root));
+        ServerHelloMessage msg;
+        ASSERT_TRUE(process_server_hello_message(root, &msg));
+        EXPECT_EQ(msg.name, "srv");
+        EXPECT_EQ(msg.source_codecs, row.codecs);
+    }
 }
 
 // If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a
@@ -1483,4 +1554,165 @@ TEST(Protocol, PairAbortMessageUnknownReason) {
     PairAbortMessage msg;
     EXPECT_FALSE(process_pair_abort_message(root, &msg))
         << "unrecognized reason should return false";
+}
+
+// ============================================================================
+// Source role
+// ============================================================================
+
+// The binary timestamp is a big-endian two's-complement int64 on every platform, and decoding
+// inverts encoding across the full range.
+TEST(Protocol, Be64HelpersAreBigEndianAndRoundTrip) {
+    struct Row {
+        int64_t value;
+        std::array<uint8_t, BINARY_TIMESTAMP_SIZE> bytes;
+    };
+    const Row rows[] = {
+        {0x0102030405060708LL, {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}},
+        {-2, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}},
+        {INT64_MAX, {0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
+        {INT64_MIN, {0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+        {0, {}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.value);
+        std::array<uint8_t, BINARY_TIMESTAMP_SIZE> bytes{};
+        host_to_be64(row.value, bytes.data());
+        EXPECT_EQ(bytes, row.bytes);
+        EXPECT_EQ(be64_to_host(row.bytes.data()), row.value);
+    }
+}
+
+// messaging.md "client/hello" requires the object whenever source@v1 is listed, so it is emitted
+// even with no features; line_sense is emitted only when set (roles/source/v1.md "client/hello
+// source@v1 support object").
+TEST(Protocol, FormatClientHelloSourceSupport) {
+    ClientHelloMessage msg;
+    msg.name = "Line In";
+    msg.supported_roles = {SendspinRole::SOURCE};
+
+    msg.source_v1_support = SourceSupportObject{.line_sense = true};
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    EXPECT_STREQ(doc["payload"]["supported_roles"][0], "source@v1");
+    ASSERT_TRUE(doc["payload"]["source@v1_support"]["features"]["line_sense"].is<bool>());
+    EXPECT_TRUE(doc["payload"]["source@v1_support"]["features"]["line_sense"].as<bool>());
+
+    msg.source_v1_support = SourceSupportObject{};
+    JsonDocument doc_no_features;
+    ASSERT_FALSE(deserializeJson(doc_no_features, format_client_hello_message(&msg, TestArena())));
+    ASSERT_TRUE(doc_no_features["payload"]["source@v1_support"].is<JsonObject>());
+    EXPECT_EQ(doc_no_features["payload"]["source@v1_support"].as<JsonObject>().size(), 0U);
+
+    // Control: a client without the role sends no support object.
+    msg.supported_roles = {};
+    msg.source_v1_support.reset();
+    JsonDocument doc_unset;
+    ASSERT_FALSE(deserializeJson(doc_unset, format_client_hello_message(&msg, TestArena())));
+    EXPECT_TRUE(doc_unset["payload"]["source@v1_support"].isUnbound());
+}
+
+// roles/source/v1.md "client/state source object": absent when unset, present and empty without a
+// signal, and carrying the signal when one is reported.
+TEST(Protocol, FormatClientStateSourceObject) {
+    ClientStateMessage msg;
+    JsonDocument doc_unset;
+    ASSERT_FALSE(deserializeJson(doc_unset, format_client_state_message(&msg, TestArena())));
+    EXPECT_TRUE(doc_unset["payload"]["source"].isUnbound());
+
+    msg.source = ClientSourceStateObject{};
+    JsonDocument doc_empty;
+    ASSERT_FALSE(deserializeJson(doc_empty, format_client_state_message(&msg, TestArena())));
+    ASSERT_TRUE(doc_empty["payload"]["source"].is<JsonObject>());
+    EXPECT_EQ(doc_empty["payload"]["source"].as<JsonObject>().size(), 0U);
+
+    msg.source = ClientSourceStateObject{.signal = SourceSignal::ABSENT};
+    JsonDocument doc_signal;
+    ASSERT_FALSE(deserializeJson(doc_signal, format_client_state_message(&msg, TestArena())));
+    EXPECT_STREQ(doc_signal["payload"]["source"]["signal"], "absent");
+}
+
+// roles/source/v1.md "client-stream/start": the hyphenated type string, every format field, and
+// codec_header only when set.
+TEST(Protocol, FormatClientStreamStart) {
+    ClientStreamStartMessage msg;
+    msg.codec = SendspinCodecFormat::PCM;
+    msg.channels = 2;
+    msg.sample_rate = 48000;
+    msg.bit_depth = 16;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_stream_start_message(&msg, TestArena())));
+    EXPECT_STREQ(doc["type"], "client-stream/start");
+    JsonObject pcm = doc["payload"]["source"];
+    EXPECT_STREQ(pcm["codec"], "pcm");
+    EXPECT_EQ(pcm["channels"].as<int>(), 2);
+    EXPECT_EQ(pcm["sample_rate"].as<uint32_t>(), 48000U);
+    EXPECT_EQ(pcm["bit_depth"].as<int>(), 16);
+    EXPECT_TRUE(pcm["codec_header"].isUnbound());
+    EXPECT_EQ(pcm.size(), 4U);
+
+    msg.codec = SendspinCodecFormat::FLAC;
+    msg.bit_depth = 24;
+    msg.codec_header = "c2VuZHNwaW4=";
+    JsonDocument doc_flac;
+    ASSERT_FALSE(deserializeJson(doc_flac, format_client_stream_start_message(&msg, TestArena())));
+    JsonObject flac = doc_flac["payload"]["source"];
+    EXPECT_STREQ(flac["codec"], "flac");
+    EXPECT_EQ(flac["bit_depth"].as<int>(), 24);
+    EXPECT_STREQ(flac["codec_header"], "c2VuZHNwaW4=");
+}
+
+// roles/source/v1.md "client-stream/end" defines no fields; the envelope still carries a payload
+// object.
+TEST(Protocol, FormatClientStreamEndHasEmptyPayload) {
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_stream_end_message(TestArena())));
+    EXPECT_STREQ(doc["type"].as<const char*>(), "client-stream/end");
+    ASSERT_TRUE(doc["payload"].is<JsonObject>());
+    EXPECT_EQ(doc["payload"].as<JsonObject>().size(), 0U);
+}
+
+// roles/source/v1.md "server/command source object": command is required with no default, so a
+// source object with it missing, unknown, or of the wrong type is rejected as a whole. The source
+// and player objects are parsed independently: either one being malformed leaves the other.
+TEST(Protocol, ServerCommandSourceValidation) {
+    struct Row {
+        const char* payload;
+        std::optional<SourceCommand> source;
+        bool player;
+    };
+    const Row rows[] = {
+        // Control: both commands parse.
+        {R"({"source":{"command":"start"}})", SourceCommand::START, false},
+        {R"({"source":{"command":"stop"}})", SourceCommand::STOP, false},
+        {R"({"source":{}})", std::nullopt, false},
+        {R"({"source":{"command":"pause"}})", std::nullopt, false},
+        {R"({"source":{"command":1}})", std::nullopt, false},
+        {R"({"source":"start"})", std::nullopt, false},
+        // No source object at all.
+        {R"({"player":{"command":"volume","volume":5}})", std::nullopt, true},
+        // A malformed source object beside a valid player command keeps the player command.
+        {R"({"player":{"command":"volume","volume":5},"source":{"command":"pause"}})",
+         std::nullopt, true},
+        // A malformed player object beside a valid source command keeps the source command.
+        {R"({"player":{"command":"teleport"},"source":{"command":"start"}})",
+         SourceCommand::START, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.payload);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"server/command","payload":)") + row.payload + "}",
+                          doc, root));
+        SourceCommand cmd{};
+        const bool parsed = process_server_command_source(root, &cmd);
+        ASSERT_EQ(parsed, row.source.has_value());
+        if (parsed) {
+            EXPECT_EQ(cmd, row.source.value());
+        }
+        ServerCommandMessage player_msg;
+        const bool player_parsed = process_server_command_message(root, &player_msg);
+        EXPECT_EQ(player_parsed && player_msg.player.has_value(), row.player);
+    }
 }

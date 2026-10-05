@@ -39,13 +39,12 @@ static std::optional<uint16_t> parse_output_delay_blob(const std::vector<uint8_t
     return value;
 }
 
-/// @brief Size of the big-endian 64-bit timestamp at the start of player binary messages.
-static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
 /// @brief Size of the big-endian 32-bit send_ahead that follows the timestamp in an audio chunk
 /// (roles/player/v1.md "Audio Chunks (Binary)")
 static constexpr size_t BINARY_SEND_AHEAD_SIZE = 4;
 /// @brief Bytes an audio chunk spends on its header, after the message type byte.
-static constexpr size_t AUDIO_CHUNK_HEADER_SIZE = BINARY_TIMESTAMP_SIZE + BINARY_SEND_AHEAD_SIZE;
+static constexpr size_t AUDIO_CHUNK_HEADER_SIZE =
+    sendspin::BINARY_TIMESTAMP_SIZE + BINARY_SEND_AHEAD_SIZE;
 /// @brief Upper bound on the output delay, per roles/player/v1.md "Output delay": clients MUST
 /// clamp output_delay_ms to the range 0-5000.
 static constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000U;
@@ -94,15 +93,6 @@ static constexpr bool OPUS_DECODER_ENABLED = true;
 #else
 static constexpr bool OPUS_DECODER_ENABLED = false;
 #endif
-
-/// @brief Swaps bytes of a big-endian 64-bit value to host byte order.
-static int64_t be64_to_host(const uint8_t* bytes) {
-    uint64_t val = 0;
-    for (int i = 0; i < 8; ++i) {
-        val = (val << 8) | bytes[i];
-    }
-    return static_cast<int64_t>(val);
-}
 
 namespace sendspin {
 

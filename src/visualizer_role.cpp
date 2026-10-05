@@ -37,9 +37,8 @@ static const char* const TAG = "sendspin.visualizer";
 // of ring storage, not a wire-data quota: each frame also costs the ring's per-item overhead, so
 // effective wire-data capacity is smaller (see the buffer_capacity note in config.h).
 static constexpr size_t ENTRY_TYPE_SIZE = 1;
-static constexpr size_t TIMESTAMP_SIZE = 8;
 /// @brief Offset of a frame's payload in its plaintext
-static constexpr size_t FRAME_PAYLOAD_OFFSET = ENTRY_TYPE_SIZE + TIMESTAMP_SIZE;
+static constexpr size_t FRAME_PAYLOAD_OFFSET = ENTRY_TYPE_SIZE + sendspin::BINARY_TIMESTAMP_SIZE;
 
 // Minimum payload bytes after the timestamp, per wire message type
 static constexpr size_t LOUDNESS_PAYLOAD_SIZE = 2;  // uint16 value
@@ -97,14 +96,6 @@ static_assert(COMMAND_BOUNDARY <= sendspin::InboundItemList::LAST_CONSUMER_BIT,
 // ============================================================================
 // Big-endian helpers
 // ============================================================================
-
-static int64_t read_be64(const uint8_t* p) {
-    uint64_t val = 0;
-    for (int i = 0; i < 8; ++i) {
-        val = (val << 8) | p[i];
-    }
-    return static_cast<int64_t>(val);
-}
 
 static uint16_t read_be16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0]) << 8 | static_cast<uint16_t>(p[1]);
@@ -620,7 +611,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         }
 
         const uint8_t wire_type = header->type;
-        const int64_t server_ts = read_be64(inbound_item_bytes(item) + ENTRY_TYPE_SIZE);
+        const int64_t server_ts = be64_to_host(inbound_item_bytes(item) + ENTRY_TYPE_SIZE);
         int64_t client_ts = self->client->get_client_time(server_ts);
 
         if (client_ts == 0) {

@@ -36,7 +36,8 @@ static const char* const TAG = "sendspin.artwork";
 static constexpr size_t ARTWORK_MAX_MESSAGE_SIZE = sendspin::MAX_TRANSPORT_PLAINTEXT;
 
 /// @brief Size of an announce message: type, flags, the 8-byte timestamp, the 4-byte total_size
-static constexpr size_t ARTWORK_ANNOUNCE_SIZE = 14;
+static constexpr size_t ARTWORK_ANNOUNCE_SIZE =
+    2 + sendspin::BINARY_TIMESTAMP_SIZE + sizeof(uint32_t);
 
 /// @brief Flags byte bits: a part sets neither cancel nor announce, and bits 2-7 must be zero
 static constexpr uint8_t ARTWORK_FLAG_CANCEL = 0x01;
@@ -59,15 +60,6 @@ static_assert(COMMAND_STOP <= sendspin::InboundItemList::LAST_CONSUMER_BIT,
 // ============================================================================
 // Big-endian helpers
 // ============================================================================
-
-/// @brief Swaps bytes of a big-endian 64-bit value to host byte order
-static int64_t be64_to_host(const uint8_t* bytes) {
-    uint64_t val = 0;
-    for (int i = 0; i < 8; ++i) {
-        val = (val << 8) | bytes[i];
-    }
-    return static_cast<int64_t>(val);
-}
 
 /// @brief Swaps bytes of a big-endian 32-bit value to host byte order
 static uint32_t be32_to_host(const uint8_t* bytes) {
@@ -283,7 +275,7 @@ SendspinImageFormat ArtworkRole::Impl::image_format(uint8_t slot) const {
 ArtworkAnnounce ArtworkRole::Impl::parse_announce(const uint8_t* body) {
     ArtworkAnnounce announce;
     announce.timestamp = be64_to_host(body + 1);
-    announce.total_size = be32_to_host(body + 1 + 8);
+    announce.total_size = be32_to_host(body + 1 + BINARY_TIMESTAMP_SIZE);
     return announce;
 }
 

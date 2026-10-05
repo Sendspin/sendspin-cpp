@@ -463,20 +463,23 @@ TEST(ClientStateForRoles, CarriesOnlyTheGivenRoles) {
     snapshot.player = ClientPlayerStateObject{};
     snapshot.artwork = ClientArtworkStateObject{};
     snapshot.visualizer = ClientVisualizerStateObject{};
+    snapshot.source = ClientSourceStateObject{};
     struct Row {
         const char* name;
         uint16_t roles;
         bool player;
         bool artwork;
         bool visualizer;
+        bool source;
     };
     const Row rows[] = {
-        {"Control: every role", ALL_ROLES_MASK, true, true, true},
-        {"the player alone", bits({SendspinRole::PLAYER}), true, false, false},
+        {"Control: every role", ALL_ROLES_MASK, true, true, true, true},
+        {"the player alone", bits({SendspinRole::PLAYER}), true, false, false, false},
         {"artwork and visualizer", bits({SendspinRole::ARTWORK, SendspinRole::VISUALIZER}), false,
-         true, true},
+         true, true, false},
+        {"the source alone", bits({SendspinRole::SOURCE}), false, false, false, true},
         {"roles without a state object", bits({SendspinRole::METADATA, SendspinRole::CONTROLLER}),
-         false, false, false},
+         false, false, false, false},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -485,5 +488,6 @@ TEST(ClientStateForRoles, CarriesOnlyTheGivenRoles) {
         EXPECT_EQ(msg.player.has_value(), row.player);
         EXPECT_EQ(msg.artwork.has_value(), row.artwork);
         EXPECT_EQ(msg.visualizer.has_value(), row.visualizer);
+        EXPECT_EQ(msg.source.has_value(), row.source);
     }
 }

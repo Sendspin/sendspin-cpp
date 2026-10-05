@@ -22,6 +22,7 @@
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
+#include "sendspin/source_role.h"
 #include "sendspin/types.h"
 #include "sendspin/visualizer_role.h"
 #include <ArduinoJson.h>
@@ -339,15 +340,47 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
 // Message processing
 
 bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg) {
-    // Under the encrypted protocol, server/hello carries only the server name.
     // server_id is taken from the Noise handshake result, not parsed here.
     if (!root["payload"]["name"].is<const char*>()) {
         SS_LOGE(TAG, "Invalid server/hello message: missing name");
         return false;
     }
 
-    if (hello_msg != nullptr) {
-        hello_msg->name = root["payload"]["name"].as<std::string>();
+    if (hello_msg == nullptr) {
+        return true;
+    }
+    hello_msg->name = root["payload"]["name"].as<std::string>();
+
+    // roles/source/v1.md "server/hello source@v1 support object": supported_codecs is a required
+    // list of strings that must include flac and pcm, and a source ignores the codec identifiers
+    // it does not recognize. A malformed object rejects only itself, never the hello.
+    const JsonVariantConst source_support = root["payload"]["source@v1_support"];
+    if (!source_support.isNull()) {
+        const JsonVariantConst codecs = source_support["supported_codecs"];
+        if (!codecs.is<JsonArrayConst>()) {
+            SS_LOGW(TAG, "Ignoring server/hello source@v1_support: missing supported_codecs");
+        } else {
+            constexpr uint8_t REQUIRED = source_codec_bit(SendspinCodecFormat::PCM) |
+                                         source_codec_bit(SendspinCodecFormat::FLAC);
+            uint8_t accepted = 0;
+            bool all_strings = true;
+            for (JsonVariantConst codec : codecs.as<JsonArrayConst>()) {
+                if (!codec.is<const char*>()) {
+                    all_strings = false;
+                    break;
+                }
+                if (auto format = codec_format_from_string(codec.as<std::string>())) {
+                    accepted |= source_codec_bit(*format);
+                }
+            }
+            if (!all_strings) {
+                SS_LOGW(TAG, "Ignoring server/hello source@v1_support: non-string codec entry");
+            } else if ((accepted & REQUIRED) != REQUIRED) {
+                SS_LOGW(TAG, "Ignoring server/hello source@v1_support: pcm or flac not listed");
+            } else {
+                hello_msg->source_codecs = accepted;
+            }
+        }
     }
 
     return true;
@@ -510,6 +543,23 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
         }
         return false;
     }
+    return true;
+}
+
+// A standalone section parser, like the server/state sections below, so a malformed source
+// object never affects the player command the same message carries.
+bool process_server_command_source(JsonObject root, SourceCommand* source_cmd) {
+    if (source_cmd == nullptr || !root["payload"]["source"].is<JsonObject>()) {
+        return false;
+    }
+    // roles/source/v1.md "server/command source object": command is required, with no default.
+    auto command = read_enum_field(root["payload"]["source"]["command"], "command",
+                                   source_command_from_string);
+    if (!command) {
+        SS_LOGW(TAG, "Rejecting server/command source object: missing or invalid 'command'");
+        return false;
+    }
+    *source_cmd = command.value();
     return true;
 }
 
@@ -886,6 +936,15 @@ std::string format_client_hello_message(const ClientHelloMessage* msg,
             msg->visualizer_support.value().buffer_capacity;
     }
 
+    // messaging.md "client/hello" requires the object whenever source@v1 is listed; line_sense is
+    // emitted only when set (roles/source/v1.md "client/hello source@v1 support object").
+    if (msg->source_v1_support.has_value()) {
+        JsonObject source_json = root["payload"]["source@v1_support"].to<JsonObject>();
+        if (msg->source_v1_support.value().line_sense) {
+            source_json["features"]["line_sense"] = true;
+        }
+    }
+
     std::string output;
     serializeJson(doc, output);
     return output;
@@ -948,6 +1007,50 @@ std::string format_client_state_message(const ClientStateMessage* msg,
             vis_json["spectrum"]["f_max"] = spec.f_max;
         }
     }
+
+    // signal only when set.
+    if (msg->source.has_value()) {
+        JsonObject source_json = root["payload"]["source"].to<JsonObject>();
+        if (msg->source.value().signal.has_value()) {
+            source_json["signal"] = to_cstr(msg->source.value().signal.value());
+        }
+    }
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_stream_start_message(const ClientStreamStartMessage* msg,
+                                               SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
+    JsonObject root = doc.to<JsonObject>();
+
+    // roles/source/v1.md "client-stream/start": bit_depth is required even for opus, which ignores
+    // it.
+    root["type"] = "client-stream/start";
+    JsonObject source_json = root["payload"]["source"].to<JsonObject>();
+    source_json["codec"] = to_cstr(msg->codec);
+    source_json["channels"] = msg->channels;
+    source_json["sample_rate"] = msg->sample_rate;
+    source_json["bit_depth"] = msg->bit_depth;
+    if (msg->codec_header.has_value()) {
+        source_json["codec_header"] = msg->codec_header.value();
+    }
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_stream_end_message(SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client-stream/end";
+    // roles/source/v1.md "client-stream/end": no payload fields, but the envelope carries a payload
+    // object like every other message.
+    root["payload"].to<JsonObject>();
 
     std::string output;
     serializeJson(doc, output);
