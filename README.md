@@ -47,6 +47,7 @@ Requires ESP-IDF v5.5.2 or later, the first release whose ring buffer reclaims s
 
 - **`examples/basic_client/`** -- Standalone host example with PortAudio audio output
 - **`examples/tui_client/`** -- Terminal UI host example with PortAudio audio output
+- **`examples/source_client/`** -- Host example streaming the default PortAudio input to the server (source role)
 
 ## License
 
