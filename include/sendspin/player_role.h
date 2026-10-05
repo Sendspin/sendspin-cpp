@@ -195,9 +195,6 @@ public:
     /// @brief Returns a reference to the current stream parameters
     const ServerPlayerStreamObject& get_current_stream_params() const;
 
-    /// @brief Returns the fixed pipeline delay in microseconds (from config)
-    int32_t get_fixed_delay_us() const;
-
     /// @brief Returns true if currently muted
     bool get_muted() const;
 

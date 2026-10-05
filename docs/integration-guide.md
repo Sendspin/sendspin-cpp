@@ -1090,7 +1090,6 @@ const GroupUpdateObject& group = client.get_group_state();   // Group id, name, 
 uint8_t vol = player.get_volume();
 bool muted = player.get_muted();
 uint16_t delay = player.get_output_delay_ms();
-int32_t fixed = player.get_fixed_delay_us();
 auto& stream = player.get_current_stream_params();
 
 // Controller state
