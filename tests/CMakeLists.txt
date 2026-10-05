@@ -172,7 +172,8 @@ set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno
 # event_flags_ (the source task's loop, one step at a time, and its exit), its capture_ring_,
 # outbound_ring_ and protocol_task_ (rings created without the thread, so what a step produced
 # stays to be read), chunk_item_ (a chunk begun but not filled), chunk_message_bytes_ (the size
-# a completed chunk is acquired at, to write one as the task would) and opus_encoder_ (the
+# a completed chunk is acquired at, to write one as the task would), bytes_per_frame_ and
+# producer_drop_log_ (a run of refused writes, which shows only in the log) and opus_encoder_ (the
 # encoder an OPUS config's start() creates, given to a rig without the thread, or a stand-in
 # recording the task's encoder calls, which start() keeps); SourceRole's impl_ (the hello and
 # state objects without a server, the stream gate and codec a stream opening sets, the task);

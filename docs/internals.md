@@ -297,7 +297,7 @@ The source role is the player's inverse: audio flows from the consumer's capture
 
 ### Capture
 
-`SourceRole::write_audio()` copies each write into one item of the capture ring (`SourceTask::capture_ring_`), without waiting or allocating, stamped with its first sample's capture time and the stream generation it read from the stream gate (`SourceRole::Impl::stream_gate`). It accepts audio only while the gate is open, and only whole frames. A full ring refuses the write and records the overflow against its generation. It is created by the role's first start and kept until the role is destroyed, since the capture thread may write at any time; the gate keeps it unused while no stream is open.
+`SourceRole::write_audio()` copies each write into one item of the capture ring (`SourceTask::capture_ring_`), without waiting or allocating, stamped with its first sample's capture time and the stream generation it read from the stream gate (`SourceRole::Impl::stream_gate`). It accepts audio only while the gate is open, and only whole frames that fit one capture item. A full ring refuses the write and records the overflow against its generation; a write longer than any item is refused without one, keeping the queued audio. The capture ring is created by the role's first start and kept until the role is destroyed, since the capture thread may write at any time; the gate keeps it unused while no stream is open.
 
 ### Source task
 

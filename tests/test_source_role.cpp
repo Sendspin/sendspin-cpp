@@ -469,9 +469,14 @@ TEST(SourceRoleObjects, HelloAndStateFields) {
 // ============================================================================
 
 // write_audio() takes whole frames into an open stream, stamped with the capture time given and
-// the generation the gate names; it refuses a closed gate and a partial or empty write, and puts
-// nothing in the capture ring when it refuses.
+// the generation the gate names; it refuses a closed gate, a partial or empty write and one longer
+// than any capture item, and puts nothing in the capture ring when it refuses.
 TEST(SourceCapture, WritesWholeFramesIntoAnOpenStream) {
+    const size_t bytes_per_frame = source_bytes_per_frame(2, 16);
+    const size_t largest_write = [&] {
+        CaptureRig probe;
+        return probe.task.capture_ring_->max_message_bytes() / bytes_per_frame * bytes_per_frame;
+    }();
     struct Row {
         const char* name;
         bool open;
@@ -480,10 +485,12 @@ TEST(SourceCapture, WritesWholeFramesIntoAnOpenStream) {
     };
     const Row rows[] = {
         {"Control: whole frames into an open stream", true, WRITE_BYTES, true},
+        {"Control: the largest write a capture item holds", true, largest_write, true},
         {"the gate is closed", false, WRITE_BYTES, false},
         {"a partial frame", true, 3, false},
         {"whole frames and a partial one", true, WRITE_BYTES + 2, false},
         {"an empty write", true, 0, false},
+        {"one frame longer than any capture item", true, largest_write + bytes_per_frame, false},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -525,6 +532,26 @@ TEST(SourceCapture, UnstampedWriteEndsNow) {
     EXPECT_GE(stamp, before_us - WRITE_MS * 1000);
     EXPECT_LE(stamp, after_us - WRITE_MS * 1000);
     rig.task.capture_ring_->return_item(item);
+}
+
+// A run of refused writes belongs to one stream: the first write under a new generation ends the
+// last stream's run, logging its count, and a refusal there starts a run of its own. The run
+// shows only in the log, so the test reads its count.
+TEST(SourceCapture, EachStreamStartsItsOwnDropRun) {
+    CaptureRig rig;
+    rig.open(1);
+    int64_t stamp = 0;
+    while (rig.write(stamp)) {
+        stamp += WRITE_MS * 1000;
+    }
+    EXPECT_FALSE(rig.write(stamp));
+    ASSERT_EQ(rig.task.producer_drop_log_.dropped_, 2U);
+
+    // The ring stays full, so the new stream's first write is refused too
+    rig.close();
+    rig.open(2);
+    EXPECT_FALSE(rig.write(stamp));
+    EXPECT_EQ(rig.task.producer_drop_log_.dropped_, 1U);
 }
 
 // The source task assembles chunks of exactly chunk_duration_ms across write boundaries: the
@@ -628,15 +655,23 @@ TEST(SourceChunks, AChunkNeverOutlivesItsStream) {
 // capture rather than burst stale audio. A full capture ring refuses the write and the task drops
 // the backlog, and the chunk it has begun, as it takes its next capture item; an outbound ring with
 // no room for a chunk drops the chunk and the backlog alike. Either way the next chunk with audio
-// starts at the first write made after.
+// starts at the first write made after. A write too long for any capture item is refused without
+// counting as a stall, so the backlog stays.
 TEST(SourceChunks, AStallResumesFromLiveCapture) {
-    enum class Stall : uint8_t { NONE, CAPTURE_FULL, CAPTURE_FULL_MID_CHUNK, OUTBOUND_FULL };
+    enum class Stall : uint8_t {
+        NONE,
+        OVERSIZED_WRITE,
+        CAPTURE_FULL,
+        CAPTURE_FULL_MID_CHUNK,
+        OUTBOUND_FULL
+    };
     struct Row {
         const char* name;
         Stall stall;
     };
     const Row rows[] = {
         {"Control: no stall", Stall::NONE},
+        {"a write too long for any capture item keeps the backlog", Stall::OVERSIZED_WRITE},
         {"the capture ring overflows", Stall::CAPTURE_FULL},
         {"the capture ring overflows part-way through a chunk", Stall::CAPTURE_FULL_MID_CHUNK},
         {"the outbound ring has no room", Stall::OUTBOUND_FULL},
@@ -665,12 +700,21 @@ TEST(SourceChunks, AStallResumesFromLiveCapture) {
             rig.task.process(0);  // The first write begins a chunk it does not fill
             ASSERT_NE(rig.task.chunk_item_, nullptr);
         }
+        if (row.stall == Stall::OVERSIZED_WRITE) {
+            // Whole frames, so the length alone refuses it
+            const size_t bytes_per_frame = rig.task.bytes_per_frame_;
+            const std::vector<uint8_t> oversized(
+                (rig.task.capture_ring_->max_message_bytes() / bytes_per_frame + 1) *
+                    bytes_per_frame,
+                0);
+            ASSERT_FALSE(rig.source.write_audio(oversized.data(), oversized.size(), stamp));
+        }
         if (row.stall == Stall::CAPTURE_FULL || row.stall == Stall::CAPTURE_FULL_MID_CHUNK) {
             while (rig.write(stamp)) {
                 stamp += WRITE_MS * 1000;
             }
         }
-        if (row.stall != Stall::NONE) {
+        if (row.stall != Stall::NONE && row.stall != Stall::OVERSIZED_WRITE) {
             rig.task.process(0);  // The next capture item taken, at which the backlog goes
             size_t capacity = 0;
             EXPECT_EQ(rig.task.capture_ring_->take(&capacity, 0), nullptr)
@@ -692,8 +736,8 @@ TEST(SourceChunks, AStallResumesFromLiveCapture) {
             return chunk.first.data_len != 0;
         });
         ASSERT_NE(first_audio, chunks.end());
-        EXPECT_EQ(first_audio->first.capture_time_us,
-                  row.stall == Stall::NONE ? BACKLOG_US : LIVE_US);
+        const bool stalled = row.stall != Stall::NONE && row.stall != Stall::OVERSIZED_WRITE;
+        EXPECT_EQ(first_audio->first.capture_time_us, stalled ? LIVE_US : BACKLOG_US);
     }
 }
 

@@ -165,7 +165,7 @@ public:
 
     /// @brief Decrypts one transport frame in-place. Protocol task only, sequential with the
     /// session swap (see the file comment).
-    /// @param len  Ciphertext length (plaintext + 16-byte tag).
+    /// @param len  Ciphertext length (plaintext + AEAD_TAG_SIZE of tag).
     /// @return Plaintext length, or 0 on auth failure / no active session.
     size_t decrypt_in_place(uint8_t* ciphertext, size_t len);
 
@@ -197,7 +197,7 @@ private:
 
     /// @brief Encrypt one frame and emit it via the frame sink. A failure from the encrypt on
     /// sets send_desynced_.
-    /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + 16 (AEAD tag).
+    /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + AEAD_TAG_SIZE.
     SsErr encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity, size_t plaintext_len,
                                  const FrameWriteHook& before_write);
 
@@ -235,9 +235,9 @@ private:
     /// orig_type byte. See grow_buffer().
     bool reasm_reserve(size_t needed, bool admitted);
 
-    /// @brief Grows send_buf_ to at least `needed` bytes, capped at MAX_TRANSPORT_PLAINTEXT + 16
-    /// (the largest plaintext + AEAD tag room the non-fragmented path ever handles). See
-    /// grow_buffer().
+    /// @brief Grows send_buf_ to at least `needed` bytes, capped at MAX_TRANSPORT_PLAINTEXT +
+    /// AEAD_TAG_SIZE (the largest plaintext + AEAD tag room the non-fragmented path ever
+    /// handles). See grow_buffer().
     bool ensure_send_buf(size_t needed);
 
     /// @brief Discards any in-flight reassembly state (keeps the allocation).
@@ -264,10 +264,10 @@ private:
 
     /// Reused scratch buffer for the non-fragmented send path (send_json, send_binary,
     /// send_msg2_and_swap). Grown on demand by ensure_send_buf() to fit each frame (geometric
-    /// growth, same idiom as reasm_buf_/reasm_reserve()), capped at MAX_TRANSPORT_PLAINTEXT + 16
-    /// bytes, so typical traffic settles at a working-set size well under that ceiling instead of
-    /// paying it on every connection. Protocol task only, like every send. Placed per
-    /// buffer_location_ like reasm_buf_.
+    /// growth, same idiom as reasm_buf_/reasm_reserve()), capped at MAX_TRANSPORT_PLAINTEXT +
+    /// AEAD_TAG_SIZE bytes, so typical traffic settles at a working-set size well under that
+    /// ceiling instead of paying it on every connection. Protocol task only, like every send.
+    /// Placed per buffer_location_ like reasm_buf_.
     PlatformBuffer send_buf_;
 
     // Pointer fields

@@ -199,7 +199,7 @@ Feed the capture to `write_audio()` from one capture thread, with the capture ti
 source.write_audio(pcm_bytes, len, capture_time_us);
 ```
 
-It never waits or allocates. It refuses audio while the stream is closed, a write that is not a whole number of frames, and a write that finds the capture buffer full; after a stall the stream resumes from live capture rather than sending the stale backlog. Start capturing in `on_streaming_started()` and stop in `on_streaming_stopped()` (see [SourceRoleListener](#sourcerolelistener)); the client holds high-performance networking (`on_request_high_performance()`) between the two, as it does during playback. Stop calling `write_audio()` before destroying the client.
+It never waits or allocates. It refuses audio while the stream is closed, a write that is not a whole number of frames, a write longer than the capture buffer takes at once (see `capture_buffer_ms` in [SourceRoleConfig](#sourceroleconfig)), and a write that finds the capture buffer full; after a stall the stream resumes from live capture rather than sending the stale backlog. Start capturing in `on_streaming_started()` and stop in `on_streaming_stopped()` (see [SourceRoleListener](#sourcerolelistener)); the client holds high-performance networking (`on_request_high_performance()`) between the two, as it does during playback. Stop calling `write_audio()` before destroying the client.
 
 A role configured with `line_sense` reports the capture input's signal state from the main loop thread, which goes to the server in `client/state`:
 
@@ -1461,7 +1461,7 @@ Configuration passed to `client.add_source()`. A value that breaks any rule belo
 | `channels` | `uint8_t` | `2` | Capture channel count, at least 1 (1 or 2 for `OPUS`) |
 | `bit_depth` | `uint8_t` | `16` | 16, 24 (3 packed bytes), or 32; `OPUS` takes 16 |
 | `chunk_duration_ms` | `uint32_t` | `20` | Audio per chunk, 5 to 150 ms; one chunk with its header must fit one Noise transport message. `OPUS` takes 5, 10, 20, 40, or 60. |
-| `capture_buffer_ms` | `uint32_t` | `150` | Capture buffer, more than 0 ms; the bound on the backlog a stall can build before writes are dropped and streaming resumes from live capture. A quarter more is allocated for per-write overhead, so very small writes hold less audio, and a single write longer than half the allocated storage (just under five eighths of `capture_buffer_ms`) is always refused. |
+| `capture_buffer_ms` | `uint32_t` | `150` | Capture buffer, more than 0 ms; the bound on the backlog a stall can build before writes are dropped and streaming resumes from live capture. A quarter more is allocated for per-write overhead, so very small writes hold less audio, and a single write longer than half the allocated storage (just under five eighths of `capture_buffer_ms`) is always refused, without disturbing the audio already queued. |
 | `opus_bitrate` | `uint32_t` | `128000` | Opus bitrate in bit/s, 500 to 512000; ignored for `PCM` |
 | `opus_complexity` | `uint8_t` | `2` | Opus encoder complexity, at most 10; ignored for `PCM` |
 | `line_sense` | `bool` | `false` | Advertise signal sensing; see `SourceRole::set_signal()` |

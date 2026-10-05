@@ -85,10 +85,10 @@ SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, 
     const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_FIRST_HEADER_SIZE;
     const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_CONT_HEADER_SIZE;
 
-    // Buffer reused for each frame (plaintext + 16-byte tag room). ~64 KB, so placed per
+    // Buffer reused for each frame (plaintext + AEAD_TAG_SIZE of tag room). ~64 KB, so placed per
     // buffer_location_ (PSRAM-preferring by default on ESP) rather than internal RAM.
     PlatformBuffer frame_buf;
-    if (!frame_buf.allocate(MAX_TRANSPORT_PLAINTEXT + 16, this->buffer_location_)) {
+    if (!frame_buf.allocate(MAX_TRANSPORT_PLAINTEXT + AEAD_TAG_SIZE, this->buffer_location_)) {
         SS_LOGE(TAG, "fragment_and_send: frame buffer allocation failed");
         return SsErr::FAIL;
     }
@@ -135,7 +135,7 @@ SsErr NoiseTransport::fill_and_encrypt(const uint8_t* prefix, size_t prefix_len,
                                        const uint8_t* data, size_t data_len,
                                        const FrameWriteHook& before_write) {
     const size_t plaintext_len = prefix_len + data_len;
-    if (!this->ensure_send_buf(plaintext_len + 16)) {
+    if (!this->ensure_send_buf(plaintext_len + AEAD_TAG_SIZE)) {
         return SsErr::FAIL;
     }
     if (prefix_len > 0) {
@@ -429,10 +429,11 @@ bool NoiseTransport::reasm_reserve(size_t needed, bool admitted) {
 }
 
 bool NoiseTransport::ensure_send_buf(size_t needed) {
-    // Capped at MAX_TRANSPORT_PLAINTEXT + 16 (the largest plaintext + AEAD tag room the
+    // Capped at MAX_TRANSPORT_PLAINTEXT + AEAD_TAG_SIZE (the largest plaintext + AEAD tag room the
     // non-fragmented path ever handles); callers never request more (the non-fragmented path's
     // own size check enforces this), so the cap never actually clamps.
-    return this->grow_buffer(this->send_buf_, needed, MAX_TRANSPORT_PLAINTEXT + 16, "send");
+    return this->grow_buffer(this->send_buf_, needed, MAX_TRANSPORT_PLAINTEXT + AEAD_TAG_SIZE,
+                             "send");
 }
 
 }  // namespace sendspin

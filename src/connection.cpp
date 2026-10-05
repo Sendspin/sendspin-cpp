@@ -419,8 +419,8 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
         return InboundDispatch::NONE;
     }
 
-    // Decrypt in place: the message holds the full ciphertext (plaintext + 16-byte tag), in the
-    // ring item it was received into when it has one.
+    // Decrypt in place: the message holds the full ciphertext (plaintext + AEAD_TAG_SIZE of tag),
+    // in the ring item it was received into when it has one.
     const size_t pt_len = this->noise_transport_.decrypt_in_place(message.data, message.len);
     if (pt_len == 0) {
         // Spec Failure Handling: an AEAD failure once in transport mode closes the WebSocket
