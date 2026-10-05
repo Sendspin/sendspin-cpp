@@ -806,7 +806,9 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
 
     server.reset();  // Peer goes away mid-burst: drop_connection releases the hold
     pump_until(client, [&] { return listener.releases == 1; });
-    EXPECT_FALSE(client.is_connected());
+    // The release is queued before the protocol task publishes the loss, so is_connected() can
+    // still read true when the release arrives.
+    pump_until(client, [&] { return !client.is_connected(); });
 
     auto again = connect_paired_server(bundle.peer, HIGH_PERF_TEST_PORT);
     pump_until(client, [&] { return client.is_connected() && listener.requests == 2; });
