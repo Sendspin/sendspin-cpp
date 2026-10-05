@@ -19,6 +19,7 @@
 #pragma once
 
 #include "constants.h"
+#include "inbound_ring.h"
 #include "outbound_ring.h"
 #include "platform/event_flags.h"
 #include "sendspin/config.h"
@@ -178,6 +179,9 @@ protected:
 
     // Struct fields
     EventFlags event_flags_;
+    /// The run of writes the full capture ring refused; the capture thread's, like every
+    /// producer_ field.
+    InboundDropLog producer_drop_log_;
     PcmPassthroughEncoder pcm_encoder_;
     /// The Opus encoder of an OPUS config, created by the first start() and kept, like the
     /// capture ring; null otherwise.
@@ -226,14 +230,16 @@ protected:
     uint32_t chunk_generation_{0};
     /// The generation encoder_ was last reset for; generation 0 is never opened.
     uint32_t encoder_generation_{0};
-    /// Capture-thread-only count of writes dropped in the current overflow episode.
-    uint32_t producer_dropped_writes_{0};
+    /// The stream generation the producer's warning state belongs to; write_audio() ends its drop
+    /// run and clears its flags when a write is admitted under a new one. Capture thread only,
+    /// like every producer_ field.
+    uint32_t producer_generation_{0};
 
     // 8-bit fields
-    /// Episode flags for write_audio()'s throttled warnings: the capture thread, and
-    /// SourceTask::start() while the gate is closed.
-    bool producer_drop_episode_{false};
-    bool producer_frame_warned_{false};
+    /// Whether write_audio() warned of a partial-frame write, and of one longer than any capture
+    /// item, since its last accepted write.
+    bool producer_partial_warned_{false};
+    bool producer_oversize_warned_{false};
     /// Task-only: an outbound acquire failed and none has succeeded since.
     bool stall_episode_{false};
     /// Task-only: opus_encoder_ was warmed up on this run's thread (SourceEncoder::warm_up());

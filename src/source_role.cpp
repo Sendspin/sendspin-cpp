@@ -21,6 +21,7 @@
 #include "time_filter.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <iterator>
 
 static const char* const TAG = "sendspin.source";
@@ -54,7 +55,7 @@ static bool validate_opus_config(const SourceRoleConfig& config) {
     if (!contains(OPUS_SAMPLE_RATES, config.sample_rate)) {
         SS_LOGE(TAG,
                 "Rejecting source config: opus sample_rate must be 8000, 12000, 16000, 24000, or "
-                "48000 (got %u)",
+                "48000 (got %" PRIu32 ")",
                 config.sample_rate);
         valid = false;
     }
@@ -71,13 +72,15 @@ static bool validate_opus_config(const SourceRoleConfig& config) {
     if (!contains(OPUS_CHUNK_DURATIONS_MS, config.chunk_duration_ms)) {
         SS_LOGE(TAG,
                 "Rejecting source config: opus chunk_duration_ms must be 5, 10, 20, 40, or 60 "
-                "(got %u)",
+                "(got %" PRIu32 ")",
                 config.chunk_duration_ms);
         valid = false;
     }
     if (config.opus_bitrate < SourceRoleConfig::MIN_OPUS_BITRATE ||
         config.opus_bitrate > SourceRoleConfig::MAX_OPUS_BITRATE) {
-        SS_LOGE(TAG, "Rejecting source config: opus_bitrate %u outside [%u, %u]",
+        SS_LOGE(TAG,
+                "Rejecting source config: opus_bitrate %" PRIu32 " outside [%" PRIu32 ", %" PRIu32
+                "]",
                 config.opus_bitrate, SourceRoleConfig::MIN_OPUS_BITRATE,
                 SourceRoleConfig::MAX_OPUS_BITRATE);
         valid = false;
@@ -128,13 +131,16 @@ bool SourceRole::Impl::validate_config(const SourceRoleConfig& config) {
     }
     if (config.chunk_duration_ms < SourceRoleConfig::CHUNK_MIN_MS ||
         config.chunk_duration_ms > SourceRoleConfig::CHUNK_MAX_MS) {
-        SS_LOGE(TAG, "Rejecting source config: chunk_duration_ms %u outside [%u, %u]",
+        SS_LOGE(TAG,
+                "Rejecting source config: chunk_duration_ms %" PRIu32 " outside [%" PRIu32
+                ", %" PRIu32 "]",
                 config.chunk_duration_ms, SourceRoleConfig::CHUNK_MIN_MS,
                 SourceRoleConfig::CHUNK_MAX_MS);
         valid = false;
     } else if (valid && source_chunk_bytes(config) == 0) {
         SS_LOGE(TAG,
-                "Rejecting source config: a %u ms chunk holds no whole frame or does not fit one "
+                "Rejecting source config: a %" PRIu32
+                " ms chunk holds no whole frame or does not fit one "
                 "transport message",
                 config.chunk_duration_ms);
         valid = false;
@@ -143,7 +149,9 @@ bool SourceRole::Impl::validate_config(const SourceRoleConfig& config) {
         SS_LOGE(TAG, "Rejecting source config: capture_buffer_ms must be > 0");
         valid = false;
     } else if (valid && source_capture_ring_bytes(config) == 0) {
-        SS_LOGE(TAG, "Rejecting source config: a capture buffer of %u ms at %u Hz is unusable",
+        SS_LOGE(TAG,
+                "Rejecting source config: a capture buffer of %" PRIu32 " ms at %" PRIu32
+                " Hz is unusable",
                 config.capture_buffer_ms, config.sample_rate);
         valid = false;
     }

@@ -121,13 +121,13 @@ public:
     // ========================================
 
     /// @brief Encrypt plaintext for transport.
-    /// @param plaintext  Input bytes (modified in-place; the caller must supply `len + 16`
-    ///                   bytes of capacity).
-    /// @return Number of ciphertext bytes (len + 16 tag), or 0 on error.
+    /// @param plaintext  Input bytes (modified in-place; the caller must supply
+    ///                   `len + AEAD_TAG_SIZE` bytes of capacity).
+    /// @return Number of ciphertext bytes (len + AEAD_TAG_SIZE of tag), or 0 on error.
     size_t encrypt(uint8_t* plaintext, size_t len, size_t capacity);
 
     /// @brief Decrypt ciphertext in-place.
-    /// @param len  Number of ciphertext bytes (plaintext + 16-byte tag).
+    /// @param len  Number of ciphertext bytes (plaintext + AEAD_TAG_SIZE of tag).
     /// @return Number of plaintext bytes, or 0 on auth failure.
     size_t decrypt(uint8_t* ciphertext, size_t len);
 

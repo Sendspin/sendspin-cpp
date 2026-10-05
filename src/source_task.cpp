@@ -135,11 +135,6 @@ bool SourceTask::start(ProtocolTask* protocol_task) {
     this->encoder_generation_ = 0;
     this->stall_episode_ = false;
     this->opus_warm_ = false;
-    // The producer's episode flags too: the gate is closed, so no write admitted from now on
-    // touches them until a stream opens
-    this->producer_dropped_writes_ = 0;
-    this->producer_drop_episode_ = false;
-    this->producer_frame_warned_ = false;
     const size_t stack_size = config.codec == SendspinCodecFormat::OPUS
                                   ? SourceRoleConfig::DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE
                                   : SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE;
@@ -175,14 +170,32 @@ bool SourceTask::write_audio(const uint8_t* data, size_t len, int64_t capture_ti
     if ((gate & SOURCE_GATE_OPEN) == 0) {
         return false;
     }
+    const uint32_t generation = gate & SOURCE_GENERATION_MASK;
+    if (generation != this->producer_generation_) {
+        // A new stream ends the last one's drop run and starts its warnings afresh, here on the
+        // capture thread that owns that state
+        this->producer_generation_ = generation;
+        this->producer_drop_log_.end_run(TAG, "capture writes");
+        this->producer_partial_warned_ = false;
+        this->producer_oversize_warned_ = false;
+    }
     if (len == 0 || (len % this->bytes_per_frame_) != 0U) {
         // A partial frame would shift the channel interleaving of every later sample; warn once
         // per episode
-        if (!this->producer_frame_warned_) {
-            this->producer_frame_warned_ = true;
+        if (!this->producer_partial_warned_) {
+            this->producer_partial_warned_ = true;
             SS_LOGW(TAG,
                     "write_audio() rejected: %zu bytes is not a whole number of %zu-byte frames",
                     len, this->bytes_per_frame_);
+        }
+        return false;
+    }
+    if (len > this->capture_ring_->max_message_bytes()) {
+        // No item can ever hold it, so it is no overflow: the queued audio is kept
+        if (!this->producer_oversize_warned_) {
+            this->producer_oversize_warned_ = true;
+            SS_LOGW(TAG, "write_audio() rejected: %zu bytes exceeds the %zu-byte largest write",
+                    len, this->capture_ring_->max_message_bytes());
         }
         return false;
     }
@@ -194,26 +207,21 @@ bool SourceTask::write_audio(const uint8_t* data, size_t len, int64_t capture_ti
     void* item = this->capture_ring_->acquire(len, 0);
     if (item == nullptr) {
         // The ring bounds a stall's backlog; the task resumes from live capture once it drains
-        this->overflow_generation_.store(gate & SOURCE_GENERATION_MASK, std::memory_order_release);
-        ++this->producer_dropped_writes_;
-        if (!this->producer_drop_episode_) {
-            this->producer_drop_episode_ = true;
+        this->overflow_generation_.store(generation, std::memory_order_release);
+        if (this->producer_drop_log_.note_drop()) {
             SS_LOGW(TAG, "Capture buffer full; dropping writes until it drains");
         }
         return false;
     }
     std::memcpy(outbound_item_message(item), data, len);
     set_outbound_item_header(item, OutboundItemHeader{.capture_time_us = capture_time_us,
-                                                      .generation = gate & SOURCE_GENERATION_MASK,
+                                                      .generation = generation,
                                                       .data_len = static_cast<uint32_t>(len)});
     // Wakes the task's take
     this->capture_ring_->complete(item);
-    if (this->producer_drop_episode_) {
-        this->producer_drop_episode_ = false;
-        SS_LOGI(TAG, "Capture resumed after dropping %u writes", this->producer_dropped_writes_);
-        this->producer_dropped_writes_ = 0;
-    }
-    this->producer_frame_warned_ = false;
+    this->producer_drop_log_.end_run(TAG, "capture writes");
+    this->producer_partial_warned_ = false;
+    this->producer_oversize_warned_ = false;
     return true;
 }
 

@@ -734,7 +734,7 @@ struct SourceRoleConfig {
     /// @brief Capture buffer in milliseconds of audio in the configured format; must be > 0.
     /// Approximate: per-write bookkeeping comes out of a fixed 25% margin, so many very small
     /// write_audio() calls hold less audio than this. A single write longer than half of it (with
-    /// that margin) is always refused.
+    /// that margin) is always refused, without disturbing the audio already queued.
     uint32_t capture_buffer_ms{DEFAULT_CAPTURE_BUFFER_MS};
 
     /// @brief Opus bitrate in bit/s, within [MIN_OPUS_BITRATE, MAX_OPUS_BITRATE]. Ignored (and

@@ -16,6 +16,7 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "platform/crypto.h"
 #include "platform/logging.h"
 
 // noise-c is a C library; wrap in extern "C" to avoid name-mangling issues.
@@ -285,8 +286,9 @@ size_t NoiseSession::encrypt(uint8_t* plaintext, size_t len, size_t capacity) {
         SS_LOGE(TAG, "encrypt: transport not ready");
         return 0;
     }
-    if (capacity < len + 16) {
-        SS_LOGE(TAG, "encrypt: buffer too small (need %zu, have %zu)", len + 16, capacity);
+    if (capacity < len + AEAD_TAG_SIZE) {
+        SS_LOGE(TAG, "encrypt: buffer too small (need %zu, have %zu)", len + AEAD_TAG_SIZE,
+                capacity);
         return 0;
     }
 

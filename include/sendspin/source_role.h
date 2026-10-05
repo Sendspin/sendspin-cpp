@@ -108,8 +108,9 @@ public:
     ///        SendspinClient::get_client_time()) of the FIRST sample in data, or 0 to stamp the
     ///        write as ending at the current time (its first sample one write duration earlier).
     /// @return true if the audio was accepted; false when the stream is not open, the write is
-    ///         not whole frames, or the capture buffer is full (the write is dropped, and the
-    ///         stream resumes from live capture once the buffer drains).
+    ///         not whole frames or longer than the capture buffer ever takes in one write
+    ///         (SourceRoleConfig::capture_buffer_ms), or the capture buffer is full (the write is
+    ///         dropped, and the stream resumes from live capture once the buffer drains).
     bool write_audio(const uint8_t* data, size_t len, int64_t capture_time_us);
 
     /// @brief Reports the capture input's signal state, published to the server in client/state
