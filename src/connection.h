@@ -37,7 +37,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -55,9 +54,6 @@ class SendspinArenaAllocator;
  * This class represents a single connection to a Sendspin server. It manages connection state,
  * time synchronization, message buffering, and the hello handshake. Derived classes implement
  * the actual transport mechanism (e.g., incoming WebSocket server connection or outgoing client).
- *
- * The hub owns connection instances and uses callbacks to receive notifications about messages,
- * handshake completion, and disconnection events.
  */
 class SendspinConnection : public std::enable_shared_from_this<SendspinConnection> {
 public:
@@ -199,8 +195,7 @@ public:
     }
 
     /// @brief Build and send the client/init TEXT frame that starts the Noise handshake.
-    /// No-op if no handshake driver is installed.
-    /// Must be called after the WebSocket connection is open (from on_connected_cb).
+    /// No-op if no handshake driver is installed; call only once the WebSocket is open.
     void send_noise_client_init();  // implemented in connection.cpp
 
     /// @brief Handle an in-band re-handshake initiated by the server.
@@ -614,36 +609,6 @@ public:
         this->pairing_finalized_ = false;
     }
 
-    // ========================================
-    // Callbacks set by the hub to receive notifications
-    // ========================================
-
-    /// @brief Callback invoked on the protocol task for each complete JSON message
-    /// @param conn This connection.
-    /// @param data Pointer to the message bytes, in a ring item or a buffer the connection owns.
-    /// Valid only until the callback returns, so the callback must not retain it. Not
-    /// null-terminated; use @p len.
-    /// @param len Length of the message in bytes.
-    /// @param timestamp The client time the transport received the message at.
-    std::function<void(SendspinConnection&, const char*, size_t, int64_t)> on_json_message_cb;
-
-    /// @brief Callback invoked on the protocol task for each complete binary role message
-    /// @param conn This connection.
-    /// @param message The decrypted message: `data` points at its type byte. The callback may keep
-    /// the ring item by clearing `message.item` (see InboundMessage); anything else is valid only
-    /// until it returns.
-    std::function<void(SendspinConnection&, InboundMessage&)> on_binary_message_cb;
-
-    /// @brief Callback invoked when the transport connection is ready for messaging
-    /// @param conn Pointer to this connection.
-    /// @note Fired by outbound (client) transports only, on the transport thread, once the
-    ///       connect and WebSocket upgrade complete; the manager's callback marks the upgrade and
-    ///       wakes the protocol task, which starts the Noise handshake. Inbound server connections
-    ///       are delivered to the manager already upgraded and never fire this.
-    /// @note This can run during an outbound destructor's transport join, so it must not reach
-    ///       for an owner of the connection.
-    std::function<void(SendspinConnection*)> on_connected_cb;
-
     /// @brief Gets the time filter for this connection
     /// @return Pointer to the time filter, or nullptr if not initialized.
     SendspinTimeFilter* get_time_filter() {
@@ -678,7 +643,7 @@ public:
     }
 
     /// @brief Wakes the protocol task this connection was attached to (attach_inbound()), if any.
-    /// Any thread: the transport calls it to report its WebSocket upgrade (on_connected_cb).
+    /// Any thread: an outbound transport calls it to report its WebSocket upgrade.
     void wake_protocol_task() const;
 
     // ========================================
@@ -765,13 +730,27 @@ public:
         this->inbound_task_ = task;
     }
 
-    /// @brief Runs one complete message through the receive path: the Noise handshake driver for
-    /// a text frame; decrypt in place, Noise-level reassembly and dispatch to on_json_message_cb
-    /// or on_binary_message_cb for a binary one. Protocol task only.
+    /// @brief What process_inbound_message() leaves its caller to dispatch
+    enum class InboundDispatch : uint8_t {
+        NONE,    ///< Nothing to dispatch
+        JSON,    ///< `complete` holds a JSON body, without the type byte
+        BINARY,  ///< `complete` holds a binary role message, type byte first
+    };
+
+    /// @brief Runs one received message through the receive path: the Noise handshake driver for
+    /// a text frame; decrypt in place and Noise-level reassembly for a binary one. Protocol task
+    /// only.
     ///
-    /// A failure closes the connection silently (connection.md "Failure Handling"), which
-    /// detaches the inbound gate. The caller returns `message.item` if it is still set.
-    void process_inbound_message(InboundMessage& message);
+    /// A single-frame message moves to @p complete with its ring item, so the binary handler can
+    /// keep it; a reassembled one lives in the Noise reassembly buffer, and the item stays in
+    /// @p message. A failure closes the connection silently (connection.md "Failure Handling"),
+    /// which detaches the inbound gate. The caller returns whichever of `message.item` and
+    /// `complete.item` is still set after dispatch, NONE included.
+    /// @param message The message as received.
+    /// @param complete Set to the complete message, if one exists; a single-frame empty JSON body
+    ///        sets it and returns NONE.
+    /// @return What to dispatch @p complete as.
+    InboundDispatch process_inbound_message(InboundMessage& message, InboundMessage& complete);
 
     /// @brief Describes the message the transport published to the fallback buffer (a
     /// pre-admission message, or an admitted connection's message longer than the ring takes),
@@ -838,10 +817,9 @@ protected:
     // Noise transport helpers (connection.cpp)
     // ========================================
 
-    /// @brief Dispatch a complete (non-fragment, fully reassembled) transport message:
-    /// type 0 as JSON (without the type byte), all other types as binary role messages.
-    /// Protocol task only.
-    void dispatch_complete_noise_message(InboundMessage& message);
+    /// @brief Classifies a complete transport message: type 0 as JSON, stripping its type byte,
+    /// all others as binary role messages. Protocol task only.
+    static InboundDispatch classify_complete_noise_message(InboundMessage& complete);
 
     // ========================================
     // Inbound messages (transport side)

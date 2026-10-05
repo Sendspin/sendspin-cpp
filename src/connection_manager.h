@@ -640,9 +640,6 @@ private:
     /// in it is protocol task only.
     SendspinArenaAllocator& json_arena() const;
 
-    /// @brief Attaches message callbacks and the inbound ring to a connection.
-    void setup_connection_callbacks(SendspinConnection* conn);
-
     /// @brief Installs the Noise handshake driver on a nursery connection and sends client/init.
     void start_noise_handshake(NurseryEntry& entry);
 

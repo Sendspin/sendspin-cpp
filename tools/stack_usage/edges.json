@@ -9,9 +9,6 @@
   "_ZNKSt8functionIFmvEEclEv": [
    "sym:SendspinClient5startEvEUlvE_E9_M_invoke"
   ],
-  "_ZNKSt8functionIFvPN8sendspin18SendspinConnectionEEEclES2_": [
-   "sym:_Function_handlerIFvPN8sendspin18SendspinConnectionEEZ.*M_invoke"
-  ],
   "_ZNKSt8functionIFvvEEclEv": [
    "sym:_Function_handlerIFvvEZN8sendspin.*M_invoke"
   ],
@@ -222,9 +219,6 @@
   "sym:SendspinClient5startEv.*_M_invoke": [
    "sym:SendspinClient13protocol_tickEv$"
   ],
-  "sym:SendspinClientConnection16handle_connectedEv$": [
-   "sym:_Function_handlerIFvPN8sendspin18SendspinConnectionEEZ.*M_invoke"
-  ],
   "sym:SendspinConnection12fail_inboundEv$": [
    "SendspinServerConnection::close_transport_now(",
    "SendspinClientConnection::close_transport_now("
@@ -265,9 +259,6 @@
    "SendspinClientConnection::disconnect(",
    "SendspinServerConnection::close_transport_now(",
    "SendspinClientConnection::close_transport_now("
-  ],
-  "void sendspin::SendspinConnection::dispatch_complete_noise_message(": [
-   "sym:setup_connection_callbacks.*_M_invoke"
   ],
   "void sendspin::SendspinConnection::handle_noise_handshake_text(": [
    "SendspinServerConnection::send_text_message(",

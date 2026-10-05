@@ -302,7 +302,23 @@ void SendspinClient::process_inbound(SendspinConnection& conn, InboundMessage& m
     // task parsed or built since the last reset was destroyed before its parser or builder
     // returned.
     this->json_arena_->reset();
-    conn.process_inbound_message(message);
+    InboundMessage complete;
+    switch (conn.process_inbound_message(message, complete)) {
+        case SendspinConnection::InboundDispatch::NONE:
+            break;
+        case SendspinConnection::InboundDispatch::JSON:
+            this->process_json_message(
+                conn, reinterpret_cast<const char*>(complete.data), complete.len,
+                widen_time_stamp_us(complete.receive_time_us, platform_time_us()));
+            break;
+        case SendspinConnection::InboundDispatch::BINARY:
+            this->process_binary_message(conn, complete);
+            break;
+    }
+    // At most one of the two holds the ring item.
+    if (complete.item != nullptr) {
+        this->inbound_ring_->return_item(complete.item);
+    }
     if (message.item != nullptr) {
         this->inbound_ring_->return_item(message.item);
         message.item = nullptr;

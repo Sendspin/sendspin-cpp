@@ -139,15 +139,17 @@ void SendspinClientConnection::setup_callbacks() {
             case ix::WebSocketMessageType::Open:
                 SS_LOGD(TAG, "WebSocket connected to %s", this->url_.c_str());
                 this->connected_ = true;
-                if (this->on_connected_cb) {
-                    this->on_connected_cb(this);
-                }
+                // The protocol task starts the Noise handshake on its next tick. This can run
+                // during the destructor's ws_->stop() join, so it reaches no owner of this
+                // connection.
+                this->mark_ws_upgraded();
+                this->wake_protocol_task();
                 // Released while it was still connecting: close_transport_now() left the attempt
                 // running, so close it now that the close cannot wait on the handshake. A release
                 // that races this check (the detach and this load, the upgrade mark and the
                 // release's own load of it, are a store-load pair either side can miss) is caught
                 // by the reap instead, which drops a parked connection once its upgrade is marked
-                // (on_connected_cb above wakes the task for it).
+                // (the wake above schedules it).
                 if (this->inbound_gate_.is_detached()) {
                     this->connected_ = false;
                     this->ws_->close();

@@ -217,10 +217,10 @@ void SendspinClientConnection::handle_connected() {
     SS_LOGD(TAG, "WebSocket connected to %s", this->url_.c_str());
     this->connected_ = true;
 
-    // Invoke the on_connected_cb callback if set (hub uses this to initiate hello handshake)
-    if (this->on_connected_cb) {
-        this->on_connected_cb(this);
-    }
+    // The protocol task starts the Noise handshake on its next tick. This can run during the
+    // destructor's transport join, so it reaches no owner of this connection.
+    this->mark_ws_upgraded();
+    this->wake_protocol_task();
 }
 
 void SendspinClientConnection::handle_disconnected() {
