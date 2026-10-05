@@ -72,7 +72,9 @@ public:
     /// power saving)
     ///
     /// Toggle the platform's networking mode and return; the body must not call any
-    /// SendspinClient or role method.
+    /// SendspinClient or role method. A time burst sends its first time message only once this
+    /// call has returned, so the round trips it measures run in the mode it selects. Every
+    /// request is followed by exactly one on_release_high_performance(); requests do not nest.
     virtual void on_request_high_performance() {}
 
     /// @brief Called when the library no longer needs high-performance networking
@@ -160,6 +162,10 @@ public:
     virtual ~SendspinNetworkProvider() = default;
 
     /// @brief Returns true if the network (WiFi/Ethernet) is ready for connections
+    ///
+    /// Called from any thread: from start() on the main loop, then from the library's protocol
+    /// task, which polls it while the WebSocket server is down. Must be cheap and non-blocking, a
+    /// read of state the platform keeps current, and must not call back into the library.
     virtual bool is_network_ready() = 0;
 };
 
@@ -185,8 +191,9 @@ public:
 /// call.
 ///
 /// Blocking: perform one bounded storage operation and return. The main loop is stopped for the
-/// duration, so audio scheduling, time sync and role callbacks wait with it. Report a failed
-/// write by returning false rather than retrying inline.
+/// duration, so the listener and role callbacks wait with it; connection work, time sync and
+/// audio run on the library's own threads and do not. Report a failed write by returning false
+/// rather than retrying inline.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
@@ -241,11 +248,12 @@ class ConnectionManager;
 class InboundRing;
 struct InboundMessage;
 struct PairingUiSnapshot;
+struct ProtocolCommand;
 class ProtocolTask;
 class RecordStore;
 class SendspinArenaAllocator;
 class SendspinConnection;
-class SendspinTimeBurst;
+struct ClientStateMessage;
 struct Identity;
 
 /**
@@ -307,21 +315,23 @@ public:
     // Lifecycle
     // ========================================
 
-    /// @brief Starts the role threads and arms the WebSocket server
+    /// @brief Starts the role threads and the protocol task, and arms the WebSocket server
     ///
-    /// The server itself comes up on the first loop() tick after the network provider reports
-    /// ready. If a role fails to start, the roles that did start are stopped again so a corrected
-    /// retry begins from the stopped state. A rejected configured pairing secret
-    /// (SendspinClientConfig::pairing_psk or static_pairing_code) fails every start() of this
-    /// instance, since the config is fixed at construction. Main-loop thread only.
+    /// The server starts listening before this returns when the network provider already reports
+    /// ready, and otherwise as soon as it does, on the protocol task. If a role fails to start,
+    /// the roles that did start are stopped again so a corrected retry begins from the stopped
+    /// state. A rejected configured pairing secret (SendspinClientConfig::pairing_psk or
+    /// static_pairing_code) fails every start() of this instance, since the config is fixed at
+    /// construction. Main-loop thread only.
     /// @return true if the client is running (including when it already was), false on failure
     bool start();
 
     /// @brief Stops the client and returns only once it is fully stopped
     ///
     /// Sends a client/goodbye (reason shutdown) to every peer, waits a short bound for those
-    /// sends to complete, then closes the server and every connection regardless, joins the role
-    /// threads, resets every role, and delivers the roles' clear callbacks (on_stream_end(),
+    /// sends to complete, joins the protocol task, then closes the server and every connection
+    /// regardless, joins the role threads, resets every role, and delivers the roles' clear
+    /// callbacks (on_stream_end(),
     /// on_image_clear(), on_metadata_clear(), ...) before returning. A pairing prompt still
     /// showing is dismissed the same way (on_clear_pairing_code() / on_close_pairing_window()),
     /// and every provider write still owed is performed before returning. No-op when stopped.
@@ -353,23 +363,25 @@ public:
     ///
     /// Ignored (with a warning) unless the client is running, including from a callback fired
     /// inside stop(). start() is where the identity and record store the Noise handshake needs
-    /// are created. Must be called from the main loop
-    /// thread: it tears down and replaces connection state (time filter, dispatch, client state)
-    /// directly rather than deferring to loop(), so calling it concurrently with loop() would
-    /// race those mutations.
+    /// are created. Any thread: the request is queued to the library's protocol task, which
+    /// replaces any earlier outbound attempt; a full queue refuses it with a warning.
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
     /// @brief Disconnects from the current server with the given reason
     ///
-    /// Ignored unless the client is running, including from a callback fired inside stop().
-    /// Must be called from the main loop thread: the blocking transport close runs outside the
-    /// manager lock, so another thread could race loop()'s own release of the same connection.
+    /// Ignored unless the client is running, including from a callback fired inside stop(). Any
+    /// thread: the request is queued to the protocol task, which sends the goodbyes; a full
+    /// queue refuses it with a warning.
     /// @param reason The goodbye reason to send
     void disconnect(SendspinGoodbyeReason reason);
 
-    /// @brief Processes events, drives time sync, checks network. Call from main loop
-    /// A no-op while the client is stopped.
+    /// @brief Delivers what the library's threads produced since the last call: the listener and
+    /// role callbacks, the persistence provider's writes, and the high-performance requests. Call
+    /// from the main loop. A no-op while the client is stopped.
+    ///
+    /// Connection work (handshakes, time sync, sends, watchdogs) runs on the library's protocol
+    /// task and does not wait for this call.
     void loop();
 
     // ========================================
@@ -510,19 +522,19 @@ public:
     [[nodiscard]] std::optional<std::string> pairing_token() const;
 
     /// @brief Returns true if there is an active connection whose handshake completed and whose
-    /// first server/activate has arrived
+    /// latest server/activate has arrived. Any thread; reflects the protocol task's last tick.
     bool is_connected() const;
 
     /// @brief Returns the server information from the active connection's hello handshake, or
-    /// nullopt when no handshake has completed
+    /// nullopt when no connection is active. Any thread.
     std::optional<ServerInformationObject> get_server_information() const;
 
-    /// @brief Returns true if the time filter has received at least one measurement
+    /// @brief Returns true if the time filter has received at least one measurement. Any thread.
     bool is_time_synced() const;
 
-    /// @brief Converts a server timestamp to the equivalent client timestamp
+    /// @brief Converts a server timestamp to the equivalent client timestamp. Any thread.
     /// @param server_time Server-side timestamp in microseconds
-    /// @return Equivalent client-side timestamp in microseconds
+    /// @return Equivalent client-side timestamp in microseconds, or 0 with no active connection
     int64_t get_client_time(int64_t server_time) const;
 
     /// @brief Returns the current group state; fields are optional and may be unset
@@ -530,12 +542,13 @@ public:
         return this->group_state_;
     }
 
-    /// @brief Returns the trust level of the active connection. Main loop only.
-    /// The same value SendspinClientListener::on_trust_changed reports, queryable at any time.
+    /// @brief Returns the trust level of the active connection. Any thread.
+    /// The same value SendspinClientListener::on_trust_changed reports, queryable at any time; it
+    /// changes on the protocol task, so it can lead the callback by a loop() tick.
     /// @return The active connection's ConnectionTrust; ConnectionTrust::NONE when no
     ///         connection is active or the handshake has not completed
     ConnectionTrust get_current_trust() const {
-        return this->current_trust_;
+        return this->current_trust_.load(std::memory_order_acquire);
     }
 
     // ========================================
@@ -556,7 +569,8 @@ public:
         return this->available_;
     }
 
-    /// @brief Leaves the current group with messaging.md "client/leave". Main loop only.
+    /// @brief Leaves the current group with messaging.md "client/leave". Any thread: the request
+    /// is queued to the protocol task.
     ///
     /// The client no longer wants to take part in its group's playback, for example while
     /// playing a local source. The
@@ -566,8 +580,8 @@ public:
     /// client that will not yield calls set_available(false) instead.
     ///
     /// Only meaningful while the group is playing: a client in a stopped group keeps its
-    /// grouping by staying. Ignored, with a log, unless a connection is admitted and its latest
-    /// server/activate has arrived.
+    /// grouping by staying. Ignored, with a log, unless the client is running, a connection is
+    /// admitted and its latest server/activate has arrived.
     void leave();
 
     // ========================================
@@ -575,7 +589,8 @@ public:
     // ========================================
 
     /// @brief Signals that the operator performed the device pairing-window gesture.
-    /// Thread-safe. Opens a pairing window (pairing.md "Pairing Window"): a gesture-gated attempt
+    /// Any thread: queued to the protocol task; ignored unless the client is running. Opens a
+    /// pairing window (pairing.md "Pairing Window"): a gesture-gated attempt
     /// already waiting proceeds immediately; otherwise the window stands open for 5 minutes and
     /// admits pairing attempts on one connection without a further gesture. It closes before
     /// those 5 minutes are up when a pairing under it succeeds, when the connection it is bound
@@ -584,13 +599,16 @@ public:
     void confirm_pairing_window();
 
     /// @brief Signals that the operator cancelled the pairing window.
-    /// Thread-safe. Closes any open window, one of the closing events pairing.md "Pairing Window"
+    /// Any thread: queued to the protocol task; ignored unless the client is running. Closes any
+    /// open window, one of the closing events pairing.md "Pairing Window"
     /// defines, so the next gesture-gated attempt waits for a fresh gesture. An attempt still
     /// withheld for that gesture ends with pair/abort reason user_cancelled; one already under
     /// way runs to its own end.
     void cancel_pairing_window();
 
-    /// @brief Turns unpaired access on or off; it is off until this is called. Main loop only.
+    /// @brief Turns unpaired access on or off; it is off until this is called. Any thread: the
+    /// value takes effect at once for the next client/hello and admission, and the connections it
+    /// no longer fits are closed by the protocol task.
     ///
     /// pairing.md "Unpaired Access": servers with no pairing record may declare playback and
     /// activate roles only while it is on. Turning it off closes every connection that relies on
@@ -600,7 +618,9 @@ public:
     /// So is one on the Pairing PSK still awaiting its first server/activate: it is most likely
     /// about to declare pairing, and a restart would cost that attempt. If it activates idle
     /// instead, it keeps the hello it already read until it reconnects.
-    /// Callable at any time, before the first start() and while stopped included.
+    /// Callable at any time, before the first start() and while stopped included: while the
+    /// client is stopped the value is stored, and the next start() uses it from its first
+    /// client/hello on (there is no connection to close).
     ///
     /// The library never persists the setting. An application that keeps it across reboots
     /// stores it and restores it by calling this before start(), so the first client/hello and
@@ -609,7 +629,7 @@ public:
     /// @param enabled Whether to admit unpaired access.
     void set_unpaired_access_enabled(bool enabled);
 
-    /// @brief Whether unpaired access is on; see set_unpaired_access_enabled(). Main loop only.
+    /// @brief Whether unpaired access is on; see set_unpaired_access_enabled(). Any thread.
     bool is_unpaired_access_enabled() const;
 
     // ========================================
@@ -636,51 +656,56 @@ public:
     // Role services (called by roles via SendspinClient pointer)
     // ========================================
 
-    /// @brief Publishes the current client state to the active connection
+    /// @brief Publishes the current client state to the active connections
     ///
-    /// Main loop only, like the role setters that call it: the client state and the role fields
-    /// it serializes are main-loop state. The connection itself is resolved as a shared_ptr, so
-    /// the publish cannot outlive the slot even when a caller ignores that contract.
+    /// Main loop only, like the role setters that call it: the availability and the role fields
+    /// it serializes are main-loop state. It builds a snapshot here and hands it to the protocol
+    /// task, which keeps only the newest and sends each admitted connection the role objects of
+    /// the roles that connection owns. Ignored unless the client is running.
     void publish_state();
 
-    /// @brief Sends a role-originated text message over the active connection
+    /// @brief Sends a role-originated text message to the connection that owns the role
     ///
     /// Every message sent on a role's behalf carries the role it belongs to, so the activation
     /// gate cannot be forgotten at a call site. The client's own messages do not come through
     /// here.
     ///
-    /// Dropped unless that role is active on the connection: messaging.md "server/activate"
-    /// tolerates inactive-role objects server-side because a client that received the role
-    /// removal stops sending them. The activation test is on the versioned name, the same test
-    /// the receive path applies. Also held, like client/state, while a re-handshake awaits the
-    /// server/activate that follows it.
+    /// The message is queued to the protocol task, which sends it to the admitted connection that
+    /// owns the role, and drops it there unless that connection has the role active:
+    /// messaging.md "server/activate" tolerates inactive-role objects server-side because a client
+    /// that received the role removal stops sending them. The activation test is on the
+    /// versioned name, the same test the receive path applies. Also dropped, like client/state,
+    /// while a re-handshake awaits the server/activate that follows it.
     ///
-    /// Callable from any thread: the gate reads the connection's published role mask, not the
-    /// main-loop-only role set.
+    /// Callable from any thread.
     /// @param text The text message to send
     /// @param role_family Role family the message belongs to, without the version suffix
     ///                    (e.g. "controller")
-    void send_text(const std::string& text, const std::string& role_family);
+    /// @return false when the message was refused before it reached the protocol task: the
+    ///         client is not running, the family names no role this library implements, or the
+    ///         command queue is full (ProtocolTask::CONSUMER_COMMAND_BURST requests, logged). true
+    ///         means queued, not sent: the protocol task's role gate can still drop it.
+    bool send_text(const std::string& text, const std::string& role_family);
 
-    /// @brief Acquires a ref-counted high-performance networking request
+    /// @brief Acquires a ref-counted high-performance networking request. Main loop only: the
+    /// first acquire calls the listener inline.
     void acquire_high_performance();
 
-    /// @brief Releases a ref-counted high-performance networking request
-    ///
-    /// The last release calls the listener inline, so only call this where no ConnectionManager
-    /// lock is held; locked teardown paths use release_high_performance_deferred().
+    /// @brief Releases a ref-counted high-performance networking request. Main loop only: the
+    /// last release calls the listener inline.
     void release_high_performance();
 
-    /// @brief Hands a high-performance release to the next drain instead of performing it here
-    ///
-    /// The reference stays held until flush_high_performance_releases() runs, so a release
-    /// deferred out of a locked teardown can never be reordered against an acquire that follows
-    /// it. Main loop only.
-    void release_high_performance_deferred();
-
 private:
-    /// @brief Cleans up playback state when the active streaming connection is removed
-    void cleanup_connection_state();
+    /// @brief The protocol-task half of a teardown: when `teardown_roles` covers every role, wipes
+    /// the event ring, the pending group and time-sync slots, the pairing notes other than a
+    /// dismissal already owed, and the trust level; and runs cleanup() on each role in
+    /// `teardown_roles`, each of which queues its stamped clear for the main loop. Protocol task,
+    /// or the main loop in stop() once every other thread is joined. Each role's main-loop half
+    /// runs in drain_inbox() before anything stamped with the new generation is acted on
+    /// (catch_up_teardown() in src/teardown_tracker.h).
+    /// @param teardown_roles The roles to tear down, as role_mask_bit() bits: the roles no
+    ///        remaining admitted connection owns.
+    void cleanup_connection_state(uint16_t teardown_roles);
 
     /// @brief Wakes the main loop to run flush_pending_persistence(). Callable from any thread
     /// and under any library lock: it takes only the Inbox mutex.
@@ -694,18 +719,36 @@ private:
     /// succeeded.
     void flush_pending_persistence();
 
-    /// @brief Drains the inbox: lifecycle events, role slots, and group updates, dispatching
-    /// listener callbacks on the calling (main-loop) thread. Shared by loop() and stop().
+    /// @brief Drains the inbox: high-performance requests, provider writes, the time-sync report,
+    /// lifecycle events (each role's teardown half caught up ahead of its stamped events),
+    /// pairing notes, role slots, and group updates, dispatching listener callbacks on the
+    /// calling (main-loop) thread. Shared by loop() and stop(). A callback that calls stop()
+    /// abandons the rest of this drain (EventState::drain_generation).
     void drain_inbox();
 
-    /// @brief Performs the releases release_high_performance_deferred() handed over
-    ///
-    /// Runs at the head of drain_inbox(), with no ConnectionManager lock held, so a last
-    /// release's listener callback may call back into the client.
-    void flush_high_performance_releases();
+    /// @brief Applies the high-performance edges the protocol task queued: every acquire, then
+    /// the grant for them (high_performance_granted_, waking the protocol task), then every
+    /// release, so a release never lands before the acquire it ends. Main loop only.
+    void apply_high_performance_requests();
 
-    /// @brief Signals the drain roles, goodbyes and closes every transport, joining the
-    /// transport threads, then joins the protocol task. The shared first half of stop() and the
+    /// @brief Queues a high-performance acquire (true) or release (false) for the main loop,
+    /// where the listener is called. Protocol task.
+    /// @return For an acquire, its ticket: the burst that requested the hold sends its first
+    ///         time frame only once high_performance_granted() reports the ticket granted. 0 for
+    ///         a release, which waits for nothing.
+    uint32_t request_high_performance(bool acquire);
+
+    /// @brief Whether the main loop has called the listener for the acquire `ticket` names (see
+    /// request_high_performance()). Protocol task.
+    bool high_performance_granted(uint32_t ticket) const;
+
+    /// @brief Queues a completed time burst's filter error for on_time_sync_updated() on the main
+    /// loop. Protocol task.
+    void post_time_sync_error(double error);
+
+    /// @brief Signals the drain roles, closes admission, joins the protocol task (whose final
+    /// tick goodbyes every peer within a bound), then closes every transport and stops the
+    /// server, joining the transport threads. The shared first half of stop() and the
     /// destructor's teardown.
     /// @return The pairing prompts the dropped connections left showing; stop() dismisses them
     ///         after cleanup_connection_state(), the destructor dispatches nothing.
@@ -735,81 +778,62 @@ private:
     // Protocol task
     // ========================================
 
-    /// @brief The protocol task's work: the command queue, the role lists' recall check, each
-    /// managed connection's held replay, pending pre-admission message and drained close, and the
-    /// inbound ring. Protocol task only.
-    /// @return ProtocolTask::NO_DEADLINE, or 0 to run again at once when the ring was not drained
-    ///         within one pass.
+    /// @brief The protocol task's work, in order: the command queue, the shutdown pass once
+    /// admission is closed, the client/state snapshot, the role lists' recall check, the
+    /// outbound handshakes, each managed connection's pending pre-admission message, the inbound
+    /// ring, the losses, the lifecycle scans, the time bursts, and the published slots
+    /// (docs/internals.md "The Protocol Task's Tick"). Protocol task only.
+    /// @return Milliseconds until the earliest of the task's timers, 0 to run again at once when
+    ///         the ring was not drained within one pass, or ProtocolTask::NO_DEADLINE.
     uint32_t protocol_tick();
+
+    /// @brief Acts on one command from the queue. Protocol task only.
+    void handle_command(ProtocolCommand& command);
 
     /// @brief Runs one of a connection's messages through the receive path and returns its ring
     /// item unless a role kept it. Protocol task only.
     void process_inbound(SendspinConnection& conn, InboundMessage& message);
 
-    /// @brief Replays the role messages `conn` held before admission, once it is admitted.
-    /// Protocol task only: called ahead of each of the connection's messages and for every
-    /// managed connection on each tick, so the replay precedes every message that arrives after
-    /// it was held.
-    void replay_admitted_messages(SendspinConnection* conn);
-
-    /// @brief Builds the formatted client hello message from config
+    /// @brief Builds the formatted client hello message from config. Protocol task.
     std::string build_hello_message();
+
+    /// @brief Builds the client/state snapshot publish_state() hands the protocol task: the
+    /// availability and every role's state object. Main loop only, where that state lives.
+    ClientStateMessage build_client_state() const;
 
     // ========================================
     // Message processing
     // ========================================
 
-    /// @brief Processes a JSON message from a connection
-    ///
-    /// Called on the protocol task. Replays any held role messages first, then hands off to
-    /// dispatch_json_message(). `data` is not null-terminated and is valid for the duration of
-    /// the call only.
+    /// @brief Parses and routes one JSON message from a connection. Protocol task only (it owns
+    /// json_arena_). `data` is not null-terminated and is valid for the duration of the call
+    /// only.
     void process_json_message(SendspinConnection* conn, const char* data, size_t len,
                               int64_t timestamp);
 
-    /// @brief Where a dispatched JSON message came from.
-    enum class JsonMessageOrigin : uint8_t {
-        NETWORK,           ///< Live traffic, subject to the admission gate
-        ADMISSION_REPLAY,  ///< A message held until admission, whose gate has already been passed
-    };
-
-    /// @brief Defers a pairing message that failed to parse to the main loop.
+    /// @brief Hands a pairing message that failed to parse to the pairing state machine.
     ///
-    /// Shared by the pair-init, pair-auth and pair-confirm arms of dispatch_json_message(), which
+    /// Shared by the pair-init, pair-auth and pair-confirm arms of process_json_message(), which
     /// differ only in the payload they parse.
-    void schedule_malformed_pairing_message(SendspinConnection* conn, const char* type_name);
-
-    /// @brief Parses and routes one JSON message. Protocol task only (it owns json_arena_).
-    /// @param origin Whether the admission gate still applies to this message
-    void dispatch_json_message(SendspinConnection* conn, const char* data, size_t len,
-                               int64_t timestamp,
-                               JsonMessageOrigin origin = JsonMessageOrigin::NETWORK);
-
-    /// @brief Marks the connection admitted and wakes the protocol task, which replays the role
-    /// messages the connection held (replay_admitted_messages()) ahead of any later message.
-    ///
-    /// Main loop only; ConnectionManager::flush_pending_admission() is the only caller, with no
-    /// ConnectionManager lock held. A client/state held for this admission (see
-    /// client_state_held_) is sent once the flag is set: the server's reply traffic reaches the
-    /// protocol task only behind the replay.
-    void admit_connection(SendspinConnection* conn);
+    void report_malformed_pairing_message(SendspinConnection* conn, const char* type_name);
 
     /// @brief Processes a binary message from a connection. Protocol task only.
-    /// Every binary message is role-bound, so this is dropped unless `conn` holds the admitted
-    /// slot. A player audio chunk or a visualizer frame is handed to its consumer by its ring item
-    /// when it has one (the role clears `message.item`).
+    /// Every binary message is role-bound, so this is dropped unless `conn` is admitted and owns
+    /// the role. A player audio chunk or a visualizer frame is handed to its consumer by its ring
+    /// item when it has one (the role clears `message.item`).
     void process_binary_message(SendspinConnection* conn, InboundMessage& message);
 
     // ========================================
     // State publishing
     // ========================================
 
-    /// @brief Publishes the current client state to the specified connection
+    /// @brief Sends the latest client/state snapshot to an admitted connection, with the role
+    /// objects of the roles it owns. Protocol task only.
     ///
-    /// Held while `conn` is not admitted yet, and while an available, active player has no clock
-    /// sync yet (see client_state_held_).
-    /// Takes no lock of its own: its main-loop callers already hold conn_ptr_mutex_ or a
-    /// shared_ptr, which is what keeps `conn` alive for the call.
+    /// Nothing for a connection that is not admitted and operational. Held while the snapshot is
+    /// available and `conn` owns an active player with no clock sync yet
+    /// (AdmittedEntry::state_held); ConnectionManager::run_time_sync() sends it with the first
+    /// measurement.
     void publish_client_state(SendspinConnection* conn);
 
     // ========================================
@@ -828,10 +852,9 @@ private:
     /// @brief Loads the last played server_id from persistence
     void load_last_played_server();
 
-    /// @brief Makes server_id the last-played server in RAM; the provider write waits for
-    /// flush_pending_persistence(). Main loop only, and may run under
-    /// ConnectionManager::conn_ptr_mutex_, where arbitration reads the value later in the same
-    /// locked block. An empty or unchanged server_id is a no-op: one flash write per handoff.
+    /// @brief Makes server_id the last-played server in RAM and queues its provider write for
+    /// flush_pending_persistence() on the main loop. Protocol task, where arbitration reads the
+    /// value. An empty or unchanged server_id is a no-op: one flash write per handoff.
     void note_last_played_server(const std::string& server_id);
 
     /// @brief Writes the last-played server_id through the persistence provider.
@@ -841,30 +864,24 @@ private:
     // Connection event handlers (called by ConnectionManager via friend access)
     // ========================================
 
-    /// @brief Publishes the initial client state after handshake completes; on a connection the
-    /// promotion scan has not admitted yet the state is held for admit_connection() to send
+    /// @brief Publishes the initial client state once an admitted connection goes operational,
+    /// clears its pairing state and reports its trust level. Protocol task only.
     /// @param conn The connection that completed the handshake
     void on_handshake_complete(SendspinConnection* conn);
 
-    /// @brief Tears down every role the activation just took out of active_roles
+    /// @brief Tears down the roles an activation took away from their connection
     ///
     /// messaging.md "server/activate" has the client stop a removed stream role's output and clear
     /// its buffers, and discard a removed state role's current state and pending scheduled update,
     /// as part of applying the activation. Roles that stay active at the same version are
-    /// untouched.
-    ///
-    /// Called by ConnectionManager on the main loop while conn_ptr_mutex_ is held, for the
-    /// admitted connection only, so the teardown obeys the same rule as the disconnect path: it
-    /// queues its listener callbacks on the inbox instead of calling them here.
-    /// @param roles_before The active roles the activation replaces
-    /// @param roles_after The active roles the activation established
-    void apply_role_removals(const std::vector<std::string>& roles_before,
-                             const std::vector<std::string>& roles_after);
+    /// untouched. Protocol task only, like the disconnect path's teardown, and like it it queues
+    /// its listener callbacks for the main loop instead of calling them here.
+    /// @param removed_roles The roles the connection owned before the activation and no longer
+    ///        does, as role_mask_bit() bits.
+    void apply_role_removals(uint16_t removed_roles);
 
-    // Pairing and trust notifications. Each is called by ConnectionManager on the main loop,
-    // most while conn_ptr_mutex_ is held, and queues the listener callback for delivery from
-    // loop() so it fires unlocked. note_pairing_succeeded() runs after the protocol task's
-    // schedule_pairing_succeeded() event has been drained (ConnectionManager::loop()).
+    // Pairing and trust notifications. Each is called on the protocol task and queues the
+    // listener callback for delivery from the main loop's drain_inbox().
 
     /// @brief Queue an on_pairing_started notification
     void note_pairing_started(const std::string& server_id);
@@ -891,6 +908,7 @@ private:
     void note_trust_changed(ConnectionTrust trust);
 
     struct EventState;
+    struct TaskState;
 
     // Struct fields
     SendspinClientConfig config_;
@@ -898,8 +916,6 @@ private:
 
     // String fields
     std::string client_id_;  ///< Derived from the static keypair: base64url(public_key).
-    /// The last-played server_id the provider has not been handed. Main loop only.
-    std::optional<std::string> pending_last_played_;
 
     // Pointer fields
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -920,11 +936,11 @@ private:
     /// The shared inbound ring for the current run: created by start(), released by stop() once
     /// every producer and consumer is joined. Null while stopped. Reached by the transports and
     /// the protocol task through the pointers attach_inbound() and the role starts hand out.
-    /// Written on the main loop only. The httpd task also reads this member, in
-    /// ConnectionManager::on_new_connection() through attach_inbound(): safe because start()
-    /// creates the ring before the manager opens admission (and the server only starts after
-    /// that), and stop() releases it only after ConnectionManager::stop() has stopped the server
-    /// and joined its tasks.
+    /// Written on the main loop only. The transport delivery threads and the protocol task also
+    /// read this member (ConnectionManager::on_new_connection() through attach_inbound(), and the
+    /// tick): safe because start() creates the ring before the manager opens admission and the
+    /// protocol task starts, and stop() releases it only after the protocol task is joined and
+    /// ConnectionManager::finish_stop() has stopped the server and joined its tasks.
     std::unique_ptr<InboundRing> inbound_ring_;
     /// Internal-RAM scratch arena for parsing incoming JSON; null unless config_.json_arena_size >
     /// 0. Used by the protocol task only.
@@ -947,28 +963,35 @@ private:
     /// In-memory pairing record store (PSK resolution). Set in start();
     /// outlives every connection the manager hands it out to.
     std::unique_ptr<RecordStore> record_store_;
-    std::unique_ptr<SendspinTimeBurst> time_burst_;
+    /// State the protocol task owns at client level (the latest client/state snapshot and the
+    /// high-performance ticket count).
+    std::unique_ptr<TaskState> task_state_;
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     std::unique_ptr<VisualizerRole> visualizer_;
 #endif
 
+    // 32-bit fields
+    /// High-performance acquires the main loop has applied, the listener called for each: the
+    /// grant a time burst waits for before its first time frame (high_performance_granted()).
+    /// Written by the main loop's drain (apply_high_performance_requests()); read by the protocol
+    /// task.
+    std::atomic<uint32_t> high_performance_granted_{0};
+
     // 8-bit fields
-    /// Consumer-owned availability; see set_available(). Main loop only.
+    /// Consumer-owned availability; see set_available(). Main loop only (the protocol task reads
+    /// it from the client/state snapshot).
     bool available_{true};
     /// The unpaired-access setting admission and the client/hello read; see
-    /// set_unpaired_access_enabled(). Main loop only.
-    bool unpaired_access_enabled_{false};
-    /// A client/state held for admission, which admit_connection() sends, or for clock sync, which
-    /// loop() sends once synced. Main loop only.
-    bool client_state_held_{false};
-    /// Trust level of the active connection; written by on_handshake_complete() and reset by
-    /// cleanup_connection_state(), both main loop only, so get_current_trust() needs no lock.
-    ConnectionTrust current_trust_{ConnectionTrust::NONE};
-    bool high_performance_held_for_time_{false};
+    /// set_unpaired_access_enabled(). Written by the setter on any thread, read by the protocol
+    /// task.
+    std::atomic<bool> unpaired_access_enabled_{false};
+    /// Trust level of the active connection. Written on the protocol task (on_handshake_complete()
+    /// and cleanup_connection_state()), and by stop()'s cleanup once it is joined; read from any
+    /// thread (get_current_trust()).
+    std::atomic<ConnectionTrust> current_trust_{ConnectionTrust::NONE};
+    /// High-performance requests applied and not yet released. Main loop only; atomic for the
+    /// destructor's release loop.
     std::atomic<uint8_t> high_performance_ref_count_{0};
-    /// Releases handed over by release_high_performance_deferred() and performed by the next
-    /// flush_high_performance_releases(). Main loop only.
-    uint8_t high_performance_releases_pending_{0};
     /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;
     /// atomic so is_started() can be read from any thread. STOPPING covers the whole of stop():
     /// start() is refused and stop()/connect_to()/disconnect() are ignored while it is set, so a

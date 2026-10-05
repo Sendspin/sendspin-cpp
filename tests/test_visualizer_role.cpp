@@ -478,6 +478,44 @@ TEST(VisualizerHandleBinary, HandlersRefuseAGenerationATeardownOvertook) {
     EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_BEAT);
 }
 
+/// Counts on_visualizer_stream_start() calls.
+class StreamStartCounter : public VisualizerRoleListener {
+public:
+    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*config*/) override {
+        ++this->starts;
+    }
+    int starts{0};
+};
+
+// A STREAM_START applies only the config written with its own stamp: a config left in the slot by
+// a stream a teardown ended (taken by a drain on the far side of that teardown) is dropped rather
+// than reported for the next stream. The slot is written with the old stamp directly, the payload
+// such a drain would hold; nothing public interleaves the two threads on demand.
+TEST(VisualizerStreamEvents, AStreamStartAppliesOnlyTheConfigOfItsOwnGeneration) {
+    struct Row {
+        const char* name;
+        bool stale;
+        int expected_starts;
+    };
+    const Row rows[] = {{"Control: written under the event's generation", false, 1},
+                        {"written before a teardown", true, 0}};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        StreamStartCounter listener;
+        impl->listener = &listener;
+        const uint32_t before = live_generation(*impl);
+        impl->cleanup();
+        ServerVisualizerStreamObject config;
+        config.types = {VisualizerDataType::BEAT};
+        impl->event_state->config_slot.write(config, row.stale ? before : live_generation(*impl));
+
+        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, live_generation(*impl));
+
+        EXPECT_EQ(listener.starts, row.expected_starts);
+    }
+}
+
 // roles/visualizer/v1.md "Server -> Client: stream/start": a stream that names the spectrum type
 // without a spectrum object has no bin count, so its frames are not deliverable. No wire input
 // reaches this: parse_server_message() drops a visualizer object that advertises spectrum with no

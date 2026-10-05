@@ -25,12 +25,12 @@
 #include "noise_transport.h"
 #include "platform/crypto.h"
 #include "platform/memory.h"
-#include "platform/shadow_slot.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "record_store.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
+#include "time_burst.h"
 #include "time_filter.h"
 
 #include <array>
@@ -39,7 +39,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -75,15 +74,12 @@ public:
     /// processing)
     virtual void start() = 0;
 
-    /// @brief Periodic loop processing (e.g., poll for events, handle state machine)
-    virtual void loop() = 0;
-
     /// @brief Disconnects from the server with a goodbye message
     /// @param reason The reason for disconnecting (e.g., shutdown, another server).
     /// @param on_complete Optional callback invoked after goodbye is sent (or send fails/times
     /// out).
-    ///                    For server connections, invoked from httpd worker thread (use defer() if
-    ///                    needed). For client connections, invoked synchronously in the calling
+    ///                    For ESP server connections, invoked on the httpd worker thread, so it
+    ///                    must be safe there. Otherwise invoked synchronously in the calling
     ///                    thread.
     virtual void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) = 0;
 
@@ -118,12 +114,11 @@ public:
     /// transport drops everything it receives from here on and the protocol task drops what it
     /// still takes for the connection, and retires the client/time frame in flight, so a
     /// server/time already being processed cannot claim it and overwrite the next connection's
-    /// measurement. Any thread; called by the connection manager when the connection leaves it and
-    /// by close_silently().
+    /// measurement. Protocol task (the connection manager when the connection leaves it, and
+    /// close_silently()), or the transport thread (fail_inbound()).
     ///
-    /// A message the protocol task is already dispatching is not recalled: role-bound traffic is
-    /// gated on is_admitted(), which every drop clears first, and a handler already past that gate
-    /// is caught by its role's teardown-generation re-check.
+    /// A message the protocol task is already dispatching is not recalled: the drop that called
+    /// this runs between two of the task's messages, and clears the admitted flag first.
     void detach_inbound() {
         this->inbound_gate_.detach();
         this->cancel_time_frame();
@@ -144,77 +139,29 @@ public:
         return this->is_handshake_complete() && this->first_activate_received();
     }
 
-    /// @brief Whether this connection currently occupies the manager's admitted (current) slot.
+    /// @brief Whether this connection currently occupies one of the manager's admitted slots.
     ///
     /// Being operational is not the same as being admitted: a nursery member can complete the
     /// Noise handshake and the hello cycle and still lose arbitration, and every peer that knows
     /// the Sentinel PSK (a spec constant, so effectively any peer on the network) can reach that
     /// state. Admission is where the PSK category is actually checked against the requested
     /// activities (see admission.h), so anything that drives shared client state (the roles)
-    /// must gate on this, not on the handshake having succeeded.
+    /// must gate on this, not on the handshake having succeeded. Which roles an admitted
+    /// connection drives is a further question, answered by ConnectionManager::owns_role().
     ///
-    /// Written on the main loop only (see set_admitted()) into the inbound gate, which the
+    /// Written on the protocol task only (see set_admitted()) into the inbound gate, which the
     /// transport reads to route a message and the protocol task reads on the dispatch path.
-    /// @return true while this connection is the admitted one.
+    /// @return true while this connection is admitted.
     bool is_admitted() const {
         return this->inbound_gate_.is_admitted();
     }
 
-    /// @brief Mark this connection as occupying (or vacating) the admitted slot.
-    /// Set by SendspinClient::admit_connection(); cleared by ConnectionManager, from
-    /// set_current_connection(), drop_connection(), and stop().
-    /// @param admitted Whether this connection now occupies the admitted slot.
+    /// @brief Mark this connection as occupying (or vacating) an admitted slot. Protocol task
+    /// only: set and cleared by ConnectionManager as the connection enters and leaves its
+    /// admitted array.
+    /// @param admitted Whether this connection now occupies an admitted slot.
     void set_admitted(bool admitted) {
         this->inbound_gate_.set_admitted(admitted);
-    }
-
-    /// @brief Notes that a server/activate from this connection reached the dispatch path.
-    ///
-    /// Distinct from first_activate_received(), which the main loop sets once it has APPLIED an
-    /// activate. This one is set by the protocol task the moment one is handed off, and is what
-    /// tells the dispatch gate that role traffic arriving now belongs to an activation the main
-    /// loop has not resolved yet (see hold_pre_admission_message()). Never cleared: a connection
-    /// that has sent one activate is a peer whose later role traffic is worth holding.
-    void note_activate_delivered() {
-        this->activate_delivered_.store(true, std::memory_order_release);
-    }
-
-    /// @brief Whether a server/activate from this connection has reached the dispatch path.
-    bool activate_delivered() const {
-        return this->activate_delivered_.load(std::memory_order_acquire);
-    }
-
-    /// @brief Receives one held role message: its bytes and the arrival time the live path would
-    /// have processed it with.
-    using HeldMessageVisitor =
-        std::function<void(const char* data, size_t len, int64_t arrival_us)>;
-
-    /// @brief Holds a role message that arrived before admission, for replay at admission.
-    ///
-    /// A server sends role traffic as soon as it has sent its server/activate, but admission is
-    /// decided on the main loop one tick later, so the messages in between would otherwise be
-    /// lost (a one-shot server/state carries state that is never repeated). Holding them here
-    /// keeps the admission gate: a connection that never wins admission never replays anything,
-    /// and its held messages die with it. Only messages that follow an activate are held.
-    ///
-    /// The storage has no lock: every call, here and in replay_pre_admission_messages(), runs on
-    /// the protocol task, which also dispatches the connection's live messages, so the replay is
-    /// ordered against them by that one thread.
-    /// @param data Raw JSON text (not null-terminated).
-    /// @param len Length of the JSON text in bytes.
-    /// @param arrival_us Receive timestamp in microseconds.
-    /// @return true if the message was held, false when the budget is full.
-    bool hold_pre_admission_message(const char* data, size_t len, int64_t arrival_us);
-
-    /// @brief Passes each held role message to `visit`, in arrival order, then drops them all.
-    /// Stops early, dropping the rest, once the connection is detached or no longer admitted.
-    /// Protocol task only, like hold_pre_admission_message().
-    /// @param visit Called once per held message, with the message bytes and its arrival time.
-    void replay_pre_admission_messages(const HeldMessageVisitor& visit);
-
-    /// @brief Whether role messages are held for replay. Protocol task only.
-    bool has_held_messages() const {
-        return this->held_count_ != 0;
     }
 
     // ========================================
@@ -233,7 +180,7 @@ public:
 
     /// @brief Return true once the Noise handshake has completed and transport is encrypted.
     bool is_noise_handshake_complete() const {
-        return this->noise_handshake_complete_.load(std::memory_order_acquire);
+        return this->noise_handshake_complete_;
     }
 
     /// @brief Return true if a Noise handshake driver has been installed on this connection.
@@ -260,8 +207,8 @@ public:
     /// transport is already active (routed here from the dispatch for the "noise/handshake"
     /// message type). Runs the deferred-PSK-binding msg1 read with prologue = the current
     /// NoiseTransport's handshake_hash(), then commits the new session via
-    /// NoiseTransport::send_msg2_and_swap() (msg2 sent under the OLD session, swap happens under
-    /// the same lock so a concurrent main-loop encrypt cannot interleave).
+    /// NoiseTransport::send_msg2_and_swap() (msg2 sent under the OLD session, then the swap; every
+    /// send runs on this task, so no encrypt falls between the two).
     ///
     /// Resets first_activate_received_ so the connection waits for the post-swap
     /// server/activate that connection.md "Re-handshake" makes the server's first message under
@@ -293,13 +240,10 @@ public:
     /// - If not yet encrypted (pre-handshake), routes through send_text_message().
     ///
     /// All role senders use this method. client/time is the one exception: send_time_message()
-    /// calls NoiseTransport::send_json() directly to pass its write hook.
+    /// calls NoiseTransport::send_json() directly to pass its write hook. Protocol task only,
+    /// like every send on a connection. On an ESP outbound connection the transport send blocks
+    /// for up to its 10 ms send timeout (src/esp/client_connection.cpp), once per frame.
     /// @return SsErr::OK if queued/sent, error code otherwise.
-    /// @note The encrypted path blocks on the Noise session mutex, which the protocol task also
-    ///       holds across the re-handshake's msg2 send. On an ESP outbound connection that send
-    ///       blocks for up to the transport's 10 ms send timeout (src/esp/client_connection.cpp),
-    ///       so a call from loop() can stall that long, once per frame for a fragmented message
-    ///       since the lock spans the whole fragment loop.
     SsErr send_app_json(const std::string& json, SendCompleteCallback cb = nullptr,
                         bool allow_before_hello = false);
 
@@ -325,16 +269,16 @@ public:
     }
 
     /// @brief Records the accept/provisional timestamp (microseconds from platform_time_us()).
-    /// Called when the connection is admitted into a manager slot (on_new_connection /
-    /// connect_to), which may happen on a transport thread. The provisional-connection timeout in
-    /// ConnectionManager::loop() reads it on the main loop, hence atomic.
+    /// Protocol task only: stamped when the connection enters the nursery (an accept or a
+    /// connect_to()) and again when a re-handshake or a pairing-finalize ack starts a re-proving
+    /// window; read by the establish and re-prove watchdogs.
     void set_provisional_time_us(int64_t t) {
-        this->provisional_time_us_.store(t, std::memory_order_relaxed);
+        this->provisional_time_us_ = t;
     }
 
     /// @brief Returns the accept/provisional timestamp, or 0 if not yet set.
     int64_t get_provisional_time_us() const {
-        return this->provisional_time_us_.load(std::memory_order_relaxed);
+        return this->provisional_time_us_;
     }
 
     /// @brief Returns the low 32 bits of the last complete inbound message's arrival time.
@@ -356,7 +300,8 @@ public:
                                     bool allow_before_hello = false) = 0;
 
     /// @brief Sends a client/time message and records it as the frame in flight (see
-    /// time_frame_tag_). Needs the Noise transport, which is_operational() implies. Main loop only.
+    /// time_frame_tag_). Needs the Noise transport, which is_operational() implies. Protocol task
+    /// only.
     /// @return The client_transmitted the frame carries, or 0 if the message was not queued/sent.
     int64_t send_time_message();
 
@@ -393,12 +338,11 @@ public:
     ///
     /// connection.md "Failure Handling": handshake-phase failures, an AEAD failure once in
     /// transport mode, and malformed fragment sequences all close the WebSocket without sending a
-    /// client/goodbye (or any other application-level message). Called on the protocol task from
-    /// the receive path and on the main loop by the re-prove watchdog, so this routes to
-    /// close_transport_now() (non-blocking on every platform) instead of disconnect() (which can
-    /// block on a transport join; see close_transport_now()). The inbound gate is detached first,
-    /// so nothing the peer sent after the failure is processed, and the protocol task reports the
-    /// loss.
+    /// client/goodbye (or any other application-level message). Called on the protocol task, from
+    /// the receive path, so this routes to close_transport_now() (non-blocking on every platform)
+    /// instead of disconnect() (which can block on a transport join; see close_transport_now()).
+    /// The inbound gate is detached first, so nothing the peer sent after the failure is processed,
+    /// and the protocol task reports the loss.
     void close_silently(SendspinGoodbyeReason /*reason*/) {
         this->detach_inbound();
         this->close_transport_now();
@@ -423,41 +367,34 @@ public:
     // server/activate state accessors
     // ========================================
 
-    /// @brief Returns the current activity set declared by server/activate. Main-loop-only.
+    /// @brief Returns the current activity set declared by server/activate. Protocol task only.
     const std::vector<SendspinActivity>& get_activities() const {
         return this->activities_;
     }
 
-    /// @brief Returns the sticky active_roles set declared by server/activate.
+    /// @brief Returns the sticky active_roles set declared by server/activate. Protocol task only.
     const std::vector<std::string>& get_active_roles() const {
         return this->active_roles_;
     }
 
     /// @brief Returns true once the first server/activate has been received and applied.
-    /// Atomic because re-handshake (protocol task, see handle_noise_rehandshake) resets it
-    /// to false at the start of a key rotation, while the main loop reads it here and via
-    /// is_operational().
+    /// Reset by a re-handshake (handle_noise_rehandshake()) and a pairing-finalize ack. Protocol
+    /// task only.
     bool first_activate_received() const {
-        return this->first_activate_received_.load(std::memory_order_acquire);
+        return this->first_activate_received_;
     }
 
     /// @brief Returns the PSK category resolved by the Noise handshake (set at COMPLETE, or
     /// re-handshake). Defaults to SENTINEL when no Noise handshake has completed (e.g. when
     /// encryption is not required on this connection).
     PskCategory get_psk_category() const {
-        return this->psk_category_.load(std::memory_order_acquire);
+        return this->psk_category_;
     }
 
-    /// @brief Returns the psk_id of the matched PSK (set at COMPLETE; empty for Sentinel or
-    /// when no Noise handshake has completed).
-    ///
-    /// Returns by value under psk_id_mutex_, which both writers also hold, so this is safe from
-    /// any thread. psk_id_ is rewritten on the protocol task at every in-band re-handshake, and
-    /// a server may start one at any point after admission, so a caller that needs the value more
-    /// than once must read it into a local: two calls can straddle a re-handshake and observe
-    /// different psk_ids. Every call site is cold, so the copy is off any hot path.
-    std::string get_psk_id() const {
-        std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
+    /// @brief Returns the psk_id of the matched PSK (set at COMPLETE and rewritten at every
+    /// in-band re-handshake; empty for Sentinel or when no Noise handshake has completed).
+    /// Protocol task only, the thread that writes it.
+    const std::string& get_psk_id() const {
         return this->psk_id_;
     }
 
@@ -474,29 +411,28 @@ public:
     }
 
     /// @brief Returns the count of pairing server/activate messages received since the last
-    /// Noise handshake (or re-handshake). See pairing_index_ for the cross-thread contract.
+    /// Noise handshake (or re-handshake). Protocol task only.
     uint32_t get_pairing_index() const {
-        return this->pairing_index_.load(std::memory_order_acquire);
+        return this->pairing_index_;
     }
 
     /// @brief Increments the pairing-server/activate counter and returns the new value.
-    /// Call on the main loop exactly once per pairing server/activate that starts or re-enters a
-    /// pairing attempt (handle_enter_pairing).
+    /// Call exactly once per pairing server/activate received, on the protocol task.
     uint32_t bump_pairing_index() {
-        return this->pairing_index_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        return ++this->pairing_index_;
     }
 
     /// @brief Resets the pairing-server/activate counter to zero.
     /// Call on the protocol task when a Noise handshake (initial or re-handshake) completes.
     void reset_pairing_index() {
-        this->pairing_index_.store(0, std::memory_order_release);
+        this->pairing_index_ = 0;
     }
 
     // ========================================
     // Pairing-code session state (dynamic and static)
     // ========================================
 
-    /// @brief Steps in the pairing-code PAKE state machine (main-loop-only).
+    /// @brief Steps in the pairing-code PAKE state machine (protocol task only).
     /// Shared by both code-based methods; AWAIT_SERVER_PAIR_INIT is exclusive to the dynamic
     /// pairing code (see PairingSession::method), the remaining steps (AWAIT_SERVER_PAIR_AUTH
     /// onward) are common to both.
@@ -514,7 +450,7 @@ public:
                                      ///< server/pair-finalize.
     };
 
-    /// @brief All pairing-code session state (main-loop-only; never touched by protocol task).
+    /// @brief All pairing-code session state (protocol task only).
     /// Shared by both code-based methods; `method` selects the gating policy, whether the
     /// attempt runs further rounds, and the pair-confirm wire shape.
     struct PairingSession {
@@ -565,17 +501,13 @@ public:
         PairingSession& operator=(const PairingSession&) = delete;
     };
 
-    /// @brief Return the current pairing-code session state. Main-loop-only.
+    /// @brief Return the current pairing-code session state. Protocol task only.
     PairingSession& pairing_session() {
         return this->pairing_session_;
     }
 
     /// @brief Return the Noise handshake hash, or nullopt if no active transport session.
-    ///
-    /// Safe to call from the main loop during a pairing flow because the NoiseTransport session
-    /// is only written on the protocol task at handshake COMPLETE (before any server/activate
-    /// that can trigger pairing) or at re-handshake swap. During a pairing-code activation
-    /// the transport session is stable and active.
+    /// Protocol task only, the thread that owns the session.
     ///
     /// Virtual so a fake connection can report a canned hash without an active Noise session;
     /// production connections keep the same implementation via dynamic dispatch.
@@ -588,54 +520,46 @@ public:
     // ========================================
 
     /// @brief Returns true if a pairing exchange is in progress on this connection.
-    /// Written on the main loop (set when entering pairing, cleared on abort).
-    /// Also cleared on the protocol task by handle_noise_rehandshake().
-    /// Must be atomic: written main-loop + protocol task, read on main loop.
+    /// Set when entering pairing, cleared on abort and by handle_noise_rehandshake(). Protocol
+    /// task only.
     bool is_pairing_in_progress() const {
-        return this->pairing_in_progress_.load(std::memory_order_acquire);
+        return this->pairing_in_progress_;
     }
 
     /// @brief Returns true if the server has acked server/pair-finalize but no fresh
     /// server/activate has arrived yet, i.e. get_activities() still reports the stale
     /// pre-finalize [PAIRING] set for an exchange that is already complete.
     bool is_pairing_finalized() const {
-        return this->pairing_finalized_.load(std::memory_order_acquire);
+        return this->pairing_finalized_;
     }
 
-    /// @brief Sets the pairing-in-progress flag.
-    /// Call on the main loop when entering the pairing exchange.
+    /// @brief Sets the pairing-in-progress flag. Protocol task only.
     void set_pairing_in_progress(bool value) {
-        this->pairing_in_progress_.store(value, std::memory_order_release);
+        this->pairing_in_progress_ = value;
     }
 
     /// @brief Stores the pending pairing record, committed if/when the server acks with
-    /// server/pair-finalize. Written on the main loop when entering pairing; taken on the
-    /// protocol task in the server/pair-finalize handler (the commit must happen there, before
-    /// the server's re-handshake msg1 (the next message on the same thread) resolves the new PSK
-    /// against the RecordStore). Thin wrapper around pending_pairing_slot_ (ShadowSlot);
-    /// latest-wins overwrite, matching write()'s semantics.
+    /// server/pair-finalize (the commit happens in that handler, before the server's re-handshake
+    /// msg1, the next message, resolves the new PSK against the RecordStore). Latest wins.
+    /// Protocol task only.
     void set_pending_pairing_record(SendspinPairingRecord record) {
-        this->pending_pairing_slot_.write(std::move(record));
+        this->pending_pairing_record_ = std::move(record);
     }
 
-    /// @brief Atomically returns and clears the pending pairing record. A returned value is a
-    /// record to store; nullopt means there was no pending pairing (take() leaves the out-param
-    /// at its default-constructed nullopt when the slot is clean). Called on the protocol task
-    /// when the server/pair-finalize ack arrives.
+    /// @brief Returns and clears the pending pairing record. A returned value is a record to
+    /// store; nullopt means there was no pending pairing. Protocol task only.
     std::optional<SendspinPairingRecord> take_pending_pairing_record() {
-        std::optional<SendspinPairingRecord> out;
-        this->pending_pairing_slot_.take(out);
-        return out;
+        return std::exchange(this->pending_pairing_record_, std::nullopt);
     }
 
     /// @brief Clears all pairing state on this connection. Called on abort or leftover-activate.
+    /// Protocol task only.
     void clear_pairing_state() {
-        this->pairing_in_progress_.store(false, std::memory_order_release);
-        this->pairing_finalized_.store(false, std::memory_order_release);
-        this->pending_pairing_slot_.reset();
-        // Reset the pairing-code session (main-loop-only fields; no lock needed). Destroyed and
-        // rebuilt in place rather than assigned over: assignment would overwrite the secrets
-        // instead of wiping them, and would never run ~PairingSession or ~CPace.
+        this->pairing_in_progress_ = false;
+        this->pairing_finalized_ = false;
+        this->pending_pairing_record_.reset();
+        // Destroyed and rebuilt in place rather than assigned over: assignment would overwrite
+        // the secrets instead of wiping them, and would never run ~PairingSession or ~CPace.
         std::destroy_at(&this->pairing_session_);
         std::construct_at(&this->pairing_session_);
     }
@@ -646,38 +570,20 @@ public:
     /// an in-flight pairing. Protocol task; defined in connection.cpp.
     void note_pairing_finalize_ack();
 
-    /// @brief ORs the roles a just-received server/activate names into the active-role mask.
-    ///
-    /// Runs on the protocol task, where the activate is parsed, so a role the activation adds is
-    /// already active for the receive gate when the traffic that legitimately follows it arrives:
-    /// messaging.md "server/state" has the server send a re-added role's state promptly, without
-    /// waiting for the client's next main-loop tick. Removals are applied in
-    /// apply_server_activate() on the main loop, in the same step that tears the removed roles
-    /// down, so the gate and the teardown agree on when a role stopped.
-    void note_activated_roles(const std::vector<std::string>& active_roles) {
-        this->active_role_mask_.fetch_or(active_role_mask(active_roles), std::memory_order_acq_rel);
-    }
-
-    /// @brief Takes back the mask bits a refused activation added.
-    ///
-    /// Main-loop only. An activation the main loop rejects while keeping the connection open
-    /// never reaches apply_server_activate(); without this the receive gate would go on admitting
-    /// traffic for a role this client never activated.
-    void withdraw_activated_roles(const std::vector<std::string>& refused_roles) {
-        this->publish_role_mask(active_role_mask(refused_roles));
-    }
-
     /// @brief Returns true if `role` is active on this connection, judged on the exact versioned
     /// name this library implements.
     ///
     /// The one activation test in the library: the receive gate, the send gate, the client/state
     /// role objects and role removal all read the mask active_role_mask() builds with the same
     /// exact-version test (role_in()) role removal applies, so none of them can disagree. The
-    /// mask is rebuilt by apply_server_activate() and read atomically, so the receive path may
-    /// call it from the protocol task while the main loop applies an activation; active_roles_
-    /// itself is main-loop-only and must not be walked from there.
+    /// mask is rebuilt by apply_server_activate(). Protocol task only.
     bool is_role_active(SendspinRole role) const {
-        return (this->active_role_mask_.load(std::memory_order_acquire) & role_mask_bit(role)) != 0;
+        return (this->active_role_mask_ & role_mask_bit(role)) != 0;
+    }
+
+    /// @brief The active roles as a bitmask of role_mask_bit() values. Protocol task only.
+    uint16_t get_active_role_mask() const {
+        return this->active_role_mask_;
     }
 
     /// @brief Returns true if the given activity is in the current activity set.
@@ -694,9 +600,7 @@ public:
     /// (sticky: a nullopt active_roles in the message leaves the prior set unchanged). Sets
     /// first_activate_received_ on every call (including after a re-handshake reset it).
     ///
-    /// Main-loop-only: called by ConnectionManager::loop() while applying a deferred
-    /// ServerActivateEvent, never from the protocol task, so activities_/active_roles_ need
-    /// no synchronization of their own.
+    /// Protocol task only: ConnectionManager applies the activation as its message is processed.
     /// @param pairing_method Method from the activation's pairing object (nullopt when absent).
     ///                       Ignored (stored as nullopt) unless `activities` includes PAIRING
     ///                       (spec: "A client ignores this field when activities does not
@@ -708,14 +612,12 @@ public:
                                const std::optional<SendspinPairMethod>& pairing_method,
                                const std::optional<SendspinPairingCodeFormat>& pairing_format) {
         this->activities_ = activities;
-        const uint16_t previous = active_role_mask(this->active_roles_);
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
         }
-        // Republished on every activation, sticky set included, so the mask cannot drift from
-        // active_roles_. Only the roles this activation takes out are withdrawn.
-        this->publish_role_mask(
-            static_cast<uint16_t>(previous & ~active_role_mask(this->active_roles_)));
+        // Rebuilt on every activation, sticky set included, so the mask cannot drift from
+        // active_roles_.
+        this->active_role_mask_ = active_role_mask(this->active_roles_);
         bool has_pairing = false;
         for (const auto& a : activities) {
             if (a == SendspinActivity::PAIRING) {
@@ -725,9 +627,9 @@ public:
         }
         this->pairing_method_ = has_pairing ? pairing_method : std::nullopt;
         this->pairing_format_ = has_pairing ? pairing_format : std::nullopt;
-        this->first_activate_received_.store(true, std::memory_order_release);
+        this->first_activate_received_ = true;
         // activities_ is fresh again, so the post-finalize staleness window is over.
-        this->pairing_finalized_.store(false, std::memory_order_release);
+        this->pairing_finalized_ = false;
     }
 
     // ========================================
@@ -752,12 +654,12 @@ public:
 
     /// @brief Callback invoked when the transport connection is ready for messaging
     /// @param conn Pointer to this connection.
-    /// @note Fired by outbound (client) transports only, once the connect and WebSocket upgrade
-    ///       complete; the manager uses it to start the Noise handshake. Inbound server
-    ///       connections are delivered to the manager already upgraded (their handshake starts at
-    ///       nursery admission) and never fire this.
-    /// @note This can run during an outbound destructor's transport join (see "Event queuing" in
-    ///       connection_manager.h).
+    /// @note Fired by outbound (client) transports only, on the transport thread, once the
+    ///       connect and WebSocket upgrade complete; the manager's callback marks the upgrade and
+    ///       wakes the protocol task, which starts the Noise handshake. Inbound server connections
+    ///       are delivered to the manager already upgraded and never fire this.
+    /// @note This can run during an outbound destructor's transport join, so it must not reach
+    ///       for an owner of the connection.
     std::function<void(SendspinConnection*)> on_connected_cb;
 
     /// @brief Gets the time filter for this connection
@@ -767,7 +669,7 @@ public:
     }
 
     /// @brief Returns a shared reference to this connection's time filter, for ConnectionManager's
-    /// time filter slot (see ConnectionManager::current_time_filter())
+    /// time filter slot (see ConnectionManager::time_filter())
     /// @return The time filter, or nullptr if not initialized.
     std::shared_ptr<SendspinTimeFilter> get_shared_time_filter() const {
         return this->time_filter_;
@@ -786,6 +688,16 @@ public:
     /// can enter a manager slot: ConnectionManager's time filter slot copies this filter at install
     /// and never refreshes it.
     void init_time_filter();
+
+    /// @brief This connection's time burst, which feeds its time filter. Protocol task only: the
+    /// burst sends its client/time frames there and is fed the server/time replies there.
+    SendspinTimeBurst& time_burst() {
+        return this->time_burst_;
+    }
+
+    /// @brief Wakes the protocol task this connection was attached to (attach_inbound()), if any.
+    /// Any thread: the transport calls it to report its WebSocket upgrade (on_connected_cb).
+    void wake_protocol_task() const;
 
     // ========================================
     // Configuration setters (called by hub after receiving server/hello message)
@@ -831,13 +743,8 @@ public:
     void set_noise_handshake_result(const std::string& server_id, PskCategory psk_category,
                                     const std::string& psk_id) {
         this->server_information_.server_id = server_id;
-        this->psk_category_.store(psk_category, std::memory_order_release);
-        {
-            // Held so a concurrent get_psk_id() (the revocation sweep walking the nursery from
-            // the main loop) cannot observe this string mid-assignment.
-            std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
-            this->psk_id_ = psk_id;
-        }
+        this->psk_category_ = psk_category;
+        this->psk_id_ = psk_id;
     }
 
     /// @brief Sets the server hello received flag
@@ -868,8 +775,9 @@ public:
     /// @brief Gives the transport the shared inbound ring an admitted connection receives into
     /// and the protocol task it wakes. Called once, by the connection manager, before the
     /// transport can deliver a message: on the transport's own delivery thread for an inbound
-    /// connection (ahead of its first frame), before start() for an outbound one. A connection
-    /// never given one drops everything it receives.
+    /// connection (ahead of its first frame, before the connection is handed to the protocol
+    /// task), before start() for an outbound one. A connection never given one drops everything
+    /// it receives.
     void attach_inbound(InboundRing* ring, ProtocolTask* task) {
         this->inbound_ring_ = ring;
         this->inbound_task_ = task;
@@ -938,25 +846,6 @@ protected:
     /// hook where the write happens.
     virtual SsErr send_transport_frame(const uint8_t* data, size_t len,
                                        const NoiseTransport::FrameWriteHook& before_write);
-
-    // ========================================
-    // Active-role mask
-    // ========================================
-
-    /// @brief Republishes the active-role mask: clears `withdrawn`, then sets what is applied.
-    ///
-    /// Main-loop only, and the only writer of the mask outside note_activated_roles(). Both steps
-    /// are read-modify-writes because the protocol task ORs a newly arrived activation's roles
-    /// in without waiting for the main loop: a plain store of the applied set would erase the
-    /// bits of an activation that is delivered but not yet applied, and the receive gate would
-    /// then drop exactly the traffic a server sends immediately behind its activate.
-    /// @param withdrawn Bits this step takes back (the roles it removed, or a refusal's roles).
-    void publish_role_mask(uint16_t withdrawn) {
-        this->active_role_mask_.fetch_and(static_cast<uint16_t>(~withdrawn),
-                                          std::memory_order_acq_rel);
-        this->active_role_mask_.fetch_or(active_role_mask(this->active_roles_),
-                                         std::memory_order_acq_rel);
-    }
 
     // ========================================
     // Noise transport helpers (connection.cpp)
@@ -1078,31 +967,7 @@ protected:
     // Noise transport state
     // ========================================
 
-    /// Extent of one held role message within held_messages_.
-    struct HeldMessageExtent {
-        size_t offset{};
-        size_t length{};
-        int64_t arrival_us{};
-    };
-
-    /// Pre-admission hold budgets, covering the burst a server can send between its
-    /// server/activate and the client's next loop() tick: one server/state per role this client
-    /// can carry (player, controller, metadata, artwork, visualizer, color), plus the
-    /// stream/start and group/update that can follow the same activation. The byte budget is
-    /// four steady-state protocol messages' worth (SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE
-    /// is one), which those eight fit comfortably: role state objects run to a few hundred bytes
-    /// each. Whichever budget runs out first, the message is dropped with a warning rather than
-    /// letting an unadmitted peer grow held_messages_ without bound.
-    static constexpr size_t MAX_HELD_MESSAGES = 8;
-    static constexpr size_t MAX_HELD_BYTES = 4 * SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE;
-    static_assert(MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES == 2 * MAX_HELD_BYTES,
-                  "the pre-admission reassembly cap is stated as twice the pre-admission hold "
-                  "budget; keep the two derivations in step");
-
     // Struct fields
-
-    /// Extents of the messages held in held_messages_, in arrival order.
-    std::array<HeldMessageExtent, MAX_HELD_MESSAGES> held_extents_{};
 
     /// The fallback buffer: a pre-admission message, or a multi-frame message being assembled
     /// (see begin_inbound_fragment()). Written by the transport thread; read by the protocol task
@@ -1117,27 +982,26 @@ protected:
     /// reader threads.
     InboundGate inbound_gate_;
 
-    /// Role messages received before admission, replayed in order when the connection is
-    /// admitted. See hold_pre_admission_message().
-    ///
-    /// The buffer is allocated on the first hold and freed by the replay (or with the
-    /// connection), so it costs nothing on a connection that is admitted before the server says
-    /// anything. Worst case is one buffer per live connection, NURSERY_CAPACITY (2) plus the
-    /// current slot, i.e. 24 KB of SPIRAM-preferring heap, held only across the admission window.
-    PlatformBuffer held_messages_;
-
-    /// Encrypted transport: owns the cipher session, its mutex, outbound fragmentation,
-    /// and inbound reassembly. See noise_transport.h for the threading contract.
+    /// Encrypted transport: owns the cipher session, outbound fragmentation, and inbound
+    /// reassembly. Protocol task only; see noise_transport.h.
     NoiseTransport noise_transport_;
 
     /// Server identity: name from server/hello, server_id from the Noise handshake result
-    /// (or re-handshake; unchanged across a re-handshake since it is the same server).
+    /// (or re-handshake; unchanged across a re-handshake since it is the same server). Protocol
+    /// task only; ConnectionManager publishes a copy to other threads at admission.
     ServerInformationObject server_information_{};
+
+    /// The pairing record staged by the attempt in flight, committed by the
+    /// server/pair-finalize handler (nullopt = nothing to store). Protocol task only.
+    std::optional<SendspinPairingRecord> pending_pairing_record_{};
+
+    /// Sends this connection's client/time bursts and feeds its time filter. Protocol task only.
+    SendspinTimeBurst time_burst_{};
 
     // Pointer fields
 
     /// Time synchronization filter (Kalman-based). Shared so role threads can hold it without
-    /// holding this connection (ConnectionManager::current_time_filter()).
+    /// holding this connection (ConnectionManager::time_filter()).
     std::shared_ptr<SendspinTimeFilter> time_filter_;
 
     /// Noise handshake driver (active from connection open until handshake complete).
@@ -1164,22 +1028,14 @@ protected:
 
     // 64-bit fields
 
-    /// Monotonic timestamp (platform_time_us()) when this connection was admitted into a manager
-    /// slot. Atomic because it is written at admission (possibly on a transport thread) and read on
-    /// the main loop (provisional-connection timeout check). 0 = not yet set.
-    std::atomic<int64_t> provisional_time_us_{0};
+    /// Monotonic timestamp (platform_time_us()) when this connection entered the nursery, or
+    /// began its latest re-proving window. Protocol task only. 0 = not yet set.
+    int64_t provisional_time_us_{0};
 
     /// Process-unique connection identity (see get_instance_id()). Assigned once at construction.
     const uint64_t instance_id{next_instance_id()};
 
     // size_t fields
-
-    /// Bytes of held_messages_ in use, against MAX_HELD_BYTES. Protocol task only (the hold and
-    /// the replay both run there).
-    size_t held_bytes_{0};
-
-    /// Messages held in held_extents_, against MAX_HELD_MESSAGES. Protocol task only.
-    size_t held_count_{0};
 
     /// Bytes of fallback_buf_ holding the message being assembled or the pending message. Written
     /// by the transport thread; read by the protocol task while a message is pending.
@@ -1189,7 +1045,7 @@ protected:
 
     /// Low 32 bits of platform_time_us() at the last complete inbound message, or at the start of
     /// one the transport drops (see note_message_completed()). Atomic because it is written on
-    /// the transport thread and read by the main-loop liveness check; 32 bits because it is
+    /// the transport thread and read by the protocol task's liveness check; 32 bits because it is
     /// stored per message and a 64-bit atomic is not lock-free on the ESP32 family.
     std::atomic<uint32_t> last_receive_time_us_{0};
 
@@ -1203,81 +1059,41 @@ protected:
     std::string noise_suite_name_{};
 
     /// psk_id of the PSK matched by the Noise handshake (empty for Sentinel, or when no
-    /// Noise handshake has completed). Written on the protocol task at handshake COMPLETE and
-    /// at every in-band re-handshake; read from both the protocol task and the main loop.
-    /// Never read directly outside this class: go through get_psk_id(), which takes the mutex
-    /// below.
+    /// Noise handshake has completed). Written at handshake COMPLETE and at every in-band
+    /// re-handshake. Protocol task only.
     std::string psk_id_{};
-
-    /// Guards psk_id_. Both writers (set_noise_handshake_result(), handle_noise_rehandshake())
-    /// and the sole reader (get_psk_id()) hold it. Held only around the assignment and the copy,
-    /// never across a send or a callback.
-    mutable std::mutex psk_id_mutex_;
 
     // Vector fields
 
     /// Activities declared by server/activate (empty until the first activate is applied).
-    /// Main-loop-only: see apply_server_activate().
+    /// Protocol task only: see apply_server_activate().
     std::vector<SendspinActivity> activities_{};
 
     /// Active roles declared by server/activate (sticky: preserved across activates that omit
-    /// the field). Empty until the first activate that includes active_roles.
+    /// the field). Empty until the first activate that includes active_roles. Protocol task only.
     std::vector<std::string> active_roles_{};
 
-    /// active_roles_ as a bitmask of the roles this library implements, so the protocol task can
-    /// test a role without reading the vector the main loop rewrites. Written by
-    /// note_activated_roles() on the protocol task and through publish_role_mask() on the main
-    /// loop, never with a plain store (see publish_role_mask()).
-    std::atomic<uint16_t> active_role_mask_{0};
-
     /// Pairing method from the pairing object of the last pairing server/activate; nullopt
-    /// outside a pairing activation. Read by the pairing flow. Written and read on
-    /// the main loop (apply_server_activate runs in ConnectionManager::loop()).
+    /// outside a pairing activation. Read by the pairing flow. Protocol task only.
     std::optional<SendspinPairMethod> pairing_method_{};
 
     /// Emission format from the same pairing object (dynamic_pairing_code only); nullopt outside
-    /// a pairing activation. Same main-loop-only contract as pairing_method_.
+    /// a pairing activation. Protocol task only.
     std::optional<SendspinPairingCodeFormat> pairing_format_{};
 
     // ========================================
     // Pairing state members
     // ========================================
 
-    /// Pairing-code PAKE session (all fields are main-loop-only; no lock needed).
+    /// Pairing-code PAKE session. Protocol task only.
     PairingSession pairing_session_{};
-
-    /// True while a Pairing-PSK exchange is in progress on this connection.
-    /// Written on the main loop (enter/abort) and by the protocol task
-    /// (handle_noise_rehandshake clears it when the re-handshake begins).
-    /// Read on the main loop by ConnectionManager: the re-entry check in process_activate_event()
-    /// and the already-ended checks in handle_pair_abort() / handle_pairing_message().
-    /// Atomic because of the protocol-task write in handle_noise_rehandshake.
-    std::atomic<bool> pairing_in_progress_{false};
-
-    /// True from the moment the server acks server/pair-finalize until fresh activities arrive
-    /// (or pairing state is cleared). In that window the exchange is protocol-complete (the
-    /// record is already stored), but `activities_` still holds the pre-finalize [PAIRING] set,
-    /// because only apply_server_activate() ever rewrites it and the post-finalize activate has
-    /// not arrived yet. Admission consults this so the "in-flight pairing is not displaced" rule
-    /// stops protecting a pairing that has already finished (see should_switch_to_new_server).
-    /// Written on the protocol task (note_pairing_finalize_ack) and the main loop
-    /// (apply_server_activate / clear_pairing_state); read on the main loop. Hence atomic.
-    std::atomic<bool> pairing_finalized_{false};
-
-    /// Pending pairing record to be committed when the server/pair-finalize ack arrives (nullopt
-    /// = nothing to store). Written on the main loop (enter pairing), taken on the
-    /// protocol task (server/pair-finalize handler), cleared on the main loop (abort/leftover).
-    /// A ShadowSlot: latest-wins write, take-and-clear read, single mutex internal to the slot.
-    ShadowSlot<std::optional<SendspinPairingRecord>> pending_pairing_slot_{};
 
     /// Count of pairing server/activate messages received since the last Noise handshake (or
     /// re-handshake) (pairing.md "Pairing index"). Feeds both the wire `pairing_index` field on
     /// client/pair-init and the CPace `sid` (see PairingSession::pairing_index, captured at
     /// handle_enter_pairing() so a later PAKE step reuses the exact value client/pair-init sent).
-    /// Written on the main loop (bump_pairing_index(), each pairing server/activate) and on the
-    /// protocol task (reset_pairing_index(), at handshake/re-handshake completion); atomic for
-    /// that cross-thread reset.
-    std::atomic<uint32_t> pairing_index_{0};
+    /// Protocol task only.
+    uint32_t pairing_index_{0};
 
     /// Tag of the client/time frame in flight: the low 32 bits of the client_transmitted it
     /// carries, never 0 for a frame, and 0 once the frame is claimed or cancelled. A failed send
@@ -1288,6 +1104,12 @@ protected:
     /// Low 32 bits of the client clock when the frame in flight was handed to the socket, seeded
     /// with the tag until the write hook overwrites it on whichever thread performs the write.
     std::atomic<uint32_t> time_frame_sent_us_{0};
+
+    // 16-bit fields
+
+    /// active_roles_ as a bitmask of the roles this library implements (see is_role_active()).
+    /// Rebuilt by apply_server_activate(). Protocol task only.
+    uint16_t active_role_mask_{0};
 
     // 8-bit fields
 
@@ -1301,10 +1123,10 @@ protected:
     ///    server_hello_received_ (once per connection; connection.md "Re-handshake" re-sends
     ///    neither hello), and first_activate_received_, which the server owes again after every
     ///    re-handshake.
-    ///  - Admission: inbound_gate_'s admitted flag, whether this connection occupies the
-    ///    manager's current slot.
+    ///  - Admission: inbound_gate_'s admitted flag, whether this connection occupies one of the
+    ///    manager's admitted slots.
     ///    Orthogonal to proving: an operational nursery loser is never admitted, and a
-    ///    re-handshaking current connection is admitted but not operational.
+    ///    re-handshaking admitted connection is admitted but not operational.
     ///
     /// Each flag's own comment below names its writers and threads. Do not fold them into one
     /// phase enum: client_hello_sent_ and server_hello_received_ complete in either order, and
@@ -1312,29 +1134,36 @@ protected:
     /// from the protocol task. Derive a phase on demand instead, as SetupStage in
     /// connection_manager.cpp does for reap diagnostics.
 
-    /// PSK category resolved by the Noise handshake (set at COMPLETE, or re-handshake).
-    /// Atomic because get_psk_category() is read on the main loop (build_hello_message via the
-    /// hello scan) while the protocol task writes it at COMPLETE / re-handshake.
-    std::atomic<PskCategory> psk_category_{PskCategory::SENTINEL};
+    /// PSK category resolved by the Noise handshake (set at COMPLETE, or re-handshake). Protocol
+    /// task only.
+    PskCategory psk_category_{PskCategory::SENTINEL};
 
-    /// Hello handshake state. Atomic because it is set from the send-completion callback (the httpd
-    /// worker thread on ESP) and the disconnect handlers (transport thread), which only the
-    /// outbound transports install: a dropped inbound connection is torn down, not reused. Read by
-    /// is_handshake_complete() and the pre-hello send gate from other threads.
+    /// True while a pairing exchange is in progress on this connection: set when entering
+    /// pairing, cleared on abort, on a leftover activate and by handle_noise_rehandshake().
+    /// Protocol task only.
+    bool pairing_in_progress_{false};
+
+    /// True from the moment the server acks server/pair-finalize until fresh activities arrive
+    /// (or pairing state is cleared). In that window the exchange is protocol-complete (the
+    /// record is already stored), but `activities_` still holds the pre-finalize [PAIRING] set,
+    /// because only apply_server_activate() ever rewrites it and the post-finalize activate has
+    /// not arrived yet. Admission consults this so the "in-flight pairing is not displaced" rule
+    /// stops protecting a pairing that has already finished (see should_switch_to_new_server).
+    /// Protocol task only.
+    bool pairing_finalized_{false};
+
+    /// Hello handshake state. Set on the protocol task by the hello send's completion, which the
+    /// encrypted send path runs inline, and cleared by the outbound transports' disconnect
+    /// handlers (transport thread). Read by is_handshake_complete() on the protocol task and by the
+    /// ESP server's pre-hello send gate on the httpd worker, hence atomic.
     std::atomic<bool> client_hello_sent_{false};
 
-    /// True once the Noise transport handshake has completed (set on the protocol task,
-    /// read from the main loop via is_noise_handshake_complete()).
-    std::atomic<bool> noise_handshake_complete_{false};
-
-    /// True once a server/activate from this connection reached the dispatch path. Written and
-    /// read on the protocol task only. See note_activate_delivered().
-    std::atomic<bool> activate_delivered_{false};
+    /// True once the Noise transport handshake has completed. Protocol task only.
+    bool noise_handshake_complete_{false};
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
-    /// Written from the transport connected callback (transport thread), read by the manager's
-    /// setup-stage derivation on the main loop and on other threads, hence atomic.
-    /// See mark_ws_upgraded().
+    /// Written from the transport connected callback (transport thread), read by the manager on
+    /// the protocol task, hence atomic. See mark_ws_upgraded().
     std::atomic<bool> ws_upgraded_{false};
 
     /// Throttles the ring-acquire drop warning in route_inbound_message(). Transport thread only.
@@ -1361,15 +1190,13 @@ protected:
     /// Protocol task only.
     bool loss_reported_{false};
 
-    /// Atomic for the same reason as client_hello_sent_: written on transport threads, read from
-    /// the main loop via is_handshake_complete().
+    /// Set by the server/hello handler on the protocol task, cleared by the outbound transports'
+    /// disconnect handlers (transport thread), read on the protocol task; atomic for that clear.
     std::atomic<bool> server_hello_received_{false};
 
-    /// True after the first server/activate message has been received and applied. Atomic
-    /// because re-handshake (protocol task, handle_noise_rehandshake) resets it to false at
-    /// the start of a key rotation, while the main loop reads it via first_activate_received()
-    /// / is_operational() and apply_server_activate() (main-loop-only) sets it back to true.
-    std::atomic<bool> first_activate_received_{false};
+    /// True after the first server/activate message has been received and applied, until a
+    /// re-handshake or a pairing-finalize ack rewinds it. Protocol task only.
+    bool first_activate_received_{false};
 
     /// Memory placement preference for fallback_buf_ (ESP-IDF only).
     MemoryLocation fallback_location_{MemoryLocation::PREFER_EXTERNAL};

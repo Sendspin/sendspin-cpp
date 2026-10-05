@@ -20,6 +20,7 @@
 #include "inbox.h"
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
+#include "teardown_tracker.h"
 
 #include <atomic>
 #include <memory>
@@ -52,7 +53,7 @@ struct ColorRole::Impl {
     // ========================================
 
     struct EventState {
-        InboxSlot<PendingColorStates> slot;
+        GenerationSlot<PendingColorStates> slot;
     };
 
     // ========================================
@@ -71,31 +72,38 @@ struct ColorRole::Impl {
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & INBOX_TOPIC_COLOR) != 0 || this->held_state.has_value();
     }
+    /// @brief Takes the slot, catches the role up on any teardown (complete_teardown()), then
+    /// holds the taken palettes if they were admitted under the current generation and applies
+    /// whichever is due. Main loop.
     void drain_events();
     /// Whether a palette's server-clock deadline has passed on the synchronized client clock.
     bool state_is_due(int64_t timestamp) const;
     /// Applies the held palette and fires the listener once its server-clock deadline has passed.
     void apply_due_state();
-    void handle_cleared_event() const;
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
-    /// The gate in SendspinClient's role dispatch is checked once, on the protocol task, while the
-    /// handler it admits runs on: a teardown on the main loop can land in between (neither a lost
-    /// connection nor a deactivation waits for the protocol task). Re-checking at each point of
-    /// effect invalidates the whole handler instead of only the part that ran before it.
+    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
+    /// runs, and stop()'s teardown on the main loop can land in between. Re-checking at each point
+    /// of effect invalidates the whole handler instead of only the part that ran before it. The
+    /// drain applies the same check to a slot payload's stamp.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
     }
 
-    /// @brief Stops the role and discards its state. Main loop only.
+    /// @brief Stops the role and discards the state the protocol task can reach. Protocol task,
+    /// or the main loop in SendspinClient::stop() once every other thread is joined.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
     /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
-    /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
-    /// the inbox rather than fired here, because both callers run under the connection manager's
-    /// conn_ptr_mutex_.
+    /// from active_roles (SendspinClient::apply_role_removals()). Queues a COLOR_CLEARED event
+    /// stamped with the new generation; the main loop runs complete_teardown() for it
+    /// (catch_up_teardown()).
     void cleanup();
+
+    /// @brief The main-loop teardown half: resets the state only the main loop touches and fires
+    /// on_color_clear(). Main loop only, through catch_up_teardown().
+    void complete_teardown();
 
     // ========================================
     // Fields
@@ -104,8 +112,9 @@ struct ColorRole::Impl {
     // Struct fields
     ServerColorStateObject color{};
     // Palette taken from the inbox slot, awaiting its server-clock deadline. Main-thread only:
-    // written and read exclusively from drain_events()/cleanup() on the loop thread.
+    // written and read exclusively from drain_events()/complete_teardown() on the loop thread.
     std::optional<ServerColorStateObject> held_state;
+    TeardownTracker teardown;  ///< Main loop only.
 
     // Pointer fields
     SendspinClient* client;
@@ -115,7 +124,8 @@ struct ColorRole::Impl {
 
     // 32-bit fields
     /// @brief Teardown generation, bumped by cleanup() and re-checked at every point of effect
-    /// (see accepts()). Atomic because the protocol task reads it.
+    /// (see accepts()). Written on the protocol task (or the main loop in stop() once it is
+    /// joined); read on the main loop.
     std::atomic<uint32_t> cleanup_generation{0};
 };
 

@@ -21,6 +21,7 @@
 #include "inbox.h"
 #include "platform/event_flags.h"
 #include "sendspin/visualizer_role.h"
+#include "teardown_tracker.h"
 
 #include <atomic>
 #include <cstdint>
@@ -115,7 +116,7 @@ struct VisualizerRole::Impl {
     /// @brief Deferred event state for the visualizer stream config, delivered to the main thread
     /// via the shared Inbox
     struct EventState {
-        InboxSlot<ServerVisualizerStreamObject> config_slot;
+        GenerationSlot<ServerVisualizerStreamObject> config_slot;
     };
 
     // ========================================
@@ -142,25 +143,32 @@ struct VisualizerRole::Impl {
     void handle_stream_start(const ServerVisualizerStreamObject& stream, uint32_t generation);
     void handle_stream_end(uint32_t generation);
     void handle_stream_clear(uint32_t generation);
-    void handle_stream_ring_event(VisualizerEventType event) const;
+    /// @brief Fires the listener callback for a current stream event. Main loop.
+    /// @param generation The event's stamp: a STREAM_START applies only the config written with
+    ///        the same stamp.
+    void handle_stream_ring_event(VisualizerEventType event, uint32_t generation) const;
+    /// @brief The main-loop teardown half, which the event drain runs through
+    /// catch_up_teardown() like every role's. The visualizer keeps no main-loop state (its
+    /// stream events carry everything the listener hears, and the STREAM_END cleanup() queues is
+    /// its clear), so there is nothing to reset.
+    void complete_teardown() {}
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
-    /// The gate in SendspinClient's role dispatch is checked once, on the protocol task, while the
-    /// handler it admits runs on: a teardown on the main loop can land in between. Re-checking at
-    /// each point of effect invalidates the whole handler instead of only the part that ran
-    /// before it.
+    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
+    /// runs, and stop()'s teardown on the main loop can land in between. Re-checking at each point
+    /// of effect invalidates the whole handler instead of only the part that ran before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
     }
 
-    /// @brief Stops the role and discards its state. Main loop only.
+    /// @brief Stops the role and discards its state. Protocol task, or the main loop in
+    /// SendspinClient::stop() once every other thread is joined.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
     /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
     /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
-    /// the inbox rather than fired here, because both callers run under the connection manager's
-    /// conn_ptr_mutex_.
+    /// the inbox, stamped with the new generation.
     void cleanup();
 
     // ========================================
@@ -209,6 +217,8 @@ struct VisualizerRole::Impl {
     Inbox* inbox{nullptr};
     VisualizerRoleListener* listener{nullptr};
 
+    TeardownTracker teardown;  ///< Main loop only.
+
     /// Throttles the over-quota drop warning in hand_item(). Protocol task only.
     InboundDropLog over_quota_log;
     /// Throttles the warning for a frame that could not be copied into a ring item. Protocol task
@@ -221,10 +231,11 @@ struct VisualizerRole::Impl {
     uint32_t recalled_generation{0};
 
     // Atomic fields (written by the protocol task, read by drain thread / cleanup)
-    /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event queued
-    /// afterwards. At the drain an event whose stamp no longer matches is discarded, so it cannot
-    /// act after the teardown (see event_is_current() in inbox.h). Atomic because the protocol
-    /// task reads it (see accepts()).
+    /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event, config
+    /// payload and handed-over item queued afterwards. At the drain an event whose stamp no longer
+    /// matches is discarded, so it cannot act after the teardown (see event_is_current() in
+    /// inbox.h). Written on the protocol task (or the main loop in stop() once it is joined);
+    /// read on the main loop, the drain thread and the protocol task.
     std::atomic<uint32_t> cleanup_generation{0};
 
     std::atomic<uint8_t> spectrum_bin_count{0};
@@ -233,7 +244,7 @@ struct VisualizerRole::Impl {
     // Bitmask of negotiated wire types, bit N = wire type SENDSPIN_BINARY_VISUALIZER_FIRST + N.
     // Written by handle_stream_start and read by handle_binary on the same protocol task, so
     // admission is always judged against the config in force when a message arrives; atomic only
-    // because cleanup() clears it from the main thread.
+    // because stop() runs cleanup() on the main loop once the protocol task is joined.
     std::atomic<uint8_t> negotiated_types_mask{0};
 };
 

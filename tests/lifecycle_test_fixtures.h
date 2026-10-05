@@ -213,14 +213,10 @@ public:
         return *this->client_;
     }
 
-    /// Starts the client and ticks loop() once, which binds the WS server synchronously, so a
-    /// fake server may connect as soon as this returns.
+    /// Starts the client, which binds the WS server before it returns (the network provider
+    /// reports ready), so a fake server may connect as soon as this returns.
     bool start() {
-        if (!this->client_->start()) {
-            return false;
-        }
-        this->client_->loop();
-        return true;
+        return this->client_->start();
     }
 
     PairedPeer peer;
@@ -434,8 +430,8 @@ protected:
 
     // Guards every field below: the concrete subclass's message handlers run on IXWebSocket's own
     // thread(s), while the test thread may call into subclass methods (trigger_rehandshake,
-    // send_tampered_frame, etc.) concurrently. Mirrors NoiseTransport::session_mutex_'s role in
-    // the production responder.
+    // send_tampered_frame, etc.) concurrently. The production responder needs no such lock: every
+    // use of its session runs on the protocol task.
     mutable std::mutex crypto_mutex_;
     std::array<uint8_t, X25519_KEY_SIZE> client_pubkey_{};
     std::string client_init_text_;
@@ -553,6 +549,12 @@ public:
 
     int activate_count() const {
         return this->activate_count_.load();
+    }
+
+    /// client_state_count() when the most recent server/activate was sent: a client/state counted
+    /// beyond it was sent in answer to that activation or later.
+    int client_states_at_last_activate() const {
+        return this->client_states_at_last_activate_.load();
     }
 
     /// The keys of supported_pair_methods from the most recent client/hello, in wire order.
@@ -934,6 +936,7 @@ private:
     // client/hello, the second_* options for every one after a re-handshake. Caller must hold
     // crypto_mutex_.
     void send_activate_locked() {
+        this->client_states_at_last_activate_.store(this->client_state_count_.load());
         const bool first = this->activate_count_.fetch_add(1) == 0;
         const std::string& activities = first ? this->options_.first_activities_json
                                               : this->options_.second_activities_json;
@@ -980,6 +983,7 @@ private:
 
     std::atomic<int> client_leave_count_{0};
     std::atomic<int> client_state_count_{0};
+    std::atomic<int> client_states_at_last_activate_{0};
     std::atomic<bool> got_client_time_{false};
 };
 

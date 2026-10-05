@@ -29,15 +29,11 @@ static const char* const TAG = "sendspin.noise_transport";
 // ============================================================================
 
 void NoiseTransport::activate(std::unique_ptr<NoiseSession> session) {
-    {
-        std::lock_guard<std::mutex> lock(this->session_mutex_);
-        this->session_ = std::move(session);
-    }
-    this->active_.store(true, std::memory_order_release);
+    this->session_ = std::move(session);
+    this->active_ = true;
 }
 
 std::optional<std::array<uint8_t, 32>> NoiseTransport::handshake_hash() const {
-    std::lock_guard<std::mutex> lock(this->session_mutex_);
     if (!this->session_) {
         return std::nullopt;
     }
@@ -48,9 +44,9 @@ std::optional<std::array<uint8_t, 32>> NoiseTransport::handshake_hash() const {
 // Outbound (encrypt + send)
 // ============================================================================
 
-SsErr NoiseTransport::encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity,
-                                                    size_t plaintext_len,
-                                                    const FrameWriteHook& before_write) {
+SsErr NoiseTransport::encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity,
+                                             size_t plaintext_len,
+                                             const FrameWriteHook& before_write) {
     if (!this->session_) {
         return SsErr::INVALID_STATE;
     }
@@ -74,9 +70,8 @@ SsErr NoiseTransport::encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_cap
     return this->frame_sink_(buf, ct_len, before_write);
 }
 
-SsErr NoiseTransport::fragment_and_send_locked(uint8_t orig_type, const uint8_t* data,
-                                               size_t data_len,
-                                               const FrameWriteHook& before_write) {
+SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, size_t data_len,
+                                        const FrameWriteHook& before_write) {
     const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_FIRST_HEADER_SIZE;
     const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_CONT_HEADER_SIZE;
 
@@ -97,9 +92,8 @@ SsErr NoiseTransport::fragment_and_send_locked(uint8_t orig_type, const uint8_t*
     size_t first_frame_len = FRAGMENT_FIRST_HEADER_SIZE + first_chunk;
 
     const bool first_is_last = (first_chunk == data_len);
-    SsErr err =
-        this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), first_frame_len,
-                                            first_is_last ? before_write : nullptr);
+    SsErr err = this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), first_frame_len,
+                                             first_is_last ? before_write : nullptr);
     if (err != SsErr::OK) {
         return err;
     }
@@ -115,8 +109,8 @@ SsErr NoiseTransport::fragment_and_send_locked(uint8_t orig_type, const uint8_t*
         std::memcpy(frame_buf.data() + FRAGMENT_CONT_HEADER_SIZE, data + offset, chunk);
         size_t cont_frame_len = FRAGMENT_CONT_HEADER_SIZE + chunk;
 
-        err = this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(),
-                                                  cont_frame_len, is_last ? before_write : nullptr);
+        err = this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), cont_frame_len,
+                                           is_last ? before_write : nullptr);
         if (err != SsErr::OK) {
             return err;
         }
@@ -126,9 +120,9 @@ SsErr NoiseTransport::fragment_and_send_locked(uint8_t orig_type, const uint8_t*
     return SsErr::OK;
 }
 
-SsErr NoiseTransport::fill_and_encrypt_locked(const uint8_t* prefix, size_t prefix_len,
-                                              const uint8_t* data, size_t data_len,
-                                              const FrameWriteHook& before_write) {
+SsErr NoiseTransport::fill_and_encrypt(const uint8_t* prefix, size_t prefix_len,
+                                       const uint8_t* data, size_t data_len,
+                                       const FrameWriteHook& before_write) {
     const size_t plaintext_len = prefix_len + data_len;
     if (!this->ensure_send_buf(plaintext_len + 16)) {
         return SsErr::FAIL;
@@ -137,8 +131,8 @@ SsErr NoiseTransport::fill_and_encrypt_locked(const uint8_t* prefix, size_t pref
         std::memcpy(this->send_buf_.data(), prefix, prefix_len);
     }
     std::memcpy(this->send_buf_.data() + prefix_len, data, data_len);
-    return this->encrypt_and_send_frame_locked(this->send_buf_.data(), this->send_buf_.size(),
-                                               plaintext_len, before_write);
+    return this->encrypt_and_send_frame(this->send_buf_.data(), this->send_buf_.size(),
+                                        plaintext_len, before_write);
 }
 
 SsErr NoiseTransport::send_json(const char* json, size_t len, const FrameWriteHook& before_write) {
@@ -150,20 +144,15 @@ SsErr NoiseTransport::send_json(const char* json, size_t len, const FrameWriteHo
     const size_t plaintext_len = 1 + len;
 
     if (plaintext_len <= MAX_TRANSPORT_PLAINTEXT) {
-        // Locked for fill + encrypt + send, not just encrypt + send: send_buf_ is a shared
-        // member, so the whole read/write window over it must stay inside the critical
-        // section (see send_buf_'s doc comment).
-        std::lock_guard<std::mutex> lock(this->session_mutex_);
         const uint8_t prefix = MSG_TYPE_JSON_BODY;
-        return this->fill_and_encrypt_locked(&prefix, 1, reinterpret_cast<const uint8_t*>(json),
-                                             len, before_write);
+        return this->fill_and_encrypt(&prefix, 1, reinterpret_cast<const uint8_t*>(json), len,
+                                      before_write);
     }
 
     // Need fragmentation. Rare (large messages only) and larger than send_buf_'s cap, so
-    // fragment_and_send_locked() allocates its own frame buffer instead.
-    std::lock_guard<std::mutex> lock(this->session_mutex_);
-    return this->fragment_and_send_locked(
-        MSG_TYPE_JSON_BODY, reinterpret_cast<const uint8_t*>(json), len, before_write);
+    // fragment_and_send() allocates its own frame buffer instead.
+    return this->fragment_and_send(MSG_TYPE_JSON_BODY, reinterpret_cast<const uint8_t*>(json), len,
+                                   before_write);
 }
 
 SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
@@ -181,21 +170,16 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
     }
 
     if (len <= MAX_TRANSPORT_PLAINTEXT) {
-        std::lock_guard<std::mutex> lock(this->session_mutex_);
-        return this->fill_and_encrypt_locked(nullptr, 0, data, len, nullptr);
+        return this->fill_and_encrypt(nullptr, 0, data, len, nullptr);
     }
 
-    std::lock_guard<std::mutex> lock(this->session_mutex_);
-    return this->fragment_and_send_locked(data[0], data + 1, len - 1, nullptr);
+    return this->fragment_and_send(data[0], data + 1, len - 1, nullptr);
 }
 
 SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
                                          std::unique_ptr<NoiseSession> next_session) {
-    // One locked region for "send msg2 under the OLD session, then swap to the new session"
-    // so a concurrent encrypt on another thread cannot interleave between the two. This also
-    // covers the send_buf_ fill (see send_buf_'s doc comment).
-    std::lock_guard<std::mutex> lock(this->session_mutex_);
-
+    // msg2 goes out under the OLD session, then the session swaps. Every send runs on the
+    // protocol task, as this does, so no encrypt can fall between the two.
     const size_t plaintext_len = 1 + msg2_text.size();
     if (plaintext_len > MAX_TRANSPORT_PLAINTEXT) {
         // The handshake msg2 JSON is never expected to approach this size; reject rather than
@@ -205,7 +189,7 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
     }
 
     const uint8_t prefix = MSG_TYPE_JSON_BODY;
-    SsErr err = this->fill_and_encrypt_locked(
+    SsErr err = this->fill_and_encrypt(
         &prefix, 1, reinterpret_cast<const uint8_t*>(msg2_text.data()), msg2_text.size(), nullptr);
     if (err != SsErr::OK) {
         SS_LOGE(TAG, "send_msg2_and_swap: failed to send encrypted msg2 (err=%d)",
@@ -213,9 +197,8 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
         return err;
     }
 
-    // Swap to the new session. After this line, all subsequent inbound decrypt (protocol
-    // task, sequential with this call) uses the new session, and all subsequent encrypt
-    // (once the lock is released) uses the new session too.
+    // Swap to the new session. After this line every decrypt and every encrypt, all on the
+    // protocol task, uses the new session.
     this->session_ = std::move(next_session);
     return SsErr::OK;
 }
@@ -225,7 +208,7 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
 // ============================================================================
 
 size_t NoiseTransport::decrypt_in_place(uint8_t* ciphertext, size_t len) {
-    // Protocol task only; unlocked by design (see the file comment).
+    // Protocol task only, like every use of the session (see the file comment).
     if (!this->session_) {
         return 0;
     }
@@ -234,7 +217,7 @@ size_t NoiseTransport::decrypt_in_place(uint8_t* ciphertext, size_t len) {
 
 NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaintext, size_t len,
                                                                  bool admitted) {
-    // Protocol task only (reassembly state is unlocked).
+    // Protocol task only.
     if (len == 0) {
         SS_LOGW(TAG, "accept_plaintext: empty plaintext");
         return {};
@@ -330,8 +313,8 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
     if (!this->reasm_discarding_) {
         // Before admission every peer on the network can reach this path with nothing but the
         // Sentinel PSK, and nothing that legitimately arrives then approaches the tighter cap
-        // (the pre-admission JSON hold budget, MAX_HELD_BYTES, is half of it), so that cap
-        // applies until the connection wins the admitted slot.
+        // (see MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES), so that cap applies until the
+        // connection wins an admitted slot.
         const size_t cap = reasm_cap(admitted);
         if (this->reasm_len_ - 1 + data_len > cap) {
             SS_LOGW(TAG, "fragmented message exceeds %zu bytes; discarding the rest of it", cap);

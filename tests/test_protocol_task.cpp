@@ -146,9 +146,11 @@ TEST(ProtocolTaskState, SlotKeepsOnlyTheNewestSnapshot) {
     EXPECT_FALSE(task.take_state(out));
 }
 
-// stop() drops every command the task left queued, and the leases they carry go back to their
-// owner. The tick never takes a command, so only stop()'s drain can release them.
-TEST(ProtocolTaskCommands, StopReleasesTheLeasesOfCommandsLeftQueued) {
+// stop() leaves the commands the final tick did not take queued for the joining thread, which
+// takes them (an accept refused after the join) or drops them, and the leases they carry go back
+// to their owner on the drop. The state snapshot describes a run that is over, so stop() drops it.
+// The tick never takes a command, so only the joining thread can release them.
+TEST(ProtocolTaskCommands, StopLeavesQueuedCommandsForTheJoiningThread) {
     ProtocolTask task(MAX_CONNECTIONS);
     LeaseOwner owner;
     ASSERT_TRUE(task.start([] { return ProtocolTask::NO_DEADLINE; }, TEST_STACK, TEST_PRIORITY,
@@ -159,14 +161,20 @@ TEST(ProtocolTaskCommands, StopReleasesTheLeasesOfCommandsLeftQueued) {
         ASSERT_TRUE(task.push_command(std::move(command)));
     }
     task.publish_state(ClientStateMessage{});
-    EXPECT_EQ(owner.released.load(), 0);
     task.stop();
     EXPECT_FALSE(task.is_running());
-    EXPECT_EQ(owner.released.load(), 3);
-    ProtocolCommand out;
-    EXPECT_FALSE(task.take_command(out));
+    EXPECT_EQ(owner.released.load(), 0) << "stop() released a command the joining thread owns";
     ClientStateMessage state;
-    EXPECT_FALSE(task.take_state(state));
+    EXPECT_FALSE(task.take_state(state)) << "the snapshot outlived the run";
+
+    // The joining thread takes one, then drops the rest.
+    ProtocolCommand out;
+    ASSERT_TRUE(task.take_command(out));
+    out.lease.reset();
+    EXPECT_EQ(owner.released.load(), 1);
+    task.drop_commands();
+    EXPECT_EQ(owner.released.load(), 3);
+    EXPECT_FALSE(task.take_command(out));
 }
 
 // A command pushed from another thread reaches the running task, which takes it inside its tick.

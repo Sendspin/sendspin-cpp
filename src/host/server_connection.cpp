@@ -40,10 +40,6 @@ void SendspinServerConnection::start() {
     // Open event, so the transport is already established and upgraded by the time it exists.
 }
 
-void SendspinServerConnection::loop() {
-    // Time message sending is handled by the hub
-}
-
 void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
                                           std::function<void()> on_complete) {
     if (!this->is_connected()) {

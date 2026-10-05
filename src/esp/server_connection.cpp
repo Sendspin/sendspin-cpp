@@ -97,10 +97,6 @@ void SendspinServerConnection::start() {
     // Time filter is initialized by the hub when it sets up the connection.
 }
 
-void SendspinServerConnection::loop() {
-    // Time message sending is handled by the hub
-}
-
 void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
                                           std::function<void()> on_complete) {
     if (!this->is_connected()) {
@@ -124,9 +120,8 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
             self->trigger_close();
         }
 
-        // Invoke user-provided completion callback if provided.
-        // Already running in httpd worker thread context (async_send_frame),
-        // so caller should use defer() if they need main loop context
+        // Invoke the caller's completion callback, if any, on the httpd worker thread
+        // (async_send_frame); it must be safe there, as the GoodbyeWait completion is.
         if (on_complete) {
             on_complete();
         }
@@ -242,7 +237,9 @@ void SendspinServerConnection::trigger_close() {
     // wrong peer. A residual instruction-scale TOCTOU remains (the session could close between
     // this check and the call below); eliminating it entirely would need an identity check on
     // the httpd task itself, which is not worth the extra queue hop for a close-time race.
-    if (!this->is_connected()) {
+    // Idempotent: httpd_sess_trigger_close() queues a close against the session slot, so a second
+    // one queued before the first runs could close a session accepted onto that slot meanwhile.
+    if (!this->is_connected() || this->close_triggered_.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
     httpd_sess_trigger_close(this->server_, this->sockfd_);

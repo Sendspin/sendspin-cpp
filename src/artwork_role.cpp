@@ -290,7 +290,9 @@ SendspinImageFormat ArtworkRole::Impl::image_format(uint8_t slot) const {
 }
 
 void ArtworkRole::Impl::enqueue_notification(const ArtworkNotification& notif) const {
-    if (!this->drain_task->notify_queue.send(notif, 0)) {
+    ArtworkNotification stamped = notif;
+    stamped.teardown_generation = this->cleanup_generation.load(std::memory_order_acquire);
+    if (!this->drain_task->notify_queue.send(stamped, 0)) {
         SS_LOGW(TAG, "Artwork notify queue full; dropping %s for slot %u",
                 notif.data_length > 0 ? "image" : "clear", notif.slot);
     }
@@ -335,7 +337,8 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
     // clears a channel. There are no bytes to stage, so no buffer is claimed and the notification
     // travels with data_length == 0 (see ArtworkNotification).
     if (total_size == 0) {
-        complete = ArtworkNotification{slot, 0, 0, timestamp, this->image_format(slot), 0, epoch};
+        complete =
+            ArtworkNotification{slot, 0, 0, timestamp, this->image_format(slot), 0, epoch, 0};
         return TransferOutcome::COMPLETED;
     }
 
@@ -435,7 +438,8 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::append_part(uint8_t slot, 
                                    t.timestamp,
                                    this->image_format(slot),
                                    t.generation,
-                                   this->slot_epochs[slot].load(std::memory_order_relaxed)};
+                                   this->slot_epochs[slot].load(std::memory_order_relaxed),
+                                   0};
     t = ArtworkTransfer{};
     return discarding ? TransferOutcome::ACCEPTED : TransferOutcome::COMPLETED;
 }
@@ -555,8 +559,8 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         // notification still queued for them stale to the decode thread.
         //
         // The comparison and the store of the new array are inside the lock because
-        // streamed_channels is also cleared by cleanup(), which the main loop runs on a live
-        // connection when a server/activate removes the artwork role.
+        // streamed_channels is also cleared by cleanup(), which stop() runs on the main loop and
+        // the decode thread's slot reads share.
         //
         // A transfer in flight ends here only if its channel changed; the server cancels those
         // first (roles/artwork/v1.md "Artwork (Binary)"), and one on an unchanged channel
@@ -685,13 +689,25 @@ void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
 
 void ArtworkRole::Impl::drain_events() {
     // Fold any newly published display update into the main-thread holds. Latest-wins per
-    // artwork slot, same as the old per-slot ShadowSlot overwrite: a bit set in valid_mask means
+    // artwork slot: a bit set in valid_mask means
     // timestamps[i] is a fresher pending display than whatever (if anything) slot i already
     // held. Any STREAM_END for this tick has already run via
     // handle_stream_ring_event() before this call (see the comment there), so a lifecycle event
     // arriving this tick has already cleared held_display_mask before we get here.
+    //
+    // Taken before the catch-up, like every slot role's drain: a teardown that ran before the
+    // take is caught up below (dropping the holds) and drops a display decoded before it; one
+    // that runs after the take is caught up by the next drain.
     ArtworkDisplayUpdate update{};
-    if (this->event_state->display_slot.take(update)) {
+    uint32_t stamp = 0;
+    bool have_update = this->event_state->display_slot.take(update, stamp);
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
+    catch_up_teardown(*this, generation);
+    if (have_update && stamp != generation) {
+        SS_LOGD(TAG, "Dropping artwork displays decoded before the role was torn down");
+        have_update = false;
+    }
+    if (have_update) {
         for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
             const uint8_t bit = static_cast<uint8_t>(1U << slot);
             if (update.valid_mask & bit) {
@@ -782,11 +798,43 @@ void ArtworkRole::Impl::drain_events() {
                 this->listener->on_image_display(slot, display_lateness_ms(client_ts, overdue_us));
             }
         }
+        // The callback may re-enter teardown (a listener calling stop()), whose own drain already
+        // dropped the holds.
+        if (!this->accepts(generation)) {
+            return;
+        }
+    }
+}
+
+void ArtworkRole::Impl::complete_teardown() {
+    // A dropped hold is a decode whose display will never fire, so its ack gate is released
+    // exactly as the epoch-mismatch drop in drain_events() releases it: DECODE_DELIVERED back to
+    // IDLE, and the decode thread woken for a notification parked behind it. PRESENTED is left
+    // armed: that delivery reached the listener and still owes its frame_done().
+    const uint8_t dropped = this->held_display_mask;
+    this->held_display_mask = 0;
+    this->held_display_clear = 0;
+    bool should_wake = false;
+    {
+        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+            if ((dropped & (1U << slot)) == 0 || !this->ack_enabled(slot)) {
+                continue;
+            }
+            auto& sb = this->drain_task->slot_buffers[slot];
+            if (sb.ack_state == SlotAckState::DECODE_DELIVERED) {
+                sb.ack_state = SlotAckState::IDLE;
+            }
+            should_wake |= sb.has_parked;
+        }
+    }
+    if (should_wake) {
+        this->wake_drain_thread();
     }
 }
 
 // ============================================================================
-// Cleanup (main thread)
+// Cleanup (protocol task, or the main loop in stop() once it is joined)
 // ============================================================================
 
 void ArtworkRole::Impl::cleanup() {
@@ -802,9 +850,10 @@ void ArtworkRole::Impl::cleanup() {
     // SendspinClient::cleanup_connection_state()'s inbox.reset_events() has already wiped them,
     // and on the deactivation path, which leaves the ring alone for the roles that stay active,
     // they carry the generation this teardown just left behind and the drain discards them (see
-    // event_is_current()).
-    this->held_display_mask = 0;
-    this->held_display_clear = 0;
+    // event_is_current()). The main-loop display holds are dropped by complete_teardown(), which
+    // the drain runs for this generation before it acts on the STREAM_END below or folds in a
+    // display stamped with it, and a hold is also dropped by its slot-epoch check, which
+    // discard_all_pending() just bumped.
     this->event_state->display_slot.reset();
 
     // discard_all_pending() bumped every slot epoch, so no transfer is in flight and nothing
@@ -929,7 +978,8 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
         if (is_clear) {
             delta.clear_mask = static_cast<uint8_t>(1U << slot);
         }
-        this->event_state->display_slot.merge(merge_artwork_display_update, delta);
+        this->event_state->display_slot.merge(merge_artwork_display_update, delta,
+                                              notif.teardown_generation);
     }
 }
 

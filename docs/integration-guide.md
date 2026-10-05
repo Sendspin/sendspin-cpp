@@ -461,6 +461,11 @@ struct HostNetworkProvider : SendspinNetworkProvider {
 };
 ```
 
+`is_network_ready()` is called from any thread: from `start()` on the main loop, then from the
+library's protocol task, which polls it about once a second while the WebSocket server is down.
+Keep it cheap and non-blocking (a read of a flag the platform keeps current), and do not call
+back into the client from it.
+
 ### SendspinPersistenceProvider (Optional)
 
 Allows the library to persist state across reboots. Required for stable identity and
@@ -485,12 +490,13 @@ below; a provider never needs to parse or interpret the bytes, only store and re
 byte-for-byte.
 
 Every method is invoked on the main loop thread, for every key, so a provider needs no locking
-of its own. (The one library write that originates on the protocol task, the pairing record
-committed when a pairing finalizes, is staged internally and flushed to that record's slot key
-from the next `loop()` tick.)
-No internal library lock is held across the call, so a slow write does not stall the audio path
-or a Noise handshake -- but it does stop the main loop for its duration, so the call must be one
-bounded storage operation, and it must not call back into the client.
+of its own. (A persisted change decided on the protocol task, such as the pairing record
+committed when a pairing finalizes, an unpair, or a playback handoff, is staged internally and
+written from the next `loop()` call.)
+No internal library lock is held across the call, so a slow write does not stall the audio path,
+a Noise handshake or any other connection work -- but it does stop the main loop for its
+duration, so the call must be one bounded storage operation, and it must not call back into the
+client.
 Provisioning writes from inside `start()` rather than in response to a runtime event:
 `save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored, and
 `save_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored and none is
@@ -711,8 +717,8 @@ client.set_persistence_provider(&persistence_provider); // Optional
 ## Step 6: Start and Run
 
 ```cpp
-// Start the role threads and arm the WebSocket server (it comes up on the first loop() tick
-// after the network provider reports ready).
+// Start the role threads and the protocol task, and arm the WebSocket server (it listens before
+// start() returns when the network provider already reports ready, otherwise as soon as it does).
 // Task priorities and PSRAM settings are taken from SendspinClientConfig.
 if (!client.start()) {
     // Handle failure
@@ -723,7 +729,8 @@ if (!client.start()) {
 // Without this, the client waits for incoming server connections.
 client.connect_to("ws://192.168.1.10:8928/sendspin");
 
-// Main loop: call loop() periodically to process events.
+// Main loop: call loop() periodically to deliver callbacks. Connection work runs on the library's
+// protocol task and does not wait for it.
 while (running) {
     client.loop();
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -742,14 +749,14 @@ Restarting is `start()` again; start, stop, and start again can be repeated inde
 `stop()` may block, but the wait is bounded. Besides the goodbye bound it includes:
 
 - The transports' own close. The host server joins every accepted connection thread; a WebSocket peer completes its close handshake within about 300 ms, but a raw socket that connected and never completed the upgrade holds the join for the full 3 s handshake timeout. The ESP server waits for the httpd task to exit, which polls at 100 ms and first finishes any queued send, which can take up to httpd's send timeout for a peer that has stopped reading.
-- An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`).
+- An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`) and, for a connection whose upgrade is still in flight, can last up to the transport's connect and handshake timeout: 30 s on host (`SendspinClientConnection::HANDSHAKE_TIMEOUT_SECS`, the nursery's establish window), and esp_websocket_client's `network_timeout_ms` on ESP (its 10 s default; the library does not set it).
 - A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
 
 A pairing attempt in flight is cut short the same way: `on_clear_pairing_code()` and `on_close_pairing_window()` fire from inside `stop()` for a prompt that was still showing, and every provider write still owed (a long-term record a `server/pair-finalize` had just committed, for example) is performed before `stop()` returns. The identity and record store survive the stop, so a restarted client keeps its `client_id`, its pairing token, and every record.
 
 Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
 
-`on_request_high_performance()` and `on_release_high_performance()` fire from the main loop with no internal lock held, and their bodies should only toggle the platform networking mode rather than calling back into the client or a role.
+`on_request_high_performance()` and `on_release_high_performance()` fire from the main loop with no internal lock held, and their bodies should only toggle the platform networking mode rather than calling back into the client or a role. A time burst waits for the request to have been delivered before it sends its first time message, so a main loop that stalls delays the next clock measurement rather than measuring it in power-save mode; a release is never delayed that way.
 
 Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no role teardown or clear callback; the only listener call is `on_release_high_performance()` for a hold still outstanding. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
 
@@ -932,8 +939,8 @@ client.set_unpaired_access_enabled(true);
 bool on = client.is_unpaired_access_enabled();
 ```
 
-The call is main-loop only and works at any time, before the first `start()` and while stopped
-included; the next `start()` advertises and admits against the value it left.
+The call may be made from any thread and works at any time, before the first `start()` and while
+stopped included; the next `start()` advertises and admits against the value it left.
 
 The library never persists the setting. An application that keeps it across reboots stores it
 and restores it by calling `set_unpaired_access_enabled()` before `start()`, so the first
@@ -988,7 +995,7 @@ controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .o
 
 Fields that do not match the command are ignored when the message is serialized. The client drops, with a warning, a command missing from the latest controller state's `supported_commands`, and one without the field it requires (`volume` in 0-100, `muted`, `position_ms`, `offset_ms`); gate your UI on `supported_commands` so such calls are not made. The server clamps seeks to the seekable range.
 
-A command is sent only while the server has `controller@v1` among the connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. That gate lives in `SendspinClient::send_text()`, which every role-originated message goes through and which therefore takes the role family (`"controller"`) alongside the message; the client's own messages do not use it.
+A command is sent only to the admitted connection that owns the controller role, and only while the server has `controller@v1` among that connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. Every role-originated message goes through `SendspinClient::send_text()`, which therefore takes the role family (`"controller"`) alongside the message; the client's own messages do not use it. It queues the message to the protocol task, which applies the gate and sends it, and returns `false` when the request never reached the task: the client is not running, the family names no role, or the request queue is full. `send_command()` returns that same result, and `false` as well for a command it drops itself (not in `supported_commands`, or a missing parameter). The queue holds a small fixed burst of consumer requests (eight, shared with `connect_to()`, `disconnect()`, `leave()`, the pairing-window gestures and unpaired-access changes), so a control that fires faster than the protocol task drains it, such as a rotary encoder sending a volume step per detent, sees `send_command()` return `false` and should coalesce and retry. A `false` for an unsupported command or a missing parameter is not one a retry can fix: retry only on a full queue, and gate the UI on `supported_commands` for the rest. `true` means queued, not sent.
 
 ## Accessing Roles
 
@@ -1048,7 +1055,8 @@ the server may still take the client over for new playback.
 
 Leaving is only meaningful while the group is playing; a client in a stopped group keeps its
 grouping by staying. The call needs an admitted connection that has received its first
-`server/activate`, and is ignored (with a log) otherwise. Call it from the main loop thread.
+`server/activate`, and is ignored (with a log) otherwise. It may be called from any thread: the
+request is queued to the protocol task.
 
 ### Reporting Unavailability
 
@@ -1097,6 +1105,10 @@ int64_t client_ts = client.get_client_time(server_timestamp);
 
 ## Thread Safety Summary
 
+The library runs its connection work on its own protocol task (`SsProto`): every handshake,
+admission, pairing exchange, time sync, watchdog and send. `loop()` only delivers what that task
+and the role threads produced, so a slow main loop delays callbacks but not connections.
+
 Most listener callbacks fire on the main loop thread (the thread calling `client.loop()`). The exceptions are:
 
 | Callback | Thread |
@@ -1114,10 +1126,19 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 `ArtworkRole::frame_done()` must be called from the main loop thread (typically from inside `on_image_display()`/`on_image_clear()` or when a cross-fade animation completes).
 
 `SendspinPersistenceProvider` calls are on the main loop thread for every key (see the
-`SendspinPersistenceProvider` section above).
+`SendspinPersistenceProvider` section above). `SendspinNetworkProvider::is_network_ready()` is
+called from any thread and must be cheap and non-blocking.
 
-The pairing exchange (CPace and SHA-512) also runs on the thread that calls `loop()`, so that
-thread's stack has to carry the deepest crypto frame, not just the listener callbacks.
+Callable from any thread: `connect_to()`, `disconnect()`, `leave()`, `send_text()`,
+`confirm_pairing_window()`, `cancel_pairing_window()`, `set_unpaired_access_enabled()` and the
+getters `is_started()`, `is_connected()`, `is_time_synced()`, `get_client_time()`,
+`get_server_information()`, `get_current_trust()` and `is_unpaired_access_enabled()`. The
+requests are queued to the protocol task and take effect on its next tick; the getters read
+what that task last published. Everything else (`start()`, `stop()`, `loop()`, the setters and
+role registration) belongs to the main loop.
+
+The pairing exchange (CPace and SHA-512) runs on the protocol task with the Noise handshakes, so
+`protocol_task_stack_size` has to carry the deepest crypto frame.
 
 ## Minimal Example
 
@@ -1249,7 +1270,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `websocket_stack_size` | `size_t` | `8192` | esp_websocket_client task stack size in bytes (ESP-IDF only), the outbound connection's transport task. Values below the default are clamped up to it with a warning, as for `httpd_stack_size`. Raising it is allowed. |
 | `protocol_task_psram_stack` | `bool` | `false` | Allocate the protocol task (`SsProto`) stack in PSRAM (ESP-IDF only) |
 | `protocol_task_priority` | `unsigned` | `5` | FreeRTOS priority for the protocol task (ESP-IDF only). Defaults to the httpd task's priority, below the player's sync task. |
-| `protocol_task_stack_size` | `size_t` | `8192` | Protocol task stack size in bytes (ESP-IDF only). Every Noise handshake (including the in-band re-handshake after pairing, with its X25519 crypto), the JSON parse and the role handlers run on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
+| `protocol_task_stack_size` | `size_t` | `8192` | Protocol task stack size in bytes (ESP-IDF only). Every Noise handshake (including the in-band re-handshake after pairing, with its X25519 crypto), the pairing exchange (CPace and SHA-512), the JSON parse and the role handlers run on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
 | `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye) |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |

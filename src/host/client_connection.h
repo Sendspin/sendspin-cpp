@@ -35,11 +35,22 @@ namespace sendspin {
  * @brief Outbound WebSocket connection to a Sendspin server (host build, IXWebSocket)
  *
  * Connects to a server URL and hands each incoming message to the protocol task through the
- * inbound ring, and reconnects automatically after connection loss; loop() drives the reconnect
- * timer.
+ * inbound ring. A lost connection is not reopened: connect_to() opens a new one.
  */
 class SendspinClientConnection : public SendspinConnection {
 public:
+    /// @brief Bound on the opening handshake (TCP connect and WebSocket upgrade), in seconds
+    ///
+    /// The nursery's establish window (NURSERY_ESTABLISH_TIMEOUT_S in connection_manager.h, 30 s):
+    /// an outbound upgrade may legitimately be slow (a proxy, a busy server; see
+    /// ConnectionLifecycle.SlowOutboundSurvivesUpgradeTier), so it gets the whole window rather
+    /// than the inbound server's 3 s, and the nursery reaps it at that same deadline anyway. It is
+    /// also the bound on stop() for a connection whose upgrade is in flight: IXWebSocket clears
+    /// its cancellation flag when it enters the handshake, so a close() that lands between start()
+    /// and that point is forgotten and the destructor's ix::WebSocket::stop() waits for the
+    /// handshake to finish or time out (IXWebSocket's own default is 60 s).
+    static constexpr int HANDSHAKE_TIMEOUT_SECS = 30;
+
     /// @brief Constructs a client connection to the given WebSocket URL
     explicit SendspinClientConnection(std::string url);
 
@@ -47,9 +58,6 @@ public:
 
     /// @brief Initiates the WebSocket connection to the server
     void start() override;
-
-    /// @brief Drives periodic connection maintenance (reconnect timer, state machine)
-    void loop() override;
 
     /// @brief Sends a goodbye message and closes the connection
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
@@ -69,11 +77,6 @@ public:
     ///        pre-hello gate does not apply.
     SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
                               bool allow_before_hello) override;
-
-    /// @brief Enables or disables automatic reconnection after connection loss
-    void set_auto_reconnect(bool enabled) {
-        this->auto_reconnect_ = enabled;
-    }
 
     /// @brief No-op on host builds; task configuration is an ESP-IDF concept. Both parameters are
     /// accepted and ignored: the host build has no analogue of a FreeRTOS task priority or stack
@@ -124,18 +127,7 @@ protected:
 
     // 32-bit fields
 
-    /// @brief Monotonic timestamp (ms) of the last reconnection attempt
-    uint32_t last_reconnect_attempt_{0};
-
-    static constexpr uint32_t DEFAULT_RECONNECT_INTERVAL_MS = 5000U;
-
-    /// @brief Delay in milliseconds between reconnection attempts
-    uint32_t reconnect_interval_ms_{DEFAULT_RECONNECT_INTERVAL_MS};
-
     // 8-bit fields
-
-    /// @brief Whether to automatically reconnect after connection loss
-    bool auto_reconnect_{true};
 
     /// @brief Whether the websocket is currently connected. Written by the IXWebSocket
     /// callback thread, read cross-thread via is_connected(), hence atomic.

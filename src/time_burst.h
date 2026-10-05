@@ -25,7 +25,8 @@ namespace sendspin {
 
 class SendspinConnection;
 
-/// @brief One server/time reply, measured on the protocol task and handed to the main loop
+/// @brief One server/time reply, measured on the protocol task and handed to its connection's
+/// time burst
 struct TimeResponse {
     int64_t offset{0};     ///< Server clock minus client clock (microseconds).
     int64_t max_error{0};  ///< Half the round-trip delay (microseconds).
@@ -51,18 +52,21 @@ struct TimeBurstResult {
  * connection's Kalman filter. Waiting for the inter-burst interval between rounds
  * reduces filter update frequency while still capturing clean measurements.
  *
- * Usage:
- * 1. Call loop() on each iteration of the hub's main loop, passing the active connection
+ * Each SendspinConnection owns one, beside its time filter, and drives it on the protocol task:
+ * 1. Call loop() on each tick while the connection is admitted and operational, and wake again
+ *    after ms_until_due(); starts_burst() says when the next loop() opens a burst, which the
+ *    caller may hold back until the platform is ready for it
  * 2. Call on_time_response() when a SERVER_TIME response arrives for that connection
- * 3. Call reset() when the connection is lost or replaced
+ * 3. Call reset() when the connection is dropped
  * 4. Check TimeBurstResult::burst_completed to know when to act on updated time estimates
  *
  * @code
  * SendspinTimeBurst burst;
  * burst.reset();
  *
- * // In the hub loop:
- * TimeBurstResult result = burst.loop(conn);
+ * // On the protocol task's tick:
+ * const int64_t now_ms = platform_time_us() / US_PER_MS;
+ * TimeBurstResult result = burst.loop(conn, now_ms, burst.starts_burst(now_ms));
  * if (result.burst_completed) {
  *     int64_t server_now = conn->get_time_filter()->compute_server_time(platform_time_us());
  * }
@@ -77,10 +81,14 @@ public:
     // Public API
     // ========================================
 
-    /// @brief Drive the burst state machine. Called from hub's loop()
-    /// @param conn The active connection to send time messages on.
+    /// @brief Drive the burst state machine. Protocol task only.
+    /// @param conn The connection that owns this burst, to send time messages on.
+    /// @param now_ms platform_time_us() / US_PER_MS, read once by the caller for this call and
+    ///        its starts_burst().
+    /// @param may_open_burst Whether a burst that is due may be opened (its first time message
+    ///        sent) by this call. A burst already open runs on regardless.
     /// @return Result indicating whether a message was sent and/or the burst completed.
-    TimeBurstResult loop(SendspinConnection* conn);
+    TimeBurstResult loop(SendspinConnection* conn, int64_t now_ms, bool may_open_burst);
 
     /// @brief Called when a SERVER_TIME response arrives; ignored unless it answers the time
     /// message still pending
@@ -88,6 +96,20 @@ public:
     /// @param response The measurement and the echo identifying the message it answers.
     /// @return true if this completed the burst (Kalman filter was updated).
     bool on_time_response(SendspinConnection* conn, const TimeResponse& response);
+
+    /// @brief Whether the next loop() starts a new burst: the previous one is complete and the
+    /// interval since it has elapsed, so loop() would send the burst's first time frame
+    /// @param now_ms platform_time_us() / US_PER_MS, the value the caller passes loop().
+    [[nodiscard]] bool starts_burst(int64_t now_ms) const {
+        return this->burst_index_ >= this->burst_size_ && !this->pending_burst_completed_ &&
+               now_ms - this->last_burst_complete_time_ >= this->burst_interval_ms_;
+    }
+
+    /// @brief Milliseconds until loop() has something to do: the next message of a burst (0),
+    /// the timeout of the message in flight, or the end of the inter-burst interval
+    /// @param now_ms platform_time_us() / US_PER_MS, as loop() reads it.
+    /// @return 0 when loop() is due now.
+    [[nodiscard]] uint32_t ms_until_due(int64_t now_ms) const;
 
     // ========================================
     // Lifecycle
@@ -106,6 +128,11 @@ public:
 protected:
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;
     static constexpr int64_t DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
+    /// Wait before sending again after the transport refused a client/time: a full send queue or
+    /// a closing socket, neither of which clears at once. The hello's first backoff
+    /// (NurseryEntry::INITIAL_HELLO_RETRY_DELAY_MS) answers the same refusal, and it keeps the
+    /// protocol task from re-ticking at once for a send that cannot succeed.
+    static constexpr int64_t SEND_RETRY_DELAY_MS = 100;
 
     // 64-bit fields
     int64_t best_max_error_{std::numeric_limits<int64_t>::max()};
@@ -118,6 +145,8 @@ protected:
     // client_transmitted of the time message awaiting a reply, 0 when none is (see
     // on_time_response())
     int64_t pending_embedded_{0};
+    // Earliest time (ms) to try again after a refused send, 0 when no send was refused
+    int64_t send_retry_after_ms_{0};
 
     // 8-bit fields
     uint8_t burst_size_{8};

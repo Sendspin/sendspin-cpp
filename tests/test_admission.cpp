@@ -23,6 +23,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <vector>
@@ -386,4 +388,102 @@ TEST(ShouldAdmitConnection, FinalizedPairingIsNotEvictedByRankZeroLastPlaybackPe
                                          /*admitted_pairing_in_flight=*/false))
         << "a rank-0 peer must not displace a rank-1 connection, finalized or not: rank still "
            "decides, and rule 5 applies only when BOTH sides are rank 0";
+}
+
+// ============================================================================
+// Role ownership: admission_conflicts() and claimable_roles()
+// ============================================================================
+
+namespace {
+
+uint16_t bits(std::initializer_list<SendspinRole> roles) {
+    uint16_t mask = 0;
+    for (SendspinRole role : roles) {
+        mask |= role_mask_bit(role);
+    }
+    return mask;
+}
+
+}  // namespace
+
+// A newcomer conflicts with the admitted connections that own a role it wants, and with every
+// admitted connection only when it shares no role with them and no slot is free. Arbitration is
+// therefore asked about exactly the incumbents it could displace, and never when a free slot
+// takes the newcomer beside them. Rows marked Control: are the ones a conflict detector that
+// reported nothing, or everything, would fail.
+TEST(AdmissionConflicts, OnlyRoleOwnershipOrAFullArrayConflicts) {
+    const uint16_t player = bits({SendspinRole::PLAYER});
+    const uint16_t metadata = bits({SendspinRole::METADATA});
+    const uint16_t player_metadata = bits({SendspinRole::PLAYER, SendspinRole::METADATA});
+    const AdmittedRoles free_slot{0, false};
+    struct Row {
+        const char* name;
+        uint16_t incoming;
+        std::vector<AdmittedRoles> slots;
+        uint32_t expected;
+    };
+    const std::vector<Row> rows = {
+        {"Control: an empty array admits without arbitration", player, {free_slot}, 0},
+        {"Control: disjoint roles beside a free slot admit without arbitration", metadata,
+         {{player, true}, free_slot}, 0},
+        {"an owner of a wanted role conflicts", player, {{player, true}, free_slot}, 0b01},
+        {"only the owners of wanted roles conflict", player_metadata,
+         {{player, true}, {bits({SendspinRole::COLOR}), true}, {metadata, true}}, 0b101},
+        {"a full array conflicts with every slot when nothing overlaps", metadata,
+         {{player, true}}, 0b1},
+        {"a newcomer that wants no role still needs a slot", 0, {{player, true}}, 0b1},
+        {"Control: a newcomer that wants no role takes a free slot", 0, {{player, true}, free_slot},
+         0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(admission_conflicts(row.incoming, row.slots), row.expected);
+    }
+}
+
+// What a connection may own is what it has active and no other admitted connection owns.
+TEST(ClaimableRoles, ActiveRolesOthersDoNotOwn) {
+    const uint16_t player = bits({SendspinRole::PLAYER});
+    const uint16_t metadata = bits({SendspinRole::METADATA});
+    EXPECT_EQ(claimable_roles(player | metadata, 0), player | metadata) << "Control: no others";
+    EXPECT_EQ(claimable_roles(player | metadata, player), metadata);
+    EXPECT_EQ(claimable_roles(metadata, player), metadata) << "Control: disjoint";
+    EXPECT_EQ(claimable_roles(0, player), 0);
+}
+
+// ============================================================================
+// client/state per connection: client_state_for_roles()
+// ============================================================================
+
+// Each admitted connection is sent the role objects of the roles it owns and has active, and the
+// availability every connection shares.
+TEST(ClientStateForRoles, CarriesOnlyTheGivenRoles) {
+    ClientStateMessage snapshot;
+    snapshot.available = false;
+    snapshot.player = ClientPlayerStateObject{};
+    snapshot.artwork = ClientArtworkStateObject{};
+    snapshot.visualizer = ClientVisualizerStateObject{};
+    struct Row {
+        const char* name;
+        uint16_t roles;
+        bool player;
+        bool artwork;
+        bool visualizer;
+    };
+    const Row rows[] = {
+        {"Control: every role", ALL_ROLES_MASK, true, true, true},
+        {"the player alone", bits({SendspinRole::PLAYER}), true, false, false},
+        {"artwork and visualizer", bits({SendspinRole::ARTWORK, SendspinRole::VISUALIZER}), false,
+         true, true},
+        {"roles without a state object", bits({SendspinRole::METADATA, SendspinRole::CONTROLLER}),
+         false, false, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        const ClientStateMessage msg = client_state_for_roles(snapshot, row.roles);
+        EXPECT_FALSE(msg.available) << "the availability is every connection's";
+        EXPECT_EQ(msg.player.has_value(), row.player);
+        EXPECT_EQ(msg.artwork.has_value(), row.artwork);
+        EXPECT_EQ(msg.visualizer.has_value(), row.visualizer);
+    }
 }

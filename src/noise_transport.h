@@ -14,21 +14,13 @@
 
 /// @file noise_transport.h
 /// @brief Encrypted transport layer for a Sendspin connection: owns the Noise cipher session,
-/// its send-side mutex, outbound fragmentation, and inbound fragment reassembly.
+/// outbound fragmentation, and inbound fragment reassembly.
 ///
-/// This class isolates every piece of state that the "decrypt runs unlocked on the protocol task"
-/// invariant applies to. Its threading contract:
-///
-///   - ENCRYPT / send (send_json, send_binary): the main loop and the protocol task; serialized
-///     by session_mutex_. The non-fragmented path also fills and encrypts the reused send_buf_
-///     member under the same lock, so that reuse is safe precisely because this path is fully
-///     serialized (see send_buf_'s doc comment).
-///   - DECRYPT (decrypt_in_place) and reassembly (accept_plaintext): protocol task only.
-///     The decrypt path is deliberately unlocked: the only writer that can replace the session
-///     mid-connection (send_msg2_and_swap, driven by an inbound re-handshake frame) runs on the
-///     same protocol task, so decrypt and swap are sequential, never concurrent.
-///   - Session swap (activate, send_msg2_and_swap): protocol task, under session_mutex_ so a
-///     concurrent main-loop encrypt cannot interleave with the swap.
+/// Every use runs on the protocol task: the encrypt and send path (send_json, send_binary), the
+/// decrypt path (decrypt_in_place) and reassembly (accept_plaintext), and the session swaps
+/// (activate at handshake COMPLETE, send_msg2_and_swap at a re-handshake). One thread owns the
+/// session, so this class takes no lock: a swap is sequential with every encrypt and decrypt, and
+/// the reused send_buf_ is filled and encrypted by one caller at a time.
 
 #pragma once
 
@@ -38,12 +30,10 @@
 #include "sendspin/types.h"
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -91,26 +81,25 @@ public:
     void activate(std::unique_ptr<NoiseSession> session);
 
     /// @brief Returns the current session's 32-byte Noise handshake hash, or nullopt if no
-    /// session is active. Takes session_mutex_, so it is safe from any thread.
+    /// session is active. Protocol task only.
     std::optional<std::array<uint8_t, 32>> handshake_hash() const;
 
     /// @brief Returns true once a transport session exists (stays true across re-handshake
-    /// swaps). Atomic; safe from any thread. This is the check send paths use to decide
-    /// encrypted-vs-cleartext without racing a session swap.
+    /// swaps). This is the check send paths use to decide encrypted-vs-cleartext. Protocol task
+    /// only.
     bool is_active() const {
-        return this->active_.load(std::memory_order_acquire);
+        return this->active_;
     }
 
     // ========================================
-    // Outbound (encrypt + send); any thread, serialized by session_mutex_
+    // Outbound (encrypt + send); protocol task only
     // ========================================
 
     /// @brief Encrypt and send a JSON string as a Noise transport frame.
     /// Encodes as [MSG_TYPE_JSON_BODY | utf8(json)] -> encrypt -> frame sink.
     /// Fragments automatically when the plaintext exceeds MAX_TRANSPORT_PLAINTEXT.
     /// @param before_write Goes to the frame sink with the message's last frame. A synchronous
-    ///                     transport runs it inside session_mutex_, so it must not block, send,
-    ///                     or take a lock that is held while acquiring session_mutex_.
+    ///                     transport runs it inside this call, so it must not block or send.
     /// @return SsErr::OK on success, INVALID_STATE if the transport is not active.
     SsErr send_json(const char* json, size_t len, const FrameWriteHook& before_write = nullptr);
 
@@ -124,8 +113,8 @@ public:
     SsErr send_binary(const uint8_t* data, size_t len);
 
     /// @brief Re-handshake commit: encrypt and send msg2 under the OLD session, then swap to
-    /// the new session, all inside one locked region so a concurrent encrypt cannot interleave
-    /// between the msg2 send and the swap. Called on the protocol task.
+    /// the new session. Protocol task only, like every other send, so no encrypt falls between
+    /// the msg2 send and the swap.
     /// @return SsErr::OK on success (session swapped); on error the old session is kept.
     SsErr send_msg2_and_swap(const std::string& msg2_text,
                              std::unique_ptr<NoiseSession> next_session);
@@ -134,8 +123,8 @@ public:
     // Inbound (decrypt + reassemble); protocol task only
     // ========================================
 
-    /// @brief Decrypts one transport frame in-place. Unlocked by design: see the file comment
-    /// (decrypt is sequential with the session swap on the same thread).
+    /// @brief Decrypts one transport frame in-place. Protocol task only, sequential with the
+    /// session swap (see the file comment).
     /// @param len  Ciphertext length (plaintext + 16-byte tag).
     /// @return Plaintext length, or 0 on auth failure / no active session.
     size_t decrypt_in_place(uint8_t* ciphertext, size_t len);
@@ -158,11 +147,10 @@ public:
     }
 
 private:
-    /// @brief Encrypt one frame and emit it via the frame sink. Caller must hold session_mutex_,
-    /// which excludes a concurrent re-handshake session swap from racing the encrypt.
+    /// @brief Encrypt one frame and emit it via the frame sink.
     /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + 16 (AEAD tag).
-    SsErr encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity, size_t plaintext_len,
-                                        const FrameWriteHook& before_write);
+    SsErr encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity, size_t plaintext_len,
+                                 const FrameWriteHook& before_write);
 
     /// @brief Fragment a plaintext > MAX_TRANSPORT_PLAINTEXT into multiple frames and
     /// encrypt+send each one. Implements messaging.md "Fragmentation": every fragment is a
@@ -171,18 +159,18 @@ private:
     /// The plaintext is passed as its type byte plus the payload rather than as one contiguous
     /// buffer, so no caller has to stage a copy of a message this large.
     ///
-    /// Caller must hold session_mutex_ across every frame: the fragments of one logical message
-    /// must reach the wire consecutively, since a peer that sees a non-fragment frame between
-    /// them treats it as a messaging.md "Malformed sequences" error (see accept_plaintext()), and
-    /// releasing the lock between frames would let a concurrent send interleave one.
+    /// The fragments of one logical message reach the wire consecutively, since a peer that sees
+    /// a non-fragment frame between them treats it as a messaging.md "Malformed sequences" error
+    /// (see accept_plaintext()); every send runs on the protocol task, so none can fall between
+    /// them.
     /// @param before_write Passed to the frame sink with the last fragment.
-    SsErr fragment_and_send_locked(uint8_t orig_type, const uint8_t* data, size_t data_len,
-                                   const FrameWriteHook& before_write);
+    SsErr fragment_and_send(uint8_t orig_type, const uint8_t* data, size_t data_len,
+                            const FrameWriteHook& before_write);
 
     /// @brief Fills send_buf_ with an optional prefix followed by data, then encrypts and
-    /// sends it. Caller must hold session_mutex_ across the whole call, as send_buf_ requires.
-    SsErr fill_and_encrypt_locked(const uint8_t* prefix, size_t prefix_len, const uint8_t* data,
-                                  size_t data_len, const FrameWriteHook& before_write);
+    /// sends it.
+    SsErr fill_and_encrypt(const uint8_t* prefix, size_t prefix_len, const uint8_t* data,
+                           size_t data_len, const FrameWriteHook& before_write);
 
     /// @brief Grows a PlatformBuffer to at least `needed` bytes (geometric growth, contents
     /// preserved, capacity retained across calls), optionally capped.
@@ -199,8 +187,8 @@ private:
     bool reasm_reserve(size_t needed, bool admitted);
 
     /// @brief Grows send_buf_ to at least `needed` bytes, capped at MAX_TRANSPORT_PLAINTEXT + 16
-    /// (the largest plaintext + AEAD tag room the non-fragmented path ever handles). Caller
-    /// must hold session_mutex_ (see send_buf_). See grow_buffer().
+    /// (the largest plaintext + AEAD tag room the non-fragmented path ever handles). See
+    /// grow_buffer().
     bool ensure_send_buf(size_t needed);
 
     /// @brief Discards any in-flight reassembly state (keeps the allocation).
@@ -211,8 +199,6 @@ private:
     }
 
     // Struct fields
-    /// True once a transport session exists. See is_active().
-    std::atomic<bool> active_{false};
 
     /// Emits one encrypted frame as a binary WS frame.
     FrameSink frame_sink_;
@@ -228,18 +214,13 @@ private:
     /// send_msg2_and_swap). Grown on demand by ensure_send_buf() to fit each frame (geometric
     /// growth, same idiom as reasm_buf_/reasm_reserve()), capped at MAX_TRANSPORT_PLAINTEXT + 16
     /// bytes, so typical traffic settles at a working-set size well under that ceiling instead of
-    /// paying it on every connection. Guarded by session_mutex_: every caller fills and encrypts
-    /// it while holding the lock, so concurrent sends from different threads never touch it at
-    /// the same time. Placed per buffer_location_ like reasm_buf_.
+    /// paying it on every connection. Protocol task only, like every send. Placed per
+    /// buffer_location_ like reasm_buf_.
     PlatformBuffer send_buf_;
-
-    /// Guards the send-side encrypt path against the re-handshake session swap.
-    mutable std::mutex session_mutex_;
 
     // Pointer fields
     /// Noise cipher session (set at handshake COMPLETE, replaced on re-handshake swap).
-    /// Guarded by session_mutex_ for the ENCRYPT (send) path and the swap; the DECRYPT
-    /// (receive) path reads it unlocked (same-thread sequential with the swap).
+    /// Protocol task only.
     std::unique_ptr<NoiseSession> session_;
 
     // size_t fields
@@ -250,6 +231,9 @@ private:
     // 8-bit fields
     /// Memory placement for reasm_buf_, send_buf_ and the fragmentation frame buffer.
     MemoryLocation buffer_location_{MemoryLocation::PREFER_EXTERNAL};
+
+    /// True once a transport session exists. See is_active(). Protocol task only.
+    bool active_{false};
 
     /// True when the in-flight message's data is being thrown away rather than buffered: its
     /// orig_type is a reserved ID nothing implements, it outgrew the reassembly cap in force,

@@ -404,7 +404,9 @@ TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
          },
          [](PlayerRole::Impl& impl) {
              ServerPlayerStreamObject published;
-             const bool published_params = impl.event_state->stream_params_slot.take(published);
+             uint32_t stamp = 0;
+             const bool published_params =
+                 impl.event_state->stream_params_slot.take(published, stamp);
              const bool queued_start = drain_stream_events(impl).starts > 0;
              if (published_params) {
                  EXPECT_EQ(published.sample_rate.value_or(0), 44100u);
@@ -427,7 +429,8 @@ TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
          },
          [](PlayerRole::Impl& impl) {
              ServerCommandMessage merged;
-             if (!impl.event_state->command_slot.take(merged)) {
+             uint32_t stamp = 0;
+             if (!impl.event_state->command_slot.take(merged, stamp)) {
                  return false;
              }
              EXPECT_TRUE(merged.player.has_value());
@@ -644,16 +647,23 @@ TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
     }
 }
 
-// A teardown on the main loop (a dropped connection, a removed role) moves the role's generation
-// on; the protocol task's next tick recalls what the sync task has not taken, returning it and
-// its quota charge to the ring, rather than leaving the old stream's audio to be read later.
+// A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and
+// the old stream's audio never plays: the protocol task's next tick recalls what the sync task has
+// not taken, returning it and its quota charge to the ring, and an item the sync task takes before
+// that tick is dropped by its generation stamp and returned the same way.
 TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
     struct Row {
         const char* name;
         bool teardown;
-        size_t items_left;
+        bool recall_tick;
+        size_t listed_before_take;
+        size_t delivered;
     };
-    const Row rows[] = {{"Control: no teardown", false, 2}, {"torn down", true, 0}};
+    const Row rows[] = {
+        {"Control: no teardown", false, true, 2, 2},
+        {"torn down, recalled by the protocol task's tick", true, true, 0, 0},
+        {"torn down, taken by the sync task before the recall", true, false, 2, 0},
+    };
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -666,14 +676,43 @@ TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
         if (row.teardown) {
             impl->cleanup();
         }
+        if (row.recall_tick) {
+            impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
+        }
 
-        impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
+        EXPECT_EQ(impl->sync_task->encoded_items_.is_empty(), row.listed_before_take == 0);
+        // Taken under the live generation, as the sync task would: a recalled or stale item is
+        // not delivered, and an item left over is.
+        EXPECT_EQ(take_all(*impl).size(), row.delivered);
+        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
+            << "an item of the torn-down stream kept its charge";
+    }
+}
 
-        EXPECT_EQ(impl->sync_task->encoded_items_.is_empty(), row.items_left == 0);
-        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding() == 0, row.items_left == 0);
-        // Taken under the live generation, as the sync task would: a recalled item cannot come
-        // back, and an item left over is still delivered.
-        EXPECT_EQ(take_all(*impl).size(), row.items_left);
+// A server command the drain takes is applied only if it was admitted under the role's current
+// generation: one stamped before a teardown (taken by a drain on the far side of it) is dropped,
+// not applied after the stream it belonged to was torn down. The slot is written with the old
+// stamp directly, the payload a drain that took it before the teardown would hold; no observable
+// call stages that interleaving on demand.
+TEST(PlayerTeardownGeneration, ACommandStampedBeforeATeardownIsNotApplied) {
+    struct Row {
+        const char* name;
+        bool stale;
+        uint8_t expected_volume;
+    };
+    const Row rows[] = {{"Control: stamped with the current generation", false, 70},
+                        {"stamped before the teardown", true, 0}};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        const uint32_t before = live_generation(*impl);
+        impl->cleanup();
+        impl->event_state->command_slot.write(volume_command(70),
+                                              row.stale ? before : live_generation(*impl));
+
+        impl->drain_events();
+
+        EXPECT_EQ(impl->volume, row.expected_volume);
     }
 }
 

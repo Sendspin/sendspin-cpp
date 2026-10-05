@@ -11,21 +11,32 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - A transport thread is a pipe: it receives a complete message into the
   shared inbound ring (an admitted connection) or the connection's fallback
   buffer (an unadmitted one, or a message split across WebSocket frames),
-  reports a close, and wakes the protocol task. Every other receive-side step
-  on a connection (decrypt, reassembly, the handshake, dispatch, the admission
-  replay, close reporting) runs on the protocol task. A connection's sends come
-  from the protocol task (the Noise handshake messages and the replies its
-  handlers make) and from the main loop (hellos, client/state, time requests,
-  goodbyes), and
-  `NoiseTransport::session_mutex_` serializes them. Payload validation and
+  reports a close, delivers an upgraded inbound connection as an accept in the
+  protocol task's command queue, and wakes the protocol task. Every connection
+  belongs to the protocol task: the receive side (decrypt, reassembly, the
+  handshake, dispatch, close handling), the lifecycle (hello, activation,
+  admission, role ownership, pairing, watchdogs, time bursts) and every send
+  run there, so no connection state needs a lock. Any other thread reaches a
+  connection only by queueing a `ProtocolCommand`; a request that the full
+  queue refuses is reported to the caller (`send_text()` returns false) or
+  logged, never dropped silently. A connection refused at delivery is left with
+  the transport that delivered it, which releases it after the delivery
+  returns (on ESP, with its httpd session), so no refusal destroys a connection
+  inside the delivery. Payload validation and
   decoding happen on the drain or worker thread that consumes the data, following the pattern the player and artwork
   roles establish; the protocol task hands audio and visualizer frames over in
   the ring item they arrived in rather than copying them.
 - All main-loop-bound cross-thread state goes through the `Inbox`
-  (`src/inbox.h`). Do not add new mutex-protected endpoints polled by
-  `loop()`. The one exemption is `ConnectionManager`'s `pending_*_events_`
-  queues, which predate the rule and carry payloads the POD ring cannot: one
-  mutex, one gate atomic, one swap. Do not add a second.
+  (`src/inbox.h`). `loop()` runs the Inbox drain and nothing else: do not add
+  mutex-protected endpoints or atomics that `loop()` polls for work. The
+  protocol task calls no listener, a role thread calls only the data-path
+  callbacks `docs/integration-guide.md` names for it (`on_audio_write()` on
+  the sync task, `on_image_decode()` on the artwork decode thread, the
+  visualizer data callbacks on its drain thread), and only the main loop
+  calls the persistence provider: everything else a consumer hears it hears
+  from the main loop's drain. A thread that must wait for the main loop to
+  have called a listener waits for a grant the drain publishes (the
+  high-performance grant), never for the main loop itself.
 - The Inbox event ring is for ordered lifecycle events only (stream start and
   end, cleared, connection events). Latest-wins state (player state, metadata,
   progress) belongs on a collapsing `InboxSlot`, never the ring: a flood of
@@ -33,58 +44,60 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - State published from one writer thread to one reader thread uses a
   `ShadowSlot` (`src/platform/shadow_slot.h`), whichever side (if either) the
   main loop is on. State the main loop *reads* goes through the Inbox instead.
-  The one value read by several threads without being consumed, the current
-  connection's time filter, sits in `ConnectionManager`'s own slot behind a
-  leaf mutex (`current_time_filter()`).
+  The values read by several threads without being consumed, the primary
+  admitted connection's time filter and server information, sit in
+  `ConnectionManager`'s own slots behind leaf mutexes (`time_filter()`,
+  `server_information()`), written by the protocol task; a flag read the same
+  way is a plain atomic.
 - Event producers push through `push_event_or_log()` rather than hand-rolling
   the build, push, and log-on-drop sequence.
 - A bounded queue or ring that drops an item never drops it silently: log at
   least a warning at the drop site. A site that can drop every message of a
   burst throttles it with `InboundDropLog`: one warning when the drops start,
   one with their count when they stop.
-- An event whose delivery must not survive its producer being torn down
-  carries the producer's teardown generation and is checked against it at the
-  drain (`push_event_or_log()` / `event_is_current()`), rather than relying on
-  the ring being reset: a teardown that leaves other producers running cannot
-  reset it.
+- An event or a slot payload whose delivery must not survive its producer
+  being torn down carries the producer's teardown generation and is checked
+  against it at the drain (`push_event_or_log()` / `event_is_current()` for
+  events, `GenerationSlot` for a role's slots), rather than relying on the
+  ring or the slot being reset: a teardown that leaves other producers running
+  cannot reset it, and a drain can take a slot on either side of a teardown.
 - Callback dispatch must tolerate re-entrant teardown: a listener callback may
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.
-- A message handler on the protocol task writes to Inbox slots, role item
-  lists and buffers, the connection it was handed, and the connection
-  manager's deferred-event queues, and nothing else. It does not reach back
-  into the client for the current connection or the clock, does not publish
-  state, and does not call a listener: those belong on the main-loop drain.
-  That keeps one connection's message from delaying every other connection's,
-  and keeps the admission replay, which runs the same handlers, as short as the
-  live path. Connection-protocol work a message triggers (the `noise/handshake`
-  re-handshake and its `msg2` send, the RAM commit of a pairing record on
-  `server/pair-finalize`) is not role work: it runs on the protocol task like
-  the decrypt it must stay ordered with.
-- A protocol-task step has a bounded wait or none, with one exception: the
-  task takes `ConnectionManager::conn_ptr_mutex_` every tick
-  (`snapshot_connections()`) and in the handlers that ask the manager about
-  open connections (`open_connection_psk_ids()`), and main-loop sections hold
-  that lock across blocking work, so the task can wait as long as they do. A
-  transport's wait on the task is bounded: an admitted connection waits at most
-  `INBOUND_ACQUIRE_TIMEOUT_MS` for ring space and drops the message with a
-  warning, and an unadmitted one waits at most
+- A message handler on the protocol task does the connection work the message
+  calls for in place (an activation's trust check, admission and role
+  ownership, a pairing step, a `noise/handshake` re-handshake, the RAM commit
+  of a pairing record), and hands role and consumer work on through Inbox
+  slots, role item lists and buffers. It never calls a listener or the
+  persistence provider, and it does not wait on the main loop: those belong on
+  the main-loop drain, and one connection's message must not delay every other
+  connection's. The roles a teardown takes away are torn down in two halves:
+  the protocol task resets what its handlers and the role threads reach and
+  stamps the role's events and slot payloads with the new teardown generation,
+  and the main loop runs the role's own half once per generation, through the
+  role's `TeardownTracker` (`catch_up_teardown()`), before acting on anything
+  stamped with it. A role drain takes its slot before it catches up, then
+  applies only a payload stamped with the current generation.
+- A protocol-task step has a bounded wait or none: the Noise DH operations, a
+  ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, a transport send
+  bounded by the transport's own send timeout, and at shutdown the goodbye
+  flush bounded by `GOODBYE_FLUSH_TIMEOUT_MS` per goodbye. Its tick returns the
+  time to its earliest deadline, or `ProtocolTask::NO_DEADLINE`, and never
+  wakes on a fixed period. A transport's wait on the task is bounded too: an
+  admitted connection waits at most `INBOUND_ACQUIRE_TIMEOUT_MS` for ring space
+  and drops the message with a warning, and an unadmitted one waits at most
   `InboundGate::WRITABLE_WAIT_MS` for its previous message to be consumed and
   is closed if it is not.
-- The client holds exactly one lock order, and every site that takes two locks
-  cites it: `ConnectionManager::conn_ptr_mutex_`, then the leaves
-  (`ConnectionManager::conn_mutex_`, `ConnectionManager::time_filter_mutex_`,
-  `RecordStore::mutex_`, the Inbox mutex, `SendspinConnection::psk_id_mutex_`,
-  `NoiseTransport::session_mutex_`, and the inbound ring's, item lists' and
-  protocol task command queue's own locks), which nest under anything and
-  under no other library lock. Taking `conn_ptr_mutex_` while holding a leaf
-  is a defect, not a local trade-off. `session_mutex_` is a leaf among the
-  library's locks, but a send made under it takes the transport's own send
-  lock (IXWebSocket's, or esp_websocket_client's, which a send waits for up to
-  its send timeout), so those sit under it.
-  Blocking work (a deferred release, an admission) is pushed out from under
-  `conn_ptr_mutex_` instead (see `ConnectionManager::flush_deferred_releases()`
-  and `flush_pending_admission()`).
+- Every library lock is a leaf: it is held only to copy or update its own
+  state, never across a call that takes another library lock, a send, a
+  listener or the persistence provider, so the library has no lock order to
+  cite. The leaves are `ConnectionManager::time_filter_mutex_` and
+  `server_info_mutex_`, `RecordStore::mutex_`, the Inbox mutex, each
+  `SendspinTimeFilter`'s `state_mutex_`, the inbound ring's, item lists' and
+  protocol task command queue's own locks, `GoodbyeWait`'s, the artwork role's
+  slot mutex, `ShadowSlot`'s and the ESP server's pending-upgrade mutex. A
+  change that would take a second library lock under one of them is a design
+  change, not a local trade-off.
 
 ## Protocol validation
 
@@ -119,7 +132,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
 ## Embedded resource discipline
 
 - Stack is a measured budget, not a vibe. Large stack frames on paths
-  reachable from ESP tasks (the httpd receive path, the sync task, `loop()`)
+  reachable from ESP tasks (the httpd receive path, the protocol task, the sync task, `loop()`)
   are defects; when in doubt, measure with `-fstack-usage` on the target
   compiler at the shipped optimization level and record the numbers in the PR.
   Watch for aggressive inlining aggregating several frames into one.
@@ -235,7 +248,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
   | Anything shown in usage examples          | `@code` blocks in headers, `examples/`, README |
 
 - `docs/internals.md` holds only facts that span files: the thread model,
-  cross-thread channels, the `loop()` tick order, and invariants that hold
+  cross-thread channels, the protocol task's tick and the `loop()` drain order,
+  and invariants that hold
   across classes. Why a single function or member behaves as it does belongs
   in a comment at that function or member, and protocol behavior is cited
   from the spec rather than restated. Do not add test names or numeric

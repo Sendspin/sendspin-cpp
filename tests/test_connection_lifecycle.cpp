@@ -28,6 +28,7 @@
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/crypto.h"
+#include "protocol_task.h"  // ProtocolTask::NO_DEADLINE
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
@@ -270,7 +271,7 @@ private:
 TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     PairedClientBundle bundle(make_config(PROBE_TEST_PORT));
     SendspinClient& client = bundle.client();
-    // The WS server starts synchronously on the first loop() once the network reports ready.
+    // start() creates the WS server and, with the network ready, starts it before returning.
     ASSERT_TRUE(bundle.start());
 
     // Hold a nursery's worth of raw TCP connections open without ever speaking WebSocket.
@@ -425,7 +426,6 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
-    client.loop();  // First tick binds the WS server
 
     // Server A establishes and is promoted into the empty slot first...
     FakeEncryptedServer server_a(server_url(RACE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
@@ -594,14 +594,69 @@ TEST(LivenessTimeout, ExpiresOnceSilenceReachesTheTimeout) {
     }
 }
 
+// liveness_remaining_us() is the time the protocol task sleeps before liveness_expired() can next
+// change its verdict: the timeout minus the silence so far, never negative, measured on the same
+// low 32 bits.
+TEST(LivenessTimeout, RemainingTimeIsTheTimeoutLessTheSilence) {
+    struct Row {
+        const char* name;
+        int64_t now_us;
+        uint32_t last_receive_us;
+        int64_t expected_us;
+    };
+    constexpr int64_t TIMEOUT_US = 60'000'000;
+    constexpr int64_t EPOCH_US = 5LL << 32;  // High bits set, so a row fails if they take part.
+    constexpr uint32_t LAST = 1'000'000'000U;
+    constexpr int64_t LAST_US = EPOCH_US + LAST;
+    constexpr auto PRE_WRAP = static_cast<uint32_t>((1LL << 32) - TIMEOUT_US / 2);
+    constexpr int64_t WRAP_US = EPOCH_US + (1LL << 32);
+    const Row rows[] = {
+        {"Control: an arrival at now leaves the whole timeout", LAST_US, LAST, TIMEOUT_US},
+        {"part of the timeout spent", LAST_US + 1'000'000, LAST, TIMEOUT_US - 1'000'000},
+        {"exactly at the timeout", LAST_US + TIMEOUT_US, LAST, 0},
+        {"past the timeout never goes negative", LAST_US + 2 * TIMEOUT_US, LAST, 0},
+        {"across the 32-bit wrap", WRAP_US + 1'000'000, PRE_WRAP, TIMEOUT_US / 2 - 1'000'000},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(liveness_remaining_us(row.now_us, row.last_receive_us, TIMEOUT_US),
+                  row.expected_us);
+    }
+}
+
+// ms_until() turns a deadline into the protocol task's wait: rounded up, so the task never wakes
+// before the deadline and finds nothing due, 0 once it has passed, and never NO_DEADLINE, which a
+// real deadline must not read as.
+TEST(NextDeadline, MillisecondsUntilADeadlineRoundUp) {
+    struct Row {
+        const char* name;
+        int64_t due_us;
+        uint32_t expected_ms;
+    };
+    constexpr int64_t NOW_US = 7LL << 32;
+    const Row rows[] = {
+        {"Control: a deadline already passed", NOW_US - 1, 0},
+        {"Control: a deadline at now", NOW_US, 0},
+        {"one microsecond ahead waits a whole millisecond", NOW_US + 1, 1},
+        {"an exact millisecond", NOW_US + 1000, 1},
+        {"just past a millisecond rounds up", NOW_US + 1001, 2},
+        {"a deadline beyond the 32-bit range clamps short of NO_DEADLINE",
+         NOW_US + (1LL << 50), ProtocolTask::NO_DEADLINE - 1},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(ms_until(row.due_us, NOW_US), row.expected_ms);
+    }
+}
+
 // An established peer that stops answering without closing is dropped with a restart goodbye.
 // Waiting for client/time proves the peer was admitted, so the drop is not a nursery reap.
 //
 // Its controls are the "Control:" rows of the table above and of
 // LivenessTickDropsOnlyAStaleCurrentConnection (test_encrypted_lifecycle.cpp), which runs the same
-// check in loop() against a current connection whose last arrival is fresh, together with
-// AnInboundMessageAdvancesTheLivenessStamp there, which shows an answering peer's messages keep
-// that arrival fresh. A control here would have to outlast the timeout, so a scheduling stall
+// check in the protocol tick against a current connection whose last arrival is fresh, together
+// with AnInboundMessageAdvancesTheLivenessStamp there, which shows an answering peer's messages
+// keep that arrival fresh. A control here would have to outlast the timeout, so a scheduling stall
 // could fail it on a correct client.
 TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
     PairedClientBundle bundle(make_liveness_config(LIVENESS_TEST_PORT, 300));
@@ -646,4 +701,91 @@ TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+// ============================================================================
+// The protocol task works without the main loop
+// ============================================================================
+
+namespace {
+
+constexpr uint16_t NO_LOOP_ADMISSION_TEST_PORT = 19101;
+constexpr uint16_t CROSS_THREAD_COMMAND_TEST_PORT = 19102;
+constexpr uint16_t TWO_PEERS_TEST_PORT = 19103;
+
+}  // namespace
+
+// The protocol task admits a connection on its own: the Noise handshake, the hello exchange, the
+// activation, the admission and the first client/state all complete without a single loop()
+// call, which only delivers callbacks. The waits are unbounded: a client that needs the main loop
+// to admit hangs here, and the suite watchdog names the test.
+TEST(ConnectionLifecycle, AdmissionNeedsNoLoopTick) {
+    PairedClientBundle bundle(make_config(NO_LOOP_ADMISSION_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    auto server = connect_paired_server(bundle.peer, NO_LOOP_ADMISSION_TEST_PORT);
+    wait_until([&] { return client.is_connected(); });
+    wait_until([&] { return server->client_state_count() > 0; });
+    EXPECT_FALSE(server->closed());
+
+    client.stop();
+}
+
+// A request made on a thread other than the main loop reaches the protocol task, which acts on it
+// with no loop() call in between: the disconnect's goodbye reaches the peer.
+TEST(ConnectionLifecycle, ARequestFromAnotherThreadIsActedOnWithoutALoopTick) {
+    PairedClientBundle bundle(make_config(CROSS_THREAD_COMMAND_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    auto server = connect_paired_server(bundle.peer, CROSS_THREAD_COMMAND_TEST_PORT);
+    wait_until([&] { return client.is_connected(); });
+    ASSERT_FALSE(server->goodbye_reason().has_value()) << "Control: no goodbye before the request";
+
+    std::thread consumer([&client] { client.disconnect(SendspinGoodbyeReason::USER_REQUEST); });
+    consumer.join();
+    wait_until([&] { return server->goodbye_reason().has_value(); });
+    EXPECT_EQ(server->goodbye_reason().value_or(""), "user_request");
+
+    client.stop();
+}
+
+// Two servers connecting at the same moment are both driven by the protocol task at once, and the
+// admission settles on the preferred one whichever finishes its handshake first: the last-played
+// server holds the slot and the other is released with a goodbye, another_server when it was
+// admitted first and then displaced, concurrent_attempt when it arrived second. Nothing calls
+// loop().
+TEST(ConnectionLifecycle, TwoPeersAtOnceSettleOnThePreferredOne) {
+    PairedPeer peer_a = make_paired_peer();
+    PairedPeer peer_b = make_paired_peer();
+    TestNetworkProvider network;
+    TestPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{peer_a.record, peer_b.record});
+    persistence.set_last_played_server_id(peer_b.server_identity.peer_id());
+
+    SendspinClient client(make_config(TWO_PEERS_TEST_PORT));
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    FakeEncryptedServer server_a(server_url(TWO_PEERS_TEST_PORT),
+                                 std::string(NOISE_SUITE_CHACHAPOLY), peer_a.server_identity,
+                                 peer_a.record.psk_id, peer_a.psk, rank_zero_peer_options());
+    FakeEncryptedServer server_b(server_url(TWO_PEERS_TEST_PORT),
+                                 std::string(NOISE_SUITE_CHACHAPOLY), peer_b.server_identity,
+                                 peer_b.record.psk_id, peer_b.psk, rank_zero_peer_options());
+
+    wait_until([&] { return server_a.closed(); });
+    const std::string reason = server_a.goodbye_reason().value_or("");
+    EXPECT_TRUE(reason == "another_server" || reason == "concurrent_attempt")
+        << "the other server must be told why it was released, not '" << reason << "'";
+    wait_until([&] {
+        auto info = client.get_server_information();
+        return info.has_value() && info->server_id == peer_b.server_identity.peer_id();
+    });
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_FALSE(server_b.closed()) << "the preferred server must keep the slot";
+
+    client.stop();
 }
