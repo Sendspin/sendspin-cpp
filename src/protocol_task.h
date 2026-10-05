@@ -202,19 +202,16 @@ public:
     /// runs it too.
     void drop_commands();
 
-    /// @brief Closes admission: refuses every later ACCEPT_CONNECTION push (push_command()
-    /// returns false), and the task, reading is_accepting() false, refuses the accepts already
-    /// queued and runs the shutdown pass. Set under the queue lock, so an accept is either queued
-    /// before it, and taken by a tick of the task (its final one at the latest), or refused at
-    /// its push, with nothing in between. Main loop, from ConnectionManager::close_admission()
-    /// before stop().
+    /// @brief Closes admission (see accepting_). An accept is either queued before it, and taken
+    /// by a tick of the task (its final one at the latest), or refused at its push, with nothing
+    /// in between. Main loop, from ConnectionManager::close_admission() before stop().
     void close_accepts();
 
     /// @brief Opens admission again; see close_accepts(). Main loop, from
     /// ConnectionManager::start() before the platform server can deliver.
     void open_accepts();
 
-    /// @brief Whether admission is open (see accepting_). Any thread, lock-free.
+    /// @brief Whether admission is open (see accepting_). Any thread.
     bool is_accepting() const {
         return this->accepting_.load(std::memory_order_acquire);
     }
@@ -229,7 +226,8 @@ public:
 
     /// @brief Queues a command and wakes the task. Any thread.
     /// @return false when the command's slots are all taken (consumer commands share
-    ///         CONSUMER_COMMAND_BURST slots, accepts their reserved ones): the refusal is logged
+    ///         CONSUMER_COMMAND_BURST slots, accepts their reserved ones) or, for an accept,
+    ///         admission is closed (close_accepts()): the refusal is logged
     ///         and the command is left with the caller unchanged, so the connection an accept
     ///         carries is released on the caller's thread, outside the queue lock.
     bool push_command(ProtocolCommand&& command);
@@ -318,13 +316,12 @@ private:
     size_t accepts_queued_{0};
 
     // 8-bit fields
-    /// Whether admission is open. While it is false, push_command() refuses an accept, and the
-    /// task (through ConnectionManager::is_accepting()) refuses the accepts already queued, drops
-    /// consumer requests and runs the shutdown pass. Written by close_accepts() and
-    /// open_accepts() on the main loop under command_mutex_, so push_command() reads it in the
-    /// critical section that queues or refuses an accept; read lock-free (is_accepting())
-    /// everywhere else. True from construction: no platform server exists to deliver an accept
-    /// before ConnectionManager::start() opens admission.
+    /// Whether admission is open. While false, push_command() refuses an accept, and the task
+    /// refuses the accepts already queued, drops consumer requests and runs the shutdown pass.
+    /// Written by close_accepts() and open_accepts() on the main loop under command_mutex_, so
+    /// push_command() reads it in the critical section that queues or refuses an accept; read
+    /// lock-free (is_accepting()) everywhere else. True from construction, unobservable before
+    /// ConnectionManager::start(): no platform server exists to deliver an accept.
     std::atomic<bool> accepting_{true};
 };
 

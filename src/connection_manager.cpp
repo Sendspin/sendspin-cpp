@@ -257,7 +257,6 @@ void ConnectionManager::start() {
         this->ws_server_->set_wake_callback([task]() { task->wake(); });
     }
 
-    // Admission reopens before the server can deliver.
     this->client_->protocol_task_->open_accepts();
     // Started here when the network is already up, so the server is listening once start()
     // returns; otherwise the protocol task starts it once the provider reports ready.
@@ -265,10 +264,6 @@ void ConnectionManager::start() {
 }
 
 void ConnectionManager::close_admission() {
-    // Closed under the queue lock: an accept is either queued already, and the task's next or
-    // final tick refuses it with a goodbye (accept()), or refused at its push, which leaves it
-    // with its transport (on_new_connection()). None reaches the queue after the final tick, so
-    // nothing is left for the main loop to refuse once the task is joined.
     this->client_->protocol_task_->close_accepts();
     this->client_->protocol_task_->wake();
 }
@@ -982,9 +977,8 @@ uint32_t ConnectionManager::run_time_sync() {
         // activity is not a gate: pairing.md "Entering and leaving pairing" runs pairing
         // alongside playback, leaving streams open and their timeline unaffected, which a player
         // can only deliver with its time filter still converging. A connection whose transport
-        // is gone waits for its close to be processed. The one time-sync gate on the burst path:
-        // burst.loop() relies on it (is_operational() implies the hello handshake), and
-        // send_time_message() checks the transport again before it writes.
+        // is gone waits for its close to be processed. This is the burst path's only gate;
+        // send_time_message() rechecks the transport.
         if (conn == nullptr || !conn->is_operational() || !conn->is_connected()) {
             continue;
         }

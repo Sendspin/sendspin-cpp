@@ -331,10 +331,10 @@ public:
     void start();
 
     /// @brief Closes admission (ProtocolTask::close_accepts()) and wakes the protocol task.
-    /// Main loop, from stop() and ~SendspinClient, before ProtocolTask::stop(): the protocol
-    /// task's next tick, or its final one, then runs the shutdown pass (shutdown()) and refuses
-    /// every accept already queued with a goodbye, and a delivery from here on is refused at its
-    /// push, so its transport closes it without one.
+    /// Main loop, from stop(), ~SendspinClient and a failed start(), before ProtocolTask::stop():
+    /// the protocol task's next tick, or its final one, then runs the shutdown pass (shutdown())
+    /// and refuses every accept already queued with a goodbye, and a delivery from here on is
+    /// refused at its push, so its transport closes it without one.
     void close_admission();
 
     /// @brief The main-loop half of the shutdown, once the protocol task is joined: closes the

@@ -134,7 +134,6 @@ bool ProtocolTask::push_command(ProtocolCommand&& command) {
     bool accepts_closed = false;
     {
         std::lock_guard<std::mutex> lock(this->command_mutex_);
-        // Written only under this lock, so the read cannot straddle a close.
         accepts_closed = is_accept && !this->accepting_.load(std::memory_order_relaxed);
         const size_t others_queued = this->command_count_ - this->accepts_queued_;
         const bool has_room = is_accept
