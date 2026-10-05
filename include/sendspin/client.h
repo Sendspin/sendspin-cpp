@@ -869,8 +869,8 @@ private:
     /// sends each admitted connection its copy (publish_client_state()). Protocol task only.
     void adopt_client_state(ClientStateMessage&& snapshot);
 
-    /// @brief Whether the adopted client/state snapshot (adopt_client_state()) reports the client
-    /// available; false before the first one. Protocol task only.
+    /// @brief Whether the adopted client/state snapshot reports the client available; false before
+    /// the first is adopted (adopt_client_state()). Protocol task only.
     bool adopted_state_available() const;
 
     /// @brief Folds a group/update delta from the primary admitted connection into group_slot

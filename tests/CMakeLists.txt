@@ -159,9 +159,7 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # to show one holder's quota does not stop the other. The availability table reaches
 # SendspinClient's protocol_task_, build_client_state(), adopt_client_state(),
 # connection_manager_ (its install_admitted()) and process_binary_message(): the client is never
-# started, so the test thread publishes and adopts the client/state snapshot as start() and the
-# tick do, and delivers the chunk through the dispatcher's availability gate from a stand-in that
-# owns the player.
+# started, so the test publishes and adopts each snapshot and dispatches the chunk itself.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_json_arena.cpp reads SendspinArenaAllocator's base_, cap_ and offset_: where the bump

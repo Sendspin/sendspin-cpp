@@ -19,7 +19,7 @@
 /// races a background consumer: the encoded ring and the inbox hold whatever a handler put there.
 /// The binary audio chunk header is parsed directly too.
 
-#include "connection.h"  // PlayerOwnerConnection stands in for a real connection
+#include "connection.h"
 #include "connection_manager.h"
 #include "fake_persistence.h"
 #include "inbound_test_helpers.h"
@@ -343,8 +343,8 @@ std::vector<uint8_t> audio_chunk(uint8_t marker = 0xDE, int64_t server_timestamp
     return chunk;
 }
 
-// An admitted connection that owns the player, with every transport call inert: the receive
-// path's dispatch reaches the player only from such a connection.
+// An admitted player-owning connection with inert transport calls; dispatch reaches the player
+// only from one.
 class PlayerOwnerConnection : public SendspinConnection {
 public:
     void start() override {}
@@ -363,13 +363,9 @@ public:
 
 }  // namespace
 
-// roles/player/v1.md "Audio Chunks (Binary)": while the client is unavailable the player
-// discards incoming audio. The gate is the dispatcher's, on the client/state snapshot the
-// protocol task adopted, so a set_available() reaches it with the tick that adopts the snapshot
-// it publishes, not before. The client is never started, so set_available() publishes nothing;
-// the test thread publishes each snapshot as start() does, adopts it as the tick's step 3 does,
-// and delivers the chunk through process_binary_message() from a stand-in that owns the player
-// (install_admitted()).
+// roles/player/v1.md "Audio Chunks (Binary)": the player discards incoming audio while the
+// adopted client/state snapshot reports the client unavailable; a set_available() takes effect
+// only once its snapshot is adopted.
 TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
     struct Row {
         const char* name;

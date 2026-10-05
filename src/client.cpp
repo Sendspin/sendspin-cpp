@@ -216,9 +216,8 @@ struct SendspinClient::EventState {
 /// @brief Client-level state the protocol task owns
 struct SendspinClient::TaskState {
     /// The newest client/state snapshot the main loop published (publish_state()); each admitted
-    /// connection is sent its filtered copy (publish_client_state()), and its availability gates
-    /// player audio (adopted_state_available()). Protocol task only, and reset by stop() once the
-    /// task is joined.
+    /// connection is sent its filtered copy (publish_client_state()). Protocol task only, and
+    /// reset by stop() once the task is joined.
     std::optional<ClientStateMessage> client_state;
     /// High-performance acquires queued so far (request_high_performance()); the ticket of the
     /// latest one. Protocol task only.
