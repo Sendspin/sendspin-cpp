@@ -16,10 +16,11 @@ checklists in `.claude/skills/` apply these standards to a diff.
   belongs to the protocol task: the receive side (decrypt, reassembly, the
   handshake, dispatch, close handling), the lifecycle (hello, activation,
   admission, role ownership, pairing, watchdogs, time bursts) and every send
-  run there, so no connection state needs a lock. Any other thread reaches a
-  connection only by queueing a `ProtocolCommand`; a request that the full
-  queue refuses is reported to the caller (`send_text()` returns false) or
-  logged, never dropped silently. A connection refused at delivery is left with
+  run there, so no connection state needs a lock (the transport's own atomics
+  state their writer and reader at their declaration). Any other thread
+  reaches a connection only by queueing a `ProtocolCommand`; a request that
+  the full queue refuses is reported to the caller (`send_text()` returns
+  false) or logged, never dropped silently. A connection refused at delivery is left with
   the transport that delivered it, which releases it after the delivery
   returns (on ESP, with its httpd session), so no refusal destroys a connection
   inside the delivery. Payload validation and
@@ -46,7 +47,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   main loop is on. State the main loop *reads* goes through the Inbox instead.
   The values read by several threads without being consumed, the primary
   admitted connection's time filter and server information, sit in
-  `ConnectionManager`'s own slots behind leaf mutexes (`time_filter()`,
+  `ConnectionManager`'s own slot behind a leaf mutex (`time_filter()`,
   `server_information()`), written by the protocol task; a flag read the same
   way is a plain atomic.
 - Event producers push through `push_event_or_log()` rather than hand-rolling
@@ -55,6 +56,13 @@ checklists in `.claude/skills/` apply these standards to a diff.
   least a warning at the drop site. A site that can drop every message of a
   burst throttles it with `InboundDropLog`: one warning when the drops start,
   one with their count when they stop.
+- A consumer that holds items of the shared inbound ring holds them against a
+  quota of its own (`InboundQuota`), charged on the protocol task before the
+  item is handed over (the codec headers and stream markers the task writes
+  itself excepted): a holder over its quota has the new item dropped with
+  a warning, so no holder's backlog can starve another's, and a role's share
+  of the ring is part of the ring's derivation (`derive_inbound_ring_bytes()`)
+  rather than a separate buffer.
 - An event or a slot payload whose delivery must not survive its producer
   being torn down carries the producer's teardown generation and is checked
   against it at the drain (`push_event_or_log()` / `event_is_current()` for
@@ -81,7 +89,16 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - A protocol-task step has a bounded wait or none: the Noise DH operations, a
   ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, a transport send
   bounded by the transport's own send timeout, and at shutdown the goodbye
-  flush bounded by `GOODBYE_FLUSH_TIMEOUT_MS` per goodbye. Its tick returns the
+  flush bounded by `GOODBYE_FLUSH_TIMEOUT_MS` per goodbye. A released
+  outbound attempt still connecting, whose destructor would join its
+  transport for the rest of the connect, is closed without blocking and
+  parked in `ConnectionManager`'s reaping list until its transport reports
+  the close or its upgrade, or its deadline passes
+  (`SendspinClientConnection::CONNECT_TIMEOUT_MS`); a drop at the deadline, or
+  of the entry parked longest when the list is full, pays a join bounded by
+  what remains of the connect. Releasing a connection whose upgrade completed
+  pays the short stop of an open transport on the task (synchronous after a
+  goodbye). The task's tick returns the
   time to its earliest deadline, or `ProtocolTask::NO_DEADLINE`, and never
   wakes on a fixed period. A transport's wait on the task is bounded too: an
   admitted connection waits at most `INBOUND_ACQUIRE_TIMEOUT_MS` for ring space
@@ -91,8 +108,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - Every library lock is a leaf: it is held only to copy or update its own
   state, never across a call that takes another library lock, a send, a
   listener or the persistence provider, so the library has no lock order to
-  cite. The leaves are `ConnectionManager::time_filter_mutex_` and
-  `server_info_mutex_`, `RecordStore::mutex_`, the Inbox mutex, each
+  cite. The leaves are `ConnectionManager::published_mutex_`,
+  `RecordStore::mutex_`, the Inbox mutex, each
   `SendspinTimeFilter`'s `state_mutex_`, the inbound ring's, item lists' and
   protocol task command queue's own locks, `GoodbyeWait`'s, the artwork role's
   slot mutex, `ShadowSlot`'s and the ESP server's pending-upgrade mutex. A
@@ -119,7 +136,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
   differences live in `src/platform/`, `src/esp/`, and `src/host/`. Within
   the library, role compile-gates (`#ifdef SENDSPIN_ENABLE_*`) live only in
   `cmake/sources.cmake` and the dispatch points in
-  `include/sendspin/client.h` / `src/client.cpp`, and the codec gate
+  `include/sendspin/client.h`, `src/client.cpp` and `src/client_dispatch.cpp`,
+  and the codec gate
   `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`, and
   `src/player_role.cpp`; consumers, including the examples, guard their own
   role and codec usage (see Public API).
@@ -219,7 +237,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
   is the documented contract.
 - Tests assert on what a caller or peer can observe. Private state, queue
   contents, and which thread ran a step are reached only when no observable
-  outcome distinguishes the correct path, and the test says so.
+  outcome distinguishes the correct path, and the test says so. A test file
+  that reaches private members compiles with `-fno-access-control`, set on
+  that one translation unit in `tests/CMakeLists.txt` beside a comment naming
+  every member it reaches and why.
 - Elapsed time is never a pass/fail condition. A blocked call is proven by
   waiting with no timeout, by a value only the correct path can produce, or
   by a structural failure; hangs are caught by the suite watchdog and the

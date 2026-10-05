@@ -30,7 +30,7 @@ class SendspinClient;
 struct ClientHelloMessage;
 
 /// @brief Private implementation of the controller role
-struct ControllerRole::Impl {
+struct ControllerRole::Impl : RoleTeardown {
     explicit Impl(SendspinClient* client);
     ~Impl() = default;
 
@@ -59,16 +59,6 @@ struct ControllerRole::Impl {
     /// @brief Takes the slot, catches the role up on any teardown (complete_teardown()), then
     /// applies the taken state if it was admitted under the current generation. Main loop.
     void drain_events();
-    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
-    ///
-    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
-    /// runs, and stop()'s teardown on the main loop can land in between. Re-checking at each
-    /// point of effect invalidates the whole handler instead of only the part that ran before it.
-    /// The drain applies the same check to a slot payload's stamp.
-    /// @param generation The counter value captured when the message was admitted.
-    bool accepts(uint32_t generation) const {
-        return generation == this->cleanup_generation.load(std::memory_order_acquire);
-    }
 
     /// @brief Stops the role and discards the state the protocol task can reach. Protocol task,
     /// or the main loop in SendspinClient::stop() once every other thread is joined.
@@ -96,7 +86,6 @@ struct ControllerRole::Impl {
 
     // Struct fields
     ServerStateControllerObject controller_state{};
-    TeardownTracker teardown;  ///< Main loop only.
 
     // Pointer fields
     SendspinClient* client;
@@ -113,10 +102,6 @@ struct ControllerRole::Impl {
     /// loop wrote around it. Written on the main loop (drain_events(), complete_teardown()); read
     /// by send_command() on any thread.
     std::atomic<uint32_t> supported_commands{0};
-    /// @brief Teardown generation, bumped by cleanup() and re-checked at every point of effect
-    /// (see accepts()). Written on the protocol task (or the main loop in stop() once it is
-    /// joined); read on the main loop and by send_command() on any thread.
-    std::atomic<uint32_t> cleanup_generation{0};
 };
 
 }  // namespace sendspin

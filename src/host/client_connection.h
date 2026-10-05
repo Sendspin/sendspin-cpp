@@ -45,11 +45,19 @@ public:
     /// an outbound upgrade may legitimately be slow (a proxy, a busy server; see
     /// ConnectionLifecycle.SlowOutboundSurvivesUpgradeTier), so it gets the whole window rather
     /// than the inbound server's 3 s, and the nursery reaps it at that same deadline anyway. It is
-    /// also the bound on stop() for a connection whose upgrade is in flight: IXWebSocket clears
-    /// its cancellation flag when it enters the handshake, so a close() that lands between start()
-    /// and that point is forgotten and the destructor's ix::WebSocket::stop() waits for the
+    /// also the bound on the destructor for a connection whose upgrade is in flight:
+    /// IXWebSocket clears its cancellation flag when it enters the handshake, so a close() that
+    /// lands between start() and that point is forgotten and ix::WebSocket::stop() waits for the
     /// handshake to finish or time out (IXWebSocket's own default is 60 s).
     static constexpr int HANDSHAKE_TIMEOUT_SECS = 30;
+
+    /// @brief How long a released connection stays parked for reaping before it is dropped with
+    /// its transport still open (ReapEntry in connection_manager.h): the handshake timeout, by
+    /// when IXWebSocket has given the attempt up, since the release does not cancel an attempt
+    /// that has not opened (see close_transport_now()). A handshake that began after the release
+    /// runs a little past it, which the destructor's join then pays.
+    static constexpr uint32_t CONNECT_TIMEOUT_MS =
+        static_cast<uint32_t>(HANDSHAKE_TIMEOUT_SECS) * 1000U;
 
     /// @brief Constructs a client connection to the given WebSocket URL
     explicit SendspinClientConnection(std::string url);
@@ -63,7 +71,10 @@ public:
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
     /// @brief Closes the transport immediately without blocking (see base class doc comment).
-    /// Safe to call from IX's own worker thread, unlike disconnect() -> ws_->stop().
+    /// Safe to call from IX's own worker thread, unlike disconnect() -> ws_->stop(). An attempt
+    /// whose upgrade has not completed is left running: IXWebSocket's close() can wait out its
+    /// handshake then, so the attempt ends on its own (its failure reports the close), is closed
+    /// by the Open handler if it opens, or is stopped by the destructor.
     void close_transport_now() override;
 
     /// @brief Sends a text message to the server

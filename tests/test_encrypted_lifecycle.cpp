@@ -523,8 +523,9 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
 // server out of band (a pairing token; see crypto/pairing_token.h), so the server's initial
 // handshake resolves it directly to PskCategory::PAIRING (spec: "pairing.method MUST be
 // 'pairing_psk' if and only if the matched PSK IS the Pairing PSK". The client enforces this via
-// ConnectionManager::loop()'s pairing-method admissibility check, so a fake server that selected
-// pairing_psk over a Sentinel-matched connection is correctly rejected as method_not_supported).
+// ConnectionManager::on_server_activate()'s pairing-method admissibility check, so a fake server
+// that selected pairing_psk over a Sentinel-matched connection is correctly rejected as
+// method_not_supported).
 // The client generates a fresh long-term PSK client-side (CSPRNG) and sends it via
 // client/pair-finalize, the server acks, the client persists the record, and then, exactly like a
 // real server immediately rekeying onto the new PSK, the fake server triggers an in-band
@@ -614,9 +615,9 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     EXPECT_EQ(committed_at_success->psk_id, server.learned_psk_id().value());
 
     // The application must see the exchange begin before it sees it end. The ordering is
-    // structural (ConnectionManager::loop() swaps pending events out before draining lifecycle
-    // events, and SendspinClient::loop() drains the whole note batch each tick), so pin it here
-    // to catch a future reordering of either drain.
+    // structural (the protocol task queues the notes in the order the exchange runs, and
+    // SendspinClient::loop() drains the whole note batch each tick), so pin it here to catch a
+    // future reordering of either.
     ASSERT_TRUE(listener.pairing_started_seq().has_value());
     ASSERT_TRUE(listener.pairing_succeeded_seq().has_value());
     EXPECT_LT(listener.pairing_started_seq().value(), listener.pairing_succeeded_seq().value())
@@ -1108,7 +1109,8 @@ TEST(EncryptedLifecycle, ControllerCommandsNeedAnOfferedCommandAndItsParameter) 
 
     std::vector<std::string> expected;
     for (const Row& row : rows) {
-        controller.send_command(row.cmd);
+        EXPECT_EQ(controller.send_command(row.cmd), row.sent_as != nullptr)
+            << "the refusal must reach the caller: " << to_cstr(row.cmd.command);
         if (row.sent_as != nullptr) {
             expected.emplace_back(row.sent_as);
         }
@@ -1872,11 +1874,11 @@ public:
     void deliver(SendspinConnection& conn, const std::string& json) {
         // A complete message off a transport proves the peer alive (end_inbound_message()),
         // and the protocol tick's liveness scan reaps an admitted connection whose last arrival
-        // is older than the timeout. Handing the JSON straight to the dispatch entry point skips the stamp, so
-        // do it here rather than stubbing the tick out.
+        // is older than the timeout. Handing the JSON straight to the dispatch entry point skips
+        // the stamp, so do it here rather than stubbing the tick out.
         conn.last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                          std::memory_order_relaxed);
-        this->client_storage->process_json_message(&conn, json.data(), json.size(),
+        this->client_storage->process_json_message(conn, json.data(), json.size(),
                                                    platform_time_us());
     }
 
@@ -1928,7 +1930,9 @@ public:
 // any peer on the network can reach handshake-complete and sit in the nursery; whether its PSK
 // category may drive playback is decided by admission when server/activate arrives. Without the
 // gate, a peer could drive the roles by sending traffic ahead of server/activate, or never
-// sending one, for the whole nursery establish window.
+// sending one, for the whole nursery establish window. Control: the role traffic the server
+// sends right behind the activation that admits the connection is applied (a controller state,
+// so it cannot coalesce with the refused metadata and hide it).
 TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     SendspinClientConfig config;
     config.name = "Pre-Admission Role Traffic Test Client";
@@ -1947,6 +1951,14 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     };
     RecordingMetadataListener metadata_listener;
     client.add_metadata().set_listener(&metadata_listener);
+    struct RecordingControllerListener : ControllerRoleListener {
+        std::optional<uint8_t> volume;
+        void on_controller_state(const ServerStateControllerObject& state) override {
+            this->volume = state.volume;
+        }
+    };
+    RecordingControllerListener controller_listener;
+    client.add_controller().set_listener(&controller_listener);
 
     ASSERT_TRUE(bundle.start());
 
@@ -1956,12 +1968,18 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     // it while the connection is handshake-complete but still unadmitted.
     options.pre_activate_message =
         R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Pre-Admission Leak"}}})";
+    options.post_activate_message =
+        R"({"type":"server/state","payload":{"controller":{"supported_commands":[],"volume":37,)"
+        R"("muted":false}}})";
     FakeEncryptedServer server(server_url(PREADMISSION_ROLE_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                bundle.peer.record.psk_id, bundle.peer.psk, options);
 
-    pump_until(client, [&] { return client.is_connected(); });
-
+    // The state behind the activate arrives with no client message in between; a gate that
+    // dropped it leaves this waiting for the suite watchdog to name.
+    pump_until(client, [&] { return controller_listener.volume.has_value(); });
+    EXPECT_EQ(controller_listener.volume.value_or(0), 37);
+    pump_for(client, 20);
     // The pre-activate server/state must have been dropped on the floor.
     EXPECT_EQ(metadata_listener.updates, 0)
         << "Role traffic from an unadmitted connection reached the metadata role (last_title='"
@@ -2007,7 +2025,7 @@ TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
     HoldTestConnection unsolicited;
 
     auto deliver = [&client](SendspinConnection& conn, const std::string& json) {
-        client.process_json_message(&conn, json.data(), json.size(), platform_time_us());
+        client.process_json_message(conn, json.data(), json.size(), platform_time_us());
     };
     auto time_reply = [](int64_t echo) {
         return R"({"type":"server/time","payload":{"client_transmitted":)" +
@@ -2444,9 +2462,9 @@ public:
 // stream and send its binary data, and the client drops binary from a connection that is not
 // admitted yet. A state sent before the connection is installed in the admitted slot would invite
 // an artwork announce into that gap; the announce is dropped and the part behind it is a malformed
-// sequence the role closes the connection on. A first activate that selects pairing alone still carries active roles on a
-// playback-capable connection (messaging.md "server/activate"), and those are owed the initial
-// state as well.
+// sequence the role closes the connection on. A first activate that selects pairing alone still
+// carries active roles on a playback-capable connection (messaging.md "server/activate"), and
+// those are owed the initial state as well.
 //
 // Driven through the protocol task's own tick from the nursery, so the order under test is the
 // one a real promotion runs. The stand-in sends inline, which makes "was it admitted when the state
@@ -2518,13 +2536,14 @@ public:
     std::optional<SendspinGoodbyeReason> goodbye;
 };
 
-// The protocol tick's liveness scan reads the admitted connection's last-arrival stamp: a connection whose
-// last arrival is older than the timeout is dropped with a restart goodbye (messaging.md
-// "client/goodbye"), and one heard from just now stays current. The stamp is set directly rather
-// than aged by waiting, and the timeout is the manager's own, default-derived and tens of seconds,
-// so no scheduling stall can age the control row past it. The stand-in is promoted from the
-// nursery by a real tick, so it holds the slot the way an established connection does; as a
-// Sentinel-category playback connection it is admissible only with unpaired access on.
+// The protocol tick's liveness scan reads the admitted connection's last-arrival stamp: a
+// connection whose last arrival is older than the timeout is dropped with a restart goodbye
+// (messaging.md "client/goodbye"), and one heard from just now stays current. The stamp is set
+// directly rather than aged by waiting, and the timeout is the manager's own, default-derived and
+// tens of seconds, so no scheduling stall can age the control row past it. The stand-in is
+// promoted from the nursery by a real tick, so it holds the slot the way an established
+// connection does; as a Sentinel-category playback connection it is admissible only with unpaired
+// access on.
 TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
     struct Row {
         const char* label;
@@ -2960,7 +2979,7 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
     const std::string playing = R"({"type":"group/update","payload":{"playback_state":"playing"}})";
     conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                       std::memory_order_relaxed);
-    client.process_json_message(conn.get(), playing.data(), playing.size(), platform_time_us());
+    client.process_json_message(*conn, playing.data(), playing.size(), platform_time_us());
     // Two ticks: a write requested by the group drain would land on the tick after it.
     tick(client);
     tick(client);
@@ -3362,16 +3381,15 @@ private:
 
 }  // namespace
 
-// The lifecycle handlers change RAM under conn_ptr_mutex_ and leave the provider write to
-// SendspinClient::flush_pending_persistence(), which holds no lock. Consumer threads reading the
-// connection and the protocol task's server/pair-finalize handler take the same mutex, and on ESP
-// the write is an NVS commit that stalls code running from flash for tens of milliseconds.
-//
-// The provider above holds that whole window open inside the persist_records() the flush after
-// the first activate performs.
-// A get_server_information() issued in the window must still return. It is waited on with no timeout, so a regression hangs rather than turning a
-// loaded runner into a failure, and the watchdog in tests/main.cpp names the test.
-TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
+// The persistence provider is called only from the main loop (flush_pending_persistence()), and on
+// ESP its write is an NVS commit that stalls code running from flash for tens of milliseconds, so
+// connection work must not wait for it. The provider above parks the main loop inside the
+// persist_records() the flush after the first activate performs; while it is parked, the server
+// information the protocol task published reads back the admitted server, and a disconnect
+// requested from another thread still reaches the peer as a goodbye. Both waits have no timeout:
+// a regression hangs rather than turning a loaded runner into a failure, and the watchdog in
+// tests/main.cpp names the test.
+TEST(EncryptedLifecycle, ASlowRecordWriteDoesNotStallTheProtocolTask) {
     PairedPeer peer = make_paired_peer();
     TestNetworkProvider network;
     BlockingRecordWriteProvider persistence(peer.record);
@@ -3385,7 +3403,7 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     ASSERT_TRUE(client.start());
 
     // The main loop runs on its own thread from here: it is the thread that parks in the write,
-    // so the probe below has to be a different one.
+    // so the requests below come from a different one.
     std::atomic<bool> pumping{true};
     std::thread main_loop([&] {
         while (pumping.load(std::memory_order_acquire)) {
@@ -3399,24 +3417,18 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
                                peer.record.psk_id, peer.psk);
     persistence.wait_until_entered();
 
-    std::promise<void> probed;
-    std::future<void> probed_future = probed.get_future();
-    std::thread probe([&] {
-        (void)client.get_server_information();
-        probed.set_value();
-    });
-
-    // The provider is still parked here, so a current_shared() that waits on the manager lock
-    // hangs on this get().
-    probed_future.get();
-    probe.join();
+    // The provider stays parked until release() below.
+    const auto info = client.get_server_information();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->server_id, peer.server_identity.peer_id());
+    client.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+    wait_until([&] { return server.goodbye_reason().has_value(); });
+    EXPECT_EQ(server.goodbye_reason().value_or(""), "user_request");
 
     persistence.release();
     pumping.store(false, std::memory_order_release);
     main_loop.join();
-
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-    pump_for(client, 100);
+    client.stop();
 }
 
 // pairing.md "Unpaired Access" on one live client. Turning the setting on restarts an idle

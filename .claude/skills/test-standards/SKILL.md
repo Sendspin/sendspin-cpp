@@ -56,7 +56,11 @@ during this review.
 - Allowed test-side techniques: tests are white-box and include private
   headers from `src/`; a fixture may construct and drive a role's `Impl`
   directly (`tests/test_artwork_role.cpp`); connection tests use real
-  loopback sockets (`tests/test_connection_lifecycle.cpp`).
+  loopback sockets (`tests/test_connection_lifecycle.cpp`); a test file that
+  reaches private members compiles with `-fno-access-control`, set on that
+  translation unit in `tests/CMakeLists.txt` beside a comment naming each
+  member it reaches and why. A test that reaches a private member the
+  comment does not name is a finding.
 
 ## Mutation survival
 

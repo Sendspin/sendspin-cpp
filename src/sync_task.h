@@ -69,6 +69,9 @@ struct SyncContext {
     /// storage it was received and decrypted into, or a codec header or stream/clear marker the
     /// protocol task wrote. Returned to the ring once processed.
     void* encoded_item{nullptr};
+    /// The next stream's codec header, taken while the stream a stream/end had already ended was
+    /// still active; IDLE starts from it (load_next_chunk(), wait_for_codec_header()).
+    void* next_header{nullptr};
 
     // 64-bit fields
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
@@ -81,6 +84,9 @@ struct SyncContext {
 
     // 32-bit fields
     uint32_t buffered_frames{0};
+
+    // 16-bit fields
+    uint16_t active_ordinal{0};  // Ordinal of the codec header the active stream started on
 
     // 8-bit fields
     bool hard_syncing{true};  // Starts true so initial sync uses tight settle threshold
@@ -98,11 +104,11 @@ enum EventGroupBits : uint16_t {
     COMMAND_STOP = (1 << 0),          // Signal task to stop
     COMMAND_STREAM_END = (1 << 1),    // Signal end of current stream
     COMMAND_STREAM_CLEAR = (1 << 2),  // Seek: discard buffered audio up to the clear marker
-    COMMAND_START = (1 << 3),         // Signal stream start acknowledged
-    TASK_RUNNING = (1 << 8),          // Task is actively processing a stream
-    TASK_STOPPED = (1 << 10),         // Task thread has exited
-    TASK_ERROR = (1 << 11),           // Task encountered a fatal error
-    TASK_IDLE = (1 << 12),            // Task is idle, waiting for a new stream
+    COMMAND_START = (1 << 3),  // Wake: a stream start was acknowledged (see started_ordinal_)
+    TASK_RUNNING = (1 << 8),   // Task is actively processing a stream
+    TASK_STOPPED = (1 << 10),  // Task thread has exited
+    TASK_ERROR = (1 << 11),    // Task encountered a fatal error
+    TASK_IDLE = (1 << 12),     // Task is idle, waiting for a new stream
 };
 
 /// @brief Self-contained sync task for Sendspin synchronized audio playback
@@ -144,31 +150,10 @@ public:
         return this->event_flags_.is_created();
     }
 
-    /// @brief Whether the item list is bound to a ring (between start() and stop()), so the
-    /// protocol task may hand it items. Protocol task.
-    bool accepts_items() const {
-        return this->ring_.load(std::memory_order_acquire) != nullptr;
-    }
-
-    /// @brief The ring the item list is bound to, or nullptr outside a run. Protocol task.
-    InboundRing* ring() const {
-        return this->ring_.load(std::memory_order_acquire);
-    }
-
-    /// @brief Charges an item to the player's quota and appends it to the item list, waking the
-    /// thread. Protocol task only; requires accepts_items().
-    /// @param item_len The item's message length (see InboundMessage::item_len).
-    /// @return false, appending nothing, when the player is over quota: the caller returns the
-    ///         item and logs the drop.
-    bool hand_item(void* item, size_t item_len) {
-        return hand_inbound_item(*this->ring(), this->encoded_items_, InboundHolder::PLAYER, item,
-                                 item_len);
-    }
-
-    /// @brief Returns every item the thread has not taken yet to the ring. Protocol task, or the
-    /// main loop once the thread is joined.
-    void recall_items() {
-        this->encoded_items_.recall();
+    /// @brief The player's end of the inbound ring: the protocol task hands the thread encoded
+    /// chunks, codec headers and markers through it, bound to the ring between start() and stop()
+    InboundConsumer& inbound() {
+        return this->inbound_;
     }
 
     /// @brief Whether the sync task is actively decoding and syncing a stream; false when idle
@@ -183,9 +168,11 @@ public:
     }
 
     /// @brief Signals the sync task to end the current stream. Non-blocking
-    /// The task drains stale audio from its item list and returns to idle.
-    /// Thread-safe: may be called from any context.
-    void signal_stream_end();
+    /// The task drains stale audio from its item list and returns to idle, and from then on
+    /// discards a codec header numbered `ordinal` or earlier: those streams have ended.
+    /// Protocol task, or the main loop once it is joined (the one writer of ended_ordinal_).
+    /// @param ordinal The stream ordinal of the latest codec header the player handed over.
+    void signal_stream_end(uint16_t ordinal);
 
     /// @brief Signals the sync task that a stream/clear (seek) occurred. Non-blocking
     /// The task discards buffered audio up to the CHUNK_TYPE_STREAM_CLEAR_MARKER that the caller
@@ -194,13 +181,10 @@ public:
     /// Thread-safe: may be called from any context.
     void signal_stream_clear();
 
-    /// @brief Signals the sync task that the client has processed the stream start
-    /// The sync task waits for this after finding a codec header before transitioning
-    /// to the active state, so the client's stream lifecycle callbacks
-    /// (end/clear -> start) fire before the task begins decoding. A start that finds no codec
-    /// header pending is stale: the task clears it on its way back to idle.
-    /// Thread-safe: may be called from any context.
-    void signal_stream_start();
+    /// @brief Acknowledges the start of stream `ordinal` once the main loop has fired its
+    /// on_stream_start() (docs/internals.md, "Stream End and Start"). Main loop.
+    /// @param ordinal The ordinal the STREAM_START event carried (InboxEvent::serial).
+    void signal_stream_start(uint16_t ordinal);
 
     /// @brief The ChunkType of an item on the list (InboundItemHeader::type)
     static ChunkType chunk_type(void* item) {
@@ -264,19 +248,13 @@ protected:
     bool transfer_audio(SyncContext& sync_context);
 
     /// @brief Loads the next encoded chunk from the item list
-    /// Returns true if a chunk is available, false if none ready yet.
+    /// Returns true if a chunk is available, false if none ready yet or the item taken was a
+    /// later stream's codec header, kept in `sync_context.next_header`.
     bool load_next_chunk(SyncContext& sync_context);
 
-    /// @brief Takes the next item from the list, returning to the ring any whose teardown
-    /// generation the player has moved past (it was appended for a stream a teardown ended)
-    /// @param timeout_ms As InboundItemList::take(), applied to the first take only.
-    /// @return The item, or nullptr: treat it as "re-check state and retry".
+    /// @brief Takes the next item of the player's current teardown generation
+    /// (InboundConsumer::take()). Sync thread.
     void* take_item(uint32_t timeout_ms);
-
-    /// @brief Returns an item to the ring
-    void return_item(void* item) const {
-        this->ring()->return_item(item);
-    }
 
     /// @brief Removes last decoded frame, blending into the second-to-last to minimize glitches
     /// Returns -1 if a frame was removed, 0 if preconditions not met.
@@ -295,17 +273,26 @@ protected:
     /// `sync_context`.
     static bool decode_whole_chunk(SyncContext& sync_context);
 
-    /// @brief Waits in IDLE for a codec header to arrive on the item list
-    /// Discards stale audio chunks. Returns true if a codec header was found. Returns false when
-    /// COMMAND_STOP, COMMAND_STREAM_END or COMMAND_STREAM_CLEAR was signaled, or COMMAND_START
-    /// with no codec header pending (a start for a stream this task already left).
+    /// @brief Waits in IDLE for a pending codec header (is_pending_header()), starting from
+    /// `sync_context.next_header` and discarding everything else
+    /// @return true with the header in `sync_context.encoded_item`; false on COMMAND_STOP,
+    ///         COMMAND_STREAM_END or COMMAND_STREAM_CLEAR, or a COMMAND_START with no header
+    ///         pending.
     bool wait_for_codec_header(SyncContext& sync_context);
 
-    /// @brief Non-blocking drain of audio data from the item list, preserving codec headers
-    void drain_items(SyncContext& sync_context);
+    /// @brief WAIT FOR CLIENT ACK (docs/playback-sync.md) on the header `encoded_item` holds;
+    /// applies a stream/clear in place
+    /// @return true once acknowledged; false on COMMAND_STOP or COMMAND_STREAM_END.
+    bool wait_for_start_acknowledgement(SyncContext& sync_context);
 
-    /// @brief Handles a stream/clear (seek) while a stream is active: discards queued chunks
-    /// up to (and including) the CHUNK_TYPE_STREAM_CLEAR_MARKER, then applies apply_stream_clear()
+    /// @brief Whether `item` is a codec header for a stream that has not ended: a header
+    /// numbered no later than ended_ordinal_ belongs to a stream whose stream/end the task may
+    /// already have consumed before taking the header.
+    bool is_pending_header(void* item) const;
+
+    /// @brief Handles a stream/clear (seek): discards queued chunks up to (and including) the
+    /// CHUNK_TYPE_STREAM_CLEAR_MARKER, keeping the newest pending codec header in
+    /// `encoded_item`, then applies apply_stream_clear()
     void discard_to_clear_marker(SyncContext& sync_context);
 
     /// @brief Drops in-flight decoded audio and pending silence (they carry the pre-seek timeline),
@@ -314,6 +301,10 @@ protected:
     /// sync logic re-align on its own. The caller re-enters the loop at INITIAL_SYNC so unfinished
     /// priming resumes.
     void apply_stream_clear(SyncContext& sync_context);
+
+    /// @brief Leaves `encoded_item` empty on the way to IDLE: a still-pending codec header moves
+    /// to `next_header` for IDLE to start from, anything else goes back to the ring
+    void release_held_item(SyncContext& sync_context);
 
     /// @brief Resets SyncContext between streams without deallocating buffers
     void reset_context(SyncContext& sync_context);
@@ -329,16 +320,20 @@ protected:
     ShadowSlot<PlaybackProgress> playback_progress_slot_;
     std::thread sync_thread_;
 
-    /// The encoded chunks and markers the protocol task hands the thread (appended on the
-    /// protocol task, taken on the sync thread; recalled on the protocol task or, once the thread
-    /// is joined, on the main loop). No storage of its own: it links ring items.
-    InboundItemList encoded_items_;
+    /// See inbound(); InboundConsumer states its threads.
+    InboundConsumer inbound_;
 
     // Pointer fields
     PlayerRole::Impl* player_impl_{nullptr};
-    /// The ring the item list is bound to for the current run, or nullptr outside one. Written by
-    /// start() and stop() on the main loop, read by the protocol task and the sync thread.
-    std::atomic<InboundRing*> ring_{nullptr};
+
+    // 16-bit fields
+    /// The stream ordinal the main loop last acknowledged (signal_stream_start()). Written on the
+    /// main loop before COMMAND_START is set; read on the sync thread after it clears the bit.
+    std::atomic<uint16_t> started_ordinal_{0};
+    /// The latest stream ordinal a stream/end or a teardown ended (signal_stream_end()). Written
+    /// on the protocol task, or the main loop once it is joined, before COMMAND_STREAM_END is
+    /// set; read on the sync thread.
+    std::atomic<uint16_t> ended_ordinal_{0};
 };
 
 }  // namespace sendspin

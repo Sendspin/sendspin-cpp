@@ -156,23 +156,15 @@ void MetadataRole::Impl::apply_due_state() {
 }
 
 void MetadataRole::Impl::drain_events() {
-    // Taken before the catch-up: a teardown that ran before the take is caught up below (its
-    // clear fires first) and drops a payload stamped before it; one that runs after the take is
-    // caught up by the next drain, behind what this drain applies.
     PendingMetadataStates taken;
-    uint32_t stamp = 0;
-    bool have_taken = this->event_state->slot.take(taken, stamp);
-    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
-    catch_up_teardown(*this, generation);
+    bool have_taken = false;
+    const uint32_t generation =
+        take_current_payload(*this, this->event_state->slot, taken, have_taken, TAG, "metadata");
     // Every check below against `generation` also catches a listener callback that re-entered
     // teardown (a listener calling stop()): its cleanup() moved the generation on, and its own
     // drain already reset this role.
     if (!this->accepts(generation)) {
         return;
-    }
-    if (have_taken && stamp != generation) {
-        SS_LOGD(TAG, "Dropping metadata queued before the role was torn down");
-        have_taken = false;
     }
 
     // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex;
@@ -215,8 +207,6 @@ void MetadataRole::Impl::cleanup() {
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();
 
-    // Stamped so the drain runs complete_teardown() for this generation before it applies
-    // anything the next connection sends.
     push_event_or_log(this->inbox, InboxEventType::METADATA_CLEARED, 0, TAG,
                       "metadata cleared event", generation);
 }

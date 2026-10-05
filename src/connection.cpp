@@ -24,7 +24,6 @@
 #include "time_filter.h"
 
 #include <algorithm>
-#include <cinttypes>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -36,6 +35,9 @@
 namespace sendspin {
 
 static const char* const TAG = "sendspin.connection";
+
+/// What acquire_drop_log_'s run reports.
+static const char* const DROPPED_MESSAGES = "messages for want of inbound space";
 
 // ============================================================================
 // Constructor / Destructor
@@ -52,9 +54,7 @@ SendspinConnection::SendspinConnection() {
 SendspinConnection::~SendspinConnection() {
     // The last reference is gone, so no transport callback can still run on this connection:
     // the drop log is this thread's now, and no delivery will end its run.
-    if (const uint32_t dropped = this->acquire_drop_log_.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Dropped %" PRIu32 " messages for want of inbound ring space", dropped);
-    }
+    this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
 }
 
 // ============================================================================
@@ -346,7 +346,7 @@ void SendspinConnection::dispatch_complete_noise_message(InboundMessage& message
         }
         if (this->on_json_message_cb) {
             this->on_json_message_cb(
-                this, reinterpret_cast<const char*>(message.data + 1), message.len - 1,
+                *this, reinterpret_cast<const char*>(message.data + 1), message.len - 1,
                 widen_time_stamp_us(message.receive_time_us, platform_time_us()));
         }
         return;
@@ -354,7 +354,7 @@ void SendspinConnection::dispatch_complete_noise_message(InboundMessage& message
 
     // All other types: route as binary role message (full type-prefixed plaintext).
     if (this->on_binary_message_cb) {
-        this->on_binary_message_cb(this, message);
+        this->on_binary_message_cb(*this, message);
     }
 }
 
@@ -453,7 +453,9 @@ SS_HOT void SendspinConnection::process_inbound_message(InboundMessage& message)
 }
 
 bool SendspinConnection::pending_message(InboundMessage& out) {
-    if (!this->inbound_gate_.has_pending_message()) {
+    // The transport writes nothing while a message is pending, so the in-flight count only falls
+    // until the ring pass has taken every item written before it.
+    if (!this->inbound_gate_.has_pending_message() || this->inbound_gate_.in_flight() != 0) {
         return false;
     }
     // The acquire load above orders these reads after the transport's writes before its publish.
@@ -518,7 +520,7 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
     }
 
     if (!this->inbound_gate_.is_admitted()) {
-        if (!InboundGate::pre_admission_message_fits(len)) {
+        if (len > InboundGate::PRE_ADMISSION_MESSAGE_BYTES) {
             SS_LOGW(TAG, "Pre-admission message of %zu bytes exceeds the %zu-byte cap; closing",
                     len, InboundGate::PRE_ADMISSION_MESSAGE_BYTES);
             this->fail_inbound();
@@ -528,21 +530,7 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
         if (len == 0) {
             return {nullptr, InboundRoute::DROP};
         }
-        const InboundRoute waited = this->wait_until_writable();
-        if (waited != InboundRoute::RECEIVE) {
-            return {nullptr, waited};
-        }
-        if (this->fallback_buf_.size() < len &&
-            !this->fallback_buf_.allocate(len, this->fallback_location_)) {
-            SS_LOGE(TAG, "Failed to allocate %zu bytes for a pre-admission message; closing", len);
-            this->fail_inbound();
-            return {nullptr, InboundRoute::CLOSE};
-        }
-        this->fallback_len_ = len;
-        this->fallback_kind_ = kind;
-        this->fallback_receive_time_us_ = stamp;
-        this->inbound_to_fallback_ = true;
-        return {this->fallback_buf_.data(), InboundRoute::RECEIVE};
+        return this->route_to_fallback(len, kind, stamp, /*admitted=*/false);
     }
 
     if (len > INBOUND_MAX_MESSAGE_BYTES) {
@@ -550,6 +538,14 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
                 INBOUND_MAX_MESSAGE_BYTES);
         this->fail_inbound();
         return {nullptr, InboundRoute::CLOSE};
+    }
+    // Longer than any message the enabled roles need in a ring item, which the ring is sized for
+    // (InboundRing::max_message_bytes(); without the artwork role or a large player buffer that
+    // is a JSON message): delivered through the fallback buffer, in order with this connection's
+    // ring items (see InboundGate). The rare path; the buffer is allocated for it and released at
+    // the next ring write.
+    if (len > this->inbound_ring_->max_message_bytes()) {
+        return this->route_to_fallback(len, kind, stamp, /*admitted=*/true);
     }
     // A pre-admission message still pending from before the admission holds every later write
     // back, so the protocol task sees this connection's messages in order.
@@ -562,17 +558,17 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
     void* item = this->inbound_ring_->acquire(len, INBOUND_ACQUIRE_TIMEOUT_MS);
     if (item == nullptr) {
         this->inbound_gate_.abandon_ring_write();
-        // Throttled: see InboundDropLog. Reclamation is in ring order, so with the player
-        // holding audio the space behind its oldest chunk is what ran out (see
+        // Throttled: see InboundDropLog. Reclamation is in ring order, so with the player or the
+        // visualizer holding items the space behind the oldest of them is what ran out (see
         // derive_inbound_ring_bytes()): said so, to tell that limit from a stalled protocol task.
         if (this->acquire_drop_log_.note_drop()) {
-            const size_t held_audio =
-                this->inbound_ring_->quota(InboundHolder::PLAYER).outstanding();
-            if (held_audio > 0) {
+            const size_t held = this->inbound_ring_->quota(InboundHolder::PLAYER).outstanding() +
+                                this->inbound_ring_->quota(InboundHolder::VISUALIZER).outstanding();
+            if (held > 0) {
                 SS_LOGW(TAG,
                         "No inbound ring space for a %zu-byte message within %u ms: ring pinned "
-                        "behind held audio (%zu bytes held); dropping until there is",
-                        len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), held_audio);
+                        "behind held items (%zu bytes held); dropping until there is",
+                        len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), held);
             } else {
                 SS_LOGW(TAG,
                         "No inbound ring space for a %zu-byte message within %u ms; dropping "
@@ -582,15 +578,51 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
         }
         return {nullptr, InboundRoute::DROP};
     }
-    if (const uint32_t dropped = this->acquire_drop_log_.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Dropped %" PRIu32 " messages for want of inbound ring space", dropped);
-    }
+    this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
     InboundItemHeader* header = inbound_item_header(item);
     header->connection_id = static_cast<uint32_t>(this->instance_id);
     header->receive_time_us = stamp;
     header->kind = kind;
     this->inbound_item_ = item;
     return {inbound_item_bytes(item), InboundRoute::RECEIVE};
+}
+
+SendspinConnection::InboundTarget SendspinConnection::route_to_fallback(size_t len,
+                                                                        InboundKind kind,
+                                                                        uint32_t stamp,
+                                                                        bool admitted) {
+    if (admitted) {
+        // An admitted connection's message waits for the buffer no longer than one waits for
+        // ring space, and is dropped rather than the connection closed, as a full ring drops it.
+        if (!this->inbound_gate_.wait_until_writable(INBOUND_ACQUIRE_TIMEOUT_MS)) {
+            if (!this->inbound_gate_.is_detached() && this->acquire_drop_log_.note_drop()) {
+                SS_LOGW(TAG,
+                        "Fallback buffer still holds the previous message after %u ms; dropping "
+                        "a %zu-byte message until it is free",
+                        static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), len);
+            }
+            return {nullptr, InboundRoute::DROP};
+        }
+    } else {
+        const InboundRoute waited = this->wait_until_writable();
+        if (waited != InboundRoute::RECEIVE) {
+            return {nullptr, waited};
+        }
+    }
+    if (this->fallback_buf_.size() < len &&
+        !this->fallback_buf_.allocate(len, this->fallback_location_)) {
+        SS_LOGE(TAG, "Failed to allocate %zu bytes for a fallback message; closing", len);
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
+    }
+    if (admitted) {
+        this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
+    }
+    this->fallback_len_ = len;
+    this->fallback_kind_ = kind;
+    this->fallback_receive_time_us_ = stamp;
+    this->inbound_to_fallback_ = true;
+    return {this->fallback_buf_.data(), InboundRoute::RECEIVE};
 }
 
 SendspinConnection::InboundRoute SendspinConnection::wait_until_writable() {
@@ -739,8 +771,8 @@ void SendspinConnection::end_inbound_fragment(size_t len, bool last) {
         return;
     }
     if (this->inbound_item_ == nullptr) {
-        // The admission flag cleared in between and the message went to the fallback buffer it
-        // is already in.
+        // Routed to the fallback buffer it is already in: longer than the ring takes, or the
+        // admission flag cleared in between.
         this->end_inbound_message(true);
         return;
     }

@@ -472,6 +472,10 @@ struct FakeEncryptedServerOptions {
     // server/activate: while the connection has finished the Noise handshake but has not
     // yet been admitted. Used to prove role-bound traffic is refused until admission.
     std::optional<std::string> pre_activate_message;
+    // When set, this raw JSON message is sent (encrypted) immediately AFTER the first
+    // server/activate, with no client message in between: role traffic a server sends right
+    // behind the activation that admits the connection.
+    std::optional<std::string> post_activate_message;
     // When true, no server/activate is ever sent. The connection completes the Noise handshake
     // (so its psk_id/category are resolved) and the hello exchange, but never proves itself, so
     // it stays in the nursery instead of being promoted.
@@ -798,6 +802,9 @@ private:
                 this->send_encrypted_locked(this->options_.pre_activate_message.value());
             }
             this->send_activate_locked();
+            if (this->options_.post_activate_message.has_value()) {
+                this->send_encrypted_locked(this->options_.post_activate_message.value());
+            }
             return;
         }
 

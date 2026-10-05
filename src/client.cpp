@@ -23,13 +23,11 @@
 #include "inbox.h"
 #include "pairing_offers.h"
 #include "platform/base64.h"
-#include "platform/compiler.h"
 #include "platform/crypto.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/network_info.h"
-#include "platform/time.h"
 #include "record_store.h"
 #include "teardown_tracker.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -54,7 +52,6 @@
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 #include "visualizer_role_impl.h"
 #endif
-#include <ArduinoJson.h>
 
 #include <algorithm>
 #include <utility>
@@ -132,6 +129,14 @@ struct PersistRequest {
     std::optional<std::string> last_played{};
 };
 
+/// @brief Folds a later persist request into the one the drain has not taken yet: a newer
+/// last-played server replaces an older one.
+void merge_persist_request(PersistRequest& current, PersistRequest&& delta) {
+    if (delta.last_played.has_value()) {
+        current.last_played = std::move(delta.last_played);
+    }
+}
+
 /// @brief High-performance edges the protocol task queued for the main loop, which calls the
 /// listener. Two counts rather than a net value, so an acquire and a release queued inside one
 /// stalled main-loop tick still reach the listener as a request followed by its release. 32-bit:
@@ -153,31 +158,6 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
         return std::nullopt;
     }
     return configured;
-}
-
-/// @brief Whether inbound traffic for `role` from `conn` may be acted on.
-///
-/// Every role this client drives has at most one owner among the admitted connections, and only
-/// that connection's traffic reaches the role: a connection that is not admitted, or one that
-/// does not own the role, is ignored. Ownership implies the role is active on the connection.
-///
-/// messaging.md "Communication" keeps a message the client implements *recognized* while its role
-/// is inactive ("An ID the receiver implements is still recognized when its role is inactive"), so
-/// this is not the unknown-message rule: the message is parsed and validated as usual, the
-/// connection is never closed for it, and only the role's own handling is skipped. messaging.md
-/// "server/activate" requires the mirror of this of servers, so a role removal the peer has not
-/// yet seen never costs the connection.
-///
-/// A true verdict is only half the gate. The caller pairs it with the role's teardown generation,
-/// loaded right after this returns and passed into the handler, and each point of effect
-/// re-checks the captured value (see Impl::accepts() on each role). Protocol task only.
-[[maybe_unused]] bool role_accepts_traffic(const ConnectionManager& manager,
-                                           const SendspinConnection* conn, SendspinRole role) {
-    if (manager.owns_role(conn, role)) {
-        return true;
-    }
-    SS_LOGD(TAG, "Ignoring %s traffic: the connection does not own the role", to_cstr(role));
-    return false;
 }
 
 /// @brief Whether `role` is in `mask`, logging the teardown once per role rather than once per
@@ -421,9 +401,9 @@ bool SendspinClient::start() {
     }
 
     // A command queued after the last stop() finished (a request racing it on another thread)
-    // belongs to the run that ended; this run begins with an empty queue, taking accepts again.
+    // belongs to the run that ended; this run begins with an empty queue. Accepts reopen with
+    // admission, in connection_manager_->start() below.
     this->protocol_task_->drop_commands();
-    this->protocol_task_->open_accepts();
 
     // The first client/state snapshot, taken by the protocol task's first tick: every
     // connection's client/state is built from the newest snapshot the task holds.
@@ -435,8 +415,8 @@ bool SendspinClient::start() {
     // task's first tick.
     this->connection_manager_->start();
 
-    // The protocol task. Undersized stacks are clamped to the documented minimum, as the
-    // transport tasks' are.
+    // The protocol task. Undersized stacks are clamped to the documented minimum, the measured
+    // stack of its deepest call chain, as the transport tasks' are.
     size_t protocol_stack = this->config_.protocol_task_stack_size;
     if (protocol_stack < SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE) {
         SS_LOGW(TAG, "protocol_task_stack_size %u below minimum %u; clamping",
@@ -506,10 +486,10 @@ void SendspinClient::stop() {
     }
 
     // 7. Deliver what the teardown owes, now rather than on a loop() tick that is not coming:
-    //    each role's main-loop half (its clear or STREAM_END callback), the high-performance
-    //    releases the shutdown pass queued, the owed provider writes and the dismissals above.
-    //    Every getter already reports the stopped state, so a callback that reads the client sees
-    //    exactly what a caller sees once stop() returns.
+    //    each role's main-loop half (its clear callback, the player's on_stream_end()), the
+    //    high-performance releases the shutdown pass queued, the owed provider writes and the
+    //    dismissals above. Every getter already reports the stopped state, so a callback that reads
+    //    the client sees exactly what a caller sees once stop() returns.
     this->drain_inbox();
 
     this->lifecycle_.store(LifecycleState::STOPPED, std::memory_order_release);
@@ -523,8 +503,10 @@ PairingUiSnapshot SendspinClient::close_transports() {
     //    consumer.
     this->signal_drain_role_stops();
 
-    // 2. Close admission before the join, so the protocol task's next tick (at the latest its
-    //    final one) runs the shutdown pass and refuses every accept with a goodbye.
+    // 2. Close admission, and with it the protocol task's accepts, before the join: the task's
+    //    next tick (at the latest its final one) runs the shutdown pass and refuses every accept
+    //    already queued with a goodbye, and a delivery from here on is refused at its push, so its
+    //    transport closes it.
     this->connection_manager_->close_admission();
 
     // 3. The protocol task: its final tick acts on the commands queued so far (refusing every
@@ -532,23 +514,9 @@ PairingUiSnapshot SendspinClient::close_transports() {
     //    goodbye each with reason shutdown, wait up to the flush bound), then the join.
     this->protocol_task_->stop();
 
-    // An accept the server delivered after the final tick waits in the queue. With the task
-    // joined the manager is this thread's: refuse it the same way, then wait out its goodbye.
-    // Closing accepts under the queue lock makes the hand-off atomic: an accept is either already
-    // queued, and taken below, or refused at its push on the delivering thread, which detaches
-    // it; none can slip in behind this pass with an attached gate.
-    this->protocol_task_->close_accepts();
-    ProtocolCommand command;
-    while (this->protocol_task_->take_command(command)) {
-        if (command.type == ProtocolCommandType::ACCEPT_CONNECTION &&
-            command.connection != nullptr) {
-            this->connection_manager_->refuse_accept(std::move(command.connection));
-        }
-    }
-    this->connection_manager_->flush_shutdown_goodbyes();
-
-    // 4. Close every transport the shutdown pass kept and stop the server, joining every
-    //    transport thread, then release those connections here.
+    // 4. Close every transport the shutdown pass kept, and every released outbound connection
+    //    still parked for reaping, and stop the server, joining every transport thread, then
+    //    release those connections here.
     const PairingUiSnapshot pairing_ui = this->connection_manager_->finish_stop();
 
     // Commands a consumer pushed meanwhile are dropped here, outside any run.
@@ -588,12 +556,21 @@ void SendspinClient::stop_role_threads() {
 }
 
 bool SendspinClient::create_inbound_ring() {
+    // Created whatever roles are enabled: every admitted connection receives into it, including
+    // the server/time replies whose receive stamps must be taken at the socket read, which the
+    // one-at-a-time fallback hand-off would delay behind the protocol task. The enabled roles set
+    // its size, down to two JSON messages without the player, the visualizer or artwork.
     InboundRingBudget budget;
     budget.time_burst_size = this->config_.time_burst_size;
     budget.time_burst_interval_ms = this->config_.time_burst_interval_ms;
+    size_t player_message_bytes = 0;
+    size_t visualizer_message_bytes = 0;
+    bool artwork = false;
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         budget.audio_hold_bytes = this->player_->impl_->config.audio_buffer_capacity;
+        player_message_bytes =
+            inbound_held_message_bytes(this->player_->impl_->advertised_buffer_capacity());
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
@@ -601,6 +578,8 @@ bool SendspinClient::create_inbound_ring() {
         budget.visualizer_hold_bytes = this->visualizer_->impl_->visualizer_support.buffer_capacity;
         budget.visualizer_stored_bytes_per_second =
             this->visualizer_->impl_->stored_frame_bytes_per_second();
+        visualizer_message_bytes =
+            inbound_held_message_bytes(this->visualizer_->impl_->advertised_buffer_capacity());
     }
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -608,16 +587,21 @@ bool SendspinClient::create_inbound_ring() {
         for (const auto& slot : this->artwork_->impl_->config.preferred_formats) {
             budget.artwork_images_stored_bytes += inbound_frames_stored_bytes(slot.max_image_bytes);
         }
+        artwork = true;
     }
 #endif
+    budget.largest_message_bytes =
+        inbound_largest_message_bytes(player_message_bytes, visualizer_message_bytes, artwork);
     const size_t storage_bytes = derive_inbound_ring_bytes(budget);
     auto ring = std::make_unique<InboundRing>();
-    if (!ring->create(storage_bytes, this->config_.inbound_ring_location)) {
+    if (!ring->create(storage_bytes, this->config_.inbound_ring_location,
+                      budget.largest_message_bytes)) {
         return false;
     }
     ring->quota(InboundHolder::PLAYER).set_limit(budget.audio_hold_bytes);
     ring->quota(InboundHolder::VISUALIZER).set_limit(budget.visualizer_hold_bytes);
-    SS_LOGD(TAG, "Inbound ring: %zu bytes", storage_bytes);
+    SS_LOGD(TAG, "Inbound ring: %zu bytes, messages up to %zu bytes", storage_bytes,
+            ring->max_message_bytes());
     this->inbound_ring_ = std::move(ring);
     return true;
 }
@@ -666,13 +650,7 @@ void SendspinClient::loop() {
 }
 
 void SendspinClient::request_persist() {
-    this->event_state_->persist_slot.merge(
-        [](PersistRequest& current, PersistRequest&& delta) {
-            if (delta.last_played.has_value()) {
-                current.last_played = std::move(delta.last_played);
-            }
-        },
-        PersistRequest{});
+    this->event_state_->persist_slot.merge(merge_persist_request, PersistRequest{});
 }
 
 void SendspinClient::flush_pending_persistence() {
@@ -715,8 +693,7 @@ uint32_t SendspinClient::request_high_performance(bool acquire) {
 bool SendspinClient::high_performance_granted(uint32_t ticket) const {
     // Tickets and grants count the same acquires in the same order, so the grant for `ticket`
     // is visible once the granted count has reached it (compared across the wrap).
-    return !generation_after(ticket,
-                             this->high_performance_granted_.load(std::memory_order_acquire));
+    return !count_after(ticket, this->high_performance_granted_.load(std::memory_order_acquire));
 }
 
 void SendspinClient::apply_high_performance_requests() {
@@ -759,45 +736,57 @@ void SendspinClient::drain_inbox() {
     // EventState::drain_generation).
     const uint32_t drain_generation = es.drain_generation;
 
-    // Each role with main-loop state catches up on the teardowns the protocol task ran since the
-    // last drain: one acquire load per role (the visualizer has no main-loop half). Event dispatch
-    // and the role drains catch up on their own, at the stamp they act on; this pass covers a
-    // teardown whose stamped CLEARED or STREAM_END the full event ring dropped, which would
-    // otherwise leave the role holding the torn-down connection's state (and the player its
-    // playback hold) until the role's next drain. It can only run a teardown half earlier, never
-    // apply anything: a slot payload is still applied only when its stamp is the current
-    // generation.
+    // Catches each role up on a teardown: with `cleared` null, to the role's current generation;
+    // otherwise only the role a *_CLEARED event names, to the generation it carries.
+    // [[maybe_unused]]: with every role compiled out the body is empty.
+    const auto catch_up_roles = [&]([[maybe_unused]] const InboxEvent* cleared) {
+        [[maybe_unused]] const auto catch_up = [cleared](auto& impl, InboxEventType type) {
+            if (cleared == nullptr) {
+                catch_up_teardown(impl, impl.cleanup_generation.load(std::memory_order_acquire));
+            } else if (cleared->type == type) {
+                catch_up_teardown(impl, cleared->epoch);
+            }
+        };
 #ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        catch_up_teardown(*this->player_->impl_,
-                          this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
+        if (this->player_) {
+            catch_up(*this->player_->impl_, InboxEventType::PLAYER_CLEARED);
+        }
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (this->controller_) {
-        catch_up_teardown(
-            *this->controller_->impl_,
-            this->controller_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
+        if (this->controller_) {
+            catch_up(*this->controller_->impl_, InboxEventType::CONTROLLER_CLEARED);
+        }
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
-    if (this->metadata_) {
-        catch_up_teardown(*this->metadata_->impl_, this->metadata_->impl_->cleanup_generation.load(
-                                                       std::memory_order_acquire));
-    }
+        if (this->metadata_) {
+            catch_up(*this->metadata_->impl_, InboxEventType::METADATA_CLEARED);
+        }
 #endif
 #ifdef SENDSPIN_ENABLE_COLOR
-    if (this->color_) {
-        catch_up_teardown(*this->color_->impl_,
-                          this->color_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
+        if (this->color_) {
+            catch_up(*this->color_->impl_, InboxEventType::COLOR_CLEARED);
+        }
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_) {
-        catch_up_teardown(*this->artwork_->impl_, this->artwork_->impl_->cleanup_generation.load(
-                                                      std::memory_order_acquire));
-    }
+        if (this->artwork_) {
+            catch_up(*this->artwork_->impl_, InboxEventType::ARTWORK_CLEARED);
+        }
 #endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+        if (this->visualizer_) {
+            catch_up(*this->visualizer_->impl_, InboxEventType::VISUALIZER_CLEARED);
+        }
+#endif
+    };
+
+    // Each role catches up on the teardowns the protocol task ran since the last drain: one
+    // acquire load per role. Event dispatch and the role drains catch up on their own, at the
+    // stamp they act on; this pass covers a teardown whose stamped *_CLEARED event the full event
+    // ring dropped, which would otherwise leave the role's clear undelivered and the role holding
+    // the torn-down connection's state (and the player its playback hold). It can only run a
+    // teardown half earlier, never apply anything: a slot payload is still applied only when its
+    // stamp is the current generation.
+    catch_up_roles(nullptr);
 
     const uint32_t inbox_bits = es.inbox.poll();
 
@@ -860,41 +849,23 @@ void SendspinClient::drain_inbox() {
                                                  std::memory_order_acquire),
                                              TAG, "a player stream event")) {
                             catch_up_teardown(*this->player_->impl_, event.epoch);
-                            this->player_->impl_->on_stream_ring_event(
-                                static_cast<PlayerStreamCallbackType>(event.code));
+                            this->player_->impl_->on_stream_ring_event(event);
                         }
 #endif
                         break;
                     }
-                    // CONTROLLER_CLEARED / METADATA_CLEARED / COLOR_CLEARED: pushed by each role's
-                    // cleanup(). The clear callback is the role's main-loop teardown half, so the
-                    // event only catches the role up; a stale one (a later teardown, or a drain
-                    // that took the next connection's state, already caught up past it) is a
-                    // no-op.
-                    case InboxEventType::CONTROLLER_CLEARED: {
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-                        if (this->controller_) {
-                            catch_up_teardown(*this->controller_->impl_, event.epoch);
-                        }
-#endif
+                    // *_CLEARED: pushed by each role's cleanup(). The clear callback is the role's
+                    // main-loop teardown half, so the event only catches the role up; a stale one
+                    // (a later teardown, or a drain that took the next connection's state, already
+                    // caught up past it) is a no-op.
+                    case InboxEventType::PLAYER_CLEARED:
+                    case InboxEventType::CONTROLLER_CLEARED:
+                    case InboxEventType::METADATA_CLEARED:
+                    case InboxEventType::COLOR_CLEARED:
+                    case InboxEventType::ARTWORK_CLEARED:
+                    case InboxEventType::VISUALIZER_CLEARED:
+                        catch_up_roles(&event);
                         break;
-                    }
-                    case InboxEventType::METADATA_CLEARED: {
-#ifdef SENDSPIN_ENABLE_METADATA
-                        if (this->metadata_) {
-                            catch_up_teardown(*this->metadata_->impl_, event.epoch);
-                        }
-#endif
-                        break;
-                    }
-                    case InboxEventType::COLOR_CLEARED: {
-#ifdef SENDSPIN_ENABLE_COLOR
-                        if (this->color_) {
-                            catch_up_teardown(*this->color_->impl_, event.epoch);
-                        }
-#endif
-                        break;
-                    }
                     // ARTWORK_STREAM / VISUALIZER_STREAM: code is the role-local
                     // ArtworkEventType/VisualizerEventType.
                     case InboxEventType::ARTWORK_STREAM: {
@@ -937,7 +908,7 @@ void SendspinClient::drain_inbox() {
             // generation but leaves drain_aborted false: the check at the top of the inner loop
             // never runs again because there is no next iteration. Re-check here so the loop stops
             // instead of calling take_events() again and destructively pulling the cleanup's
-            // freshly re-pushed CLEARED/STREAM_END events off the live ring (dropping them).
+            // freshly re-pushed *_CLEARED events off the live ring (dropping them).
             if (es.drain_generation != drain_generation) {
                 drain_aborted = true;
             }
@@ -1312,10 +1283,10 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
     // the survivor's events, group and time-sync report in place.
     if (teardown_roles == ALL_ROLES_MASK) {
         // A second teardown before the main loop drains (a handoff chain can displace two
-        // connections in one tick) wipes the first teardown's just-pushed CLEARED/STREAM_END
-        // events here before they are ever drained. That is safe only because every role's
-        // cleanup() below pushes its full event set unconditionally, re-creating exactly what
-        // this wiped. Keep role cleanups unconditional or this reset starts losing clear signals.
+        // connections in one tick) wipes the first teardown's just-pushed *_CLEARED events here
+        // before they are ever drained. Nothing is lost: every role's cleanup() below pushes its
+        // own again, and the teardowns the two stamp collapse into one main-loop half, which the
+        // head of every drain runs from the role's generation even without the event.
         this->event_state_->inbox.reset_events();
         this->event_state_->group_slot.reset();
         this->event_state_->time_sync_slot.reset();
@@ -1458,749 +1429,6 @@ std::string SendspinClient::build_hello_message() {
 }
 
 // ============================================================================
-// Message processing
-// ============================================================================
-// Protocol task
-// ============================================================================
-
-uint32_t SendspinClient::protocol_tick() {
-    ConnectionManager& manager = *this->connection_manager_;
-
-    // 1. Commands, in the order they were queued. Each command's resources (a connection, a
-    //    lease) are released as the next take replaces it.
-    {
-        ProtocolCommand command;
-        while (this->protocol_task_->take_command(command)) {
-            this->handle_command(command);
-        }
-    }
-
-    // 2. Once admission is closed: the shutdown pass, and the bounded wait for the goodbyes the
-    //    commands above refused. Every slot is empty afterwards, so the steps below find no
-    //    connection and the ring pass only returns the items still in flight.
-    if (manager.shutdown_pending()) {
-        manager.shutdown();
-    } else {
-        manager.flush_shutdown_goodbyes();
-    }
-
-    // 3. The newest client/state snapshot, sent to every admitted connection it changes.
-    {
-        ClientStateMessage snapshot;
-        if (this->protocol_task_->take_state(snapshot)) {
-            this->task_state_->client_state = std::move(snapshot);
-            manager.for_each_admitted(
-                [this](AdmittedEntry& entry) { this->publish_client_state(entry.conn.get()); });
-        }
-    }
-
-    // 4. A role torn down since the last tick hands back what its consumer has not taken
-    //    (InboundItemList::recall()); the consumer returns what it holds itself.
-#ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        this->player_->impl_->recall_stale_items(
-            this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_) {
-        this->visualizer_->impl_->recall_stale_items(
-            this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
-    }
-#endif
-
-    // 5. client/init on the outbound connections whose upgrade completed: the server says
-    //    nothing before it, so it goes ahead of the receive pass.
-    manager.start_upgraded_handshakes();
-
-    // 6. The receive pass, over a snapshot of the managed connections: a handler below can drop
-    //    a connection from its slot, and the snapshot keeps it alive until the tick ends (see
-    //    ConnectionManager::snapshot_connections()). Each connection's pending pre-admission
-    //    message comes before its ring items: a connection has no ring item queued while a
-    //    pending message waits (InboundGate).
-    ConnectionManager::ConnectionSnapshot connections;
-    manager.snapshot_connections(connections);
-    for (auto& conn : connections) {
-        InboundMessage message;
-        if (!conn->pending_message(message)) {
-            continue;
-        }
-        if (!conn->inbound_gate().is_detached()) {
-            this->process_inbound(*conn, message);
-        }
-        conn->consume_pending_message();
-    }
-
-    // The ring, in arrival order across connections. Bounded per tick so the steps around it (a
-    // command, a pending pre-admission message, a close report, a timer) come round again while
-    // a stream keeps the ring busy: an audio or visualizer item costs microseconds to hand over,
-    // so 32 of them delay those steps by well under a millisecond, while 32 still covers 0.6 s
-    // of 20 ms audio chunks in one pass. The tick asks to run again at once when it stops here.
-    constexpr size_t MAX_ITEMS_PER_TICK = 32;
-    bool ring_drained = true;
-    for (size_t taken = 0;; ++taken) {
-        if (taken == MAX_ITEMS_PER_TICK) {
-            ring_drained = false;
-            break;
-        }
-        size_t item_len = 0;
-        void* item = this->inbound_ring_->take(&item_len, 0);
-        if (item == nullptr) {
-            break;
-        }
-        const InboundItemHeader* header = inbound_item_header(item);
-        SendspinConnection* conn = nullptr;
-        for (auto& candidate : connections) {
-            if (static_cast<uint32_t>(candidate->get_instance_id()) == header->connection_id) {
-                conn = candidate.get();
-                break;
-            }
-        }
-        if (conn == nullptr) {
-            // The connection left the manager since it wrote the item.
-            this->inbound_ring_->return_item(item);
-            continue;
-        }
-        conn->inbound_gate().note_item_taken();
-        if (conn->inbound_gate().is_detached()) {
-            this->inbound_ring_->return_item(item);
-            continue;
-        }
-        InboundMessage message;
-        message.item = item;
-        message.item_len = item_len;
-        message.data = inbound_item_bytes(item);
-        message.len = item_len;
-        message.receive_time_us = header->receive_time_us;
-        message.kind = header->kind;
-        this->process_inbound(*conn, message);
-    }
-
-    // 7. Losses: a connection the receive path closed, one the manager released, or one whose
-    //    transport closed with every message it sent before the close processed, is dropped once
-    //    (a connection the manager no longer manages is a no-op there).
-    for (auto& conn : connections) {
-        InboundGate& gate = conn->inbound_gate();
-        if ((gate.is_detached() || gate.close_ready()) && conn->mark_loss_reported()) {
-            manager.on_connection_lost(conn.get());
-        }
-    }
-
-    // 8. The lifecycle scans and timers, 9. the time bursts, 10. what other threads read.
-    uint32_t next_deadline = manager.tick(platform_time_us());
-    next_deadline = std::min(next_deadline, manager.run_time_sync());
-    manager.refresh_published_state();
-    if (!ring_drained) {
-        next_deadline = 0;
-    }
-    // The snapshot's references drop here; see ConnectionManager::snapshot_connections().
-    return next_deadline;
-}
-
-void SendspinClient::handle_command(ProtocolCommand& command) {
-    ConnectionManager& manager = *this->connection_manager_;
-    switch (command.type) {
-        case ProtocolCommandType::ACCEPT_CONNECTION:
-            if (command.connection != nullptr) {
-                manager.accept(std::move(command.connection));
-            }
-            return;
-        case ProtocolCommandType::CONNECT_TO:
-        case ProtocolCommandType::DISCONNECT:
-        case ProtocolCommandType::LEAVE:
-        case ProtocolCommandType::PAIRING_WINDOW_CANCEL:
-        case ProtocolCommandType::PAIRING_WINDOW_CONFIRM:
-        case ProtocolCommandType::SEND_TEXT:
-        case ProtocolCommandType::SET_UNPAIRED_ACCESS:
-            break;
-    }
-    // A consumer request that reaches the task once admission is closed belongs to a run that
-    // is ending: the shutdown pass goodbyes every peer, so acting on it could only open or
-    // address a connection that is about to be closed.
-    if (!manager.is_accepting()) {
-        SS_LOGD(TAG, "Dropping protocol command of type %d: the client is stopping",
-                static_cast<int>(command.type));
-        return;
-    }
-    switch (command.type) {
-        case ProtocolCommandType::CONNECT_TO:
-            manager.connect_to(command.text);
-            break;
-        case ProtocolCommandType::DISCONNECT:
-            manager.disconnect(command.reason);
-            break;
-        case ProtocolCommandType::LEAVE:
-            manager.leave();
-            break;
-        case ProtocolCommandType::PAIRING_WINDOW_CANCEL:
-            manager.cancel_pairing_window();
-            break;
-        case ProtocolCommandType::PAIRING_WINDOW_CONFIRM:
-            manager.confirm_pairing_window();
-            break;
-        case ProtocolCommandType::SEND_TEXT:
-            manager.send_role_text(command.role, command.text);
-            break;
-        case ProtocolCommandType::SET_UNPAIRED_ACCESS:
-            manager.apply_unpaired_access_change(command.enabled);
-            break;
-        case ProtocolCommandType::ACCEPT_CONNECTION:
-            // Handled above.
-            break;
-    }
-}
-
-void SendspinClient::process_inbound(SendspinConnection& conn, InboundMessage& message) {
-    conn.process_inbound_message(message);
-    if (message.item != nullptr) {
-        this->inbound_ring_->return_item(message.item);
-        message.item = nullptr;
-    }
-}
-
-void SendspinClient::report_malformed_pairing_message(SendspinConnection* conn,
-                                                      const char* type_name) {
-    SS_LOGW(TAG, "Malformed %s; aborting any active code pairing", type_name);
-    ServerPairingMessage message;
-    message.kind = PairingMessageKind::MALFORMED;
-    this->connection_manager_->on_pairing_message(conn, message);
-}
-
-void SendspinClient::process_json_message(SendspinConnection* conn, const char* data, size_t len,
-                                          int64_t timestamp) {
-    // Every connection's messages are processed on the protocol task, one at a time, so the
-    // shared arena, the parse and the handlers it dispatches to need no lock. Reusing the arena
-    // is safe: the JsonDocument from the previous call was destroyed when that call returned.
-    if (this->json_arena_) {
-        this->json_arena_->reset();
-    }
-    JsonDocument doc =
-        this->json_arena_ ? make_json_document(*this->json_arena_) : make_json_document();
-    DeserializationError error = deserializeJson(doc, data, len);
-    if (error || doc.isNull()) {
-        SS_LOGW(TAG, "Failed to parse JSON message");
-        return;
-    }
-    JsonObject root = doc.as<JsonObject>();
-
-    SendspinServerToClientMessageType message_type = determine_message_type(root);
-
-    // Role-bound traffic is gated per role on ownership (role_accepts_traffic()): only the
-    // admitted connection that owns a role reaches it. The connection is not closed over a
-    // message it may not act on: a nursery member that is still racing toward promotion, or one
-    // that just lost arbitration, is not misbehaving, and the establish/re-prove watchdogs
-    // already reap a connection that never gets admitted. The server/activate that admits a
-    // connection is applied before the next message is parsed, so the role traffic behind it is
-    // never dropped for lack of admission.
-    switch (message_type) {
-        case SendspinServerToClientMessageType::STREAM_START: {
-            SS_LOGD(TAG, "Stream Started");
-
-            StreamStartMessage stream_msg;
-            if (!process_stream_start_message(root, &stream_msg)) {
-                SS_LOGE(TAG, "Failed to parse stream/start message");
-                break;
-            }
-
-#ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_ && stream_msg.player.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                this->player_->impl_->handle_stream_start(
-                    stream_msg.player.value(),
-                    this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-            }
-#endif
-
-#ifdef SENDSPIN_ENABLE_ARTWORK
-            if (this->artwork_ && stream_msg.artwork.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
-                this->artwork_->impl_->handle_stream_start(
-                    stream_msg.artwork.value(),
-                    this->artwork_->impl_->cleanup_generation.load(std::memory_order_acquire));
-            }
-#endif
-
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-            if (this->visualizer_ && stream_msg.visualizer.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
-                this->visualizer_->impl_->handle_stream_start(
-                    stream_msg.visualizer.value(),
-                    this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
-            }
-#endif
-            break;
-        }
-        case SendspinServerToClientMessageType::STREAM_END: {
-            StreamEndMessage end_msg;
-            if (process_stream_end_message(root, &end_msg)) {
-                bool end_player = !end_msg.roles.has_value();
-                bool end_artwork = !end_msg.roles.has_value();
-                bool end_visualizer = !end_msg.roles.has_value();
-
-                if (end_msg.roles.has_value()) {
-                    for (const auto& role : end_msg.roles.value()) {
-                        if (role == "player") {
-                            end_player = true;
-                        } else if (role == "artwork") {
-                            end_artwork = true;
-                        } else if (role == "visualizer") {
-                            end_visualizer = true;
-                        }
-                    }
-                }
-
-                SS_LOGD(TAG, "Stream ended - player:%d artwork:%d visualizer:%d", end_player,
-                        end_artwork, end_visualizer);
-
-#ifdef SENDSPIN_ENABLE_PLAYER
-                if (this->player_ && end_player &&
-                    role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                    this->player_->impl_->handle_stream_end(
-                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                }
-#endif
-
-#ifdef SENDSPIN_ENABLE_ARTWORK
-                if (this->artwork_ && end_artwork &&
-                    role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
-                    this->artwork_->impl_->handle_stream_end(
-                        this->artwork_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                }
-#endif
-
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-                if (this->visualizer_ && end_visualizer &&
-                    role_accepts_traffic(*this->connection_manager_, conn,
-                                         SendspinRole::VISUALIZER)) {
-                    this->visualizer_->impl_->handle_stream_end(
-                        this->visualizer_->impl_->cleanup_generation.load(
-                            std::memory_order_acquire));
-                }
-#endif
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::STREAM_CLEAR: {
-            StreamClearMessage clear_msg;
-            if (process_stream_clear_message(root, &clear_msg)) {
-                // messaging.md "stream/clear": only player and visualizer streams clear, and an
-                // omitted roles list clears both.
-                bool clear_player = !clear_msg.roles.has_value();
-                bool clear_visualizer = !clear_msg.roles.has_value();
-
-                if (clear_msg.roles.has_value()) {
-                    for (const auto& role : clear_msg.roles.value()) {
-                        if (role == "player") {
-                            clear_player = true;
-                        } else if (role == "visualizer") {
-                            clear_visualizer = true;
-                        }
-                    }
-                }
-
-                SS_LOGD(TAG, "Stream clear - player:%d visualizer:%d", clear_player,
-                        clear_visualizer);
-
-#ifdef SENDSPIN_ENABLE_PLAYER
-                if (this->player_ && clear_player &&
-                    role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                    this->player_->impl_->handle_stream_clear(
-                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                }
-#endif
-
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-                if (this->visualizer_ && clear_visualizer &&
-                    role_accepts_traffic(*this->connection_manager_, conn,
-                                         SendspinRole::VISUALIZER)) {
-                    this->visualizer_->impl_->handle_stream_clear(
-                        this->visualizer_->impl_->cleanup_generation.load(
-                            std::memory_order_acquire));
-                }
-#endif
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_HELLO: {
-            ServerHelloMessage hello_msg;
-            if (process_server_hello_message(root, &hello_msg)) {
-                // server_id comes from the Noise handshake result (already set on the
-                // connection); server/hello only carries the display name.
-                if (conn != nullptr) {
-                    ServerInformationObject info = conn->get_server_information();
-                    info.name = hello_msg.name;
-                    conn->set_server_information(std::move(info));
-                    // The nursery scan on this task observes is_handshake_complete() and
-                    // establishes the connection; nothing needs to be scheduled here.
-                    conn->set_server_hello_received(true);
-
-                    SS_LOGD(TAG, "Connected to server '%s' (server_id=%s)", hello_msg.name.c_str(),
-                            conn->get_server_id().c_str());
-                }
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_ACTIVATE: {
-            ServerActivateMessage activate_msg;
-            if (process_server_activate_message(root, &activate_msg)) {
-                if (conn != nullptr) {
-                    SS_LOGD(TAG, "server/activate received (activities_count=%zu)",
-                            activate_msg.activities.size());
-                    // Applied before the next message is parsed: trust enforcement, role
-                    // ownership and, for a nursery connection that is now operational, admission
-                    // all land here, so the role traffic the server sends behind this activate
-                    // meets the gate this activation set.
-                    this->connection_manager_->on_server_activate(conn, std::move(activate_msg));
-                }
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::NOISE_HANDSHAKE: {
-            // In-band re-handshake initiated by the server. This runs on the protocol task, the
-            // thread that decrypts this connection's frames and sends on it, so the session swap
-            // is ordered with the decrypt of the next frame and with every send
-            // (connection.md "Re-handshake").
-            if (conn != nullptr) {
-                SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
-                if (!conn->handle_noise_rehandshake(std::string_view(data, len))) {
-                    SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
-                    // Do not leave a half-swapped session. UNAUTHORIZED is the closest available
-                    // reason for a crypto failure, though close_silently() never transmits it
-                    // (connection.md "Failure Handling": close without any application-level
-                    // message). disconnect() can block on a transport join, which close_silently()
-                    // avoids; see close_transport_now()'s doc comment in connection.h.
-                    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
-                }
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_TIME: {
-            if (conn == nullptr) {
-                SS_LOGW(TAG, "Received time message but no connection context");
-                break;
-            }
-
-            ServerTimeMessage time_msg;
-            if (!process_server_time_message(root, &time_msg)) {
-                break;
-            }
-            // Only the reply to this connection's frame in flight is taken, so no peer can feed
-            // a burst a measurement it did not ask for. Each connection measures its own clock
-            // into its own filter.
-            const std::optional<int64_t> client_sent =
-                conn->claim_time_frame(time_msg.client_transmitted);
-            if (!client_sent.has_value()) {
-                SS_LOGV(TAG, "server/time answers no client/time in flight; discarding");
-                break;
-            }
-            TimeResponse response;
-            compute_time_exchange(time_msg, client_sent.value(), timestamp, &response.offset,
-                                  &response.max_error);
-            response.timestamp = timestamp;
-            response.source_id = conn->get_instance_id();
-            response.client_transmitted = time_msg.client_transmitted;
-            conn->time_burst().on_time_response(conn, response);
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_STATE: {
-            // One section at a time, each in its own scope so the compiler reuses the slots.
-            // Parsing the whole message into an aggregate would hold every section's storage (a
-            // metadata state alone is 200 bytes) in this frame at once, and this runs on the
-            // protocol task, whose stack is a fixed budget on ESP-IDF.
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-            if (this->controller_ &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::CONTROLLER)) {
-                ServerStateControllerObject controller_state;
-                if (process_server_state_controller(root, &controller_state)) {
-                    this->controller_->impl_->handle_server_state(
-                        std::move(controller_state),
-                        this->controller_->impl_->cleanup_generation.load(
-                            std::memory_order_acquire));
-                }
-            }
-#endif
-
-#ifdef SENDSPIN_ENABLE_METADATA
-            if (this->metadata_ &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::METADATA)) {
-                ServerMetadataStateObject metadata_state;
-                if (process_server_state_metadata(root, &metadata_state)) {
-                    this->metadata_->impl_->handle_server_state(
-                        std::move(metadata_state),
-                        this->metadata_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                }
-            }
-#endif
-
-#ifdef SENDSPIN_ENABLE_COLOR
-            if (this->color_ &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::COLOR)) {
-                ServerColorStateObject color_state;
-                if (process_server_state_color(root, &color_state)) {
-                    this->color_->impl_->handle_server_state(
-                        color_state,
-                        this->color_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                }
-            }
-#endif
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_COMMAND: {
-#ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_ &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                ServerCommandMessage cmd_msg;
-                if (process_server_command_message(root, &cmd_msg)) {
-                    this->player_->impl_->handle_server_command(
-                        cmd_msg,
-                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                }
-            }
-#endif
-            break;
-        }
-        case SendspinServerToClientMessageType::GROUP_UPDATE: {
-            // group/update describes the group of the connection the client reports from: the
-            // primary admitted connection.
-            AdmittedEntry* primary = this->connection_manager_->primary();
-            if (primary == nullptr || primary->conn.get() != conn) {
-                SS_LOGD(TAG, "Ignoring group/update from a connection that is not the primary");
-                break;
-            }
-            GroupUpdateMessage group_msg;
-            if (process_group_update_message(root, &group_msg)) {
-                this->event_state_->group_slot.merge(
-                    [](GroupUpdateObject& current, GroupUpdateObject&& delta) {
-                        apply_group_update_deltas(&current, delta);
-                    },
-                    std::move(group_msg.group));
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE: {
-            // server/pair-finalize: server acked our client/pair-finalize.
-            // Commit the pending pairing record to RAM here: the server rekeys onto the new
-            // long-term PSK immediately after this ack, and its re-handshake msg1 (the next
-            // message on this same thread) resolves that PSK against the RecordStore. The record
-            // must therefore be resolvable before this handler returns, else the re-handshake
-            // sees an unknown psk_id and aborts. RecordStore locks its own mutex, since the main
-            // loop reads it for the provider write. Only the RAM commit happens here: the provider
-            // write is deferred to the main loop via request_persist() below, because the
-            // persistence provider is main-loop-only.
-            // The payload is spec'd as empty; the message-type dispatch above is the only
-            // validation this message needs.
-            if (conn != nullptr) {
-                auto record = conn->take_pending_pairing_record();
-                bool stored_record = false;
-                if (record.has_value() && this->record_store_ != nullptr) {
-                    // Logged before the store takes ownership of the record; a rejection warns
-                    // from inside store_record_superseding().
-                    SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
-                            record->psk_id.c_str());
-                    // store_record_superseding() mutates RAM only. At capacity it evicts the
-                    // least recently used record rather than failing, since a pairing never
-                    // fails for lack of record storage (pairing.md "Pairing Records"); the
-                    // psk_ids of every open connection are handed over so none of them is the
-                    // victim. A provider that later rejects the deferred write does not fail the
-                    // pairing: the record works for this boot and persist_records() warns that it
-                    // will not survive a reboot.
-                    //
-                    // The superseding form is correct here and only here: this PSK replaces
-                    // whatever this server held before, so the prior record for the same
-                    // server_id must be retired or the old PSK stays valid forever.
-                    if (this->record_store_->store_record_superseding(
-                            std::move(record.value()),
-                            this->connection_manager_->open_connection_psk_ids())) {
-                        stored_record = true;
-                    }
-                } else {
-                    SS_LOGI(TAG, "server/pair-finalize: no pending pairing record to store");
-                }
-                if (stored_record) {
-                    // Before on_pairing_succeeded, so the drain that fires it flushes the write
-                    // first. Not fired for the capacity-rejection case.
-                    this->request_persist();
-                    this->connection_manager_->on_pairing_succeeded(conn);
-                }
-                // Re-arm the provisional timeout so the 30 s watchdog fires if the server
-                // acks but never sends the in-band re-handshake that follows pair-finalize.
-                conn->note_pairing_finalize_ack();
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::PAIR_ABORT: {
-            // pair/abort: the server aborted the pairing exchange.
-            if (conn != nullptr) {
-                PairAbortMessage abort_msg;
-                if (process_pair_abort_message(root, &abort_msg)) {
-                    SS_LOGW(TAG, "pair/abort received: reason=%s", to_cstr(abort_msg.reason));
-                    this->connection_manager_->on_pair_abort(conn, abort_msg.reason);
-                } else {
-                    // pair/abort must trigger cleanup even when the reason is unrecognized.
-                    SS_LOGW(TAG, "Malformed pair/abort message; treating as abort with "
-                                 "method_not_supported");
-                    this->connection_manager_->on_pair_abort(conn,
-                                                             PairAbortReason::METHOD_NOT_SUPPORTED);
-                }
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_UNPAIR: {
-            // server/unpair. Trust gating (LONG_TERM only) happens in handle_server_unpair.
-            if (conn != nullptr) {
-                SS_LOGI(TAG, "server/unpair received (psk_id=%s)", conn->get_psk_id().c_str());
-                this->connection_manager_->on_server_unpair(conn);
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_PAIR_INIT: {
-            // server/pair-init: nonce_A from the server (the emission format arrived in the
-            // activation's pairing object).
-            if (conn != nullptr) {
-                ServerPairInitPayload payload;
-                if (process_server_pair_init_message(root, &payload)) {
-                    ServerPairingMessage message;
-                    message.kind = PairingMessageKind::PAIR_INIT;
-                    message.nonce_a = payload.nonce_a;
-                    this->connection_manager_->on_pairing_message(conn, message);
-                } else {
-                    this->report_malformed_pairing_message(conn, "server/pair-init");
-                }
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_PAIR_AUTH: {
-            // server/pair-auth: server CPace share.
-            if (conn != nullptr) {
-                ServerPairAuthPayload payload;
-                if (process_server_pair_auth_message(root, &payload)) {
-                    ServerPairingMessage message;
-                    message.kind = PairingMessageKind::PAIR_AUTH;
-                    message.pake_msg_1 = payload.pake_msg_1;
-                    this->connection_manager_->on_pairing_message(conn, message);
-                } else {
-                    this->report_malformed_pairing_message(conn, "server/pair-auth");
-                }
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM: {
-            // server/pair-confirm: server CPace confirmation tag.
-            if (conn != nullptr) {
-                ServerPairConfirmPayload payload;
-                if (process_server_pair_confirm_message(root, &payload)) {
-                    ServerPairingMessage message;
-                    message.kind = PairingMessageKind::PAIR_CONFIRM;
-                    message.server_kc = payload.server_kc;
-                    this->connection_manager_->on_pairing_message(conn, message);
-                } else {
-                    this->report_malformed_pairing_message(conn, "server/pair-confirm");
-                }
-            }
-            break;
-        }
-        default:
-            SS_LOGW(TAG, "Unhandled server message type: %s",
-                    root["type"].is<const char*>() ? root["type"].as<const char*>() : "unknown");
-    }
-}
-
-SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn,
-                                                   InboundMessage& message) {
-    // One byte is enough to name the role that owns the message; how short a body that role
-    // tolerates is the role's own rule (roles/artwork/v1.md, for one, closes the connection on a
-    // message shorter than 2 bytes).
-    if (message.len < 1) {
-        return;
-    }
-
-    // Every binary message feeds a role, so only an admitted connection's reach one; each role
-    // below also gates on the connection owning it (role_accepts_traffic()).
-    if (conn == nullptr || this->connection_manager_->find_admitted(conn) == nullptr) {
-        SS_LOGW(TAG, "Ignoring binary message from a connection that is not admitted");
-        return;
-    }
-
-    uint8_t binary_type = message.data[0];
-    uint8_t role = get_binary_role(binary_type);
-
-    // The type byte stripped, for the artwork role, which copies the body into its image buffer.
-    // The player and the visualizer take the whole message, since they can keep its ring item.
-    // Only declared when the artwork role consumes it, so a build without it does not warn/error
-    // on an unused variable under -Werror.
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    const uint8_t* data = message.data + 1;
-    size_t data_len = message.len - 1;
-#endif
-
-    // The visualizer role has an expanded 8-slot allocation (IDs 16-23), so it is
-    // dispatched by ID range before the standard 4-slot role decoding below
-    if (binary_type >= SENDSPIN_BINARY_VISUALIZER_FIRST &&
-        binary_type <= SENDSPIN_BINARY_VISUALIZER_LAST) {
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-        if (this->visualizer_ &&
-            role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
-            this->visualizer_->impl_->handle_binary(
-                binary_type, message,
-                this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
-        }
-#endif
-        return;
-    }
-
-    switch (role) {
-        case SENDSPIN_ROLE_PLAYER: {
-#ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_ &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                uint8_t slot = get_binary_slot(binary_type);
-                if (slot == 0) {
-                    this->player_->impl_->handle_binary(
-                        message,
-                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                } else {
-                    SS_LOGW(TAG, "Unknown player binary slot %d", slot);
-                }
-            }
-#endif
-            break;
-        }
-        case SENDSPIN_ROLE_ARTWORK: {
-#ifdef SENDSPIN_ENABLE_ARTWORK
-            // Deliberately not gated on the role being active, unlike every other role dispatch
-            // here. messaging.md "Communication" keeps a message the client implements recognized
-            // while its role is inactive, and "the validation, direction, and sequencing rules for
-            // recognized messages still apply", so an artwork message that is malformed as a
-            // message is still the protocol error the role closes on. The role already drops the
-            // payload of a message that arrives outside an active stream, below those shape
-            // checks, and a removed role has no active stream (cleanup() clears it and a
-            // stream/start for an inactive role is refused above). It is gated on ownership
-            // conflicts alone: the artwork stream belongs to its owner, so a connection that does
-            // not own the role while another one does cannot feed it.
-            SendspinConnection* artwork_owner =
-                this->connection_manager_->role_owner(SendspinRole::ARTWORK);
-            if (this->artwork_ && (artwork_owner == nullptr || artwork_owner == conn)) {
-                uint8_t slot = get_binary_slot(binary_type);
-                if (!this->artwork_->impl_->handle_binary(slot, data, data_len)) {
-                    // roles/artwork/v1.md "Artwork (Binary)": a malformed artwork message, and a
-                    // malformed sequence within an active artwork stream, are protocol errors the
-                    // client MUST close the connection on. Closed silently, like every other
-                    // protocol error the receive path finds (see close_silently()).
-                    SS_LOGW(TAG, "Malformed artwork message; closing connection");
-                    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
-                }
-            }
-#endif
-            break;
-        }
-        default: {
-            SS_LOGW(TAG, "Unknown binary role %d (type %d)", role, binary_type);
-            break;
-        }
-    }
-}
-
-// ============================================================================
 // State publishing
 // ============================================================================
 
@@ -2235,6 +1463,20 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     const ClientStateMessage state_msg =
         client_state_for_roles(snapshot, entry->owned_roles & conn->get_active_role_mask());
     conn->send_app_json(format_client_state_message(&state_msg), nullptr);
+}
+
+void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {
+    this->task_state_->client_state = std::move(snapshot);
+    this->connection_manager_->for_each_admitted(
+        [this](AdmittedEntry& entry) { this->publish_client_state(entry.conn.get()); });
+}
+
+void SendspinClient::merge_group_update(GroupUpdateObject&& delta) {
+    this->event_state_->group_slot.merge(
+        [](GroupUpdateObject& current, GroupUpdateObject&& added) {
+            apply_group_update_deltas(&current, added);
+        },
+        std::move(delta));
 }
 
 // ============================================================================
@@ -2320,13 +1562,7 @@ void SendspinClient::note_last_played_server(const std::string& server_id) {
     this->connection_manager_->set_last_played_server_id(server_id);
     PersistRequest request;
     request.last_played = server_id;
-    this->event_state_->persist_slot.merge(
-        [](PersistRequest& current, PersistRequest&& delta) {
-            if (delta.last_played.has_value()) {
-                current.last_played = std::move(delta.last_played);
-            }
-        },
-        std::move(request));
+    this->event_state_->persist_slot.merge(merge_persist_request, std::move(request));
 }
 
 void SendspinClient::write_last_played_server(const std::string& server_id) {
@@ -2352,9 +1588,6 @@ void SendspinClient::write_last_played_server(const std::string& server_id) {
 // ============================================================================
 
 void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
-    if (conn == nullptr) {
-        return;
-    }
     // Entering the operational state structurally ends any pairing exchange: discard the pending
     // pairing record and reset the pairing session so a stale attempt timeout can never fire a
     // stray pair/abort on an operational connection. This is the one place every "connection is
@@ -2373,7 +1606,7 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     this->note_trust_changed(trust);
 }
 
-void SendspinClient::apply_role_removals(uint16_t removed_roles) {
+void SendspinClient::apply_role_removals([[maybe_unused]] uint16_t removed_roles) {
     // messaging.md "server/activate", "When applying a server/activate, the client MUST": every
     // removed server-to-client stream role stops its remaining output and clears its buffers, even
     // where an earlier stream/end had let buffered data finish, and every removed role with a

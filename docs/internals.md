@@ -6,9 +6,9 @@ This document maps how the library's parts work together: which threads exist, h
 
 Each role class uses the pimpl pattern. The public header (`include/sendspin/<role>_role.h`) exposes the protocol types, the listener interface, and a thin role class holding `std::unique_ptr<Impl> impl_`; all private state and thread management live in `src/<role>_role_impl.h` and the role's `.cpp`. `SendspinClient` is a `friend` of each role class so it can dispatch into `impl_`. Internal references below use the `Impl` qualification (e.g. `PlayerRole::Impl::drain_events()`).
 
-Roles are disabled at build time through two cooperating mechanisms. `cmake/sources.cmake` keeps a source list per role, so a disabled role's translation units are never compiled and its dependencies are never required; `#ifdef SENDSPIN_ENABLE_<ROLE>` guards in `include/sendspin/client.h` and `src/client.cpp` remove the members, accessors, and dispatch branches that must name the role's type. The split exists because CMake cannot gate individual declarations, and `#ifdef` around whole files would still put the codec headers on the include path. On ESP-IDF the codec dependencies are gated by `idf_component.yml`'s Kconfig rules alone, because ESP-IDF collects `REQUIRES` before `sdkconfig` is loaded. The Opus decoder is a third gate inside the player role (`SENDSPIN_ENABLE_OPUS`), confined to `src/decoder.h`, `src/decoder.cpp`, and `src/player_role.cpp`.
+Roles are disabled at build time through two cooperating mechanisms. `cmake/sources.cmake` keeps a source list per role, so a disabled role's translation units are never compiled and its dependencies are never required; `#ifdef SENDSPIN_ENABLE_<ROLE>` guards in `include/sendspin/client.h`, `src/client.cpp` and `src/client_dispatch.cpp` (the protocol task's tick and message dispatch) remove the members, accessors, and dispatch branches that must name the role's type. The split exists because CMake cannot gate individual declarations, and `#ifdef` around whole files would still put the codec headers on the include path. On ESP-IDF the codec dependencies are gated by `idf_component.yml`'s Kconfig rules alone, because ESP-IDF collects `REQUIRES` before `sdkconfig` is loaded. The Opus decoder is a third gate inside the player role (`SENDSPIN_ENABLE_OPUS`), confined to `src/decoder.h`, `src/decoder.cpp`, and `src/player_role.cpp`.
 
-Adding a role therefore means: a `SENDSPIN_<ROLE>_SOURCES` list in `cmake/sources.cmake`, the guarded member, accessor, and dispatch branches in `client.h` and `client.cpp`, and any heavy dependency kept behind the role's private headers. A role-private header such as `src/decoder.h`, which pulls in the codec headers, may only be reached from the role's own sources or a guarded include in `client.cpp`; public role headers stay codec-free because core files such as `src/protocol_messages.h` include them unconditionally.
+Adding a role therefore means: a `SENDSPIN_<ROLE>_SOURCES` list in `cmake/sources.cmake`, the guarded member, accessor, and dispatch branches in `client.h`, `client.cpp` and `client_dispatch.cpp`, and any heavy dependency kept behind the role's private headers. A role-private header such as `src/decoder.h`, which pulls in the codec headers, may only be reached from the role's own sources or a guarded include in `client.cpp` or `client_dispatch.cpp`; public role headers stay codec-free because core files such as `src/protocol_messages.h` include them unconditionally.
 
 ## Thread Model
 
@@ -17,11 +17,11 @@ Listener callbacks fire on the caller's main loop unless noted otherwise. Connec
 | Thread | Name | Created by | Purpose |
 |--------|------|-----------|---------|
 | **Main loop** | (caller's) | User code | Drives `SendspinClient::loop()`, which only drains the Inbox: every role event, listener callback, high-performance request and persistence-provider write runs here. Calls `start()`/`stop()`. |
-| **Protocol task** | `SsProto` | `ProtocolTask::start()`, from `SendspinClient::start()` | Owns every connection and the `ConnectionManager` slots: decrypt, Noise reassembly and handshakes, hello, activation, admission and role ownership, pairing, JSON and binary dispatch, time bursts, watchdogs, every send, and the consumer requests in its command queue. Ticks on a wake or at its next deadline (`SendspinClient::protocol_tick()`, see [The Protocol Task's Tick](#the-protocol-tasks-tick)). |
+| **Protocol task** | `SsProto` | `ProtocolTask::start()`, from `SendspinClient::start()` | Owns every connection and the `ConnectionManager` slots: decrypt, Noise reassembly and handshakes, hello, activation, admission and role ownership, pairing, JSON and binary dispatch, time bursts, watchdogs, every send, and the consumer requests in its command queue. Ticks on a wake or at its next deadline (`SendspinClient::protocol_tick()`, see [The Protocol Task's Tick](#the-protocol-tasks-tick)). Runs no single-precision float of its own, with one exposure: ArduinoJson's `parseNumber()` converts a JSON number with a fraction or an exponent through `float` even with `ARDUINOJSON_USE_DOUBLE`, and on ESP-IDF a task's first FPU instruction pins it to its current core for good (ESP-IDF's FreeRTOS notes on floating point). No protocol field carries such a number. A parse filter skips unknown fields without converting them, but cannot help for a field the library keeps, so a peer that sends such a number there pins the task; the library adds no core pinning of its own. |
 | **Sync task** | `Sendspin` | `SyncTask::start()` | Decodes audio, aligns it to server timestamps (`docs/playback-sync.md`), writes PCM via `on_audio_write`, and notes its return to idle to the main loop through the Inbox. |
 | **Visualizer drain** | `SsVis` | `VisualizerRole::Impl::start()` | Delivers visualization frames from its item list at their playback time. |
 | **Artwork decode** | `SsArt` | `ArtworkRole::Impl::start()` | Calls `on_image_decode()` for completed images; hands the display deadline to the main loop. |
-| **Transport** | (library-internal) | IXWebSocket (host); esp_http_server for inbound and esp_websocket_client for outbound connections (ESP) | WebSocket I/O only: receives each complete message into the shared inbound ring or the connection's fallback buffer, reports a close, delivers an upgraded inbound connection to the command queue, and wakes the protocol task. |
+| **Transport** | (library-internal) | IXWebSocket (host); esp_http_server for inbound and esp_websocket_client for outbound connections (ESP) | WebSocket I/O only: receives each complete message into the shared inbound ring or the connection's fallback buffer, reports a close, delivers an upgraded inbound connection to the command queue, and wakes the protocol task. An outbound transport released while still connecting runs on until its attempt ends, its connection parked in `ConnectionManager`'s reaping list (see [Slots](#slots)). |
 
 On ESP-IDF, `platform_configure_thread()` sets each thread's stack size, priority, and name before the `std::thread` is constructed; priorities come from the client and role configs in `config.h`. On host it is a no-op.
 
@@ -29,20 +29,37 @@ The three role threads share one lifecycle shape. `start()` clears every event f
 
 ## Cross-Thread State
 
-The primitives other than the Inbox live in `src/platform/`, with FreeRTOS implementations on ESP and `std::mutex`/condition-variable implementations on host. `docs/conventions.md` ("Threading and cross-thread state") says which to use when.
+The primitives other than the Inbox and the inbound ring live in `src/platform/`, with FreeRTOS implementations on ESP and `std::mutex`/condition-variable implementations on host. `docs/conventions.md` ("Threading and cross-thread state") says which to use when. Every channel between two threads:
 
-| Primitive | Use |
-|-----------|-----|
-| `EventFlags` | Command and status bits between the protocol task or main loop and a role thread (`COMMAND_STOP`, `COMMAND_STREAM_END`, `TASK_IDLE`, ...) |
-| `ThreadSafeQueue` | Fixed-depth hand-off from the protocol task to a worker (the artwork notification queue) |
-| `InboundRing` (`src/inbound_ring.h`) | The one shared ring every admitted connection's transport receives into; the protocol task takes its items in arrival order |
-| `InboundItemList` | A role's FIFO of inbound ring items, linked through the items themselves: the protocol task appends, the sync task or visualizer drain thread takes and returns. Each holder's items are charged to its `InboundQuota`. Its mutex also guards the two-party return count of a task-written (LOCAL) item charged to that holder, since the ring storage may be external RAM, where the ESP32 cannot run an atomic |
-| `InboundGate` | Per connection, between its transport and the protocol task: the admitted and detached flags, the one pre-admission message in flight, the count of ring items not yet taken, and the out-of-band close |
-| `ProtocolTask` command queue | Bounded requests from any thread to the protocol task (`ProtocolCommand`): the accepts the platform servers deliver, and the consumer's `connect_to()`, `disconnect()`, `leave()`, pairing-window gestures, `send_text()` and unpaired-access changes. Beside it, one latest-wins `client/state` snapshot slot (`publish_state()`) |
-| `ShadowSlot` | Single-writer/single-reader state whose reader is not the main loop, latest-wins or merged (sync-task playback progress) |
-| `Inbox` (`src/inbox.h`) | Cross-thread state bound for the main loop |
+| Channel | Producer | Consumer |
+|---------|----------|----------|
+| `InboundRing` (`src/inbound_ring.h`, see [The Inbound Ring](#the-inbound-ring)) | Transport threads, each admitted connection's messages; the protocol task, the items it writes itself (codec headers, clear markers, copied chunks) | The protocol task, in arrival order; an item handed to a role is returned by that role's consumer thread |
+| The player's `InboundConsumer` (`SyncTask::inbound_`) | Protocol task, appending the items it charges to the player's quota | Sync task, which takes and returns them; the protocol task recalls a torn-down stream's, and the main loop the rest once the thread is joined |
+| The visualizer's `InboundConsumer` (`DrainTask::inbound`) | Protocol task, against the visualizer's quota | Visualizer drain thread, likewise |
+| `InboundGate`, one per connection | The connection's transport: the fallback message in flight, the count of ring items not yet taken, the out-of-band close | The protocol task, which takes and consumes them and detaches the gate; the connection manager detaches it when the connection leaves it, from any thread |
+| `ProtocolTask` command queue (`ProtocolCommand`) | Transport threads (accepts of upgraded inbound connections); any thread (`connect_to()`, `disconnect()`, `leave()`, the pairing-window gestures, `send_text()`, unpaired-access changes) | The protocol task; at `stop()`, the joining thread for what the final tick left |
+| `ProtocolTask` state slot (`publish_state()`) | Any thread, latest-wins `client/state` | The protocol task |
+| Role `EventFlags` | The protocol task, or the main loop in `stop()` (`COMMAND_STOP`, `COMMAND_STREAM_END`, ...); the main loop (`COMMAND_START`) | The role's thread |
+| Sync-task stream ordinals (`SyncTask::started_ordinal_`, `ended_ordinal_`) | The main loop's start acknowledgement; the protocol task's stream end | Sync task (see [Stream End and Start](#stream-end-and-start)) |
+| Sync-task status bits (`TASK_RUNNING`, `TASK_IDLE`, `TASK_STOPPED` in its `EventFlags`) | Sync task | Main loop (`is_running()` gates a held STREAM_END), and the thread in `start()` waiting for IDLE |
+| `ThreadSafeQueue` (the artwork notification queue) | Protocol task | Artwork decode thread |
+| `ShadowSlot` (sync-task playback progress) | The consumer's audio thread (`notify_audio_played()`) | Sync task |
+| `Inbox` (`src/inbox.h`, see [Inbox](#inbox)) | Protocol task, sync task, artwork decode thread | Main loop |
+| `ConnectionManager` published primary slot (time filter and server information) | Protocol task (`refresh_published_state()`) | Any thread (`time_filter()`, `server_information()`) |
+| Each connection's `SendspinTimeFilter` | Protocol task (its burst's measurements) | Sync task and visualizer drain thread, converting timestamps |
+| `RecordStore` | Protocol task (resolves and changes records) | Main loop (writes them to the provider) |
 
-Three slots read from any thread sit outside these primitives, each behind a leaf mutex held only to copy a value: `ConnectionManager::time_filter_mutex_` and `server_info_mutex_` guard the time filter and server information of the primary admitted connection, which the protocol task publishes (see [Time Filter Slot](#time-filter-slot)), and each connection's `SendspinTimeFilter` guards its state with its own `state_mutex_`, because the protocol task updates it while the sync task and the visualizer drain thread convert timestamps through it (`docs/playback-sync.md`). `RecordStore` keeps its own mutex, since the protocol task resolves and changes records while the main loop writes them to the provider. Plain atomics carry the rest: the `connected_` and `accepting_` flags on `ConnectionManager`, and the trust level, the unpaired-access setting and the high-performance grant count (`high_performance_granted_`, see [One Main Loop Drain](#one-main-loop-drain)) on `SendspinClient`.
+Plain atomics carry the rest: the `connected_` and `accepting_` flags on `ConnectionManager`; the trust level, the unpaired-access setting, the lifecycle state and the high-performance grant count (`high_performance_granted_`, see [One Main Loop Drain](#one-main-loop-drain)) on `SendspinClient`; and each role's teardown generation (`cleanup_generation`), written by the protocol task and read by the main loop and the role's thread. The role- and connection-local atomics (a connection's last-arrival stamp, upgrade and hello flags and time-frame tag, which its transport writes or clears; a role's stream and negotiation flags, artwork's slot epochs, the player's output delay and audio-discard flag, the controller's supported commands) each state their writer and reader at their declaration.
+
+### Locks
+
+Every library lock is a leaf: it is held only to copy or update its own state, never across a call that takes another library lock, a send, a listener or the persistence provider, so no two library locks are ever held at once and there is no lock order. The locks are the Inbox's `mutex_`; the inbound ring's own (`SharedRingBuffer::mtx_` on host, the FreeRTOS ring's internal lock on ESP); each `InboundItemList::mutex_`; `ProtocolTask::command_mutex_` (the command queue and the state slot); `ConnectionManager::published_mutex_` (which also serialises the role threads' `time_filter()` reads behind `server_information()` copies); `GoodbyeWait::mutex`; each `SendspinTimeFilter::state_mutex_`; `RecordStore::mutex_`; the artwork role's `DrainTask::slot_mutex`; each `ShadowSlot::mutex_`; the ESP server's `SendspinWsServer::pending_mutex_`; and, on host, the mutexes inside `EventFlags` and `ThreadSafeQueue`. Connection state has no lock at all: only the protocol task touches it, except the transport's own atomics, which state their writer and reader at their declaration.
+
+### The Inbound Ring
+
+One `InboundRing` serves every admitted connection, created by `start()` whatever roles are enabled. A transport receives each complete message of an admitted connection straight into an item it acquires; the protocol task decrypts it in place and either dispatches it and returns the item at once (JSON, time replies, artwork) or hands the item itself to a role's consumer thread through that role's item list (a player audio chunk, a visualizer frame), which returns it when done. An unadmitted connection never writes the ring: it delivers one message at a time through its fallback buffer (`InboundGate`), so an unauthenticated peer cannot pin ring space.
+
+Space is reclaimed in ring order, so everything received while the oldest held item is out stays allocated until it returns. Each holder's outstanding items are charged to its own `InboundQuota` on the protocol task, all but the codec headers and stream markers the task writes itself: a role over its quota has the new item dropped and returned with a warning, and the other holder keeps flowing. `derive_inbound_ring_bytes()` (`src/inbound_ring.h`) sizes the ring from the quotas, the pass-through traffic that arrives during the longest hold (state JSON, time-burst replies, and visualizer frames behind held audio), and the artwork images that window carries, and never below two of the longest messages the enabled roles need in one item: a JSON message (`INBOUND_JSON_MESSAGE_BYTES`), the longest chunk the player's and the visualizer's advertised buffers allow, or a maximal Noise frame with artwork. A message longer than the ring takes (`InboundRing::max_message_bytes()`) goes through the connection's fallback buffer, in order behind the ring items the connection wrote before it.
 
 ### Inbox
 
@@ -52,7 +69,7 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
 
 | Endpoint | Topic bit | Producer |
 |----------|-----------|----------|
-| Event ring | `INBOX_TOPIC_EVENTS` | Protocol task (stream events, and the `*_CLEARED` and synthetic stream events each role's `cleanup()` pushes); the main loop in `stop()` once the task is joined |
+| Event ring | `INBOX_TOPIC_EVENTS` | Protocol task (stream events, and the `*_CLEARED` event each role's `cleanup()` pushes); the main loop in `stop()` once the task is joined |
 | `SendspinClient::EventState::time_sync_slot` | `INBOX_TOPIC_TIME` | Protocol task (the primary connection's completed time burst) |
 | `SendspinClient::EventState::group_slot` | `INBOX_TOPIC_GROUP` | Protocol task (`group/update` from the primary connection) |
 | `SendspinClient::EventState::persist_slot` | `INBOX_TOPIC_PERSIST` | Protocol task (`server/pair-finalize`, an unpair, a playback activate, a last-played change); main loop (`start()`) |
@@ -80,46 +97,49 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
 3. The newest client/state snapshot, sent to every admitted connection
 4. Recall the inbound items of a stream role torn down since the last tick
 5. client/init on outbound connections whose WebSocket upgrade completed
-6. The receive pass over a snapshot of the managed connections: each connection's pending
-   pre-admission message, then up to 32 ring items in arrival order
+6. The receive pass over a snapshot of the managed connections: each connection's message
+   pending in its fallback buffer once the ring items it wrote before it are taken, then up to
+   MAX_ITEMS_PER_TICK ring items in arrival order
 7. Losses: a connection whose gate is detached or whose close is ready is dropped
-   (ConnectionManager::on_connection_lost())
+   (ConnectionManager::on_connection_lost()); a fallback message the ring items just taken held
+   back makes the tick run again at once
 8. ConnectionManager::tick(): the nursery's hello sends, the promotion of operational nursery
    connections, the establish reap; the admitted connections' liveness, re-prove and
-   pairing-attempt watchdogs; the pairing window's expiry; the platform server's upgrade reap;
-   the WebSocket server start once the network is ready
+   pairing-attempt watchdogs; the pairing window's expiry; the reap of released outbound
+   connections whose transport closed or opened, or whose deadline passed; the platform server's
+   upgrade reap; the WebSocket server start once the network is ready
 9. ConnectionManager::run_time_sync(): each admitted, operational connection's time burst, and
    the client/state that waited for its first measurement
-10. ConnectionManager::refresh_published_state(): the time filter, server information and
-    connected slots other threads read
+10. ConnectionManager::refresh_published_state(): the published primary slot (time filter and
+    server information) and the connected flag other threads read
 ```
 
-The tick returns the milliseconds until the earliest of its timers: a nursery entry's hello retry or establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound returns 0 and runs again at once. Every handler a message reaches runs inside step 6, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
+The tick returns the milliseconds until the earliest of its timers: a nursery entry's hello retry or establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a released outbound connection's reaping deadline, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound, or one that freed a held-back fallback message, returns 0 and runs again at once. No timer is periodic except the network poll, which runs only while the server is down, so an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 6, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
 
 ## One Main Loop Drain
 
 `SendspinClient::loop()` is a no-op while the client is stopped. While started, each call runs `drain_inbox()`, which `stop()` also calls once so teardown callbacks are delivered synchronously:
 
 ```api
-1. Each role with main-loop state catches up to its current teardown generation
-   (catch_up_teardown()): one acquire load per role
+1. Each role catches up to its current teardown generation (catch_up_teardown()): one
+   acquire load per role
 2. High-performance requests: every acquire, the grant for them, then every release
 3. Provider writes owed since the last drain (flush_pending_persistence())
 4. The time-sync report: on_time_sync_updated()
 5. The inbox event ring; each event's role first catches up on the teardown the event is
    stamped with (catch_up_teardown())
-   ├─ *_CLEARED → the catch-up alone: the role's main-loop half fires its clear callback
+   ├─ *_CLEARED → the catch-up alone: the role's main-loop half delivers its clear
    └─ PLAYER/ARTWORK/VISUALIZER_STREAM → a current event's handler, after the catch-up
 6. Pairing and trust notes, grouped by type
 7. Role drains: each role's impl_->drain_events(), gated on impl_->needs_drain(slot_bits)
 8. Drain group_slot: apply deltas, fire on_group_update
 ```
 
-Step 1 is what still runs a teardown's main-loop half when the full event ring dropped its stamped CLEARED or STREAM_END. It can only run a half earlier, never apply anything: a payload is applied only when its stamp is the current generation, and the events and role drains after it catch up again at the stamp they act on. The steps gate on two `poll()` snapshots: one before the ring drain (steps 2 to 5) and one after it (steps 6 to 8), which catches bits set while the ring was draining. Provider writes precede the pairing notes, so `on_pairing_succeeded` finds the record committed. Pairing notes follow the event ring, so a role's clear can be delivered ahead of a note queued before it: the two never describe the same listener state, and the one ordering between them that matters, the provider write ahead of `on_pairing_succeeded`, is step 3. Roles whose pending work waits on a deadline rather than on a new message (the metadata and color roles' future-dated state, artwork's held displays) add a carry-over term to `needs_drain()`, since no inbox bit tracks that wait; the player's STREAM_END held for the sync task waits instead for `sync_idle_slot`, which the sync task writes each time it returns to idle from a stream.
+Step 1 is what still runs a teardown's main-loop half, and delivers its clear, when the full event ring dropped its stamped `*_CLEARED`. It can only run a half earlier, never apply anything: a payload is applied only when its stamp is the current generation, and the events and role drains after it catch up again at the stamp they act on. The steps gate on two `poll()` snapshots: one before the ring drain (steps 2 to 5) and one after it (steps 6 to 8), which catches bits set while the ring was draining. Provider writes precede the pairing notes, so `on_pairing_succeeded` finds the record committed. Pairing notes follow the event ring, so a role's clear can be delivered ahead of a note queued before it: the two never describe the same listener state, and the one ordering between them that matters, the provider write ahead of `on_pairing_succeeded`, is step 3. Roles whose pending work waits on a deadline rather than on a new message (the metadata and color roles' future-dated state, artwork's held displays) add a carry-over term to `needs_drain()`, since no inbox bit tracks that wait; the player's STREAM_END held for the sync task waits instead for `sync_idle_slot`, which the sync task writes each time it returns to idle from a stream.
 
 The high-performance hold is a ref-counted request, surfaced to the consumer through `on_request_high_performance()` / `on_release_high_performance()`, for the platform to keep networking responsive (e.g. disable WiFi power saving) during time sync and playback. A time burst requests it through `high_performance_slot` when it comes due, and sends its first time frame only once the main loop has granted that request: step 2 calls the listener for every acquire it took, then adds them to `SendspinClient::high_performance_granted_` and wakes the protocol task, which compares the burst's ticket against that count (`high_performance_granted()`). Acquires and releases are counted separately, so an acquire and a release queued inside one stalled tick (a connection dropped before its grant) still reach the listener as a request followed by its release. Releases wait for nothing. The player holds the same ref count from its drained STREAM_START to its STREAM_END on the main loop.
 
-Every role drain in step 7 has the same head: it takes its slot first, catches the role up on its current teardown generation (`catch_up_teardown()`), then applies the taken payload only if its stamp is still the current generation, dropping a stale one with a debug log. Controller, metadata, and color then fire their state callback, metadata and color holding a future-dated state until its server-clock timestamp. Artwork folds its displays into its holds and fires `on_image_display()` when each deadline passes. The player's drain is the main loop's half of the stream end/start handshake (see [Stream End and Start](#stream-end-and-start)). Visualizer has no drain; it is driven entirely by its ring events, its STREAM_START applying the config written with the same stamp.
+Every role drain in step 7 has the same head: it takes its slot first, catches the role up on its current teardown generation (`catch_up_teardown()`), then applies the taken payload only if its stamp is still the current generation, dropping a stale one with a debug log. Controller, metadata, and color then fire their state callback, metadata and color holding a future-dated state until its server-clock timestamp. Artwork folds its displays into its holds and fires `on_image_display()` when each deadline passes. The player's drain is the main loop's half of the stream end/start handshake (see [Stream End and Start](#stream-end-and-start)). Visualizer has no drain; it is driven entirely by its ring events, its STREAM_START applying the config written with the same stamp, and by its teardown catch-up.
 
 ## Ordering Guarantees
 
@@ -129,17 +149,17 @@ Protocol-task work bound for the main loop crosses through the Inbox only, and i
 
 ### Stream End and Start
 
-`stream/end` followed by `stream/start` crosses three threads, and a two-way handshake keeps them in order:
+`stream/end` followed by `stream/start` crosses three threads, and a two-way handshake keeps them in order. Every `stream/start` the player serves gets the next stream ordinal (`PlayerRole::Impl::stream_ordinal`), which numbers both its codec header item and its STREAM_START event:
 
-1. On `stream/end` the protocol task signals the sync task `COMMAND_STREAM_END`, then pushes STREAM_END as a `PLAYER_STREAM` event onto the inbox ring; on `stream/start` it appends the codec header to the sync task's item list, then pushes STREAM_START.
-2. The sync task finishes the stream and returns to IDLE, clearing `TASK_RUNNING`.
+1. On `stream/end` the protocol task signals the sync task `COMMAND_STREAM_END` with the ordinal of the latest stream it started (`signal_stream_end()`), then pushes STREAM_END as a `PLAYER_STREAM` event onto the inbox ring; on `stream/start` it appends the numbered codec header to the sync task's item list, then pushes the STREAM_START carrying the same ordinal.
+2. The sync task finishes the stream and returns to IDLE, clearing `TASK_RUNNING`. A codec header numbered no later than the ended ordinal is discarded when the sync task takes it, so a header whose end overtook it is never started; a later header it takes while the ended stream is still ACTIVE is kept for IDLE rather than decoded into that stream.
 3. The main loop moves the ring events into `awaiting_sync_idle_events`. It holds STREAM_END, and everything behind it, until `SyncTask::is_running()` reads false, then fires `on_stream_end()`. While it holds, the drain runs again only when the sync task writes `sync_idle_slot` on its way back to idle.
-4. The main loop fires `on_stream_start()` and signals `COMMAND_START`.
-5. The sync task, which has been waiting for `COMMAND_START` since it saw the new codec header (WAIT FOR CLIENT ACK in `docs/playback-sync.md`), goes ACTIVE.
+4. The main loop fires `on_stream_start()` and acknowledges the event's ordinal (`signal_stream_start()`, which sets `COMMAND_START` as the wake).
+5. The sync task, which has been holding the codec header since it took it (WAIT FOR CLIENT ACK in `docs/playback-sync.md`), goes ACTIVE once the acknowledged ordinal reaches the header's.
 
-A `stream/start` and `stream/end` the main loop drains together take the same steps out of order: the sync task may already have taken the header, met the end, returned the header and gone back to waiting for one, so step 4's `COMMAND_START` finds no header pending. The sync task then takes the start as stale and returns to idle, which clears it and writes `sync_idle_slot`, so the STREAM_END the main loop holds behind that start is released, and the next stream waits for its own start. That holds only when no header is pending: when `stream/end` is signalled before the sync task takes the start's header (a start, its end and the next start inside one main-loop stall), the unnumbered `COMMAND_START` can activate the next header early, and the held STREAM_END waits for the following `stream/end`. Closing it takes a numbered start acknowledgement (a stream ordinal on the header item and on the STREAM_START event, `signal_stream_start(n)`), which is a named gap.
+Stream events the main loop drains together still end each stream before the next starts, however the sync task interleaved with them: every codec header the task takes is either discarded (its stream ended), held for its own acknowledgement, or decoded into the stream still active, which is only ever its own stream or one it changes the format of. An acknowledgement for an earlier stream than the header the sync task holds, or one that finds no header pending (the task took that stream's header, met its end and returned it), is stale: the sync task notes idle for it, which releases the STREAM_END the main loop holds behind that start, and the held header waits for its own acknowledgement.
 
-Signalling before pushing is what lets the `is_running()` gate in step 3 release only an end the sync task has already been told to honour. Step 5's wait is what makes step 3 safe: without it the sync task could pass through IDLE and back to ACTIVE before the main loop ever observed it not running, and the held STREAM_END would wait forever. `stream/clear` does not use this path; it signals the sync task directly and appends a marker item to its list, and the sync task stays ACTIVE while it discards up to the marker.
+Signalling before pushing is what lets the `is_running()` gate in step 3 release only an end the sync task has already been told to honour. Step 5's wait is what makes step 3 safe: without it the sync task could pass through IDLE and back to ACTIVE before the main loop ever observed it not running, and the held STREAM_END would wait forever. `stream/clear` does not use this path; it signals the sync task directly and appends a marker item to its list, and the sync task discards up to the marker without leaving the stream, keeping its codec header: ACTIVE, or still in WAIT FOR CLIENT ACK.
 
 The hold in step 3, and step 4, run in `PlayerRole::Impl::drain_events()`, which first applies any current server command (volume, mute, output delay), then walks `awaiting_sync_idle_events`:
 
@@ -150,12 +170,12 @@ PLAYER_STREAM ring events → on_stream_ring_event() → awaiting_sync_idle_even
          For each event in order:
            ├─ STREAM_END:
            │    Sync task still running → wait for next tick
-           │    Sync task idle → fire on_stream_end(), continue
+           │    Sync task idle → fire on_stream_end() if a stream is open, continue
            │
            └─ STREAM_START:
                 Take stream_params_slot (applied if its stamp is current)
                 Mark stream active, fire on_stream_start()
-                Signal sync task COMMAND_START
+                Acknowledge the event's ordinal to the sync task
 ```
 
 ### Cleanup
@@ -164,8 +184,8 @@ When a connection leaves the admitted array, `detach_inbound()` runs first. It d
 
 `cleanup_connection_state()` then tears down the roles no remaining admitted connection owns, on the protocol task. When that is every role it also resets the inbox ring, the group and time-sync slots and the trust level, and drops the pending pairing notes other than a dismissal whose prompt an earlier drain delivered. Each role's teardown is split in two halves, with a `TeardownTracker` (`src/teardown_tracker.h`) on each role recording which teardowns the main loop has caught up with:
 
-- The protocol-task half, the role's `cleanup()`, bumps its `cleanup_generation`, resets its Inbox slots, signals its thread, and pushes its synthetic STREAM_END or `*_CLEARED` stamped with the new generation. Everything the role queues from then on, events and slot payloads alike, carries the new generation.
-- The main-loop half, the role's `complete_teardown()`, resets what only the main loop touches (the player's held stream events and playback high-performance hold, the controller, metadata and color state, artwork's held displays; the visualizer has none) and, for a state role, fires its clear callback. `catch_up_teardown()` runs it once per teardown generation: at the head of every drain, from the event drain before the main loop acts on an event stamped with a newer generation, and from each role drain before it applies a slot payload. A role drain takes its slot first and only then catches up to the role's current generation, so a payload the next connection wrote right after the teardown is applied after the clear, never wiped by it, and a payload from the torn-down connection, stamped with the older generation, is dropped instead of applied after its clear. The controller's supported-commands mask carries the same stamp, so `send_command()` reads a torn-down connection's mask as empty.
+- The protocol-task half, the role's `cleanup()`, bumps its `cleanup_generation`, resets its Inbox slots, signals its thread, and pushes its `*_CLEARED` event stamped with the new generation. Everything the role queues from then on, events and slot payloads alike, carries the new generation.
+- The main-loop half, the role's `complete_teardown()`, resets what only the main loop touches (the player's held stream events and playback high-performance hold, the controller, metadata and color state, artwork's held displays) and delivers the role's clear: the controller, metadata and color clear callbacks, artwork's `on_image_clear()` for every channel, the visualizer's `on_visualizer_stream_end()`, and the player's STREAM_END, which it queues in `awaiting_sync_idle_events` for the drain to fire once the sync task reads idle. `catch_up_teardown()` runs it once per teardown generation: at the head of every drain, from the event drain before the main loop acts on an event stamped with a newer generation, and from each role drain before it applies a slot payload. A role drain takes its slot first and only then catches up to the role's current generation, so a payload the next connection wrote right after the teardown is applied after the clear, never wiped by it, and a payload from the torn-down connection, stamped with the older generation, is dropped instead of applied after its clear. The controller's supported-commands mask carries the same stamp, so `send_command()` reads a torn-down connection's mask as empty.
 
 Items a stream role's consumer holds are recalled the same way: the protocol task returns what the sync task or the visualizer drain thread has not taken once the role's generation moves past their stamp (`recall_stale_items()`), and a consumer that takes such an item first returns it, by its stamp, without acting on it. A role removed by a `server/activate` and a `stop()` take the same path; `stop()` then also returns everything left on the lists once the role threads are joined.
 
@@ -186,7 +206,13 @@ Encryption is mandatory, so every application message arrives as a binary Noise 
 Transport thread (IXWebSocket / esp_http_server / esp_websocket_client)
   │
   ├─ Admitted connection: receives the message straight into an InboundRing item
-  │  (waits up to INBOUND_ACQUIRE_TIMEOUT_MS for room, else drops it with a warning)
+  │  (waits up to INBOUND_ACQUIRE_TIMEOUT_MS for room, else drops it with a warning); a
+  │  message longer than the ring takes (InboundRing::max_message_bytes()) goes to the
+  │  fallback buffer, waiting the same bound for the previous one to be consumed, else
+  │  dropped with a warning; on the ESP server, which must drain the frame into a discard
+  │  buffer sized to the longest message a conforming server sends
+  │  (InboundRing::largest_message_bytes()), the connection closes instead: every admitted
+  │  fallback drop closes on ESP
   ├─ Unadmitted connection: receives into its fallback buffer and publishes it as the one
   │  pending message (waits up to InboundGate::WRITABLE_WAIT_MS for the previous one, else
   │  closes); a message over InboundGate::PRE_ADMISSION_MESSAGE_BYTES closes
@@ -195,7 +221,7 @@ Transport thread (IXWebSocket / esp_http_server / esp_websocket_client)
   └─ wakes the protocol task
          │
 Protocol task: SendspinClient::protocol_tick()
-  ├─ per connection: its pending pre-admission message
+  ├─ per connection: its pending fallback message, once its earlier ring items are taken
   └─ ring items in arrival order → SendspinConnection::process_inbound_message()
      ├─ detached connection → dropped (teardown guard)
      ├─ Text frame → handshake driver only (server/init, noise/handshake)
@@ -220,8 +246,8 @@ Role-bound traffic reaches a role only from the admitted connection that owns it
 | `server/state` | Writes the controller, metadata, and color `InboxSlot`s |
 | `server/command` | Merges into the player's `command_slot` |
 | `group/update` | Merges into `group_slot`, from the primary admitted connection only |
-| `stream/start` | Player writes the codec header into an item it acquires from the inbound ring (a bounded wait) and appends it to the sync task's list, then writes its params slot and pushes STREAM_START; visualizer appends a clear marker to its list, writes its config slot, and pushes STREAM_START; artwork marks its stream active and discards the pending image of each channel whose configuration changed |
-| `stream/end` | Pushes STREAM_END events for each streaming role and signals the sync task |
+| `stream/start` | Player writes the codec header, numbered with the stream's ordinal, into an item it acquires from the inbound ring (a bounded wait) and appends it to the sync task's list, then writes its params slot and pushes STREAM_START; visualizer appends a clear marker to its list, writes its config slot, and pushes STREAM_START; artwork marks its stream active and discards the pending image of each channel whose configuration changed |
+| `stream/end` | Pushes STREAM_END events for each streaming role and signals the sync task with the ordinal the stream ended |
 | `stream/clear` | Visualizer appends a clear marker to its list and pushes STREAM_CLEAR; player signals the sync task and appends a clear marker to its list |
 | Pairing messages, `pair/abort`, `server/unpair` | The pairing state machine and record revocation in `ConnectionManager` |
 | `server/pair-finalize` | Commits the pending record to `RecordStore` in RAM and queues the provider write |
@@ -286,9 +312,12 @@ Every slot belongs to the protocol task; nothing else reads or writes it.
 |------|---------|
 | `admitted_` | The admitted connections, `MAX_ADMITTED` entries (one today), each with the roles it owns (`AdmittedEntry`) |
 | `nursery_` | Unproven connections (inbound or outbound) awaiting establishment, bounded by `MAX_NURSERY_ENTRIES` |
+| `reaping_` | Released outbound connections whose transport may still be connecting, bounded by `REAPING_CAPACITY` (`ReapEntry`) |
 | `closing_` | Connections the shutdown pass took out of the slots, kept for `finish_stop()` to close |
 
 All hold `std::shared_ptr<SendspinConnection>`. On the ESP server path these are observers; see [Server Connection Ownership (ESP)](#server-connection-ownership-esp). The other holders of a connection reference are the protocol task's per-tick snapshot (`snapshot_connections()`), an accept waiting in the command queue, and the ESP platform server (the httpd session slot, the owner on ESP). No reference leaves the protocol task for a consumer or role thread: what they read about the connection goes through the published slots.
+
+An outbound connection's destructor joins its transport, which for one still connecting waits out the rest of the connect. So the protocol task never drops a released outbound attempt still connecting itself: every release of one (a `disconnect()`, a `connect_to()` replacing the pending attempt, the establish reap, a displaced or lost connection that never opened) closes its transport without blocking, which leaves the attempt to end on its own (`close_transport_now()` on each platform says why), and parks it in `reaping_`. The reap pass in the tick drops it once its inbound gate reports the transport closed or its upgrade completes, when the join is short, or at its deadline (`SendspinClientConnection::CONNECT_TIMEOUT_MS` after the release); a release that finds the list full drops the entry parked longest instead, and in those two cases the join is bounded by what remains of the connect. On ESP that includes the DNS lookup, which `CONNECT_TIMEOUT_MS` does not cover: lwIP's resolver gives up on a server after 7 s and tries each configured one (`CONFIG_LWIP_DNS_MAX_SERVERS`, 3 by default), so a drop at the deadline can hold the protocol task for up to about 21 s behind a stalled lookup. A connection whose upgrade had completed is released in place: its destructor's stop is the short close of an open transport, and a goodbye release has already stopped it synchronously. `finish_stop()` closes and drops what is still parked on the main loop, which pays those joins.
 
 Every role this client drives has at most one owner among the admitted connections. Ownership gates role dispatch, `send_text()` routing and the role objects of each connection's `client/state`. A connection owns the roles it activates that no other admitted connection owns (`claimable_roles()`); arbitration runs only when a newcomer wants a role an admitted connection owns, or when no slot is free (`admission_conflicts()`). The primary admitted connection, the owner of the player or else the first admitted one, is the one whose clock, server information and group the client reports. With one slot every role is owned by the one admitted connection; raising `MAX_ADMITTED` admits connections that share the roles between them.
 
@@ -306,13 +335,13 @@ A later `server/activate` can remove roles. Each removed role runs the same `cle
 
 ### Time Filter Slot
 
-Role threads convert server timestamps through `SendspinClient::is_time_synced()` and `get_client_time()`: the sync task per chunk, the visualizer drain thread per frame. Both resolve the primary admitted connection's `SendspinTimeFilter` through `ConnectionManager::time_filter()`, which reads a slot of its own (`time_filter_`, under the leaf `time_filter_mutex_`) and never waits on the protocol task. `refresh_published_state()` writes the slot, with the server-information slot beside it, whenever the primary connection changes, so it always names the primary connection's filter; a role thread holding the filter never holds the connection, whose destructor can join a transport thread.
+Role threads convert server timestamps through `SendspinClient::is_time_synced()` and `get_client_time()`: the sync task per chunk, the visualizer drain thread per frame. Both resolve the primary admitted connection's `SendspinTimeFilter` through `ConnectionManager::time_filter()`, which reads the `PublishedPrimary` slot (`published_`, under the leaf `published_mutex_`) and never waits on the protocol task. `refresh_published_state()` writes that one slot, holding both the filter and the server information, whenever the primary connection changes, so it always names the primary connection's filter; a role thread holding the filter never holds the connection, whose destructor can join a transport thread.
 
 Each getter reads the slot once, so a caller that checks `is_time_synced()` and then calls `get_client_time()` can see two different connections across a server handoff. A drop or handoff commands the stream to end before it changes the slot, so the sync task leaves the stream before transferring such a chunk; the shutdown pass empties the slot before the role threads stop, and the 0 an empty slot returns reads as late.
 
 ### Client Start and Stop
 
-`SendspinClient::start()` validates the pairing config, creates the `RecordStore` and identity, loads persisted state, creates the inbound ring (sized by `derive_inbound_ring_bytes()` from the player's and visualizer's quotas, the pass-through traffic that arrives while the player holds its oldest chunk (state JSON, time-burst replies and visualizer frames), and the artwork images that window carries), starts the threaded roles with it, publishes the first `client/state` snapshot, opens `ConnectionManager` for admission (starting the WebSocket server at once when the network is already up, otherwise the protocol task starts it once it is), and starts the protocol task. An accept the server delivers before the task starts waits in the command queue.
+`SendspinClient::start()` validates the pairing config, creates the `RecordStore` and identity, loads persisted state, creates the inbound ring whatever roles are enabled, since every admitted connection receives into it, the time replies included (see [The Inbound Ring](#the-inbound-ring)), starts the threaded roles with it, publishes the first `client/state` snapshot, opens `ConnectionManager` for admission (starting the WebSocket server at once when the network is already up, otherwise the protocol task starts it once it is), and starts the protocol task. An accept the server delivers before the task starts waits in the command queue.
 
 `SendspinClient::stop()` is synchronous and ordered so that every producer is gone before any state is reset:
 
@@ -322,36 +351,36 @@ Each getter reads the slot once, so a caller that checks `is_time_synced()` and 
 1. Signal the visualizer and artwork threads to stop, without joining. The player is not
    signalled yet: it keeps returning the ring items it plays, so a transport waiting for ring
    space is not parked behind a stopped consumer
-2. ConnectionManager::close_admission()
-3. ProtocolTask::stop(): the final tick acts on the commands queued so far (an accept is
-   refused with a shutdown goodbye) and runs the shutdown pass (snapshot the pairing-UI flags,
-   detach every connection, goodbye each with reason shutdown, wait up to the flush bound),
-   then the join. Accepts are then closed under the queue lock
-   (ProtocolTask::close_accepts()): one already queued is refused with a goodbye on the main
-   loop, and a later delivery is refused at its push, on the delivering thread
-4. ConnectionManager::finish_stop(): close every transport the shutdown pass kept, stop the
-   ws_server (joining its transport threads), release those connections; then drop any
-   command still queued
+2. ConnectionManager::close_admission(), which closes the protocol task's accepts with it
+   under the queue lock (ProtocolTask::close_accepts()): a delivery from here on is refused at
+   its push, on the delivering thread, and its transport closes it without a goodbye
+3. ProtocolTask::stop(): the final tick acts on the commands queued so far (an accept already
+   queued is refused with a shutdown goodbye) and runs the shutdown pass (snapshot the
+   pairing-UI flags, detach every connection, goodbye each with reason shutdown, wait up to the
+   flush bound per goodbye still outstanding), then the join
+4. ConnectionManager::finish_stop(): close every transport the shutdown pass kept and every
+   released outbound connection still parked for reaping, stop the ws_server (joining its
+   transport threads), release those connections; then drop any command still queued
 5. Join all role threads; each then returns its items to the ring or discards its queue
    content, and the emptied inbound ring is released
 6. Bump drain_generation, cleanup_connection_state() for every role (the protocol-task halves
    run here, on the main loop), then queue the pairing-UI dismissals the step 3 snapshot calls
    for
-7. drain_inbox() runs each role's main-loop half (its clear or STREAM_END callback), the
+7. drain_inbox() runs each role's main-loop half (its clear; the player's on_stream_end()), the
    high-performance releases the shutdown pass queued, the owed provider writes, and the
    pairing notes step 6 queued, each exactly once: a dismissal step 6 queues beside one an
    earlier drop left pending is a coalesced note type, delivered once
 8. lifecycle_ = STOPPED
 ```
 
-The library's last reference to a connection is therefore dropped on the protocol task, or on the main loop in steps 3 and 4 once the task is joined, never on a role thread. An ESP inbound connection, owned by its httpd session, is destroyed by its transport when the session is freed, and a host connection the client refused at delivery by its transport's open handler once the delivery has returned (see [Server Connection Ownership (ESP)](#server-connection-ownership-esp)). The client destructor performs steps 1 to 4, drops the high-performance requests no drain applied (they were never granted, so the listener never heard them) and releases the holds the main loop applied, its only listener call; it dispatches no teardown or clear callback, and performs the provider writes still owed once the connection manager is gone; the roles' destructors then join their threads, so listeners must outlive the client.
+The library's last reference to a connection is therefore dropped on the protocol task, or on the main loop in step 4 once the task is joined, never on a role thread. An ESP inbound connection, owned by its httpd session, is destroyed by its transport when the session is freed, and a host connection the client refused at delivery by its transport's open handler once the delivery has returned (see [Server Connection Ownership (ESP)](#server-connection-ownership-esp)). The client destructor performs steps 1 to 4, drops the high-performance requests no drain applied (they were never granted, so the listener never heard them) and releases the holds the main loop applied, its only listener call; it dispatches no teardown or clear callback, and performs the provider writes still owed once the connection manager is gone; the roles' destructors then join their threads, so listeners must outlive the client.
 
 ### Server Connection Ownership (ESP)
 
 On ESP, a `SendspinServerConnection`'s lifetime belongs to its httpd session rather than to `ConnectionManager`:
 
 1. `SendspinWsServer::open_callback` creates the `shared_ptr` and stores a heap-allocated copy as the session context, with a `free_fn` that deletes it. That copy is the authoritative reference.
-2. Once the upgrade completes, `ConnectionManager::on_new_connection()` receives the same `shared_ptr` on the httpd task and queues it as an accept; the protocol task's nursery entry keeps a copy as an observer. A refused accept (a full command queue) makes the server close the session, whose slot still owns the connection, so the refusal never destroys it on the httpd task.
+2. Once the upgrade completes, `ConnectionManager::on_new_connection()` receives the same `shared_ptr` on the httpd task and queues it as an accept; the protocol task's nursery entry keeps a copy as an observer. A refused accept (a full command queue, or admission closed) makes the server close the session, whose slot still owns the connection, so the refusal never destroys it on the httpd task.
 3. The WebSocket handler looks the connection up through the session context each time it runs. Queued send workers capture a `weak_ptr` and lock it when they run, rather than a socket number, which httpd can reuse for a different session after the original closes.
 4. On close, httpd calls `close_fn`, which marks the connection's inbound gate closed and wakes the protocol task; the task drops its observer once the messages the session delivered before closing are processed. httpd calls `free_fn` once no worker is queued for the session.
 

@@ -98,7 +98,8 @@ static constexpr size_t MAX_REASSEMBLED_MESSAGE_BYTES = 1UL * 1024UL * 1024UL;
 /// Eight of those is far above any single one of them, while denying a peer holding only the
 /// Sentinel PSK the 1 MiB it could otherwise pin per nursery slot. The traffic that makes
 /// MAX_REASSEMBLED_MESSAGE_BYTES as large as it is (player audio chunks, artwork parts) is binary,
-/// and is dispatched only once the connection is admitted (requires_admitted_connection()).
+/// and reaches a role only once the connection is admitted (SendspinClient::
+/// process_binary_message()).
 static constexpr size_t MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES =
     8 * SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE;
 

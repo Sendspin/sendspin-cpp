@@ -56,7 +56,7 @@ struct AudioChunk {
 };
 
 /// @brief Private implementation of the player role
-struct PlayerRole::Impl {
+struct PlayerRole::Impl : RoleTeardown {
     Impl(PlayerRoleConfig config, SendspinClient* client);
     ~Impl();
 
@@ -92,6 +92,10 @@ struct PlayerRole::Impl {
     /// @param ring The client's inbound ring for this run, which the sync task's item list links.
     bool start(SendspinPersistenceProvider* persistence, InboundRing* ring);
     void build_hello_fields(ClientHelloMessage& msg);
+    /// @brief The buffer_capacity client/hello advertises: the share of the quota that holds
+    /// encoded frames at the smallest frame size (see AUDIO_BUFFER_ADVERTISE_DENOMINATOR in
+    /// player_role.cpp), which also bounds the longest chunk the server sends.
+    size_t advertised_buffer_capacity() const;
     void build_state_fields(ClientStateMessage& msg) const;
     // Each handler takes the teardown generation the receive gate captured when it admitted the
     // message and re-checks it where it takes effect; see accepts(). All run on the protocol task.
@@ -103,7 +107,9 @@ struct PlayerRole::Impl {
     void handle_stream_end(uint32_t generation) const;
     void handle_stream_clear(uint32_t generation);
     void handle_server_command(const ServerCommandMessage& cmd, uint32_t generation) const;
-    void on_stream_ring_event(PlayerStreamCallbackType event);
+    /// @brief Holds a PLAYER_STREAM event (code: PlayerStreamCallbackType; serial: a STREAM_START's
+    /// stream ordinal) in awaiting_sync_idle_events. Main loop.
+    void on_stream_ring_event(const InboxEvent& event);
     /// @brief Tells the main loop the sync task returned to idle from a stream (sync_idle_slot).
     /// Sync task.
     void note_sync_idle() const {
@@ -112,48 +118,36 @@ struct PlayerRole::Impl {
     // True if this tick has drainable player work: a server command (volume/mute/output delay)
     // in command_slot; the sync task having left a stream (sync_idle_slot) while a STREAM_END
     // waits for it; or stream lifecycle events in awaiting_sync_idle_events, appended by
-    // on_stream_ring_event() during this tick's ring dispatch, that are not held for the sync
-    // task. stream_params_slot's own topic bit needs no term: it is only ever consumed from the
-    // STREAM_START branch while that event sits in awaiting_sync_idle_events.
+    // on_stream_ring_event() during this tick's ring dispatch or by a teardown's catch-up
+    // (complete_teardown()), that are not held for the sync task. stream_params_slot's own topic
+    // bit needs no term: it is only ever consumed from the STREAM_START branch while that event
+    // sits in awaiting_sync_idle_events.
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & (INBOX_TOPIC_PLAYER_COMMAND | INBOX_TOPIC_PLAYER_SYNC_IDLE)) != 0 ||
                (!this->awaiting_sync_idle_events.empty() && !this->awaiting_sync_idle);
     }
     void drain_events();
-    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
-    ///
-    /// The gate in SendspinClient's role dispatch is checked once, before the handler it admits
-    /// runs, and stop()'s teardown on the main loop can land in between. Re-checking at each point
-    /// of effect invalidates the whole handler instead of only the part that ran before it. The
-    /// drain applies the same check to a slot payload's stamp.
-    /// @param generation The counter value captured when the message was admitted.
-    bool accepts(uint32_t generation) const {
-        return generation == this->cleanup_generation.load(std::memory_order_acquire);
-    }
 
     /// @brief Stops the role and discards the state the protocol task can reach. Protocol task,
     /// or the main loop in SendspinClient::stop() once every other thread is joined.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
     /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
-    /// from active_roles (SendspinClient::apply_role_removals()). The STREAM_END is queued on
-    /// the inbox, stamped with the new generation, and the main loop runs complete_teardown() for
-    /// it before acting on that event (catch_up_teardown()).
+    /// from active_roles (SendspinClient::apply_role_removals()). Queues PLAYER_CLEARED, stamped
+    /// with the new generation, for the main loop to catch up on (catch_up_teardown()).
     void cleanup();
 
-    /// @brief The main-loop teardown half: drops the stream events the teardown overtook and
-    /// releases the playback high-performance hold. Main loop only, through catch_up_teardown().
+    /// @brief The main-loop teardown half: replaces the stream events the teardown overtook with
+    /// the STREAM_END it owes the listener (fired once the sync task reads idle) and releases the
+    /// playback high-performance hold. Main loop only, through catch_up_teardown().
     void complete_teardown();
 
     /// @brief Joins the sync task thread and returns its buffered audio to the inbound ring;
     /// no-op if not started.
     void stop() const;
 
-    /// @brief Recalls the items the sync task has not taken once a teardown has moved the
-    /// generation past the one they were appended under. Protocol task only: each tick, and
-    /// before each item it hands over, so no item of the new generation is ever recalled.
-    /// @param generation The generation about to be appended under, or the live one.
-    void recall_stale_items(uint32_t generation);
+    /// @brief InboundConsumer::recall_stale() on the sync task's list. Protocol task, each tick.
+    void recall_stale_items(uint32_t generation) const;
 
     // ========================================
     // Consumer-facing method implementations
@@ -167,32 +161,32 @@ struct PlayerRole::Impl {
     // Helpers
     // ========================================
 
-    /// @brief Fills an item's consumer fields and hands it to the sync task, returning it to the
-    /// ring with a warning when the player is over quota. Protocol task only.
+    /// @brief Fills an item's consumer fields and hands it to the sync task
+    /// (InboundConsumer::hand()). Protocol task only.
     /// @param item_len The item's message length (InboundMessage::item_len, or what
-    ///        acquire_local() was asked for).
+    ///        copy_local() was given).
     /// @param data_offset Where the sync task's bytes start in the item's message bytes.
     /// @param data_len How many bytes the sync task reads.
     /// @return false when the item was returned instead of handed over.
     bool hand_item(void* item, size_t item_len, ChunkType chunk_type, uint8_t data_offset,
-                   uint32_t data_len, uint32_t generation);
+                   uint32_t data_len, uint32_t generation) const;
 
-    /// @brief Writes `len` bytes into an item the protocol task acquires itself and hands it to
-    /// the sync task: a codec header, a stream/clear marker (len 0), or a chunk that reached the
-    /// protocol task outside a ring item. Protocol task only.
-    /// @param timeout_ms Bound on waiting for ring space.
-    /// @return false when the ring had no room in time or the player is over quota.
-    bool hand_local_item(const uint8_t* data, size_t len, ChunkType chunk_type, uint8_t data_offset,
-                         uint32_t receive_time_us, uint32_t timeout_ms, uint32_t generation);
+    /// @brief Copies a PCM or Opus codec header, or a stream/clear marker (len 0), into an item
+    /// the protocol task acquires itself, waiting up to HEADER_SEND_TIMEOUT_MS for ring space,
+    /// and hands it to the sync task. Protocol task only.
+    /// @return false when the sync task is not running or the ring had no room in time.
+    bool hand_local_item(const uint8_t* data, size_t len, ChunkType chunk_type,
+                         uint32_t generation) const;
 
     /// @brief Base64-decodes a FLAC codec header straight into an item the protocol task
     /// acquires and hands it to the sync task. Protocol task only.
-    /// @return false when the header does not decode, the ring had no room in time, or the
-    ///         player is over quota.
-    bool hand_flac_header(const std::string& codec_header, uint32_t generation);
+    /// @return false when the sync task is not running, the header does not decode, or the ring
+    ///         had no room in time.
+    bool hand_flac_header(const std::string& codec_header, uint32_t generation) const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
-    /// against the live counter before dispatching it.
-    void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation) const;
+    /// against the live counter before dispatching it, and carrying a STREAM_START's `ordinal`.
+    void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation,
+                              uint16_t ordinal) const;
     void load_output_delay();
     void persist_output_delay() const;
     uint16_t get_effective_output_delay_ms() const;
@@ -204,8 +198,7 @@ struct PlayerRole::Impl {
     // Struct fields
     PlayerRoleConfig config;
     ServerPlayerStreamObject current_stream_params{};
-    std::vector<PlayerStreamCallbackType> awaiting_sync_idle_events;
-    TeardownTracker teardown;  ///< Main loop only.
+    std::vector<InboxEvent> awaiting_sync_idle_events;
 
     // Pointer fields
     SendspinClient* client;
@@ -215,26 +208,14 @@ struct PlayerRole::Impl {
     SendspinPersistenceProvider* persistence{nullptr};
     std::unique_ptr<SyncTask> sync_task;
 
-    /// Throttles the over-quota drop warning in hand_item(). Protocol task only.
-    InboundDropLog over_quota_log;
-    /// Throttles the warning for a chunk that could not be copied into a ring item. Protocol task
-    /// only.
-    InboundDropLog copy_drop_log;
-
-    // 32-bit fields
-    /// The teardown generation the sync task's item list was last recalled for
-    /// (recall_stale_items()). Protocol task only.
-    uint32_t recalled_generation{0};
-    // Bumped by cleanup() and stamped onto every stream event and slot payload queued
-    // afterwards. At the drain it decides whether a ring event or a payload is still current: a
-    // STREAM_START queued before the teardown must not re-arm the sync task for a stream that is
-    // gone. Within drain_events() it also detects a listener callback that re-entered teardown.
-    // Written on the protocol task (or the main loop in stop() once it is joined); read on the
-    // main loop, the sync task (which drops items of an older generation) and the protocol task.
-    std::atomic<uint32_t> cleanup_generation{0};
-
     // 16-bit fields
+    /// Written on the main loop (a server or consumer change, load_output_delay()); read there
+    /// and on the sync task (get_effective_output_delay_ms()).
     std::atomic<uint16_t> output_delay_ms{0};
+    /// The ordinal of the latest stream whose codec header went to the sync task, one per
+    /// stream/start (see SyncTask::signal_stream_start()). Protocol task only, or the main loop
+    /// in SendspinClient::stop() once the task is joined.
+    uint16_t stream_ordinal{0};
 
     // 8-bit fields
     // True while the head of awaiting_sync_idle_events is a STREAM_END waiting for the sync task
@@ -245,8 +226,11 @@ struct PlayerRole::Impl {
     // True between the drained STREAM_START and STREAM_END callbacks (main-thread only); keeps
     // on_stream_end() from firing without a matching on_stream_start()
     bool stream_active{false};
+    /// Written by set_output_delay_adjustable() on the consumer's thread; read on the main loop
+    /// and the sync task.
     std::atomic<bool> output_delay_adjustable{false};
-    // Set by the client while it is unavailable; read by handle_binary() on the protocol task.
+    /// Set while the client is unavailable, on the main loop (set_available(), add_player());
+    /// read by handle_binary() on the protocol task.
     std::atomic<bool> discard_audio{false};
     uint8_t volume{0};
 };

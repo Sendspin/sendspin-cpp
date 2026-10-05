@@ -14,6 +14,7 @@
 
 #include "ws_server.h"
 
+#include "constants.h"
 #include "lwip/sockets.h"  // for close()
 #include "platform/compiler.h"
 #include "platform/logging.h"
@@ -66,9 +67,8 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
         config.task_caps = MALLOC_CAP_SPIRAM;
     }
     config.task_priority = task_priority;
-    // Clamp to the documented minimum, the value shipped and verified on hardware (see
-    // SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE), until this task's receive path is
-    // measured.
+    // Clamp to the documented minimum, the measured stack of this task's deepest call chain (see
+    // SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE).
     if (task_stack_size < SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE) {
         SS_LOGW(TAG, "httpd_stack_size %u below minimum %u; clamping",
                 static_cast<unsigned>(task_stack_size),
@@ -158,7 +158,7 @@ void SendspinWsServer::stop() {
 
 uint8_t* SendspinWsServer::discard_buffer() {
     if (this->discard_buf_.data() == nullptr &&
-        !this->discard_buf_.allocate(INBOUND_MAX_MESSAGE_BYTES, MemoryLocation::PREFER_EXTERNAL)) {
+        !this->discard_buf_.allocate(this->discard_capacity_, MemoryLocation::PREFER_EXTERNAL)) {
         return nullptr;
     }
     return this->discard_buf_.data();
@@ -200,11 +200,7 @@ uint32_t SendspinWsServer::tick() {
                 static_cast<int>(WS_UPGRADE_TIMEOUT_US / (1000 * 1000)));
         conn->trigger_close();
     }
-    if (next_due_us == INT64_MAX) {
-        return UINT32_MAX;
-    }
-    // Rounded up so the wake is never early; at most WS_UPGRADE_TIMEOUT_US away.
-    return static_cast<uint32_t>((next_due_us - now_us + 999) / 1000);
+    return next_due_us == INT64_MAX ? UINT32_MAX : ms_until(next_due_us, now_us);
 }
 
 void SendspinWsServer::deliver_upgraded(int sockfd) {

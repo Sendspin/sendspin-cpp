@@ -31,8 +31,8 @@ For every behavioral or API change in the diff, check each of these:
 1. **`docs/internals.md`**: anything it says that the diff makes untrue is a
    finding. It holds only cross-file facts (`docs/conventions.md`,
    "Documentation"), so a change that alters the thread model, a
-   cross-thread channel, the `loop()` tick order, or an invariant spanning
-   classes must be reflected there; a change confined to one function is
+   cross-thread channel, the protocol task's tick or the `loop()` drain
+   order, or an invariant spanning classes must be reflected there; a change confined to one function is
    documented at that function instead. Text the diff adds to this file that
    explains a single function, restates the spec, names a test, or quotes a
    numeric constant is itself a finding: move it to a code comment or cite

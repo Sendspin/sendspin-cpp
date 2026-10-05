@@ -32,6 +32,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -278,8 +279,7 @@ namespace {
 // starting its thread, so what a handler handed over stays on the list to be read.
 void bind_items(PlayerRole::Impl& impl, InboundRing& ring) {
     EXPECT_TRUE(impl.sync_task->init(&impl));
-    EXPECT_TRUE(impl.sync_task->encoded_items_.create(&ring, InboundHolder::PLAYER));
-    impl.sync_task->ring_.store(&ring, std::memory_order_release);
+    EXPECT_TRUE(impl.sync_task->inbound().bind(&ring, InboundHolder::PLAYER));
 }
 
 // A PlayerRole::Impl whose item list is bound to a ring of its own but whose sync-task thread was
@@ -349,13 +349,14 @@ std::vector<uint8_t> audio_chunk(uint8_t marker = 0xDE, int64_t server_timestamp
 void hand_copied_chunk(PlayerRole::Impl& impl, std::vector<uint8_t> chunk, uint32_t generation) {
     InboundMessage message = message_over(chunk);
     impl.handle_binary(message, generation);
-    take_in_ring_order(*impl.sync_task->ring());
+    take_in_ring_order(*impl.sync_task->inbound().ring());
 }
 
-// Drains the inbox and counts the player stream events it held.
+// Drains the inbox and counts the player stream events and teardown markers it held.
 struct StreamEventCounts {
     int starts{0};
     int ends{0};
+    int cleared{0};
 };
 
 StreamEventCounts drain_stream_events(PlayerRole::Impl& impl) {
@@ -363,6 +364,10 @@ StreamEventCounts drain_stream_events(PlayerRole::Impl& impl) {
     InboxEvent events[Inbox::EVENT_CAPACITY];
     const size_t n = impl.inbox->take_events(events, Inbox::EVENT_CAPACITY);
     for (size_t i = 0; i < n; ++i) {
+        if (events[i].type == InboxEventType::PLAYER_CLEARED) {
+            ++counts.cleared;
+            continue;
+        }
         if (events[i].type != InboxEventType::PLAYER_STREAM) {
             continue;
         }
@@ -417,12 +422,12 @@ TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
          [](PlayerRole::Impl& impl, uint32_t generation) {
              hand_copied_chunk(impl, audio_chunk(), generation);
          },
-         [](PlayerRole::Impl& impl) { return !impl.sync_task->encoded_items_.is_empty(); }},
+         [](PlayerRole::Impl& impl) { return !impl.sync_task->inbound().items().is_empty(); }},
         // stream/clear enqueues the marker that tells the sync task where the discarded pre-seek
         // audio ends, so a stale one would place that boundary in an ended stream.
         {"stream/clear",
          [](PlayerRole::Impl& impl, uint32_t generation) { impl.handle_stream_clear(generation); },
-         [](PlayerRole::Impl& impl) { return !impl.sync_task->encoded_items_.is_empty(); }},
+         [](PlayerRole::Impl& impl) { return !impl.sync_task->inbound().items().is_empty(); }},
         {"server/command",
          [](PlayerRole::Impl& impl, uint32_t generation) {
              impl.handle_server_command(volume_command(70), generation);
@@ -445,16 +450,16 @@ TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
         const uint32_t captured = live_generation(*impl);
 
         impl->cleanup();
-        ASSERT_EQ(drain_stream_events(*impl).ends, 1) << "cleanup() queued no STREAM_END";
-        ASSERT_TRUE(impl->sync_task->encoded_items_.is_empty());
+        ASSERT_EQ(drain_stream_events(*impl).cleared, 1) << "cleanup() queued no PLAYER_CLEARED";
+        ASSERT_TRUE(impl->sync_task->inbound().items().is_empty());
 
         row.drive(*impl, captured);
-        take_in_ring_order(*impl->sync_task->ring());
+        take_in_ring_order(*impl->sync_task->inbound().ring());
         EXPECT_FALSE(row.took_effect(*impl)) << "a stale message reached the main loop";
 
         // Control: the same message with the generation the role now reports takes effect.
         row.drive(*impl, live_generation(*impl));
-        take_in_ring_order(*impl->sync_task->ring());
+        take_in_ring_order(*impl->sync_task->inbound().ring());
         EXPECT_TRUE(row.took_effect(*impl));
     }
 }
@@ -486,7 +491,7 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
         client.set_available(row.available_on_arrival);
 
         hand_copied_chunk(impl, audio_chunk(), live_generation(impl));
-        EXPECT_EQ(!impl.sync_task->encoded_items_.is_empty(), row.queued);
+        EXPECT_EQ(!impl.sync_task->inbound().items().is_empty(), row.queued);
     }
 }
 
@@ -505,8 +510,7 @@ std::unique_ptr<VisualizerRole::Impl> make_visualizer(InboundRing& ring) {
     impl->stream_active = true;
     impl->negotiated_types_mask = 0x1F;
     EXPECT_TRUE(impl->drain_task->event_flags.create());
-    EXPECT_TRUE(impl->drain_task->items.create(&ring, InboundHolder::VISUALIZER));
-    impl->drain_task->ring.store(&ring, std::memory_order_release);
+    EXPECT_TRUE(impl->drain_task->inbound.bind(&ring, InboundHolder::VISUALIZER));
     return impl;
 }
 
@@ -525,7 +529,7 @@ std::vector<uint8_t> take_all(PlayerRole::Impl& impl) {
     void* item = nullptr;
     while ((item = impl.sync_task->take_item(0)) != nullptr) {
         markers.push_back(SyncTask::encoded_size(item) > 0 ? SyncTask::encoded_data(item)[0] : 0);
-        impl.sync_task->return_item(item);
+        impl.sync_task->inbound().return_item(item);
     }
     return markers;
 }
@@ -548,7 +552,7 @@ TEST(PlayerInboundHandOff, AChunkInARingItemIsDecodedInPlace) {
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        InboundRing& ring = *impl->sync_task->ring();
+        InboundRing& ring = *impl->sync_task->inbound().ring();
         std::vector<uint8_t> chunk = audio_chunk(0xC1, SERVER_TS);
         InboundMessage message =
             row.in_ring_item ? receive_into_ring(ring, chunk, 7) : message_over(chunk, 7);
@@ -567,20 +571,28 @@ TEST(PlayerInboundHandOff, AChunkInARingItemIsDecodedInPlace) {
         EXPECT_EQ(SyncTask::encoded_size(item), 4U);
         EXPECT_EQ(decoded_from[0], 0xC1);
         EXPECT_EQ(SyncTask::server_timestamp(item), SERVER_TS);
-        impl->sync_task->return_item(item);
+        impl->sync_task->inbound().return_item(item);
     }
 }
 
 // The ring is shared, and each holder's quota bounds what it may keep outstanding. A player past
 // its quota drops the chunk with a warning, returning its item, while the visualizer, charged
-// against its own quota on the same ring, keeps receiving.
+// against its own quota on the same ring, keeps receiving. The codec header and the clear marker
+// the protocol task writes itself are exempt: a server that overran the quota with audio still
+// gets its stream started and its seek boundary placed, rather than a header refused into a
+// STREAM_END.
 TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeepsFlowing) {
     struct Row {
         const char* name;
         size_t player_quota_chunks;
+        bool header_and_marker;
         size_t player_items;
     };
-    const Row rows[] = {{"Control: room for both chunks", 2, 2}, {"room for one chunk", 1, 1}};
+    const Row rows[] = {
+        {"Control: room for both chunks", 2, false, 2},
+        {"room for one chunk", 1, false, 1},
+        {"room for one chunk: its codec header and clear marker still pass", 1, true, 3},
+    };
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -597,15 +609,20 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
 
         InboundMessage second = receive_into_ring(ring, audio_chunk(0x02), 0);
         player->handle_binary(second, live_generation(*player));
+        if (row.header_and_marker) {
+            player->handle_stream_start(pcm_stream_params(), live_generation(*player));
+            player->handle_stream_clear(live_generation(*player));
+            take_in_ring_order(ring);
+        }
         EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(),
-                  row.player_items * one_chunk);
+                  std::min<size_t>(row.player_items, row.player_quota_chunks) * one_chunk);
 
         InboundMessage frame = receive_into_ring(ring, loudness_frame(), 0);
         visualizer->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, frame,
                                   visualizer->cleanup_generation.load());
         EXPECT_GT(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
             << "the player's quota stopped the visualizer";
-        EXPECT_FALSE(visualizer->drain_task->items.is_empty());
+        EXPECT_FALSE(visualizer->drain_task->inbound.items().is_empty());
 
         EXPECT_EQ(take_all(*player).size(), row.player_items);
         visualizer->flush_items();
@@ -631,7 +648,7 @@ TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        InboundRing& ring = *impl->sync_task->ring();
+        InboundRing& ring = *impl->sync_task->inbound().ring();
         InboundMessage before = receive_into_ring(ring, audio_chunk(0x01), 0);
         impl->handle_binary(before, live_generation(*impl));
         if (row.clear) {
@@ -668,7 +685,7 @@ TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        InboundRing& ring = *impl->sync_task->ring();
+        InboundRing& ring = *impl->sync_task->inbound().ring();
         for (uint8_t marker : {0x01, 0x02}) {
             InboundMessage message = receive_into_ring(ring, audio_chunk(marker), 0);
             impl->handle_binary(message, live_generation(*impl));
@@ -680,7 +697,7 @@ TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
             impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
         }
 
-        EXPECT_EQ(impl->sync_task->encoded_items_.is_empty(), row.listed_before_take == 0);
+        EXPECT_EQ(impl->sync_task->inbound().items().is_empty(), row.listed_before_take == 0);
         // Taken under the live generation, as the sync task would: a recalled or stale item is
         // not delivered, and an item left over is.
         EXPECT_EQ(take_all(*impl).size(), row.delivered);

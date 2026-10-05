@@ -75,10 +75,11 @@ void SendspinClientConnection::start() {
     esp_websocket_client_config_t config = {};
     config.uri = this->url_.c_str();
     config.disable_auto_reconnect = true;  // A lost connection is not reopened
+    // Explicit, so the reaping deadline derived from it (CONNECT_TIMEOUT_MS) is the one in force.
+    config.network_timeout_ms = static_cast<int>(NETWORK_TIMEOUT_MS);
     config.task_prio = static_cast<int>(this->task_priority_);
-    // Clamp to the documented minimum, the value shipped and verified on hardware (see
-    // SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE), until this task's receive path is
-    // measured.
+    // Clamp to the documented minimum, the measured stack of this task's deepest call chain (see
+    // SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE).
     size_t task_stack_size = this->task_stack_size_;
     if (task_stack_size < SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE) {
         SS_LOGW(TAG, "websocket_stack_size %u below minimum %u; clamping",
@@ -240,6 +241,9 @@ void SendspinClientConnection::websocket_event_handler(void* handler_args, esp_e
         case WEBSOCKET_EVENT_ERROR:
             conn->handle_error();
             break;
+        case WEBSOCKET_EVENT_FINISH:
+            conn->handle_finished();
+            break;
         default:
             break;
     }
@@ -337,6 +341,17 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
 void SendspinClientConnection::handle_error() {
     SS_LOGE(TAG, "WebSocket error on connection to %s", this->url_.c_str());
     // Error will typically be followed by a disconnect event
+}
+
+void SendspinClientConnection::handle_finished() {
+    // Posted on every exit of the websocket task, before it sets its stopped bit, so the
+    // connection is still alive here. A stop ends the task with this event alone (only an abort
+    // posts DISCONNECTED), and a released connection's reap waits for the close it reports. A
+    // repeat after DISCONNECTED is harmless.
+    this->connected_ = false;
+    this->chunk_dest_ = nullptr;
+    this->abandon_inbound_message();
+    this->notify_transport_closed();
 }
 
 }  // namespace sendspin

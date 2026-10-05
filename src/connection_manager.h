@@ -55,9 +55,9 @@ constexpr int64_t seconds_to_us(double s) {
 /// complete and first server/activate applied; connection.md "Multiple servers
 /// (server-initiated)"), measured from the connection's delivery or initiation
 ///
-/// Reaps peers that connect and then stall before becoming operational, and outbound sockets whose
-/// transport never delivers a close (host IXWebSocket). Sockets that never upgrade are
-/// closed in the platform layer before the manager sees them (ESP ws_server tick() at
+/// Reaps peers that connect and then stall before becoming operational, and outbound attempts that
+/// stall without failing (a listener that never answers the upgrade). Sockets that never upgrade
+/// are closed in the platform layer before the manager sees them (ESP ws_server tick() at
 /// WS_UPGRADE_TIMEOUT_US; host IXWebSocket's 3 s handshake timeout).
 static constexpr double NURSERY_ESTABLISH_TIMEOUT_S = 30.0;
 
@@ -101,19 +101,13 @@ bool liveness_expired(int64_t now_us, uint32_t last_receive_us, int64_t timeout_
 /// @param timeout_us Liveness timeout in microseconds, positive.
 int64_t liveness_remaining_us(int64_t now_us, uint32_t last_receive_us, int64_t timeout_us);
 
-/// @brief Converts a deadline into the milliseconds a protocol-task wait may last, rounded up so
-/// the wake is never early; 0 when the deadline has passed.
-/// @param due_us The deadline, on the platform_time_us() clock.
-/// @param now_us The current time on the same clock.
-uint32_t ms_until(int64_t due_us, int64_t now_us);
-
 /// @brief Bound (milliseconds, per goodbye) on waiting for the shutdown goodbyes to be sent before
 /// the transports are torn down
 ///
-/// The shutdown pass waits this long times the number of goodbyes it issued: on the ESP server
-/// path every goodbye is queued to the single httpd worker and handed to lwIP in turn, so a fixed
-/// bound would let the last of several peers lose its goodbye to the close. Per goodbye that is a
-/// few scheduler quanta for the worker to dequeue the frame; the host transports send
+/// The shutdown pass waits this long times the number of goodbyes still outstanding: on the ESP
+/// server path every goodbye is queued to the single httpd worker and handed to lwIP in turn, so a
+/// fixed bound would let the last of several peers lose its goodbye to the close. Per goodbye that
+/// is a few scheduler quanta for the worker to dequeue the frame; the host transports send
 /// synchronously, so the wait resolves before it starts. Send completion is best-effort, so this
 /// caps how long the shutdown blocks, never a guarantee the goodbye arrived.
 static constexpr uint32_t GOODBYE_FLUSH_TIMEOUT_MS = 50;
@@ -145,6 +139,12 @@ struct GoodbyeWait {
             }
         }
         this->cv.notify_all();
+    }
+
+    /// @brief The registered goodbyes that have not completed yet
+    size_t outstanding() {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        return this->pending;
     }
 
     /// @brief Blocks until every registered goodbye has completed, or `timeout_ms` elapses.
@@ -211,6 +211,27 @@ struct AdmittedEntry {
     bool high_performance_held{false};
 };
 
+/// @brief A released outbound connection waiting for its transport to finish
+///
+/// Releasing an outbound connection whose connect or WebSocket upgrade is still in flight must not
+/// join its transport on the protocol task: the transport's stop waits out the connect timeout.
+/// The release closes the transport without blocking (which leaves an attempt still connecting to
+/// end on its own: see SendspinConnection::close_transport_now() on each platform) and parks the
+/// connection here instead; the reap pass (ConnectionManager::reap_released()) drops it once its
+/// inbound gate reports the transport closed or its upgrade completes, when the destructor's join
+/// is short, or at `deadline_us`. A connection whose upgrade had completed when it was released
+/// is not parked: its destructor's stop is the short close of an open transport. Protocol task
+/// only.
+struct ReapEntry {
+    /// The released connection; detached, its transport closed without blocking.
+    std::shared_ptr<SendspinConnection> conn;
+    /// platform_time_us() past which the connection is dropped even with its transport still
+    /// connecting: the release time plus SendspinClientConnection::CONNECT_TIMEOUT_MS, by when the
+    /// transport's own connect bounds have ended the attempt or nearly so. The destructor's join
+    /// at that point is bounded by what remains of the connect.
+    int64_t deadline_us{0};
+};
+
 /// @brief Disposition for the connection once abort_pairing_attempt() ends a pairing attempt.
 enum class PairingDropAction : uint8_t {
     KEEP_OPEN,           ///< Leave the connection open.
@@ -255,6 +276,10 @@ struct PairingUiSnapshot {
     bool code_was_emitted;
     bool window_was_shown;
 };
+
+/// @brief Captures `conn`'s pairing-UI display flags, before any pairing-state cleanup (see
+/// PairingUiSnapshot). Protocol task, or the main loop once it is joined.
+PairingUiSnapshot snapshot_pairing_ui(SendspinConnection* conn);
 
 /**
  * @brief Manages WebSocket connection lifecycle.
@@ -336,6 +361,19 @@ public:
                   "open connections must stay below the pairing-record capacity floor");
     static_assert(MAX_ADMITTED <= 32, "admission_conflicts() reports slots in a 32-bit mask");
 
+    /// @brief Released outbound connections parked at once, waiting for their transports to finish
+    /// (see ReapEntry).
+    ///
+    /// One pass can release every connection the manager holds (a disconnect(), an arbitration
+    /// that drops the incumbents), so the bound is the whole nursery plus every admitted slot.
+    /// Only outbound attempts still connecting are parked, and one replaces the previous one,
+    /// so the list fills only when attempts are released faster than their transports finish
+    /// (connect_to() called repeatedly against a listener that never answers); a release that
+    /// finds it full logs a warning and drops the entry parked longest, whose destructor's join
+    /// is then paid on the protocol task: the shortest of the parked ones, since its attempt is
+    /// the furthest along, and at most what remains of its connect timeout.
+    static constexpr size_t REAPING_CAPACITY = MAX_NURSERY_ENTRIES + MAX_ADMITTED;
+
     /// @brief Every managed connection at one moment: the admitted ones and the nursery.
     using ConnectionSnapshot =
         InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS>;
@@ -347,8 +385,9 @@ public:
     // Main loop
     // ========================================
 
-    /// @brief Opens admission, creates the WebSocket server on first use, and starts it at once
-    /// when the network provider already reports ready
+    /// @brief Opens admission and the protocol task's accepts (ProtocolTask::open_accepts(), the
+    /// inverse of close_admission()), creates the WebSocket server on first use, and starts it at
+    /// once when the network provider already reports ready
     ///
     /// Server configuration is read from the client's config when the server object is created;
     /// a restart reuses the object. A server that did not start here is started by the protocol
@@ -356,21 +395,25 @@ public:
     /// protocol task starts: everything it writes is the task's from then on.
     void start();
 
-    /// @brief Closes admission. Main loop, from stop() and ~SendspinClient, before
-    /// ProtocolTask::stop(): the protocol task's next tick, or its final one, then runs the
-    /// shutdown pass (shutdown()), and refuses every accept still queued with a goodbye.
+    /// @brief Closes admission and the protocol task's accepts (ProtocolTask::close_accepts()).
+    /// Main loop, from stop() and ~SendspinClient, before ProtocolTask::stop(): the protocol
+    /// task's next tick, or its final one, then runs the shutdown pass (shutdown()) and refuses
+    /// every accept already queued with a goodbye, and a delivery from here on is refused at its
+    /// push, so its transport closes it without one.
     void close_admission();
 
     /// @brief The main-loop half of the shutdown, once the protocol task is joined: closes the
-    /// transports of every connection the shutdown pass took out of the slots, stops the
-    /// WebSocket server (joining its transport threads), then releases those connections, whose
-    /// destructors may join an outbound transport thread. Main loop only.
+    /// transports of every connection the shutdown pass took out of the slots and of every
+    /// connection still parked for reaping, stops the WebSocket server (joining its transport
+    /// threads), then releases those connections, whose destructors may join an outbound
+    /// transport thread. Main loop only.
     ///
     /// Blocks on the transports' own teardown: the host server joins every accepted connection
     /// thread, including a raw socket that never completed its WebSocket upgrade, which can hold
     /// the join for the full WS_HANDSHAKE_TIMEOUT_SECS (3 s); the ESP server waits for the httpd
     /// task to exit, and an outbound connection's transport stop is synchronous
-    /// (esp_websocket_client_stop() / ix::WebSocket::stop()).
+    /// (esp_websocket_client_stop() / ix::WebSocket::stop()), up to its connect timeout
+    /// (SendspinClientConnection::CONNECT_TIMEOUT_MS) for one still connecting.
     /// @return The pairing prompts the dropped connections left showing. The caller dismisses
     ///         them (SendspinClient::note_clear_pairing_code() / note_close_pairing_window()) after
     ///         its own cleanup_connection_state(), which would otherwise wipe the queued notes.
@@ -390,7 +433,7 @@ public:
     /// @brief Returns the time filter of the primary admitted connection (see primary()), or
     /// nullptr when none is admitted. Any thread.
     ///
-    /// Reads a slot of its own behind the leaf time_filter_mutex_, so a role thread converting
+    /// Reads published_ behind the leaf published_mutex_, so a role thread converting
     /// timestamps (the sync task per chunk, the visualizer drain per frame) never waits on the
     /// protocol task. Hands out the filter, never the connection: a connection's destructor can
     /// join its transport thread, which must not happen on a role thread, while the filter's last
@@ -399,7 +442,7 @@ public:
 
     /// @brief Returns a copy of the primary admitted connection's server information, or nullopt
     /// when none is admitted. Any thread: reads a slot written at admission and cleared on the
-    /// drop, behind the leaf server_info_mutex_.
+    /// drop, behind the leaf published_mutex_.
     std::optional<ServerInformationObject> server_information() const;
 
     // ========================================
@@ -413,7 +456,7 @@ public:
     /// frame, then queues an ACCEPT_CONNECTION command; the task admits it into the nursery or
     /// refuses it with a goodbye (accept()).
     /// @return false when the command queue refused the accept: every accept slot is taken, or
-    ///         stop() has joined the protocol task (ProtocolTask::close_accepts()). The connection
+    ///         admission is closed (close_admission()). The connection
     ///         is then left with the caller, which closes its socket and releases it on its own
     ///         close path (see SendspinWsServer::NewConnectionCallback), so it is never destroyed
     ///         inside this call.
@@ -437,7 +480,9 @@ public:
     void connect_to(const std::string& url);
 
     /// @brief Goodbyes every connected managed connection (SendspinClient::disconnect()). An
-    /// admitted or nursery connection leaves its slot once its close is processed.
+    /// admitted or nursery connection leaves its slot once its close is processed; an outbound
+    /// attempt still connecting is released at once, without waiting for its transport (see
+    /// ReapEntry).
     /// @param reason The goodbye reason to send before closing.
     void disconnect(SendspinGoodbyeReason reason);
 
@@ -448,8 +493,12 @@ public:
     /// (SendspinClient::send_text()).
     void send_role_text(SendspinRole role, const std::string& text) const;
 
-    /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window()).
-    void confirm_pairing_window();
+    /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window(), the operator
+    /// gesture). If an attempt is already waiting in AWAIT_PAIRING_WINDOW, the window admits it
+    /// immediately; otherwise it stands open for WINDOW_LIFETIME_US (5 minutes) awaiting a
+    /// pairing activate. The gesture is also the deliberate operator action that clears a
+    /// standing round limit (pairing.md "Rounds").
+    void open_pairing_window();
 
     /// @brief Closes the pairing window (SendspinClient::cancel_pairing_window()).
     void cancel_pairing_window();
@@ -457,11 +506,6 @@ public:
     /// @brief Closes the managed connections a changed unpaired-access setting no longer fits
     /// (SendspinClient::set_unpaired_access_enabled()).
     void apply_unpaired_access_change(bool enabled);
-
-    /// @brief Refuses an accept that reached the protocol task after admission closed: goodbye
-    /// with reason shutdown, registered with the shutdown pass's bounded wait, and the connection
-    /// kept for finish_stop() to close.
-    void refuse_accept(std::shared_ptr<SendspinConnection> conn);
 
     // ========================================
     // Protocol task: message handlers
@@ -503,7 +547,9 @@ public:
     /// copy can be a connection's last reference, whose destructor then runs on the protocol
     /// task: every path that releases a connection detaches its inbound gate first
     /// (SendspinConnection::detach_inbound()), so a transport thread that destructor joins is
-    /// never parked on the gate, and at most INBOUND_ACQUIRE_TIMEOUT_MS in a ring acquire.
+    /// never parked on the gate, and at most INBOUND_ACQUIRE_TIMEOUT_MS in a ring acquire. An
+    /// outbound attempt still connecting is parked for reaping when released (see ReapEntry), so
+    /// its last reference drops once its transport has closed or opened, or its deadline passed.
     void snapshot_connections(ConnectionSnapshot& out) const;
 
     /// @brief Sends client/init on every outbound nursery connection whose transport reported its
@@ -513,8 +559,9 @@ public:
 
     /// @brief The lifecycle scans, in order: the hello sends, admission of nursery connections
     /// that became operational, the nursery establish reap, the admitted connections' liveness,
-    /// re-prove and pairing-attempt watchdogs, the pairing window's lifetime, the platform
-    /// server's upgrade reap, and the WebSocket server start
+    /// re-prove and pairing-attempt watchdogs, the pairing window's lifetime, the reap of
+    /// released outbound connections, the platform server's upgrade reap, and the WebSocket
+    /// server start
     /// @param now_us platform_time_us() at the start of the tick.
     /// @return Milliseconds until the earliest of those timers, or ProtocolTask::NO_DEADLINE.
     uint32_t tick(int64_t now_us);
@@ -545,18 +592,20 @@ public:
 
     /// @brief The shutdown pass: snapshots the pairing-UI flags, detaches every managed
     /// connection, goodbyes each with reason shutdown, waits up to GOODBYE_FLUSH_TIMEOUT_MS per
-    /// goodbye (accepts refused this tick included), empties the slots and closes the pairing
-    /// window. The connections are kept for finish_stop() to close and release.
+    /// goodbye still outstanding (accepts refused this tick included), empties the slots and
+    /// closes the pairing window. The connections are kept for finish_stop() to close and
+    /// release.
     void shutdown();
 
-    /// @brief Waits, bounded, for the goodbyes refuse_accept() issued since the last wait.
+    /// @brief Waits for the shutdown goodbyes issued since the last wait (the shutdown pass's,
+    /// and refuse_accept()'s), up to GOODBYE_FLUSH_TIMEOUT_MS per goodbye still outstanding.
     void flush_shutdown_goodbyes();
 
     // ========================================
     // Protocol task: role ownership
     // ========================================
 
-    /// @brief The admitted entry holding `conn`, or nullptr.
+    /// @brief The admitted entry holding `conn` (not null), or nullptr.
     AdmittedEntry* find_admitted(const SendspinConnection* conn);
 
     /// @brief Whether `conn` is admitted and owns `role`, the gate every role dispatch, the role
@@ -617,6 +666,12 @@ private:
     /// @return Milliseconds until the next hello attempt or establish deadline.
     uint32_t scan_nursery(int64_t now_us);
 
+    /// @brief Drops the released outbound connections whose transport has closed or opened, or
+    /// whose deadline has passed (see ReapEntry).
+    /// @return Milliseconds until the earliest remaining deadline, or NO_DEADLINE; a transport's
+    ///         close or upgrade wakes the task itself.
+    uint32_t reap_released(int64_t now_us);
+
     /// @brief The admitted connections' watchdogs: liveness (a silent connection is dropped with
     /// a restart goodbye), re-prove (one that failed to re-prove after an in-band re-handshake or
     /// a pairing-finalize rekey within REPROVE_TIMEOUT_US is closed without a goodbye: one of
@@ -645,6 +700,12 @@ private:
     /// admitted, and refreshes the published slots. The slot must be free.
     void install_admitted(std::shared_ptr<SendspinConnection> conn, uint16_t owned_roles);
 
+    /// @brief Takes the connection out of an occupied admitted slot: detaches its inbound gate,
+    /// clears its admitted flag and time burst, releases the high-performance request its burst
+    /// held, and frees the slot. The caller refreshes the published slots and releases the
+    /// connection it returns.
+    std::shared_ptr<SendspinConnection> vacate_admitted(AdmittedEntry& entry);
+
     /// @brief Releases a nursery entry: erases it, then goodbyes and drops the connection.
     /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
     ///        already gone so no goodbye should be attempted.
@@ -652,12 +713,28 @@ private:
     NurseryEntry* release_nursery_entry(NurseryEntry* it,
                                         std::optional<SendspinGoodbyeReason> reason);
 
+    /// @brief Refuses an accept queued before admission closed and taken after: goodbye with
+    /// reason shutdown, registered with the shutdown pass's bounded wait, and the connection kept
+    /// for finish_stop() to close.
+    void refuse_accept(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Goodbyes `conn` with reason shutdown, counted in the bounded wait
+    /// flush_shutdown_goodbyes() makes, and keeps it for finish_stop() to close. Its gate must
+    /// be detached.
+    void goodbye_for_shutdown(std::shared_ptr<SendspinConnection> conn);
+
     /// @brief Detaches `conn`, sends `goodbye` if there is one or else closes a still-connected
     /// transport without one, and drops the caller's reference: a connection leaving the
-    /// manager. The destructor this can run (on the protocol task) can join an outbound transport
-    /// thread, which detach_inbound() keeps off the gate.
-    static void release_connection(std::shared_ptr<SendspinConnection> conn,
-                                   std::optional<SendspinGoodbyeReason> goodbye);
+    /// manager. An outbound attempt still connecting is parked for reaping instead
+    /// (park_for_reaping()), since its destructor would join its transport for the rest of the
+    /// connect.
+    void release_connection(std::shared_ptr<SendspinConnection> conn,
+                            std::optional<SendspinGoodbyeReason> goodbye);
+
+    /// @brief Closes a released outbound connection's transport without blocking and parks it
+    /// in reaping_ until reap_released() drops it; with the list full, first drops the entry
+    /// parked longest, with a warning.
+    void park_for_reaping(std::shared_ptr<SendspinConnection> conn);
 
     // ========================================
     // Hello handshake
@@ -859,12 +936,6 @@ private:
     /// lifetime).
     [[nodiscard]] bool pairing_window_open() const;
 
-    /// @brief Open the pairing window (operator gesture). If an attempt is already waiting in
-    /// AWAIT_PAIRING_WINDOW, the window admits it immediately; otherwise it stands open for
-    /// WINDOW_LIFETIME_US (5 minutes) awaiting a pairing activate. The gesture is also the
-    /// deliberate operator action that clears a standing round limit (pairing.md "Rounds").
-    void open_pairing_window();
-
     /// @brief Whether the dynamic-pairing-code round limit currently holds attempts back:
     /// PAIRING_ROUND_LIMIT rounds have run since the last verified server_kc
     /// (pairing.md "Rounds").
@@ -900,6 +971,9 @@ private:
     // Unproven connections awaiting establishment, each carrying its hello send state. Protocol
     // task only.
     InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery_;
+    // Released outbound connections waiting for their transports to finish (see ReapEntry).
+    // Protocol task, then the main loop's finish_stop() once the task is joined.
+    InlineVector<ReapEntry, REAPING_CAPACITY> reaping_;
     // Connections the shutdown pass took out of the slots, and accepts it refused, kept for
     // finish_stop() to close and release. Written by the protocol task's shutdown pass, read on
     // the main loop once the task is joined.
@@ -914,7 +988,8 @@ private:
     // Created by the main loop's start() on first use; started there or by the protocol task,
     // ticked by the task, and stopped by finish_stop() once the task is joined.
     std::unique_ptr<SendspinWsServer> ws_server_;
-    // The bounded wait of the shutdown goodbyes not yet waited for. Protocol task only.
+    // The bounded wait of the shutdown goodbyes not yet waited for; null once they were waited
+    // for, so a goodbye that never completes is waited for once. Protocol task only.
     std::shared_ptr<GoodbyeWait> shutdown_wait_;
 
     // String fields
@@ -950,9 +1025,6 @@ private:
     // when a window opens. Protocol task only.
     uint32_t pairing_window_failed_attempts_{0};
 
-    // Goodbyes registered with shutdown_wait_ since its last wait. Protocol task only.
-    uint32_t shutdown_goodbyes_pending_{0};
-
     // 8-bit fields
     /// The pairing prompts the shutdown pass found showing. Written by the protocol task's
     /// shutdown pass, read by finish_stop() on the main loop once the task is joined.
@@ -970,18 +1042,17 @@ private:
     /// read from any thread.
     std::atomic<bool> connected_{false};
 
-    /// Guards time_filter_. A leaf (docs/conventions.md): held only to copy the pointer.
-    mutable std::mutex time_filter_mutex_;
-    /// The primary admitted connection's time filter. Written by the protocol task
-    /// (refresh_published_state()), read by role threads and the main loop.
-    std::shared_ptr<SendspinTimeFilter> time_filter_;
-
-    /// Guards server_information_. A leaf (docs/conventions.md): held only to copy the value.
-    mutable std::mutex server_info_mutex_;
-    /// The primary admitted connection's server information. Written by the protocol task
-    /// (refresh_published_state()), read from any thread
-    /// (SendspinClient::get_server_information()).
-    std::optional<ServerInformationObject> server_information_;
+    /// @brief What other threads read of the primary admitted connection, written together
+    struct PublishedPrimary {
+        std::shared_ptr<SendspinTimeFilter> time_filter;
+        std::optional<ServerInformationObject> server_information;
+    };
+    /// Guards published_. A leaf (docs/conventions.md): held only to copy or swap a member, so it
+    /// also serialises the role threads' time_filter() reads behind server_information() copies.
+    mutable std::mutex published_mutex_;
+    /// Written by the protocol task (refresh_published_state()); read from any thread
+    /// (time_filter(), server_information()): role threads, the main loop, the consumer.
+    PublishedPrimary published_;
 };
 
 }  // namespace sendspin

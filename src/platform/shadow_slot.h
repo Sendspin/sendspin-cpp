@@ -28,8 +28,8 @@ namespace sendspin {
 ///
 /// The writer locks briefly to write or merge a value; the reader locks briefly to move it out
 /// if dirty. Safe between any single-writer/single-reader thread pair, whichever side (if either)
-/// is the main loop: the sync task's playback-progress slot and a connection's pending pairing
-/// record both use it. State bound for the main loop's read side goes through Inbox / InboxSlot
+/// is the main loop: the sync task's playback-progress slot uses it. State bound for the main
+/// loop's read side goes through Inbox / InboxSlot
 /// (see inbox.h) instead, which consolidates many producers onto one mutex and one lock-free
 /// poll() per tick.
 template <typename T>

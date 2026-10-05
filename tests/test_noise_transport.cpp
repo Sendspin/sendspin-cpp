@@ -479,7 +479,7 @@ TEST(NoiseTransport, ReceiveEncryptedBinary_JsonDispatch) {
 
     // Wire up a JSON dispatch callback
     std::string dispatched_json;
-    conn.on_json_message_cb = [&dispatched_json](SendspinConnection* /*c*/, const char* data,
+    conn.on_json_message_cb = [&dispatched_json](SendspinConnection& /*c*/, const char* data,
                                                   size_t len, int64_t /*ts*/) {
         dispatched_json = std::string(data, len);
     };
@@ -806,12 +806,12 @@ class FragmentReceiver {
 public:
     explicit FragmentReceiver(LoopbackResult& r) : server_send_(r.initiator.send_cs) {
         this->conn_.set_noise_session(std::move(r.responder_session));
-        this->conn_.on_json_message_cb = [this](SendspinConnection* /*c*/, const char* d, size_t n,
+        this->conn_.on_json_message_cb = [this](SendspinConnection& /*c*/, const char* d, size_t n,
                                                 int64_t /*t*/) {
             ++this->json_dispatched_;
             this->last_message_.assign(d, d + n);
         };
-        this->conn_.on_binary_message_cb = [this](SendspinConnection* /*c*/,
+        this->conn_.on_binary_message_cb = [this](SendspinConnection& /*c*/,
                                                   InboundMessage& message) {
             ++this->binary_dispatched_;
             this->last_message_.assign(message.data, message.data + message.len);
@@ -1267,7 +1267,7 @@ static void run_fragment_reassemble_receive(const std::string& suite) {
 
     std::string received;
     int calls = 0;
-    conn.on_json_message_cb = [&received, &calls](SendspinConnection* /*c*/, const char* d,
+    conn.on_json_message_cb = [&received, &calls](SendspinConnection& /*c*/, const char* d,
                                                   size_t n, int64_t /*t*/) {
         received.assign(d, n);
         ++calls;
@@ -1313,9 +1313,9 @@ TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     conn.set_noise_session(std::move(r->responder_session));
 
     int calls = 0;
-    conn.on_json_message_cb = [&calls](SendspinConnection* /*c*/, const char* /*d*/, size_t /*n*/,
+    conn.on_json_message_cb = [&calls](SendspinConnection& /*c*/, const char* /*d*/, size_t /*n*/,
                                        int64_t /*t*/) { ++calls; };
-    conn.on_binary_message_cb = [&calls](SendspinConnection* /*c*/,
+    conn.on_binary_message_cb = [&calls](SendspinConnection& /*c*/,
                                          InboundMessage& /*message*/) { ++calls; };
 
     std::string json = "{\"x\":1}";
@@ -1347,7 +1347,7 @@ TEST(NoiseTransport, CleartextFrameInTransportModeClosesSilently) {
     TestConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
     int calls = 0;
-    conn.on_json_message_cb = [&calls](SendspinConnection* /*c*/, const char* /*d*/, size_t /*n*/,
+    conn.on_json_message_cb = [&calls](SendspinConnection& /*c*/, const char* /*d*/, size_t /*n*/,
                                        int64_t /*t*/) { ++calls; };
 
     conn.inject_text_payload(R"({"type":"server/state","payload":{}})");
@@ -1898,6 +1898,12 @@ struct InboundHarness {
         this->conn.attach_inbound(&this->ring, &this->task);
     }
 
+    // Over a ring of `ring_bytes`, which sets the longest message it takes.
+    explicit InboundHarness(size_t ring_bytes) {
+        EXPECT_TRUE(this->ring.create(ring_bytes, MemoryLocation::PREFER_EXTERNAL));
+        this->conn.attach_inbound(&this->ring, &this->task);
+    }
+
     // Receives one complete message as a single-frame transport does.
     TestConnection::InboundRoute receive(const std::vector<uint8_t>& bytes) {
         const TestConnection::InboundTarget target =
@@ -1916,30 +1922,44 @@ struct InboundHarness {
 
 }  // namespace
 
-// An unadmitted connection never writes into the shared ring: its messages go one at a time
-// through the connection's own buffer, and the transport may not overwrite the one in flight
-// before the protocol task has consumed it. Waiting longer than InboundGate::WRITABLE_WAIT_MS for
-// that closes the connection rather than parking the transport thread.
-TEST(InboundReceive, AnUnadmittedConnectionHandsOverOneMessageAtATime) {
+// The fallback buffer holds one message at a time, and the transport may not overwrite the one in
+// flight before the protocol task has consumed it. An unadmitted connection, which never writes
+// into the shared ring, waits up to InboundGate::WRITABLE_WAIT_MS for that and is then closed
+// rather than parking the transport thread. An admitted connection's message longer than the ring
+// takes waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and is then dropped like
+// one, the connection left open. The Control rows consume the first message in time. The two
+// rows that leave the first message pending wait out those bounds (about 600 ms together): the
+// bound running out is the behavior under test.
+TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
     struct Row {
         const char* name;
+        bool admitted;
         bool consume_first;
         TestConnection::InboundRoute second_route;
     };
     const Row rows[] = {
-        {"Control: consumed before the next arrives", true, TestConnection::InboundRoute::RECEIVE},
-        {"the next arrives while the first is pending", false,
+        {"Control: unadmitted, consumed before the next arrives", false, true,
+         TestConnection::InboundRoute::RECEIVE},
+        {"unadmitted, the next arrives while the first is pending", false, false,
          TestConnection::InboundRoute::CLOSE},
+        {"Control: admitted, consumed before the next arrives", true, true,
+         TestConnection::InboundRoute::RECEIVE},
+        {"admitted, the next arrives while the first is pending", true, false,
+         TestConnection::InboundRoute::DROP},
     };
-    const std::vector<uint8_t> first{0x01, 0x02, 0x03};
-    const std::vector<uint8_t> second{0x0A, 0x0B};
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        InboundHarness h;
+        // A ring sized for JSON, so an admitted connection's longer messages take the buffer.
+        InboundHarness h(inbound_ring_min_storage_bytes(INBOUND_JSON_MESSAGE_BYTES));
+        h.conn.set_admitted(row.admitted);
+        const size_t len = row.admitted ? h.ring.max_message_bytes() + 1 : 3;
+        const std::vector<uint8_t> first(len, 0x01);
+        const std::vector<uint8_t> second(len, 0x0A);
 
         ASSERT_EQ(h.receive(first), TestConnection::InboundRoute::RECEIVE);
-        EXPECT_EQ(h.ring.items_waiting(), 0U) << "an unadmitted connection wrote into the ring";
+        size_t taken_len = 0;
+        EXPECT_EQ(h.ring.take(&taken_len, 0), nullptr) << "the message was written into the ring";
         EXPECT_FALSE(h.conn.inbound_gate().may_write()) << "the first message is in flight";
 
         InboundMessage pending;
@@ -1953,7 +1973,9 @@ TEST(InboundReceive, AnUnadmittedConnectionHandsOverOneMessageAtATime) {
         const std::vector<uint8_t>& expected = row.consume_first ? second : first;
         EXPECT_EQ(std::vector<uint8_t>(pending.data, pending.data + pending.len), expected)
             << "the message in flight was overwritten or lost";
-        EXPECT_EQ(h.conn.close_transport_now_calls_, row.consume_first ? 0 : 1);
+        const bool closed = row.second_route == TestConnection::InboundRoute::CLOSE;
+        EXPECT_EQ(h.conn.close_transport_now_calls_, closed ? 1 : 0);
+        EXPECT_EQ(h.conn.inbound_gate().is_detached(), closed);
     }
 }
 
@@ -2050,6 +2072,74 @@ TEST(InboundReceive, AMultiFrameMessageIsCappedOnItsRunningTotal) {
             len = pending.len;
         }
         EXPECT_EQ(len, row.cap);
+    }
+}
+
+// An admitted connection's message longer than the ring takes (a ring sized for JSON, as a client
+// without the player or artwork role has) is still delivered: through the fallback buffer, and in
+// its place between the connection's ring items. The protocol task gets it only once the ring item
+// received before it is taken, and the transport writes nothing more until it is consumed. The
+// Control rows fit their ring and arrive in a ring item behind the first.
+TEST(InboundReceive, AMessageLongerThanTheRingTakesArrivesInOrderThroughTheFallbackBuffer) {
+    struct Row {
+        const char* name;
+        size_t ring_bytes;
+        size_t extra_len;  // added to the ring's max_message_bytes()
+        bool via_fallback;
+    };
+    const size_t json_ring = inbound_ring_min_storage_bytes(INBOUND_JSON_MESSAGE_BYTES);
+    const Row rows[] = {
+        {"Control: the longest message a JSON-sized ring takes", json_ring, 0, false},
+        {"one byte longer than a JSON-sized ring takes", json_ring, 1, true},
+        {"a maximal frame on a JSON-sized ring", json_ring,
+         INBOUND_MAX_MESSAGE_BYTES - INBOUND_JSON_MESSAGE_BYTES, true},
+        {"Control: a maximal frame on a ring sized for one", INBOUND_RING_MIN_STORAGE_BYTES, 0,
+         false},
+    };
+    const std::vector<uint8_t> first{0x01, 0x02, 0x03};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h(row.ring_bytes);
+        h.conn.set_admitted(true);
+        const std::vector<uint8_t> second(h.ring.max_message_bytes() + row.extra_len, 0x5A);
+
+        ASSERT_EQ(h.receive(first), TestConnection::InboundRoute::RECEIVE);
+        ASSERT_EQ(h.receive(second), TestConnection::InboundRoute::RECEIVE)
+            << "the longer message was not delivered";
+        EXPECT_EQ(h.conn.close_transport_now_calls_, 0);
+
+        // The ring item received first comes first, whichever way the second arrived.
+        InboundMessage pending;
+        EXPECT_FALSE(h.conn.pending_message(pending))
+            << "the fallback message overtook the ring item received before it";
+        size_t len = 0;
+        void* item = h.ring.take(&len, 0);
+        ASSERT_NE(item, nullptr);
+        EXPECT_EQ(std::vector<uint8_t>(inbound_item_bytes(item), inbound_item_bytes(item) + len),
+                  first);
+        h.conn.inbound_gate().note_item_taken();
+        h.ring.return_item(item);
+
+        if (row.via_fallback) {
+            EXPECT_EQ(h.ring.take(&len, 0), nullptr) << "the longer message went into the ring";
+            EXPECT_FALSE(h.conn.inbound_gate().may_write())
+                << "the transport may overwrite the message before it is consumed";
+            ASSERT_TRUE(h.conn.pending_message(pending));
+            EXPECT_FALSE(pending.data >= h.ring.storage() &&
+                         pending.data < h.ring.storage() + row.ring_bytes);
+            EXPECT_EQ(std::vector<uint8_t>(pending.data, pending.data + pending.len), second);
+            h.conn.consume_pending_message();
+        } else {
+            item = h.ring.take(&len, 0);
+            ASSERT_NE(item, nullptr);
+            EXPECT_EQ(len, second.size());
+            h.conn.inbound_gate().note_item_taken();
+            h.ring.return_item(item);
+            EXPECT_FALSE(h.conn.pending_message(pending));
+        }
+        EXPECT_EQ(h.conn.inbound_gate().in_flight(), 0U);
+        EXPECT_TRUE(h.conn.inbound_gate().may_write());
     }
 }
 

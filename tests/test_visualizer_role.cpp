@@ -199,8 +199,7 @@ std::unique_ptr<VisualizerRole::Impl> make_impl() {
     InboundRing& ring = rings.emplace_back();
     create_test_ring(ring);
     EXPECT_TRUE(impl->drain_task->event_flags.create());
-    EXPECT_TRUE(impl->drain_task->items.create(&ring, InboundHolder::VISUALIZER));
-    impl->drain_task->ring.store(&ring, std::memory_order_release);
+    EXPECT_TRUE(impl->drain_task->inbound.bind(&ring, InboundHolder::VISUALIZER));
     return impl;
 }
 
@@ -224,7 +223,7 @@ void hand(VisualizerRole::Impl& impl, uint8_t type, const std::vector<uint8_t>& 
     std::vector<uint8_t> bytes = frame_message(type, data);
     InboundMessage message = message_over(bytes);
     impl.handle_binary(type, message, generation);
-    take_in_ring_order(*impl.drain_task->ring.load());
+    take_in_ring_order(*impl.drain_task->inbound.ring());
 }
 
 // One item the drain thread would take: its item type (the wire type, or the clear marker's),
@@ -239,7 +238,7 @@ struct Entry {
 // Takes one item from the drain list, returning it to the ring, or returns false if none is
 // waiting.
 bool pop_entry(VisualizerRole::Impl& impl, Entry& out) {
-    void* item = impl.drain_task->items.take(0);
+    void* item = impl.drain_task->inbound.items().take(0);
     if (item == nullptr) {
         return false;
     }
@@ -249,7 +248,7 @@ bool pop_entry(VisualizerRole::Impl& impl, Entry& out) {
     const uint8_t* bytes = inbound_item_bytes(item);
     out.message.assign(bytes, bytes + header->data_offset + header->data_len);
     out.data = bytes;
-    impl.drain_task->ring.load()->return_item(item);
+    impl.drain_task->inbound.ring()->return_item(item);
     return true;
 }
 
@@ -271,7 +270,7 @@ TEST(VisualizerHandleBinary, ForwardsTheMessageWithItsReceiveStamp) {
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        InboundRing& ring = *impl->drain_task->ring.load();
+        InboundRing& ring = *impl->drain_task->inbound.ring();
 
         // data = [server_ts(8)][loudness(2)], then more than this type defines: the protocol task
         // neither truncates nor caps, so a spectrum with many bins survives intact.
@@ -449,7 +448,7 @@ TEST(VisualizerHandleBinary, HandlersRefuseAGenerationATeardownOvertook) {
     // live stream, handle_binary's !stream_active term alone would drop the stale frame below
     // and the generation check would never be the deciding one.
     impl->handle_stream_start(stream, live_generation(*impl));
-    take_in_ring_order(*impl->drain_task->ring.load());
+    take_in_ring_order(*impl->drain_task->inbound.ring());
     ASSERT_TRUE(impl->stream_active.load());
     ASSERT_TRUE(pop_entry(*impl, entry));  // the stream/start boundary marker
     const uint32_t captured = live_generation(*impl);
@@ -458,14 +457,14 @@ TEST(VisualizerHandleBinary, HandlersRefuseAGenerationATeardownOvertook) {
 
     impl->handle_stream_start(stream, captured);
 
-    take_in_ring_order(*impl->drain_task->ring.load());
+    take_in_ring_order(*impl->drain_task->inbound.ring());
     EXPECT_FALSE(impl->stream_active.load()) << "a stopped role was re-armed by a stale handler";
     EXPECT_EQ(impl->negotiated_types_mask.load(), 0U);
 
     // Re-arm under the generation the role now reports, as a re-added role does, so the only
     // thing left that can refuse the captured generation's frame is the gate under test.
     impl->handle_stream_start(stream, live_generation(*impl));
-    take_in_ring_order(*impl->drain_task->ring.load());
+    take_in_ring_order(*impl->drain_task->inbound.ring());
     ASSERT_TRUE(impl->stream_active.load());
     ASSERT_TRUE(pop_entry(*impl, entry));  // the stream/start boundary marker
 
@@ -550,7 +549,7 @@ TEST(VisualizerSpectrumWiring, TheSpectrumTypeWithNoSpectrumObjectDeliversNothin
             stream.spectrum = impl->config.stream.spectrum;
         }
         impl->handle_stream_start(stream, live_generation(*impl));
-        take_in_ring_order(*impl->drain_task->ring.load());
+        take_in_ring_order(*impl->drain_task->inbound.ring());
 
         std::vector<uint16_t> bins;
         auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, payload.data(),
@@ -568,7 +567,7 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
     ServerVisualizerStreamObject stream;
     stream.types = {VisualizerDataType::BEAT};
     impl->handle_stream_start(stream, live_generation(*impl));
-    take_in_ring_order(*impl->drain_task->ring.load());
+    take_in_ring_order(*impl->drain_task->inbound.ring());
 
     // stream/start appends a boundary marker, which carries no message bytes; consume it first.
     Entry entry;
@@ -597,7 +596,7 @@ TEST(VisualizerClearMarker, StreamClearEnqueuesMarker) {
 
     impl->handle_stream_clear(live_generation(*impl));
 
-    take_in_ring_order(*impl->drain_task->ring.load());
+    take_in_ring_order(*impl->drain_task->inbound.ring());
 
     // The marker's item type lies outside the visualizer wire-type range, so it can never be
     // mistaken for a message: the exact value is an internal encoding, the range is the contract.
@@ -607,6 +606,43 @@ TEST(VisualizerClearMarker, StreamClearEnqueuesMarker) {
     EXPECT_TRUE(entry.type < SENDSPIN_BINARY_VISUALIZER_FIRST ||
                 entry.type > SENDSPIN_BINARY_VISUALIZER_LAST)
         << "the clear marker collides with wire type " << static_cast<int>(entry.type);
+}
+
+// A clear marker is exempt from the quota (InboundConsumer::hand()): a server that overran the
+// buffer_capacity it was told still gets its stream/clear boundary, or the drain thread would
+// blur the old stream into the new one. Control: a frame over the same quota is refused, so the
+// quota does bind.
+TEST(VisualizerClearMarker, AClearMarkerPassesAQuotaTheServersFramesExhausted) {
+    struct Row {
+        const char* name;
+        bool marker;
+        bool listed;
+    };
+    const Row rows[] = {
+        {"Control: a frame over quota is refused", false, false},
+        {"a clear marker over quota is still handed over", true, true},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        InboundRing& ring = *impl->drain_task->inbound.ring();
+        ring.quota(InboundHolder::VISUALIZER).set_limit(0);
+
+        if (row.marker) {
+            impl->handle_stream_clear(live_generation(*impl));
+            take_in_ring_order(ring);
+        } else {
+            std::vector<uint8_t> data;
+            put_be64(data, 1);
+            put_be16(data, 0x0001);
+            hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data, live_generation(*impl));
+        }
+
+        Entry entry;
+        EXPECT_EQ(pop_entry(*impl, entry), row.listed);
+        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U);
+    }
 }
 
 TEST(VisualizerClearMarker, DiscardPreservesPostClearFrames) {
@@ -619,7 +655,7 @@ TEST(VisualizerClearMarker, DiscardPreservesPostClearFrames) {
 
     impl->handle_stream_clear(live_generation(*impl));
 
-    take_in_ring_order(*impl->drain_task->ring.load());
+    take_in_ring_order(*impl->drain_task->inbound.ring());
 
     std::vector<uint8_t> post;
     put_be64(post, 2);
@@ -653,21 +689,29 @@ TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
     EXPECT_FALSE(pop_entry(*impl, entry));
 }
 
-// A teardown on the main loop moves the role's generation on; the protocol task's next tick
-// recalls the frames the drain thread has not taken, returning them and their quota charge to the
-// shared ring rather than leaving the old stream's frames to be delivered later.
+// A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and
+// the old stream's frames are never delivered: the protocol task's next tick recalls what the
+// drain thread has not taken, returning it and its quota charge to the shared ring, and a frame
+// the drain thread takes before that tick is dropped by its generation stamp and returned the
+// same way.
 TEST(VisualizerClearMarker, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) {
     struct Row {
         const char* name;
         bool teardown;
-        bool frames_left;
+        bool recall_tick;
+        bool listed_before_take;
+        size_t delivered;
     };
-    const Row rows[] = {{"Control: no teardown", false, true}, {"torn down", true, false}};
+    const Row rows[] = {
+        {"Control: no teardown", false, true, true, 2},
+        {"torn down, recalled by the protocol task's tick", true, true, false, 0},
+        {"torn down, taken by the drain thread before the recall", true, false, true, 0},
+    };
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        InboundRing& ring = *impl->drain_task->ring.load();
+        InboundRing& ring = *impl->drain_task->inbound.ring();
         std::vector<uint8_t> data;
         put_be64(data, 1);
         put_be16(data, 0x0001);
@@ -680,12 +724,22 @@ TEST(VisualizerClearMarker, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) 
         if (row.teardown) {
             impl->cleanup();
         }
+        if (row.recall_tick) {
+            impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
+        }
 
-        impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
-
-        EXPECT_EQ(!impl->drain_task->items.is_empty(), row.frames_left);
-        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding() > 0, row.frames_left);
-        impl->flush_items();
+        EXPECT_EQ(!impl->drain_task->inbound.items().is_empty(), row.listed_before_take);
+        // Taken under the live generation, as the drain thread takes them: a recalled or stale
+        // frame is not delivered, and one left over is.
+        size_t delivered = 0;
+        void* item = nullptr;
+        while ((item = impl->take_item(0)) != nullptr) {
+            ++delivered;
+            ring.return_item(item);
+        }
+        EXPECT_EQ(delivered, row.delivered);
+        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
+            << "a frame of the torn-down stream kept its charge";
     }
 }
 

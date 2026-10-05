@@ -27,8 +27,8 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.server_conn";
 
-SendspinServerConnection::SendspinServerConnection(std::shared_ptr<ix::WebSocket> ws, int sockfd)
-    : ws_(std::move(ws)), sockfd_(sockfd) {
+SendspinServerConnection::SendspinServerConnection(std::shared_ptr<ix::WebSocket> ws)
+    : ws_(std::move(ws)) {
     // No TCP_NODELAY setsockopt is needed here: IXWebSocket disables Nagle on accepted sockets
     // itself. SocketServer::run() calls SocketConnect::configure(clientFd) on every accepted
     // client fd (the same routine that sets TCP_NODELAY on outbound connects) so time messages

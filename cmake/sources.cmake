@@ -31,10 +31,12 @@ function(sendspin_get_sources BASE_DIR)
         # Connection base class
         ${BASE_DIR}/src/connection.cpp
 
-        # Connection management
+        # Connection management, and its pairing state machines
         ${BASE_DIR}/src/connection_manager.cpp
+        ${BASE_DIR}/src/connection_manager_pairing.cpp
 
-        # Protocol thread and its command queue; the shared inbound ring's per-consumer item list
+        # Protocol thread and its command queue; the shared inbound ring, its per-consumer item
+        # lists and consumers, and the per-connection inbound gate
         ${BASE_DIR}/src/protocol_task.cpp
         ${BASE_DIR}/src/inbound_ring.cpp
 
@@ -44,8 +46,9 @@ function(sendspin_get_sources BASE_DIR)
         # Public persistence codec (fixed-size binary storage format for the pairing structs)
         ${BASE_DIR}/src/persistence_codec.cpp
 
-        # Client orchestration
+        # Client orchestration, and its protocol-task half (the tick and the message dispatch)
         ${BASE_DIR}/src/client.cpp
+        ${BASE_DIR}/src/client_dispatch.cpp
 
         PARENT_SCOPE
     )

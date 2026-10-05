@@ -21,7 +21,6 @@
 #include "sendspin/client.h"
 
 #include <algorithm>
-#include <cinttypes>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -285,15 +284,18 @@ void PlayerRole::Impl::stop() const {
 void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::PLAYER);
 
-    // Advertise the share of the quota that holds encoded frames at the smallest frame size (see
-    // AUDIO_BUFFER_ADVERTISE_DENOMINATOR), so the server's fill never overruns the quota
+    // Advertise the share of the quota that holds encoded frames at the smallest frame size, so
+    // the server's fill never overruns the quota
     PlayerSupportObject player_support = {
         .supported_formats = this->config.audio_formats,
-        .buffer_capacity = this->config.audio_buffer_capacity *
-                           (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
-                           AUDIO_BUFFER_ADVERTISE_DENOMINATOR,
+        .buffer_capacity = this->advertised_buffer_capacity(),
     };
     msg.player_v1_support = std::move(player_support);
+}
+
+size_t PlayerRole::Impl::advertised_buffer_capacity() const {
+    return this->config.audio_buffer_capacity * (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
+           AUDIO_BUFFER_ADVERTISE_DENOMINATOR;
 }
 
 void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
@@ -348,36 +350,38 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t ge
         SS_LOGV(TAG, "Discarding audio chunk while unavailable");
         return;
     }
-    if (!this->sync_task->accepts_items()) {
+    InboundConsumer& inbound = this->sync_task->inbound();
+    if (inbound.ring() == nullptr) {
         SS_LOGW(TAG, "Failed to send audio chunk: the sync task is not running");
         return;
     }
-    if (message.item != nullptr) {
-        // The zero-copy path: the chunk stays in the ring item it was received and decrypted
-        // into, and the sync task decodes it from there.
-        void* item = std::exchange(message.item, nullptr);
-        this->hand_item(item, message.item_len, CHUNK_TYPE_ENCODED_AUDIO, AUDIO_FRAME_OFFSET,
-                        static_cast<uint32_t>(chunk->audio_len), generation);
-        return;
-    }
-    // A chunk reassembled from Noise fragments (one larger than a Noise frame) or delivered
-    // before admission is not in a ring item: copied into one, whole, so its timestamp stays
-    // at plaintext bytes 1-8. No wait: audio over a full ring is dropped, as above.
-    if (!this->hand_local_item(message.data, message.len, CHUNK_TYPE_ENCODED_AUDIO,
-                               AUDIO_FRAME_OFFSET, message.receive_time_us, 0, generation)) {
-        // Throttled like the over-quota drop (see InboundDropLog); an over-quota drop has
-        // already been counted there.
-        if (this->copy_drop_log.note_drop()) {
-            SS_LOGW(TAG, "Failed to copy an audio chunk into the inbound ring; dropping");
+    void* item = std::exchange(message.item, nullptr);
+    size_t item_len = message.item_len;
+    if (item == nullptr) {
+        // A chunk reassembled from Noise fragments (one larger than a Noise frame) or routed
+        // through the fallback buffer (longer than the ring takes) is not in a ring item: copied
+        // into one, whole, so its timestamp stays at plaintext bytes 1-8. No wait: audio over a
+        // full ring is dropped, like audio over the quota.
+        item = inbound.copy_local(message.data, message.len, message.receive_time_us, 0);
+        if (item == nullptr) {
+            inbound.note_drop("has no ring space to copy an audio chunk into; dropping");
+            return;
         }
-    } else if (const uint32_t dropped = this->copy_drop_log.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Dropped %" PRIu32 " audio chunks that could not be copied", dropped);
+        item_len = message.len;
     }
+    // Otherwise the zero-copy path: the chunk stays in the ring item it was received and
+    // decrypted into, and the sync task decodes it from there.
+    this->hand_item(item, item_len, CHUNK_TYPE_ENCODED_AUDIO, AUDIO_FRAME_OFFSET,
+                    static_cast<uint32_t>(chunk->audio_len), generation);
 }
 
 void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj,
                                            uint32_t generation) {
     bool header_sent = false;
+    // This stream's ordinal: hand_item() numbers its codec header with the same
+    // stream_ordinal + 1 and its STREAM_START carries it, so the sync task starts it only on its
+    // own acknowledgement.
+    const auto ordinal = static_cast<uint16_t>(this->stream_ordinal + 1);
 
     if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
         !player_obj.sample_rate.has_value() || !player_obj.codec.has_value()) {
@@ -396,10 +400,8 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
                                        ? CHUNK_TYPE_PCM_DUMMY_HEADER
                                        : CHUNK_TYPE_OPUS_DUMMY_HEADER;
 
-            header_sent = this->sync_task->accepts_items() &&
-                          this->hand_local_item(reinterpret_cast<const uint8_t*>(&header),
-                                                sizeof(DummyHeader), chunk_type, 0, 0,
-                                                HEADER_SEND_TIMEOUT_MS, generation);
+            header_sent = this->hand_local_item(reinterpret_cast<const uint8_t*>(&header),
+                                                sizeof(DummyHeader), chunk_type, generation);
             if (!header_sent) {
                 SS_LOGE(TAG, "Failed to send codec header");
             }
@@ -407,8 +409,7 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
             if (!player_obj.codec_header.has_value()) {
                 SS_LOGE(TAG, "FLAC codec header missing");
             } else {
-                header_sent = this->sync_task->accepts_items() &&
-                              this->hand_flac_header(player_obj.codec_header.value(), generation);
+                header_sent = this->hand_flac_header(player_obj.codec_header.value(), generation);
                 if (!header_sent) {
                     SS_LOGE(TAG, "Failed to send codec header");
                 }
@@ -419,10 +420,11 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     }
 
     if (!header_sent) {
-        this->sync_task->signal_stream_end();
-        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
+        this->sync_task->signal_stream_end(this->stream_ordinal);
+        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation, 0);
         return;
     }
+    this->stream_ordinal = ordinal;
 
     // The codec-header write above waits up to HEADER_SEND_TIMEOUT_MS for ring space, which is the
     // widest window a teardown can land in between the receive gate and this publication. One
@@ -439,12 +441,12 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     // teardown that lands between the two Inbox writes (stop()'s, on the main loop) leaves a
     // START the drain discards and params it never applies (see drain_events()).
     this->event_state->stream_params_slot.write(player_obj, generation);
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation, ordinal);
 }
 
 void PlayerRole::Impl::handle_stream_end(uint32_t generation) const {
-    this->sync_task->signal_stream_end();
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
+    this->sync_task->signal_stream_end(this->stream_ordinal);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation, 0);
 }
 
 void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
@@ -458,10 +460,8 @@ void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
     // so the sync task starts draining (freeing ring space) before the marker is written.
     // No listener callback: a seek is not a stream lifecycle event for the consumer.
     this->sync_task->signal_stream_clear();
-    if (!this->sync_task->accepts_items() ||
-        !this->hand_local_item(nullptr, 0, CHUNK_TYPE_STREAM_CLEAR_MARKER, 0, 0,
-                               HEADER_SEND_TIMEOUT_MS, generation)) {
-        // The marker couldn't be appended (no ring space, or over quota). The sync task will
+    if (!this->hand_local_item(nullptr, 0, CHUNK_TYPE_STREAM_CLEAR_MARKER, generation)) {
+        // The marker couldn't be appended (no ring space). The sync task will
         // still drain to empty and apply the clear, but the pre-seek/post-seek boundary is lost,
         // so new audio may be discarded along with the old.
         SS_LOGW(TAG, "Failed to append stream/clear marker; seek boundary may be imprecise");
@@ -500,29 +500,22 @@ void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
                 cp.output_delay_ms = dp.output_delay_ms;
             }
         },
-        cmd, generation);
+        ServerCommandMessage{cmd}, generation);
 }
 
-void PlayerRole::Impl::on_stream_ring_event(PlayerStreamCallbackType event) {
+void PlayerRole::Impl::on_stream_ring_event(const InboxEvent& event) {
     this->awaiting_sync_idle_events.push_back(event);
 }
 
 void PlayerRole::Impl::drain_events() {
-    // Taken before the catch-up, like every slot role's drain: a teardown that ran before the
-    // take is caught up below and drops a command stamped before it; one that runs after the take
-    // is caught up by the next drain. The sync-idle note is taken before is_running() is read
-    // below, so an idle transition after that read sets the bit again for the next drain.
-    ServerCommandMessage cmd_msg{};
-    uint32_t stamp = 0;
-    bool have_command = this->event_state->command_slot.take(cmd_msg, stamp);
+    // The sync-idle note is taken before is_running() is read below, so an idle transition after
+    // that read sets the bit again for the next drain.
     bool sync_idle_note = false;
     (void)this->event_state->sync_idle_slot.take(sync_idle_note);
-    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
-    catch_up_teardown(*this, generation);
-    if (have_command && stamp != generation) {
-        SS_LOGD(TAG, "Dropping a server command queued before the role was torn down");
-        have_command = false;
-    }
+    ServerCommandMessage cmd_msg{};
+    bool have_command = false;
+    const uint32_t generation = take_current_payload(*this, this->event_state->command_slot,
+                                                     cmd_msg, have_command, TAG, "server command");
 
     // --- Server command events (volume, mute, output delay) ---
     // Check each field independently since multiple command types may have been merged into one
@@ -580,24 +573,28 @@ void PlayerRole::Impl::drain_events() {
         // and the clamp before the erase below keeps the range valid.
         // NOLINTNEXTLINE(modernize-loop-convert): body mutates the vector, see above
         for (size_t idx = 0; idx < this->awaiting_sync_idle_events.size(); ++idx) {
-            const PlayerStreamCallbackType event = this->awaiting_sync_idle_events[idx];
-            if (event == PlayerStreamCallbackType::STREAM_END && !sync_idle) {
+            const InboxEvent event = this->awaiting_sync_idle_events[idx];
+            const auto type = static_cast<PlayerStreamCallbackType>(event.code);
+            if (type == PlayerStreamCallbackType::STREAM_END && !sync_idle) {
                 // Wait for the sync task to go idle before firing this and anything after it. The
                 // sync task writes sync_idle_slot when it does, which runs this drain again.
                 this->awaiting_sync_idle = true;
                 break;
             }
 
-            switch (event) {
+            switch (type) {
                 case PlayerStreamCallbackType::STREAM_END:
-                    // Only fire the callback when a stream is actually open: cleanup() enqueues
-                    // an unconditional STREAM_END (and a failed stream start enqueues one with no
-                    // preceding START), so gating here keeps on_stream_end() paired 1:1 with
-                    // on_stream_start()
-                    if (this->listener && this->stream_active) {
-                        this->listener->on_stream_end();
+                    // Only fire the callback when a stream is actually open: every teardown owes
+                    // a STREAM_END (complete_teardown()), and a failed stream start enqueues one
+                    // with no preceding START, so gating here keeps on_stream_end() paired 1:1
+                    // with on_stream_start(). Cleared before the callback, which may re-enter
+                    // teardown and owe a STREAM_END of its own: that one finds the stream closed.
+                    if (this->stream_active) {
+                        this->stream_active = false;
+                        if (this->listener) {
+                            this->listener->on_stream_end();
+                        }
                     }
-                    this->stream_active = false;
                     if (this->high_performance_requested_for_playback) {
                         this->client->release_high_performance();
                         this->high_performance_requested_for_playback = false;
@@ -628,24 +625,24 @@ void PlayerRole::Impl::drain_events() {
                         }
                     }
                     // Mark the stream active before invoking the listener. on_stream_start() may
-                    // re-enter teardown, and the STREAM_END that cleanup() enqueues fires
+                    // re-enter teardown, and the STREAM_END the teardown owes fires
                     // on_stream_end() only when stream_active is set (see the gate above). Setting
                     // it first keeps start/end paired even when the batch is abandoned below.
                     this->stream_active = true;
                     if (this->listener) {
                         this->listener->on_stream_start();
-                        // on_stream_start() may re-enter connection teardown, which already ended
-                        // the stream, cleared this vector, and enqueued a fresh STREAM_END.
+                        // on_stream_start() may re-enter connection teardown, whose own drain
+                        // already ended the stream and replaced this vector's content.
                         // Re-arming the sync task below would resurrect the dead stream, so
-                        // abandon the batch instead (the clamp below then erases nothing from the
-                        // already-cleared vector). stream_active stays true so the enqueued
-                        // STREAM_END still delivers a paired on_stream_end().
+                        // abandon the batch instead (the clamp below keeps the erase in range).
+                        // stream_active stays true so a STREAM_END the teardown still owes
+                        // delivers a paired on_stream_end().
                         if (!this->accepts(generation)) {
                             teardown_reentered = true;
                             break;
                         }
                     }
-                    this->sync_task->signal_stream_start();
+                    this->sync_task->signal_stream_start(event.serial);
                     // The sync task sets TASK_RUNNING asynchronously after this signal, so the
                     // pre-loop snapshot is stale now: a STREAM_END later in this same batch must
                     // wait for the just-started task to drain
@@ -675,14 +672,14 @@ void PlayerRole::Impl::drain_events() {
 void PlayerRole::Impl::cleanup() {
     // Flag the teardown before anything else: it tells a drain_events() frame that may be on the
     // call stack right now (a listener callback re-entering teardown) that the stream is gone,
-    // and it stamps every event queued from here on, so the STREAM_END below is delivered while
-    // a START this teardown just invalidated is discarded (see cleanup_generation).
+    // and it stamps every event queued from here on, so a START this teardown just invalidated is
+    // discarded (see cleanup_generation).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
     // End the current stream: the sync task drains and returns to idle. (Not signal_stream_clear():
     // that path is a seek within a live stream and expects a marker to follow.)
-    this->sync_task->signal_stream_end();
+    this->sync_task->signal_stream_end(this->stream_ordinal);
 
     // Discard stale slot content. Stale ring-borne events (an in-flight STREAM_START/STREAM_END
     // queued before this teardown) need no per-queue ring reset either way: on the
@@ -693,15 +690,17 @@ void PlayerRole::Impl::cleanup() {
     this->event_state->stream_params_slot.reset();
     this->event_state->command_slot.reset();
 
-    // Enqueue a clean STREAM_END - drain_events() will fire the callback (enqueue_stream_event()
-    // logs if the ring is too full to take it)
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
+    push_event_or_log(this->inbox, InboxEventType::PLAYER_CLEARED, 0, TAG, "player cleared event",
+                      generation);
 }
 
 void PlayerRole::Impl::complete_teardown() {
-    // The lifecycle events the teardown overtook. The STREAM_END cleanup() queued is appended
-    // after this runs: the drain catches up on its generation before dispatching it.
+    // The lifecycle events the teardown overtook, replaced by the STREAM_END it owes the
+    // listener. The drain fires it once the sync task, which cleanup() told to end the stream,
+    // reads idle, and only when a stream is open (see the STREAM_END gate in drain_events()).
     this->awaiting_sync_idle_events.clear();
+    this->awaiting_sync_idle_events.push_back(InboxEvent{
+        InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(PlayerStreamCallbackType::STREAM_END)});
     this->awaiting_sync_idle = false;
     if (this->high_performance_requested_for_playback) {
         this->client->release_high_performance();
@@ -713,69 +712,47 @@ void PlayerRole::Impl::complete_teardown() {
 // Impl: Helpers
 // ============================================================================
 
-void PlayerRole::Impl::recall_stale_items(uint32_t generation) {
-    if (generation == this->recalled_generation || !this->sync_task->accepts_items()) {
-        return;
-    }
-    // Every item on the list was appended under an earlier generation: an append under
-    // `generation` runs this first, so none of its items can be here yet.
-    this->recalled_generation = generation;
-    this->sync_task->recall_items();
-    // The stream the drops belonged to is gone, so no delivery will end their runs.
-    if (const uint32_t dropped = this->over_quota_log.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Player dropped %" PRIu32 " items over its buffer", dropped);
-    }
-    if (const uint32_t dropped = this->copy_drop_log.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Dropped %" PRIu32 " audio chunks that could not be copied", dropped);
-    }
+void PlayerRole::Impl::recall_stale_items(uint32_t generation) const {
+    this->sync_task->inbound().recall_stale(generation);
 }
 
 bool PlayerRole::Impl::hand_item(void* item, size_t item_len, ChunkType chunk_type,
-                                 uint8_t data_offset, uint32_t data_len, uint32_t generation) {
+                                 uint8_t data_offset, uint32_t data_len,
+                                 uint32_t generation) const {
     InboundItemHeader* header = inbound_item_header(item);
     header->type = chunk_type;
     header->data_offset = data_offset;
     header->data_len = data_len;
-    header->generation = generation;
-    this->recall_stale_items(generation);
-    if (!this->sync_task->hand_item(item, item_len)) {
-        // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
-        // advertised buffer_capacity, which the quota covers at the smallest chunk size, so this
-        // is a server overrunning it. Throttled: see InboundDropLog.
-        if (this->over_quota_log.note_drop()) {
-            SS_LOGW(TAG, "Player over its %zu-byte buffer; dropping items until it drains",
-                    this->config.audio_buffer_capacity);
-        }
-        this->sync_task->ring()->return_item(item);
-        return false;
+    const bool audio = chunk_type == CHUNK_TYPE_ENCODED_AUDIO;
+    if (!audio && chunk_type != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
+        // A codec header numbers the stream it starts; handle_stream_start() computes the same
+        // ordinal for its STREAM_START and adopts it once the header is handed over. Every other
+        // item keeps acquire()'s 0.
+        header->serial = static_cast<uint16_t>(this->stream_ordinal + 1);
     }
-    if (const uint32_t dropped = this->over_quota_log.note_delivery(); dropped != 0) {
-        SS_LOGW(TAG, "Player dropped %" PRIu32 " items over its buffer", dropped);
-    }
-    return true;
+    // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
+    // advertised buffer_capacity, which the quota covers at the smallest chunk size. A codec
+    // header and a clear marker are exempt (InboundConsumer::hand()).
+    return this->sync_task->inbound().hand(item, item_len, generation, /*exempt=*/!audio);
 }
 
 bool PlayerRole::Impl::hand_local_item(const uint8_t* data, size_t len, ChunkType chunk_type,
-                                       uint8_t data_offset, uint32_t receive_time_us,
-                                       uint32_t timeout_ms, uint32_t generation) {
-    if (len < data_offset) {
+                                       uint32_t generation) const {
+    InboundConsumer& inbound = this->sync_task->inbound();
+    if (inbound.ring() == nullptr) {
         return false;
     }
-    InboundRing* ring = this->sync_task->ring();
-    void* item = ring->acquire_local(len, timeout_ms);
-    if (item == nullptr) {
-        return false;
-    }
-    if (len > 0) {
-        std::memcpy(inbound_item_bytes(item), data, len);
-    }
-    inbound_item_header(item)->receive_time_us = receive_time_us;
-    ring->complete(item);
-    return this->hand_item(item, len, chunk_type, data_offset,
-                           static_cast<uint32_t>(len - data_offset), generation);
+    void* item = inbound.copy_local(data, len, 0, HEADER_SEND_TIMEOUT_MS);
+    return item != nullptr &&
+           this->hand_item(item, len, chunk_type, 0, static_cast<uint32_t>(len), generation);
 }
 
-bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint32_t generation) {
+bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header,
+                                        uint32_t generation) const {
+    InboundRing* ring = this->sync_task->inbound().ring();
+    if (ring == nullptr) {
+        return false;
+    }
     // Decoded straight into the item the sync task reads it from.
     const auto* input = reinterpret_cast<const unsigned char*>(codec_header.data());
     size_t decoded_len = 0;
@@ -784,7 +761,6 @@ bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint32_
         SS_LOGW(TAG, "FLAC codec header of %zu bytes is out of range", decoded_len);
         return false;
     }
-    InboundRing* ring = this->sync_task->ring();
     void* item = ring->acquire_local(decoded_len, HEADER_SEND_TIMEOUT_MS);
     if (item == nullptr) {
         return false;
@@ -806,8 +782,8 @@ bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint32_
                            static_cast<uint32_t>(written), generation);
 }
 
-void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event,
-                                            uint32_t generation) const {
+void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation,
+                                            uint16_t ordinal) const {
     // A dropped STREAM_START would leave the sync task waiting for its start signal forever;
     // a dropped STREAM_END would leave the consumer believing the stream is still active. Both
     // wedge the stream, so log the drop at ERROR (the helper defaults to WARN, which suits the
@@ -815,7 +791,7 @@ void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event,
     push_event_or_log(
         this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
         event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END", generation,
-        /*error_level=*/true);
+        /*error_level=*/true, ordinal);
 }
 
 void PlayerRole::Impl::load_output_delay() {

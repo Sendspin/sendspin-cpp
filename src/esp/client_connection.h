@@ -40,6 +40,29 @@ namespace sendspin {
  */
 class SendspinClientConnection : public SendspinConnection {
 public:
+    /// @brief esp_websocket_client's network_timeout_ms, set explicitly at start(): the bound on
+    /// each step of the connect (the TCP connect, the upgrade request, its response) and on each
+    /// transport read and write after it. esp_websocket_client's own default, which it warns
+    /// about using.
+    static constexpr uint32_t NETWORK_TIMEOUT_MS = 10000U;
+
+    /// @brief How long a released connection stays parked for reaping before it is dropped with
+    /// its transport still connecting (ReapEntry in connection_manager.h)
+    ///
+    /// The whole connect: esp_transport_connect() runs the TCP connect, the upgrade request's
+    /// write and the read of its response, each bounded by NETWORK_TIMEOUT_MS, and
+    /// esp_websocket_client_stop() cannot interrupt it. The DNS lookup before them
+    /// (getaddrinfo()) is not under that timeout but under lwIP's resolver, which gives up on a
+    /// server after 7 s (DNS_MAX_RETRIES of 4 at DNS_TMR_INTERVAL ticks of 1 s, waiting 1, 1, 2
+    /// and 3 ticks) and tries each configured one in turn (CONFIG_LWIP_DNS_MAX_SERVERS, 3 by
+    /// default; an mDNS query tries once). So a drop at the deadline still pays up to that
+    /// resolver bound, about 21 s by default, in the destructor's stop, which waits for the
+    /// websocket task to exit.
+    /// The handle is not handed to esp_websocket_client_destroy_on_exit() instead: the event
+    /// handler registered on it takes this connection as its argument, so the handle must not
+    /// outlive the connection, and nothing short of a stop ends the attempt early.
+    static constexpr uint32_t CONNECT_TIMEOUT_MS = 3 * NETWORK_TIMEOUT_MS;
+
     /// @brief Constructs a client connection to a URL such as "ws://server.local:8927/sendspin"
     explicit SendspinClientConnection(std::string url);
 
@@ -59,8 +82,9 @@ public:
     /// @brief Closes the transport immediately without blocking (see base class doc comment).
     /// Stops taking frames without touching the transport; the actual
     /// esp_websocket_client_stop() runs later in the destructor once the manager drops this
-    /// connection (off the websocket task), because esp_websocket_client_stop() cannot be called
-    /// from the websocket task's own event handler.
+    /// connection (off the websocket task, and for a released one once its transport reported the
+    /// close or its reaping deadline passed), because esp_websocket_client_stop() cannot be called
+    /// from the websocket task's own event handler and blocks until that task exits.
     void close_transport_now() override;
 
     /// @brief Whether the websocket connection is established
@@ -115,6 +139,10 @@ protected:
 
     /// @brief Handles websocket error event
     void handle_error();
+
+    /// @brief Handles the websocket task's exit (WEBSOCKET_EVENT_FINISH): the transport's close,
+    /// whichever way the task ended, including a stop that posts no DISCONNECTED
+    void handle_finished();
 
     // Struct fields
 

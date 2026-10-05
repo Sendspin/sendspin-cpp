@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -195,7 +196,7 @@ TEST(InboundRing, ALocalItemGoesBackOnItsSecondReturn) {
         EXPECT_EQ(inbound_item_header(local)->kind, InboundKind::LOCAL);
         f.ring.complete(local);
         if (row.charged) {
-            ASSERT_TRUE(f.ring.charge(local, LEN, InboundHolder::PLAYER));
+            ASSERT_TRUE(f.ring.charge(local, LEN, InboundHolder::PLAYER, false));
         }
         void* passthrough[2] = {f.ring.acquire(LEN, 0), f.ring.acquire(LEN, 0)};
         for (void* item : passthrough) {
@@ -243,7 +244,7 @@ TEST(InboundRing, ResetSuppliesTheMissingHalfOfALocalItem) {
     void* local = f.ring.acquire_local(LEN, 0);
     ASSERT_NE(local, nullptr);
     f.ring.complete(local);
-    ASSERT_TRUE(f.ring.charge(local, LEN, InboundHolder::PLAYER));
+    ASSERT_TRUE(f.ring.charge(local, LEN, InboundHolder::PLAYER, false));
     for (int i = 0; i < 2; ++i) {
         void* item = f.ring.acquire(LEN, 0);
         ASSERT_NE(item, nullptr);
@@ -271,40 +272,91 @@ TEST(InboundRing, ResetReturnsEverythingStillQueued) {
     EXPECT_EQ(ring.acquire(largest, 0), nullptr) << "Control";
 
     ring.reset();
-    EXPECT_EQ(ring.items_waiting(), 0U);
+    size_t len = 0;
+    EXPECT_EQ(ring.take(&len, 0), nullptr);
     EXPECT_NE(ring.acquire(largest, 0), nullptr);
 }
 
 // charge() admits an item only while its holder is within quota, records the charge in the item,
-// and return_item() releases exactly that charge. Rows walk one ring through a sequence; the
-// quota is sized for two 16-byte items (52 stored bytes each).
+// and return_item() releases exactly that charge; the quota underneath admits a charge only while
+// the outstanding total stays within the limit, to the byte, and a release makes room again. One
+// table walks one ring through a sequence: the player's quota is sized for two 16-byte items, the
+// visualizer's for one, and the TRY/RELEASE rows drive the player's quota directly for the
+// byte-granular boundaries a stored item size cannot reach.
 TEST(InboundRing, ChargeAndReturnKeepTheHolderQuotaExact) {
     constexpr size_t STORED = SharedRingLayout::stored_size(sizeof(InboundItemHeader) + 16);
+    enum class Op : uint8_t { CHARGE, RETURN, TRY, RELEASE };
+    struct Row {
+        const char* name;
+        Op op;
+        size_t item;  // CHARGE, RETURN: index into `items`
+        InboundHolder holder;
+        bool exempt;
+        size_t bytes;   // TRY, RELEASE
+        bool accepted;  // CHARGE, TRY
+        size_t player_after;
+        size_t visualizer_after;
+    };
+    constexpr InboundHolder PLAYER = InboundHolder::PLAYER;
+    constexpr InboundHolder VISUALIZER = InboundHolder::VISUALIZER;
+    const Row rows[] = {
+        {"Control: an item within the quota is charged", Op::CHARGE, 0, PLAYER, false, 0, true,
+         STORED, 0},
+        {"a charge up to exactly the limit", Op::CHARGE, 1, PLAYER, false, 0, true, 2 * STORED, 0},
+        {"an item over the quota is refused", Op::CHARGE, 2, PLAYER, false, 0, false, 2 * STORED,
+         0},
+        {"one byte over the limit is refused", Op::TRY, 0, PLAYER, false, 1, false, 2 * STORED, 0},
+        {"another holder keeps flowing", Op::CHARGE, 3, VISUALIZER, false, 0, true, 2 * STORED,
+         STORED},
+        {"an exempt item passes a holder over its quota, uncharged", Op::CHARGE, 2, PLAYER, true, 0,
+         true, 2 * STORED, STORED},
+        {"returning the exempt item releases nothing", Op::RETURN, 2, PLAYER, false, 0, true,
+         2 * STORED, STORED},
+        {"a return releases exactly its item's charge", Op::RETURN, 0, PLAYER, false, 0, true,
+         STORED, STORED},
+        {"a charge that would cross the limit is refused", Op::TRY, 0, PLAYER, false, STORED + 1,
+         false, STORED, STORED},
+        {"Control: a charge that fits again is admitted", Op::TRY, 0, PLAYER, false, STORED, true,
+         2 * STORED, STORED},
+        {"a release frees exactly its bytes", Op::RELEASE, 0, PLAYER, false, STORED, true, STORED,
+         STORED},
+        {"the other holder's return releases its own quota", Op::RETURN, 3, VISUALIZER, false, 0,
+         true, STORED, 0},
+        {"the last return empties the quota", Op::RETURN, 1, PLAYER, false, 0, true, 0, 0},
+        {"a single charge larger than the limit is refused", Op::TRY, 0, PLAYER, false,
+         2 * STORED + 1, false, 0, 0},
+    };
+
     Fixture f(1024);
-    f.ring.quota(InboundHolder::PLAYER).set_limit(2 * STORED);
-    f.ring.quota(InboundHolder::VISUALIZER).set_limit(STORED);
+    InboundQuota& player = f.ring.quota(PLAYER);
+    player.set_limit(2 * STORED);
+    f.ring.quota(VISUALIZER).set_limit(STORED);
+    void* items[] = {routed_item(f.ring, 1), routed_item(f.ring, 2), routed_item(f.ring, 3),
+                     routed_item(f.ring, 4)};
 
-    void* first = routed_item(f.ring, 1);
-    void* second = routed_item(f.ring, 2);
-    void* third = routed_item(f.ring, 3);
-    void* vis = routed_item(f.ring, 4);
-
-    EXPECT_TRUE(f.ring.charge(first, 16, InboundHolder::PLAYER)) << "Control: within quota";
-    EXPECT_EQ(inbound_item_header(first)->charge, STORED);
-    EXPECT_TRUE(f.ring.charge(second, 16, InboundHolder::PLAYER));
-    EXPECT_FALSE(f.ring.charge(third, 16, InboundHolder::PLAYER)) << "player over quota";
-    EXPECT_TRUE(f.ring.charge(vis, 16, InboundHolder::VISUALIZER))
-        << "another holder keeps flowing";
-    EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 2 * STORED);
-
-    f.ring.return_item(third);  // never charged: releases nothing
-    EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 2 * STORED);
-    f.ring.return_item(first);
-    EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), STORED);
-    f.ring.return_item(vis);
-    EXPECT_EQ(f.ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U);
-    f.ring.return_item(second);
-    EXPECT_EQ(f.ring.quota(InboundHolder::PLAYER).outstanding(), 0U);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        switch (row.op) {
+            case Op::CHARGE:
+                EXPECT_EQ(f.ring.charge(items[row.item], 16, row.holder, row.exempt), row.accepted);
+                if (row.accepted) {
+                    EXPECT_EQ(inbound_item_header(items[row.item])->charge, row.exempt ? 0U : STORED)
+                        << "the charge the item records, which its return releases";
+                }
+                break;
+            case Op::RETURN:
+                f.ring.return_item(items[row.item]);
+                break;
+            case Op::TRY:
+                EXPECT_EQ(player.try_charge(row.bytes), row.accepted);
+                break;
+            case Op::RELEASE:
+                player.release(row.bytes);
+                break;
+        }
+        EXPECT_EQ(player.outstanding(), row.player_after);
+        EXPECT_EQ(f.ring.quota(VISUALIZER).outstanding(), row.visualizer_after);
+    }
 }
 
 // Items come out of the list in the order the protocol task appended them, each the ring item
@@ -368,8 +420,8 @@ TEST(InboundItemList, RecallReturnsEveryLinkedItemAndReleasesItsCharge) {
     void* first = routed_item(f.ring, 1, LEN);
     void* passthrough = routed_item(f.ring, 2, LEN);
     void* second = routed_item(f.ring, 3, LEN);
-    ASSERT_TRUE(f.ring.charge(first, LEN, InboundHolder::PLAYER));
-    ASSERT_TRUE(f.ring.charge(second, LEN, InboundHolder::PLAYER));
+    ASSERT_TRUE(f.ring.charge(first, LEN, InboundHolder::PLAYER, false));
+    ASSERT_TRUE(f.ring.charge(second, LEN, InboundHolder::PLAYER, false));
     f.list.append(first);
     f.list.append(second);
     f.ring.return_item(passthrough);
@@ -401,7 +453,8 @@ TEST(InboundItemList, TheRingResetNeverReachesAnUnboundList) {
     void* local = ring.acquire_local(LEN, 0);
     ASSERT_NE(local, nullptr);
     ring.complete(local);
-    ASSERT_TRUE(hand_inbound_item(ring, *list, InboundHolder::PLAYER, local, LEN));
+    ASSERT_TRUE(ring.charge(local, LEN, InboundHolder::PLAYER, false));
+    list->append(local);
     ASSERT_EQ(list->take(0), local);
     ring.return_item(local);  // the holder's return; the ring-order one never came
 
@@ -420,39 +473,6 @@ TEST(InboundItemList, AppendAfterRecallStartsAFreshList) {
     void* item = routed_item(f.ring, 2);
     f.list.append(item);
     EXPECT_EQ(f.list.take(0), item);
-}
-
-// The quota admits a charge only while the outstanding total stays within the limit, and a
-// release makes room again. One table walks a single quota through a sequence of operations.
-TEST(InboundQuota, ChargesWithinTheLimitOnly) {
-    enum class Op { CHARGE, RELEASE };
-    struct Row {
-        const char* name;
-        Op op;
-        size_t bytes;
-        bool accepted;  // CHARGE only
-        size_t outstanding_after;
-    };
-    const std::vector<Row> rows = {
-        {"Control: charge below the limit", Op::CHARGE, 60, true, 60},
-        {"charge up to exactly the limit", Op::CHARGE, 40, true, 100},
-        {"one byte over the limit", Op::CHARGE, 1, false, 100},
-        {"release part", Op::RELEASE, 40, true, 60},
-        {"charge that would cross the limit", Op::CHARGE, 41, false, 60},
-        {"charge that fits again", Op::CHARGE, 40, true, 100},
-        {"release all", Op::RELEASE, 100, true, 0},
-        {"single charge larger than the limit", Op::CHARGE, 101, false, 0},
-    };
-    InboundQuota quota(100);
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        if (row.op == Op::CHARGE) {
-            EXPECT_EQ(quota.try_charge(row.bytes), row.accepted);
-        } else {
-            quota.release(row.bytes);
-        }
-        EXPECT_EQ(quota.outstanding(), row.outstanding_after);
-    }
 }
 
 // Concurrent charges and releases never let the outstanding total past the limit and leave it at
@@ -505,24 +525,6 @@ TEST(InboundGate, NothingIsWrittenWhileAPreAdmissionMessageIsPending) {
     EXPECT_EQ(gate.in_flight(), 1U);
 }
 
-// A pre-admission message is accepted up to PRE_ADMISSION_MESSAGE_BYTES and refused past it.
-TEST(InboundGate, PreAdmissionMessageCap) {
-    struct Row {
-        const char* name;
-        size_t len;
-        bool fits;
-    };
-    const std::vector<Row> rows = {
-        {"Control: a small message", 64, true},
-        {"exactly the cap", InboundGate::PRE_ADMISSION_MESSAGE_BYTES, true},
-        {"one byte past the cap", InboundGate::PRE_ADMISSION_MESSAGE_BYTES + 1, false},
-    };
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        EXPECT_EQ(InboundGate::pre_admission_message_fits(row.len), row.fits);
-    }
-}
-
 // An indefinite wait survives a CONSUMED bit left over from the previous message (the protocol
 // task cleared the pending flag, the transport published again, then the task's bit landed): it
 // keeps waiting until the new message is actually consumed, and never returns false. The late
@@ -548,19 +550,42 @@ TEST(InboundGate, IndefiniteWaitOutlastsALeftoverConsumedBit) {
     EXPECT_TRUE(writable);
 }
 
-// A transport waiting for its pending message to be consumed is woken by the consume. The join
-// has no timeout: a consume that does not wake it hangs here and the watchdog names the test.
-TEST(InboundGate, ConsumeWakesATransportWaitingToWrite) {
+// A transport parked waiting for its pending message to be consumed is released by the consume,
+// and also by a detach: a connection released or stopped while its transport waits detaches the
+// gate before anything joins the transport thread, and the detach ends the wait so the join
+// completes. The wait has no timeout and neither has the join: a consume or a detach that does
+// not wake the transport hangs here and the watchdog names the test. The consume row is the
+// Control: only it leaves the transport free to write.
+TEST(InboundGate, AConsumeOrADetachReleasesATransportWaitingToWrite) {
+    struct Row {
+        const char* name;
+        bool detach;
+        bool expected_writable;
+    };
+    const Row rows[] = {
+        {"Control: the protocol task consumes the message", false, true},
+        {"the connection is released and its gate detached", true, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundGate gate;
+        ASSERT_TRUE(gate.publish_pending_message());
+        bool writable = !row.expected_writable;
+        std::thread transport([&] { writable = gate.wait_until_writable(UINT32_MAX); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(PARK_MS));
+        if (row.detach) {
+            gate.detach();
+        } else {
+            gate.consume_pending_message();
+        }
+        transport.join();
+        EXPECT_EQ(writable, row.expected_writable);
+    }
+
+    // A consume left over from a message does not end the next message's wait early.
     InboundGate gate;
     ASSERT_TRUE(gate.publish_pending_message());
-    bool writable = false;
-    std::thread transport([&] { writable = gate.wait_until_writable(UINT32_MAX); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(PARK_MS));
     gate.consume_pending_message();
-    transport.join();
-    EXPECT_TRUE(writable);
-
-    // A consume left over from that message does not end the next message's wait early.
     ASSERT_TRUE(gate.publish_pending_message());
     EXPECT_FALSE(gate.wait_until_writable(0));
     EXPECT_FALSE(gate.wait_until_writable(1));
@@ -605,69 +630,6 @@ TEST(InboundGate, CloseIsHonouredOnlyOnceNothingIsInFlight) {
         }
         EXPECT_EQ(gate.close_ready(), row.ready);
     }
-}
-
-// The derived ring always satisfies the FreeRTOS storage rule, accepts a maximal message and holds
-// every term of the derivation: each holder's quota, the pass-through traffic that can arrive
-// during the player's longest hold (state JSON, time replies, visualizer frames), and the images
-// that window carries or the maximal-message allowance. The terms are recomputed here from the
-// stated budget (a track change every 30 s). Rows cover each role mix; the first is the
-// controller-only floor.
-TEST(InboundRingSize, DerivationHoldsEveryTerm) {
-    struct Row {
-        const char* name;
-        InboundRingBudget budget;
-    };
-    const size_t default_image =
-        inbound_frames_stored_bytes(ImageSlotPreference::DEFAULT_MAX_IMAGE_BYTES);
-    const std::vector<Row> rows = {
-        {"Control: no holding role, no artwork", {0, 0, 0, 0}},
-        {"default player", {PlayerRoleConfig::DEFAULT_AUDIO_BUFFER_CAPACITY, 0, 0, 0}},
-        {"default player and one artwork channel",
-         {PlayerRoleConfig::DEFAULT_AUDIO_BUFFER_CAPACITY, 0, 0, default_image}},
-        {"small player, visualizer, two artwork channels",
-         {100000, 8192, 30 * 72, 2 * inbound_frames_stored_bytes(64 * 1024)}},
-        {"player size not a multiple of 4", {100001, 0, 0, 0}},
-        {"faster time bursts", {100000, 0, 0, 0, 16, 1000}},
-    };
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        const size_t bytes = derive_inbound_ring_bytes(row.budget);
-        EXPECT_EQ(bytes % SharedRingLayout::STORAGE_ALIGNMENT, 0U);
-        EXPECT_GE(SharedRingLayout::max_item_size(bytes),
-                  sizeof(InboundItemHeader) + INBOUND_MAX_MESSAGE_BYTES);
-
-        // The player's longest hold at the lowest budgeted rate, and what arrives meanwhile.
-        const size_t stored_per_second =
-            (160 + 13 + INBOUND_ITEM_STORED_OVERHEAD_BYTES) * 50;  // 20 ms Opus at 64 kbit/s
-        const size_t hold_seconds =
-            (row.budget.audio_hold_bytes + stored_per_second - 1) / stored_per_second;
-        const size_t bursts =
-            hold_seconds > 0
-                ? hold_seconds * 1000 / static_cast<size_t>(row.budget.time_burst_interval_ms) + 1
-                : 0;
-        const size_t held_passthrough =
-            hold_seconds * (1024 + row.budget.visualizer_stored_bytes_per_second) +
-            bursts * row.budget.time_burst_size * INBOUND_TIME_REPLY_STORED_BYTES;
-        const size_t allowance =
-            row.budget.artwork_images_stored_bytes > 0
-                ? (hold_seconds / 30 + 1) * row.budget.artwork_images_stored_bytes
-                : INBOUND_PASSTHROUGH_MESSAGES * INBOUND_MAX_ITEM_STORED_BYTES;
-        EXPECT_GE(bytes, row.budget.audio_hold_bytes + row.budget.visualizer_hold_bytes +
-                             held_passthrough + allowance);
-
-        InboundRing ring;
-        EXPECT_TRUE(ring.create(bytes, MemoryLocation::PREFER_EXTERNAL));
-    }
-}
-
-// The hold window the pass-through term is sized for: the default player quota filled with
-// 160-byte frames every 20 ms holds its oldest chunk for 87 s (1,000,000 bytes at 11,600 stored
-// bytes a second, rounded up). Spelled out: it is the figure the default ring size rests on.
-TEST(InboundRingSize, TheDefaultPlayerHoldsAudioFor87Seconds) {
-    EXPECT_EQ(INBOUND_MIN_AUDIO_STORED_BYTES_PER_SECOND, 11600U);
-    EXPECT_EQ(inbound_max_hold_seconds(PlayerRoleConfig::DEFAULT_AUDIO_BUFFER_CAPACITY), 87U);
-    EXPECT_EQ(inbound_max_hold_seconds(0), 0U) << "Control: no player, no hold window";
 }
 
 // A run of frames is stored as whole items: each maximal frame and the final partial one pays

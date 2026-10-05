@@ -49,16 +49,25 @@ review, never on recollection or on how the code is expected to look.
 Check against `docs/conventions.md` ("Threading and cross-thread state") and
 the descriptions in `docs/internals.md`:
 
-- First, map each changed function to the thread(s) that execute it (network
-  thread, drain/decode thread, sync task, main loop) by tracing its callers;
-  every rule below is judged against that mapping, and a function whose
-  thread you have not identified is not yet reviewed.
+- First, map each changed function to the thread(s) that execute it
+  (transport thread, protocol task, drain/decode thread, sync task, main
+  loop) by tracing its callers; every rule below is judged against that
+  mapping, and a function whose thread you have not identified is not yet
+  reviewed.
+- A transport thread is a pipe: it writes the inbound ring or the fallback
+  buffer, reports a close and wakes the protocol task. Connection state is
+  touched only on the protocol task, except the transport's own atomics,
+  documented at their declaration; any other thread reaches a connection
+  through the command queue.
+- Every lock is a leaf: a second library lock taken under one, or a lock
+  held across a send, a listener or the provider, is a finding. Every
+  cross-thread member states its writer and reader threads.
 - Main-loop-bound cross-thread state goes through the `Inbox`; no new
   mutex-protected endpoints polled by `loop()`.
 - Event ring for ordered lifecycle events only; latest-wins state on an
   `InboxSlot`; two non-main-loop threads communicate via `ShadowSlot`.
-- Payload validation and decoding on the consuming thread, not the network
-  thread.
+- Payload validation and decoding on the consuming thread, never the
+  transport thread.
 - Callback dispatch tolerates re-entrant teardown (a listener may call back
   into the client mid-callback).
 - Silent drops on bounded queues are findings; drop sites log a warning.
@@ -79,7 +88,8 @@ the descriptions in `docs/internals.md`:
   `src/platform/`, `src/esp/`, `src/host/`.
 - Role compile-gates (`SENDSPIN_ENABLE_*`) appear only in
   `cmake/sources.cmake` and the dispatch points in
-  `include/sendspin/client.h` / `src/client.cpp`; the codec gate
+  `include/sendspin/client.h`, `src/client.cpp` and `src/client_dispatch.cpp`;
+  the codec gate
   `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`, and
   `src/player_role.cpp`. Examples must build with roles (and Opus) disabled:
   role and opus usage in `examples/` is guarded like an external consumer

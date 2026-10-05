@@ -158,12 +158,7 @@ uint32_t SendspinTimeBurst::ms_until_due(int64_t now_ms) const {
     } else if (this->send_retry_after_ms_ != 0) {
         due_ms = this->send_retry_after_ms_;
     }
-    if (due_ms <= now_ms) {
-        return 0;
-    }
-    const int64_t wait_ms = due_ms - now_ms;
-    return wait_ms >= static_cast<int64_t>(UINT32_MAX) ? UINT32_MAX - 1
-                                                       : static_cast<uint32_t>(wait_ms);
+    return ms_until(due_ms * US_PER_MS, now_ms * US_PER_MS);
 }
 
 void SendspinTimeBurst::configure(uint8_t burst_size, int64_t burst_interval_ms,
