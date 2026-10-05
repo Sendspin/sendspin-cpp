@@ -365,7 +365,8 @@ public:
 
 // roles/player/v1.md "Audio Chunks (Binary)": the player discards incoming audio while the
 // adopted client/state snapshot reports the client unavailable; a set_available() takes effect
-// only once its snapshot is adopted.
+// only once its snapshot is adopted. A discarded chunk's ring item stays with the dispatcher,
+// for process_inbound() to return.
 TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
     struct Row {
         const char* name;
@@ -377,6 +378,7 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
     const Row rows[] = {
         {"Control: available", true, true, false, true},
         {"unavailable", false, false, false, false},
+        {"unavailable, snapshot not yet adopted", true, false, false, true},
         {"available again, snapshot not yet adopted", false, true, false, false},
         {"Control: available again, snapshot adopted", false, true, true, true},
     };
@@ -408,11 +410,13 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
                                     std::nullopt);
         client.connection_manager_->install_admitted(conn, role_mask_bit(SendspinRole::PLAYER));
 
-        std::vector<uint8_t> chunk = audio_chunk();
-        InboundMessage message = message_over(chunk);
+        InboundMessage message = receive_into_ring(ring, audio_chunk(), 0);
         client.process_binary_message(*conn, message);
-        take_in_ring_order(ring);
         EXPECT_EQ(!impl.sync_task->inbound().items().is_empty(), row.queued);
+        EXPECT_EQ(message.item != nullptr, !row.queued);
+        if (message.item != nullptr) {
+            ring.return_item(message.item);
+        }
     }
 }
 
