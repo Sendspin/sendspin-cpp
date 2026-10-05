@@ -20,9 +20,6 @@
 // The "server" side uses raw noise-c as the Noise initiator.
 // The client proposes only Noise_KKpsk2_25519_ChaChaPoly_SHA256 (see NOISE_SUITE_CHACHAPOLY
 // in crypto/constants.h), so that is the only suite exercised here.
-//
-// Named gap: no test covers a failed encrypt setting the send-desync flag in
-// NoiseTransport::encrypt_and_send_frame(); a live session cannot fail its encrypt without a seam.
 
 #include "connection.h"
 #include "connection_manager.h"
@@ -37,6 +34,8 @@
 #include "noise_handshake.h"
 #include "noise_session.h"
 #include "noise_test_helpers.h"
+#include "outbound_ring.h"
+#include "outbound_test_helpers.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
 #include "platform/time.h"
@@ -1634,24 +1633,89 @@ TEST(NoiseTransport, SendBinaryRejectsAnEmptyPayload) {
 }
 
 TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
-    // Both transport sends are guarded on is_active(): with no session installed there is no
+    // Every transport send is guarded on is_active(): with no session installed there is no
     // cipher to seal with, and the caller is told the state is wrong rather than having its
-    // message sent in the clear or dropped silently.
+    // message sent in the clear or dropped silently. A lent binary message has no cleartext
+    // fallback either, and its item goes back to the ring unsent.
     TestConnection conn;
+    TestOutboundRing lent(64);
 
     const std::string json = R"({"type":"client/state"})";
     EXPECT_EQ(conn.send_encrypted_text(json), SsErr::INVALID_STATE);
     const std::vector<uint8_t> payload = {SENDSPIN_BINARY_PLAYER_AUDIO, 0x01};
     EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::INVALID_STATE);
+    void* refused = lent.take_filled(payload);
+    ASSERT_NE(refused, nullptr);
+    EXPECT_EQ(conn.send_app_binary_lent(lent.ring, refused, lent.capacity, payload.size()),
+              SsErr::INVALID_STATE);
     EXPECT_TRUE(conn.sent_binary_.empty());
+    EXPECT_TRUE(conn.sent_text_.empty()) << "a lent message went out in the clear";
+    EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT) << "the refused item was not returned";
 
-    // Control: with a session installed the same two calls seal and send.
+    // Control: with a session installed the same three calls seal and send.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     conn.set_noise_session(std::move(r->responder_session));
     EXPECT_EQ(conn.send_encrypted_text(json), SsErr::OK);
     EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::OK);
-    EXPECT_EQ(conn.sent_binary_.size(), 2u);
+    void* sent = lent.take_filled(payload);
+    ASSERT_NE(sent, nullptr);
+    EXPECT_EQ(conn.send_app_binary_lent(lent.ring, sent, lent.capacity, payload.size()), SsErr::OK);
+    EXPECT_EQ(conn.sent_binary_.size(), 3u);
+    EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT);
+}
+
+// encrypt_in_place() seals a frame the peer authenticates. A buffer without the AEAD tag room is
+// refused before the encrypt, spending no nonce, so the next frame still authenticates; a failed
+// encrypt marks the send desynced, since a send nonce may be spent (the Noise specification,
+// section 5.1 "The CipherState object"). The encrypt is made to fail by exhausting the send
+// nonce, the one failure a live session can meet.
+TEST(NoiseTransport, EncryptInPlaceRefusesMissingTagRoomAndMarksAFailedEncrypt) {
+    enum class Case : uint8_t { FITS, NO_TAG_ROOM, NONCE_EXHAUSTED };
+    struct Row {
+        const char* name;
+        Case c;
+        bool sealed;
+        bool desynced;
+    };
+    const Row rows[] = {
+        {"Control: room for the tag", Case::FITS, true, false},
+        {"one byte short of the tag room", Case::NO_TAG_ROOM, false, false},
+        {"the send nonce is exhausted", Case::NONCE_EXHAUSTED, false, true},
+    };
+    const std::vector<uint8_t> message = {SENDSPIN_BINARY_PLAYER_AUDIO, 0x01, 0x02, 0x03};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+        NoiseCipherState* send_cs = r->responder_session->send_cipher_;
+        NoiseTransport transport;
+        transport.activate(std::move(r->responder_session));
+        if (row.c == Case::NONCE_EXHAUSTED) {
+            ASSERT_EQ(noise_cipherstate_set_nonce(send_cs, UINT64_MAX), NOISE_ERROR_NONE);
+        }
+
+        std::vector<uint8_t> buf(message.size() + AEAD_TAG_SIZE);
+        std::copy(message.begin(), message.end(), buf.begin());
+        const size_t capacity = row.c == Case::NO_TAG_ROOM ? buf.size() - 1 : buf.size();
+        const size_t ct_len = transport.encrypt_in_place(buf.data(), capacity, message.size());
+        EXPECT_EQ(transport.is_send_desynced(), row.desynced);
+        if (row.sealed) {
+            ASSERT_EQ(ct_len, buf.size());
+            EXPECT_EQ(raw_decrypt(r->initiator.recv_cs, buf), message);
+        } else {
+            EXPECT_EQ(ct_len, 0U);
+        }
+
+        if (!row.desynced) {
+            // The next frame authenticates, so the refusal spent no nonce.
+            std::vector<uint8_t> next(message.size() + AEAD_TAG_SIZE);
+            std::copy(message.begin(), message.end(), next.begin());
+            ASSERT_EQ(transport.encrypt_in_place(next.data(), next.size(), message.size()),
+                      next.size());
+            EXPECT_EQ(raw_decrypt(r->initiator.recv_cs, next), message);
+        }
+    }
 }
 
 // ============================================================================
@@ -1960,6 +2024,9 @@ public:
         if (!this->connected_) {
             return SsErr::INVALID_STATE;
         }
+        if (this->during_write) {
+            this->during_write();
+        }
         if (this->writes_before_refusal == 0) {
             ++this->refused_writes;
             return SsErr::FAIL;
@@ -1990,6 +2057,9 @@ public:
         this->connected_ = false;
     }
 
+    /// Run inside every write the connected transport attempts, before it succeeds or fails.
+    std::function<void()> during_write;
+
     /// Writes that succeed before every later one is refused; negative never refuses.
     int writes_before_refusal{-1};
     int refused_writes{0};
@@ -2002,9 +2072,18 @@ private:
 // (connection.md "Failure Handling"), and every later send is refused before its encrypt. A
 // refusal before the encrypt leaves the connection up, and its next frame decrypts on the peer.
 // A detached connection or a closed transport is not closed again, and its next send is still
-// refused. A failed encrypt has no row (the file comment's named gap).
+// refused. A lent message's item goes back to the ring on every row that sends one. The encrypt
+// fails by exhausting the send nonce, the one failure a live session can meet.
 TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
-    enum class Send : uint8_t { SINGLE, FRAGMENTED, NO_FRAME_SINK, FRAGMENT_TYPED_BINARY };
+    enum class Send : uint8_t {
+        SINGLE,
+        FRAGMENTED,
+        NO_FRAME_SINK,
+        FRAGMENT_TYPED_BINARY,
+        ENCRYPT_FAILS,
+        LENT,
+        FRAGMENT_TYPED_LENT,
+    };
     struct Row {
         const char* name;
         Send send;
@@ -2030,14 +2109,24 @@ TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
          true, true, 0},
         {"the write is refused by a closed transport", Send::SINGLE, -1, false, true,
          SsErr::INVALID_STATE, true, false, 0},
+        {"the encrypt fails", Send::ENCRYPT_FAILS, -1, false, false, SsErr::FAIL, true, true, 1},
+        {"Control: a lent message is written", Send::LENT, -1, false, false, SsErr::OK, false,
+         false, 0},
+        {"a lent message's write fails", Send::LENT, 0, false, false, SsErr::FAIL, true, true, 1},
+        {"refused before the encrypt: a fragment-typed lent message", Send::FRAGMENT_TYPED_LENT,
+         -1, false, false, SsErr::FAIL, false, false, 0},
+        {"refused before the encrypt: a lent message on a detached connection", Send::LENT, 0,
+         true, false, SsErr::INVALID_STATE, false, true, 0},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
         ASSERT_TRUE(r.has_value());
         FailingWriteConnection conn;
+        NoiseCipherState* send_cs = r->responder_session->send_cipher_;
         conn.set_noise_session(std::move(r->responder_session));
         conn.writes_before_refusal = row.writes_before_refusal;
+        TestOutboundRing lent(64);
         if (row.detached_first) {
             conn.detach_inbound();
         }
@@ -2065,6 +2154,23 @@ TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
                 err = conn.test_send_binary(fragment_typed.data(), fragment_typed.size());
                 break;
             }
+            case Send::ENCRYPT_FAILS:
+                ASSERT_EQ(noise_cipherstate_set_nonce(send_cs, UINT64_MAX), NOISE_ERROR_NONE);
+                err = conn.send_app_json(R"({"type":"client/state"})");
+                break;
+            case Send::LENT:
+            case Send::FRAGMENT_TYPED_LENT: {
+                const std::vector<uint8_t> message = {
+                    static_cast<uint8_t>(row.send == Send::LENT ? SENDSPIN_BINARY_PLAYER_AUDIO
+                                                                : MSG_TYPE_FRAGMENT),
+                    0xAA};
+                void* item = lent.take_filled(message);
+                ASSERT_NE(item, nullptr);
+                err = conn.send_app_binary_lent(lent.ring, item, lent.capacity, message.size());
+                EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT)
+                    << "the lent item did not come back";
+                break;
+            }
         }
         EXPECT_EQ(err, row.expected) << "err=" << static_cast<int>(err);
         EXPECT_EQ(conn.noise_transport_.is_send_desynced(), row.desynced);
@@ -2089,6 +2195,125 @@ TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
                 EXPECT_FALSE(raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[i]).empty())
                     << "frame " << i << " does not authenticate on the peer";
             }
+        }
+    }
+}
+
+// send_binary_lent() encrypts the message where it lies and lends its item to the transport, and
+// the item comes back to the ring on every path: from the default send_lent_frame() after the
+// write (the item is still out while the write runs), or from send_binary_lent() itself on a
+// refusal before the encrypt or a failed encrypt. A failed encrypt (the send nonce exhausted) or a
+// failed write desynchronizes the send, and the next lent send is refused with its item returned;
+// after any other row the next lent frame authenticates.
+TEST(NoiseTransport, ALentBinarySendReturnsItsItemOnEveryPath) {
+    enum class Case : uint8_t {
+        SENT,
+        EMPTY,
+        OVER_ONE_FRAME,
+        FRAGMENT_TYPED,
+        NO_TAG_ROOM,
+        OVER_CAPACITY,
+        NO_SESSION,
+        NONCE_EXHAUSTED,
+        WRITE_FAILS,
+    };
+    struct Row {
+        const char* name;
+        Case c;
+        SsErr expected;
+        bool desynced;
+        bool written;
+    };
+    const Row rows[] = {
+        {"Control: the frame is written", Case::SENT, SsErr::OK, false, true},
+        {"an empty message", Case::EMPTY, SsErr::FAIL, false, false},
+        {"a message longer than one frame", Case::OVER_ONE_FRAME, SsErr::FAIL, false, false},
+        {"a fragment-typed message", Case::FRAGMENT_TYPED, SsErr::FAIL, false, false},
+        {"an item without the tag room", Case::NO_TAG_ROOM, SsErr::FAIL, false, false},
+        {"a message longer than the item", Case::OVER_CAPACITY, SsErr::FAIL, false, false},
+        {"no session", Case::NO_SESSION, SsErr::INVALID_STATE, false, false},
+        {"the encrypt fails: the send nonce is exhausted", Case::NONCE_EXHAUSTED, SsErr::FAIL, true,
+         false},
+        {"the write fails", Case::WRITE_FAILS, SsErr::FAIL, true, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        std::vector<uint8_t> message(row.c == Case::OVER_ONE_FRAME ? MAX_TRANSPORT_PLAINTEXT + 1
+                                                                   : 6);
+        for (size_t i = 0; i < message.size(); ++i) {
+            message[i] = static_cast<uint8_t>(i * 7);
+        }
+        message[0] =
+            row.c == Case::FRAGMENT_TYPED ? MSG_TYPE_FRAGMENT : SENDSPIN_BINARY_PLAYER_AUDIO;
+        const size_t len = row.c == Case::EMPTY ? 0 : message.size();
+        TestOutboundRing lent(message.size() + AEAD_TAG_SIZE);
+
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+        NoiseCipherState* send_cs = r->responder_session->send_cipher_;
+        FailingWriteConnection conn;
+        if (row.c != Case::NO_SESSION) {
+            conn.set_noise_session(std::move(r->responder_session));
+        }
+        if (row.c == Case::NONCE_EXHAUSTED) {
+            ASSERT_EQ(noise_cipherstate_set_nonce(send_cs, UINT64_MAX), NOISE_ERROR_NONE);
+        }
+        conn.writes_before_refusal = row.c == Case::WRITE_FAILS ? 0 : -1;
+
+        size_t capacity = lent.capacity;
+        if (row.c == Case::NO_TAG_ROOM) {
+            capacity = len + AEAD_TAG_SIZE - 1;
+        } else if (row.c == Case::OVER_CAPACITY) {
+            capacity = len - 1;
+        }
+        int writes = 0;
+        size_t free_during_write = 0;
+        conn.during_write = [&] {
+            ++writes;
+            free_during_write = lent.free_items();
+        };
+        void* item = lent.take_filled(message);
+        ASSERT_NE(item, nullptr);
+        const SsErr err = conn.noise_transport_.send_binary_lent(lent.ring, item, capacity, len);
+        conn.during_write = nullptr;
+        EXPECT_EQ(err, row.expected) << "err=" << static_cast<int>(err);
+        EXPECT_EQ(writes, row.written ? 1 : 0);
+        if (row.written) {
+            EXPECT_EQ(free_during_write, OUTBOUND_RING_ITEM_COUNT - 1)
+                << "the item was returned before its write";
+        }
+        EXPECT_EQ(conn.noise_transport_.is_send_desynced(), row.desynced);
+        EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT) << "the item did not come back";
+        if (row.expected == SsErr::OK) {
+            ASSERT_EQ(conn.sent_binary_.size(), 1U);
+            EXPECT_EQ(raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]), message);
+        } else {
+            EXPECT_TRUE(conn.sent_binary_.empty()) << "a refused message reached the wire";
+        }
+
+        if (!row.desynced && row.c != Case::NO_SESSION) {
+            // The next lent frame authenticates, so no refusal spent a nonce.
+            const std::vector<uint8_t> next = {SENDSPIN_BINARY_PLAYER_AUDIO, 0x42};
+            const size_t frames_before = conn.sent_binary_.size();
+            void* next_item = lent.take_filled(next);
+            ASSERT_NE(next_item, nullptr);
+            ASSERT_EQ(conn.noise_transport_.send_binary_lent(lent.ring, next_item, lent.capacity,
+                                                             next.size()),
+                      SsErr::OK);
+            ASSERT_EQ(conn.sent_binary_.size(), frames_before + 1);
+            EXPECT_EQ(raw_decrypt(r->initiator.recv_cs, conn.sent_binary_.back()), next);
+            EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT);
+        } else if (row.desynced) {
+            // A desynced send refuses the next lent frame and returns its item.
+            const std::vector<uint8_t> next = {SENDSPIN_BINARY_PLAYER_AUDIO, 0x42};
+            const size_t frames_before = conn.sent_binary_.size();
+            void* next_item = lent.take_filled(next);
+            ASSERT_NE(next_item, nullptr);
+            EXPECT_EQ(conn.noise_transport_.send_binary_lent(lent.ring, next_item, lent.capacity,
+                                                             next.size()),
+                      SsErr::INVALID_STATE);
+            EXPECT_EQ(conn.sent_binary_.size(), frames_before) << "a refused frame was written";
+            EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT) << "the item did not come back";
         }
     }
 }

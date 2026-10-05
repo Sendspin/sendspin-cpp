@@ -45,6 +45,7 @@
 
 namespace sendspin {
 
+class OutboundRing;
 class ProtocolTask;
 class SendspinArenaAllocator;
 
@@ -57,7 +58,8 @@ class SendspinArenaAllocator;
  */
 class SendspinConnection : public std::enable_shared_from_this<SendspinConnection> {
 public:
-    /// @brief Wires the NoiseTransport frame sink to this connection's send_transport_frame().
+    /// @brief Wires the NoiseTransport frame sinks to this connection's send_transport_frame()
+    /// and send_lent_frame().
     SendspinConnection();
 
     virtual ~SendspinConnection();
@@ -251,6 +253,21 @@ public:
     /// @brief Pointer/length form of send_app_json(); encrypts straight from the caller's
     /// buffer, and the pre-handshake text fallback builds the string it needs
     SsErr send_app_json(const char* json, size_t len);
+
+    /// @brief Send an application binary message lying in an outbound ring item, encrypted in
+    /// place and lent to the transport until its frame is written (NoiseTransport::
+    /// send_binary_lent()). Protocol task only, like every send on a connection.
+    ///
+    /// Item ownership: OutboundRing, "Lending". Binary application messages exist only under the
+    /// Noise transport, so there is no cleartext fallback: before the handshake, or once
+    /// accepts_app_sends() is false, the item is returned unsent with INVALID_STATE. A failure
+    /// after the encrypt closes the connection (settle_noise_send()), as for send_app_json().
+    /// @param message_capacity As OutboundRing::take() reported it.
+    /// @param plaintext_len    Bytes of the message, type byte first, at the start of the item's
+    ///                         message bytes.
+    /// @return SsErr::OK once the transport took the frame, error code otherwise.
+    SsErr send_app_binary_lent(OutboundRing& ring, void* item, size_t message_capacity,
+                               size_t plaintext_len);
 
     /// @brief Returns this connection's process-unique instance id
     /// @return A monotonic id assigned at construction, never reused for the lifetime of the
@@ -817,6 +834,15 @@ protected:
     /// hook where the write happens.
     virtual SsErr send_transport_frame(const uint8_t* data, size_t len,
                                        const NoiseTransport::FrameWriteHook& before_write);
+
+    /// @brief Sends the first `len` message bytes of an outbound ring item as a binary WebSocket
+    /// frame; the lent frame sink (item ownership: OutboundRing, "Lending").
+    ///
+    /// The default writes through send_binary_message() and returns the item after it, which
+    /// suits a transport done with the bytes when its send returns (the host transports, the ESP
+    /// client); a transport that queues writes overrides it to keep the item with the queued
+    /// write.
+    virtual SsErr send_lent_frame(OutboundRing& ring, void* item, size_t len);
 
     // ========================================
     // Noise transport helpers (connection.cpp)

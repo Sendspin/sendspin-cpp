@@ -116,9 +116,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
   listener or the persistence provider, so the library has no lock order to
   cite. The leaves are `ConnectionManager::published_mutex_`,
   `RecordStore::mutex_`, the Inbox mutex, each
-  `SendspinTimeFilter`'s `state_mutex_`, the inbound ring's, item lists' and
-  protocol task command queue's own locks, the artwork role's
-  slot mutex, `ShadowSlot`'s and the ESP server's pending-upgrade mutex. A
+  `SendspinTimeFilter`'s `state_mutex_`, the inbound ring's, each outbound
+  ring's, item lists' and protocol task command queue's own locks, the artwork
+  role's slot mutex, `ShadowSlot`'s and the ESP server's pending-upgrade mutex. A
   change that would take a second library lock under one of them is a design
   change, not a local trade-off.
 

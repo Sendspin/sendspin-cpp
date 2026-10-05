@@ -19,6 +19,7 @@
 
 #include "connection.h"
 #include "fixed_block_pool.h"
+#include "outbound_ring.h"
 #include "platform/types.h"
 #include "sendspin/types.h"
 #include <esp_err.h>
@@ -46,6 +47,28 @@ static constexpr size_t SEND_BLOCK_COUNT = 4;
 /// @brief Pool the ESP server's queued sends take their blocks from
 using SendBlockPool = FixedBlockPool<SEND_BLOCK_SIZE, SEND_BLOCK_COUNT>;
 
+/// @brief Bytes per lent-send block: an AsyncRespArg alone, the frame staying in its outbound
+/// ring item
+static constexpr size_t LENT_BLOCK_SIZE = 64;
+
+/// @brief Lent-send blocks per server: one per item the lending ring can have out at once, since
+/// each claimed block holds a distinct item. One ring (the source role's) lends to the server,
+/// and it reserves every item at its largest size (see OutboundRing, "Item sizes"). A lent block
+/// never falls back to the heap, so SendspinServerConnection::reclaim_discarded_sends() can find
+/// every one.
+static constexpr size_t LENT_BLOCK_COUNT = OUTBOUND_RING_ITEM_COUNT;
+
+/// @brief Pool the ESP server's lent sends take their header blocks from
+using LentBlockPool = FixedBlockPool<LENT_BLOCK_SIZE, LENT_BLOCK_COUNT>;
+
+/// @brief The block pools for one server's queued sends, owned by SendspinWsServer
+struct SendBlockPools {
+    /// Header plus a copy of the frame
+    SendBlockPool copied;
+    /// Header only, for a frame lent from an outbound ring item (send_lent_frame())
+    LentBlockPool lent;
+};
+
 /**
  * @brief ESP-IDF httpd WebSocket connection representing a single Sendspin server session
  *
@@ -58,7 +81,7 @@ class SendspinWsServer;
 class SendspinServerConnection : public SendspinConnection {
 public:
     /// @brief Constructs a server connection over an accepted httpd session
-    SendspinServerConnection(httpd_handle_t server, int sockfd, SendBlockPool& send_pool);
+    SendspinServerConnection(httpd_handle_t server, int sockfd, SendBlockPools& send_pools);
 
     ~SendspinServerConnection() override = default;
 
@@ -112,6 +135,17 @@ public:
     /// Only the first call queues a close; later ones return (see close_triggered_).
     void trigger_close();
 
+    /// @brief Destroys the queued sends httpd discarded at its shutdown, returning each lent
+    /// frame's item to its ring, then marks every block free
+    ///
+    /// httpd drops work queued after its shutdown without running it, so the AsyncRespArg in each
+    /// block that work held is never destroyed and a lent item never returned: leaked storage in
+    /// a ring that outlives the server, whose owner counts on every item coming back before it
+    /// destroys the ring. Call only after httpd_stop() succeeded, with the protocol task joined
+    /// and the httpd task stopped (see OutboundRing, "Lifetime").
+    /// @param pools The stopped server's pools.
+    static void reclaim_discarded_sends(SendBlockPools& pools);
+
     /// @brief Receives one WebSocket frame and hands it to the protocol task: a single-frame
     /// message straight into its ring item (or, before admission, the fallback buffer), a frame of
     /// a multi-frame message into the fallback buffer it is assembled in. On the httpd task.
@@ -126,6 +160,11 @@ protected:
     /// worker, which runs it immediately before httpd_ws_send_frame_async()
     SsErr send_transport_frame(const uint8_t* data, size_t len,
                                const NoiseTransport::FrameWriteHook& before_write) override;
+
+    /// @brief Queues the lent frame on the httpd worker without copying it: the queued work keeps
+    /// the item, and async_send_frame() returns it to its ring once the frame is written or
+    /// dropped. A block from the lent pool carries it, never the heap.
+    SsErr send_lent_frame(OutboundRing& ring, void* item, size_t len) override;
 
     /// @brief Places an AsyncRespArg and a copy of the payload in one block (see AsyncRespArg) and
     /// queues it on the httpd worker to be sent as a text or binary frame by async_send_frame()
@@ -163,7 +202,7 @@ protected:
     httpd_handle_t server_;
 
     /// @brief Blocks for queued sends (owned by SendspinWsServer)
-    SendBlockPool* send_pool_;
+    SendBlockPools* send_pools_;
 
     // 32-bit fields
 
