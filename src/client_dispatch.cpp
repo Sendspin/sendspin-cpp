@@ -763,15 +763,6 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
     uint8_t binary_type = message.data[0];
     uint8_t role = get_binary_role(binary_type);
 
-    // The type byte stripped, for the artwork role, which copies the body into its image buffer.
-    // The player and the visualizer take the whole message, since they can keep its ring item.
-    // Only declared when the artwork role consumes it, so a build without it does not warn/error
-    // on an unused variable under -Werror.
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    const uint8_t* data = message.data + 1;
-    size_t data_len = message.len - 1;
-#endif
-
     // The visualizer role has an expanded 8-slot allocation (IDs 16-23), so it is
     // dispatched by ID range before the standard 4-slot role decoding below
     if (binary_type >= SENDSPIN_BINARY_VISUALIZER_FIRST &&
@@ -816,7 +807,7 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
                 this->connection_manager_->role_owner(SendspinRole::ARTWORK);
             if (this->artwork_ && (artwork_owner == nullptr || artwork_owner == conn)) {
                 uint8_t slot = get_binary_slot(binary_type);
-                if (!this->artwork_->impl_->handle_binary(slot, data, data_len)) {
+                if (!this->artwork_->impl_->handle_binary(slot, message)) {
                     // roles/artwork/v1.md "Artwork (Binary)": a malformed artwork message, and a
                     // malformed sequence within an active artwork stream, are protocol errors the
                     // client MUST close the connection on. Closed silently, like every other

@@ -388,7 +388,7 @@ bool SendspinClient::start() {
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (roles_started && this->artwork_) {
-        roles_started = this->artwork_->impl_->start();
+        roles_started = this->artwork_->impl_->start(this->inbound_ring_.get());
     }
 #endif
     if (!roles_started) {
@@ -495,10 +495,9 @@ void SendspinClient::stop() {
 
 PairingUiSnapshot SendspinClient::close_transports() {
     // 1. Ask the artwork and visualizer threads to exit now, so a slow on_image_decode() or a
-    //    parked drain overlaps the transport teardown instead of following it. The visualizer's
-    //    frames stay on its list until its join; the player keeps running, returning the items
-    //    it plays, so a transport waiting for ring space is never parked behind a stopped
-    //    consumer.
+    //    parked drain overlaps the transport teardown instead of following it. Their items stay on
+    //    their lists until their joins; the player keeps running, returning the items it plays,
+    //    so a transport waiting for ring space is never parked behind a stopped consumer.
     this->signal_drain_role_stops();
 
     // 2. Close admission, and with it the protocol task's accepts, before the join: the task's
@@ -585,8 +584,11 @@ bool SendspinClient::create_inbound_ring() {
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
         for (const auto& slot : this->artwork_->impl_->config.preferred_formats) {
-            budget.artwork_images_stored_bytes += inbound_frames_stored_bytes(slot.max_image_bytes);
+            budget.artwork_images_stored_bytes +=
+                inbound_artwork_image_stored_bytes(slot.max_image_bytes);
         }
+        budget.artwork_hold_bytes =
+            INBOUND_ARTWORK_IN_FLIGHT_IMAGES * budget.artwork_images_stored_bytes;
         artwork = true;
     }
 #endif
@@ -600,6 +602,7 @@ bool SendspinClient::create_inbound_ring() {
     }
     ring->quota(InboundHolder::PLAYER).set_limit(budget.audio_hold_bytes);
     ring->quota(InboundHolder::VISUALIZER).set_limit(budget.visualizer_hold_bytes);
+    ring->quota(InboundHolder::ARTWORK).set_limit(budget.artwork_hold_bytes);
     SS_LOGD(TAG, "Inbound ring: %zu bytes, messages up to %zu bytes", storage_bytes,
             ring->max_message_bytes());
     this->inbound_ring_ = std::move(ring);

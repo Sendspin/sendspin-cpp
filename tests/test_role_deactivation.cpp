@@ -327,17 +327,18 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
     ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES / 2)));
-    // The protocol task writes the transfer under slot_mutex, so it is read under the same lock.
-    auto transfer_in_flight = [&] {
-        std::lock_guard<std::mutex> lock(client.artwork()->impl_->drain_task->slot_mutex);
-        return client.artwork()->impl_->transfer.in_flight;
-    };
-    pump_until(client, transfer_in_flight);
 
+    // The connection's messages are handled in order, so the half-sent transfer is in flight when
+    // the activation removes the role. The re-sent stream/start below would end a surviving
+    // transfer anyway (cleanup() forgets the streamed channels, so every channel counts as
+    // changed), so the direct read of transfer.in_flight after the clear is what guards its reset.
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["metadata@v1"])")));
     pump_until(client, [&] { return artwork_listener.clears == 1; });
     EXPECT_EQ(artwork_listener.last_clear_slot, 0);
-    EXPECT_FALSE(transfer_in_flight()) << "the in-flight transfer survived the removal";
+    // The transfer belongs to the protocol task, which wrote it before the teardown queued the
+    // clear just delivered and does not touch it again here, so it is read after that delivery.
+    EXPECT_FALSE(client.artwork()->impl_->transfer.in_flight)
+        << "the in-flight transfer survived the removal";
     EXPECT_EQ(artwork_listener.decodes.load(), 0U);
     EXPECT_EQ(metadata_listener.clears, 0) << "a role the activation kept was torn down";
 
@@ -350,30 +351,25 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
     pump_until(client, [&] { return artwork_listener.decodes.load() == 1; });
     EXPECT_EQ(artwork_listener.last_decode_length.load(), IMAGE_BYTES);
 
-    // The image buffers are the role's memory, not the session's: they grow to the largest image
-    // a channel received and would otherwise stay allocated for the client's life, a megabyte at
-    // the defaults, on a device that is no longer showing artwork. A stop hands them back. No
-    // callback reports a release, so the buffers are read directly: holding memory is not
-    // something a caller or peer can observe.
+    // The assembly buffers are the run's memory: allocated by start(), one per configured
+    // channel at its max_image_bytes, they would otherwise stay allocated for the client's life,
+    // half a megabyte at the defaults, on a device that is no longer showing artwork. A stop hands
+    // them back. No callback reports a release, so the buffers are read directly: holding memory
+    // is not something a caller or peer can observe. Only the buffer objects are read, which the
+    // decode thread never reassigns.
     auto* drain = client.artwork()->impl_->drain_task.get();
     ASSERT_NE(drain, nullptr);
-    bool holds_an_image = false;
-    {
-        std::lock_guard<std::mutex> lock(drain->slot_mutex);
-        for (auto& sb : drain->slot_buffers) {
-            for (const auto& buf : sb.buffers) {
-                holds_an_image = holds_an_image || buf.data() != nullptr;
-            }
-        }
+    bool holds_a_buffer = false;
+    for (const auto& assembly : drain->assemblies) {
+        holds_a_buffer = holds_a_buffer || assembly.buffer.data() != nullptr;
     }
-    ASSERT_TRUE(holds_an_image) << "the decoded image left no buffer behind to release";
+    ASSERT_TRUE(holds_a_buffer) << "the running role holds no assembly buffer to release";
 
     client.stop();
 
-    for (auto& sb : drain->slot_buffers) {
-        for (const auto& buf : sb.buffers) {
-            EXPECT_EQ(buf.data(), nullptr) << "a stopped artwork role is still holding an image";
-        }
+    for (const auto& assembly : drain->assemblies) {
+        EXPECT_EQ(assembly.buffer.data(), nullptr)
+            << "a stopped artwork role is still holding an image buffer";
     }
 }
 

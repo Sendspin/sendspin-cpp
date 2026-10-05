@@ -632,19 +632,46 @@ TEST(InboundGate, CloseIsHonouredOnlyOnceNothingIsInFlight) {
     }
 }
 
-// A run of frames is stored as whole items: each maximal frame and the final partial one pays
-// its own header, tag and alignment. Control: a payload of zero needs no frame.
-TEST(InboundRingSize, FramesAreStoredAsWholeItems) {
-    constexpr size_t PER_FRAME = MAX_TRANSPORT_PLAINTEXT - INBOUND_ROLE_HEADER_ALLOWANCE;
-    constexpr size_t OVERHEAD =
-        sizeof(InboundItemHeader) + AEAD_TAG_SIZE + INBOUND_ROLE_HEADER_ALLOWANCE;
-    EXPECT_EQ(inbound_frames_stored_bytes(0), 0U);
-    EXPECT_EQ(inbound_frames_stored_bytes(1), SharedRingLayout::stored_size(1 + OVERHEAD));
-    EXPECT_EQ(inbound_frames_stored_bytes(PER_FRAME),
-              SharedRingLayout::stored_size(PER_FRAME + OVERHEAD));
-    EXPECT_EQ(inbound_frames_stored_bytes(PER_FRAME + 3),
-              SharedRingLayout::stored_size(PER_FRAME + OVERHEAD) +
-                  SharedRingLayout::stored_size(3 + OVERHEAD));
+// An artwork image's quota is its data plus a part's stored overhead for each part it can take
+// at INBOUND_ARTWORK_MIN_PART_BYTES, which covers the image sent in parts of that size or larger
+// (the item headers, part header, tag and alignment of each received part), and not one sent in
+// smaller parts. Control: maximal parts, as the reference server sends.
+TEST(InboundRingSize, AnArtworkImageQuotaCoversPartsOfTheMinimumSize) {
+    // The ring storage `image_bytes` takes received in parts of `part_bytes`, the last one taking
+    // the remainder.
+    const auto stored_as_parts = [](size_t image_bytes, size_t part_bytes) {
+        size_t stored = 0;
+        for (size_t offset = 0; offset < image_bytes; offset += part_bytes) {
+            const size_t data = std::min(part_bytes, image_bytes - offset);
+            stored += inbound_item_stored_bytes(INBOUND_ARTWORK_PART_HEADER_BYTES + data +
+                                                AEAD_TAG_SIZE);
+        }
+        return stored;
+    };
+    constexpr size_t MIN_PART = INBOUND_ARTWORK_MIN_PART_BYTES;
+    constexpr size_t MAX_PART = MAX_TRANSPORT_PLAINTEXT - INBOUND_ARTWORK_PART_HEADER_BYTES;
+    struct Row {
+        const char* name;
+        size_t image_bytes;
+        size_t part_bytes;
+        bool fits;
+    };
+    const Row rows[] = {
+        {"Control: a 128 KiB image in maximal parts", 128 * 1024, MAX_PART, true},
+        {"a 128 KiB image in parts of the minimum size", 128 * 1024, MIN_PART, true},
+        {"a 128 KiB image in parts three bytes over the minimum, three pad bytes each", 128 * 1024,
+         MIN_PART + 3, true},
+        {"a 40,000-byte image in parts of the minimum size", 40000, MIN_PART, true},
+        {"a one-byte image", 1, 1, true},
+        {"a 128 KiB image in parts one byte under the minimum", 128 * 1024, MIN_PART - 1, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(stored_as_parts(row.image_bytes, row.part_bytes) <=
+                      inbound_artwork_image_stored_bytes(row.image_bytes),
+                  row.fits);
+    }
+    EXPECT_EQ(inbound_artwork_image_stored_bytes(0), 0U) << "an empty budget holds no part";
 }
 
 }  // namespace

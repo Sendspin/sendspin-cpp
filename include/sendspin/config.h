@@ -322,9 +322,10 @@ struct SendspinClientConfig {
 
     /// @brief Memory placement for the shared inbound ring every admitted connection receives
     /// into (sized from the enabled roles' buffers: the player's audio_buffer_capacity, the
-    /// visualizer's buffer_capacity and the largest artwork image) and for each connection's
-    /// fallback buffer, which holds a pre-admission message or a message longer than the ring
-    /// takes (ESP-IDF only; ignored on host).
+    /// visualizer's buffer_capacity, one image per artwork channel in flight, and a baseline of two
+    /// of the longest messages) and for each connection's fallback buffer, which holds a
+    /// pre-admission message or a message longer than the ring takes (ESP-IDF only; ignored on
+    /// host).
     /// Defaults to PREFER_EXTERNAL (SPIRAM), falling back to internal RAM.
     MemoryLocation inbound_ring_location{MemoryLocation::PREFER_EXTERNAL};
 
@@ -490,9 +491,11 @@ struct ImageSlotPreference {
     /// @brief Default max_image_bytes: 128 KiB per artwork channel, which holds any JPEG a
     /// 320x320 channel receives (a noisy worst case measures about 78 KB, though a high-entropy
     /// PNG at that size can exceed the default), with room for a larger channel, and bounds a
-    /// four-channel role at 1 MiB of image buffers. That budget assumes PSRAM: on a part without
-    /// it, lower this per channel to what internal RAM can spare, or the first announce of an
-    /// image the heap cannot hold is refused and the channel shows nothing.
+    /// four-channel role at 512 KiB of assembly buffers. The inbound ring adds the artwork quota
+    /// of one image per channel in flight plus, with the default player, the two per channel its
+    /// 87 s hold carries: three images per channel, 1.5 MiB for four. That budget assumes PSRAM: on
+    /// a part without it, lower this per channel to what internal RAM can spare, or start() fails
+    /// for want of a channel's buffer.
     static constexpr uint32_t DEFAULT_MAX_IMAGE_BYTES = 128U * 1024U;
 
     SendspinImageSource source{};
@@ -519,15 +522,16 @@ struct ImageSlotPreference {
     int32_t display_offset_ms{0};
 
     /// @brief Largest encoded image this channel will hold, in bytes. An image the server
-    /// announces as larger is refused before any of it is allocated: the transfer is followed to
-    /// its end with its bytes dropped and the channel keeps whatever it was showing, rather than
-    /// the heap being exhausted. Raise it for a channel whose images are genuinely larger; the
-    /// role logs every image it refuses, with the cap it was measured against. Two buffers are held
-    /// per channel, so the role's image memory is bounded by twice this value per configured
-    /// channel, and only while the role is running: a buffer grows to the largest image its channel
-    /// received and is handed back when the role is torn down (a stop, a disconnect, or a
-    /// server/activate that removes the role), then re-allocated by the next transfer. A channel
-    /// with 0 here holds nothing.
+    /// announces as larger is refused: the transfer is followed to its end with its bytes dropped
+    /// and the channel keeps whatever it was showing. Raise it for a channel whose images are
+    /// genuinely larger; the role logs every image it refuses, with the cap it was measured
+    /// against. The role holds one buffer of this size per configured channel, which each image is
+    /// assembled in, allocated by SendspinClient::start() and released by stop(); an image that
+    /// completes while a require_frame_done channel's last delivery is un-acked waits there. The
+    /// image's messages arrive in the shared inbound ring, which reserves one image of this size
+    /// per channel in flight, sent in parts of at least 4,096 bytes: each part is charged its
+    /// stored size, so an image split into smaller parts can exceed the reservation and is dropped
+    /// while the decode thread is busy. A channel with 0 here holds nothing.
     uint32_t max_image_bytes{DEFAULT_MAX_IMAGE_BYTES};
 };
 

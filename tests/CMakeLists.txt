@@ -30,7 +30,6 @@ add_executable(sendspin_tests
     test_protocol.cpp
     test_json_arena.cpp
     test_network_info.cpp
-    test_thread_safe_queue.cpp
     test_shared_ring_buffer.cpp
     test_inbound_ring.cpp
     test_protocol_task.cpp
@@ -137,9 +136,9 @@ set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
 # public surface does not expose: the sync task's run state and its item list, the artwork
-# transfer in flight and its drain-side slot buffers, the visualizer's stream flag and list, a
-# state role's held scheduled update and its teardown generation (including the metadata slot
-# written with that generation, a payload a drain takes across the removal), the controller's
+# transfer in flight and its decode thread's assembly buffers, the visualizer's stream flag and
+# list, a state role's held scheduled update and its teardown generation (including the metadata
+# slot written with that generation, a payload a drain takes across the removal), the controller's
 # supported-commands word (seeded, stamped with the role's generation, so a command reaches the
 # inactive-role send gate), plus the queued-event probe that proves ordering without a sleep (a
 # role inbox's topic bits).
