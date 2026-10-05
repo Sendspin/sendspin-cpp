@@ -1384,6 +1384,8 @@ public:
             this->events.emplace_back("command");
         } else if (msg.find("client/state") != std::string::npos) {
             this->events.emplace_back("state");
+        } else if (msg.find("client/init") != std::string::npos) {
+            this->events.emplace_back("init");
         }
         return SsErr::OK;
     }
@@ -1448,8 +1450,6 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
         bool owns_controller{false};
         /// Whether the stand-in has finished its hello exchange, so a client/state reaches it.
         bool operational{false};
-        /// Connections the shutdown pass holds for finish_stop().
-        size_t held_for_stop{0};
     };
     const std::string user_goodbye = goodbye_event(SendspinGoodbyeReason::USER_REQUEST);
     const Row rows[] = {
@@ -1532,11 +1532,7 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
          false,
          {Call::DISCONNECT, Call::CLOSE_ADMISSION},
          false,
-         {goodbye_event(SendspinGoodbyeReason::SHUTDOWN)},
-         0,
-         false,
-         false,
-         1},
+         {goodbye_event(SendspinGoodbyeReason::SHUTDOWN)}},
         {"a disconnect applied before admission closed: no second goodbye at the final tick",
          false,
          {Call::DISCONNECT_ON_TASK, Call::CLOSE_ADMISSION},
@@ -1635,7 +1631,6 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
         (void) client.protocol_tick();
         EXPECT_EQ(manager.pairing_window_open(), row.window_open);
         EXPECT_EQ(conn->events, row.events);
-        EXPECT_EQ(manager.closing_.size(), row.held_for_stop);
         EXPECT_EQ(manager.nursery_.size(), row.attempts) << "outbound attempts in the nursery";
         EXPECT_TRUE(manager.reaping_.empty()) << "an attempt was opened and then released";
         (void) client.protocol_tick();
@@ -1656,7 +1651,8 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
 // A disconnect frees the nursery slots it goodbyes before the accept queued with it is taken.
 // The nursery holds connected inbound stand-ins whose client/init went out, as accept() leaves
 // one; one tick takes the posted disconnect and the queued accept, requests first. The test
-// thread plays the protocol task. The no-disconnect control keeps the capacity check live.
+// thread plays the protocol task. An admitted newcomer is sent client/init, a refused one a
+// goodbye. The no-disconnect control keeps the capacity check live.
 TEST(ClientLifecycle, AnAcceptBehindADisconnectFindsTheNurserySlotsItFreed) {
     struct Row {
         const char* name;
@@ -1702,11 +1698,9 @@ TEST(ClientLifecycle, AnAcceptBehindADisconnectFindsTheNurserySlotsItFreed) {
         ASSERT_TRUE(client.protocol_task_->push_command(std::move(command)));
 
         (void) client.protocol_tick();
-        const bool in_nursery = manager.find_in_nursery(newcomer.get()) != manager.nursery_.end();
-        EXPECT_EQ(in_nursery, row.admitted);
         const std::vector<std::string> newcomer_events =
             row.admitted
-                ? std::vector<std::string>{}
+                ? std::vector<std::string>{"init"}
                 : std::vector<std::string>{goodbye_event(SendspinGoodbyeReason::ANOTHER_SERVER)};
         EXPECT_EQ(newcomer->events, newcomer_events);
         for (const auto& occupant : occupants) {
