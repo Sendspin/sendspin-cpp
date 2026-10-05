@@ -539,12 +539,16 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
             this->fail_inbound();
             return {nullptr, InboundRoute::CLOSE};
         }
+        // An empty frame can never be a valid handshake or JSON message.
+        if (len == 0) {
+            return {nullptr, InboundRoute::DROP};
+        }
         const InboundRoute waited = this->wait_until_writable();
         if (waited != InboundRoute::RECEIVE) {
             return {nullptr, waited};
         }
         if (this->fallback_buf_.size() < len &&
-            !this->fallback_buf_.allocate(std::max<size_t>(len, 1), this->fallback_location_)) {
+            !this->fallback_buf_.allocate(len, this->fallback_location_)) {
             SS_LOGE(TAG, "Failed to allocate %zu bytes for a pre-admission message; closing", len);
             this->fail_inbound();
             return {nullptr, InboundRoute::CLOSE};

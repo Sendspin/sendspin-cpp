@@ -2101,6 +2101,8 @@ TEST(InboundReceive, AMessageOverTheCapInForceClosesTheConnection) {
          TestConnection::InboundRoute::RECEIVE},
         {"pre-admission, one byte over", false, InboundGate::PRE_ADMISSION_MESSAGE_BYTES + 1,
          TestConnection::InboundRoute::CLOSE},
+        {"Control: pre-admission, one byte", false, 1, TestConnection::InboundRoute::RECEIVE},
+        {"pre-admission, zero length", false, 0, TestConnection::InboundRoute::DROP},
         {"Control: admitted, one Noise frame", true, INBOUND_MAX_MESSAGE_BYTES,
          TestConnection::InboundRoute::RECEIVE},
         {"admitted, one byte over a Noise frame", true, INBOUND_MAX_MESSAGE_BYTES + 1,
