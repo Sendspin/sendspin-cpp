@@ -13,8 +13,9 @@
 // limitations under the License.
 
 /// @file test_json_arena.cpp
-/// @brief Tests for SendspinArenaAllocator and ParsedJsonMessage: every freed block is wiped, and
-/// a parsed message released before its reply is built leaves the arena to the reply.
+/// @brief Tests for SendspinArenaAllocator and ParsedJsonMessage: every byte the arena's own
+/// buffer gives up is wiped, and a parsed message released before its reply is built leaves the
+/// arena to the reply.
 
 #include "platform/json_arena.h"
 #include "protocol_messages.h"
@@ -59,17 +60,20 @@ bool in_backing(const SendspinArenaAllocator& arena, const void* p, size_t len) 
 // Wipe on free
 // ============================================================================
 
-// Every block the arena gives up is zeroed: a freed block (an interior block's shrunk-away tail
-// with it), the tail a top block's shrinking reallocate() returns to free space and the old copy
-// a moving one leaves behind. The freed bytes are read back from the
-// arena's backing buffer (base_ and cap_ through -fno-access-control): a freed block's address
-// stays inside that buffer, so the read is of the arena's own memory. A heap fallback block
-// cannot be read after its free without a use-after-free, so the heap rows show only that the
-// header the wipe sizes itself by is in place (ASan reports a wrong size as an overflow or a bad
-// free); the wipe of a heap block is the same secure_zero() call as the arena rows'. A heap
-// block's shrink whose new block cannot be allocated keeps the old block; no allocation failure
-// can be staged without a seam, so that path is untested.
-TEST(JsonArena, FreedBytesAreWiped) {
+// Every block the arena's backing buffer gives up is zeroed: a freed block (an interior block's
+// shrunk-away tail with it), the tail a top block's shrinking reallocate() returns to free space
+// and the old copy a moving one leaves behind, including an arena block that moves to the heap.
+// The freed bytes are read back from the arena's backing buffer (base_ and cap_ through
+// -fno-access-control): a freed block's address stays inside that buffer, so the read is of the
+// arena's own memory.
+//
+// Gap: the wipe of a heap fallback block is not observed. Its bytes cannot be read after
+// platform_free() without a use-after-free, so the heap row shows only that the header the wipe
+// sizes itself by is in place (ASan reports a wrong size as an overflow or a bad free); a change
+// that skipped secure_zero() for heap blocks alone would leave this test green. A heap block's
+// shrink whose new block cannot be allocated keeps the old block; no allocation failure can be
+// staged without a seam, so that path is untested too.
+TEST(JsonArena, FreedArenaBytesAreWiped) {
     struct Row {
         const char* name;
         // Runs the scenario on a fresh 512-byte arena and checks its outcome.

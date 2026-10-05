@@ -61,9 +61,11 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_protocol.cpp`: wire-protocol parsing/formatting: enum round-trips, message dispatch, the
   full-state metadata/color objects, and the hand-rolled `client/time` formatter checked against
   `snprintf`.
-- `test_json_arena.cpp`: `SendspinArenaAllocator` wipes every block it frees, shrinks or moves;
-  a parse released through `ParsedJsonMessage` leaves only its stranded first key, and the peak
-  over a parse and then its reply is the larger of the two, not their sum.
+- `test_json_arena.cpp`: `SendspinArenaAllocator` wipes every byte its own buffer gives up
+  when a block is freed, shrunk or moved (the wipe of a freed heap fallback block cannot be
+  read back and is a named gap); a parse released through `ParsedJsonMessage` leaves only its
+  stranded first key, and the peak over a parse and then its reply is the larger of the two,
+  not their sum.
 - `test_time_filter.cpp`: `SendspinTimeFilter` invariants (monotonic-timestamp rejection, reset,
   offset round-trip, convergence).
 - `test_audio_stream_info.cpp`: byte/frame/sample/duration conversions.

@@ -513,13 +513,12 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
     return true;
 }
 
-// server/state is parsed one section at a time rather than into a single aggregate struct. The
-// caller runs on the protocol task (its stack is bounded on ESP-IDF; see
-// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE), and an aggregate would
-// keep every section's fields alive in the caller's frame for the whole parse while the section
-// parser built a second copy of the same fields in its own. Each section here is an out-of-line
-// function that fills a caller-owned struct directly, so only one section's storage is live at a
-// time and nothing is materialized twice.
+// server/state is parsed per section rather than into a single aggregate struct. Each section
+// here is an out-of-line function that fills a caller-owned struct directly, so no section's
+// fields are materialized twice (once in a parser frame, once in the caller's). The caller keeps
+// every section a role takes live together in its own frame for one parse of the document; that
+// combined frame is on the protocol task, whose stack is bounded on ESP-IDF and covers it (see
+// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
 
 bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* metadata) {
     if (metadata == nullptr || !root["payload"]["metadata"].is<JsonObject>()) {

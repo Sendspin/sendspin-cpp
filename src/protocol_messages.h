@@ -958,10 +958,10 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
 /// @brief Parses the metadata section of a server/state JSON message; true if the section was
 /// present and parsed
 ///
-/// The server/state sections are parsed one at a time, not into an aggregate struct: the caller
-/// runs on the protocol task, whose stack is bounded on ESP-IDF (at least
-/// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE), and an aggregate would keep every
-/// section's storage live in that frame for the whole parse.
+/// The server/state sections are parsed per section, each into a caller-owned struct, not into
+/// an aggregate a parser frame would copy out of. The caller holds every section a role takes
+/// live together for one parse, a combined frame on the protocol task, whose stack is bounded on
+/// ESP-IDF (at least SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
 bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* metadata);
 
 /// @brief Parses the color section of a server/state JSON message; true if the section was
