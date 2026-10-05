@@ -374,6 +374,9 @@ void InboundConsumer::unbind() {
     this->items_.recall();
     this->items_.unbind();
     this->ring_ = nullptr;
+    // The role's cleanup() runs after this, when recall() is a no-op, so the run ends here
+    // rather than carrying its count into the next one.
+    this->drop_log_.end_run(TAG, this->dropped_items_name());
 }
 
 void* InboundConsumer::take(uint32_t timeout_ms, const std::atomic<uint32_t>& generation) {

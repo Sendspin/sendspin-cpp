@@ -96,6 +96,9 @@ constexpr uint16_t STREAM_FILTER_MIDSTREAM_TEST_PORT = 19077;
 constexpr uint16_t VISUALIZER_SPECTRUM_TEST_PORT = 19078;
 constexpr uint16_t VISUALIZER_STALE_TEST_PORT = 19084;
 constexpr uint16_t VISUALIZER_OFFSET_TEST_PORT = 19088;
+constexpr uint16_t VISUALIZER_HELD_END_TEST_PORT = 19099;
+constexpr uint16_t VISUALIZER_HELD_CLEAR_TEST_PORT = 19100;
+constexpr uint16_t VISUALIZER_HELD_TEARDOWN_TEST_PORT = 19104;
 constexpr uint16_t HELLO_TEST_PORT = 19090;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
@@ -512,7 +515,8 @@ bool two_or_more_linked(const InboundItemList& list) {
 //
 // The list is read directly because nothing a caller or peer observes distinguishes a drained
 // list from an abandoned one: the restarted thread drops leftovers before the new peer is time
-// synced, and the new session's stream/start would discard them at its clear marker anyway.
+// synced, and they carry the generation stop()'s teardown moved past, so a take would return
+// them anyway.
 TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     constexpr int64_t OLD_FRAME_LEAD_US = 5 * 1000 * 1000;
 
@@ -549,6 +553,65 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     send_loudness_until(client, *server, VISUALIZER_LEAD_US,
                         [&] { return listener.loudness.load() >= 1; });
     client.stop();
+}
+
+// A stream/end, a stream/clear and a teardown each return the frame the drain thread holds for
+// its display time at once, with the frames listed behind it, and the held frame is never
+// delivered. The frames are stamped an hour ahead, so a held frame the wait does not return keeps
+// its quota outstanding and the pump never ends (the watchdog names it); the stop() that ends each
+// row joins the thread, so a frame delivered on its way out is counted. Control: the frames were
+// charged to the visualizer's quota before the boundary.
+TEST(ClientLifecycle, AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime) {
+    constexpr int64_t HELD_FRAME_LEAD_US = 3600LL * 1000 * 1000;
+    enum class Boundary : uint8_t { END, CLEAR, TEARDOWN };
+    struct Row {
+        const char* name;
+        uint16_t port;
+        Boundary boundary;
+    };
+    const Row rows[] = {
+        {"stream/end", VISUALIZER_HELD_END_TEST_PORT, Boundary::END},
+        {"stream/clear", VISUALIZER_HELD_CLEAR_TEST_PORT, Boundary::CLEAR},
+        {"a teardown", VISUALIZER_HELD_TEARDOWN_TEST_PORT, Boundary::TEARDOWN},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        CountingVisualizerListener listener;
+        auto config = make_config(row.port);
+        config.time_burst_interval_ms = 100;  // Sync promptly after the connect
+        PairedClientBundle bundle(std::move(config));
+        SendspinClient& client = bundle.client();
+        client.add_visualizer(make_visualizer_config()).set_listener(&listener);
+
+        FakeEncryptedServerOptions options;
+        options.answer_time = true;
+
+        ASSERT_TRUE(bundle.start());
+        auto server = connect_paired_server(bundle.peer, row.port, options);
+        pump_until_synced(client);
+        ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
+        InboundConsumer& inbound = client.visualizer()->impl_->drain_task->inbound;
+        const InboundQuota& quota = inbound.ring()->quota(InboundHolder::VISUALIZER);
+        send_loudness_until(client, *server, HELD_FRAME_LEAD_US,
+                            [&] { return two_or_more_linked(inbound.items()); });
+        EXPECT_GT(quota.outstanding(), 0U);
+
+        switch (row.boundary) {
+            case Boundary::END:
+                ASSERT_TRUE(server->send_app_json(R"({"type":"stream/end","payload":{}})"));
+                break;
+            case Boundary::CLEAR:
+                ASSERT_TRUE(server->send_app_json(R"({"type":"stream/clear","payload":{}})"));
+                break;
+            case Boundary::TEARDOWN:
+                server.reset();
+                break;
+        }
+        pump_until(client, [&] { return quota.outstanding() == 0; });
+        EXPECT_TRUE(inbound.items().is_empty());
+        client.stop();
+        EXPECT_EQ(listener.loudness.load(), 0U);
+    }
 }
 
 /// Records the bins of the last spectrum frame the drain thread delivered.
@@ -615,8 +678,7 @@ std::string stream_start_spectrum_json(unsigned served_bins) {
 }
 
 // Pumps until pred() holds, sending one four-bin spectrum frame per iteration stamped
-// VISUALIZER_LEAD_US ahead. A frame can be lost to the ring's documented wake race right after a
-// stream/start (see send_loudness_until), so frames keep coming until one is delivered.
+// VISUALIZER_LEAD_US ahead, as send_loudness_until() does with loudness frames.
 void send_spectrum_until(SendspinClient& client, FakeEncryptedServer& server,
                          const std::function<bool()>& pred) {
     const std::string four_bins("\x00\x0A\x00\x14\x00\x1E\x00\x28", 8);

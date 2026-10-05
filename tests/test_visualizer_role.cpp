@@ -536,9 +536,9 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 // leaves nothing to deliver, even when a start and its frames came before it in the same wait.
 // messaging.md "stream/clear": frames sent after the clear survive it. The rows drive the
 // protocol-task handlers with no drain thread, as if it saw every boundary in one wait.
-// Gap: no test drives the drain thread's wait-loop handling (a stale held frame returned, a
-// current one's wait resumed) or the held frame cleanup()'s own boundary returns, since nothing
-// can hold the drain thread mid-wait from a host test; the teardown row passes on recall() alone.
+// The held frame each boundary returns from the drain thread's wait is covered end to end by
+// ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime; the teardown
+// row here passes on recall() alone. Gap: a current held frame's resumed wait is not covered.
 TEST(VisualizerBoundary, ATakeSkipsTheFramesABoundaryMadeStale) {
     enum class Step { END, START, CLEAR, CLEANUP, FRAME };
     struct Row {

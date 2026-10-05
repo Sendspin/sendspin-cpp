@@ -449,6 +449,25 @@ TEST(InboundItemList, ASignalEndsATakeAndStaysPendingForItsOwnWait) {
     }
 }
 
+// A blocking take_signals() waits for the consumer's own bits only: an append and a
+// wake_receiver() while it waits leave it waiting (the visualizer's delivery-time wait relies on
+// it), and the signal that follows ends it. The wait has no timeout, so a correct wait cannot
+// return early; one that wakes on the list's bits returns 0 instead of the signal.
+TEST(InboundItemList, ABlockingSignalWaitIgnoresTheListsOwnBits) {
+    constexpr uint32_t BIT = InboundItemList::FIRST_CONSUMER_BIT;
+    Fixture f(1024);
+    uint32_t got = UINT32_MAX;  // poisoned so a wait that never ran is visible
+    std::thread consumer([&] { got = f.list.take_signals(BIT, UINT32_MAX); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(PARK_MS));
+    f.list.append(routed_item(f.ring, 1));
+    f.list.wake_receiver();
+    std::this_thread::sleep_for(std::chrono::milliseconds(PARK_MS));
+    f.list.signal(BIT);
+    consumer.join();
+    EXPECT_EQ(got, BIT);
+    f.list.recall();
+}
+
 // recall() unlinks every item not yet taken and returns each through the ring's return path:
 // the space is reclaimed (with an unlisted item returned at once between them, as a JSON message
 // is, recalling the listed items frees the whole ring) and their quota charges are released.
@@ -615,6 +634,28 @@ TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
             consumer.unbind();
         }
     }
+}
+
+// unbind() ends the drop log's run: stop() unbinds before the role's cleanup(), whose recall()
+// then finds the consumer unbound, so a run left open there would carry its count into the next
+// run and swallow that run's first warning (the run's count is private, hence
+// -fno-access-control for this file). Control: the drop over the quota opened a run.
+TEST(InboundConsumer, UnbindEndsTheDropRun) {
+    InboundRing ring;
+    ASSERT_TRUE(ring.create(1024, MemoryLocation::PREFER_EXTERNAL));
+    ring.quota(InboundHolder::PLAYER).set_limit(0);
+    InboundConsumer consumer;
+    ASSERT_TRUE(consumer.bind(&ring, InboundHolder::PLAYER));
+    InboundMessage message;
+    message.item = routed_item(ring, 0);
+    ASSERT_NE(message.item, nullptr);
+    message.item_len = 16;
+    message.data = inbound_item_bytes(message.item);
+    message.len = 16;
+    ASSERT_FALSE(consumer.hand_message(message, InboundItemFields{}, 0));
+    EXPECT_EQ(consumer.drop_log_.dropped_, 1U);
+    consumer.unbind();
+    EXPECT_EQ(consumer.drop_log_.dropped_, 0U);
 }
 
 // Concurrent charges and releases never let the outstanding total past the limit and leave it at

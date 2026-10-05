@@ -620,10 +620,9 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     // grows to the largest bin count seen and is resized (not reallocated) after that.
     std::vector<uint16_t> spectrum_bins;
 
-    // RAII guard so the ring item is returned exactly once on every exit path. Each branch calls
-    // release() to hand the item back *before* invoking the listener callback, so a slow callback
-    // never holds ring space; if a branch exits without releasing (a short-payload drop, or a
-    // future wire type that forgets), the destructor returns it. Stack-only.
+    // RAII guard so the ring item is returned exactly once on every exit path: every skip and
+    // drop leaves it to the destructor, and the delivery calls release() *before* invoking the
+    // listener callback, so a slow callback never holds ring space. Stack-only.
     struct ItemGuard {
         InboundRing& ring;
         void* item = nullptr;
@@ -654,11 +653,11 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         if (item == nullptr) {
             continue;
         }
+        ItemGuard guard{ring, item};
         const InboundItemHeader* header = inbound_item_header(item);
 
         // Waiting for time sync.
         if (!self->client->is_time_synced()) {
-            ring.return_item(item);
             continue;
         }
 
@@ -667,7 +666,6 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         int64_t client_ts = self->client->get_client_time(server_ts);
 
         if (client_ts == 0) {
-            ring.return_item(item);
             continue;
         }
 
@@ -675,7 +673,6 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         const std::optional<int64_t> wait_us = visualizer_delivery_wait_us(
             client_ts, widen_time_stamp_us(header->receive_time_us, now), offset_ms, now);
         if (!wait_us.has_value()) {
-            ring.return_item(item);
             continue;
         }
 
@@ -685,42 +682,33 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         // and the wait resumes for what is left of it.
         const int64_t deliver_at_us = now + *wait_us;
         bool stop = false;
-        bool stale = false;
         for (int64_t left_us = *wait_us; left_us >= US_PER_MS;
              left_us = deliver_at_us - platform_time_us()) {
             const auto wait_ms =
                 static_cast<uint32_t>(std::min<int64_t>(left_us / US_PER_MS, UINT32_MAX));
             cmd = items.take_signals(COMMAND_STOP | COMMAND_BOUNDARY, wait_ms);
             stop = (cmd & COMMAND_STOP) != 0;
-            stale = (cmd & COMMAND_BOUNDARY) != 0 && self->is_stale(item);
-            if (stop || stale || (cmd & COMMAND_BOUNDARY) == 0) {
+            if (stop || (cmd & COMMAND_BOUNDARY) == 0 || self->is_stale(item)) {
                 break;
             }
         }
-        if (stop || stale) {
-            ring.return_item(item);
-            if (stop) {
-                break;
-            }
-            continue;
+        if (stop) {
+            break;
         }
-        // A boundary that landed after the take and that the wait did not see. This narrows the
-        // window without closing it: the loop above waits only while at least 1 ms is left, and
-        // a boundary can still land between this check and the decode.
+        // A boundary the wait saw, or one that landed after the take and that the wait did not
+        // see. The second narrows the window without closing it: the loop above waits only while
+        // at least 1 ms is left, and a boundary can still land between this check and the decode.
         if (self->is_stale(item)) {
-            ring.return_item(item);
             continue;
         }
 
         if (self->listener == nullptr) {
-            ring.return_item(item);
             continue;
         }
 
         // Decode and deliver. The protocol task hands messages over verbatim, so decode validates
         // each payload's length before reading. Decode out of the item, release it via the
         // guard, then deliver, so a slow listener callback never holds ring space.
-        ItemGuard guard{ring, item};
         VisualizerDelivery out = decode_visualizer_message(
             wire_type, inbound_item_data(item), header->data_len, self->spectrum_bin_count,
             self->tracks_downbeats, spectrum_bins);

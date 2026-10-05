@@ -78,10 +78,11 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_shared_ring_buffer.cpp`: the host `SharedRingBuffer`: ring-order reclamation under
   out-of-order returns, no-split wrap placement, the full-ring acquire policies, completion
   order, and concurrent producers.
-- `test_inbound_ring.cpp`: `InboundRing`, `InboundItemList`, `InboundQuota` and `InboundGate`:
-  the wrapped-item hold-back, LOCAL items' two returns, quota accounting, the item list's
-  append/take/recall/wake, the one-in-flight fallback hand-off, its release by a consume or a
-  detach, the close rule, and the ring size derivation.
+- `test_inbound_ring.cpp`: `InboundRing`, `InboundItemList`, `InboundConsumer`, `InboundQuota`
+  and `InboundGate`: the wrapped-item hold-back, LOCAL items' two returns, quota accounting, the
+  item list's append/take/recall/wake and consumer signals, the consumer's hand-overs and drop
+  run, the one-in-flight fallback hand-off, its release by a consume or a detach, the close rule,
+  and the ring size derivation.
 - `test_protocol_task.cpp`: `ProtocolTask`'s command queue (order, the consumer burst and the
   reserved accept slots), the latest-state slot, the lifecycle-request slot's wake and its
   hand-off at stop, the wakes, and stop/restart.
@@ -92,7 +93,8 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_decoder.cpp`: `SendspinDecoder` chunk decoding per codec (multi-frame FLAC, PCM at the
   spec maximum, an Opus packet longer than the estimate) and the sync task's whole-chunk decode.
 - `test_visualizer_role.cpp`: `decode_visualizer_message()` and the visualizer role's
-  negotiation and dispatch, the receive stamp a frame carries, and the recall after a teardown.
+  negotiation and dispatch, the receive stamp a frame carries, the stream boundaries that make
+  listed frames stale, and the recall after a teardown.
 - `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: announce/part/cancel
   transfers and the messages and sequences that close the connection, the per-channel image cap,
   the inbound ring hand-off (item order, markers, the stale-stamp discard), decode thread, slot

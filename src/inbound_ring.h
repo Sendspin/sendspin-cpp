@@ -87,10 +87,10 @@ static constexpr size_t INBOUND_HOLDER_COUNT = 3;
 /// The first drop of a run logs (note_drop() returns true), the drops after it are only counted,
 /// and the next delivery at the site ends the run, logging its count (end_run()). A run that no
 /// delivery follows (the stream or the connection ended) is ended where its site's owner tears
-/// down: a role's recall after a teardown, a connection's destructor. A drop is therefore never
-/// silent, and a sustained overrun costs two log lines rather than one per message. Not
-/// thread-safe: each instance belongs to the one thread that runs its site, or to whichever
-/// thread tears it down once that one is joined.
+/// down: a role's recall after a teardown, a consumer's unbind() at stop, a connection's
+/// destructor. A drop is therefore never silent, and a sustained overrun costs two log lines
+/// rather than one per message. Not thread-safe: each instance belongs to the one thread that
+/// runs its site, or to whichever thread tears it down once that one is joined.
 class InboundDropLog {
 public:
     /// @brief Counts a drop. @return true for the first drop of a run, which the site logs.
@@ -557,9 +557,9 @@ public:
     /// @param timeout_ms Milliseconds to wait for an item: 0 does not wait, UINT32_MAX waits
     ///        indefinitely.
     /// @return The item, which the consumer hands to InboundRing::return_item() when done, or
-    ///         nullptr on timeout, on a wake_receiver() interruption, or on a wake left by an
-    ///         append whose item an earlier take already removed. Treat nullptr as "re-check
-    ///         state and retry".
+    ///         nullptr on timeout, on a wake_receiver() or signal() interruption, or on a wake
+    ///         left by an append whose item an earlier take already removed. Treat nullptr as
+    ///         "re-check state and retry".
     void* take(uint32_t timeout_ms);
 
     /// @brief Wakes the consumer out of a blocking take(); one-shot, and redundant wakes
@@ -652,9 +652,9 @@ private:
 
 /// Fallback wakeup interval for a consumer thread's blocking take (the sync task while idle, the
 /// visualizer drain thread, the artwork decode thread). A stop, the stream commands and a
-/// teardown wake the take at once (InboundItemList::wake_receiver()), as does every path that
-/// reopens an artwork channel's gate for the decode thread's parked-slot recheck; each thread
-/// also re-runs its checks (the decode thread's parked-slot sweep among them) whenever this
+/// teardown wake the take at once (InboundItemList::wake_receiver() or signal()), as does every
+/// path that reopens an artwork channel's gate for the decode thread's parked-slot recheck; each
+/// thread also re-runs its checks (the decode thread's parked-slot sweep among them) whenever this
 /// timeout expires. So it is only a safety net against a missed wake: long enough to keep an idle
 /// thread asleep, short enough that a wake bug degrades to a slow reaction rather than a hang.
 static constexpr uint32_t INBOUND_CONSUMER_FALLBACK_WAKE_MS = 5000;
@@ -697,8 +697,9 @@ public:
     /// cannot be created.
     bool bind(InboundRing* ring, InboundHolder holder);
 
-    /// @brief Returns every item left on the list and unbinds it from the ring. Main loop, once
-    /// the consumer thread and the protocol task are joined; bind() binds it again.
+    /// @brief Returns every item left on the list, unbinds it from the ring and ends the drop
+    /// log's run. Main loop, once the consumer thread and the protocol task are joined; bind()
+    /// binds it again.
     void unbind();
 
     /// @brief The ring the list is bound to, or nullptr outside a run
@@ -803,7 +804,8 @@ private:
     /// Appended on the protocol task, taken on the consumer thread, recalled on the protocol task
     /// or, once the consumer is joined, on the main loop.
     InboundItemList items_;
-    /// Every drop of the holder's items. Protocol task only.
+    /// Every drop of the holder's items. Protocol task, or the main loop's unbind() once the
+    /// protocol task is joined.
     InboundDropLog drop_log_;
 
     // Pointer fields
