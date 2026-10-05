@@ -38,7 +38,7 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
         return {.sent = false, .burst_completed = true};
     }
 
-    if (conn == nullptr || !conn->is_connected() || !conn->is_handshake_complete()) {
+    if (conn == nullptr) {
         return {.sent = false, .burst_completed = false};
     }
 

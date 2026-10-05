@@ -399,7 +399,7 @@ bool SendspinClient::start() {
 
     // A command queued or a request posted after the last stop() finished (a call racing it on
     // another thread) belongs to the run that ended; this run begins with an empty queue and no
-    // request waiting. Accepts reopen with admission, in connection_manager_->start() below.
+    // request waiting. Admission reopens in connection_manager_->start() below.
     this->protocol_task_->drop_commands();
 
     // The first client/state snapshot, taken by the protocol task's first tick: every
@@ -500,10 +500,7 @@ PairingUiSnapshot SendspinClient::close_transports() {
     //    so a transport waiting for ring space is never parked behind a stopped consumer.
     this->signal_drain_role_stops();
 
-    // 2. Close admission, and with it the protocol task's accepts, before the join: the task's
-    //    next tick (at the latest its final one) runs the shutdown pass and refuses every accept
-    //    already queued with a goodbye, and a delivery from here on is refused at its push, so its
-    //    transport closes it.
+    // 2. Close admission before the join (close_admission()).
     this->connection_manager_->close_admission();
 
     // 3. The protocol task: its final tick acts on the commands queued and the requests posted

@@ -51,7 +51,7 @@ The primitives other than the Inbox and the inbound ring live in `src/platform/`
 | Each connection's `SendspinTimeFilter` | Protocol task (its burst's measurements) | Sync task and visualizer drain thread, converting timestamps |
 | `RecordStore` | Protocol task (resolves and changes records) | Main loop (writes them to the provider) |
 
-Plain atomics carry the rest: the `connected_` and `accepting_` flags on `ConnectionManager`; the unpaired-access setting, the lifecycle state and the high-performance grant count (`high_performance_granted_`, see [One Main Loop Drain](#one-main-loop-drain)) on `SendspinClient`; and each role's teardown generation (`cleanup_generation`), written by the protocol task and read by the main loop and the role's thread. The role- and connection-local atomics (a connection's last-arrival stamp, upgrade flag and time-frame write time; artwork's `stream_active` and slot epochs, the visualizer's `spectrum_bin_count`, `tracks_downbeats` and `boundary_sequence`, the player's output delay and audio-discard flag, the controller's supported commands) each state their writer and reader at their declaration.
+Plain atomics carry the rest: the `connected_` flag on `ConnectionManager`; the admission flag `accepting_` on `ProtocolTask`, written on the main loop under the queue lock; the unpaired-access setting, the lifecycle state and the high-performance grant count (`high_performance_granted_`, see [One Main Loop Drain](#one-main-loop-drain)) on `SendspinClient`; and each role's teardown generation (`cleanup_generation`), written by the protocol task and read by the main loop and the role's thread. The role- and connection-local atomics (a connection's last-arrival stamp, upgrade flag and time-frame write time; artwork's `stream_active` and slot epochs, the visualizer's `spectrum_bin_count`, `tracks_downbeats` and `boundary_sequence`, the player's output delay and audio-discard flag, the controller's supported commands) each state their writer and reader at their declaration.
 
 ### Locks
 
@@ -366,9 +366,9 @@ Each getter reads the slot once, so a caller that checks `is_time_synced()` and 
 1. Signal the visualizer and artwork threads to stop, without joining. The player is not
    signalled yet: it keeps returning the ring items it plays, so a transport waiting for ring
    space is not parked behind a stopped consumer
-2. ConnectionManager::close_admission(), which closes the protocol task's accepts with it
-   under the queue lock (ProtocolTask::close_accepts()): a delivery from here on is refused at
-   its push, on the delivering thread, and its transport closes it without a goodbye
+2. ConnectionManager::close_admission(), which closes admission under the queue lock
+   (ProtocolTask::close_accepts()): a delivery from here on is refused at its push, on the
+   delivering thread, and its transport closes it without a goodbye
 3. ProtocolTask::stop(): the final tick acts on the commands queued and the requests posted so
    far (an accept already queued is refused with a shutdown goodbye) and runs the shutdown pass
    (snapshot the pairing-UI flags, detach every connection, goodbye and close each with reason

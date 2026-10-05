@@ -79,7 +79,8 @@ public:
     // ========================================
 
     /// @brief Drive the burst state machine. Protocol task only.
-    /// @param conn The connection that owns this burst, to send time messages on.
+    /// @param conn The connection that owns this burst, to send time messages on; connected and
+    ///        operational (ConnectionManager::run_time_sync() gates it; loop() does not recheck).
     /// @param now_ms platform_time_us() / US_PER_MS, read once by the caller for this call and
     ///        its starts_burst().
     /// @param may_open_burst Whether a burst that is due may be opened (its first time message

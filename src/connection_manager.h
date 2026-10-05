@@ -320,9 +320,9 @@ public:
     // Main loop
     // ========================================
 
-    /// @brief Opens admission and the protocol task's accepts (ProtocolTask::open_accepts(), the
-    /// inverse of close_admission()), creates the WebSocket server on first use, and starts it at
-    /// once when the network provider already reports ready
+    /// @brief Opens admission (ProtocolTask::open_accepts(), the inverse of close_admission()),
+    /// creates the WebSocket server on first use, and starts it at once when the network provider
+    /// already reports ready
     ///
     /// Server configuration is read from the client's config when the server object is created;
     /// a restart reuses the object. A server that did not start here is started by the protocol
@@ -330,11 +330,11 @@ public:
     /// protocol task starts: everything it writes is the task's from then on.
     void start();
 
-    /// @brief Closes admission and the protocol task's accepts (ProtocolTask::close_accepts()).
-    /// Main loop, from stop() and ~SendspinClient, before ProtocolTask::stop(): the protocol
-    /// task's next tick, or its final one, then runs the shutdown pass (shutdown()) and refuses
-    /// every accept already queued with a goodbye, and a delivery from here on is refused at its
-    /// push, so its transport closes it without one.
+    /// @brief Closes admission (ProtocolTask::close_accepts()) and wakes the protocol task.
+    /// Main loop, from stop(), ~SendspinClient and a failed start(), before ProtocolTask::stop():
+    /// the protocol task's next tick, or its final one, then runs the shutdown pass (shutdown())
+    /// and refuses every accept already queued with a goodbye, and a delivery from here on is
+    /// refused at its push, so its transport closes it without one.
     void close_admission();
 
     /// @brief The main-loop half of the shutdown, once the protocol task is joined: closes the
@@ -529,15 +529,12 @@ public:
     /// the events queued for the drain) is in place.
     void publish_connected();
 
-    /// @brief Whether admission is open: false from close_admission() until the next start().
-    bool is_accepting() const {
-        return this->accepting_.load(std::memory_order_acquire);
-    }
+    /// @brief Whether admission is open: false from close_admission() until the next start()
+    /// (ProtocolTask::is_accepting()).
+    bool is_accepting() const;
 
     /// @brief Whether the shutdown pass is due: admission is closed and the pass has not run.
-    bool shutdown_pending() const {
-        return !this->accepting_.load(std::memory_order_acquire) && !this->shutdown_done_;
-    }
+    bool shutdown_pending() const;
 
     /// @brief The shutdown pass: snapshots the pairing-UI flags, detaches every managed
     /// connection, empties the slots, closes the pairing window, and goodbyes and closes each
@@ -986,10 +983,6 @@ private:
     /// Whether the shutdown pass has run since start(). Reset by start() before the protocol task
     /// runs, then protocol task only.
     bool shutdown_done_{false};
-
-    /// True between start() and close_admission(). Written on the main loop; read by the protocol
-    /// task, which refuses every accept and runs the shutdown pass once it reads false.
-    std::atomic<bool> accepting_{false};
 
     /// What is_connected() reports. Written by the protocol task (raised by publish_connected(),
     /// lowered by refresh_published_state() too), read from any thread.

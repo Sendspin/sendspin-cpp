@@ -92,12 +92,12 @@ void ProtocolTask::drop_commands() {
 
 void ProtocolTask::close_accepts() {
     std::lock_guard<std::mutex> lock(this->command_mutex_);
-    this->accepts_closed_ = true;
+    this->accepting_.store(false, std::memory_order_release);
 }
 
 void ProtocolTask::open_accepts() {
     std::lock_guard<std::mutex> lock(this->command_mutex_);
-    this->accepts_closed_ = false;
+    this->accepting_.store(true, std::memory_order_release);
 }
 
 void ProtocolTask::thread_entry(ProtocolTask* self) {
@@ -134,11 +134,11 @@ bool ProtocolTask::push_command(ProtocolCommand&& command) {
     bool accepts_closed = false;
     {
         std::lock_guard<std::mutex> lock(this->command_mutex_);
-        accepts_closed = is_accept && this->accepts_closed_;
+        accepts_closed = is_accept && !this->accepting_.load(std::memory_order_relaxed);
         const size_t others_queued = this->command_count_ - this->accepts_queued_;
-        const bool has_room =
-            is_accept ? !this->accepts_closed_ && this->accepts_queued_ < this->accept_slots_
-                      : others_queued < CONSUMER_COMMAND_BURST;
+        const bool has_room = is_accept
+                                  ? !accepts_closed && this->accepts_queued_ < this->accept_slots_
+                                  : others_queued < CONSUMER_COMMAND_BURST;
         if (has_room) {
             // The slot is empty (moved-from or default), so this move frees nothing.
             this->commands_[(this->command_head_ + this->command_count_) % this->capacity_] =
