@@ -351,12 +351,6 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
         SS_LOGV(TAG, "Audio chunk carries no encoded frame");
         return;
     }
-    // roles/player/v1.md "Audio Chunks (Binary)": an unavailable client discards otherwise
-    // valid audio.
-    if (this->discard_audio.load(std::memory_order_relaxed)) {
-        SS_LOGV(TAG, "Discarding audio chunk while unavailable");
-        return;
-    }
     // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
     // advertised buffer_capacity, which the quota covers at the smallest chunk size.
     (void)inbound.hand_message(message,

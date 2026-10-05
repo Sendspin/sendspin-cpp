@@ -120,6 +120,8 @@ uint32_t SendspinClient::protocol_tick() {
     }
 
     // 3. The newest client/state snapshot, sent to every admitted connection that can take it.
+    //    Its availability is also what step 5's player audio gate reads
+    //    (adopted_state_available()).
     {
         ClientStateMessage snapshot;
         if (this->protocol_task_->take_state(snapshot)) {
@@ -782,10 +784,16 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
             if (this->player_ &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
                 uint8_t slot = get_binary_slot(binary_type);
-                if (slot == 0) {
-                    this->player_->impl_->handle_binary(message);
-                } else {
+                if (slot != 0) {
                     SS_LOGW(TAG, "Unknown player binary slot %d", slot);
+                } else if (!this->adopted_state_available()) {
+                    // roles/player/v1.md "Audio Chunks (Binary)": an unavailable client discards
+                    // audio. Availability is read from the snapshot step 3 adopted, the one every
+                    // connection's client/state is built from, so the gate flips in the same tick
+                    // step that sends the new availability in client/state.
+                    SS_LOGV(TAG, "Discarding audio chunk while unavailable");
+                } else {
+                    this->player_->impl_->handle_binary(message);
                 }
             }
 #endif

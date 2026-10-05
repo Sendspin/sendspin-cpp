@@ -223,9 +223,6 @@ struct PlayerRole::Impl : RoleTeardown {
     /// Written by set_output_delay_adjustable() on the consumer's thread; read on the main loop
     /// and the sync task.
     std::atomic<bool> output_delay_adjustable{false};
-    /// Set while the client is unavailable, on the main loop (set_available(), add_player());
-    /// read by handle_binary() on the protocol task.
-    std::atomic<bool> discard_audio{false};
     uint8_t volume{0};
 };
 

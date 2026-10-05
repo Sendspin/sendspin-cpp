@@ -51,7 +51,7 @@ The primitives other than the Inbox and the inbound ring live in `src/platform/`
 | Each connection's `SendspinTimeFilter` | Protocol task (its burst's measurements) | Sync task and visualizer drain thread, converting timestamps |
 | `RecordStore` | Protocol task (resolves and changes records) | Main loop (writes them to the provider) |
 
-Plain atomics carry the rest: the `connected_` flag on `ConnectionManager`; the admission flag `accepting_` on `ProtocolTask`, written on the main loop under the queue lock; the unpaired-access setting, the lifecycle state and the high-performance grant count (`high_performance_granted_`, see [One Main Loop Drain](#one-main-loop-drain)) on `SendspinClient`; and each role's teardown generation (`cleanup_generation`), written by the protocol task and read by the main loop and the role's thread. The role- and connection-local atomics (a connection's last-arrival stamp, upgrade flag and time-frame write time; artwork's `stream_active` and slot epochs, the visualizer's `spectrum_bin_count`, `tracks_downbeats` and `boundary_sequence`, the player's output delay and audio-discard flag, the controller's supported commands) each state their writer and reader at their declaration.
+Plain atomics carry the rest: the `connected_` flag on `ConnectionManager`; the admission flag `accepting_` on `ProtocolTask`, written on the main loop under the queue lock; the unpaired-access setting, the lifecycle state and the high-performance grant count (`high_performance_granted_`, see [One Main Loop Drain](#one-main-loop-drain)) on `SendspinClient`; and each role's teardown generation (`cleanup_generation`), written by the protocol task and read by the main loop and the role's thread. The role- and connection-local atomics (a connection's last-arrival stamp, upgrade flag and time-frame write time; artwork's `stream_active` and slot epochs, the visualizer's `spectrum_bin_count`, `tracks_downbeats` and `boundary_sequence`, the player's output delay, the controller's supported commands) each state their writer and reader at their declaration.
 
 ### Locks
 
@@ -105,7 +105,8 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
    queued before it still enters the nursery: a disconnect addresses the connections it finds,
    not a newcomer
 2. Once admission is closed: the shutdown pass (ConnectionManager::shutdown())
-3. The newest client/state snapshot, sent to every admitted connection
+3. The newest client/state snapshot, sent to every admitted connection; its availability
+   is what step 5's player audio gate reads
 4. client/init on outbound connections whose WebSocket upgrade completed
 5. The receive pass over a snapshot of the managed connections: each connection's message
    pending in its fallback buffer once the ring items it wrote before it are taken, then up to
@@ -265,7 +266,7 @@ Role-bound traffic reaches a role only from the admitted connection that owns it
 | `stream/clear` | Visualizer moves its boundary sequence on (see `stream/end`) and pushes STREAM_CLEAR; player signals the sync task and appends a clear marker to its list |
 | Pairing messages, `pair/abort`, `server/unpair` | The pairing state machine and record revocation in `ConnectionManager` |
 | `server/pair-finalize` | Commits the pending record to `RecordStore` in RAM and queues the provider write |
-| Player audio (binary) | `PlayerRole::Impl::handle_binary()` charges the chunk's ring item to the player's quota and appends it to the sync task's list (a reassembled chunk is first copied into an item); over quota, or too short for its header, it is dropped with a throttled warning |
+| Player audio (binary) | Discarded while the client/state snapshot the tick adopted reports the client unavailable (`SendspinClient::adopted_state_available()`), so the gate flips in the same tick step that sends the new availability in `client/state`; otherwise `PlayerRole::Impl::handle_binary()` charges the chunk's ring item to the player's quota and appends it to the sync task's list (a reassembled chunk is first copied into an item); over quota, or too short for its header, it is dropped with a throttled warning |
 | Artwork (binary) | `ArtworkRole::Impl::handle_binary()` checks the transfer sequence and hands the decode thread an announce item, then each part in its ring item, charged to the artwork quota (a reassembled part is first copied into an item); a cancel, a refused image or a part dropped over quota hands a marker that discards the channel's pending image instead |
 | Visualizer (binary) | `VisualizerRole::Impl::handle_binary()` hands the frame's ring item, stamped with the boundary sequence (see `stream/end`), to the drain thread the same way, against the visualizer's quota (a frame too short for its timestamp is dropped with the same throttled warning); the drain thread dates it from the transport's receive stamp |
 
