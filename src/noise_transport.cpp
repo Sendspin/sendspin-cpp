@@ -15,6 +15,8 @@
 #include "noise_transport.h"
 
 #include "crypto/constants.h"
+#include "outbound_ring.h"
+#include "platform/crypto.h"
 #include "platform/logging.h"
 
 #include <cstring>
@@ -44,6 +46,21 @@ std::optional<std::array<uint8_t, 32>> NoiseTransport::handshake_hash() const {
 // Outbound (encrypt + send)
 // ============================================================================
 
+size_t NoiseTransport::encrypt_in_place(uint8_t* buf, size_t buf_capacity, size_t plaintext_len) {
+    if (buf_capacity < plaintext_len + AEAD_TAG_SIZE) {
+        SS_LOGE(TAG, "encrypt_in_place: buffer lacks AEAD tag room");
+        return 0;
+    }
+
+    // noise-c advances the send nonce past a failed encrypt too.
+    const size_t ct_len = this->session_->encrypt(buf, plaintext_len, buf_capacity);
+    if (ct_len == 0) {
+        SS_LOGE(TAG, "Noise encrypt failed");
+        this->send_desynced_ = true;
+    }
+    return ct_len;
+}
+
 SsErr NoiseTransport::encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity,
                                              size_t plaintext_len,
                                              const FrameWriteHook& before_write) {
@@ -51,18 +68,8 @@ SsErr NoiseTransport::encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity,
         return SsErr::INVALID_STATE;
     }
 
-    // Every caller allocates plaintext_len + 16; this guards against a future caller that
-    // forgets the AEAD tag room.
-    if (buf_capacity < plaintext_len + 16) {
-        SS_LOGE(TAG, "encrypt_and_send_frame: buffer lacks AEAD tag room");
-        return SsErr::FAIL;
-    }
-
-    // noise-c advances the send nonce past a failed encrypt too.
-    size_t ct_len = this->session_->encrypt(buf, plaintext_len, buf_capacity);
+    const size_t ct_len = this->encrypt_in_place(buf, buf_capacity, plaintext_len);
     if (ct_len == 0) {
-        SS_LOGE(TAG, "Noise encrypt failed");
-        this->send_desynced_ = true;
         return SsErr::FAIL;
     }
 
@@ -178,6 +185,41 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
     }
 
     return this->fragment_and_send(data[0], data + 1, len - 1, nullptr);
+}
+
+SsErr NoiseTransport::send_binary_lent(OutboundRing& ring, void* item, size_t message_capacity,
+                                       size_t plaintext_len) {
+    uint8_t* message = outbound_item_message(item);
+    SsErr refusal = SsErr::OK;
+    if (!this->is_active() || !this->lent_frame_sink_ || this->send_desynced_) {
+        refusal = SsErr::INVALID_STATE;
+    } else if (plaintext_len == 0 || plaintext_len > MAX_TRANSPORT_PLAINTEXT) {
+        SS_LOGE(TAG, "send_binary_lent: a %zu-byte message does not fit one frame", plaintext_len);
+        refusal = SsErr::FAIL;
+    } else if (plaintext_len + AEAD_TAG_SIZE > message_capacity) {
+        SS_LOGE(TAG, "send_binary_lent: item lacks AEAD tag room");
+        refusal = SsErr::FAIL;
+    } else if (message[0] == MSG_TYPE_FRAGMENT) {
+        // messaging.md "Fragmentation": a sender MUST NOT use 1 as orig_type.
+        SS_LOGE(TAG, "send_binary_lent: message type 1 belongs to the fragmentation layer");
+        refusal = SsErr::FAIL;
+    }
+    if (refusal != SsErr::OK) {
+        ring.return_item(item);
+        return refusal;
+    }
+
+    const size_t ct_len = this->encrypt_in_place(message, message_capacity, plaintext_len);
+    if (ct_len == 0) {
+        ring.return_item(item);
+        return SsErr::FAIL;
+    }
+
+    const SsErr err = this->lent_frame_sink_(ring, item, ct_len);
+    if (err != SsErr::OK) {
+        this->send_desynced_ = true;
+    }
+    return err;
 }
 
 SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,

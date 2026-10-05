@@ -32,6 +32,7 @@ add_executable(sendspin_tests
     test_network_info.cpp
     test_shared_ring_buffer.cpp
     test_inbound_ring.cpp
+    test_outbound_ring.cpp
     test_protocol_task.cpp
     test_inbox.cpp
     test_player_role.cpp
@@ -257,7 +258,11 @@ set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
 # that sends client/time); and the controller's impl_, whose supported_commands it seeds, stamped
 # with its cleanup_generation, so a send_command() is queued. The connection-level table removes
 # NoiseTransport::frame_sink_ for one send: the one refusal before the encrypt send_app_json()
-# can meet without a seam.
+# can meet without a seam. The encrypt-failure rows exhaust the send nonce through the session's
+# NoiseSession::send_cipher_ (noise_cipherstate_set_nonce()), the one encrypt failure a live
+# session can meet. The lent-send and encrypt tables call NoiseTransport::encrypt_in_place() and
+# a stand-in's SendspinConnection::noise_transport_ directly, since no protocol-task step drives a
+# lent send.
 set_source_files_properties(test_noise_transport.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

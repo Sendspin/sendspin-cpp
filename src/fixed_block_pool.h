@@ -69,6 +69,18 @@ public:
         this->free_mask_.fetch_or(1U << (offset / BLOCK_SIZE), std::memory_order_release);
     }
 
+    /// @brief Calls `fn(block)` for every claimed block. Only for when no thread can claim or
+    /// release a block, such as before reset() reclaims blocks whose holder will never run.
+    template <typename Fn>
+    void for_each_claimed(Fn&& fn) {
+        uint32_t claimed = ~this->free_mask_.load(std::memory_order_acquire) & ALL_FREE;
+        while (claimed != 0) {
+            const int index = std::countr_zero(claimed);
+            claimed &= claimed - 1;
+            fn(static_cast<void*>(this->storage_.data() + static_cast<size_t>(index) * BLOCK_SIZE));
+        }
+    }
+
     /// @brief Marks every block free. Only for when no thread can hold or claim a block: a block
     /// still claimed is abandoned, and whatever its holder placed in it is never destroyed.
     void reset() {

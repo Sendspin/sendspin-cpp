@@ -15,6 +15,7 @@
 #include "connection.h"
 
 #include "crypto/constants.h"
+#include "outbound_ring.h"
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "platform/time.h"
@@ -46,6 +47,9 @@ SendspinConnection::SendspinConnection() {
                const NoiseTransport::FrameWriteHook& before_write) {
             return this->send_transport_frame(data, len, before_write);
         });
+    this->noise_transport_.set_lent_frame_sink([this](OutboundRing& ring, void* item, size_t len) {
+        return this->send_lent_frame(ring, item, len);
+    });
 }
 
 SendspinConnection::~SendspinConnection() = default;
@@ -60,6 +64,12 @@ SsErr SendspinConnection::send_transport_frame(const uint8_t* data, size_t len,
         before_write();
     }
     return this->send_binary_message(data, len);
+}
+
+SsErr SendspinConnection::send_lent_frame(OutboundRing& ring, void* item, size_t len) {
+    const SsErr err = this->send_binary_message(outbound_item_message(item), len);
+    ring.return_item(item);
+    return err;
 }
 
 // ============================================================================
@@ -101,6 +111,17 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len) {
     }
     // Pre-handshake cold path: the text-frame API takes a std::string.
     return this->send_text_message(std::string(json, len));
+}
+
+SsErr SendspinConnection::send_app_binary_lent(OutboundRing& ring, void* item,
+                                               size_t message_capacity, size_t plaintext_len) {
+    // Before the handshake NoiseTransport::send_binary_lent() refuses it (no cleartext fallback).
+    if (!this->accepts_app_sends()) {
+        ring.return_item(item);
+        return SsErr::INVALID_STATE;
+    }
+    return this->settle_noise_send(
+        this->noise_transport_.send_binary_lent(ring, item, message_capacity, plaintext_len));
 }
 
 SsErr SendspinConnection::settle_noise_send(SsErr err) {

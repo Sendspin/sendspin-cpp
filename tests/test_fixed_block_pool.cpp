@@ -13,8 +13,8 @@
 // limitations under the License.
 
 /// @file test_fixed_block_pool.cpp
-/// @brief Tests for FixedBlockPool: size limit, exhaustion, block reuse, reset, and exclusive
-/// claims under contention
+/// @brief Tests for FixedBlockPool: size limit, exhaustion, block reuse, the claimed-block walk,
+/// reset, and exclusive claims under contention
 
 #include "fixed_block_pool.h"
 
@@ -29,8 +29,9 @@
 namespace sendspin {
 namespace {
 
-// Claims every block, then checks the pool hands out nothing more until one comes back. Run at
-// 3 blocks and at the full 32-bit mask, whose all-free value is computed differently.
+// Claims every block, then checks the pool hands out nothing more until one comes back, and that
+// for_each_claimed() visits exactly the blocks still claimed. Run at 3 blocks and at the full
+// 32-bit mask, whose all-free value is computed differently.
 template <size_t BLOCK_SIZE, size_t BLOCK_COUNT>
 void check_claims_each_block_once() {
     FixedBlockPool<BLOCK_SIZE, BLOCK_COUNT> pool;
@@ -50,11 +51,19 @@ void check_claims_each_block_once() {
     // The released block, and only it, becomes available again.
     void* returned = reinterpret_cast<void*>(*std::next(blocks.begin(), BLOCK_COUNT / 2));
     pool.release(returned);
+    std::set<uintptr_t> visited;
+    pool.for_each_claimed([&visited](void* block) {
+        EXPECT_TRUE(visited.insert(reinterpret_cast<uintptr_t>(block)).second) << "visited twice";
+    });
+    std::set<uintptr_t> still_claimed = blocks;
+    still_claimed.erase(reinterpret_cast<uintptr_t>(returned));
+    EXPECT_EQ(visited, still_claimed);
     EXPECT_EQ(pool.try_acquire(1), returned);
     EXPECT_EQ(pool.try_acquire(1), nullptr);
 
     // reset() reclaims every block, including ones never released.
     pool.reset();
+    pool.for_each_claimed([](void*) { ADD_FAILURE() << "a block reads as claimed after reset()"; });
     for (size_t i = 0; i < BLOCK_COUNT; ++i) {
         EXPECT_NE(pool.try_acquire(1), nullptr);
     }

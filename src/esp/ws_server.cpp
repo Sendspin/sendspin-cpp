@@ -137,9 +137,9 @@ void SendspinWsServer::stop() {
         this->server_ = nullptr;
         if (err == ESP_OK) {
             // httpd discards work queued after its shutdown without running it, so the send blocks
-            // that work held are never released. Every session is closed, so nothing can claim a
-            // block now.
-            this->send_pool_.reset();
+            // that work held are never released, nor the outbound ring items lent ones hold. Every
+            // session is closed and the protocol task joined, so nothing can claim a block now.
+            SendspinServerConnection::reclaim_discarded_sends(this->send_pools_);
             // The httpd task is gone, so nothing reads into the discard buffer any more.
             this->discard_buf_.reset();
         }
@@ -261,7 +261,7 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
     // the close_fn before the free_fn, so observers (ConnectionManager) get notified first and any
     // queued workers that have already started look up the same shared_ptr via httpd_sess_get_ctx
     // and run safely until the session is freed.
-    auto conn = std::make_shared<SendspinServerConnection>(handle, sockfd, server->send_pool_);
+    auto conn = std::make_shared<SendspinServerConnection>(handle, sockfd, server->send_pools_);
     auto* slot = new std::shared_ptr<SendspinServerConnection>(conn);
     httpd_sess_set_ctx(handle, sockfd, slot, [](void* p) {
         delete static_cast<std::shared_ptr<SendspinServerConnection>*>(p);

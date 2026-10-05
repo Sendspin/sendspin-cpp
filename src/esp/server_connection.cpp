@@ -46,12 +46,18 @@ static const char* const TAG = "sendspin.server_connection";
 /// Block layout: one block of `sizeof(AsyncRespArg) + len` bytes, the struct placement-new'd at
 /// its start and `payload` pointing at the byte immediately following it. The struct is not POD
 /// (it holds a weak_ptr and a std::function hook), so the tail cannot be a flexible array member;
-/// `payload` stays a plain pointer into that same block instead. Release it only through
-/// release_async_resp_arg(), which also frees the payload.
+/// `payload` stays a plain pointer into that same block instead. A lent frame (send_lent_frame())
+/// takes a block of `sizeof(AsyncRespArg)` from the lent pool, with `payload` pointing into its
+/// outbound ring item. Release it only through release_async_resp_arg(), which also frees the
+/// payload or returns the item.
 struct AsyncRespArg {
     std::weak_ptr<SendspinServerConnection> conn;
-    /// Pool the block came from, or nullptr for a heap block.
-    SendBlockPool* pool{nullptr};
+    /// Pools the block came from (the lent pool when `ring` is set), or nullptr for a heap block.
+    SendBlockPools* pools{nullptr};
+    /// For a lent frame, the ring `item` goes back to; nullptr for a copied one.
+    OutboundRing* ring{nullptr};
+    /// For a lent frame, the outbound ring item `payload` points into.
+    void* item{nullptr};
     uint8_t* payload{nullptr};
     size_t len{0};
     /// Frame type (HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY) the worker sends this as.
@@ -62,16 +68,42 @@ struct AsyncRespArg {
 
 static_assert(SEND_BLOCK_SIZE - sizeof(AsyncRespArg) >= 256,
               "SEND_BLOCK_SIZE must leave room for the steady-state sends");
+static_assert(sizeof(AsyncRespArg) <= LENT_BLOCK_SIZE, "LENT_BLOCK_SIZE must hold an AsyncRespArg");
 
-/// @brief Destroys `resp_arg` and returns its block to the pool or heap it came from
+/// @brief Destroys `resp_arg`, returns a lent frame's item to its ring, and returns the block to
+/// the pool or heap it came from
 static void release_async_resp_arg(AsyncRespArg* resp_arg) {
-    SendBlockPool* pool = resp_arg->pool;
+    SendBlockPools* pools = resp_arg->pools;
+    OutboundRing* ring = resp_arg->ring;
+    void* item = resp_arg->item;
     resp_arg->~AsyncRespArg();
-    if (pool != nullptr) {
-        pool->release(resp_arg);
+    if (ring != nullptr) {
+        // The block goes first: returning the item can wake a producer waiting for ring space,
+        // and its next send must find a free block or it fails after the encrypt.
+        pools->lent.release(resp_arg);
+        ring->return_item(item);
+    } else if (pools != nullptr) {
+        pools->copied.release(resp_arg);
     } else {
         platform_free(resp_arg);
     }
+}
+
+void SendspinServerConnection::reclaim_discarded_sends(SendBlockPools& pools) {
+    // Every claimed block holds a constructed AsyncRespArg: a block is claimed and constructed in
+    // one send call on the protocol task, and nothing else touches it, with the protocol task
+    // joined and the httpd task stopped.
+    pools.copied.for_each_claimed(
+        [](void* block) { static_cast<AsyncRespArg*>(block)->~AsyncRespArg(); });
+    pools.lent.for_each_claimed([](void* block) {
+        auto* resp_arg = static_cast<AsyncRespArg*>(block);
+        OutboundRing* ring = resp_arg->ring;
+        void* item = resp_arg->item;
+        resp_arg->~AsyncRespArg();
+        ring->return_item(item);
+    });
+    pools.copied.reset();
+    pools.lent.reset();
 }
 
 // ============================================================================
@@ -79,8 +111,8 @@ static void release_async_resp_arg(AsyncRespArg* resp_arg) {
 // ============================================================================
 
 SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int sockfd,
-                                                   SendBlockPool& send_pool)
-    : server_(server), send_pool_(&send_pool), sockfd_(sockfd) {
+                                                   SendBlockPools& send_pools)
+    : server_(server), send_pools_(&send_pools), sockfd_(sockfd) {
     // Disabling Nagle's algorithm significantly improves the time syncing accuracy
     int nodelay = 1;
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
@@ -132,6 +164,36 @@ SsErr SendspinServerConnection::send_transport_frame(
     return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, before_write);
 }
 
+SsErr SendspinServerConnection::send_lent_frame(OutboundRing& ring, void* item, size_t len) {
+    if (!this->is_connected()) {
+        ring.return_item(item);
+        return SsErr::INVALID_STATE;
+    }
+
+    void* block = this->send_pools_->lent.try_acquire(sizeof(AsyncRespArg));
+    if (block == nullptr) {
+        SS_LOGW(TAG, "Lent send blocks exhausted after the encrypt; closing the connection");
+        ring.return_item(item);
+        return SsErr::NO_MEM;
+    }
+
+    auto* resp_arg = new (block) AsyncRespArg();
+    resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
+    resp_arg->pools = this->send_pools_;
+    resp_arg->ring = &ring;
+    resp_arg->item = item;
+    resp_arg->payload = outbound_item_message(item);
+    resp_arg->len = len;
+    resp_arg->type = HTTPD_WS_TYPE_BINARY;
+
+    if (httpd_queue_work(this->server_, async_send_frame, resp_arg) != ESP_OK) {
+        SS_LOGE(TAG, "httpd_queue_work failed for a lent binary send!");
+        release_async_resp_arg(resp_arg);
+        return SsErr::FAIL;
+    }
+    return SsErr::OK;
+}
+
 SsErr SendspinServerConnection::queue_async_send(
     const uint8_t* data, size_t len, httpd_ws_type_t type,
     const NoiseTransport::FrameWriteHook& before_write) {
@@ -142,13 +204,13 @@ SsErr SendspinServerConnection::queue_async_send(
     }
 
     const size_t block_size = sizeof(AsyncRespArg) + len;
-    SendBlockPool* pool = this->send_pool_;
-    void* block = pool->try_acquire(block_size);
+    SendBlockPools* pools = this->send_pools_;
+    void* block = pools->copied.try_acquire(block_size);
     if (block == nullptr) {
         if (block_size <= SendBlockPool::block_size()) {
             SS_LOGD(TAG, "Send pool exhausted, allocating %zu bytes", block_size);
         }
-        pool = nullptr;
+        pools = nullptr;
         block = platform_malloc(block_size);
     }
     if (block == nullptr) {
@@ -163,7 +225,7 @@ SsErr SendspinServerConnection::queue_async_send(
     auto* resp_arg = new (block) AsyncRespArg();
 
     resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
-    resp_arg->pool = pool;
+    resp_arg->pools = pools;
     resp_arg->payload = reinterpret_cast<uint8_t*>(block) + sizeof(AsyncRespArg);
     resp_arg->len = len;
     resp_arg->type = type;
@@ -320,7 +382,8 @@ void SendspinServerConnection::async_send_frame(void* arg) {
         }
     }
 
-    // payload lives in resp_arg's own block (see AsyncRespArg), so this releases it too.
+    // payload lives in resp_arg's own block or its lent item (see AsyncRespArg), so this releases
+    // it too.
     release_async_resp_arg(resp_arg);
 }
 

@@ -207,8 +207,9 @@ protected:
 
     /// @brief Blocks for every accepted connection's queued sends. A member so it outlives each
     /// queued send (the destructor stops the server first); it adds
-    /// SEND_BLOCK_SIZE * SEND_BLOCK_COUNT bytes to the server object.
-    SendBlockPool send_pool_;
+    /// SEND_BLOCK_SIZE * SEND_BLOCK_COUNT + LENT_BLOCK_SIZE * LENT_BLOCK_COUNT bytes to the server
+    /// object.
+    SendBlockPools send_pools_;
 
     /// @brief See discard_buffer(). httpd task only; released by stop() once httpd has stopped.
     PlatformBuffer discard_buf_;

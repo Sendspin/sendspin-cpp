@@ -16,11 +16,11 @@
 /// @brief Encrypted transport layer for a Sendspin connection: owns the Noise cipher session,
 /// outbound fragmentation, and inbound fragment reassembly.
 ///
-/// Every use runs on the protocol task: the encrypt and send path (send_json, send_binary), the
-/// decrypt path (decrypt_in_place) and reassembly (accept_plaintext), and the session swaps
-/// (activate at handshake COMPLETE, send_msg2_and_swap at a re-handshake). One thread owns the
-/// session, so this class takes no lock: a swap is sequential with every encrypt and decrypt, and
-/// the reused send_buf_ is filled and encrypted by one caller at a time.
+/// Every use runs on the protocol task: the encrypt and send path (send_json, send_binary,
+/// send_binary_lent), the decrypt path (decrypt_in_place) and reassembly (accept_plaintext), and
+/// the session swaps (activate at handshake COMPLETE, send_msg2_and_swap at a re-handshake). One
+/// thread owns the session, so this class takes no lock: a swap is sequential with every encrypt
+/// and decrypt, and the reused send_buf_ is filled and encrypted by one caller at a time.
 
 #pragma once
 
@@ -40,11 +40,14 @@
 
 namespace sendspin {
 
+class OutboundRing;
+
 /// @brief Owns the Noise transport session and the wire framing around it.
 ///
 /// A SendspinConnection embeds one NoiseTransport and wires set_frame_sink() to its
-/// send_transport_frame(). All post-handshake application traffic flows through send_json() /
-/// send_binary() outbound and decrypt_in_place() + accept_plaintext() inbound.
+/// send_transport_frame() and set_lent_frame_sink() to its send_lent_frame(). All post-handshake
+/// application traffic flows through send_json() / send_binary() / send_binary_lent() outbound and
+/// decrypt_in_place() + accept_plaintext() inbound.
 class NoiseTransport {
 public:
     /// @brief Run by the transport immediately before it writes a frame to the socket
@@ -54,6 +57,11 @@ public:
     /// `before_write` (if set) immediately before the write.
     using FrameSink =
         std::function<SsErr(const uint8_t* data, size_t len, const FrameWriteHook& before_write)>;
+
+    /// @brief Sink that writes one encrypted frame lying in an outbound ring item, its first
+    /// `len` message bytes (outbound_item_message()), as a binary WS frame. Item ownership:
+    /// OutboundRing, "Lending".
+    using LentFrameSink = std::function<SsErr(OutboundRing& ring, void* item, size_t len)>;
 
     /// @brief One complete (non-fragment, fully reassembled) plaintext transport message.
     /// data == nullptr means "no complete message yet" (mid-reassembly, or a dropped frame),
@@ -74,6 +82,12 @@ public:
     /// @brief Sets the sink used to emit encrypted frames. Must be set before activate().
     void set_frame_sink(FrameSink sink) {
         this->frame_sink_ = std::move(sink);
+    }
+
+    /// @brief Sets the sink used to emit encrypted frames lent from an outbound ring item. Must be
+    /// set before activate().
+    void set_lent_frame_sink(LentFrameSink sink) {
+        this->lent_frame_sink_ = std::move(sink);
     }
 
     /// @brief Installs the cipher session produced by the initial Noise handshake and marks
@@ -122,6 +136,22 @@ public:
     /// @param data  Pointer to type-prefixed binary bytes (first byte is the role type byte).
     SsErr send_binary(const uint8_t* data, size_t len);
 
+    /// @brief Encrypt a binary message where it lies in an outbound ring item and lend the item
+    /// to the lent frame sink, which returns it to `ring` once the frame is written.
+    ///
+    /// The message is never fragmented: one longer than MAX_TRANSPORT_PLAINTEXT is refused. Item
+    /// ownership: OutboundRing, "Lending".
+    /// @param item              Taken from `ring`; its message bytes (outbound_item_message())
+    ///                          hold the plaintext, type byte first.
+    /// @param message_capacity  The item's message capacity, as OutboundRing::take() reported it;
+    ///                          must hold the plaintext plus AEAD_TAG_SIZE.
+    /// @param plaintext_len     Bytes of plaintext at the start of the message bytes.
+    /// @return SsErr::OK once the sink took the frame; INVALID_STATE if the transport is not
+    ///         active or is_send_desynced(); FAIL for a message refused before the encrypt or a
+    ///         failed encrypt; the sink's error otherwise.
+    SsErr send_binary_lent(OutboundRing& ring, void* item, size_t message_capacity,
+                           size_t plaintext_len);
+
     /// @brief Re-handshake commit: encrypt and send msg2 under the OLD session, then swap to
     /// the new session. Protocol task only, like every other send, so no encrypt falls between
     /// the msg2 send and the swap.
@@ -157,6 +187,14 @@ public:
     }
 
 private:
+    /// @brief Encrypts one frame in place under the current session. Call only with a session
+    /// and the send not desynced, which every caller checks first. A failed encrypt sets
+    /// send_desynced_; a buffer without AEAD_TAG_SIZE bytes of tag room after the plaintext is
+    /// refused before the encrypt, spending no nonce.
+    /// @param buf_capacity  Total capacity of buf.
+    /// @return The ciphertext length (plaintext + tag), or 0 on a refusal or a failed encrypt.
+    size_t encrypt_in_place(uint8_t* buf, size_t buf_capacity, size_t plaintext_len);
+
     /// @brief Encrypt one frame and emit it via the frame sink. A failure from the encrypt on
     /// sets send_desynced_.
     /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + 16 (AEAD tag).
@@ -213,6 +251,9 @@ private:
 
     /// Emits one encrypted frame as a binary WS frame.
     FrameSink frame_sink_;
+
+    /// Emits one encrypted frame lent from an outbound ring item (send_binary_lent()).
+    LentFrameSink lent_frame_sink_;
 
     /// Accumulates the reassembled message as [orig_type][data...] while a fragmented
     /// message is in flight; on completion accept_plaintext() returns a pointer into this

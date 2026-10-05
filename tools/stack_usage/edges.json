@@ -200,11 +200,19 @@
    "SendspinServerConnection::send_transport_frame(",
    "SendspinConnection::send_transport_frame("
   ],
+  "sendspin::NoiseTransport::send_binary_lent(": [
+   "SendspinServerConnection::send_lent_frame(",
+   "SendspinConnection::send_lent_frame("
+  ],
   "sendspin::SendspinConnection::send_app_json(const char*": [
    "SendspinServerConnection::send_binary_message(",
    "SendspinClientConnection::send_binary_message(",
    "SendspinServerConnection::send_transport_frame(",
    "SendspinConnection::send_transport_frame("
+  ],
+  "sendspin::SendspinConnection::send_lent_frame(": [
+   "SendspinServerConnection::send_binary_message(",
+   "SendspinClientConnection::send_binary_message("
   ],
   "sendspin::SendspinConnection::send_transport_frame(": [
    "SendspinServerConnection::send_binary_message(",
