@@ -120,7 +120,7 @@ enum EventGroupBits : uint16_t {
 /// thread create/destroy churn on embedded devices.
 ///
 /// The task communicates with the caller via event flags (lifecycle/commands) and a
-/// playback progress queue (timing feedback from the audio output).
+/// playback progress slot (timing feedback from the audio output).
 class SyncTask {
 public:
     SyncTask() = default;
