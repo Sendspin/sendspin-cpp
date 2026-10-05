@@ -297,7 +297,7 @@ inline bool event_is_current(uint32_t event_epoch, uint32_t role_epoch, const ch
 // ============================================================================
 
 /**
- * @brief Latest-value slot bound to a shared Inbox, replacing ShadowSlot for main-loop topics
+ * @brief Latest-value slot bound to a shared Inbox, for state the main loop reads
  *
  * Owns its T storage and dirty flag but has no mutex of its own: every operation locks the
  * bound Inbox's shared mutex and, while holding it, keeps the slot's owned topic bit in sync

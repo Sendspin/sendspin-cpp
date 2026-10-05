@@ -685,9 +685,8 @@ void ArtworkRole::Impl::drain_events() {
         return;
     }
 
-    // Single now snapshot per tick, like today. No lock is held here (the slot value was
-    // already taken above), unlike the old take_if predicate which ran under the shadow slot's
-    // mutex.
+    // Single now snapshot per tick. No lock is held here: the slot value was already taken
+    // above.
     const int64_t now = platform_time_us();
     for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
         const uint8_t bit = static_cast<uint8_t>(1U << slot);
