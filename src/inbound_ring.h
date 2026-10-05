@@ -783,9 +783,12 @@ public:
     /// the artwork role's RECONFIGURE marker, 300 ms). An artwork announce, cancel or stream/end
     /// makes one, as does an image part dropped over the artwork quota (the DISCARD marker in its
     /// place) and the announce of an image over its cap (the marker alone); an announce makes two
-    /// only when handing the announce itself fails and its marker follows. The bound covers a
-    /// tick with a stream/start and two single-wait messages; a tick with more waits than that,
-    /// with the ring full and the role threads not draining it, closes the waiting connection.
+    /// only when handing the announce itself fails and its marker follows. A stream/start and two
+    /// single-wait messages in one tick add up to five waits, which is the whole bound with
+    /// nothing left for the handlers, so that mix, with the ring full and the role threads not
+    /// draining it, can close the waiting connection, as can any tick with more waits. This is
+    /// accepted: it takes a stream/start plus two marker-bearing messages from the incumbent in
+    /// one tick under ring back-pressure, and the closed connection reconnects.
     /// Every lock the task takes is a leaf held for a copy, so nothing else stretches a tick, and
     /// a task stalled beyond the bound closes the waiting connection rather than parking the
     /// transport thread.
