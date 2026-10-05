@@ -3206,10 +3206,11 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
 // frames a second (2,040 stored bytes) holds its oldest for 69 s, which pins 69 s of state JSON
 // and 7 time bursts behind it (70,656 + 17,472 bytes). Every ring also carries a baseline of two
 // of its longest messages that can sit behind a held item (2 x 65,576 bytes with artwork). The
-// artwork role adds its quota of one image per channel in flight (131,292 stored bytes for one
-// default 128 KiB channel, 40,072 for a 40,000-byte one), and behind the player's 87 s hold two
-// more returned images (one per 30 s). Controller and metadata hold nothing, so they leave the no-role
-// budget unchanged. The time replies follow the configured burst cadence:
+// artwork role adds its quota of one image per channel in flight, sent in parts of at least
+// 4,096 bytes (133,024 stored bytes for one default 128 KiB channel: the image plus 61 bytes for
+// each of 32 parts; 40,610 for a 40,000-byte one in 10 parts), and behind the player's 87 s hold
+// two more returned images (one per 30 s). Controller and metadata hold nothing, so they leave
+// the no-role budget unchanged. The time replies follow the configured burst cadence:
 // the default player syncing every second instead of every 10 s holds 88 bursts of 8 replies
 // (312 stored bytes each) behind its 87 s hold instead of 9. Read from the ring the client
 // creates, so every role's figures and the burst configuration have to reach the derivation.
@@ -3247,15 +3248,15 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
          LARGE_VISUALIZER, 268240, INBOUND_MAX_MESSAGE_BYTES, 0, 20000},
         {"a 25,000-byte player: two of its longest chunks, its share advertised uncapped",
          SMALL_PLAYER, 64016, 31968, 16666, 0},
-        {"artwork only: one default image in flight and the two-frame baseline", ARTWORK, 262444,
+        {"artwork only: one default image in flight and the two-frame baseline", ARTWORK, 264176,
          INBOUND_MAX_MESSAGE_BYTES, 0, 0},
         {"artwork capped at 40,000-byte images: one in flight and the baseline", SMALL_ARTWORK,
-         171224, INBOUND_MAX_MESSAGE_BYTES, 0, 0},
+         171764, INBOUND_MAX_MESSAGE_BYTES, 0, 0},
         {"Control: the default player, its advertised share capped at the ring's largest item",
          PLAYER, 1242704, INBOUND_MAX_MESSAGE_BYTES, 621312, 0},
         {"the default player, a time burst every second: its share fits the larger ring", PLAYER,
          1439888, INBOUND_MAX_MESSAGE_BYTES, 666666, 0, 1000},
-        {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1818156,
+        {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1823352,
          INBOUND_MAX_MESSAGE_BYTES, 666666, 585},
     };
     for (const Row& row : rows) {

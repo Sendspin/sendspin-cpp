@@ -86,10 +86,12 @@ std::vector<uint8_t> artwork_message(uint8_t slot, const std::vector<uint8_t>& b
 // A message received into a ring item and taken off the ring, as the protocol task hands it to
 // handle_binary(). Unlike receive_into_ring() the acquire waits for room: the decode thread
 // returns the items it copied out asynchronously, and a ring that never frees is a regression the
-// suite watchdog reports.
-InboundMessage receive_waiting(InboundRing& ring, const std::vector<uint8_t>& bytes) {
+// suite watchdog reports. `tag_bytes` behind the plaintext stand for the AEAD tag the in-place
+// decrypt leaves in the item, so a role charges the message what a received one costs.
+InboundMessage receive_waiting(InboundRing& ring, const std::vector<uint8_t>& bytes,
+                               size_t tag_bytes = 0) {
     InboundMessage message;
-    void* item = ring.acquire(bytes.size(), UINT32_MAX);
+    void* item = ring.acquire(bytes.size() + tag_bytes, UINT32_MAX);
     std::memcpy(inbound_item_bytes(item), bytes.data(), bytes.size());
     inbound_item_header(item)->kind = InboundKind::BINARY;
     ring.complete(item);
@@ -99,17 +101,19 @@ InboundMessage receive_waiting(InboundRing& ring, const std::vector<uint8_t>& by
     message.item = taken;
     message.data = inbound_item_bytes(taken);
     message.item_len = item_len;
-    message.len = item_len;
+    message.len = item_len - tag_bytes;
     return message;
 }
 
-// Plays the protocol task for one artwork message: receives `body` on `slot` into a ring item,
-// runs handle_binary(), returns the item if the role did not keep it, and takes the role's LOCAL
-// items in ring order as the task's next tick would. Returns what handle_binary() reported: false
-// means the message is a protocol error and the connection must be closed.
-bool feed(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t>& body) {
+// Plays the protocol task for one artwork message: receives `body` on `slot` into a ring item
+// (with `tag_bytes` of AEAD tag behind it, see receive_waiting()), runs handle_binary(), returns
+// the item if the role did not keep it, and takes the role's LOCAL items in ring order as the
+// task's next tick would. Returns what handle_binary() reported: false means the message is a
+// protocol error and the connection must be closed.
+bool feed(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t>& body,
+          size_t tag_bytes = 0) {
     InboundRing& ring = ring_of(impl);
-    InboundMessage message = receive_waiting(ring, artwork_message(slot, body));
+    InboundMessage message = receive_waiting(ring, artwork_message(slot, body), tag_bytes);
     const bool accepted = impl.handle_binary(slot, message);
     if (message.item != nullptr) {
         ring.return_item(message.item);
@@ -1951,11 +1955,35 @@ TEST(ArtworkDisplayHandOff, ADisplayStampedBeforeATeardownIsNotShown) {
 
 namespace {
 
-// Two ungated channels, the first capped small enough to cross.
+// The second hand-off channel's image budget: several parts of INBOUND_ARTWORK_MIN_PART_BYTES,
+// and a quota the test ring holds.
+constexpr uint32_t QUOTA_IMAGE_BYTES = 4 * INBOUND_ARTWORK_MIN_PART_BYTES;
+
+// Two ungated channels, the first capped small enough to cross, the second at QUOTA_IMAGE_BYTES.
 ArtworkRoleConfig make_handoff_config() {
     ArtworkRoleConfig config = make_two_ungated_slot_config();
     config.preferred_formats[0].max_image_bytes = SMALL_IMAGE_CAP;
+    config.preferred_formats[1].max_image_bytes = QUOTA_IMAGE_BYTES;
     return config;
+}
+
+// Announces `image` on `slot` and sends it in parts of `part_bytes` (the last one taking the
+// remainder), each received with its AEAD tag so the quota charges it what a received part
+// costs. Returns false if any message was rejected.
+bool send_received_parts(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t>& image,
+                         size_t part_bytes) {
+    if (!feed(impl, slot, announce_body(1, static_cast<uint32_t>(image.size())))) {
+        return false;
+    }
+    for (size_t offset = 0; offset < image.size(); offset += part_bytes) {
+        const size_t take = std::min(part_bytes, image.size() - offset);
+        std::vector<uint8_t> slice(image.begin() + static_cast<long>(offset),
+                                   image.begin() + static_cast<long>(offset + take));
+        if (!feed(impl, slot, part_body(slice), AEAD_TAG_SIZE)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 ArtworkAnnounce announce_of(const ListEntry& entry) {
@@ -1981,6 +2009,31 @@ TEST(ArtworkHandOff, ItemsReachTheDecodeThreadInMessageOrder) {
         std::function<void(ArtworkRole::Impl&)> messages;
         std::vector<Expected> expected;
     };
+    // Channel 1's image under the quota the client derives for its budget, sent in received parts
+    // of `part_bytes`, while no decode thread runs, so every handed part stays charged: the
+    // announce, then the first `parts` parts in order.
+    const std::vector<uint8_t> quota_image = make_image('Q', QUOTA_IMAGE_BYTES);
+    const auto send_under_quota = [&quota_image](size_t part_bytes) {
+        return [&quota_image, part_bytes](ArtworkRole::Impl& impl) {
+            ring_of(impl).quota(InboundHolder::ARTWORK).set_limit(
+                inbound_artwork_image_stored_bytes(QUOTA_IMAGE_BYTES));
+            ASSERT_TRUE(send_received_parts(impl, 1, quota_image, part_bytes));
+        };
+    };
+    const auto quota_image_parts = [&quota_image](size_t part_bytes, size_t parts) {
+        std::vector<Expected> expected{{T::ANNOUNCE, 1, {QUOTA_IMAGE_BYTES}}};
+        for (size_t i = 0; i < parts; ++i) {
+            const auto first = quota_image.begin() + static_cast<long>(i * part_bytes);
+            expected.push_back(
+                {T::PART, 1,
+                 std::vector<uint32_t>(first, first + static_cast<long>(part_bytes))});
+        }
+        return expected;
+    };
+    // 1,024-byte parts store 1,084 bytes each (8 + align4(32 + 1,024 + 2 + 16)), so the quota of
+    // 16,384 + 4 x 61 = 16,628 bytes holds 15 of the 16 and the last is dropped with a marker.
+    std::vector<Expected> small_parts_expected = quota_image_parts(1024, 15);
+    small_parts_expected.push_back({T::DISCARD, 0x02, {}});
     const std::vector<Row> rows = {
         {"Control: an announce, then each part",
          [](ArtworkRole::Impl& impl) {
@@ -2012,6 +2065,11 @@ TEST(ArtworkHandOff, ItemsReachTheDecodeThreadInMessageOrder) {
              ASSERT_TRUE(feed(impl, 0, part_body({3, 4})));
          },
          {{T::ANNOUNCE, 0, {4}}, {T::DISCARD, 0x01, {}}}},
+        {"Control: an image within its budget in parts of the minimum part size fits the quota",
+         send_under_quota(INBOUND_ARTWORK_MIN_PART_BYTES),
+         quota_image_parts(INBOUND_ARTWORK_MIN_PART_BYTES, 4)},
+        {"an image within its budget in parts under the minimum part size: refused at the quota",
+         send_under_quota(1024), small_parts_expected},
         {"a stream/start reconfiguring channel 1: a marker for it alone",
          [](ArtworkRole::Impl& impl) { impl.handle_stream_start(two_channel_stream(100, 200)); },
          {{T::RECONFIGURE, 0x02, {}}}},

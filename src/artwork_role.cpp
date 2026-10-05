@@ -45,6 +45,8 @@ static constexpr uint8_t ARTWORK_FLAGS_RESERVED = 0xFC;
 
 /// @brief Offset of a part's image data in its message: the type byte, then the flags byte
 static constexpr uint8_t ARTWORK_PART_DATA_OFFSET = 2;
+static_assert(ARTWORK_PART_DATA_OFFSET == sendspin::INBOUND_ARTWORK_PART_HEADER_BYTES,
+              "the artwork quota's part overhead counts the part header");
 
 /// @brief Every channel's bit, the mask of a stream end's DISCARD marker
 static constexpr uint8_t ARTWORK_ALL_CHANNELS = (1U << sendspin::ARTWORK_MAX_SLOTS) - 1U;

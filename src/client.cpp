@@ -584,7 +584,8 @@ bool SendspinClient::create_inbound_ring() {
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
         for (const auto& slot : this->artwork_->impl_->config.preferred_formats) {
-            budget.artwork_images_stored_bytes += inbound_frames_stored_bytes(slot.max_image_bytes);
+            budget.artwork_images_stored_bytes +=
+                inbound_artwork_image_stored_bytes(slot.max_image_bytes);
         }
         budget.artwork_hold_bytes =
             INBOUND_ARTWORK_IN_FLIGHT_IMAGES * budget.artwork_images_stored_bytes;

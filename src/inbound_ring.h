@@ -1050,10 +1050,6 @@ static_assert(
 /// behind a held item. Two lets one arrive while the previous is still being processed.
 static constexpr size_t INBOUND_PASSTHROUGH_MESSAGES = 2;
 
-/// Upper bound on the bytes a role message spends ahead of its payload inside one frame (the
-/// type byte, an artwork part's channel and flags, an 8-byte timestamp).
-static constexpr size_t INBOUND_ROLE_HEADER_ALLOWANCE = 16;
-
 /// Bytes of an audio chunk message ahead of its encoded frame: the message type byte and the
 /// 12-byte header (roles/player/v1.md "Audio Chunks (Binary)": 8-byte timestamp, 4-byte
 /// send_ahead).
@@ -1102,7 +1098,44 @@ static constexpr size_t INBOUND_MIN_TRACK_SECONDS = 30;
 /// second image for a channel arrives behind a complete one still queued while the thread is
 /// inside a long decode, its parts go over the quota and it is dropped, and the channel keeps its
 /// current image until the server sends the next one.
+///
+/// A third image arriving while the decode callback is still inside the first one is dropped at
+/// the quota too, but its refused parts stay pinned behind the queued second image. With a hold
+/// window of INBOUND_MIN_TRACK_SECONDS or more (the default player's) the ring carries further
+/// images behind the held items (see derive_inbound_ring_bytes()). With none (artwork alone, or
+/// a visualizer holding under INBOUND_MIN_TRACK_SECONDS) the ring has about one baseline message
+/// of room behind the pinned parts, so a stall long enough for time replies and state JSON to
+/// arrive behind them can exhaust the ring, and the connection closes after
+/// INBOUND_ACQUIRE_TIMEOUT_MS. That needs a decode callback blocked for about two image cadences
+/// (around a minute at one image per INBOUND_MIN_TRACK_SECONDS) or track skips faster than
+/// INBOUND_MIN_TRACK_SECONDS, which the derivation treats as beyond its budget.
 static constexpr size_t INBOUND_ARTWORK_IN_FLIGHT_IMAGES = 1;
+
+/// Bytes of an artwork part message ahead of its image data: the type byte, then the flags byte
+/// (roles/artwork/v1.md "Artwork (Binary)").
+static constexpr size_t INBOUND_ARTWORK_PART_HEADER_BYTES = 2;
+
+/// The most ring storage an artwork part costs beyond its image data: the part header and the
+/// stored overhead of its item.
+static constexpr size_t INBOUND_ARTWORK_PART_STORED_OVERHEAD_BYTES =
+    INBOUND_ITEM_STORED_OVERHEAD_BYTES + INBOUND_ARTWORK_PART_HEADER_BYTES;
+
+/// The smallest image part, in data bytes, the artwork quota is derived for. The quota charges
+/// each part its stored size (the item headers, the type and flags bytes, the Noise tag and the
+/// alignment padding: INBOUND_ARTWORK_PART_STORED_OVERHEAD_BYTES), so an image within
+/// ImageSlotPreference::max_image_bytes split into parts smaller than this costs more than the
+/// quota and is dropped while the decode thread is busy. The reference server sends maximal parts
+/// (65,517 bytes).
+static constexpr size_t INBOUND_ARTWORK_MIN_PART_BYTES = 4096;
+
+/// @brief Ring storage one image of up to `max_image_bytes` occupies, sent in parts of at least
+/// INBOUND_ARTWORK_MIN_PART_BYTES (the last one may be shorter): its data plus a part's stored
+/// overhead for each of at most ceil(max_image_bytes / INBOUND_ARTWORK_MIN_PART_BYTES) parts.
+static constexpr size_t inbound_artwork_image_stored_bytes(size_t max_image_bytes) {
+    const size_t max_parts =
+        (max_image_bytes + INBOUND_ARTWORK_MIN_PART_BYTES - 1) / INBOUND_ARTWORK_MIN_PART_BYTES;
+    return max_image_bytes + max_parts * INBOUND_ARTWORK_PART_STORED_OVERHEAD_BYTES;
+}
 
 /// @brief The configuration figures the ring size is derived from
 ///
@@ -1122,8 +1155,8 @@ struct InboundRingBudget {
     /// stored_frame_bytes_per_second()). 0 without the visualizer role.
     size_t visualizer_stored_bytes_per_second{0};
     /// Ring storage one image per artwork channel takes: the sum over the channels of
-    /// inbound_frames_stored_bytes(ImageSlotPreference::max_image_bytes). 0 without the artwork
-    /// role.
+    /// inbound_artwork_image_stored_bytes(ImageSlotPreference::max_image_bytes). 0 without the
+    /// artwork role.
     size_t artwork_images_stored_bytes{0};
     /// The artwork role's quota: INBOUND_ARTWORK_IN_FLIGHT_IMAGES * artwork_images_stored_bytes. 0
     /// without the artwork role.
@@ -1137,18 +1170,6 @@ struct InboundRingBudget {
     /// allowance without artwork.
     size_t largest_message_bytes{INBOUND_MAX_MESSAGE_BYTES};
 };
-
-/// @brief Ring storage a run of maximal frames carrying `payload_bytes` occupies: each whole
-/// frame and the final partial one stored as one item
-static constexpr size_t inbound_frames_stored_bytes(size_t payload_bytes) {
-    constexpr size_t FRAME_OVERHEAD =
-        sizeof(InboundItemHeader) + AEAD_TAG_SIZE + INBOUND_ROLE_HEADER_ALLOWANCE;
-    constexpr size_t PAYLOAD_PER_FRAME = MAX_TRANSPORT_PLAINTEXT - INBOUND_ROLE_HEADER_ALLOWANCE;
-    const size_t whole_frames = payload_bytes / PAYLOAD_PER_FRAME;
-    const size_t remainder = payload_bytes % PAYLOAD_PER_FRAME;
-    return whole_frames * SharedRingLayout::stored_size(PAYLOAD_PER_FRAME + FRAME_OVERHEAD) +
-           (remainder > 0 ? SharedRingLayout::stored_size(remainder + FRAME_OVERHEAD) : 0);
-}
 
 /// @brief The longest a holder keeps its oldest item, in whole seconds: `held_bytes` of quota
 /// filled at `stored_bytes_per_second`, rounded up; 0 for a holder that is not enabled.
@@ -1180,7 +1201,14 @@ static constexpr size_t inbound_hold_seconds(size_t held_bytes, size_t stored_by
  *  - the baseline, INBOUND_PASSTHROUGH_MESSAGES items of largest_message_bytes, which can always
  *    arrive and sit behind a held item, whatever the holders' windows;
  *  - with the artwork role, the artwork that window carries: one image per channel per
- *    INBOUND_MIN_TRACK_SECONDS, copied out and returned but pinned behind the held items;
+ *    INBOUND_MIN_TRACK_SECONDS, copied out and returned but pinned behind the held items. With
+ *    no hold window of INBOUND_MIN_TRACK_SECONDS or more (artwork alone, or a visualizer holding
+ *    under INBOUND_MIN_TRACK_SECONDS) this term is 0: a third image arriving while the decode
+ *    callback is still inside the first one is dropped at the quota, but its refused parts stay
+ *    pinned behind the queued second image, so a stall long enough for time replies and state
+ *    JSON to arrive behind them can exhaust the ring and close the connection (see
+ *    INBOUND_ARTWORK_IN_FLIGHT_IMAGES). That needs a decode callback blocked for about two image
+ *    cadences or track skips faster than INBOUND_MIN_TRACK_SECONDS, beyond this budget;
  * and never less than two items of largest_message_bytes (inbound_ring_min_storage_bytes()),
  * rounded up to the 4-byte multiple FreeRTOS requires. Unadmitted connections never write into
  * the ring (InboundGate), so they add nothing.

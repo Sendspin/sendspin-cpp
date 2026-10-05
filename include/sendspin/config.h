@@ -529,7 +529,9 @@ struct ImageSlotPreference {
     /// assembled in, allocated by SendspinClient::start() and released by stop(); an image that
     /// completes while a require_frame_done channel's last delivery is un-acked waits there. The
     /// image's messages arrive in the shared inbound ring, which reserves one image of this size
-    /// per channel in flight. A channel with 0 here holds nothing.
+    /// per channel in flight, sent in parts of at least 4,096 bytes: each part is charged its
+    /// stored size, so an image split into smaller parts can exceed the reservation and is dropped
+    /// while the decode thread is busy. A channel with 0 here holds nothing.
     uint32_t max_image_bytes{DEFAULT_MAX_IMAGE_BYTES};
 };
 
