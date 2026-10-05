@@ -2434,11 +2434,14 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
                 break;
             case Stage::START_CLEAR:
                 // The sync task takes the header and waits; the clear reaches it there, and the
-                // stream it holds still plays once acknowledged.
+                // stream it holds still plays once acknowledged. The wait is for the clear being
+                // applied, not for an empty list: the flag goes up before the marker is handed, so
+                // the sync task may apply the clear first and leave the marker for the active
+                // stream to take.
                 start();
                 wait_until([&] { return sync.inbound().items().is_empty(); });
                 player.handle_stream_clear(player.cleanup_generation.load());
-                wait_until([&] { return sync.inbound().items().is_empty(); });
+                wait_until([&] { return (sync.event_flags_.get() & COMMAND_STREAM_CLEAR) == 0; });
                 break;
             case Stage::START_END_START:
                 start();
