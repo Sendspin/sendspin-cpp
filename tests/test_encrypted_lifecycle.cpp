@@ -708,7 +708,11 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                long_term_peer.record.psk_id, long_term_peer.psk, options);
 
-    pump_until(client, [&] { return client.is_connected(); });
+    // Admission publishes is_connected() before the trust level is stored, so the wait also
+    // covers the trust callback, which is queued only after the getter's value is set.
+    pump_until(client, [&] {
+        return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
+    });
     EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER);
 
     // Becoming operational the first time legitimately sends one client/state; only traffic
@@ -832,7 +836,11 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     ASSERT_TRUE(learned_psk.has_value() && learned_psk_id.has_value());
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
-    pump_until(client, [&] { return client.is_connected(); });
+    // The protocol task can publish is_connected() before it stores the trust level, so the wait
+    // also covers the trust callback, which is queued only after the getter's value is set.
+    pump_until(client, [&] {
+        return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
+    });
     EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER)
         << "Trust must upgrade to USER on the RAM-committed record";
 
