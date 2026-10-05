@@ -14,6 +14,7 @@
 
 #include "inbound_ring.h"
 
+#include "constants.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 
@@ -213,7 +214,7 @@ bool InboundGate::wait_until_writable(uint32_t timeout_ms) {
             if (remaining_us <= 0) {
                 return false;
             }
-            wait_ms = static_cast<uint32_t>((remaining_us + 999) / 1000);
+            wait_ms = static_cast<uint32_t>((remaining_us + US_PER_MS - 1) / US_PER_MS);
         }
         this->consumed_flags_.wait(CONSUMED, false, true, wait_ms);
     }

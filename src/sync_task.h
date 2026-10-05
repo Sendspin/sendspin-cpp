@@ -273,7 +273,7 @@ protected:
     void* take_item(uint32_t timeout_ms);
 
     /// @brief Returns an item to the ring
-    void return_item(void* item) {
+    void return_item(void* item) const {
         this->ring()->return_item(item);
     }
 

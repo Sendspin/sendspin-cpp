@@ -103,7 +103,8 @@ void ProtocolTask::wake() {
 // ============================================================================
 
 bool ProtocolTask::push_command(ProtocolCommand&& command) {
-    const bool is_accept = command.type == ProtocolCommandType::ACCEPT_CONNECTION;
+    const ProtocolCommandType type = command.type;
+    const bool is_accept = type == ProtocolCommandType::ACCEPT_CONNECTION;
     bool queued = false;
     {
         std::lock_guard<std::mutex> lock(this->command_mutex_);
@@ -127,7 +128,7 @@ bool ProtocolTask::push_command(ProtocolCommand&& command) {
                     this->accept_slots_);
         } else {
             SS_LOGW(TAG, "Protocol command queue full (%zu); dropping a command of type %d",
-                    CONSUMER_COMMAND_BURST, static_cast<int>(command.type));
+                    CONSUMER_COMMAND_BURST, static_cast<int>(type));
         }
         return false;
     }

@@ -300,10 +300,10 @@ private:
 
     // size_t fields
     /// Slots reserved for ACCEPT_CONNECTION: ACCEPT_SLOTS_PER_SOCKET per socket. Fixed at
-    /// construction.
-    const size_t accept_slots_;
-    /// accept_slots_ + CONSUMER_COMMAND_BURST. Fixed at construction.
-    const size_t capacity_;
+    /// construction, never written after.
+    size_t accept_slots_;
+    /// accept_slots_ + CONSUMER_COMMAND_BURST. Fixed at construction, never written after.
+    size_t capacity_;
     /// Queued commands in total, and the accepts among them. Guarded by command_mutex_.
     size_t command_count_{0};
     size_t command_head_{0};
