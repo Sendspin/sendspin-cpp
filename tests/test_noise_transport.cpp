@@ -20,11 +20,19 @@
 // The "server" side uses raw noise-c as the Noise initiator.
 // The client proposes only Noise_KKpsk2_25519_ChaChaPoly_SHA256 (see NOISE_SUITE_CHACHAPOLY
 // in crypto/constants.h), so that is the only suite exercised here.
+//
+// Named gap: no test covers a failed encrypt setting the send-desync flag in
+// NoiseTransport::encrypt_and_send_frame(); a live session cannot fail its encrypt without a seam.
 
 #include "connection.h"
+#include "connection_manager.h"
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+#include "controller_role_impl.h"  // The supported commands a send_command() is checked against
+#endif
 #include "crypto/constants.h"
 #include "inbound_ring.h"
 #include "inbound_test_helpers.h"
+#include "lifecycle_test_fixtures.h"
 #include "crypto/keys.h"
 #include "noise_handshake.h"
 #include "noise_session.h"
@@ -36,6 +44,7 @@
 #include "protocol_task.h"
 #include "record_store.h"
 #include "record_test_helpers.h"
+#include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
 #include "time_burst.h"
@@ -1936,6 +1945,294 @@ TEST(NoiseTransport, TimeMessageNeedsTheNoiseTransport) {
     EXPECT_EQ(conn.send_time_message(), 0);
     EXPECT_TRUE(conn.sent_text_.empty());
     EXPECT_TRUE(conn.sent_binary_.empty());
+}
+
+// ============================================================================
+// Send failures
+// ============================================================================
+
+/// TestConnection whose transport fails every write from a chosen one on. Like the real
+/// transports, once closed it refuses every write as not connected, and its disconnect() sends
+/// the goodbye and then closes.
+class FailingWriteConnection : public TestConnection {
+public:
+    SsErr send_binary_message(const uint8_t* data, size_t len) override {
+        if (!this->connected_) {
+            return SsErr::INVALID_STATE;
+        }
+        if (this->writes_before_refusal == 0) {
+            ++this->refused_writes;
+            return SsErr::FAIL;
+        }
+        if (this->writes_before_refusal > 0) {
+            --this->writes_before_refusal;
+        }
+        return TestConnection::send_binary_message(data, len);
+    }
+
+    void disconnect(SendspinGoodbyeReason reason) override {
+        TestConnection::disconnect(reason);
+        this->send_goodbye_reason(reason);
+        this->close_transport_now();
+    }
+
+    void close_transport_now() override {
+        TestConnection::close_transport_now();
+        this->connected_ = false;
+    }
+
+    bool is_connected() const override {
+        return this->connected_;
+    }
+
+    /// The peer closed the transport, which has not reported the close.
+    void lose_transport() {
+        this->connected_ = false;
+    }
+
+    /// Writes that succeed before every later one is refused; negative never refuses.
+    int writes_before_refusal{-1};
+    int refused_writes{0};
+
+private:
+    bool connected_{true};
+};
+
+// A send that fails from the encrypt on closes the connection without a goodbye
+// (connection.md "Failure Handling"), and every later send is refused before its encrypt. A
+// refusal before the encrypt leaves the connection up, and its next frame decrypts on the peer.
+// A detached connection or a closed transport is not closed again, and its next send is still
+// refused. A failed encrypt has no row (the file comment's named gap).
+TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
+    enum class Send : uint8_t { SINGLE, FRAGMENTED, NO_FRAME_SINK, FRAGMENT_TYPED_BINARY };
+    struct Row {
+        const char* name;
+        Send send;
+        int writes_before_refusal;
+        bool detached_first;
+        bool transport_closed_first;
+        SsErr expected;
+        bool desynced;
+        bool detached;
+        int closes;
+    };
+    const Row rows[] = {
+        {"Control: the write succeeds", Send::SINGLE, -1, false, false, SsErr::OK, false, false,
+         0},
+        {"the write fails", Send::SINGLE, 0, false, false, SsErr::FAIL, true, true, 1},
+        {"a later fragment's write fails", Send::FRAGMENTED, 1, false, false, SsErr::FAIL, true,
+         true, 1},
+        {"refused before the encrypt: no frame sink", Send::NO_FRAME_SINK, -1, false, false,
+         SsErr::INVALID_STATE, false, false, 0},
+        {"refused before the encrypt: a fragment-typed binary message",
+         Send::FRAGMENT_TYPED_BINARY, -1, false, false, SsErr::FAIL, false, false, 0},
+        {"the write fails on a detached connection", Send::SINGLE, 0, true, false, SsErr::FAIL,
+         true, true, 0},
+        {"the write is refused by a closed transport", Send::SINGLE, -1, false, true,
+         SsErr::INVALID_STATE, true, false, 0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+        FailingWriteConnection conn;
+        conn.set_noise_session(std::move(r->responder_session));
+        conn.writes_before_refusal = row.writes_before_refusal;
+        if (row.detached_first) {
+            conn.detach_inbound();
+        }
+        if (row.transport_closed_first) {
+            conn.lose_transport();
+        }
+
+        SsErr err = SsErr::OK;
+        switch (row.send) {
+            case Send::SINGLE:
+                err = conn.send_app_json(R"({"type":"client/state"})");
+                break;
+            case Send::FRAGMENTED:
+                err = conn.send_app_json(std::string(MAX_TRANSPORT_PLAINTEXT * 2, 'A'));
+                break;
+            case Send::NO_FRAME_SINK: {
+                NoiseTransport::FrameSink sink = std::move(conn.noise_transport_.frame_sink_);
+                conn.noise_transport_.frame_sink_ = nullptr;
+                err = conn.send_app_json(R"({"type":"client/state"})");
+                conn.noise_transport_.frame_sink_ = std::move(sink);
+                break;
+            }
+            case Send::FRAGMENT_TYPED_BINARY: {
+                const std::vector<uint8_t> fragment_typed = {MSG_TYPE_FRAGMENT, 0xAA};
+                err = conn.test_send_binary(fragment_typed.data(), fragment_typed.size());
+                break;
+            }
+        }
+        EXPECT_EQ(err, row.expected) << "err=" << static_cast<int>(err);
+        EXPECT_EQ(conn.noise_transport_.is_send_desynced(), row.desynced);
+        EXPECT_EQ(conn.inbound_gate().is_detached(), row.detached);
+        EXPECT_EQ(conn.close_transport_now_calls_, row.closes);
+        EXPECT_TRUE(conn.disconnect_calls_.empty()) << "a goodbye was attempted";
+
+        // The next send: refused once desynced, otherwise authenticated by the peer.
+        const size_t frames_before = conn.sent_binary_.size();
+        conn.writes_before_refusal = -1;
+        const SsErr next = conn.send_app_json(R"({"type":"client/goodbye"})");
+        if (row.desynced) {
+            EXPECT_EQ(next, SsErr::INVALID_STATE);
+            EXPECT_EQ(conn.sent_binary_.size(), frames_before)
+                << "a frame went out after the failure";
+            EXPECT_EQ(conn.inbound_gate().is_detached(), row.detached) << "the gate moved";
+            EXPECT_EQ(conn.close_transport_now_calls_, row.closes) << "closed a second time";
+        } else {
+            ASSERT_EQ(next, SsErr::OK);
+            ASSERT_GT(conn.sent_binary_.size(), frames_before);
+            for (size_t i = 0; i < conn.sent_binary_.size(); ++i) {
+                EXPECT_FALSE(raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[i]).empty())
+                    << "frame " << i << " does not authenticate on the peer";
+            }
+        }
+    }
+}
+
+// A send that fails after its encrypt drops its connection in its own tick, once and without a
+// goodbye, from each protocol-task step that sends: the commands, the client/state pass, the time
+// bursts (after step 6, so step 9 drops it) and a release's goodbye. The test thread plays the
+// protocol task and the main loop; the stopped task's final tick took the client/state start()
+// published, before the stand-in was installed. In the Control row every send goes out and the
+// peer authenticates every frame in order.
+TEST(NoiseTransport, ASendFailureAfterTheEncryptDropsTheConnectionInItsTick) {
+    enum class Site : uint8_t { NONE, TIME, CLIENT_STATE, CONTROLLER, GOODBYE };
+    struct Row {
+        const char* name;
+        Site site;
+    };
+    const Row rows[] = {
+        {"Control: every send succeeds", Site::NONE},
+        {"client/time", Site::TIME},
+        {"client/state", Site::CLIENT_STATE},
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+        {"a controller command", Site::CONTROLLER},
+#endif
+        {"the goodbye of a disconnect()", Site::GOODBYE},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+        TestNetworkProvider network;
+        SendspinClientConfig config;
+        config.name = "Send Failure Test Client";
+        config.server_port = 0;
+        SendspinClient client(config);
+        client.set_network_provider(&network);
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+        ControllerRole& controller = client.add_controller();
+#endif
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+        manager.liveness_timeout_us_ = 0;
+
+        auto conn = std::make_shared<FailingWriteConnection>();
+        conn->set_json_arena(*client.json_arena_);
+        conn->set_noise_session(std::move(r->responder_session));
+        conn->init_time_filter();
+        conn->set_client_hello_sent(true);
+        conn->set_server_hello_received(true);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK},
+                                    std::vector<std::string>{"controller@v1"}, std::nullopt,
+                                    std::nullopt);
+        // Not due until the row opens it, so only the row's own site sends.
+        conn->time_burst().last_burst_complete_time_ = platform_time_us() / 1000;
+        manager.install_admitted(conn, role_mask_bit(SendspinRole::CONTROLLER));
+
+        const bool time = row.site == Site::TIME || row.site == Site::NONE;
+        if (time) {
+            // The burst asks for the high-performance hold, which the main loop grants.
+            conn->time_burst().last_burst_complete_time_ = 0;
+            (void) client.protocol_tick();
+            client.loop();
+        }
+        if (row.site != Site::NONE) {
+            conn->writes_before_refusal = 0;
+        }
+        if (row.site == Site::CLIENT_STATE || row.site == Site::NONE) {
+            client.set_available(false);
+        }
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+        if (row.site == Site::CONTROLLER || row.site == Site::NONE) {
+            controller.impl_->supported_commands =
+                (controller.impl_->cleanup_generation.load() << 16) |
+                (1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY));
+            ASSERT_TRUE(controller.send_command({.command = SendspinControllerCommand::PLAY}));
+        }
+#endif
+        if (row.site == Site::GOODBYE) {
+            client.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+        }
+        (void) client.protocol_tick();
+
+        const bool dropped = row.site != Site::NONE;
+        EXPECT_EQ(manager.find_admitted(conn.get()) == nullptr, dropped);
+        EXPECT_EQ(conn->refused_writes, dropped ? 1 : 0)
+            << "a frame was encrypted after the failed one";
+        EXPECT_EQ(conn->close_transport_now_calls_, dropped ? 1 : 0);
+        const std::vector<SendspinGoodbyeReason> goodbyes =
+            row.site == Site::GOODBYE
+                ? std::vector<SendspinGoodbyeReason>{SendspinGoodbyeReason::USER_REQUEST}
+                : std::vector<SendspinGoodbyeReason>{};
+        EXPECT_EQ(conn->disconnect_calls_, goodbyes);
+        if (!dropped) {
+            // A client/state and a client/time, behind a client/command.
+            size_t expected_frames = 2;
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+            ++expected_frames;
+#endif
+            EXPECT_EQ(conn->sent_binary_.size(), expected_frames);
+            for (size_t i = 0; i < conn->sent_binary_.size(); ++i) {
+                EXPECT_FALSE(raw_decrypt(r->initiator.recv_cs, conn->sent_binary_[i]).empty())
+                    << "frame " << i << " does not authenticate on the peer";
+            }
+        }
+
+        manager.close_admission();
+        (void) client.protocol_tick();
+        client.stop();
+    }
+}
+
+// A client/time not sent counts as timed out: a burst whose every send is refused (no Noise
+// session here) ends after its last message, waits out the interval and leaves the connection
+// up. The Control row sends, so its message waits for its reply.
+TEST(TimeBurst, AnUnsentTimeMessageCountsAsTimedOut) {
+    constexpr int64_t NOW_MS = 1'000'000;
+    constexpr int64_t INTERVAL_MS = 500;
+    constexpr int64_t TIMEOUT_MS = 100;
+    for (const bool session : {true, false}) {
+        SCOPED_TRACE(session ? "Control: the message is sent" : "the message is not sent");
+        DeferredWriteConnection conn;
+        std::optional<LoopbackResult> r;
+        if (session) {
+            r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+            ASSERT_TRUE(r.has_value());
+            conn.set_noise_session(std::move(r->responder_session));
+        }
+        conn.init_time_filter();
+        conn.set_client_hello_sent(true);
+        conn.set_server_hello_received(true);
+
+        SendspinTimeBurst burst;
+        burst.configure(/*burst_size=*/2, INTERVAL_MS, TIMEOUT_MS);
+        const TimeBurstResult first = burst.loop(&conn, NOW_MS, true);
+        const TimeBurstResult second = burst.loop(&conn, NOW_MS, true);
+        EXPECT_EQ(first.sent, session);
+        EXPECT_FALSE(first.burst_completed);
+        EXPECT_FALSE(second.sent) << "a second message while the first awaits its reply";
+        EXPECT_EQ(second.burst_completed, !session);
+        EXPECT_FALSE(conn.inbound_gate().is_detached())
+            << "an unsent message closed the connection";
+        EXPECT_EQ(burst.ms_until_due(NOW_MS),
+                  static_cast<uint32_t>(session ? TIMEOUT_MS + 1 : INTERVAL_MS));
+    }
 }
 
 // ============================================================================

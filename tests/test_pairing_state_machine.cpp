@@ -1301,10 +1301,11 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     // converging filter.
     //
     // Without a Noise session the send itself fails, but send_time_message() records the frame in
-    // flight before sending, so a nonzero tag shows the burst reached the send.
-    // A burst whose send fails retries after SendspinTimeBurst::SEND_RETRY_DELAY_MS, so each wait
-    // below pumps until the next attempt; the suite watchdog names a burst that never sends.
+    // flight before sending, so a nonzero tag shows the burst reached the send. An unsent message
+    // counts as timed out, so the burst then waits out its interval; each wait below resets it to
+    // make it due at once, and the suite watchdog names a burst that never sends.
     ASSERT_EQ(conn->time_frame_tag_, 0U);
+    conn->time_burst().reset();
     this->pump_until_time_frame(conn);
 
     // Any change publishes.
@@ -1318,6 +1319,7 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     this->pump();
     ASSERT_FALSE(conn->has_activity(SendspinActivity::PAIRING));
     conn->time_frame_tag_ = 0;
+    conn->time_burst().reset();
     this->pump_until_time_frame(conn);
 }
 

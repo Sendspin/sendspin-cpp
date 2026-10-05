@@ -908,9 +908,11 @@ private:
 };
 
 // A nursery connection's client/hello is sent once, when its Noise handshake completes, and never
-// again. A send that fails on a connected transport cannot be retried (the Noise send nonce is
-// spent by then), so the connection is closed without a goodbye and dropped; one the transport
-// refuses as no longer connected is left for its close event or the establish deadline.
+// again. A send that fails on a connected transport is not retried, so the connection is closed
+// without a goodbye and dropped; one the transport refuses as no longer connected is left for its
+// close event or the establish deadline. The stand-in has no Noise session, so the drop is the
+// hello scan's own; the close after the encrypt is covered for other sends by
+// NoiseTransport.ASendFailureAfterTheEncryptDropsTheConnectionInItsTick.
 TEST(ClientLifecycle, NurseryHelloIsSentOnceAndAFailedSendDropsTheConnection) {
     struct Row {
         const char* name;
@@ -1756,9 +1758,8 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
 // ============================================================================
 
 // SendspinTimeBurst::ms_until_due() is the burst's part of the protocol task's wait: the end of
-// the interval between bursts, the timeout of the message in flight, the backoff after a refused
-// send, or 0 when loop() has work now. The burst's state is staged directly; loop() moves it
-// through these states over real time.
+// the interval between bursts, the timeout of the message in flight, or 0 when loop() has work
+// now. The burst's state is staged directly; loop() moves it through these states over real time.
 TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
     struct Row {
         const char* name;
@@ -1766,7 +1767,6 @@ TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
         int64_t last_complete_ms;
         int64_t pending;
         int64_t sent_ms;
-        int64_t retry_after_ms;
         bool completed;
         uint32_t expected_ms;
     };
@@ -1775,14 +1775,13 @@ TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
     constexpr int64_t INTERVAL_MS = 500;
     constexpr int64_t TIMEOUT_MS = 100;
     const Row rows[] = {
-        {"between bursts", SIZE, NOW_MS - 200, 0, 0, 0, false, 300},
-        {"Control: the interval has elapsed", SIZE, NOW_MS - INTERVAL_MS, 0, 0, 0, false, 0},
-        {"a message in flight times out strictly after the timeout", 3, 0, 42, NOW_MS - 50, 0,
-         false, 51},
-        {"a refused send backs off", 3, 0, 0, 0, NOW_MS + 70, false, 70},
-        {"Control: ready to send the next message", 3, 0, 0, 0, 0, false, 0},
-        {"a completed burst is reported at once", SIZE, NOW_MS, 0, 0, 0, true, 0},
-        {"a far interval clamps short of NO_DEADLINE", SIZE, NOW_MS + (1LL << 40), 0, 0, 0, false,
+        {"between bursts", SIZE, NOW_MS - 200, 0, 0, false, 300},
+        {"Control: the interval has elapsed", SIZE, NOW_MS - INTERVAL_MS, 0, 0, false, 0},
+        {"a message in flight times out strictly after the timeout", 3, 0, 42, NOW_MS - 50, false,
+         51},
+        {"Control: ready to send the next message", 3, 0, 0, 0, false, 0},
+        {"a completed burst is reported at once", SIZE, NOW_MS, 0, 0, true, 0},
+        {"a far interval clamps short of NO_DEADLINE", SIZE, NOW_MS + (1LL << 40), 0, 0, false,
          ProtocolTask::NO_DEADLINE - 1},
     };
     for (const Row& row : rows) {
@@ -1793,7 +1792,6 @@ TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
         burst.last_burst_complete_time_ = row.last_complete_ms;
         burst.pending_embedded_ = row.pending;
         burst.current_message_sent_time_ = row.sent_ms;
-        burst.send_retry_after_ms_ = row.retry_after_ms;
         burst.pending_burst_completed_ = row.completed;
         EXPECT_EQ(burst.ms_until_due(NOW_MS), row.expected_ms);
     }
@@ -2580,11 +2578,10 @@ public:
     }
 };
 
-/// How many client/time frames the burst has written: send_time_message() seeds the frame's
-/// write time (never 0) before handing it to the transport. The stand-in has no Noise session, so
-/// the frame goes no further than that; the seed is the one trace a written frame leaves that
-/// another thread may read (an atomic, unlike the frame's tag), and the burst retries a refused
-/// frame only after SEND_RETRY_DELAY_MS, past the end of each row.
+/// Whether the burst has written a client/time frame: send_time_message() seeds the frame's write
+/// time (never 0) before handing it to the transport. The stand-in has no Noise session, so the
+/// frame goes no further than that; the seed is the one trace a written frame leaves that another
+/// thread may read (an atomic, unlike the frame's tag).
 int time_frames_written(const SendspinConnection& conn) {
     return conn.time_frame_sent_us_.load() != 0 ? 1 : 0;
 }

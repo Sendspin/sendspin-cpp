@@ -79,6 +79,9 @@ public:
     // ========================================
 
     /// @brief Drive the burst state machine. Protocol task only.
+    ///
+    /// A time message the connection does not send counts as one that timed out, so a send that
+    /// keeps failing ends the burst instead of re-ticking the protocol task at once.
     /// @param conn The connection that owns this burst, to send time messages on; connected and
     ///        operational (ConnectionManager::run_time_sync() gates it; loop() does not recheck).
     /// @param now_ms platform_time_us() / US_PER_MS, read once by the caller for this call and
@@ -124,12 +127,19 @@ public:
     void reset();
 
 protected:
+    // ========================================
+    // Internal helpers
+    // ========================================
+
+    /// @brief Ends the current message without a measurement (timed out or not sent); at the
+    /// burst's last message, feeds the best measurement to the time filter.
+    /// @param conn The connection that owns this burst.
+    /// @param now_ms The loop() call's clock, stamped as the completion time.
+    /// @return true if this completed the burst.
+    bool retire_message(SendspinConnection* conn, int64_t now_ms);
+
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;
     static constexpr int64_t DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
-    /// Wait before sending again after the transport refused a client/time: a full send queue or
-    /// a closing socket, neither of which clears at once. It keeps the protocol task from
-    /// re-ticking at once for a send that cannot succeed.
-    static constexpr int64_t SEND_RETRY_DELAY_MS = 100;
 
     // 64-bit fields
     int64_t best_max_error_{std::numeric_limits<int64_t>::max()};
@@ -142,8 +152,6 @@ protected:
     // client_transmitted of the time message awaiting a reply, 0 when none is (see
     // on_time_response())
     int64_t pending_embedded_{0};
-    // Earliest time (ms) to try again after a refused send, 0 when no send was refused
-    int64_t send_retry_after_ms_{0};
 
     // 8-bit fields
     uint8_t burst_size_{8};

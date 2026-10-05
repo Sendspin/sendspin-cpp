@@ -218,16 +218,16 @@ public:
     ///         false on any failure (caller should close the WebSocket).
     bool handle_noise_rehandshake(const std::vector<uint8_t>& msg1_bytes);
 
-    /// @brief Encrypt and send a JSON string as a Noise transport binary frame.
-    /// Thin delegate to NoiseTransport::send_json().
+    /// @brief Encrypt and send a JSON string as a Noise transport binary frame, through
+    /// NoiseTransport::send_json() and settle_noise_send().
     /// @return SsErr::OK on success.
     SsErr send_encrypted_text(const char* json, size_t len) {
-        return this->noise_transport_.send_json(json, len);
+        return this->settle_noise_send(this->noise_transport_.send_json(json, len));
     }
 
     /// @brief std::string overload of send_encrypted_text().
     SsErr send_encrypted_text(const std::string& json) {
-        return this->noise_transport_.send_json(json);
+        return this->send_encrypted_text(json.data(), json.size());
     }
 
     /// @brief Send an application-level JSON message.
@@ -238,9 +238,13 @@ public:
     /// - If not yet encrypted (pre-handshake), routes through send_text_message().
     ///
     /// All role senders use this method. client/time is the one exception: send_time_message()
-    /// calls NoiseTransport::send_json() directly to pass its write hook. Protocol task only,
-    /// like every send on a connection. On an ESP outbound connection the transport send blocks
-    /// for up to its 10 ms send timeout (src/esp/client_connection.cpp), once per frame.
+    /// calls NoiseTransport::send_json() directly to pass its write hook, and settles its result
+    /// the same way. Protocol task only, like every send on a connection. On an ESP outbound
+    /// connection the transport send blocks for up to its 10 ms send timeout
+    /// (src/esp/client_connection.cpp), once per frame.
+    ///
+    /// A failure after the encrypt closes the connection (settle_noise_send()); one before it
+    /// leaves the connection open. Either way the caller only sees the error.
     /// @return SsErr::OK if queued/sent, error code otherwise.
     SsErr send_app_json(const std::string& json);
 
@@ -316,8 +320,9 @@ public:
     /// connection.md "Failure Handling": handshake-phase failures, an AEAD failure once in
     /// transport mode, and malformed fragment sequences all close the WebSocket without sending a
     /// client/goodbye (or any other application-level message). Called on the protocol task, from
-    /// the receive path, so this routes to close_transport_now() (non-blocking on every platform)
-    /// instead of disconnect() (which can block on a transport join; see close_transport_now()).
+    /// the receive path and settle_noise_send(), so this routes to close_transport_now()
+    /// (non-blocking on every platform) instead of disconnect() (which can block on a transport
+    /// join; see close_transport_now()).
     /// The inbound gate is detached first, so nothing the peer sent after the failure is processed,
     /// and the protocol task reports the loss.
     void close_silently(SendspinGoodbyeReason /*reason*/) {
@@ -816,6 +821,18 @@ protected:
     // ========================================
     // Noise transport helpers (connection.cpp)
     // ========================================
+
+    /// @brief Settles the result of a send through the Noise transport: once a send failed after
+    /// its encrypt (NoiseTransport::is_send_desynced()), the connection is closed without a
+    /// goodbye, as an AEAD failure on the receive path is (connection.md "Failure Handling"), and
+    /// the protocol task drops it in the same tick through the detached gate. A connection
+    /// already detached is left to whoever detached it, so a goodbye that fails during a release
+    /// closes nothing twice; one whose transport is no longer connected is left to that
+    /// transport's close report, which the protocol task honours after the messages received
+    /// before it (InboundGate::close_ready()); until then every send is refused before its
+    /// encrypt. Protocol task only.
+    /// @param err The send's result, returned unchanged.
+    SsErr settle_noise_send(SsErr err);
 
     /// @brief Classifies a complete transport message: type 0 as JSON, stripping its type byte,
     /// all others as binary role messages. Protocol task only.
