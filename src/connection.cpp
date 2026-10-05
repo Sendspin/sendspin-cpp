@@ -19,10 +19,12 @@
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
+#include "protocol_task.h"
 #include "sendspin/types.h"
 #include "time_filter.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -47,7 +49,13 @@ SendspinConnection::SendspinConnection() {
         });
 }
 
-SendspinConnection::~SendspinConnection() = default;
+SendspinConnection::~SendspinConnection() {
+    // The last reference is gone, so no transport callback can still run on this connection:
+    // the drop log is this thread's now, and no delivery will end its run.
+    if (const uint32_t dropped = this->acquire_drop_log_.note_delivery(); dropped != 0) {
+        SS_LOGW(TAG, "Dropped %" PRIu32 " messages for want of inbound ring space", dropped);
+    }
+}
 
 // ============================================================================
 // Transport frames
@@ -93,7 +101,7 @@ SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCal
 SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendCompleteCallback cb,
                                         bool allow_before_hello) {
     // is_active() is an atomic read; NoiseTransport owns its own session mutex, so this
-    // main-loop check cannot race the network-thread re-handshake swap: send_encrypted_text
+    // main-loop check cannot race the protocol-task re-handshake swap: send_encrypted_text
     // re-checks the session under NoiseTransport's own lock.
     if (this->noise_transport_.is_active()) {
         // Post-handshake: encrypt straight from the caller's buffer. The transport's send path
@@ -251,9 +259,9 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
 }
 
 bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
-    // Runs on the NETWORK thread (dispatched from the JSON callback for a decrypted
+    // Runs on the protocol task (dispatched from the JSON callback for a decrypted
     // "noise/handshake" message, itself only reachable post-COMPLETE, so this always runs on
-    // the same network thread as the decrypt path, sequential with it and never concurrent).
+    // the same thread as the decrypt path, sequential with it and never concurrent).
     if (!this->noise_transport_.is_active()) {
         SS_LOGE(TAG, "handle_noise_rehandshake: no active Noise transport");
         return false;
@@ -285,10 +293,10 @@ bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
 
     // Clear the pairing-in-progress flag: the re-handshake is the server's signal that
     // pairing finalized and it is rekeying onto the new long-term PSK. Clearing it here
-    // (network thread) before the new server/activate arrives is what makes the main loop read
+    // (protocol task) before the new server/activate arrives is what makes the main loop read
     // that activate as a fresh one rather than a re-entry into the attempt, and discard any
     // pairing message still in flight as stale.
-    // Atomic store: written on network thread, read on main loop.
+    // Atomic store: written on the protocol task, read on main loop.
     this->pairing_in_progress_.store(false, std::memory_order_release);
 
     // Run the deferred-PSK-binding msg1 read with prologue = the prior handshake hash h.
@@ -321,7 +329,7 @@ bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
     this->psk_category_.store(result->resolved_psk.category, std::memory_order_release);
     {
         // Same reason as in set_noise_handshake_result(): get_psk_id() may be reading this
-        // string from the main loop (the revocation sweep) while this network thread rewrites it.
+        // string from the main loop (the revocation sweep) while the protocol task rewrites it.
         std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
         this->psk_id_ = result->resolved_psk.psk_id;
     }
@@ -339,186 +347,422 @@ bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
     return true;
 }
 
-void SendspinConnection::dispatch_complete_noise_message(uint8_t* plaintext, size_t len,
-                                                         int64_t receive_time) {
-    // A complete (non-fragment, fully reassembled) transport message. plaintext[0] is the
-    // message type; fragment types never reach here.
-    const uint8_t type_byte = plaintext[0];
+void SendspinConnection::dispatch_complete_noise_message(InboundMessage& message) {
+    // A complete (non-fragment, fully reassembled) transport message. data[0] is the message
+    // type; fragment types never reach here.
+    const uint8_t type_byte = message.data[0];
 
     if (type_byte == MSG_TYPE_JSON_BODY) {
         // Type 0: JSON control body, routed without the type byte. A frame carrying only
         // the type byte (no body) is a malformed/empty JSON message; drop it.
-        if (len < 2) {
+        if (message.len < 2) {
             SS_LOGW(TAG, "empty JSON body after Noise decrypt; dropping");
             return;
         }
-        if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
-            return;
-        }
         if (this->on_json_message_cb) {
-            this->on_json_message_cb(this, reinterpret_cast<const char*>(plaintext + 1), len - 1,
-                                     receive_time);
+            this->on_json_message_cb(
+                this, reinterpret_cast<const char*>(message.data + 1), message.len - 1,
+                widen_time_stamp_us(message.receive_time_us, platform_time_us()));
         }
         return;
     }
 
     // All other types: route as binary role message (full type-prefixed plaintext).
-    if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
-        return;
-    }
     if (this->on_binary_message_cb) {
-        this->on_binary_message_cb(this, plaintext, len);
+        this->on_binary_message_cb(this, message);
     }
 }
 
 // ============================================================================
-// WebSocket payload buffer management
+// Inbound messages: protocol task side
 // ============================================================================
 
-void SendspinConnection::deallocate_websocket_payload() {
-    this->websocket_payload_.reset();
-    this->websocket_write_offset_ = 0;
-}
-
-void SendspinConnection::reset_websocket_payload() {
-    this->websocket_write_offset_ = 0;
-}
-
-uint8_t* SendspinConnection::prepare_receive_buffer(size_t data_len) {
-    // Cap the cumulative buffer before any Noise authentication: the ESP server path drives
-    // this call from a header-only frame-length probe and the ESP client path from the peer's
-    // declared message length, neither of which has been authenticated yet. The cap is
-    // MAX_TRANSPORT_PLAINTEXT + 16 (AEAD tag room), the largest legitimate single Noise
-    // transport frame; pre-handshake TEXT frames (server/init, noise/handshake msg1/msg2) are
-    // far smaller, so one cap holds in every connection phase. websocket_write_offset_ never
-    // exceeds the cap (every prior growth passed this same check), so the subtraction below
-    // cannot underflow.
-    constexpr size_t MAX_RECEIVE_BUFFER_BYTES = MAX_TRANSPORT_PLAINTEXT + 16;
-    if (data_len > MAX_RECEIVE_BUFFER_BYTES - this->websocket_write_offset_) {
-        SS_LOGW(TAG, "Declared frame size %zu (offset %zu) exceeds receive buffer cap of %zu bytes",
-                data_len, this->websocket_write_offset_, MAX_RECEIVE_BUFFER_BYTES);
-        this->deallocate_websocket_payload();
-        return nullptr;
-    }
-
-    if (!this->websocket_payload_) {
-        if (!this->websocket_payload_.allocate(data_len, this->websocket_payload_location_)) {
-            SS_LOGE(TAG, "Failed to allocate %zu bytes for websocket payload", data_len);
-            return nullptr;
-        }
-        this->websocket_write_offset_ = 0;
-    } else if (this->websocket_write_offset_ + data_len > this->websocket_payload_.size()) {
-        // Need to expand buffer for additional fragment
-        size_t new_len = this->websocket_write_offset_ + data_len;
-        if (!this->websocket_payload_.realloc(new_len)) {
-            SS_LOGE(TAG, "Failed to expand websocket payload to %zu bytes", new_len);
-            this->deallocate_websocket_payload();
-            return nullptr;
-        }
-    }
-
-    return this->websocket_payload_.data() + this->websocket_write_offset_;
-}
-
-void SendspinConnection::commit_receive_buffer(size_t data_len) {
-    this->websocket_write_offset_ += data_len;
-}
-
-SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t receive_time) {
-    // Any complete data message proves the peer is alive, including an empty one or one that
-    // arrives while dispatch is disabled.
-    this->last_receive_time_us_.store(static_cast<uint32_t>(receive_time),
-                                      std::memory_order_relaxed);
-
-    if (!this->websocket_payload_) {
+SS_HOT void SendspinConnection::process_inbound_message(InboundMessage& message) {
+    // A connection closed or dropped stops dispatching at once, including frames already
+    // received before the close was decided.
+    if (this->inbound_gate_.is_detached()) {
         return;
     }
-
-    const size_t msg_len = this->websocket_write_offset_;
-
     // Every application frame is BINARY ciphertext: decrypt, reassemble, and read the message
     // type from the leading plaintext byte. Cleartext TEXT frames carry only the pre-transport
     // handshake exchange (server/init, noise/handshake), which the handshake driver consumes.
     //
     // A WS-upgraded connection with no driver yet (outbound between connect and
-    // init_noise_handshake(), or one rejected at nursery capacity) never hears anything
-    // legitimate, so its frames are dropped.
+    // init_noise_handshake()) never hears anything legitimate, so its frames are dropped.
     const bool noise_active = this->noise_handshake_complete_.load(std::memory_order_acquire);
     const bool noise_pending = !noise_active && this->noise_handshake_;
 
-    if (is_text) {
+    if (message.kind == InboundKind::TEXT) {
         if (noise_pending) {
             // Feed the handshake driver; it handles server/init and noise/handshake frames.
-            std::string text(reinterpret_cast<const char*>(this->websocket_payload_.data()),
-                             msg_len);
-            this->reset_websocket_payload();
-            this->handle_noise_handshake_text(text);
+            this->handle_noise_handshake_text(
+                std::string(reinterpret_cast<const char*>(message.data), message.len));
             return;
         }
-
         if (noise_active) {
             // connection.md "Failure Handling": a cleartext message after the switch to transport
             // mode is a silent failure.
             SS_LOGW(TAG, "TEXT frame in transport mode; closing connection");
-            this->reset_websocket_payload();
             this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
             return;
         }
-
         SS_LOGW(TAG, "TEXT frame before the Noise handshake started; dropping");
-        this->reset_websocket_payload();
         return;
     }
 
-    // Binary frame
-    if (noise_active) {
-        // Decrypt in-place; buffer has the full ciphertext (plaintext + 16-byte tag).
-        size_t pt_len =
-            this->noise_transport_.decrypt_in_place(this->websocket_payload_.data(), msg_len);
-        if (pt_len == 0) {
-            // Spec Failure Handling: an AEAD failure once in transport mode closes the
-            // WebSocket silently. It is also unrecoverable if left open: the underlying Noise
-            // decrypt never advances the receive-direction nonce counter on an auth failure, so
-            // every later frame on this connection would fail authentication forever too.
-            SS_LOGW(TAG, "Noise AEAD failure in transport mode; closing connection");
-            this->reset_websocket_payload();
+    if (!noise_active) {
+        if (noise_pending) {
+            // A handshake driver is installed but the transport is not up, so this frame is
+            // unauthenticated application data. It must not reach the role dispatch: that would
+            // let any peer that merely completed the WebSocket upgrade inject audio/artwork data
+            // with the Noise/PSK/admission chain bypassed. Treated as a handshake-phase failure
+            // per connection.md "Failure Handling": close without any application-level message.
+            SS_LOGW(TAG, "Binary frame before the Noise handshake completed; closing connection");
             this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
             return;
         }
-        // Route through the fragment state machine; dispatch any completed message.
-        NoiseTransport::CompleteMessage msg =
-            this->noise_transport_.accept_plaintext(this->websocket_payload_.data(), pt_len);
-        if (msg.malformed) {
-            // messaging.md "Malformed sequences" is a protocol error the receiver MUST close the
-            // connection for; NoiseTransport::CompleteMessage::malformed enumerates the
-            // sequences that set it.
-            SS_LOGW(TAG, "Malformed fragment sequence; closing connection");
-            this->reset_websocket_payload();
-            this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
-            return;
-        }
-        if (msg.data != nullptr) {
-            this->dispatch_complete_noise_message(msg.data, msg.len, receive_time);
-        }
-        this->reset_websocket_payload();
+        SS_LOGW(TAG, "Binary frame before the Noise handshake started; dropping");
         return;
     }
 
-    if (noise_pending) {
-        // A handshake driver is installed but the transport is not up, so this frame is
-        // unauthenticated application data. It must not reach the unencrypted dispatch below:
-        // that path hands the bytes to the role binary handlers, letting any peer that merely
-        // completed the WebSocket upgrade inject audio/artwork data with the Noise/PSK/admission
-        // chain bypassed. Treated as a handshake-phase failure per connection.md "Failure
-        // Handling": close without any application-level message.
-        SS_LOGW(TAG, "Binary frame before the Noise handshake completed; closing connection");
-        this->reset_websocket_payload();
+    // Decrypt in place: the message holds the full ciphertext (plaintext + 16-byte tag), in the
+    // ring item it was received into when it has one.
+    const size_t pt_len = this->noise_transport_.decrypt_in_place(message.data, message.len);
+    if (pt_len == 0) {
+        // Spec Failure Handling: an AEAD failure once in transport mode closes the WebSocket
+        // silently. It is also unrecoverable if left open: the underlying Noise decrypt never
+        // advances the receive-direction nonce counter on an auth failure, so every later frame
+        // on this connection would fail authentication forever too.
+        SS_LOGW(TAG, "Noise AEAD failure in transport mode; closing connection");
         this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
         return;
     }
+    // Route through the fragment state machine; dispatch any completed message.
+    NoiseTransport::CompleteMessage complete = this->noise_transport_.accept_plaintext(
+        message.data, pt_len, this->inbound_gate_.is_admitted());
+    if (complete.malformed) {
+        // messaging.md "Malformed sequences" is a protocol error the receiver MUST close the
+        // connection for; NoiseTransport::CompleteMessage::malformed enumerates the sequences
+        // that set it.
+        SS_LOGW(TAG, "Malformed fragment sequence; closing connection");
+        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        return;
+    }
+    if (complete.data == nullptr) {
+        return;
+    }
+    if (complete.data == message.data) {
+        // A single-frame message: it is the plaintext in place, still in its ring item.
+        message.len = complete.len;
+        this->dispatch_complete_noise_message(message);
+        return;
+    }
+    // A reassembled message lives in the Noise reassembly buffer, not in a ring item; the frame
+    // that completed it (message.item) is the caller's to return.
+    InboundMessage reassembled;
+    reassembled.data = complete.data;
+    reassembled.len = complete.len;
+    reassembled.receive_time_us = message.receive_time_us;
+    reassembled.kind = InboundKind::BINARY;
+    this->dispatch_complete_noise_message(reassembled);
+}
 
-    SS_LOGW(TAG, "Binary frame before the Noise handshake started; dropping");
-    this->reset_websocket_payload();
+bool SendspinConnection::pending_message(InboundMessage& out) {
+    if (!this->inbound_gate_.has_pending_message()) {
+        return false;
+    }
+    // The acquire load above orders these reads after the transport's writes before its publish.
+    out = InboundMessage{};
+    out.data = this->fallback_buf_.data();
+    out.len = this->fallback_len_;
+    out.receive_time_us = this->fallback_receive_time_us_;
+    out.kind = this->fallback_kind_;
+    return true;
+}
+
+// ============================================================================
+// Inbound messages: transport side
+// ============================================================================
+
+void SendspinConnection::notify_transport_closed() {
+    this->inbound_gate_.mark_transport_closed();
+    if (this->inbound_task_ != nullptr) {
+        this->inbound_task_->wake();
+    }
+}
+
+void SendspinConnection::fail_inbound() {
+    this->detach_inbound();
+    this->close_transport_now();
+    if (this->inbound_task_ != nullptr) {
+        this->inbound_task_->wake();
+    }
+}
+
+SS_HOT SendspinConnection::InboundTarget SendspinConnection::begin_inbound_message(
+    size_t len, bool is_text, int64_t receive_time_us) {
+    if (this->fragment_assembly_open_) {
+        // RFC 6455 section 5.4: the fragments of one message are not interleaved with another
+        // data message. Failing here also keeps the assembly's continuations off a fallback
+        // buffer this message would publish.
+        SS_LOGW(TAG, "Data frame inside a fragmented message; closing");
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
+    }
+    const InboundTarget target =
+        this->route_inbound_message(len, is_text ? InboundKind::TEXT : InboundKind::BINARY,
+                                    static_cast<uint32_t>(receive_time_us));
+    if (target.route == InboundRoute::DROP) {
+        // A dropped message is read and discarded without holding anything, so its start
+        // stands in for its completion as proof the peer is alive.
+        this->note_message_completed();
+    }
+    // An admitted connection receives into the ring from here on and nothing is pending once a
+    // ring write began, so the fallback buffer goes back to the heap.
+    if (this->inbound_item_ != nullptr && this->fallback_buf_.data() != nullptr) {
+        this->fallback_buf_.reset();
+    }
+    return target;
+}
+
+SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size_t len,
+                                                                            InboundKind kind,
+                                                                            uint32_t stamp) {
+    if (this->inbound_ring_ == nullptr || this->inbound_gate_.is_detached()) {
+        return {nullptr, InboundRoute::DROP};
+    }
+
+    if (!this->inbound_gate_.is_admitted()) {
+        if (!InboundGate::pre_admission_message_fits(len)) {
+            SS_LOGW(TAG, "Pre-admission message of %zu bytes exceeds the %zu-byte cap; closing",
+                    len, InboundGate::PRE_ADMISSION_MESSAGE_BYTES);
+            this->fail_inbound();
+            return {nullptr, InboundRoute::CLOSE};
+        }
+        // An empty frame can never be a valid handshake or JSON message.
+        if (len == 0) {
+            return {nullptr, InboundRoute::DROP};
+        }
+        const InboundRoute waited = this->wait_until_writable();
+        if (waited != InboundRoute::RECEIVE) {
+            return {nullptr, waited};
+        }
+        if (this->fallback_buf_.size() < len &&
+            !this->fallback_buf_.allocate(len, this->fallback_location_)) {
+            SS_LOGE(TAG, "Failed to allocate %zu bytes for a pre-admission message; closing", len);
+            this->fail_inbound();
+            return {nullptr, InboundRoute::CLOSE};
+        }
+        this->fallback_len_ = len;
+        this->fallback_kind_ = kind;
+        this->fallback_receive_time_us_ = stamp;
+        this->inbound_to_fallback_ = true;
+        return {this->fallback_buf_.data(), InboundRoute::RECEIVE};
+    }
+
+    if (len > INBOUND_MAX_MESSAGE_BYTES) {
+        SS_LOGW(TAG, "Message of %zu bytes exceeds one Noise frame (%zu); closing", len,
+                INBOUND_MAX_MESSAGE_BYTES);
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
+    }
+    // A pre-admission message still pending from before the admission holds every later write
+    // back, so the protocol task sees this connection's messages in order.
+    while (!this->inbound_gate_.begin_ring_write()) {
+        const InboundRoute waited = this->wait_until_writable();
+        if (waited != InboundRoute::RECEIVE) {
+            return {nullptr, waited};
+        }
+    }
+    void* item = this->inbound_ring_->acquire(len, INBOUND_ACQUIRE_TIMEOUT_MS);
+    if (item == nullptr) {
+        this->inbound_gate_.abandon_ring_write();
+        // Throttled: see InboundDropLog. Reclamation is in ring order, so with the player
+        // holding audio the space behind its oldest chunk is what ran out (see
+        // derive_inbound_ring_bytes()): said so, to tell that limit from a stalled protocol task.
+        if (this->acquire_drop_log_.note_drop()) {
+            const size_t held_audio =
+                this->inbound_ring_->quota(InboundHolder::PLAYER).outstanding();
+            if (held_audio > 0) {
+                SS_LOGW(TAG,
+                        "No inbound ring space for a %zu-byte message within %u ms: ring pinned "
+                        "behind held audio (%zu bytes held); dropping until there is",
+                        len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), held_audio);
+            } else {
+                SS_LOGW(TAG,
+                        "No inbound ring space for a %zu-byte message within %u ms; dropping "
+                        "until there is",
+                        len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS));
+            }
+        }
+        return {nullptr, InboundRoute::DROP};
+    }
+    if (const uint32_t dropped = this->acquire_drop_log_.note_delivery(); dropped != 0) {
+        SS_LOGW(TAG, "Dropped %" PRIu32 " messages for want of inbound ring space", dropped);
+    }
+    InboundItemHeader* header = inbound_item_header(item);
+    header->connection_id = static_cast<uint32_t>(this->instance_id);
+    header->receive_time_us = stamp;
+    header->kind = kind;
+    this->inbound_item_ = item;
+    return {inbound_item_bytes(item), InboundRoute::RECEIVE};
+}
+
+SendspinConnection::InboundRoute SendspinConnection::wait_until_writable() {
+    if (this->inbound_gate_.wait_until_writable(InboundGate::WRITABLE_WAIT_MS)) {
+        return InboundRoute::RECEIVE;
+    }
+    if (this->inbound_gate_.is_detached()) {
+        return InboundRoute::DROP;
+    }
+    SS_LOGW(TAG, "Protocol task took no pending message in %u ms; closing",
+            static_cast<unsigned>(InboundGate::WRITABLE_WAIT_MS));
+    this->fail_inbound();
+    return InboundRoute::CLOSE;
+}
+
+void SendspinConnection::note_message_completed() {
+    this->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
+                                      std::memory_order_relaxed);
+}
+
+void SendspinConnection::end_inbound_message(bool received) {
+    if (received) {
+        this->note_message_completed();
+    }
+    if (this->inbound_item_ != nullptr) {
+        void* item = std::exchange(this->inbound_item_, nullptr);
+        if (received) {
+            this->inbound_ring_->complete(item);
+        } else {
+            // FreeRTOS cannot cancel an acquire: complete it as DISCARD, which take() returns
+            // without handing out, and uncount it.
+            inbound_item_header(item)->kind = InboundKind::DISCARD;
+            this->inbound_ring_->complete(item);
+            this->inbound_gate_.abandon_ring_write();
+        }
+    } else if (this->inbound_to_fallback_) {
+        this->inbound_to_fallback_ = false;
+        if (!received || !this->inbound_gate_.publish_pending_message()) {
+            return;
+        }
+    } else {
+        return;
+    }
+    this->inbound_task_->wake();
+}
+
+void SendspinConnection::abandon_inbound_message() {
+    if (this->inbound_item_ != nullptr) {
+        this->end_inbound_message(false);
+    }
+    this->inbound_to_fallback_ = false;
+    this->fragment_dropping_ = false;
+    this->fragment_assembly_open_ = false;
+}
+
+SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
+    size_t len, bool first, bool is_text, int64_t receive_time_us) {
+    // The rare path (see the declaration): a multi-frame WebSocket message is assembled in the
+    // fallback buffer whatever the admission state, and routed when its last bytes arrive.
+    if (first && this->fragment_assembly_open_) {
+        // RFC 6455 section 5.4: a fragmented message ends with its final continuation frame
+        // before another data message starts.
+        SS_LOGW(TAG, "New fragmented message inside an open one; closing");
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
+    }
+    if (first) {
+        this->fragment_assembly_open_ = true;
+        this->fragment_dropping_ = false;
+        if (this->inbound_ring_ == nullptr || this->inbound_gate_.is_detached()) {
+            this->fragment_dropping_ = true;
+        } else {
+            const InboundRoute waited = this->wait_until_writable();
+            if (waited == InboundRoute::CLOSE) {
+                return {nullptr, InboundRoute::CLOSE};
+            }
+            this->fragment_dropping_ = waited == InboundRoute::DROP;
+        }
+        if (!this->fragment_dropping_) {
+            // The buffer is the transport's from here: nothing is pending. A dropped message
+            // leaves the fields alone, since the protocol task may still be reading a detached
+            // connection's pending message through them.
+            this->fallback_len_ = 0;
+            this->fallback_kind_ = is_text ? InboundKind::TEXT : InboundKind::BINARY;
+            this->fallback_receive_time_us_ = static_cast<uint32_t>(receive_time_us);
+        }
+    } else if (!this->fragment_assembly_open_) {
+        // RFC 6455 section 5.4: a continuation frame continues a fragmented message, so one with
+        // none open is a protocol error. It never reaches the fallback buffer, which may hold a
+        // pending message the protocol task is reading.
+        SS_LOGW(TAG, "Continuation frame with no fragmented message open; closing");
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
+    }
+    if (this->fragment_dropping_ || this->inbound_gate_.is_detached()) {
+        this->fragment_dropping_ = true;
+        return {nullptr, InboundRoute::DROP};
+    }
+    const size_t cap = this->inbound_gate_.is_admitted() ? INBOUND_MAX_MESSAGE_BYTES
+                                                         : InboundGate::PRE_ADMISSION_MESSAGE_BYTES;
+    if (len > cap - this->fallback_len_) {
+        SS_LOGW(TAG, "Multi-frame message exceeds %zu bytes; closing", cap);
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
+    }
+    const size_t needed = this->fallback_len_ + len;
+    if (this->fallback_buf_.size() < needed) {
+        const bool grown = this->fallback_buf_.data() == nullptr
+                               ? this->fallback_buf_.allocate(needed, this->fallback_location_)
+                               : this->fallback_buf_.realloc(needed);
+        if (!grown) {
+            SS_LOGE(TAG, "Failed to grow the fallback buffer to %zu bytes; closing", needed);
+            this->fail_inbound();
+            return {nullptr, InboundRoute::CLOSE};
+        }
+    }
+    return {this->fallback_buf_.data() + this->fallback_len_, InboundRoute::RECEIVE};
+}
+
+void SendspinConnection::end_inbound_fragment(size_t len, bool last) {
+    if (last) {
+        this->fragment_assembly_open_ = false;
+        this->note_message_completed();
+    }
+    if (this->fragment_dropping_) {
+        if (last) {
+            this->fragment_dropping_ = false;
+        }
+        return;
+    }
+    this->fallback_len_ += len;
+    if (!last) {
+        return;
+    }
+    if (!this->inbound_gate_.is_admitted()) {
+        this->inbound_to_fallback_ = true;
+        this->end_inbound_message(true);
+        return;
+    }
+    // Admitted: copy the assembled message into a ring item, the one copy this path costs over
+    // a single-frame message, and release the buffer.
+    const size_t total = this->fallback_len_;
+    const InboundTarget target =
+        this->route_inbound_message(total, this->fallback_kind_, this->fallback_receive_time_us_);
+    if (target.route != InboundRoute::RECEIVE) {
+        return;
+    }
+    if (this->inbound_item_ == nullptr) {
+        // The admission flag cleared in between and the message went to the fallback buffer it
+        // is already in.
+        this->end_inbound_message(true);
+        return;
+    }
+    std::memcpy(target.data, this->fallback_buf_.data(), total);
+    this->fallback_buf_.reset();
+    this->fallback_len_ = 0;
+    this->end_inbound_message(true);
 }
 
 // ============================================================================
@@ -551,6 +795,13 @@ void SendspinConnection::replay_pre_admission_messages(const HeldMessageVisitor&
     this->held_count_ = 0;
     this->held_bytes_ = 0;
     for (size_t i = 0; i < count; ++i) {
+        // The admission that started the replay is read once by its caller; a main-loop drop
+        // landing between two messages clears the flag and detaches the gate, and the rest of
+        // the hold belongs to a connection that no longer drives the roles.
+        if (this->inbound_gate_.is_detached() || !this->inbound_gate_.is_admitted()) {
+            SS_LOGD(TAG, "Connection dropped during its admission replay; discarding the rest");
+            break;
+        }
         const HeldMessageExtent& extent = this->held_extents_[i];
         visit(reinterpret_cast<const char*>(this->held_messages_.data()) + extent.offset,
               extent.length, extent.arrival_us);

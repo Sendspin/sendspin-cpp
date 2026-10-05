@@ -77,7 +77,7 @@ player_config.audio_formats = {
     {SendspinCodecFormat::PCM, 2, 44100, 16},
     {SendspinCodecFormat::PCM, 2, 48000, 16},
 };
-player_config.audio_buffer_capacity = 1000000;   // Ring buffer size in bytes (default: 1000000)
+player_config.audio_buffer_capacity = 1000000;   // Encoded audio held, in bytes (default: 1000000)
 player_config.fixed_delay_us = 0;                // Fixed delay offset in microseconds
 player_config.initial_output_delay_ms = 0;       // Initial user-adjustable delay
 player_config.extra_startup_silence_ms = 50;     // Extra startup silence for decode headroom (default: 50)
@@ -143,7 +143,7 @@ Receives real-time beat, loudness, dominant-frequency, onset, and spectrum data 
 
 ```cpp
 VisualizerSupportObject vis_support;
-vis_support.buffer_capacity = 32768;  // Total ring buffer bytes; ~1/3 holds wire data
+vis_support.buffer_capacity = 32768;  // Inbound ring bytes held; ~1/7 is advertised as wire data
 
 VisualizerStreamConfig vis_stream;
 vis_stream.types = {
@@ -485,7 +485,7 @@ below; a provider never needs to parse or interpret the bytes, only store and re
 byte-for-byte.
 
 Every method is invoked on the main loop thread, for every key, so a provider needs no locking
-of its own. (The one library write that originates on the network thread, the pairing record
+of its own. (The one library write that originates on the protocol task, the pairing record
 committed when a pairing finalizes, is staged internally and flushed to that record's slot key
 from the next `loop()` tick.)
 No internal library lock is held across the call, so a slow write does not stall the audio path
@@ -1175,7 +1175,7 @@ By default all roles are enabled. You can disable roles at build time to exclude
 Pass `-D` options to cmake:
 
 ```bash
-# Disable the player role (excludes decoder, sync task, audio ring buffer)
+# Disable the player role (excludes decoder and sync task)
 cmake -B build -DSENDSPIN_ENABLE_PLAYER=OFF
 
 # Disable all optional roles, keep only the player
@@ -1214,6 +1214,8 @@ CONFIG_SENDSPIN_ENABLE_VISUALIZER=y
 CONFIG_SENDSPIN_ENABLE_COLOR=y
 ```
 
+The component also selects esp_websocket_client's `ESP_WS_CLIENT_SEPARATE_TX_LOCK`, so sends on an outbound connection (`connect_to()`) take their own lock rather than the one the client task holds while the receive handler waits for inbound ring space.
+
 ### Effect on the API
 
 When a role is disabled, its `add_*()` method, accessor method, and backing member are removed from `client.h` via `#ifdef` guards. Attempting to call `client.add_player()` when `SENDSPIN_ENABLE_PLAYER` is `OFF` produces a compile error. The corresponding role header can still be included (it defines protocol types and the listener interface), but the role class cannot be instantiated.
@@ -1242,9 +1244,12 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains. See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
-| `httpd_stack_size` | `size_t` | `8192` | HTTP server task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
+| `httpd_stack_size` | `size_t` | `8192` | HTTP server task stack size in bytes (ESP-IDF only). The task only receives frames into the inbound ring and runs queued sends; values below the default are clamped up to it with a warning until that path is measured. Raising it is allowed. |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
-| `websocket_stack_size` | `size_t` | `8192` | esp_websocket_client task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task for outbound connections; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
+| `websocket_stack_size` | `size_t` | `8192` | esp_websocket_client task stack size in bytes (ESP-IDF only), the outbound connection's transport task. Values below the default are clamped up to it with a warning, as for `httpd_stack_size`. Raising it is allowed. |
+| `protocol_task_psram_stack` | `bool` | `false` | Allocate the protocol task (`SsProto`) stack in PSRAM (ESP-IDF only) |
+| `protocol_task_priority` | `unsigned` | `5` | FreeRTOS priority for the protocol task (ESP-IDF only). Defaults to the httpd task's priority, below the player's sync task. |
+| `protocol_task_stack_size` | `size_t` | `8192` | Protocol task stack size in bytes (ESP-IDF only). Every Noise handshake (including the in-band re-handshake after pairing, with its X25519 crypto), the JSON parse and the role handlers run on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
 | `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye) |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
@@ -1252,13 +1257,13 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
 | `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
 | `liveness_timeout_ms` | `std::optional<int64_t>` | unset (`60000` with default burst settings) | Milliseconds of inbound silence before the established connection is dropped as dead, with a `restart` goodbye so a server that was only slow reconnects. Unset derives it from the time burst settings, tolerating two consecutive unanswered time messages. An explicit value below `time_burst_interval_ms + time_burst_response_timeout_ms` drops healthy connections. Set or derived, it is capped at `SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS` (30 minutes). `0` disables the check. |
-| `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
-| `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `websocket_payload_location` (which covers the raw WebSocket frame buffer). ESP-IDF only; ignored on host. |
+| `inbound_ring_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the shared inbound ring every admitted connection receives into (sized from the player's `audio_buffer_capacity`, the visualizer's `buffer_capacity` and the largest artwork image; audio is decoded straight out of it) and each connection's fallback buffer for pre-admission messages. `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
+| `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `inbound_ring_location` (which covers the inbound ring). ESP-IDF only; ignored on host. |
 | `pairing_psk` | `std::optional<SendspinPsk>` | unset | A factory-provisioned Pairing PSK (32 bytes). Outranks a stored one and is never persisted; an all-zero key or the Sentinel PSK makes `start()` fail. Unset loads the stored one or generates and persists one on first boot. See [Pairing PSK](#pairing-psk). |
 | `static_pairing_code` | `std::optional<std::string>` | unset | The device's static pairing code, exactly 8 decimal digits. The `static_pairing_code` method is advertised only when this is set, `pairing_window_supported` is true, and `dynamic_pairing_code` is not advertised. An invalid value makes `start()` fail. |
 | `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
 | `static_pairing_code_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static pairing code the device shipped with, same values as above. Advertised on the `static_pairing_code` descriptor in `client/hello`; empty omits the hint. |
-| `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the network task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
+| `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the protocol task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
 
 ---
 
@@ -1269,7 +1274,7 @@ Configuration passed to `client.add_player()`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports, in priority order; advertised to the server during the hello handshake. The server selects one when establishing a stream. Must list at least one `FLAC` or `PCM` entry, the codecs every server supports; `OPUS` may be listed in addition when the build has the Opus decoder (`SENDSPIN_ENABLE_OPUS`). `start()` fails and logs otherwise. |
-| `audio_buffer_capacity` | `size_t` | `1000000` | Internal ring buffer size in bytes. Larger buffers absorb more jitter at the cost of memory. |
+| `audio_buffer_capacity` | `size_t` | `1000000` | Bytes of the shared inbound ring the player may hold as encoded audio (its quota; the ring is sized to include it). Each chunk is charged its stored size, so the client advertises the share that holds encoded frames at the smallest chunk size (2/3 of it) to the server; a server filling that share with frames under 144 bytes overruns the quota, and the excess is dropped with a warning. The ring also holds the traffic that arrives while the oldest chunk is held (`derive_inbound_ring_bytes()` in `src/inbound_ring.h`), so the default quota yields a 1,242,704-byte ring; a visualizer's frame rate and the artwork channels' images add to it (1,505,428 bytes with one 128 KB artwork channel). Larger buffers absorb more jitter at the cost of memory. |
 | `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable output delay. |
 | `initial_output_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable output delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
 | `extra_startup_silence_ms` | `uint16_t` | `50` | Extra silence inserted at stream start, after the first playback notification and before the first decoded chunk reaches the sink. Added on top of the initial-sync priming silence to give the decode pipeline more slack to stay ahead of the sink, preventing the initial-playback stutter caused by the decoder briefly falling behind. Larger values trade a longer startup delay for more underflow protection; set to `0` to disable. |
@@ -1330,7 +1335,7 @@ Configuration passed to `client.add_visualizer()`.
 
 | Field | Type | Description |
 |---|---|---|
-| `buffer_capacity` | `size_t` | Total RAM budget in bytes for the internal ring buffer. Per-entry overhead means only ~1/3 holds wire data; the client advertises that effective capacity to the server |
+| `buffer_capacity` | `size_t` | Bytes of the shared inbound ring the visualizer may hold (its quota; the ring is sized to include it). Per-item overhead means only ~1/7 holds wire data at the smallest frame size; the client advertises that effective capacity to the server. Below 70 bytes (the smallest budget that advertises one frame) the role refuses to start |
 
 `VisualizerStreamConfig` fields:
 
@@ -1519,4 +1524,4 @@ Set with `SendspinClient::set_log_level()`. Only affects host builds; ESP-IDF bu
 | `PREFER_EXTERNAL` | Prefer SPIRAM, fall back to internal RAM (ESP-IDF only) |
 | `PREFER_INTERNAL` | Prefer internal RAM, fall back to SPIRAM (ESP-IDF only) |
 
-Used by `SendspinClientConfig::websocket_payload_location` to control where the per-connection WebSocket payload reassembly buffer is allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and fragmentation buffers are allocated, and by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated. Ignored on host platforms (no internal/external distinction).
+Used by `SendspinClientConfig::inbound_ring_location` to control where the shared inbound ring and the per-connection fallback buffers are allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and fragmentation buffers are allocated, and by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated. Ignored on host platforms (no internal/external distinction).

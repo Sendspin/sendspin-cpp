@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "platform/memory.h"
 #include "sendspin/config.h"
 #include "server_connection.h"
 #include <esp_err.h>
@@ -72,23 +73,12 @@ public:
     /// httpd_sess_set_ctx, which acts as the authoritative owner for the connection's lifetime.
     using NewConnectionCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
 
-    /// @brief Callback type for notifying the client when a session closes
-    /// Passes the closed connection itself rather than its sockfd: the OS recycles fds after
-    /// close(), so an fd-keyed event drained later (on the manager loop) could be mis-routed to
-    /// a new connection that was accepted onto the recycled fd in the meantime.
-    using ConnectionClosedCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
-
-    /// @brief Callback type for looking up a connection by sockfd.
-    /// Returns a shared_ptr to keep the connection alive during message dispatch.
-    using FindConnectionCallback = std::function<std::shared_ptr<SendspinConnection>(int sockfd)>;
-
     /// @brief Starts the HTTP server and begins listening for WebSocket connections
     /// @param client Pointer to the SendspinClient (used for context in callbacks).
     /// @param task_stack_in_psram Whether to allocate the HTTP server task stack in PSRAM.
     /// @param task_priority Priority for the HTTP server task.
     /// @param task_stack_size HTTP server task stack size in bytes. Clamped up to
-    ///        SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE if lower (the Noise in-band
-    ///        re-handshake runs on this task and overflows a smaller stack).
+    ///        SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE if lower.
     /// @return true if server started successfully, false otherwise.
     bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority,
                size_t task_stack_size);
@@ -100,16 +90,6 @@ public:
     /// never speak WebSocket; httpd has no handshake timeout of its own). Called from the
     /// ConnectionManager loop.
     void tick();
-
-    /// @brief Sets the callback to invoke when a socket closes
-    void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
-        this->connection_closed_callback_ = std::move(callback);
-    }
-
-    /// @brief No-op on ESP: `websocket_handler` runs on the httpd task and looks the connection
-    /// up via `httpd_sess_get_ctx`. Kept as an instance method for symmetry with the host build.
-    // cppcheck-suppress functionStatic
-    void set_find_connection_callback(FindConnectionCallback&& /*callback*/) {}
 
     /// @brief Configures the maximum number of simultaneous connections
     /// The default supports handoff plus graceful rejection: one established connection, the
@@ -141,12 +121,22 @@ public:
         return this->server_ != nullptr;
     }
 
+    /// @brief Scratch space of INBOUND_MAX_MESSAGE_BYTES a dropped frame's payload is read into
+    /// (SendspinServerConnection::discard_frame_payload()). httpd hands a frame's payload over
+    /// only whole: httpd_ws_recv_frame() needs max_len >= the frame length (httpd_ws.c), so a
+    /// dropped frame still needs a buffer of its size. Allocated on the first drop, PSRAM
+    /// preferred, and kept until stop(), so a ring that stays full does not allocate per frame.
+    /// httpd task only: every session shares that one task, so one buffer serves them all.
+    /// @return nullptr when it cannot be allocated.
+    uint8_t* discard_buffer();
+
 protected:
     /// @brief Callback invoked when a new client opens a connection; creates a
     /// SendspinServerConnection and adds it to the pending table.
     static esp_err_t open_callback(httpd_handle_t handle, int sockfd);
 
-    /// @brief Callback invoked when a client closes a connection
+    /// @brief Callback invoked when a client closes a connection: marks the connection closed and
+    /// tells it its transport closed (SendspinConnection::notify_transport_closed())
     static void close_callback(httpd_handle_t handle, int sockfd);
 
     /// @brief WebSocket message handler registered with httpd. Doubles as the
@@ -173,14 +163,15 @@ protected:
     /// @brief Accepted sessions whose WebSocket upgrade has not yet been observed
     std::vector<PendingUpgrade> pending_;
 
-    ConnectionClosedCallback connection_closed_callback_;
-
     NewConnectionCallback new_connection_callback_;
 
     /// @brief Blocks for every accepted connection's queued sends. A member so it outlives each
     /// queued send (the destructor stops the server first); it adds
     /// SEND_BLOCK_SIZE * SEND_BLOCK_COUNT bytes to the server object.
     SendBlockPool send_pool_;
+
+    /// @brief See discard_buffer(). httpd task only; released by stop() once httpd has stopped.
+    PlatformBuffer discard_buf_;
 
     // Pointer fields
 

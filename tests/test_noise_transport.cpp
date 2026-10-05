@@ -23,6 +23,8 @@
 
 #include "connection.h"
 #include "crypto/constants.h"
+#include "inbound_ring.h"
+#include "inbound_test_helpers.h"
 #include "crypto/keys.h"
 #include "noise_handshake.h"
 #include "noise_session.h"
@@ -31,6 +33,7 @@
 #include "platform/crypto.h"
 #include "platform/time.h"
 #include "platform/types.h"
+#include "protocol_task.h"
 #include "record_store.h"
 #include "record_test_helpers.h"
 #include "sendspin/config.h"
@@ -110,29 +113,39 @@ public:
         return SsErr::OK;
     }
 
+    // The transport side of the receive path, which a concrete transport reaches as a subclass.
+    using SendspinConnection::abandon_inbound_message;
+    using SendspinConnection::begin_inbound_message;
+    using SendspinConnection::begin_inbound_fragment;
+    using SendspinConnection::end_inbound_fragment;
+    using SendspinConnection::end_inbound_message;
+    using SendspinConnection::InboundRoute;
+    using SendspinConnection::InboundTarget;
+
     // --- Test helpers ---
 
-    /// Inject a fully assembled binary frame (plaintext simulation after WS reassembly)
-    /// into the dispatch path, bypassing the WS layer.
+    /// Inject one complete binary WS message into the receive path the protocol task runs,
+    /// bypassing the transport. The test thread plays the protocol task: the message lives in a
+    /// buffer this connection owns rather than a ring item.
     void inject_binary_payload(const uint8_t* data, size_t len, int64_t receive_time = 0) {
-        uint8_t* dest = this->prepare_receive_buffer(len);
-        if (dest != nullptr) {
-            std::memcpy(dest, data, len);
-            this->commit_receive_buffer(len);
-        }
-        this->dispatch_completed_message(/*is_text=*/false, receive_time);
+        this->inject(data, len, InboundKind::BINARY, receive_time);
     }
 
-    /// Inject a fully assembled TEXT frame into the dispatch path, bypassing the WS layer.
-    /// Used to drive the pre-transport Noise handshake (client/init, server/init,
-    /// noise/handshake) the same way a real WS TEXT frame would.
+    /// Inject one complete TEXT WS message the same way. Used to drive the pre-transport Noise
+    /// handshake (client/init, server/init, noise/handshake) as a real TEXT frame would.
     void inject_text_payload(const std::string& text, int64_t receive_time = 0) {
-        uint8_t* dest = this->prepare_receive_buffer(text.size());
-        if (dest != nullptr) {
-            std::memcpy(dest, text.data(), text.size());
-            this->commit_receive_buffer(text.size());
-        }
-        this->dispatch_completed_message(/*is_text=*/true, receive_time);
+        this->inject(reinterpret_cast<const uint8_t*>(text.data()), text.size(), InboundKind::TEXT,
+                     receive_time);
+    }
+
+    void inject(const uint8_t* data, size_t len, InboundKind kind, int64_t receive_time) {
+        this->inject_buf_.assign(data, data + len);
+        InboundMessage message;
+        message.data = this->inject_buf_.data();
+        message.len = len;
+        message.receive_time_us = static_cast<uint32_t>(receive_time);
+        message.kind = kind;
+        this->process_inbound_message(message);
     }
 
     /// Install a noise session directly (bypasses handshake, for transport-only tests).
@@ -152,27 +165,21 @@ public:
     /// through the reassembly state machine, independent of decrypt_in_place. Lets a test judge
     /// an emitted frame sequence the way a peer would without standing up a second live session.
     NoiseTransport::CompleteMessage test_accept_plaintext(uint8_t* pt, size_t len) {
-        return this->noise_transport_.accept_plaintext(pt, len);
+        return this->noise_transport_.accept_plaintext(pt, len, this->is_admitted());
     }
-
-    // --- Direct access to the receive-buffer cap, bypassing WS/dispatch ---
-
-    uint8_t* test_prepare_receive_buffer(size_t data_len) {
-        return this->prepare_receive_buffer(data_len);
-    }
-    void test_commit_receive_buffer(size_t data_len) { this->commit_receive_buffer(data_len); }
-    size_t test_write_offset() const { return this->websocket_write_offset_; }
 
     // Accumulated outgoing messages
     std::vector<std::string> sent_text_;
     std::vector<std::vector<uint8_t>> sent_binary_;
+    // Backing store for the injected message, which the receive path decrypts in place.
+    std::vector<uint8_t> inject_buf_;
 
     // Reasons passed to disconnect(), in call order.
     std::vector<SendspinGoodbyeReason> disconnect_calls_;
 
     // Number of times close_transport_now() was invoked (the silent-close path; see
-    // close_silently(), which calls this instead of disconnect() so it never blocks/joins the
-    // network thread it runs on).
+    // close_silently(), which calls this instead of disconnect() so it never blocks on or joins
+    // a transport thread from the protocol task it runs on).
     int close_transport_now_calls_{0};
 };
 
@@ -850,9 +857,10 @@ public:
             ++this->json_dispatched_;
             this->last_message_.assign(d, d + n);
         };
-        this->conn_.on_binary_message_cb = [this](SendspinConnection* /*c*/, uint8_t* d, size_t n) {
+        this->conn_.on_binary_message_cb = [this](SendspinConnection* /*c*/,
+                                                  InboundMessage& message) {
             ++this->binary_dispatched_;
-            this->last_message_.assign(d, d + n);
+            this->last_message_.assign(message.data, message.data + message.len);
         };
     }
 
@@ -1027,8 +1035,8 @@ TEST(FragmentSequence, MalformedFragmentSequenceCloses) {
     }
 }
 
-// A frame already in the socket buffer when the close was decided still decrypts, so
-// close_silently() shuts the dispatch gate rather than relying on the transport being gone.
+// A frame already received when the close was decided still reaches the protocol task, so
+// close_silently() detaches the inbound gate rather than relying on the transport being gone.
 // TestConnection::close_transport_now() only counts, leaving that gate as the one thing that can
 // keep this well-formed message from reaching a role.
 TEST(FragmentSequence, AFrameLandingAfterTheCloseDoesNotDispatch) {
@@ -1190,59 +1198,11 @@ TEST(FragmentSequence, PreAdmissionMessageOverTheTightCapIsDiscarded) {
     EXPECT_EQ(rx.json_dispatched_, 1) << "the cap must narrow again when the slot is vacated";
 }
 
-// ============================================================================
-// Pre-authentication receive-buffer cap (prepare_receive_buffer)
-// ============================================================================
-
-TEST(ReceiveBufferCap, SingleFrameOverCapRejected) {
-    // A single call declaring more than MAX_TRANSPORT_PLAINTEXT + 16 (the largest legitimate
-    // Noise transport frame: plaintext plus the AEAD tag) must be rejected before any allocation,
-    // since this call is sized from unauthenticated peer input (a WS frame-length probe or a
-    // declared message length) on both the ESP server and ESP client paths.
-    constexpr size_t cap = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) + 16;
-    TestConnection conn;
-    uint8_t* dest = conn.test_prepare_receive_buffer(cap + 1);
-    EXPECT_EQ(dest, nullptr);
-    EXPECT_EQ(conn.test_write_offset(), 0u);
-}
-
-TEST(ReceiveBufferCap, CumulativeContinuationOverCapRejected) {
-    // A WS continuation sequence that stays under the cap on each individual call but whose
-    // running total crosses it must also be rejected: the check bounds
-    // websocket_write_offset_ + data_len, not just the current call's data_len, so an attacker
-    // cannot bypass the cap by splitting a message across many small continuation frames.
-    constexpr size_t cap = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) + 16;
-    TestConnection conn;
-
-    uint8_t* first = conn.test_prepare_receive_buffer(cap - 10);
-    ASSERT_NE(first, nullptr);
-    conn.test_commit_receive_buffer(cap - 10);
-    EXPECT_EQ(conn.test_write_offset(), cap - 10);
-
-    // This continuation only adds 20 bytes, but offset + data_len now exceeds the cap.
-    uint8_t* second = conn.test_prepare_receive_buffer(20);
-    EXPECT_EQ(second, nullptr);
-    // Rejection tears the buffer down the same way an allocation failure does, so a stale
-    // partial reassembly can never reach dispatch.
-    EXPECT_EQ(conn.test_write_offset(), 0u);
-}
-
-TEST(ReceiveBufferCap, ExactlyAtCapAccepted) {
-    // A frame declaring exactly the cap is the largest legitimate single Noise transport frame
-    // and must be accepted, not just rejected past it.
-    constexpr size_t cap = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) + 16;
-    TestConnection conn;
-    uint8_t* dest = conn.test_prepare_receive_buffer(cap);
-    ASSERT_NE(dest, nullptr);
-    conn.test_commit_receive_buffer(cap);
-    EXPECT_EQ(conn.test_write_offset(), cap);
-}
-
 TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     // A fatal initial-handshake error (here: a psk_category outside the three the protocol
     // defines, which messaging.md "noise/handshake" makes a malformed payload) must close the
     // connection. An unresolvable psk_id is not such an error: it takes the Sentinel Fallback.
-    // Driven through dispatch_completed_message() -> handle_noise_handshake_text(), unlike the
+    // Driven through process_inbound_message() -> handle_noise_handshake_text(), unlike the
     // NoiseHandshakeDriver.*Aborts tests, which only prove the state machine returns ABORT.
     Identity client_id = Identity::generate().value();
     Identity server_id = Identity::generate().value();
@@ -1401,8 +1361,8 @@ TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     int calls = 0;
     conn.on_json_message_cb = [&calls](SendspinConnection* /*c*/, const char* /*d*/, size_t /*n*/,
                                        int64_t /*t*/) { ++calls; };
-    conn.on_binary_message_cb = [&calls](SendspinConnection* /*c*/, uint8_t* /*d*/,
-                                         size_t /*n*/) { ++calls; };
+    conn.on_binary_message_cb = [&calls](SendspinConnection* /*c*/,
+                                         InboundMessage& /*message*/) { ++calls; };
 
     std::string json = "{\"x\":1}";
     std::vector<uint8_t> pt;
@@ -1739,7 +1699,7 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
 // malformed, and connection.cpp turns that into close_silently()).
 //
 // Sends come from more than one thread in production: the main loop sends client/time,
-// client/state and pairing messages while the network thread sends, for example, the
+// client/state and pairing messages while the protocol task sends, for example, the
 // re-handshake's msg2 (send_msg2_and_swap()).
 // fragment_and_send_locked() therefore has to hold session_mutex_ across every frame, not
 // re-acquire it per frame; otherwise a small concurrent send lands a complete frame in the gap.
@@ -1927,7 +1887,7 @@ TEST(NoiseTransport, OnlyTheTimeFrameInFlightIsClaimedAndOnlyOnce) {
     ASSERT_NE(conn.send_time_message(), 0);
     ASSERT_EQ(conn.sent_binary_.size(), 3U);
     const int64_t dropped = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[2]);
-    conn.disable_message_dispatch();
+    conn.detach_inbound();
     EXPECT_FALSE(conn.claim_time_frame(dropped).has_value());
 }
 
@@ -1971,7 +1931,7 @@ TEST(NoiseTransport, TimeFrameWriteDelaySurvivesTheLow32BitWrap) {
 }
 
 // A reply counts toward the burst only when its whole echo is that of the message still pending.
-// The network thread matches only the low 32 bits and claims at most one reply per message, but a
+// The protocol task matches only the low 32 bits and claims at most one reply per message, but a
 // claimed reply can be drained after loop() sent the next message; counted, any of these would
 // complete a two-message burst on one real exchange.
 TEST(TimeBurst, CountsOnlyTheReplyToItsPendingMessage) {
@@ -2051,4 +2011,393 @@ TEST(NoiseTransport, TimeMessageNeedsTheNoiseTransport) {
     EXPECT_EQ(conn.send_time_message(), 0);
     EXPECT_TRUE(conn.sent_text_.empty());
     EXPECT_TRUE(conn.sent_binary_.empty());
+}
+
+// ============================================================================
+// Inbound receive path: what a transport hands the protocol task
+// ============================================================================
+
+namespace {
+
+// A TestConnection wired to its own inbound ring and an unstarted protocol task (whose wake is
+// then a no-op), as the connection manager wires a real one.
+struct InboundHarness {
+    InboundHarness() {
+        create_test_ring(this->ring);
+        this->conn.attach_inbound(&this->ring, &this->task);
+    }
+
+    // Receives one complete message as a single-frame transport does.
+    TestConnection::InboundRoute receive(const std::vector<uint8_t>& bytes) {
+        const TestConnection::InboundTarget target =
+            this->conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+        if (target.route == TestConnection::InboundRoute::RECEIVE) {
+            std::memcpy(target.data, bytes.data(), bytes.size());
+            this->conn.end_inbound_message(true);
+        }
+        return target.route;
+    }
+
+    InboundRing ring;
+    ProtocolTask task{1};
+    TestConnection conn;
+};
+
+}  // namespace
+
+// An unadmitted connection never writes into the shared ring: its messages go one at a time
+// through the connection's own buffer, and the transport may not overwrite the one in flight
+// before the protocol task has consumed it. Waiting longer than InboundGate::WRITABLE_WAIT_MS for
+// that closes the connection rather than parking the transport thread.
+TEST(InboundReceive, AnUnadmittedConnectionHandsOverOneMessageAtATime) {
+    struct Row {
+        const char* name;
+        bool consume_first;
+        TestConnection::InboundRoute second_route;
+    };
+    const Row rows[] = {
+        {"Control: consumed before the next arrives", true, TestConnection::InboundRoute::RECEIVE},
+        {"the next arrives while the first is pending", false,
+         TestConnection::InboundRoute::CLOSE},
+    };
+    const std::vector<uint8_t> first{0x01, 0x02, 0x03};
+    const std::vector<uint8_t> second{0x0A, 0x0B};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+
+        ASSERT_EQ(h.receive(first), TestConnection::InboundRoute::RECEIVE);
+        EXPECT_EQ(h.ring.items_waiting(), 0U) << "an unadmitted connection wrote into the ring";
+        EXPECT_FALSE(h.conn.inbound_gate().may_write()) << "the first message is in flight";
+
+        InboundMessage pending;
+        ASSERT_TRUE(h.conn.pending_message(pending));
+        if (row.consume_first) {
+            h.conn.consume_pending_message();
+        }
+
+        EXPECT_EQ(h.receive(second), row.second_route);
+        ASSERT_TRUE(h.conn.pending_message(pending));
+        const std::vector<uint8_t>& expected = row.consume_first ? second : first;
+        EXPECT_EQ(std::vector<uint8_t>(pending.data, pending.data + pending.len), expected)
+            << "the message in flight was overwritten or lost";
+        EXPECT_EQ(h.conn.close_transport_now_calls_, row.consume_first ? 0 : 1);
+    }
+}
+
+// A message larger than the cap in force closes the connection: before admission that is
+// InboundGate::PRE_ADMISSION_MESSAGE_BYTES, after it one Noise frame (INBOUND_MAX_MESSAGE_BYTES).
+// No conforming peer sends either, and the transport learns the length before receiving a byte.
+TEST(InboundReceive, AMessageOverTheCapInForceClosesTheConnection) {
+    struct Row {
+        const char* name;
+        bool admitted;
+        size_t len;
+        TestConnection::InboundRoute route;
+    };
+    const Row rows[] = {
+        {"Control: pre-admission, at the cap", false, InboundGate::PRE_ADMISSION_MESSAGE_BYTES,
+         TestConnection::InboundRoute::RECEIVE},
+        {"pre-admission, one byte over", false, InboundGate::PRE_ADMISSION_MESSAGE_BYTES + 1,
+         TestConnection::InboundRoute::CLOSE},
+        {"Control: pre-admission, one byte", false, 1, TestConnection::InboundRoute::RECEIVE},
+        {"pre-admission, zero length", false, 0, TestConnection::InboundRoute::DROP},
+        {"Control: admitted, one Noise frame", true, INBOUND_MAX_MESSAGE_BYTES,
+         TestConnection::InboundRoute::RECEIVE},
+        {"admitted, one byte over a Noise frame", true, INBOUND_MAX_MESSAGE_BYTES + 1,
+         TestConnection::InboundRoute::CLOSE},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+        h.conn.set_admitted(row.admitted);
+
+        EXPECT_EQ(h.receive(std::vector<uint8_t>(row.len, 0x5A)), row.route);
+        const bool closed = row.route == TestConnection::InboundRoute::CLOSE;
+        EXPECT_EQ(h.conn.close_transport_now_calls_, closed ? 1 : 0);
+        EXPECT_EQ(h.conn.inbound_gate().is_detached(), closed)
+            << "a closed connection must stop dispatching what it already received";
+    }
+}
+
+// A message split across WebSocket frames is assembled in the connection's fallback buffer and
+// held to the same cap as a single-frame message, applied to its running total, so a peer cannot
+// pass the cap with frames that are each under it.
+TEST(InboundReceive, AMultiFrameMessageIsCappedOnItsRunningTotal) {
+    struct Row {
+        const char* name;
+        bool admitted;
+        size_t cap;
+        size_t second_len;
+        TestConnection::InboundRoute route;
+    };
+    const Row rows[] = {
+        {"Control: pre-admission, total at the cap", false,
+         InboundGate::PRE_ADMISSION_MESSAGE_BYTES, 10, TestConnection::InboundRoute::RECEIVE},
+        {"pre-admission, total one byte over", false, InboundGate::PRE_ADMISSION_MESSAGE_BYTES,
+         11, TestConnection::InboundRoute::CLOSE},
+        {"Control: admitted, total at one Noise frame", true, INBOUND_MAX_MESSAGE_BYTES, 10,
+         TestConnection::InboundRoute::RECEIVE},
+        {"admitted, total one byte over", true, INBOUND_MAX_MESSAGE_BYTES, 11,
+         TestConnection::InboundRoute::CLOSE},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+        h.conn.set_admitted(row.admitted);
+        const size_t first_len = row.cap - 10;
+
+        const TestConnection::InboundTarget first = h.conn.begin_inbound_fragment(
+            first_len, /*first=*/true, /*is_text=*/false, platform_time_us());
+        ASSERT_EQ(first.route, TestConnection::InboundRoute::RECEIVE);
+        std::memset(first.data, 0x11, first_len);
+        h.conn.end_inbound_fragment(first_len, /*last=*/false);
+
+        const TestConnection::InboundTarget second = h.conn.begin_inbound_fragment(
+            row.second_len, /*first=*/false, /*is_text=*/false, platform_time_us());
+        EXPECT_EQ(second.route, row.route);
+        EXPECT_EQ(h.conn.close_transport_now_calls_,
+                  row.route == TestConnection::InboundRoute::CLOSE ? 1 : 0);
+        if (second.route != TestConnection::InboundRoute::RECEIVE) {
+            continue;
+        }
+        std::memset(second.data, 0x22, row.second_len);
+        h.conn.end_inbound_fragment(row.second_len, /*last=*/true);
+
+        // The whole message reaches the protocol task: in a ring item once admitted (the one
+        // copy this path costs), as the pending message before.
+        size_t len = 0;
+        if (row.admitted) {
+            void* item = h.ring.take(&len, 0);
+            ASSERT_NE(item, nullptr);
+            h.conn.inbound_gate().note_item_taken();
+            h.ring.return_item(item);
+        } else {
+            InboundMessage pending;
+            ASSERT_TRUE(h.conn.pending_message(pending));
+            len = pending.len;
+        }
+        EXPECT_EQ(len, row.cap);
+    }
+}
+
+// A transport that stops part-way through a message it is receiving into a ring item cannot
+// cancel the acquire, so it completes the item as DISCARD: the protocol task must never be handed
+// it, and the connection's in-flight count must not keep a close waiting on it.
+TEST(InboundReceive, AnAbandonedRingItemIsNeverHandedToTheProtocolTask) {
+    struct Row {
+        const char* name;
+        bool abandon;
+    };
+    const Row rows[] = {{"Control: received", false}, {"abandoned part-way", true}};
+    const std::vector<uint8_t> bytes{0x04, 0x05, 0x06, 0x07};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+        h.conn.set_admitted(true);
+
+        const TestConnection::InboundTarget target =
+            h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+        ASSERT_EQ(target.route, TestConnection::InboundRoute::RECEIVE);
+        ASSERT_TRUE(in_ring_storage(h.ring, target.data)) << "an admitted message skipped the ring";
+        std::memcpy(target.data, bytes.data(), bytes.size() / 2);
+        if (row.abandon) {
+            h.conn.abandon_inbound_message();
+        } else {
+            std::memcpy(target.data + bytes.size() / 2, bytes.data() + bytes.size() / 2,
+                        bytes.size() - bytes.size() / 2);
+            h.conn.end_inbound_message(true);
+        }
+
+        size_t len = 0;
+        void* item = h.ring.take(&len, 0);
+        EXPECT_EQ(item != nullptr, !row.abandon);
+        if (item != nullptr) {
+            const uint8_t* received = inbound_item_bytes(item);
+            EXPECT_EQ(std::vector<uint8_t>(received, received + len), bytes);
+            h.conn.inbound_gate().note_item_taken();
+            h.ring.return_item(item);
+        }
+        EXPECT_EQ(h.conn.inbound_gate().in_flight(), 0U);
+    }
+}
+
+// RFC 6455 section 5.4: a continuation frame continues an open fragmented message, and the
+// fragments of one message are not interleaved with another data message. The ESP transports
+// track no fragment state and pass either violation on, so the connection closes over it rather
+// than append to a fallback buffer that may hold a message the protocol task is reading.
+TEST(InboundReceive, AFrameOutOfFragmentSequenceClosesTheConnection) {
+    // What the connection's fallback buffer holds when the second frame arrives: a pending
+    // single-frame message, the first fragment of an open message, or a pending message
+    // assembled from fragments.
+    enum class Before : uint8_t { PENDING_SINGLE, OPEN_ASSEMBLY, PENDING_ASSEMBLED };
+    enum class Second : uint8_t { CONTINUATION, SINGLE_FRAME, FIRST_FRAGMENT };
+    struct Row {
+        const char* name;
+        Before before;
+        Second second;
+        TestConnection::InboundRoute route;
+    };
+    const Row rows[] = {
+        {"Control: continuation after a first fragment", Before::OPEN_ASSEMBLY,
+         Second::CONTINUATION, TestConnection::InboundRoute::RECEIVE},
+        {"continuation with no fragmented message open", Before::PENDING_SINGLE,
+         Second::CONTINUATION, TestConnection::InboundRoute::CLOSE},
+        {"continuation after a fragmented message ended", Before::PENDING_ASSEMBLED,
+         Second::CONTINUATION, TestConnection::InboundRoute::CLOSE},
+        {"single-frame message inside a fragmented message", Before::OPEN_ASSEMBLY,
+         Second::SINGLE_FRAME, TestConnection::InboundRoute::CLOSE},
+        {"fragmented message started inside another", Before::OPEN_ASSEMBLY,
+         Second::FIRST_FRAGMENT, TestConnection::InboundRoute::CLOSE},
+    };
+    const std::vector<uint8_t> single{0x01, 0x02, 0x03};
+    const std::vector<uint8_t> first{0x11, 0x12};
+    const std::vector<uint8_t> second{0x21, 0x22, 0x23, 0x24};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+
+        // An unadmitted connection's message waits in the fallback buffer for the protocol task.
+        if (row.before == Before::PENDING_SINGLE) {
+            ASSERT_EQ(h.receive(single), TestConnection::InboundRoute::RECEIVE);
+        } else {
+            const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
+                first.size(), /*first=*/true, /*is_text=*/false, platform_time_us());
+            ASSERT_EQ(target.route, TestConnection::InboundRoute::RECEIVE);
+            std::memcpy(target.data, first.data(), first.size());
+            h.conn.end_inbound_fragment(first.size(), row.before == Before::PENDING_ASSEMBLED);
+        }
+        InboundMessage pending;
+        const uint8_t* pending_data = nullptr;
+        if (row.before != Before::OPEN_ASSEMBLY) {
+            ASSERT_TRUE(h.conn.pending_message(pending));
+            pending_data = pending.data;
+        }
+
+        TestConnection::InboundRoute route;
+        if (row.second != Second::SINGLE_FRAME) {
+            const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
+                second.size(), /*first=*/row.second == Second::FIRST_FRAGMENT,
+                /*is_text=*/false, platform_time_us());
+            route = target.route;
+            if (route == TestConnection::InboundRoute::RECEIVE) {
+                std::memcpy(target.data, second.data(), second.size());
+                h.conn.end_inbound_fragment(second.size(), /*last=*/true);
+            }
+        } else {
+            route = h.receive(second);
+        }
+        EXPECT_EQ(route, row.route);
+        const bool closed = row.route == TestConnection::InboundRoute::CLOSE;
+        EXPECT_EQ(h.conn.close_transport_now_calls_, closed ? 1 : 0);
+        EXPECT_EQ(h.conn.inbound_gate().is_detached(), closed);
+
+        if (row.before == Before::OPEN_ASSEMBLY) {
+            if (!closed) {
+                std::vector<uint8_t> assembled = first;
+                assembled.insert(assembled.end(), second.begin(), second.end());
+                ASSERT_TRUE(h.conn.pending_message(pending));
+                EXPECT_EQ(std::vector<uint8_t>(pending.data, pending.data + pending.len),
+                          assembled);
+            }
+            continue;
+        }
+        // The message the protocol task holds is neither moved nor overwritten.
+        const std::vector<uint8_t>& held = row.before == Before::PENDING_SINGLE ? single : first;
+        ASSERT_TRUE(h.conn.pending_message(pending));
+        EXPECT_EQ(pending.data, pending_data) << "the pending message's buffer moved";
+        EXPECT_EQ(std::vector<uint8_t>(pending.data, pending.data + pending.len), held);
+    }
+}
+
+// The liveness stamp is taken when a message is complete, not when its first bytes arrive: a
+// transport stalled part-way through a message holds a ring item every later item waits behind,
+// and the liveness watchdog is what bounds that hold.
+TEST(InboundReceive, TheLivenessStampIsTakenWhenAMessageCompletes) {
+    enum class Shape : uint8_t { SINGLE_FRAME, MULTI_FRAME };
+    struct Row {
+        const char* name;
+        bool admitted;
+        bool detached;  // the transport drops the message rather than receiving it
+        Shape shape;
+        bool complete;  // the transport delivers the message's last bytes
+        bool stamped;
+    };
+    const Row rows[] = {
+        {"Control: admitted single frame, completed", true, false, Shape::SINGLE_FRAME, true,
+         true},
+        {"admitted single frame, ring item acquired and not completed", true, false,
+         Shape::SINGLE_FRAME, false, false},
+        {"Control: unadmitted single frame, completed", false, false, Shape::SINGLE_FRAME, true,
+         true},
+        {"unadmitted single frame, begun and not completed", false, false, Shape::SINGLE_FRAME,
+         false, false},
+        {"Control: multi-frame message, last fragment in", true, false, Shape::MULTI_FRAME, true,
+         true},
+        {"multi-frame message, first fragment only", true, false, Shape::MULTI_FRAME, false,
+         false},
+        // A dropped single frame holds nothing, so its start stands in for its completion.
+        {"dropped single frame, stamped at its start", true, true, Shape::SINGLE_FRAME, false,
+         true},
+        {"Control: dropped multi-frame message, last fragment in", true, true, Shape::MULTI_FRAME,
+         true, true},
+        {"dropped multi-frame message, first fragment only", true, true, Shape::MULTI_FRAME, false,
+         false},
+    };
+    const std::vector<uint8_t> bytes{0x31, 0x32, 0x33, 0x34};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+        h.conn.set_admitted(row.admitted);
+        if (row.detached) {
+            h.conn.inbound_gate().detach();
+        }
+        const TestConnection::InboundRoute route = row.detached
+                                                       ? TestConnection::InboundRoute::DROP
+                                                       : TestConnection::InboundRoute::RECEIVE;
+        ASSERT_EQ(h.conn.get_last_receive_time_us(), 0U);
+
+        if (row.shape == Shape::SINGLE_FRAME) {
+            const TestConnection::InboundTarget target =
+                h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+            ASSERT_EQ(target.route, route);
+            if (target.route == TestConnection::InboundRoute::RECEIVE) {
+                std::memcpy(target.data, bytes.data(), bytes.size());
+                EXPECT_EQ(h.conn.get_last_receive_time_us(), 0U) << "stamped before completion";
+                if (row.complete) {
+                    h.conn.end_inbound_message(true);
+                }
+            }
+        } else {
+            const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
+                bytes.size(), /*first=*/true, /*is_text=*/false, platform_time_us());
+            ASSERT_EQ(target.route, route);
+            size_t received = 0;
+            if (target.route == TestConnection::InboundRoute::RECEIVE) {
+                std::memcpy(target.data, bytes.data(), bytes.size());
+                received = bytes.size();
+            }
+            h.conn.end_inbound_fragment(received, /*last=*/false);
+            EXPECT_EQ(h.conn.get_last_receive_time_us(), 0U) << "stamped before completion";
+            if (row.complete) {
+                const TestConnection::InboundTarget last = h.conn.begin_inbound_fragment(
+                    0, /*first=*/false, /*is_text=*/false, platform_time_us());
+                ASSERT_EQ(last.route, route);
+                h.conn.end_inbound_fragment(0, /*last=*/true);
+            }
+        }
+        EXPECT_EQ(h.conn.get_last_receive_time_us() != 0U, row.stamped);
+
+        // Every acquired item is completed (see InboundRing::acquire()).
+        h.conn.abandon_inbound_message();
+        size_t len = 0;
+        while (void* item = h.ring.take(&len, 0)) {
+            h.conn.inbound_gate().note_item_taken();
+            h.ring.return_item(item);
+        }
+    }
 }

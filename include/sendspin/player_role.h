@@ -112,9 +112,9 @@ public:
 /**
  * @brief Audio streaming role that decodes and synchronizes playback to server timestamps
  *
- * Owns a SyncTask that runs on a background thread. Encoded audio chunks arrive from the
- * WebSocket network thread, are written into an audio ring buffer, then decoded and
- * scheduled for output against the server clock via the time filter. Decoded PCM frames
+ * Owns a SyncTask that runs on a background thread. Encoded audio chunks are received into the
+ * client's shared inbound ring, handed to the sync task by the protocol task in place, then
+ * decoded and scheduled for output against the server clock via the time filter. Decoded PCM frames
  * are delivered to the platform through the PlayerRoleListener::on_audio_write() callback.
  *
  * Usage:

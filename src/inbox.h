@@ -89,8 +89,8 @@ class InboxSlot;
 /**
  * @brief Shared main-loop mailbox: one mutex, one dirty-topic bitmask, one fixed event ring
  *
- * Producer threads (network, decode) write latest-value state through an InboxSlot bound to
- * this Inbox, or push lifecycle events directly with push_event(). The main loop reads poll()
+ * Producer threads (the protocol task, decode) write latest-value state through an InboxSlot bound
+ * to this Inbox, or push lifecycle events directly with push_event(). The main loop reads poll()
  * once per tick and only locks the mutex to drain topics whose bit is set.
  *
  * @note HARD RULE: no user-visible code (listener callbacks, client/role methods) may run while

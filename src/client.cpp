@@ -19,6 +19,7 @@
 #include "crypto/keys.h"
 #include "crypto/pairing_code.h"
 #include "crypto/pairing_token.h"
+#include "inbound_ring.h"
 #include "inbox.h"
 #include "pairing_offers.h"
 #include "platform/base64.h"
@@ -46,6 +47,7 @@
 #include "sendspin/player_role.h"
 #endif
 #include "protocol_messages.h"
+#include "protocol_task.h"
 #include "time_burst.h"
 #include "time_filter.h"
 #ifdef SENDSPIN_ENABLE_VISUALIZER
@@ -123,13 +125,12 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
 /// yet seen never costs the connection.
 ///
 /// A true verdict is only half the gate. The caller pairs it with the role's teardown generation,
-/// loaded right after this returns and passed into the handler: the gate runs once, on the network
-/// thread, while the effect it admits lands later, and the deactivation path (unlike a lost
-/// connection) never quiesces the network thread. Each point of effect re-checks the captured
-/// value, so a teardown inside that window invalidates the whole handler. See Impl::accepts() on
-/// each role.
+/// loaded right after this returns and passed into the handler: the gate runs once, on the
+/// protocol task, while the effect it admits lands later, and a teardown on the main loop can land
+/// in between. Each point of effect re-checks the captured value, so a teardown inside that window
+/// invalidates the whole handler. See Impl::accepts() on each role.
 ///
-/// Runs on the network thread, so it reads the connection's atomic role mask. `conn` is never null
+/// Runs on the protocol task, so it reads the connection's atomic role mask. `conn` is never null
 /// at the dispatch points: the admission gate ahead of them returns first.
 [[maybe_unused]] bool role_accepts_traffic(const SendspinConnection* conn, SendspinRole role) {
     if (conn->is_role_active(role)) {
@@ -196,6 +197,7 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
     : config_(std::move(config)),
       connection_manager_(std::make_unique<ConnectionManager>(this)),
       event_state_(std::make_unique<EventState>()),
+      protocol_task_(std::make_unique<ProtocolTask>(this->config_.server_max_connections)),
       time_burst_(std::make_unique<SendspinTimeBurst>()) {
     if (this->config_.json_arena_size > 0) {
         this->json_arena_ = std::make_unique<SendspinArenaAllocator>(this->config_.json_arena_size);
@@ -208,25 +210,29 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
 SendspinClient::~SendspinClient() {
     // Transport-only teardown: goodbye and close every peer in the same order as stop(), but
     // dispatch no teardown or clear callback (nothing reaches the inbox and no drain runs). A
-    // role-thread callback can still run until its role is joined by the resets below, whose
-    // destructors run the same stop() the explicit path would, so listeners must outlive the
-    // client.
+    // role-thread callback can still run until stop_role_threads() below joins its role, so
+    // listeners must outlive the client.
     if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         this->close_transports();
+        // The role threads next, as stop() does: each returns the items it holds and unbinds its
+        // list from the ring, so the ring's reset below never reaches a list the role resets
+        // destroy (a LOCAL item its holder returned but the protocol task never took is counted
+        // through that list).
+        this->stop_role_threads();
+        this->release_inbound_ring();
         // Every high-performance hold ends with the client. The release sites for the time hold
         // (cleanup_connection_state()) and the playback hold (the player's cleanup()) do not run
-        // here, and nothing can acquire once the network threads are gone.
+        // here, and nothing can acquire once the transports and the protocol task are gone.
         this->high_performance_releases_pending_ = 0;
         while (this->high_performance_ref_count_.load() > 0) {
             this->release_high_performance();
         }
     }
 
-    // The network threads are gone (above, or never started), so the role threads are the only
-    // producers left; each role's destructor joins its own. Every role is reset explicitly (not
-    // just the threaded ones): role InboxSlots release their topic-bit claims against
-    // event_state_'s Inbox on destruction, so all roles must be gone before the alphabetized
-    // member order destroys event_state_.
+    // Every thread is joined and the inbound ring released (above, by stop(), or never started).
+    // Every role is reset explicitly (not just the threaded ones):
+    // role InboxSlots release their topic-bit claims against event_state_'s Inbox on destruction,
+    // so all roles must be gone before the alphabetized member order destroys event_state_.
 #ifdef SENDSPIN_ENABLE_PLAYER
     this->player_.reset();
 #endif
@@ -332,17 +338,24 @@ bool SendspinClient::start() {
     // Load persisted state
     this->load_last_played_server();
 
+    // The inbound ring every admitted connection receives into and the role threads consume
+    // from; the role starts below bind their item lists to it.
+    if (!this->create_inbound_ring()) {
+        return false;
+    }
+
     // Start the role threads. A failure part-way stops the roles that did start, so the client
     // is back in the stopped state and a corrected retry begins clean.
     bool roles_started = true;
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (roles_started && this->player_) {
-        roles_started = this->player_->impl_->start(this->persistence_provider_);
+        roles_started =
+            this->player_->impl_->start(this->persistence_provider_, this->inbound_ring_.get());
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     if (roles_started && this->visualizer_) {
-        roles_started = this->visualizer_->impl_->start();
+        roles_started = this->visualizer_->impl_->start(this->inbound_ring_.get());
     }
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -352,6 +365,25 @@ bool SendspinClient::start() {
 #endif
     if (!roles_started) {
         this->stop_role_threads();
+        this->release_inbound_ring();
+        return false;
+    }
+
+    // The protocol task, before any connection exists: every connection's messages go to it.
+    // Undersized stacks are clamped to the documented minimum, as the transport tasks' are.
+    size_t protocol_stack = this->config_.protocol_task_stack_size;
+    if (protocol_stack < SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE) {
+        SS_LOGW(TAG, "protocol_task_stack_size %u below minimum %u; clamping",
+                static_cast<unsigned>(protocol_stack),
+                static_cast<unsigned>(SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE));
+        protocol_stack = SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE;
+    }
+    if (!this->protocol_task_->start([this]() { return this->protocol_tick(); }, protocol_stack,
+                                     this->config_.protocol_task_priority,
+                                     this->config_.protocol_task_psram_stack)) {
+        SS_LOGE(TAG, "Failed to start the protocol task");
+        this->stop_role_threads();
+        this->release_inbound_ring();
         return false;
     }
 
@@ -371,14 +403,17 @@ void SendspinClient::stop() {
     // cannot recurse into the teardown, restart the server, or admit a connection.
     this->lifecycle_.store(LifecycleState::STOPPING, std::memory_order_release);
 
-    // 1-2. Signal the drain roles, then goodbye and close every transport (see
-    //      close_transports()). Nothing reaches a role or the inbox from the network after this.
+    // 1-3. Signal the drain roles, goodbye and close every transport, then join the protocol
+    //      task (see close_transports()). Nothing reaches a role or the inbox from a transport
+    //      after this.
     const PairingUiSnapshot pairing_ui = this->close_transports();
 
-    // 3. Role threads. Each role discards its ring/queue content after its own join.
+    // 4. Role threads. Each role returns the inbound ring items it held after its own join, and
+    //    with every producer and consumer gone the ring is emptied and released.
     this->stop_role_threads();
+    this->release_inbound_ring();
 
-    // 4. Reset per-connection and role state exactly as a lost connection does. With every
+    // 5. Reset per-connection and role state exactly as a lost connection does. With every
     //    producer thread joined, the state this leaves behind is the state a restart begins
     //    from. The group slot is reset here too, so the drain below cannot repopulate
     //    group_state_ from a delta that arrived before the stop.
@@ -395,7 +430,7 @@ void SendspinClient::stop() {
         this->note_close_pairing_window();
     }
 
-    // 5. Deliver the clear callbacks the cleanup queued, now rather than on a loop() tick that is
+    // 6. Deliver the clear callbacks the cleanup queued, now rather than on a loop() tick that is
     //    not coming. Every getter already reports the stopped state, so a callback that reads
     //    the client sees exactly what a caller sees once stop() returns.
     this->drain_inbox();
@@ -405,15 +440,26 @@ void SendspinClient::stop() {
 
 PairingUiSnapshot SendspinClient::close_transports() {
     // 1. Ask the artwork and visualizer threads to exit now, so a slow on_image_decode() or a
-    //    parked drain overlaps the transport teardown instead of following it. Their inbound
-    //    channels never block a network thread (a zero-timeout queue send, a bounded ring
-    //    acquire). The player's ring does block, so the player is joined by the caller after the
-    //    network threads are gone.
+    //    parked drain overlaps the transport teardown instead of following it. The visualizer's
+    //    frames stay on its list until its join; the player keeps running, returning the items
+    //    it plays, so a transport waiting for ring space is never parked behind a stopped
+    //    consumer.
     this->signal_drain_role_stops();
 
-    // 2. Transports: goodbye every peer, wait up to the flush bound, then close the server and
-    //    every connection. This joins every network thread.
-    return this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
+    // 2. Transports: detach every connection's inbound gate (no transport waits on the protocol
+    //    task from here), goodbye every peer, wait up to the flush bound, then close the server
+    //    and every connection. This joins every transport thread. The protocol task keeps
+    //    running meanwhile, returning what still reaches the ring, so a transport inside a ring
+    //    acquire gets its room or gives up within INBOUND_ACQUIRE_TIMEOUT_MS.
+    const PairingUiSnapshot pairing_ui =
+        this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
+
+    // 3. The protocol task: a final tick, then the join. It releases the last connection
+    //    references it held, and the losses it reported for the connections step 2 released
+    //    name connections that are gone.
+    this->protocol_task_->stop();
+    this->connection_manager_->drop_pending_events();
+    return pairing_ui;
 }
 
 void SendspinClient::signal_drain_role_stops() {
@@ -445,6 +491,49 @@ void SendspinClient::stop_role_threads() {
         this->artwork_->impl_->stop();
     }
 #endif
+}
+
+bool SendspinClient::create_inbound_ring() {
+    InboundRingBudget budget;
+    budget.time_burst_size = this->config_.time_burst_size;
+    budget.time_burst_interval_ms = this->config_.time_burst_interval_ms;
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (this->player_) {
+        budget.audio_hold_bytes = this->player_->impl_->config.audio_buffer_capacity;
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_) {
+        budget.visualizer_hold_bytes = this->visualizer_->impl_->visualizer_support.buffer_capacity;
+        budget.visualizer_stored_bytes_per_second =
+            this->visualizer_->impl_->stored_frame_bytes_per_second();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    if (this->artwork_) {
+        for (const auto& slot : this->artwork_->impl_->config.preferred_formats) {
+            budget.artwork_images_stored_bytes += inbound_frames_stored_bytes(slot.max_image_bytes);
+        }
+    }
+#endif
+    const size_t storage_bytes = derive_inbound_ring_bytes(budget);
+    auto ring = std::make_unique<InboundRing>();
+    if (!ring->create(storage_bytes, this->config_.inbound_ring_location)) {
+        return false;
+    }
+    ring->quota(InboundHolder::PLAYER).set_limit(budget.audio_hold_bytes);
+    ring->quota(InboundHolder::VISUALIZER).set_limit(budget.visualizer_hold_bytes);
+    SS_LOGD(TAG, "Inbound ring: %zu bytes", storage_bytes);
+    this->inbound_ring_ = std::move(ring);
+    return true;
+}
+
+void SendspinClient::release_inbound_ring() {
+    if (this->inbound_ring_ == nullptr) {
+        return;
+    }
+    this->inbound_ring_->reset();
+    this->inbound_ring_.reset();
 }
 
 void SendspinClient::connect_to(const std::string& url) {
@@ -550,7 +639,7 @@ void SendspinClient::drain_inbox() {
     const uint32_t inbox_bits = this->event_state_->inbox.poll();
 
     // --- Deferred provider writes ---
-    // A request made since ConnectionManager::loop()'s flush (a pairing the network thread
+    // A request made since ConnectionManager::loop()'s flush (a pairing the protocol task
     // committed) or owed at the stop() drain. Ahead of the pairing-note dispatch below, so
     // on_pairing_succeeded finds the record committed.
     if (inbox_bits & INBOX_TOPIC_PERSIST) {
@@ -1132,6 +1221,9 @@ void SendspinClient::cleanup_connection_state() {
         this->release_high_performance_deferred();
         this->high_performance_held_for_time_ = false;
     }
+
+    // The protocol task recalls the items the torn-down stream roles' consumers have not taken.
+    this->protocol_task_->wake();
 }
 
 std::string SendspinClient::build_hello_message() {
@@ -1267,41 +1359,154 @@ bool requires_admitted_connection(SendspinServerToClientMessageType type) {
 
 void SendspinClient::process_json_message(SendspinConnection* conn, const char* data, size_t len,
                                           int64_t timestamp) {
-    // Two connections can deliver JSON concurrently on their own network threads (current +
-    // pending during a handoff, or an outbound connect_to() transport alongside the inbound
-    // server). Serialize the shared arena, the parse, and the handlers it dispatches to. The
-    // hold spans the in-band re-handshake's X25519 work and its msg2 send, which conventions.md
-    // "Threading and cross-thread state" sanctions: the swap must stay ordered with decrypt.
-    std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
+    // Every connection's messages are processed on the protocol task, one at a time, so the
+    // shared arena, the parse and the handlers it dispatches to need no lock. Role messages the
+    // connection held before its admission go first (see dispatch_json_message()).
     this->dispatch_json_message(conn, data, len, timestamp);
 }
 
-void SendspinClient::admit_connection(SendspinConnection* conn) {
-    // Runs on the main loop, from ConnectionManager::flush_pending_admission(), which calls it
-    // with conn_ptr_mutex_ dropped: json_processing_mutex_ is the outer lock of the pair (see
-    // docs/conventions.md, "Threading and cross-thread state"). Holding it across both steps is
-    // what makes the replay exact: a network thread that reaches the dispatch gate meanwhile
-    // either blocks here and then sees an admitted connection (dispatching live, after everything
-    // held), or already held its message and is drained below.
-    {
-        std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
-        conn->replay_pre_admission_messages(
-            [this, conn](const char* data, size_t len, int64_t arrival_us) {
-                SS_LOGD(TAG, "Replaying a role message held until admission (%zu bytes)", len);
-                this->dispatch_json_message(conn, data, len, arrival_us,
-                                            JsonMessageOrigin::ADMISSION_REPLAY);
-            });
-        // Last: the binary path reads this flag without the mutex, so audio chunks start being
-        // dispatched on the network thread only once the replay above has finished writing to the
-        // roles it feeds.
-        conn->set_admitted(true);
+void SendspinClient::replay_admitted_messages(SendspinConnection* conn) {
+    // The hold and the replay both run on the protocol task, the thread that dispatches the
+    // connection's live messages, so a message held while the connection was unadmitted is
+    // replayed exactly once, in arrival order, ahead of anything dispatched after the admission.
+    if (conn == nullptr || !conn->has_held_messages() || !conn->is_admitted()) {
+        return;
     }
+    conn->replay_pre_admission_messages(
+        [this, conn](const char* data, size_t len, int64_t arrival_us) {
+            SS_LOGD(TAG, "Replaying a role message held until admission (%zu bytes)", len);
+            this->dispatch_json_message(conn, data, len, arrival_us,
+                                        JsonMessageOrigin::ADMISSION_REPLAY);
+        });
+}
+
+void SendspinClient::admit_connection(SendspinConnection* conn) {
+    // Runs on the main loop, from ConnectionManager::flush_pending_admission(). The protocol task
+    // replays the held role messages (replay_admitted_messages()) ahead of the connection's next
+    // message, and on its next tick in any case.
+    conn->set_admitted(true);
+    this->protocol_task_->wake();
 
     // The client/state promotion held (see publish_client_state()) goes out now that the binary
-    // data it opens can be dispatched. An active player's clock gate still applies, in which case
-    // it stays held for loop().
+    // data it opens can be dispatched: the replies reach the protocol task behind the replay. An
+    // active player's clock gate still applies, in which case it stays held for loop().
     if (this->client_state_held_) {
         this->publish_client_state(conn);
+    }
+}
+
+// ============================================================================
+// Protocol task
+// ============================================================================
+
+uint32_t SendspinClient::protocol_tick() {
+    // The command queue carries no request this task acts on; anything pushed is released here,
+    // one command at a time, rather than left holding a connection or a lease.
+    ProtocolCommand command;
+    while (this->protocol_task_->take_command(command)) {
+        SS_LOGW(TAG, "Dropping protocol command of type %d", static_cast<int>(command.type));
+    }
+
+    // A role torn down on the main loop since the last tick hands back what its consumer has not
+    // taken (InboundItemList::recall()); the consumer returns what it holds itself.
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (this->player_) {
+        this->player_->impl_->recall_stale_items(
+            this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_) {
+        this->visualizer_->impl_->recall_stale_items(
+            this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
+    }
+#endif
+
+    // Takes conn_ptr_mutex_, the task's one unbounded wait (see snapshot_connections()).
+    ConnectionManager::ConnectionSnapshot connections;
+    this->connection_manager_->snapshot_connections(connections);
+
+    // Each connection's held replay and pending pre-admission message come before its ring items:
+    // a connection has no ring item queued while a pending message waits (InboundGate).
+    for (auto& conn : connections) {
+        if (conn->inbound_gate().is_detached()) {
+            InboundMessage dropped;
+            if (conn->pending_message(dropped)) {
+                conn->consume_pending_message();
+            }
+            continue;
+        }
+        this->replay_admitted_messages(conn.get());
+        InboundMessage message;
+        if (conn->pending_message(message)) {
+            this->process_inbound(*conn, message);
+            conn->consume_pending_message();
+        }
+    }
+
+    // The ring, in arrival order across connections. Bounded per tick so the steps above (a
+    // pending pre-admission message, an admission replay, a close report) come round again while
+    // a stream keeps the ring busy: an audio or visualizer item costs microseconds to hand over,
+    // so 32 of them delay those steps by well under a millisecond, while 32 still covers 0.6 s
+    // of 20 ms audio chunks in one pass. The tick asks to run again at once when it stops here.
+    constexpr size_t MAX_ITEMS_PER_TICK = 32;
+    uint32_t next_deadline = ProtocolTask::NO_DEADLINE;
+    for (size_t taken = 0;; ++taken) {
+        if (taken == MAX_ITEMS_PER_TICK) {
+            next_deadline = 0;
+            break;
+        }
+        size_t item_len = 0;
+        void* item = this->inbound_ring_->take(&item_len, 0);
+        if (item == nullptr) {
+            break;
+        }
+        const InboundItemHeader* header = inbound_item_header(item);
+        SendspinConnection* conn = nullptr;
+        for (auto& candidate : connections) {
+            if (static_cast<uint32_t>(candidate->get_instance_id()) == header->connection_id) {
+                conn = candidate.get();
+                break;
+            }
+        }
+        if (conn == nullptr) {
+            // The connection left the manager since it wrote the item.
+            this->inbound_ring_->return_item(item);
+            continue;
+        }
+        conn->inbound_gate().note_item_taken();
+        if (conn->inbound_gate().is_detached()) {
+            this->inbound_ring_->return_item(item);
+            continue;
+        }
+        InboundMessage message;
+        message.item = item;
+        message.item_len = item_len;
+        message.data = inbound_item_bytes(item);
+        message.len = item_len;
+        message.receive_time_us = header->receive_time_us;
+        message.kind = header->kind;
+        this->process_inbound(*conn, message);
+    }
+
+    // A connection the receive path closed, one the manager released, or one whose transport
+    // closed with every message it sent before the close processed is reported once; loop()
+    // drops it (a connection the manager no longer manages is a no-op there).
+    for (auto& conn : connections) {
+        InboundGate& gate = conn->inbound_gate();
+        if ((gate.is_detached() || gate.close_ready()) && conn->mark_loss_reported()) {
+            this->connection_manager_->report_connection_lost(conn);
+        }
+    }
+    // The snapshot's references drop here; see ConnectionManager::snapshot_connections().
+    return next_deadline;
+}
+
+void SendspinClient::process_inbound(SendspinConnection& conn, InboundMessage& message) {
+    conn.process_inbound_message(message);
+    if (message.item != nullptr) {
+        this->inbound_ring_->return_item(message.item);
+        message.item = nullptr;
     }
 }
 
@@ -1316,6 +1521,16 @@ void SendspinClient::schedule_malformed_pairing_message(SendspinConnection* conn
 
 void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char* data, size_t len,
                                            int64_t timestamp, JsonMessageOrigin origin) {
+    // The admitted flag is read once, here: the main loop can admit the connection at any moment,
+    // and the replay and the admission gate below must agree, or a live role message could pass
+    // ahead of the messages held before it. Read true, the held messages replay first; they are
+    // dispatched through this function, so the replay runs before this message's parse takes
+    // the shared arena. Read false, a role message is held behind them.
+    const bool admitted = conn != nullptr && conn->is_admitted();
+    if (origin == JsonMessageOrigin::NETWORK && admitted) {
+        this->replay_admitted_messages(conn);
+    }
+
     // Reuse the internal-RAM scratch arena if configured. Safe to reset here: the JsonDocument
     // from the previous call was already destroyed when that call returned.
     if (this->json_arena_) {
@@ -1335,14 +1550,16 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
     // Admission gate for role-bound traffic. The connection is not closed over it: a nursery
     // member that is still racing toward promotion, or one that just lost arbitration, is not
     // misbehaving, and the establish/re-prove watchdogs already reap a connection that never
-    // gets admitted.
+    // gets admitted. Admission is decided on the main loop while this runs on the protocol task;
+    // a drop clears the admitted flag before it tears the roles down, so traffic past this gate
+    // is caught by each role's teardown-generation re-check.
     //
     // A server starts sending role traffic as soon as it has sent its server/activate, while
     // admission is decided a tick later on the main loop, so the messages in that window are
     // held for replay at admission (see admit_connection()) rather than dropped: a one-shot
     // server/state is never repeated.
     if (origin == JsonMessageOrigin::NETWORK && requires_admitted_connection(message_type) &&
-        (conn == nullptr || !conn->is_admitted())) {
+        !admitted) {
         if (conn != nullptr && conn->activate_delivered() &&
             conn->hold_pre_admission_message(data, len, timestamp)) {
             SS_LOGD(TAG, "Holding a role message until admission (server_id=%s)",
@@ -1505,7 +1722,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             ServerActivateMessage activate_msg;
             if (process_server_activate_message(root, &activate_msg)) {
                 if (conn != nullptr) {
-                    // This runs on the network thread. The connection's activity state
+                    // This runs on the protocol task. The connection's activity state
                     // (activities_/active_roles_/first_activate_received_) is read on the main
                     // loop, so defer the mutation there: carry the parsed payload in the event
                     // and let ConnectionManager::loop() apply it (and decide is_first, trust
@@ -1513,7 +1730,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     SS_LOGD(TAG, "server/activate received (activities_count=%zu)",
                             activate_msg.activities.size());
                     // Both before the handoff: role traffic the server sends behind this activate
-                    // can arrive on this thread the moment the activate leaves it, so it must be
+                    // is dispatched on this thread the moment the activate leaves it, so it must be
                     // held (see the admission gate above) and the roles this activation adds must
                     // already accept it.
                     conn->note_activate_delivered();
@@ -1529,12 +1746,11 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             break;
         }
         case SendspinServerToClientMessageType::NOISE_HANDSHAKE: {
-            // In-band re-handshake initiated by the server. This runs on the
-            // network thread (same thread as decrypt), so no lock is needed on this side; the
-            // NoiseTransport session mutex is only acquired inside handle_noise_rehandshake for
-            // the encrypt + swap. Running the handshake and the msg2 send inline is the
-            // sanctioned exception to the receive-path rule (conventions.md "Threading and
-            // cross-thread state"): the swap must stay ordered with decrypt on this thread.
+            // In-band re-handshake initiated by the server. This runs on the protocol task, the
+            // thread that decrypts this connection's frames, so the session swap is ordered with
+            // the decrypt of the next frame (connection.md "Re-handshake"); the NoiseTransport
+            // session mutex is only acquired inside handle_noise_rehandshake for the encrypt +
+            // swap, against a concurrent main-loop send.
             if (conn != nullptr) {
                 SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
                 if (!conn->handle_noise_rehandshake(std::string_view(data, len))) {
@@ -1542,10 +1758,8 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     // Do not leave a half-swapped session. UNAUTHORIZED is the closest available
                     // reason for a crypto failure, though close_silently() never transmits it
                     // (connection.md "Failure Handling": close without any application-level
-                    // message). This handler runs on the network thread, so disconnect() here
-                    // would be the join-the-calling-thread deadlock/std::terminate() hazard
-                    // close_silently() was added to avoid; see close_transport_now()'s doc comment
-                    // in connection.h.
+                    // message). disconnect() can block on a transport join, which close_silently()
+                    // avoids; see close_transport_now()'s doc comment in connection.h.
                     conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
                 }
             }
@@ -1582,7 +1796,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             // One section at a time, each in its own scope so the compiler reuses the slots.
             // Parsing the whole message into an aggregate would hold every section's storage (a
             // metadata state alone is 200 bytes) in this frame at once, and this runs on the
-            // network task, whose stack is small on ESP-IDF.
+            // protocol task, whose stack is a fixed budget on ESP-IDF.
 #ifdef SENDSPIN_ENABLE_CONTROLLER
             if (this->controller_ && role_accepts_traffic(conn, SendspinRole::CONTROLLER)) {
                 ServerStateControllerObject controller_state;
@@ -1643,10 +1857,8 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             break;
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE: {
-            // server/pair-finalize: server acked our client/pair-finalize. A sanctioned
-            // exception to the receive-path rule (conventions.md "Threading and cross-thread
-            // state"):
-            // Commit the pending pairing record to RAM synchronously here (network thread), not
+            // server/pair-finalize: server acked our client/pair-finalize.
+            // Commit the pending pairing record to RAM synchronously here (protocol task), not
             // deferred to the main loop: the server rekeys onto the new long-term PSK immediately
             // after this ack, and its re-handshake msg1 (the next message on this same thread)
             // resolves that PSK against the RecordStore. The record must therefore be resolvable
@@ -1732,7 +1944,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_INIT: {
             // server/pair-init: nonce_A from the server (the emission format arrived in the
-            // activation's pairing object). Parse on the network thread; the state machine runs
+            // activation's pairing object). Parse on the protocol task; the state machine runs
             // on the main loop.
             if (conn != nullptr) {
                 ServerPairInitPayload payload;
@@ -1786,33 +1998,36 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
     }
 }
 
-SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, const uint8_t* payload,
-                                                   size_t len) {
+SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn,
+                                                   InboundMessage& message) {
     // One byte is enough to name the role that owns the message; how short a body that role
     // tolerates is the role's own rule (roles/artwork/v1.md, for one, closes the connection on a
     // message shorter than 2 bytes).
-    if (len < 1) {
+    if (message.len < 1) {
         return;
     }
 
     // Every binary message feeds a role, so the same admission gate as the role-bound JSON
-    // messages applies; see requires_admitted_connection().
+    // messages applies; see requires_admitted_connection(). The flag is read once: the main loop
+    // can admit the connection at any moment, and the replay below must be decided by the same
+    // read as the gate, or this message could pass ahead of the messages held before it.
     if (conn == nullptr || !conn->is_admitted()) {
         SS_LOGW(TAG, "Ignoring binary message from a connection that is not admitted");
         return;
     }
+    // Held role messages go first (see replay_admitted_messages()).
+    this->replay_admitted_messages(conn);
 
-    uint8_t binary_type = payload[0];
+    uint8_t binary_type = message.data[0];
     uint8_t role = get_binary_role(binary_type);
 
-    // Strip the type byte; each role parses its own binary format from here. Only declared when
-    // at least one role below actually consumes it, so an all-roles-disabled (or
-    // player+artwork-disabled, with visualizer also off) build does not warn/error on an unused
-    // variable under -Werror.
-#if defined(SENDSPIN_ENABLE_PLAYER) || defined(SENDSPIN_ENABLE_ARTWORK) || \
-    defined(SENDSPIN_ENABLE_VISUALIZER)
-    const uint8_t* data = payload + 1;
-    size_t data_len = len - 1;
+    // The type byte stripped, for the artwork role, which copies the body into its image buffer.
+    // The player and the visualizer take the whole message, since they can keep its ring item.
+    // Only declared when the artwork role consumes it, so a build without it does not warn/error
+    // on an unused variable under -Werror.
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    const uint8_t* data = message.data + 1;
+    size_t data_len = message.len - 1;
 #endif
 
     // The visualizer role has an expanded 8-slot allocation (IDs 16-23), so it is
@@ -1822,7 +2037,7 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, con
 #ifdef SENDSPIN_ENABLE_VISUALIZER
         if (this->visualizer_ && role_accepts_traffic(conn, SendspinRole::VISUALIZER)) {
             this->visualizer_->impl_->handle_binary(
-                binary_type, data, data_len,
+                binary_type, message,
                 this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
         }
 #endif
@@ -1836,7 +2051,7 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, con
                 uint8_t slot = get_binary_slot(binary_type);
                 if (slot == 0) {
                     this->player_->impl_->handle_binary(
-                        data, data_len,
+                        message,
                         this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 } else {
                     SS_LOGW(TAG, "Unknown player binary slot %d", slot);
@@ -1861,7 +2076,7 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, con
                     // roles/artwork/v1.md "Artwork (Binary)": a malformed artwork message, and a
                     // malformed sequence within an active artwork stream, are protocol errors the
                     // client MUST close the connection on. Closed silently, like every other
-                    // protocol error reached from the network thread (see close_silently()).
+                    // protocol error the receive path finds (see close_silently()).
                     SS_LOGW(TAG, "Malformed artwork message; closing connection");
                     conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
                 }
@@ -2109,6 +2324,8 @@ void SendspinClient::apply_role_removals(const std::vector<std::string>& roles_b
         this->visualizer_->impl_->cleanup();
     }
 #endif
+    // The protocol task recalls the items a removed stream role's consumer has not taken.
+    this->protocol_task_->wake();
 }
 
 void SendspinClient::note_pairing_started(const std::string& server_id) {

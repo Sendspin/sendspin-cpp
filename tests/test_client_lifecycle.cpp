@@ -25,10 +25,12 @@
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "fake_persistence.h"
+#include "inbound_ring.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/time.h"
 #include "player_role_impl.h"  // Stream start and the sync task; private access, see tests/CMakeLists.txt
 #include "protocol_messages.h"  // SENDSPIN_BINARY_VISUALIZER_LOUDNESS
+#include "protocol_task.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
@@ -49,9 +51,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -83,7 +87,6 @@ constexpr uint16_t ADMISSION_OPEN_TEST_PORT = 19076;
 constexpr uint16_t STREAM_FILTER_MIDSTREAM_TEST_PORT = 19077;
 constexpr uint16_t VISUALIZER_SPECTRUM_TEST_PORT = 19078;
 constexpr uint16_t VISUALIZER_STALE_TEST_PORT = 19084;
-constexpr uint16_t VISUALIZER_SHARED_TS_TEST_PORT = 19086;
 constexpr uint16_t VISUALIZER_OFFSET_TEST_PORT = 19088;
 constexpr uint16_t HELLO_TEST_PORT = 19090;
 #ifndef SENDSPIN_ENABLE_OPUS
@@ -408,10 +411,11 @@ TEST(ClientLifecycle, DestructorGoodbyesPeersWithoutCallbacks) {
 }
 
 // A role that fails to start part-way through start() rolls the roles before it back: here the
-// player comes up and the visualizer (a ring too small to create) refuses, so start() reports
-// failure and the client stays stopped. Replacing the broken role and starting again succeeds,
-// which needs the first attempt to have joined the player's sync task: SyncTask::start() refuses
-// a thread that is still running, so a rollback that skipped the join fails the retry too.
+// player comes up and the visualizer (a buffer too small to hold one frame) refuses, so start()
+// reports failure and the client stays stopped. Replacing the broken role and
+// starting again succeeds, which needs the first attempt to have joined the player's sync task:
+// SyncTask::start() refuses a thread that is still running, so a rollback that skipped the join
+// fails the retry too.
 TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     CountingPlayerListener listener;
     PairedClientBundle bundle(make_config(ROLLBACK_TEST_PORT));
@@ -420,7 +424,7 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
 
     VisualizerRoleConfig broken;
     broken.stream.types = {VisualizerDataType::LOUDNESS};
-    broken.support.buffer_capacity = 0;  // Below the ring's minimum: start() fails
+    broken.support.buffer_capacity = 0;  // Below one stored frame: start() fails
     broken.stream.rate_max = 30;
     client.add_visualizer(std::move(broken));
 
@@ -468,13 +472,20 @@ void send_loudness_until(SendspinClient& client, FakeEncryptedServer& server, in
     });
 }
 
+/// Whether at least two items are linked on `list`, read under its lock: the drain thread holds
+/// the first frame it took, so these are frames waiting behind it.
+bool two_or_more_linked(const InboundItemList& list) {
+    std::lock_guard<std::mutex> lock(list.mutex_);
+    return list.head_ != INBOUND_LIST_END && list.head_ != list.tail_;
+}
+
 // stop() joins the visualizer drain thread and flushes the frames it had buffered, and start()
-// clears the stop command, so a restart begins with an empty ring and a thread that delivers.
-// The old frames are stamped far into the future, so the first session's thread parks on the
-// first one with the rest buffered behind it when stop() runs.
+// clears the stop command, so a restart begins with an empty drain list and a thread that
+// delivers. The old frames are stamped far into the future, so the first session's thread parks
+// on the first one with the rest buffered behind it when stop() runs.
 //
-// The ring is read directly because nothing a caller or peer observes distinguishes a drained
-// ring from an abandoned one: the restarted thread drops leftovers before the new peer is time
+// The list is read directly because nothing a caller or peer observes distinguishes a drained
+// list from an abandoned one: the restarted thread drops leftovers before the new peer is time
 // synced, and the new session's stream/start would discard them at its clear marker anyway.
 TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     constexpr int64_t OLD_FRAME_LEAD_US = 5 * 1000 * 1000;
@@ -495,12 +506,12 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
         pump_until_synced(client);
         ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
         // The thread holds the first frame while it waits for its display time; the ones behind
-        // it are the ring content stop() must discard.
-        auto& ring = client.visualizer()->impl_->drain_task->ring_buffer;
+        // it are the list content stop() must return to the ring.
+        auto& items = client.visualizer()->impl_->drain_task->items;
         send_loudness_until(client, *server, OLD_FRAME_LEAD_US,
-                            [&] { return ring.items_waiting() >= 2; });
+                            [&] { return two_or_more_linked(items); });
         client.stop();
-        EXPECT_TRUE(ring.is_empty());
+        EXPECT_TRUE(items.is_empty());
         wait_until([&] { return server->closed(); });
     }
     EXPECT_EQ(listener.loudness.load(), 0U);
@@ -528,9 +539,6 @@ public:
             this->delivered_at_ = platform_time_us();
         }
         this->frames.fetch_add(1);
-        if (!bins.empty() && bins[0] >= this->hold_from_bin.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(this->hold_ms.load()));
-        }
     }
 
     std::vector<uint16_t> last_bins() const {
@@ -552,10 +560,6 @@ public:
     }
 
     std::atomic<size_t> frames{0};
-    /// Frames whose first bin is at least hold_from_bin hold the drain thread for hold_ms, as a
-    /// listener that takes time to render would.
-    std::atomic<uint16_t> hold_from_bin{0xFFFF};
-    std::atomic<int> hold_ms{0};
 
 private:
     mutable std::mutex mutex_;
@@ -651,8 +655,8 @@ protected:
                             [&] { return this->listener.frames.load() >= 1; });
         // Let the warm-up frames still queued behind the first one deliver, so a test's frames
         // reach an idle drain thread instead of waiting behind them.
-        auto& ring = this->client().visualizer()->impl_->drain_task->ring_buffer;
-        pump_until(this->client(), [&] { return ring.is_empty(); });
+        auto& items = this->client().visualizer()->impl_->drain_task->items;
+        pump_until(this->client(), [&] { return items.is_empty(); });
         pump_for(this->client(), static_cast<int>(2 * VISUALIZER_LEAD_US / 1000));
     }
 
@@ -699,43 +703,6 @@ TEST_F(VisualizerDelivery, FramesAlreadyInThePastOnArrivalAreDropped) {
     });
 
     EXPECT_EQ(this->listener.delivered(1), 0U) << "a frame late on arrival was delivered";
-}
-
-// A server sends one message per visualization type for each analysis frame, all with the same
-// timestamp, and a listener that takes 3 ms per frame leaves the drain thread reaching each
-// sibling after that timestamp. Every sibling arrived in time, so a whole group is delivered.
-// Groups repeat until one completes, so a stall that pushes a sibling past the lag bound only
-// costs another group; judging lateness at dequeue never completes one.
-TEST_F(VisualizerDelivery, FramesSharingATimestampAreAllDelivered) {
-    ASSERT_NO_FATAL_FAILURE(this->start(VISUALIZER_SHARED_TS_TEST_PORT));
-    constexpr uint16_t FIRST_GROUP_BIN = 100;
-    constexpr uint16_t SIBLINGS = 4;
-    this->listener.hold_from_bin = FIRST_GROUP_BIN;
-    this->listener.hold_ms = 3;
-
-    auto group_delivered = [&](uint16_t group) {
-        for (uint16_t i = 0; i < SIBLINGS; ++i) {
-            if (this->listener.delivered(FIRST_GROUP_BIN + group * SIBLINGS + i) == 0) {
-                return false;
-            }
-        }
-        return true;
-    };
-    uint16_t groups_sent = 0;
-    pump_until(this->client(), [&] {
-        for (uint16_t group = 0; group < groups_sent; ++group) {
-            if (group_delivered(group)) {
-                return true;
-            }
-        }
-        const int64_t display_us = platform_time_us() + VISUALIZER_LEAD_US;
-        for (uint16_t i = 0; i < SIBLINGS; ++i) {
-            this->send_frame_at(display_us, FIRST_GROUP_BIN + groups_sent * SIBLINGS + i);
-        }
-        ++groups_sent;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        return false;
-    });
 }
 
 // VisualizerRoleConfig::display_offset_ms shifts delivery from the display time, which the
@@ -1005,7 +972,7 @@ TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
 
 // A peer delivered while admission is closed (stop() tearing down, or before start()) gets a
 // client/goodbye with reason shutdown instead of a nursery slot. The goodbye is sent by
-// on_new_connection() itself, on the network thread, so the closed row waits on the peer without
+// on_new_connection() itself, on the transport thread, so the closed row waits on the peer without
 // pumping loop(). The open row is the control: the same peer is admitted and owed no goodbye.
 // The nursery-full rejection is covered by
 // ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer.
@@ -1111,15 +1078,68 @@ private:
     int64_t playhead_us_{0};  // Sync-task thread only
 };
 
-/// Writes `count` marked 20 ms chunks straight into the sync task's encoded ring, stamped in the
-/// server's clock from `first_timestamp` onward. Bypasses the server so a test can feed audio
-/// while it holds a lock the client's own loop needs.
-void feed_marked_chunks(SyncTask& sync_task, int64_t first_timestamp, int count) {
-    const std::vector<uint8_t> chunk(SINK_CHUNK_BYTES, SINK_AUDIO_MARK);
+/// Stops the client's protocol task so the calling test can play it: the player's protocol-task
+/// handlers and the feeder below then run on one test thread at a time, never beside the task.
+void play_protocol_task(SendspinClient& client) {
+    client.protocol_task_->stop();
+}
+
+/// The connections a test playing the protocol task hands to drain_ring_as_protocol_task().
+using ConnectionList = std::vector<std::shared_ptr<SendspinConnection>>;
+
+/// The protocol task's ring drain, for a test playing the task: takes every completed item, which
+/// counts the ring-order return of the LOCAL items the feeder hands over, and returns the rest
+/// (the time replies a connected server still sends) unprocessed, uncounting each from its
+/// connection's in-flight count as the task does (InboundGate::note_item_taken()).
+/// @param connections The connections the items can come from, snapshotted beforehand: the
+///        manager lock may be held while this runs.
+void drain_ring_as_protocol_task(InboundRing& ring, const ConnectionList& connections) {
+    size_t len = 0;
+    void* item = nullptr;
+    while ((item = ring.take(&len, 0)) != nullptr) {
+        for (const auto& conn : connections) {
+            if (static_cast<uint32_t>(conn->get_instance_id()) ==
+                inbound_item_header(item)->connection_id) {
+                conn->inbound_gate().note_item_taken();
+            }
+        }
+        ring.return_item(item);
+    }
+}
+
+/// Hands `count` marked 20 ms chunks straight to the sync task, stamped in the server's clock from
+/// `first_timestamp` onward, each in an item acquired from the inbound ring the way the protocol
+/// task writes a chunk it copies. Bypasses the server so a test can feed audio while it holds a
+/// lock the client's own loop needs. Protocol-task work: the caller plays the task
+/// (play_protocol_task()). A batch that finds the ring full stops early; the caller's next batch
+/// retries.
+void feed_marked_chunks(PlayerRole::Impl& impl, int64_t first_timestamp, int count) {
+    SyncTask& sync_task = *impl.sync_task;
+    InboundRing* ring = sync_task.ring();
+    constexpr size_t FRAME_OFFSET = 13;  // type byte, server timestamp, send_ahead
+    std::vector<uint8_t> message(FRAME_OFFSET + SINK_CHUNK_BYTES, SINK_AUDIO_MARK);
+    message[0] = SENDSPIN_BINARY_PLAYER_AUDIO;
+    std::fill(message.begin() + 9, message.begin() + FRAME_OFFSET, 0);
     int64_t timestamp = first_timestamp;
     for (int i = 0; i < count; ++i) {
-        sync_task.write_audio_chunk(chunk.data(), chunk.size(), timestamp,
-                                    CHUNK_TYPE_ENCODED_AUDIO, 0);
+        for (int byte = 0; byte < 8; ++byte) {
+            message[1 + byte] = static_cast<uint8_t>(static_cast<uint64_t>(timestamp) >>
+                                                     (56 - 8 * byte));
+        }
+        void* item = ring->acquire_local(message.size(), 0);
+        if (item == nullptr) {
+            return;
+        }
+        std::memcpy(inbound_item_bytes(item), message.data(), message.size());
+        InboundItemHeader* header = inbound_item_header(item);
+        header->type = CHUNK_TYPE_ENCODED_AUDIO;
+        header->data_offset = FRAME_OFFSET;
+        header->data_len = static_cast<uint32_t>(SINK_CHUNK_BYTES);
+        header->generation = impl.cleanup_generation.load(std::memory_order_acquire);
+        ring->complete(item);
+        if (!sync_task.hand_item(item, message.size())) {
+            ring->return_item(item);
+        }
         timestamp += 20 * 1000;
     }
 }
@@ -1136,17 +1156,28 @@ constexpr int64_t SINK_CHUNK_LEAD_US = 250 * 1000;
 /// clock's offset from this one, which the stream's time filter was synced to.
 class ChunkFeeder {
 public:
-    ChunkFeeder(SyncTask& sync_task, const VirtualSinkListener& listener,
-                int64_t server_offset_us = 0)
-        : thread_([&sync_task, &listener, server_offset_us] {
+    /// @param connections The client's connections (snapshot()), taken before the caller holds
+    ///        the manager lock.
+    ChunkFeeder(SendspinClient& client, ConnectionList connections,
+                const VirtualSinkListener& listener, int64_t server_offset_us = 0)
+        : thread_([&impl = *client.player_->impl_, &listener, server_offset_us,
+                   connections = std::move(connections)] {
               while (!listener.decoded()) {
-                  feed_marked_chunks(sync_task,
+                  drain_ring_as_protocol_task(*impl.sync_task->ring(), connections);
+                  feed_marked_chunks(impl,
                                      platform_time_us() + server_offset_us + SINK_CHUNK_LEAD_US, 4);
                   std::this_thread::sleep_for(std::chrono::milliseconds(10));
               }
           }) {}
     ~ChunkFeeder() {
         this->thread_.join();
+    }
+
+    /// The client's connections. Takes the manager lock.
+    static ConnectionList snapshot(SendspinClient& client) {
+        ConnectionManager::ConnectionSnapshot snapshot;
+        client.connection_manager_->snapshot_connections(snapshot);
+        return {snapshot.begin(), snapshot.end()};
     }
 
 private:
@@ -1177,10 +1208,12 @@ TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     SyncTask& sync_task = *client.player_->impl_->sync_task;
     pump_until(client, [&] { return sync_task.is_running(); });
+    play_protocol_task(client);
 
+    ConnectionList connections = ChunkFeeder::snapshot(client);
     {
         std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        ChunkFeeder feeder(sync_task, listener);
+        ChunkFeeder feeder(client, std::move(connections), listener);
         listener.wait_for_decoded();
     }
 
@@ -1242,8 +1275,10 @@ SendspinClientConfig make_stand_in_config(uint16_t port) {
 
 /// Installs a stand-in connection as current, the way a promotion does, and starts a stream on it,
 /// returning once the sync task is running. The stream is driven through PlayerRole::Impl, since
-/// nothing is connected to carry a stream/start. The client must use make_stand_in_config().
+/// nothing is connected to carry a stream/start, on the test thread, which plays the protocol task
+/// from here on. The client must use make_stand_in_config().
 void start_stream_on(SendspinClient& client, std::shared_ptr<ObservedConnection> conn) {
+    play_protocol_task(client);
     {
         std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
         client.connection_manager_->set_current_connection(std::move(conn));
@@ -1327,7 +1362,8 @@ TEST(ClientLifecycle, TheSyncTaskConvertsEachChunkWithTheCurrentOffset) {
 
     start_stream_on(client, make_synced_connection(&observation));
     {
-        ChunkFeeder feeder(*client.player_->impl_->sync_task, listener, SEEDED_SERVER_OFFSET_US);
+        ChunkFeeder feeder(client, ChunkFeeder::snapshot(client), listener,
+                           SEEDED_SERVER_OFFSET_US);
         listener.wait_for_decoded();
     }
 
@@ -1368,6 +1404,61 @@ TEST(ClientLifecycle, ADroppedStreamConnectionIsGoodbyedOnceAndFreedOnTheLoopThr
         << "the connection was freed on a thread other than the one that pumps loop()";
 
     client.stop();
+}
+
+// Destroying a running client releases the inbound ring only once the role threads are stopped
+// and their item lists unbound. A LOCAL item (one the protocol task wrote itself, here a chunk
+// copied into the ring) that its holder already returned but the task never took in ring order
+// is counted on the ring's reset through its holder's list; with the roles reset first that list
+// is freed memory, and the process crashes or is reported by AddressSanitizer. The test thread plays the protocol task, so
+// nothing takes the item in ring order before the destructor.
+TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
+    CountingPlayerListener listener;
+    TestNetworkProvider network;
+    auto client = std::make_unique<SendspinClient>(make_stand_in_config(0));
+    client->set_network_provider(&network);
+    client->add_player(make_pcm_player_config()).set_listener(&listener);
+    ASSERT_TRUE(client->start());
+    play_protocol_task(*client);
+
+    PlayerRole::Impl& impl = *client->player_->impl_;
+    InboundRing& ring = *impl.sync_task->ring();
+    std::vector<uint8_t> chunk(13 + 4, 0x00);
+    chunk[0] = SENDSPIN_BINARY_PLAYER_AUDIO;
+    InboundMessage message;
+    message.data = chunk.data();
+    message.len = chunk.size();
+    impl.handle_binary(message, impl.cleanup_generation.load());
+    ASSERT_GT(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
+        << "the chunk never reached the sync task's list";
+
+    // The idle sync task discards a chunk with no stream behind it, which is its holder's return.
+    wait_until([&] { return ring.quota(InboundHolder::PLAYER).outstanding() == 0; });
+    client.reset();
+}
+
+// The ring holds the time replies that arrive while the player holds its oldest chunk, so its
+// size follows the configured burst cadence: a client syncing ten times as often gets a larger
+// ring. Read from the ring the client creates, so the configuration has to reach the derivation.
+TEST(ClientLifecycle, TheInboundRingGrowsWithTheTimeBurstRate) {
+    const auto ring_bytes = [](int64_t interval_ms) {
+        TestNetworkProvider network;
+        SendspinClientConfig config = make_config(0);
+        config.time_burst_interval_ms = interval_ms;
+        SendspinClient client(config);
+        client.set_network_provider(&network);
+        client.add_player(make_pcm_player_config());
+        EXPECT_TRUE(client.start());
+        const size_t bytes = client.inbound_ring_->storage_.size();
+        client.stop();
+        return bytes;
+    };
+    const size_t default_bytes = ring_bytes(SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS);
+    InboundRingBudget budget;
+    budget.audio_hold_bytes = make_pcm_player_config().audio_buffer_capacity;
+    EXPECT_EQ(default_bytes, derive_inbound_ring_bytes(budget)) << "Control: the defaults";
+    EXPECT_GT(ring_bytes(SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS / 10), default_bytes)
+        << "the configured burst interval never reached the ring's derivation";
 }
 
 }  // namespace

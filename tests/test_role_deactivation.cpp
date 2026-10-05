@@ -288,7 +288,7 @@ TEST(RoleDeactivation, RemovedVisualizerEndsTheStreamAndStopsDelivery) {
     pump_for(client, SETTLE_MS);
     EXPECT_EQ(visualizer_listener.loudness.load(), loudness_after_removal)
         << "frames were delivered for a role the activation removed";
-    EXPECT_TRUE(client.visualizer()->impl_->drain_task->ring_buffer.is_empty())
+    EXPECT_TRUE(client.visualizer()->impl_->drain_task->items.is_empty())
         << "the removed role kept its buffered frames";
 
     EXPECT_EQ(player_listener.stream_ends, 0) << "a role the activation kept was torn down";
@@ -322,7 +322,7 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
     ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES / 2)));
-    // The network thread writes the transfer under slot_mutex, so it is read under the same lock.
+    // The protocol task writes the transfer under slot_mutex, so it is read under the same lock.
     auto transfer_in_flight = [&] {
         std::lock_guard<std::mutex> lock(client.artwork()->impl_->drain_task->slot_mutex);
         return client.artwork()->impl_->transfer.in_flight;
@@ -448,10 +448,10 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     EXPECT_EQ(player_listener.stream_ends, 0) << "a role the activation kept was torn down";
     stream_audio_until(client, *server, player_listener, 1);
 
-    // The gate is checked once on the network thread while the handler it admits runs on, so a
+    // The gate is checked once on the protocol task while the handler it admits runs on, so a
     // teardown can land in between. The handler re-checks the generation the gate captured, which
     // a state admitted before this removal no longer carries: driving it directly is the same call
-    // the network thread would make, with the interleaving forced rather than raced for.
+    // the protocol task would make, with the interleaving forced rather than raced for.
     ServerMetadataStateObject overtaken;
     overtaken.timestamp = 1;
     overtaken.title = "Overtaken By The Removal";
@@ -772,10 +772,10 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
 
     const size_t writes_after_removal = player_listener.audio_writes.load();
     const size_t loudness_after_removal = visualizer_listener.loudness.load();
-    // The sync task is idle and its ring drained, so anything the binary path still accepted for
-    // the removed player would show up here rather than at the audio output.
+    // The sync task is idle and its item list drained, so anything the binary path still accepted
+    // for the removed player would show up here rather than at the audio output.
     pump_until(client,
-               [&] { return client.player()->impl_->sync_task->encoded_ring_buffer_->is_empty(); });
+               [&] { return client.player()->impl_->sync_task->encoded_items_.is_empty(); });
 
     // The same traffic again, now for roles the server has removed.
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
@@ -807,7 +807,7 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     EXPECT_EQ(client.controller()->get_controller_state().volume, 0);
     EXPECT_EQ(player_listener.audio_writes.load(), writes_after_removal)
         << "a removed role's audio chunks were played";
-    EXPECT_TRUE(client.player()->impl_->sync_task->encoded_ring_buffer_->is_empty())
+    EXPECT_TRUE(client.player()->impl_->sync_task->encoded_items_.is_empty())
         << "a removed role's audio chunks were buffered";
     EXPECT_EQ(visualizer_listener.loudness.load(), loudness_after_removal)
         << "a removed role's frames were delivered";

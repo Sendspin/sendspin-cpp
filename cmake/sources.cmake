@@ -34,6 +34,10 @@ function(sendspin_get_sources BASE_DIR)
         # Connection management
         ${BASE_DIR}/src/connection_manager.cpp
 
+        # Protocol thread and its command queue; the shared inbound ring's per-consumer item list
+        ${BASE_DIR}/src/protocol_task.cpp
+        ${BASE_DIR}/src/inbound_ring.cpp
+
         # Pairing record store
         ${BASE_DIR}/src/record_store.cpp
 
@@ -49,7 +53,6 @@ function(sendspin_get_sources BASE_DIR)
     # Per-role source sets: conditionally compiled based on SENDSPIN_ENABLE_* options
     set(SENDSPIN_PLAYER_SOURCES
         ${BASE_DIR}/src/player_role.cpp
-        ${BASE_DIR}/src/audio_ring_buffer.cpp
         ${BASE_DIR}/src/decoder.cpp
         ${BASE_DIR}/src/sync_task.cpp
 

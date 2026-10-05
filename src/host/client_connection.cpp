@@ -104,13 +104,11 @@ void SendspinClientConnection::close_transport_now() {
     // ws_->stop() (used by disconnect() above) joins IX's own worker thread, so it deadlocks (and
     // on host, crashes via an uncaught std::system_error -> std::terminate()) when called from a
     // callback already running on that thread. ws_->close() is async and does not join, so it is
-    // safe here. Report the loss immediately rather than waiting for the resulting Close event;
-    // that event still arrives later and repeats on_disconnected_cb, which the manager tolerates
-    // (drop_connection() no-ops on a connection it no longer manages).
+    // safe here. The loss is reported by the protocol task, which sees the detached inbound gate
+    // (see SendspinConnection::close_silently() and fail_inbound()); the resulting Close event
+    // reports it again, which the manager tolerates (drop_connection() no-ops on a connection it
+    // no longer manages).
     this->connected_ = false;
-    if (this->on_disconnected_cb) {
-        this->on_disconnected_cb(this);
-    }
     if (this->ws_) {
         this->ws_->close();
     }
@@ -180,32 +178,21 @@ void SendspinClientConnection::setup_callbacks() {
                 this->connected_ = false;
                 this->client_hello_sent_ = false;
                 this->server_hello_received_ = false;
-                this->reset_websocket_payload();
-                if (this->on_disconnected_cb) {
-                    this->on_disconnected_cb(this);
-                }
+                // The protocol task reports the loss once the messages before it are processed.
+                this->notify_transport_closed();
                 break;
 
             case ix::WebSocketMessageType::Message: {
-                // IXWebSocket delivers complete reassembled messages
+                // IXWebSocket delivers complete reassembled messages, so every message takes the
+                // single-frame path: one copy, from IXWebSocket's string into a ring item (or,
+                // before admission, into the fallback buffer).
                 const std::string& data = msg->str;
-                bool is_binary = msg->binary;
-
-                if (!data.empty()) {
-                    uint8_t* dest = this->prepare_receive_buffer(data.size());
-                    if (dest == nullptr) {
-                        SS_LOGE(TAG, "Allocation failed, dropping connection");
-                        // Stop processing further frames and initiate a real transport close via
-                        // close_transport_now() (stop() would join IX's thread and deadlock here;
-                        // close() is async and safe; see its doc comment).
-                        this->disable_message_dispatch();
-                        this->close_transport_now();
-                        return;
-                    }
-                    std::copy(data.begin(), data.end(), dest);
-                    this->commit_receive_buffer(data.size());
+                const InboundTarget target =
+                    this->begin_inbound_message(data.size(), !msg->binary, receive_time);
+                if (target.route == InboundRoute::RECEIVE) {
+                    std::copy(data.begin(), data.end(), target.data);
+                    this->end_inbound_message(true);
                 }
-                this->dispatch_completed_message(!is_binary, receive_time);
                 break;
             }
 

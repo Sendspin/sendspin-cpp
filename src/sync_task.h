@@ -18,9 +18,10 @@
 
 #pragma once
 
-#include "audio_ring_buffer.h"
 #include "audio_stream_info.h"
+#include "audio_types.h"
 #include "decoder.h"
+#include "inbound_ring.h"
 #include "platform/event_flags.h"
 #include "platform/shadow_slot.h"
 #include "sendspin/player_role.h"
@@ -64,7 +65,10 @@ struct SyncContext {
                                                     // spare frame past the decoded data for
                                                     // soft-sync frame insertion
     std::unique_ptr<SendspinDecoder> decoder;
-    AudioRingBufferEntry* encoded_entry{nullptr};
+    /// The inbound ring item being decoded: an audio chunk, decoded straight from the ring
+    /// storage it was received and decrypted into, or a codec header or stream/clear marker the
+    /// protocol task wrote. Returned to the ring once processed.
+    void* encoded_item{nullptr};
 
     // 64-bit fields
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
@@ -103,9 +107,10 @@ enum EventGroupBits : uint16_t {
 
 /// @brief Self-contained sync task for Sendspin synchronized audio playback
 ///
-/// Manages a persistent background thread that reads encoded audio from the ring buffer,
-/// decodes it, synchronizes it to server timestamps, and writes PCM data via the player listener.
-/// The thread starts once during initialization and idles between streams to avoid
+/// Manages a persistent background thread that takes encoded audio from its item list (the
+/// shared inbound ring items the protocol task appends to it, see InboundItemList), decodes each
+/// chunk in place, synchronizes it to server timestamps, and writes PCM data via the player
+/// listener. The thread starts once during initialization and idles between streams to avoid
 /// thread create/destroy churn on embedded devices.
 ///
 /// The task communicates with the caller via event flags (lifecycle/commands) and a
@@ -115,27 +120,55 @@ public:
     SyncTask() = default;
     ~SyncTask();
 
-    /// @brief Initializes queues and creates the encoded ring buffer
+    /// @brief Creates the event flags
     /// @param player_impl The owning PlayerRole::Impl, used for delay, listener, and state
     ///        updates.
     /// @return false on allocation failure.
-    bool init(PlayerRole::Impl* player_impl, size_t buffer_size);
+    bool init(PlayerRole::Impl* player_impl);
 
-    /// @brief Creates and starts the persistent sync background thread
-    /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
+    /// @brief Binds the item list to this run's inbound ring, then creates and starts the
+    /// persistent sync background thread
+    /// Call after init(), once per client start. The thread idles until a codec header arrives.
+    /// @param ring The client's inbound ring for this run.
     /// @param task_stack_in_psram Whether to allocate the task stack in PSRAM (ESP-IDF only).
-    bool start(bool task_stack_in_psram, unsigned priority);
+    bool start(InboundRing* ring, bool task_stack_in_psram, unsigned priority);
 
-    /// @brief Signals the task to stop, joins the thread, and discards buffered audio
-    /// A later start() creates a fresh thread on the same (still initialized) queues. No-op when
-    /// the thread is not running. Main-loop thread only: joins the sync thread.
+    /// @brief Signals the task to stop, joins the thread, and returns every item it held or had
+    /// not taken to the ring. A later start() creates a fresh thread on the same (still
+    /// initialized) flags. No-op when the thread is not running. Main-loop thread only: joins the
+    /// sync thread.
     void stop();
 
     /// @brief Whether init() has been called successfully
     bool is_initialized() const {
-        // Both members are checked so a partially failed init() (flags created, ring buffer
-        // allocation failed) leaves every signal/query path safely inert.
-        return this->event_flags_.is_created() && this->encoded_ring_buffer_ != nullptr;
+        return this->event_flags_.is_created();
+    }
+
+    /// @brief Whether the item list is bound to a ring (between start() and stop()), so the
+    /// protocol task may hand it items. Protocol task.
+    bool accepts_items() const {
+        return this->ring_.load(std::memory_order_acquire) != nullptr;
+    }
+
+    /// @brief The ring the item list is bound to, or nullptr outside a run. Protocol task.
+    InboundRing* ring() const {
+        return this->ring_.load(std::memory_order_acquire);
+    }
+
+    /// @brief Charges an item to the player's quota and appends it to the item list, waking the
+    /// thread. Protocol task only; requires accepts_items().
+    /// @param item_len The item's message length (see InboundMessage::item_len).
+    /// @return false, appending nothing, when the player is over quota: the caller returns the
+    ///         item and logs the drop.
+    bool hand_item(void* item, size_t item_len) {
+        return hand_inbound_item(*this->ring(), this->encoded_items_, InboundHolder::PLAYER, item,
+                                 item_len);
+    }
+
+    /// @brief Returns every item the thread has not taken yet to the ring. Protocol task, or the
+    /// main loop once the thread is joined.
+    void recall_items() {
+        this->encoded_items_.recall();
     }
 
     /// @brief Whether the sync task is actively decoding and syncing a stream; false when idle
@@ -150,13 +183,13 @@ public:
     }
 
     /// @brief Signals the sync task to end the current stream. Non-blocking
-    /// The task drains stale audio from the ring buffer and returns to idle.
+    /// The task drains stale audio from its item list and returns to idle.
     /// Thread-safe: may be called from any context.
     void signal_stream_end();
 
     /// @brief Signals the sync task that a stream/clear (seek) occurred. Non-blocking
     /// The task discards buffered audio up to the CHUNK_TYPE_STREAM_CLEAR_MARKER that the caller
-    /// must enqueue immediately after this call, then keeps processing the same stream with its
+    /// must append immediately after this call, then keeps processing the same stream with its
     /// existing codec, decoder, and playtime accounting intact. It does not return to idle.
     /// Thread-safe: may be called from any context.
     void signal_stream_clear();
@@ -168,13 +201,25 @@ public:
     /// Thread-safe: may be called from any context.
     void signal_stream_start();
 
-    /// @brief Writes an encoded audio chunk into the ring buffer
-    /// Called from the client's audio chunk callback (may be any thread).
-    /// @param timestamp Server timestamp for this chunk.
-    /// @param timeout_ms Milliseconds to wait if the buffer is full (UINT32_MAX = wait forever).
-    /// @return false if the buffer is full or on error.
-    bool write_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
-                           ChunkType chunk_type, uint32_t timeout_ms);
+    /// @brief The ChunkType of an item on the list (InboundItemHeader::type)
+    static ChunkType chunk_type(void* item) {
+        return static_cast<ChunkType>(inbound_item_header(item)->type);
+    }
+
+    /// @brief The encoded bytes an item carries: an audio chunk's frame or a codec header, read in
+    /// place from the item
+    static const uint8_t* encoded_data(void* item) {
+        return inbound_item_data(item);
+    }
+
+    /// @brief Length of encoded_data()
+    static size_t encoded_size(void* item) {
+        return inbound_item_header(item)->data_len;
+    }
+
+    /// @brief An audio chunk's server timestamp: roles/player/v1.md "Audio Chunks (Binary)" bytes
+    /// 1-8, big-endian, read from the plaintext where it arrived
+    static int64_t server_timestamp(void* item);
 
     /// @brief Called by the audio output when it has played audio frames
     /// Thread-safe: may be called from any context.
@@ -217,9 +262,20 @@ protected:
     /// Returns true when all data has been sent, false if more transfers are needed.
     bool transfer_audio(SyncContext& sync_context);
 
-    /// @brief Loads the next encoded chunk from the ring buffer
+    /// @brief Loads the next encoded chunk from the item list
     /// Returns true if a chunk is available, false if none ready yet.
     bool load_next_chunk(SyncContext& sync_context);
+
+    /// @brief Takes the next item from the list, returning to the ring any whose teardown
+    /// generation the player has moved past (it was appended for a stream a teardown ended)
+    /// @param timeout_ms As InboundItemList::take(), applied to the first take only.
+    /// @return The item, or nullptr: treat it as "re-check state and retry".
+    void* take_item(uint32_t timeout_ms);
+
+    /// @brief Returns an item to the ring
+    void return_item(void* item) const {
+        this->ring()->return_item(item);
+    }
 
     /// @brief Removes last decoded frame, blending into the second-to-last to minimize glitches
     /// Returns -1 if a frame was removed, 0 if preconditions not met.
@@ -238,15 +294,15 @@ protected:
     /// `sync_context`.
     static bool decode_whole_chunk(SyncContext& sync_context);
 
-    /// @brief Waits in IDLE for a codec header to arrive in the ring buffer
+    /// @brief Waits in IDLE for a codec header to arrive on the item list
     /// Discards stale audio chunks. Returns true if a codec header was found.
     /// Returns false if COMMAND_STOP was signaled.
     bool wait_for_codec_header(SyncContext& sync_context);
 
-    /// @brief Non-blocking drain of audio data from the ring buffer, preserving codec headers
-    void drain_ring_buffer(SyncContext& sync_context);
+    /// @brief Non-blocking drain of audio data from the item list, preserving codec headers
+    void drain_items(SyncContext& sync_context);
 
-    /// @brief Handles a stream/clear (seek) while a stream is active: discards ring-buffer chunks
+    /// @brief Handles a stream/clear (seek) while a stream is active: discards queued chunks
     /// up to (and including) the CHUNK_TYPE_STREAM_CLEAR_MARKER, then applies apply_stream_clear()
     void discard_to_clear_marker(SyncContext& sync_context);
 
@@ -271,9 +327,16 @@ protected:
     ShadowSlot<PlaybackProgress> playback_progress_slot_;
     std::thread sync_thread_;
 
+    /// The encoded chunks and markers the protocol task hands the thread (appended on the
+    /// protocol task, taken on the sync thread; recalled on the protocol task or, once the thread
+    /// is joined, on the main loop). No storage of its own: it links ring items.
+    InboundItemList encoded_items_;
+
     // Pointer fields
-    std::unique_ptr<SendspinAudioRingBuffer> encoded_ring_buffer_;
     PlayerRole::Impl* player_impl_{nullptr};
+    /// The ring the item list is bound to for the current run, or nullptr outside one. Written by
+    /// start() and stop() on the main loop, read by the protocol task and the sync thread.
+    std::atomic<InboundRing*> ring_{nullptr};
 };
 
 }  // namespace sendspin

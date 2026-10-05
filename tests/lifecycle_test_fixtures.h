@@ -990,11 +990,11 @@ private:
 // A test that instead drives client.start() and connects FakeEncryptedServer to it as a WS
 // client exercises SendspinServerConnection (host/server_connection.cpp); that class's
 // disconnect() only ever calls the already-async trigger_close(), so it never needs the
-// network-thread deadlock/crash guard close_transport_now() (connection.h) provides.
-// SendspinClientConnection::disconnect() (host/client_connection.cpp) does need that guard: it is
-// reached when the SendspinClient itself calls connect_to() and dispatch_completed_message() runs
-// synchronously on IXWebSocket's own outbound worker thread. This class lets the client under
-// test be the outbound connector, so a test can reach that code path.
+// non-blocking close close_transport_now() (connection.h) provides.
+// SendspinClientConnection::disconnect() (host/client_connection.cpp) does need it: it is reached
+// when the SendspinClient itself calls connect_to(), and its stop() joins IXWebSocket's own
+// outbound worker thread, which may be waiting on the protocol task the close runs on. This class
+// lets the client under test be the outbound connector, so a test can reach that code path.
 class FakeOutboundEncryptedServer : public NoiseInitiatorFixtureBase {
 public:
     /// @param activate_payload The payload of the server/activate sent in answer to the hello.

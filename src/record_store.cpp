@@ -220,7 +220,7 @@ void RecordStore::provision_pairing_psk_if_needed() {
 
 std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk_id,
                                                           PskCategory category) const {
-    // Runs on the network thread; lock against main-loop mutations of records_/pairing_psk_.
+    // Runs on the protocol task; lock against main-loop mutations of records_/pairing_psk_.
     std::lock_guard<std::mutex> lock(this->mutex_);
     return this->resolve_by_psk_id_locked(psk_id, category);
 }
@@ -347,7 +347,7 @@ bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_us
 
 bool RecordStore::store_record_superseding(SendspinPairingRecord record,
                                            const std::vector<std::string>& psk_ids_in_use) {
-    // RAM-only: runs on the network thread (the server/pair-finalize ack handler), where the
+    // RAM-only: runs on the protocol task (the server/pair-finalize ack handler), where the
     // record must resolve before the handler returns, since the server's follow-up re-handshake
     // is the next message on that thread.
     std::lock_guard<std::mutex> lock(this->mutex_);
@@ -527,12 +527,12 @@ RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(const std::stri
 // the order blob, when the recency order moved). The next persist_records() encodes those writes
 // under mutex_ (take_dirty_writes_locked()), then drops the lock before handing each blob to the
 // provider (save_slot_write()). The provider write is an NVS commit on ESP, tens of milliseconds
-// per key, and resolve_by_psk_id() takes the same mutex on the network thread for every
+// per key, and resolve_by_psk_id() takes the same mutex on the protocol task for every
 // handshake.
 //
 // The two halves need not be atomic: persist_records() is main-loop-only, so blobs cannot land
 // out of order, and the one writer that can slip into the gap (store_record_superseding, on the
-// network thread) is RAM-only and its caller schedules a flush, which redoes whatever slot it
+// protocol task) is RAM-only and its caller schedules a flush, which redoes whatever slot it
 // dirtied.
 // A resolve in the gap sees the new RAM state, which is the authority for the boot; the blobs
 // only decide what survives a reboot.

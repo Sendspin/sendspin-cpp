@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// @file audio_types.h
-/// @brief Internal audio pipeline types shared across decoder, ring buffer, and sync task
+/// @brief Internal audio pipeline types shared by the decoder, the player role and the sync task
 
 #pragma once
 

@@ -34,8 +34,9 @@ namespace sendspin {
  * @brief Inbound WebSocket connection from a server to the host listener (host build, IXWebSocket)
  *
  * Wraps a shared IXWebSocket handed off by SendspinWsServer. Incoming messages arrive through
- * handle_message() on the server's callback thread. start() and loop() are no-ops because the
- * transport is already open on construction.
+ * handle_message() on the server's callback thread, which hands each to the protocol task through
+ * the inbound ring. start() and loop() are no-ops because the transport is already open on
+ * construction.
  */
 class SendspinServerConnection : public SendspinConnection {
 public:
@@ -81,8 +82,8 @@ public:
         return this->sockfd_;
     }
 
-    /// @brief Handles an incoming complete message from IXWebSocket
-    /// Called from the ws_server's message callback.
+    /// @brief Hands an incoming complete message from IXWebSocket to the protocol task
+    /// Called from the ws_server's message callback, on the connection's IXWebSocket thread.
     /// @param data The complete message payload received from IXWebSocket
     /// @param is_binary true if the message is binary, false if text
     /// @param receive_time Server-relative timestamp at which the message was received

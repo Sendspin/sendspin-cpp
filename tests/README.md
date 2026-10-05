@@ -64,8 +64,6 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   offset round-trip, convergence).
 - `test_audio_stream_info.cpp`: byte/frame/sample/duration conversions.
 - `test_network_info.cpp`: local interface MAC lookup is well-formed or absent.
-- `test_spsc_ring_buffer.cpp`: `SpscRingBuffer` wrap-around accounting with unaligned storage
-  sizes, and the `wake_receiver()` contract.
 - `test_thread_safe_queue.cpp`: `ThreadSafeQueue`'s `wake_receiver()` contract: a wake unblocks
   a parked receive, is held pending, is consumed once, and never drops a queued item.
 - `test_inline_vector.cpp`: `InlineVector` order-preserving erase, element release at removal,
@@ -74,11 +72,13 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   under concurrent claims.
 - `test_inbox.cpp`: `Inbox`/`InboxSlot` topic bits, event ring ordering, and slot binding.
 - `test_player_role.cpp`: the player's `client/state` timing parameters and the
-  supported-format validation, driven through the role's `Impl` without a server.
+  supported-format validation, driven through the role's `Impl` without a server, and its
+  inbound ring hand-off: a chunk decoded in place, per-role quotas, the stream/clear marker,
+  and the recall after a teardown.
 - `test_decoder.cpp`: `SendspinDecoder` chunk decoding per codec (multi-frame FLAC, PCM at the
   spec maximum, an Opus packet longer than the estimate) and the sync task's whole-chunk decode.
 - `test_visualizer_role.cpp`: `decode_visualizer_message()` and the visualizer role's
-  negotiation and dispatch.
+  negotiation and dispatch, the receive stamp a frame carries, and the recall after a teardown.
 - `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: announce/part/cancel
   transfers and the messages and sequences that close the connection, the per-channel image cap,
   decode thread, slot gating, `frame_done()` acks, and stream restart/clear.
@@ -88,7 +88,7 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   to end).
 - `test_encrypted_lifecycle.cpp`: the Noise transport end to end over loopback: re-handshake,
   pairing over the pairing PSK, `server/unpair`, pre-admission traffic and the held-message
-  replay with its two budgets, the admission lock order, `client/leave` gating, the
+  replay with its two budgets, `client/leave` gating, the
   `client/state` role-object rules, the combined `['playback','pairing']` activate, the
   re-prove watchdog, and the liveness tick and the arrival stamp it reads.
 - `test_client_lifecycle.cpp`: `start()`/`stop()`/restart: goodbyes, clear callbacks delivered
@@ -112,6 +112,9 @@ completes, before any `client/hello`, so that ordering is exercised by every tes
 
 `tests/wrap_test_helpers.h` holds the server side of pairing.md "Wrapping", so a test can open
 what the client sealed without the library carrying an inverse it never calls.
+
+`tests/inbound_test_helpers.h` stands in for a transport and the protocol task around the shared
+inbound ring, so a role's protocol-task handlers can be driven on the test thread.
 
 These are white-box tests: they include private headers from `src/`, so the test target adds
 `src/` to its include path. To add a new test file, create `test_<unit>.cpp` here and add it to

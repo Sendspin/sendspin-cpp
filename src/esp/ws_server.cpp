@@ -64,10 +64,9 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
         config.task_caps = MALLOC_CAP_SPIRAM;
     }
     config.task_priority = task_priority;
-    // The Noise handshake (and especially the in-band re-handshake) runs its X25519 crypto on
-    // this task; the esp_http_server 4096-byte default overflows during the post-pairing
-    // re-handshake. Clamp to the documented minimum so a lowered config value cannot
-    // reintroduce that overflow.
+    // Clamp to the documented minimum, the value shipped and verified on hardware (see
+    // SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE), until this task's receive path is
+    // measured.
     if (task_stack_size < SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE) {
         SS_LOGW(TAG, "httpd_stack_size %u below minimum %u; clamping",
                 static_cast<unsigned>(task_stack_size),
@@ -139,6 +138,8 @@ void SendspinWsServer::stop() {
             // that work held are never released. Every session is closed, so nothing can claim a
             // block now.
             this->send_pool_.reset();
+            // The httpd task is gone, so nothing reads into the discard buffer any more.
+            this->discard_buf_.reset();
         }
     }
 
@@ -151,6 +152,14 @@ void SendspinWsServer::stop() {
         std::lock_guard<std::mutex> lock(this->pending_mutex_);
         stale.swap(this->pending_);
     }
+}
+
+uint8_t* SendspinWsServer::discard_buffer() {
+    if (this->discard_buf_.data() == nullptr &&
+        !this->discard_buf_.allocate(INBOUND_MAX_MESSAGE_BYTES, MemoryLocation::PREFER_EXTERNAL)) {
+        return nullptr;
+    }
+    return this->discard_buf_.data();
 }
 
 void SendspinWsServer::tick() {
@@ -276,12 +285,13 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
         server->pop_pending(sockfd);
     }
 
-    // Notify ConnectionManager so it can drop its observer shared_ptr. Passing the connection
-    // rather than the sockfd keys the event on identity (see the typedef). The session slot keeps
-    // it alive until httpd invokes the free_fn, so in-flight workers still see a valid object.
-    if (server != nullptr && server->connection_closed_callback_ && slot != nullptr &&
-        *slot != nullptr) {
-        server->connection_closed_callback_(*slot);
+    // Tell the protocol task, which reports the loss to ConnectionManager (so it can drop its
+    // observer shared_ptr) once the messages the session delivered before closing are processed.
+    // The event is keyed on the connection's identity, never the recyclable sockfd. The session
+    // slot keeps it alive until httpd invokes the free_fn, so in-flight workers still see a
+    // valid object.
+    if (slot != nullptr && *slot != nullptr) {
+        (*slot)->notify_transport_closed();
     }
 
     // Shut down the receive side before close() to stop lwIP from delivering more packets
@@ -324,12 +334,11 @@ SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     }
 
     // Delegate to connection's handle_data. Stale messages (i.e., after the connection has been
-    // dropped from ConnectionManager's observer slots) are short-circuited inside the connection
-    // via disable_message_dispatch(), so a still-alive session-pinned conn does not leak messages
-    // into freshly-reset role queues. A frame on a never-delivered connection (its session
-    // outliving a tick() reap by a moment) dispatches into unwired callbacks and is dropped by
-    // their null guards.
-    return conn->handle_data(req, receive_time);
+    // dropped from ConnectionManager's observer slots) are dropped inside the connection by its
+    // detached inbound gate, so a still-alive session-pinned conn does not leak messages into
+    // freshly-reset role queues. A frame on a never-delivered connection (its session outliving a
+    // tick() reap by a moment) has no inbound ring to go to and is dropped the same way.
+    return conn->handle_data(req, receive_time, server);
 }
 
 }  // namespace sendspin

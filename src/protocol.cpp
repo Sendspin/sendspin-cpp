@@ -514,7 +514,8 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
 }
 
 // server/state is parsed one section at a time rather than into a single aggregate struct. The
-// caller runs on the network task (the ESP httpd task has a 4 KB stack), and an aggregate would
+// caller runs on the protocol task (its stack is bounded on ESP-IDF; see
+// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE), and an aggregate would
 // keep every section's fields alive in the caller's frame for the whole parse while the section
 // parser built a second copy of the same fields in its own. Each section here is an out-of-line
 // function that fills a caller-owned struct directly, so only one section's storage is live at a

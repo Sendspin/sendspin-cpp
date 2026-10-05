@@ -55,12 +55,12 @@ enum class SlotAckState : uint8_t {
     PRESENTED,         // on_image_display or on_image_clear fired, awaiting frame_done()
 };
 
-/// @brief Notification sent from the network thread to the decode thread when an image transfer
+/// @brief Notification sent from the protocol task to the decode thread when an image transfer
 /// completes
 ///
 /// All metadata is carried in the notification itself (not in SlotBuffer) so that the
 /// ThreadSafeQueue's internal mutex provides the happens-before guarantee between the
-/// network thread's writes and the decode thread's reads.
+/// protocol task's writes and the decode thread's reads.
 ///
 /// `generation` and `epoch` let the decode thread detect a stale notification: if the buffer it
 /// names has since been claimed for another transfer (generation mismatch) or the slot has moved
@@ -88,7 +88,7 @@ struct ArtworkNotification {
 /// cancel abandons it, or when the stream it belongs to goes away. A second announce arriving
 /// while `in_flight` is set is the malformed-sequence rule rather than a second record.
 ///
-/// Guarded by DrainTask::slot_mutex: written from the network thread (handle_binary() and the
+/// Guarded by DrainTask::slot_mutex: written from the protocol task (handle_binary() and the
 /// stream lifecycle handlers) and cleared from the main loop by cleanup().
 ///
 /// `buffer_idx`/`generation` name the SlotBuffer the parts accumulate into, claimed once at the
@@ -109,8 +109,8 @@ struct ArtworkTransfer {
 
 /// @brief Double-buffered image storage for a single artwork slot
 ///
-/// Every field is guarded by DrainTask::slot_mutex and written by both the network and decode
-/// threads. write_generation[i] is bumped whenever buffers[i] is overwritten, so the decode
+/// Every field is guarded by DrainTask::slot_mutex and written by both the protocol task and the
+/// decode thread. write_generation[i] is bumped whenever buffers[i] is overwritten, so the decode
 /// thread can compare it against the generation stamped on the notification it dequeued and skip
 /// a buffer that was reused before it could be claimed. ack_state is meaningful only for a slot
 /// with require_frame_done (see ack_enabled()); while it is not IDLE, at most one newer
@@ -200,11 +200,11 @@ struct ArtworkRole::Impl {
     void drain_events();
     /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
     ///
-    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
-    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
-    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
-    /// the gate and hands it back here at each point of effect, so a teardown inside that window
-    /// invalidates the whole handler instead of only the part that ran before it.
+    /// The gate in SendspinClient's role dispatch is checked once, on the protocol task, while the
+    /// handler it admits runs on: a teardown on the main loop can land in between (neither a lost
+    /// connection nor a deactivation waits for the protocol task). The dispatch captures this
+    /// counter with the gate and hands it back here at each point of effect, so a teardown inside
+    /// that window invalidates the whole handler instead of only the part that ran before it.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
     }
@@ -323,7 +323,7 @@ struct ArtworkRole::Impl {
     ArtworkTransfer transfer;
     // The channel array of the stream/start in force, kept so the next one can be compared
     // against it: only the channels whose configuration changes lose their pending image.
-    // Guarded by DrainTask::slot_mutex, like `transfer`: the network thread writes it from
+    // Guarded by DrainTask::slot_mutex, like `transfer`: the protocol task writes it from
     // handle_stream_start() while the main loop can clear it from cleanup(), which a
     // server/activate that removes the role runs on a live connection.
     std::optional<std::vector<ServerArtworkChannelObject>> streamed_channels;
@@ -345,14 +345,14 @@ struct ArtworkRole::Impl {
     // 32-bit fields
     // Slot epoch each held display was decoded under; a mismatch against slot_epochs at
     // deadline-check time means the slot has since moved past it (a stream restart, a cancel, or
-    // a fresh announce) and the display must be dropped, since the network thread cannot reach
+    // a fresh announce) and the display must be dropped, since the protocol task cannot reach
     // the main-thread holds to cancel it. Main-thread only; see held_display_ts.
     uint32_t held_display_epoch[ARTWORK_MAX_SLOTS]{};
 
     /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event queued
     /// afterwards. At the drain an event whose stamp no longer matches is discarded, so an event
     /// queued before a teardown cannot act after it (see event_is_current() in inbox.h). Atomic
-    /// because the network thread reads it (see accepts()).
+    /// because the protocol task reads it (see accepts()).
     std::atomic<uint32_t> cleanup_generation{0};
 
     /// @brief Per-channel delivery epoch, bumped whenever the channel's pending image is

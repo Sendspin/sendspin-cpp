@@ -54,6 +54,8 @@ using SendBlockPool = FixedBlockPool<SEND_BLOCK_SIZE, SEND_BLOCK_COUNT>;
  * and the Sendspin server connects to it as a WebSocket client. Instances are created by
  * SendspinWsServer, never directly; the httpd session owns them (see ws_server.h).
  */
+class SendspinWsServer;
+
 class SendspinServerConnection : public SendspinConnection {
 public:
     /// @brief Constructs a server connection over an accepted httpd session
@@ -124,11 +126,14 @@ public:
         return this->sockfd_;
     }
 
-    /// @brief Handles incoming WebSocket data
+    /// @brief Receives one WebSocket frame and hands it to the protocol task: a single-frame
+    /// message straight into its ring item (or, before admission, the fallback buffer), a frame of
+    /// a multi-frame message into the fallback buffer it is assembled in. On the httpd task.
     /// @param req The httpd request containing the WebSocket frame.
     /// @param receive_time Timestamp when the data was received.
-    /// @return ESP_OK on success, error code on failure.
-    esp_err_t handle_data(httpd_req_t* req, int64_t receive_time);
+    /// @param server The server whose discard buffer a dropped frame is read into.
+    /// @return ESP_OK on success; an error makes httpd close the session.
+    esp_err_t handle_data(httpd_req_t* req, int64_t receive_time, SendspinWsServer* server);
 
 protected:
     /// @brief Queues the frame like send_binary_message(), carrying `before_write` to the httpd
@@ -151,6 +156,18 @@ protected:
     SsErr queue_async_send(const uint8_t* data, size_t len, httpd_ws_type_t type,
                            SendCompleteCallback on_complete, bool allow_before_hello,
                            const NoiseTransport::FrameWriteHook& before_write);
+
+    /// @brief Receives the payload of the frame whose header `ws_pkt` holds into `dest`, which has
+    /// room for ws_pkt.len bytes. A zero-length frame reads nothing.
+    static esp_err_t receive_frame_payload(httpd_req_t* req, httpd_ws_frame_t& ws_pkt,
+                                           uint8_t* dest);
+
+    /// @brief Reads and discards the payload of the frame whose header `ws_pkt` holds, into the
+    /// server's discard buffer (SendspinWsServer::discard_buffer())
+    /// @return ESP_FAIL, closing the session, when the frame is too large to be a message or the
+    ///         discard buffer cannot be allocated.
+    static esp_err_t discard_frame_payload(httpd_req_t* req, httpd_ws_frame_t& ws_pkt,
+                                           SendspinWsServer* server);
 
     /// @brief httpd_queue_work callback that sends a queued text or binary frame over the
     /// WebSocket

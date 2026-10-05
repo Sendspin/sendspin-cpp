@@ -30,6 +30,12 @@
 namespace sendspin {
 
 static const char* const TAG = "sendspin.client_connection";
+// The component's Kconfig selects ESP_WS_CLIENT_SEPARATE_TX_LOCK, so this timeout is spent only
+// on other sends, not on the lock the client task holds while handle_data() waits for inbound
+// ring space. The exception is a failed write: esp_websocket_client then takes that lock with no
+// timeout to abort the connection, so the send waits out the handler's park (bounded by its
+// inbound waits, InboundGate::WRITABLE_WAIT_MS and INBOUND_ACQUIRE_TIMEOUT_MS, plus the rest of
+// the frame) rather than deadlocking.
 static constexpr uint32_t WEBSOCKET_SEND_TIMEOUT_MS = 10U;
 
 // WebSocket frame opcodes (RFC 6455)
@@ -52,6 +58,9 @@ SendspinClientConnection::~SendspinClientConnection() {
         esp_websocket_client_destroy(this->client_);
         this->client_ = nullptr;
     }
+    // The stop can end the websocket task between two chunks of a message; the ring item it was
+    // receiving into must still be completed.
+    this->abandon_inbound_message();
 }
 
 void SendspinClientConnection::start() {
@@ -67,10 +76,9 @@ void SendspinClientConnection::start() {
     config.uri = this->url_.c_str();
     config.disable_auto_reconnect = true;  // We handle reconnection ourselves
     config.task_prio = static_cast<int>(this->task_priority_);
-    // The Noise handshake (and especially the in-band re-handshake) runs its X25519 crypto on
-    // this task; the esp_websocket_client 4096-byte default overflows during the post-pairing
-    // re-handshake. Clamp to the documented minimum so a lowered config value cannot reintroduce
-    // that overflow.
+    // Clamp to the documented minimum, the value shipped and verified on hardware (see
+    // SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE), until this task's receive path is
+    // measured.
     size_t task_stack_size = this->task_stack_size_;
     if (task_stack_size < SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE) {
         SS_LOGW(TAG, "websocket_stack_size %u below minimum %u; clamping",
@@ -151,13 +159,13 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
 
 void SendspinClientConnection::close_transport_now() {
     // esp_websocket_client_stop() (used by disconnect() above) cannot be called from the
-    // websocket task's own event handler (see handle_data()'s allocation-failure precedent
-    // below, and esp_websocket_client.h's doc comment on esp_websocket_client_stop()): it blocks
-    // until that task exits, which deadlocks when called from within the task itself. Report the
-    // loss immediately via handle_disconnected() without touching the transport; the manager
-    // reacts by dropping this connection, whose destructor calls esp_websocket_client_stop() to
-    // actually stop it, running off the websocket task.
-    this->handle_disconnected();
+    // websocket task's own event handler (see esp_websocket_client.h's doc comment on
+    // esp_websocket_client_stop()): it blocks until that task exits, which deadlocks when called
+    // from within the task itself. Stop taking frames without touching the transport; the
+    // protocol task reports the loss (the inbound gate is detached by every caller), and the
+    // manager drops this connection, whose destructor calls esp_websocket_client_stop() to
+    // actually stop it, off the websocket task.
+    this->connected_ = false;
 }
 
 bool SendspinClientConnection::is_connected() const {
@@ -264,23 +272,21 @@ void SendspinClientConnection::handle_disconnected() {
     this->connected_ = false;
     this->client_hello_sent_ = false;
     this->server_hello_received_ = false;
-    this->reset_websocket_payload();
-
-    // Invoke the disconnected callback if set
-    if (this->on_disconnected_cb) {
-        this->on_disconnected_cb(this);
-    }
+    this->chunk_dest_ = nullptr;
+    this->abandon_inbound_message();
+    // The protocol task reports the loss once the messages before it are processed.
+    this->notify_transport_closed();
 }
 
 void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* data,
                                            int64_t receive_time) {
-    // connected_ is written only by handle_connected() and handle_disconnected(), both reached
-    // exclusively through this same websocket task's event handler, so this same-task read races
-    // with nothing. close_transport_now() reports the disconnect via handle_disconnected()
-    // without stopping the transport, so already-buffered frames keep arriving as further DATA
-    // events until the manager drops the connection off this task; drop them here instead of
-    // reprocessing a cap trip or re-firing the disconnect callback.
+    // connected_ is cleared by close_transport_now() from another thread too, without stopping
+    // the transport, so already-buffered frames keep arriving as further DATA events until the
+    // manager drops the connection off this task; drop them here, completing a ring item a
+    // message was being received into.
     if (!this->connected_) {
+        this->chunk_dest_ = nullptr;
+        this->abandon_inbound_message();
         return;
     }
 
@@ -289,39 +295,54 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
     }
 
     // Determine frame type: text (0x01), binary (0x02), or continuation (0x00)
-    if (data->op_code == WS_OP_TEXT || data->op_code == WS_OP_BINARY) {
-        // First frame of a new message: remember the type for continuation frames
-        this->is_text_frame_ = (data->op_code == WS_OP_TEXT);
-    } else if (data->op_code != WS_OP_CONTINUATION) {
+    const bool continuation = data->op_code == WS_OP_CONTINUATION;
+    if (!continuation && data->op_code != WS_OP_TEXT && data->op_code != WS_OP_BINARY) {
         // Control frames (ping, pong, close): ignore
         return;
     }
+    const bool is_text = data->op_code == WS_OP_TEXT;
+    const auto offset = static_cast<size_t>(data->payload_offset);
+    const auto chunk_len = static_cast<size_t>(data->data_len);
+    const auto frame_len = static_cast<size_t>(data->payload_len);
+    // esp_websocket_client delivers one frame's payload across as many events as its buffer
+    // needs; the frame is done once its last chunk is in.
+    const bool frame_done = offset + chunk_len >= frame_len;
 
-    // Copy data from ESP-IDF's internal buffer into our payload buffer.
-    // On the first chunk of a frame, allocate for the full frame payload so subsequent chunks
-    // write into the existing buffer without reallocation.
-    if (data->data_len > 0) {
-        size_t prepare_len = (data->payload_offset == 0) ? data->payload_len : data->data_len;
-        uint8_t* dest = this->prepare_receive_buffer(prepare_len);
-        if (dest == nullptr) {
-            SS_LOGE(TAG, "Allocation failed, dropping connection");
-            // Stop processing frames that keep arriving on the still-open transport via
-            // close_transport_now() (esp_websocket_client_stop cannot be called from the
-            // websocket task's own event handler; see its doc comment).
-            this->disable_message_dispatch();
-            this->close_transport_now();
+    if (!continuation && data->fin) {
+        // A single-frame message, the only kind a conforming peer sends: its chunks are copied
+        // from the client's buffer straight into the message's destination, a ring item once the
+        // connection is admitted. The destination is chosen on the first chunk, from the frame's
+        // full length.
+        if (offset == 0) {
+            const InboundTarget target =
+                this->begin_inbound_message(frame_len, is_text, receive_time);
+            this->chunk_dest_ = target.route == InboundRoute::RECEIVE ? target.data : nullptr;
+        }
+        if (this->chunk_dest_ == nullptr) {
             return;
         }
-        std::memcpy(dest, data->data_ptr, data->data_len);
-        this->commit_receive_buffer(data->data_len);
+        if (chunk_len > 0) {
+            std::memcpy(this->chunk_dest_ + offset, data->data_ptr, chunk_len);
+        }
+        if (frame_done) {
+            this->chunk_dest_ = nullptr;
+            this->end_inbound_message(true);
+        }
+        return;
     }
 
-    // A complete message requires both:
-    // 1. FIN flag set (last WebSocket protocol frame of the message)
-    // 2. All data for this frame received (handles ESP-IDF buffer-level fragmentation,
-    //    where a single frame's payload is delivered across multiple events)
-    if (data->fin && (data->payload_offset + data->data_len >= data->payload_len)) {
-        this->dispatch_completed_message(this->is_text_frame_, receive_time);
+    // A chunk of a multi-frame message (the rare path; see begin_inbound_fragment()).
+    const bool first = !continuation && offset == 0;
+    const bool last = data->fin && frame_done;
+    const InboundTarget target =
+        this->begin_inbound_fragment(chunk_len, first, is_text, receive_time);
+    if (target.route == InboundRoute::RECEIVE) {
+        if (chunk_len > 0) {
+            std::memcpy(target.data, data->data_ptr, chunk_len);
+        }
+        this->end_inbound_fragment(chunk_len, last);
+    } else if (target.route == InboundRoute::DROP) {
+        this->end_inbound_fragment(0, last);
     }
 }
 

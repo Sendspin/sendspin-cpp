@@ -210,7 +210,7 @@ void ArtworkRole::Impl::build_state_fields(ClientStateMessage& msg) const {
 }
 
 // ============================================================================
-// Display-deadline and ack-gate helpers (used from network, decode, and main threads)
+// Display-deadline and ack-gate helpers (used from the protocol task, decode, and main threads)
 // ============================================================================
 
 void ArtworkRole::Impl::merge_artwork_display_update(ArtworkDisplayUpdate& current,
@@ -271,7 +271,7 @@ void ArtworkRole::Impl::wake_drain_thread() const {
 }
 
 // ============================================================================
-// Binary handling (network thread)
+// Binary handling (protocol task)
 // ============================================================================
 
 uint32_t ArtworkRole::Impl::image_cap(uint8_t slot) const {
@@ -506,7 +506,7 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 }
 
 // ============================================================================
-// Stream lifecycle (network thread)
+// Stream lifecycle (protocol task)
 // ============================================================================
 
 void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream,
@@ -566,7 +566,7 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         // that decode's eventual display can no longer fire, and leaving the gate armed would
         // wedge the slot forever. PRESENTED must stay armed: that delivery has already reached
         // the consumer, which may still be mid-fade on it and owes the frame_done() that says so.
-        // Protocol messages are serialized on the network thread, so this runs before any of the
+        // Protocol messages are serialized on the protocol task, so this runs before any of the
         // new stream's handle_binary() calls.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
         // The stream is marked active inside this lock: cleanup() bumps the generation before
@@ -863,7 +863,7 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
         // Validate the notification is still current before touching the buffer: a newer
         // transfer (epoch changed) or a newer write to the same buffer (write_generation
         // changed) means this notification is stale and the bytes it names may have already
-        // been overwritten by the network thread, or are about to be. A fresher notification
+        // been overwritten by the protocol task, or are about to be. A fresher notification
         // for the same slot is already queued or has itself been parked.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
         auto& sb = this->drain_task->slot_buffers[slot];
@@ -898,7 +898,7 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
         }
 
         if (!is_clear) {
-            // Mark this buffer as in-use so the network thread avoids it while we decode.
+            // Mark this buffer as in-use so the protocol task avoids it while we decode.
             sb.drain_buf_idx = buf_idx;
             sb.drain_active = true;
             decode_data = sb.buffers[buf_idx].data();

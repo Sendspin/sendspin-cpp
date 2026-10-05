@@ -61,11 +61,17 @@ hunks: resource problems live in context.
 
 ## CPU and thread budget
 
-- The network thread only receives, copies, and hands off; validation and
-  decoding belong on the consuming thread. New work added to the network
-  thread or to `loop()` needs justification.
-- No blocking calls (locks held across I/O, unbounded waits) on `loop()` or
-  the network thread.
+- A transport thread is a pipe: it receives a complete message into the
+  inbound ring or the connection's fallback buffer, reports a close, and
+  wakes the protocol task. Decrypt, reassembly, the handshake and dispatch run
+  on the protocol task; validation and decoding belong on the consuming
+  thread. New work added to a transport, the protocol task or `loop()` needs
+  justification.
+- No blocking calls (locks held across I/O, unbounded waits) on `loop()`, the
+  protocol task or a transport thread. A transport's wait on the protocol task
+  is bounded (`INBOUND_ACQUIRE_TIMEOUT_MS`, `InboundGate::WRITABLE_WAIT_MS`);
+  on ESP every inbound session shares the one httpd task, so its waits stall
+  them all.
 
 ## Flash and code size
 
