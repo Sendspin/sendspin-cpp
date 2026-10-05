@@ -51,8 +51,10 @@ static_assert(ARTWORK_PART_DATA_OFFSET == sendspin::INBOUND_ARTWORK_PART_HEADER_
 /// @brief Every channel's bit, the mask of a stream end's DISCARD marker
 static constexpr uint8_t ARTWORK_ALL_CHANNELS = (1U << sendspin::ARTWORK_MAX_SLOTS) - 1U;
 
-// Event flag bits for decode thread signaling
-static constexpr uint32_t COMMAND_STOP = (1 << 0);
+// Decode thread command bit, signalled on its item list's flags (InboundItemList::signal())
+static constexpr uint32_t COMMAND_STOP = sendspin::InboundItemList::FIRST_CONSUMER_BIT;
+static_assert(COMMAND_STOP <= sendspin::InboundItemList::LAST_CONSUMER_BIT,
+              "the decode thread's command bit must fit the list's usable event bits");
 
 // ============================================================================
 // Big-endian helpers
@@ -119,11 +121,6 @@ bool ArtworkRole::Impl::start(InboundRing* ring) {
     if (this->drain_task->drain_thread.joinable()) {
         return true;  // Already running
     }
-    if (!this->drain_task->event_flags.is_created() && !this->drain_task->event_flags.create()) {
-        SS_LOGE(TAG, "Failed to create artwork event flags");
-        return false;
-    }
-
     // One assembly buffer per configured channel, at its cap, held for the run: each image is
     // copied into it part by part and decoded from it, so nothing is allocated per image. Image
     // data prefers SPIRAM, where it is decoded from once and never touched on a timing-critical
@@ -149,11 +146,9 @@ bool ArtworkRole::Impl::start(InboundRing* ring) {
         return false;
     }
 
-    // The flags survive a stop()/start() cycle, and a command signalled between the join and this
-    // start (cleanup() on a stopped role) is still set. Clear the whole group so the new thread's
-    // first wait() starts from a clean command state whatever bits the role defines (stop()
-    // already emptied the list).
-    this->drain_task->event_flags.clear_all();
+    // The list's flags survive a stop()/start() cycle. Clear them so the new thread starts from a
+    // clean command state (stop() already emptied the list).
+    this->drain_task->inbound.items().clear_signals();
 
     platform_configure_thread("SsArt", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
@@ -165,11 +160,10 @@ bool ArtworkRole::Impl::signal_stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
         return false;
     }
-    // Set the flag before waking: the thread re-checks its command flags at the top of every
-    // loop iteration, so this ordering guarantees it observes the stop as soon as the wake
-    // pulls it out of its blocking take.
-    this->drain_task->event_flags.set(COMMAND_STOP);
-    this->drain_task->inbound.items().wake_receiver();
+    // signal() sets the bit before it wakes: the thread re-checks its command bits at the top of
+    // every loop iteration, so it observes the stop as soon as the wake pulls it out of its
+    // blocking take.
+    this->drain_task->inbound.items().signal(COMMAND_STOP);
     return true;
 }
 
@@ -1023,11 +1017,11 @@ void ArtworkRole::Impl::sweep_parked() {
 void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
     SS_LOGD(TAG, "Decode thread started");
 
-    auto& flags = self->drain_task->event_flags;
+    InboundItemList& items = self->drain_task->inbound.items();
 
     while (true) {
         // Non-blocking check for commands
-        uint32_t cmd = flags.wait(COMMAND_STOP, false, true, 0);
+        uint32_t cmd = items.take_signals(COMMAND_STOP, 0);
         if (cmd & COMMAND_STOP) {
             break;
         }
@@ -1036,9 +1030,10 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
         self->adopt_generation(self->cleanup_generation.load(std::memory_order_acquire));
         self->sweep_parked();
 
-        // Blocking take; returns early (nullptr) when wake_receiver() signals a stop, a teardown
-        // or a parked-slot recheck. The timeout is only a safety net against a missed wake (see
-        // INBOUND_CONSUMER_FALLBACK_WAKE_MS); a timeout return simply re-runs the checks above.
+        // Blocking take; returns early (nullptr) when signal() raises a stop, or wake_receiver()
+        // a teardown or a parked-slot recheck. The timeout is only a safety net against a missed
+        // wake (see INBOUND_CONSUMER_FALLBACK_WAKE_MS); a timeout return simply re-runs the checks
+        // above.
         self->process_next_item(INBOUND_CONSUMER_FALLBACK_WAKE_MS);
     }
 

@@ -19,7 +19,6 @@
 
 #include "inbound_ring.h"
 #include "inbox.h"
-#include "platform/event_flags.h"
 #include "platform/memory.h"
 #include "protocol_messages.h"
 #include "sendspin/artwork_role.h"
@@ -186,8 +185,9 @@ struct ArtworkRole::Impl : RoleTeardown {
     /// @brief Persistent decode thread context and the artwork role's end of the inbound ring,
     /// through which the protocol task hands it announces, image parts and markers
     struct DrainTask {
-        InboundConsumer inbound;  ///< InboundConsumer states its threads.
-        EventFlags event_flags;
+        /// InboundConsumer states its threads. Its item list's flags also carry the decode
+        /// thread's command bit (InboundItemList::signal()).
+        InboundConsumer inbound;
         std::thread drain_thread;
         /// Decode thread only; see ArtworkAssembly.
         ArtworkAssembly assemblies[ARTWORK_MAX_SLOTS];
@@ -217,7 +217,7 @@ struct ArtworkRole::Impl : RoleTeardown {
     /// @brief Allocates each configured channel's assembly buffer, binds the decode thread's item
     /// list to `ring` and starts the thread. Main loop, before the protocol task starts.
     /// @param ring The client's inbound ring for this run.
-    /// @return false when a buffer, the list or the event flags cannot be created.
+    /// @return false when a buffer or the list cannot be created.
     bool start(InboundRing* ring);
     void build_hello_fields(ClientHelloMessage& msg) const;
     void build_state_fields(ClientStateMessage& msg) const;

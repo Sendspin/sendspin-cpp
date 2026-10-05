@@ -406,6 +406,49 @@ TEST(InboundItemList, WakeReceiverEndsABlockingTake) {
     EXPECT_EQ(got, nullptr);
 }
 
+// The list's flags are its consumer's one event group: signal() sets a consumer bit and ends a
+// blocking take with nothing, and the bit stays pending for the consumer's own take_signals(),
+// which reports it once. The list's own bits are not consumer signals, and clear_signals() (a
+// start) drops a pending one. The blocking take has no timeout: a signal that does not wake it
+// hangs here and the watchdog names it.
+TEST(InboundItemList, ASignalEndsATakeAndStaysPendingForItsOwnWait) {
+    constexpr uint32_t BIT = InboundItemList::FIRST_CONSUMER_BIT;
+    enum class Step { NONE, SIGNAL, APPEND, SIGNAL_THEN_CLEAR };
+    struct Row {
+        const char* name;
+        Step step;
+        uint32_t first;
+    };
+    const Row rows[] = {
+        {"Control: nothing signalled", Step::NONE, 0},
+        {"a signal is reported once", Step::SIGNAL, BIT},
+        {"an append is not a consumer signal", Step::APPEND, 0},
+        {"clear_signals() drops a pending signal", Step::SIGNAL_THEN_CLEAR, 0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Fixture f(1024);
+        switch (row.step) {
+            case Step::NONE:
+                break;
+            case Step::SIGNAL:
+                f.list.signal(BIT);
+                EXPECT_EQ(f.list.take(UINT32_MAX), nullptr);
+                break;
+            case Step::APPEND:
+                f.list.append(routed_item(f.ring, 1));
+                break;
+            case Step::SIGNAL_THEN_CLEAR:
+                f.list.signal(BIT);
+                f.list.clear_signals();
+                break;
+        }
+        EXPECT_EQ(f.list.take_signals(BIT, 0), row.first);
+        EXPECT_EQ(f.list.take_signals(BIT, 0), 0U) << "a signal was reported twice";
+        f.list.recall();
+    }
+}
+
 // recall() unlinks every item not yet taken and returns each through the ring's return path:
 // the space is reclaimed (with an unlisted item returned at once between them, as a JSON message
 // is, recalling the listed items frees the whole ring) and their quota charges are released.

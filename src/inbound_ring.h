@@ -568,6 +568,36 @@ public:
         this->flags_.set(WAKE);
     }
 
+    /// The lowest bit a consumer defines for signal() and take_signals(). The list's flags are
+    /// its consumer's one event group: the bits below this one are the list's own
+    /// (ITEMS_APPENDED, WAKE), and a consumer's command bits start here, staying inside
+    /// EventFlags::USABLE_BITS.
+    static constexpr uint32_t FIRST_CONSUMER_BIT = 1U << 2;
+    /// The highest bit a consumer may define: the eighth, the last bit every platform's group
+    /// exposes (a FreeRTOS event group with 16-bit ticks has 8 usable bits, see
+    /// EventFlags::USABLE_BITS). Each consumer static_asserts its command bits against it.
+    static constexpr uint32_t LAST_CONSUMER_BIT = 1U << 7;
+
+    /// @brief Sets consumer `bits` (FIRST_CONSUMER_BIT and up), then wakes a blocking take(), so
+    /// the consumer sees them at its next take_signals(). Any thread, once the list is created.
+    void signal(uint32_t bits) {
+        this->flags_.set(bits | WAKE);
+    }
+
+    /// @brief Waits up to `timeout_ms` for any of consumer `bits` and clears the ones set.
+    /// Consumer only. A wake signal() left behind makes the next blocking take() return nullptr
+    /// once, which take() already reports as a retry.
+    /// @return The bits among `bits` that were set; 0 on timeout.
+    uint32_t take_signals(uint32_t bits, uint32_t timeout_ms) {
+        return this->flags_.wait(bits, false, true, timeout_ms) & bits;
+    }
+
+    /// @brief Clears every bit, the consumer's and the list's own. Before the consumer thread
+    /// starts, while the list is empty, so a restart inherits no signal from the previous run.
+    void clear_signals() {
+        this->flags_.clear_all();
+    }
+
     /// @brief Unlinks every item not yet taken and returns each through
     /// InboundRing::return_item(), oldest first, releasing its charge. Protocol task, or any
     /// thread once the consumer is joined.
@@ -594,7 +624,8 @@ private:
     }
 
     // Struct fields
-    /// Set by append() and wake_receiver(); a blocking take() waits on it.
+    /// Set by append(), wake_receiver() and signal(); a blocking take() waits on the list's own
+    /// bits, take_signals() on the consumer's (see FIRST_CONSUMER_BIT).
     EventFlags flags_;
     /// Guards head_, tail_ and the links of linked items; a leaf lock (see the class comment).
     mutable std::mutex mutex_;

@@ -394,7 +394,6 @@ std::unique_ptr<VisualizerRole::Impl> make_visualizer(InboundRing& ring) {
     impl->attach_inbox(inboxes.emplace_back());
     impl->stream_active = true;
     impl->negotiated_types_mask = 0x1F;
-    EXPECT_TRUE(impl->drain_task->event_flags.create());
     EXPECT_TRUE(impl->drain_task->inbound.bind(&ring, InboundHolder::VISUALIZER));
     return impl;
 }

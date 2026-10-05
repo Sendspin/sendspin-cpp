@@ -19,7 +19,6 @@
 
 #include "inbound_ring.h"
 #include "inbox.h"
-#include "platform/event_flags.h"
 #include "sendspin/visualizer_role.h"
 #include "teardown_tracker.h"
 
@@ -102,8 +101,9 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// @brief Persistent drain thread context and the visualizer's end of the inbound ring,
     /// through which the protocol task hands it frames
     struct DrainTask {
-        InboundConsumer inbound;  ///< InboundConsumer states its threads.
-        EventFlags event_flags;
+        /// InboundConsumer states its threads. Its item list's flags also carry the drain
+        /// thread's command bits (InboundItemList::signal()).
+        InboundConsumer inbound;
         std::thread drain_thread;
     };
 

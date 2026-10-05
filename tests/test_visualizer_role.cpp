@@ -198,7 +198,6 @@ std::unique_ptr<VisualizerRole::Impl> make_impl() {
     impl->negotiated_types_mask = 0x1F;
     InboundRing& ring = rings.emplace_back();
     create_test_ring(ring);
-    EXPECT_TRUE(impl->drain_task->event_flags.create());
     EXPECT_TRUE(impl->drain_task->inbound.bind(&ring, InboundHolder::VISUALIZER));
     return impl;
 }

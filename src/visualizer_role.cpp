@@ -87,12 +87,14 @@ static_assert(fits_advertised_fraction(BEAT_PAYLOAD_SIZE) &&
                   fits_advertised_fraction(F_PEAK_PAYLOAD_SIZE),
               "the advertised buffer_capacity would exceed the visualizer's quota");
 
-// Event flag bits for drain thread signaling
-static constexpr uint32_t COMMAND_STOP = (1 << 0);
+// Drain thread command bits, signalled on its item list's flags (InboundItemList::signal())
+static constexpr uint32_t COMMAND_STOP = sendspin::InboundItemList::FIRST_CONSUMER_BIT;
 // A stream boundary (stream/start, stream/end, stream/clear or a teardown) moved
 // boundary_sequence on: a frame the drain thread holds for its delivery time is returned if the
 // boundary made it stale, and take_item() returns the stale frames still listed.
-static constexpr uint32_t COMMAND_BOUNDARY = (1 << 1);
+static constexpr uint32_t COMMAND_BOUNDARY = sendspin::InboundItemList::FIRST_CONSUMER_BIT << 1;
+static_assert(COMMAND_BOUNDARY <= sendspin::InboundItemList::LAST_CONSUMER_BIT,
+              "the drain thread's command bits must fit the list's usable event bits");
 
 // ============================================================================
 // Big-endian helpers
@@ -194,20 +196,14 @@ bool VisualizerRole::Impl::start(InboundRing* ring) {
     if (this->drain_task->drain_thread.joinable()) {
         return true;  // Already running
     }
-    if (!this->drain_task->event_flags.is_created() && !this->drain_task->event_flags.create()) {
-        SS_LOGE(TAG, "Failed to create visualizer event flags");
-        return false;
-    }
     if (!this->drain_task->inbound.bind(ring, InboundHolder::VISUALIZER)) {
         SS_LOGE(TAG, "Failed to create the visualizer item list");
         return false;
     }
 
-    // The flags survive a stop()/start() cycle, and a boundary signalled between the join and
-    // this start (cleanup() on a stopped role) is still set. Clear the whole group so the new
-    // thread starts from a clean command state whatever bits the role defines (stop() already
-    // emptied the list).
-    this->drain_task->event_flags.clear_all();
+    // The list's flags survive a stop()/start() cycle. Clear them so the new thread starts from a
+    // clean command state (stop() already emptied the list).
+    this->drain_task->inbound.items().clear_signals();
 
     platform_configure_thread("SsVis", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
@@ -219,11 +215,10 @@ bool VisualizerRole::Impl::signal_stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
         return false;
     }
-    // Set the flag before waking: the thread re-checks its command flags at the top of every
-    // loop iteration, so this ordering guarantees it observes the stop no matter which wait
-    // it was parked in (display-time flags wait or item list take).
-    this->drain_task->event_flags.set(COMMAND_STOP);
-    this->drain_task->inbound.items().wake_receiver();
+    // signal() sets the bit before it wakes: the thread re-checks its command bits at the top of
+    // every loop iteration, so it observes the stop whichever wait it was parked in (the
+    // display-time wait or the item list take).
+    this->drain_task->inbound.items().signal(COMMAND_STOP);
     return true;
 }
 
@@ -595,15 +590,16 @@ void* VisualizerRole::Impl::take_item(uint32_t timeout_ms) const {
 
 void VisualizerRole::Impl::signal_boundary() {
     // Release: the drain thread's acquire load of the new value sees what the boundary's handler
-    // wrote before it (handle_stream_start()'s config). Flag after the store and wake after the
-    // flag, so a drain thread that sees the bit reads the new sequence, and one parked in its
-    // item list take starts the discard at once instead of at its fallback wake.
+    // wrote before it (handle_stream_start()'s config). Signal after the store, so a drain thread
+    // that sees the bit reads the new sequence, and one parked in its item list take starts the
+    // discard at once instead of at its fallback wake. Outside a run there is no thread to
+    // signal, and start() clears the bits anyway.
     this->boundary_sequence.store(
         static_cast<uint16_t>(this->boundary_sequence.load(std::memory_order_relaxed) + 1),
         std::memory_order_release);
-    if (this->drain_task->event_flags.is_created()) {
-        this->drain_task->event_flags.set(COMMAND_BOUNDARY);
-        this->drain_task->inbound.items().wake_receiver();
+    InboundConsumer& inbound = this->drain_task->inbound;
+    if (inbound.ring() != nullptr) {
+        inbound.items().signal(COMMAND_BOUNDARY);
     }
 }
 
@@ -617,7 +613,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
 
     // Bound by start() before this thread exists and unbound by stop() only after it is joined.
     InboundRing& ring = *self->drain_task->inbound.ring();
-    auto& flags = self->drain_task->event_flags;
+    InboundItemList& items = self->drain_task->inbound.items();
     const int32_t offset_ms = self->config.display_offset_ms;
 
     // Reused across iterations to avoid a heap alloc/free per frame. The vector's capacity
@@ -646,13 +642,13 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     while (true) {
         // Non-blocking check for commands. A boundary needs no step of its own here: the take
         // below returns the frames it made stale, and waiting on its bit clears it.
-        uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_BOUNDARY, false, true, 0);
+        uint32_t cmd = items.take_signals(COMMAND_STOP | COMMAND_BOUNDARY, 0);
         if (cmd & COMMAND_STOP) {
             break;
         }
 
-        // Blocking take; returns early (nullptr) when wake_receiver() signals a stop or a
-        // boundary. The timeout is only a safety net against a missed wake (see
+        // Blocking take; returns early (nullptr) when signal() raises a stop or a boundary. The
+        // timeout is only a safety net against a missed wake (see
         // INBOUND_CONSUMER_FALLBACK_WAKE_MS).
         void* item = self->take_item(INBOUND_CONSUMER_FALLBACK_WAKE_MS);
         if (item == nullptr) {
@@ -683,9 +679,9 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Sleep until delivery time, interruptible via event flags. A boundary returns the held
-        // frame when it made it stale, so the next take returns the rest of the stale run; a
-        // frame still current is older than everything listed, so nothing listed is stale either,
+        // Sleep until delivery time, interruptible via its list's command bits. A boundary returns
+        // the held frame when it made it stale, so the next take returns the rest of the stale run;
+        // a frame still current is older than everything listed, so nothing listed is stale either,
         // and the wait resumes for what is left of it.
         const int64_t deliver_at_us = now + *wait_us;
         bool stop = false;
@@ -694,7 +690,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
              left_us = deliver_at_us - platform_time_us()) {
             const auto wait_ms =
                 static_cast<uint32_t>(std::min<int64_t>(left_us / US_PER_MS, UINT32_MAX));
-            cmd = flags.wait(COMMAND_STOP | COMMAND_BOUNDARY, false, true, wait_ms);
+            cmd = items.take_signals(COMMAND_STOP | COMMAND_BOUNDARY, wait_ms);
             stop = (cmd & COMMAND_STOP) != 0;
             stale = (cmd & COMMAND_BOUNDARY) != 0 && self->is_stale(item);
             if (stop || stale || (cmd & COMMAND_BOUNDARY) == 0) {
