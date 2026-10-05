@@ -20,12 +20,14 @@
 #pragma once
 
 #include "platform/json_arena.h"
+#include "protocol_messages.h"
 #include "sendspin/config.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -77,10 +79,9 @@ inline std::array<uint8_t, N> from_hex_arr(const char* s) {
 
 /// Appends val as 8 big-endian bytes: the timestamp a binary role message carries.
 inline void put_be64(std::vector<uint8_t>& out, int64_t val) {
-    auto u = static_cast<uint64_t>(val);
-    for (int i = 7; i >= 0; --i) {
-        out.push_back(static_cast<uint8_t>((u >> (8 * i)) & 0xFF));
-    }
+    uint8_t bytes[sizeof(uint64_t)];
+    sendspin::host_to_be64(val, bytes);
+    out.insert(out.end(), std::begin(bytes), std::end(bytes));
 }
 
 /// Appends val as 4 big-endian bytes: an artwork announce's total_size.

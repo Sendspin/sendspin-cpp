@@ -492,7 +492,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             ServerHelloMessage hello_msg;
             if (parsed.extract<process_server_hello_message>(&hello_msg)) {
                 // server_id comes from the Noise handshake result (already set on the
-                // connection); server/hello only carries the display name.
+                // connection); server/hello supplies the display name.
                 ServerInformationObject info = conn->get_server_information();
                 info.name = hello_msg.name;
                 conn->set_server_information(std::move(info));

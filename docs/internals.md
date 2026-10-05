@@ -284,7 +284,7 @@ Server -> Client: server/init   (server_id, cipher suite)
 Server -> Client: noise/handshake msg1 (Noise KKpsk2 initiator message)
 Client -> Server: noise/handshake msg2 (Noise KKpsk2 responder message)
 -- transport active from here --
-Server -> Client: server/hello  (encrypted, server name)
+Server -> Client: server/hello  (encrypted, server name, source codec set)
 Client -> Server: client/hello  (encrypted, device info, pair_methods)
 Server -> Client: server/activate (encrypted, activities, active_roles)
 ```
