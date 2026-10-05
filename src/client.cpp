@@ -48,6 +48,9 @@
 #endif
 #include "protocol_messages.h"
 #include "protocol_task.h"
+#ifdef SENDSPIN_ENABLE_SOURCE
+#include "source_role_impl.h"
+#endif
 #include "time_filter.h"
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 #include "visualizer_role_impl.h"
@@ -264,6 +267,9 @@ SendspinClient::~SendspinClient() {
 #ifdef SENDSPIN_ENABLE_PLAYER
     this->player_.reset();
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    this->source_.reset();
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     this->visualizer_.reset();
 #endif
@@ -389,6 +395,11 @@ bool SendspinClient::start() {
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (roles_started && this->artwork_) {
         roles_started = this->artwork_->impl_->start(this->inbound_ring_.get());
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (roles_started && this->source_) {
+        roles_started = this->source_->impl_->start(this->protocol_task_.get());
     }
 #endif
     if (!roles_started) {
@@ -545,6 +556,11 @@ void SendspinClient::stop_role_threads() {
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
         this->artwork_->impl_->stop();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        this->source_->impl_->stop();
     }
 #endif
 }
@@ -772,6 +788,11 @@ void SendspinClient::drain_inbox() {
             catch_up(*this->visualizer_->impl_, InboxEventType::VISUALIZER_CLEARED);
         }
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+        if (this->source_) {
+            catch_up(*this->source_->impl_, InboxEventType::SOURCE_CLEARED);
+        }
+#endif
     };
 
     // Each role catches up on the teardowns the protocol task ran since the last drain: one
@@ -852,6 +873,7 @@ void SendspinClient::drain_inbox() {
                     case InboxEventType::COLOR_CLEARED:
                     case InboxEventType::ARTWORK_CLEARED:
                     case InboxEventType::VISUALIZER_CLEARED:
+                    case InboxEventType::SOURCE_CLEARED:
                         catch_up_roles(&event);
                         break;
                     // ARTWORK_STREAM / VISUALIZER_STREAM: code is the role-local
@@ -880,6 +902,21 @@ void SendspinClient::drain_inbox() {
                             catch_up_teardown(*this->visualizer_->impl_, event.epoch);
                             this->visualizer_->impl_->handle_stream_ring_event(
                                 static_cast<VisualizerEventType>(event.code), event.epoch);
+                        }
+#endif
+                        break;
+                    }
+                    // SOURCE_STREAM: code is the role-local SourceStreamEventType.
+                    case InboxEventType::SOURCE_STREAM: {
+#ifdef SENDSPIN_ENABLE_SOURCE
+                        if (this->source_ &&
+                            event_is_current(event.epoch,
+                                             this->source_->impl_->cleanup_generation.load(
+                                                 std::memory_order_acquire),
+                                             TAG, "a source stream event")) {
+                            catch_up_teardown(*this->source_->impl_, event.epoch);
+                            this->source_->impl_->handle_stream_ring_event(
+                                static_cast<SourceStreamEventType>(event.code));
                         }
 #endif
                         break;
@@ -1107,6 +1144,17 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
 }
 #endif
 
+#ifdef SENDSPIN_ENABLE_SOURCE
+SourceRole& SendspinClient::add_source(SourceRoleConfig config) {
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
+        SS_LOGW(TAG, "add_source() called while started");
+    }
+    this->source_ = std::make_unique<SourceRole>(config, this);
+    this->source_->impl_->attach(this->event_state_->inbox, *this->json_arena_);
+    return *this->source_;
+}
+#endif
+
 // ============================================================================
 // Queries
 // ============================================================================
@@ -1207,6 +1255,11 @@ ClientStateMessage SendspinClient::build_client_state() const {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     if (this->visualizer_) {
         this->visualizer_->impl_->build_state_fields(state_msg);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        this->source_->impl_->build_state_fields(state_msg);
     }
 #endif
     return state_msg;
@@ -1311,6 +1364,13 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
         this->visualizer_->impl_->cleanup();
     }
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    // The connection is going away, or stop() ended the stream in its shutdown pass: the stream
+    // closes without a client-stream/end.
+    if (this->source_ && (teardown_roles & role_mask_bit(SendspinRole::SOURCE)) != 0) {
+        this->source_->impl_->cleanup();
+    }
+#endif
 }
 
 std::string SendspinClient::build_hello_message() {
@@ -1391,6 +1451,11 @@ std::string SendspinClient::build_hello_message() {
         this->visualizer_->impl_->build_hello_fields(msg);
     }
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        this->source_->impl_->build_hello_fields(msg);
+    }
+#endif
 
     return format_client_hello_message(&msg, *this->json_arena_);
 }
@@ -1410,15 +1475,19 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     }
     const ClientStateMessage& snapshot = client_state.value();
 
-    // messaging.md "client/state": a player reports `available: true` only after clock
-    // synchronization, and `false` would mean it will not yield, so the state waits for this
-    // connection's first measurement when it owns the player; run_time_sync() sends it then.
-    bool waits_for_clock = false;
+    // messaging.md "client/state": a player or source reports `available: true` only after
+    // clock synchronization, and `false` would mean it will not yield, so the state waits for
+    // this connection's first measurement when it owns either; run_time_sync() sends it then.
+    bool clocked_role = false;
 #ifdef SENDSPIN_ENABLE_PLAYER
-    waits_for_clock = snapshot.available && this->player_ &&
-                      this->connection_manager_->owns_role(conn, SendspinRole::PLAYER) &&
-                      !conn->is_time_synced();
+    clocked_role =
+        this->player_ && this->connection_manager_->owns_role(conn, SendspinRole::PLAYER);
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    clocked_role = clocked_role || (this->source_ && this->connection_manager_->owns_role(
+                                                         conn, SendspinRole::SOURCE));
+#endif
+    const bool waits_for_clock = snapshot.available && clocked_role && !conn->is_time_synced();
     entry->state_held = waits_for_clock;
     if (waits_for_clock) {
         return;
@@ -1433,6 +1502,14 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
 }
 
 void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {
+#ifdef SENDSPIN_ENABLE_SOURCE
+    // roles/source/v1.md "Source command semantics": a source that becomes unavailable clears its
+    // authorization and ends its input stream before it reports available: false.
+    if (this->source_ && !snapshot.available) {
+        this->source_->impl_->end_stream(
+            this->connection_manager_->role_owner(SendspinRole::SOURCE));
+    }
+#endif
     this->task_state_->client_state = std::move(snapshot);
     this->connection_manager_->for_each_admitted(
         [this](AdmittedEntry& entry) { this->publish_client_state(entry.conn.get()); });
@@ -1577,7 +1654,8 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     this->note_trust_changed(trust);
 }
 
-void SendspinClient::apply_role_removals([[maybe_unused]] uint16_t removed_roles) {
+void SendspinClient::apply_role_removals([[maybe_unused]] SendspinConnection* conn,
+                                         [[maybe_unused]] uint16_t removed_roles) {
     // messaging.md "server/activate", "When applying a server/activate, the client MUST": every
     // removed server-to-client stream role stops its remaining output and clears its buffers, even
     // where an earlier stream/end had let buffered data finish, and every removed role with a
@@ -1620,6 +1698,22 @@ void SendspinClient::apply_role_removals([[maybe_unused]] uint16_t removed_roles
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     if (this->visualizer_ && role_removed(removed_roles, SendspinRole::VISUALIZER)) {
         this->visualizer_->impl_->cleanup();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    // roles/source/v1.md "Source command semantics": the removal clears the authorization and ends
+    // an open stream with client-stream/end, on a connection that stays up.
+    if (this->source_ && role_removed(removed_roles, SendspinRole::SOURCE)) {
+        this->source_->impl_->end_stream(conn);
+        this->source_->impl_->cleanup();
+    }
+#endif
+}
+
+void SendspinClient::on_activation_applied([[maybe_unused]] SendspinConnection* conn) {
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        this->source_->impl_->on_activation_applied(*conn);
     }
 #endif
 }

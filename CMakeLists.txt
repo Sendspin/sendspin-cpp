@@ -82,6 +82,11 @@ if(ESP_IDF_BUILD)
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_VISUALIZER)
     endif()
 
+    if(CONFIG_SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_SOURCES})
+        list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_SOURCE)
+    endif()
+
     # Register the component using the assembled source list
     # WHOLE_ARCHIVE: this component defines noise_rand_bytes() (src/esp/noise_rand.cpp), which the
     # esphome__noise-c component references but does not define (it is built with
@@ -125,6 +130,7 @@ else()
     option(SENDSPIN_ENABLE_COLOR "Enable color role" ON)
     option(SENDSPIN_ENABLE_ARTWORK "Enable artwork role" ON)
     option(SENDSPIN_ENABLE_VISUALIZER "Enable visualizer role" ON)
+    option(SENDSPIN_ENABLE_SOURCE "Enable source role (audio capture)" ON)
 
     # Codec selection (player role only). Opus is patent-encumbered; see the player role spec.
     option(SENDSPIN_ENABLE_OPUS "Enable the Opus decoder in the player role" ON)
@@ -155,6 +161,9 @@ else()
     if(SENDSPIN_ENABLE_VISUALIZER)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_VISUALIZER_SOURCES})
     endif()
+    if(SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_SOURCES})
+    endif()
 
     # Create the library: core sources, enabled role sources, host networking (via host.cmake)
     add_library(sendspin STATIC ${SENDSPIN_ALL_SOURCES})
@@ -180,6 +189,9 @@ else()
     endif()
     if(SENDSPIN_ENABLE_VISUALIZER)
         target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_VISUALIZER)
+    endif()
+    if(SENDSPIN_ENABLE_SOURCE)
+        target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_SOURCE)
     endif()
 
     # Host build options

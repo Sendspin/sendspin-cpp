@@ -44,6 +44,9 @@
 #ifdef SENDSPIN_ENABLE_PLAYER
 #include "player_role_impl.h"
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+#include "source_role_impl.h"
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 #include "visualizer_role_impl.h"
 #endif
@@ -112,8 +115,13 @@ uint32_t SendspinClient::protocol_tick() {
 
     // 2. Once admission is closed: the shutdown pass. Every slot is empty afterwards, so the
     //    steps below find no connection and the ring pass only returns the items still in
-    //    flight.
+    //    flight. An open input stream ends ahead of the goodbye.
     if (manager.shutdown_pending()) {
+#ifdef SENDSPIN_ENABLE_SOURCE
+        if (this->source_) {
+            this->source_->impl_->end_stream(manager.role_owner(SendspinRole::SOURCE));
+        }
+#endif
         manager.shutdown();
     }
 
@@ -208,16 +216,25 @@ uint32_t SendspinClient::protocol_tick() {
     uint32_t next_deadline = manager.tick(platform_time_us());
     next_deadline = std::min(next_deadline, manager.run_time_sync());
 
-    // 9. Losses from the sends of steps 7 and 8 (SendspinConnection::settle_noise_send()),
-    //    dropped before step 10 publishes. Every connection those steps send on is in the
-    //    snapshot: no step after the commands brings in a new one.
+    // 9. The source's input stream: an authorized opening that may happen now (a time sync or
+    //    an activation in this tick can allow it), then the chunks the source task completed,
+    //    each stamped through the stream connection's time filter as it is sent.
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        this->source_->impl_->send_chunks(manager.role_owner(SendspinRole::SOURCE));
+    }
+#endif
+
+    // 10. Losses from the sends of steps 7 to 9 (SendspinConnection::settle_noise_send()),
+    //     dropped before step 11 publishes. Every connection those steps send on is in the
+    //     snapshot: no step after the commands brings in a new one.
     for (auto& conn : connections) {
         if (conn->inbound_gate().is_detached()) {
             manager.on_connection_lost(conn.get());
         }
     }
 
-    // 10. What other threads read.
+    // 11. What other threads read.
     manager.refresh_published_state();
     manager.publish_connected();
     if (!ring_drained || fallback_due) {
@@ -496,6 +513,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 ServerInformationObject info = conn->get_server_information();
                 info.name = hello_msg.name;
                 conn->set_server_information(std::move(info));
+                conn->set_server_source_codecs(hello_msg.source_codecs);
                 // The nursery scan on this task observes is_handshake_complete() and
                 // establishes the connection; nothing needs to be scheduled here.
                 conn->set_server_hello_received(true);
@@ -621,13 +639,40 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             break;
         }
         case SendspinServerToClientMessageType::SERVER_COMMAND: {
+            // One parse serves both role objects, as for server/state: each is parsed only when
+            // its role takes it, and a malformed one never affects the other.
 #ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_ &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                ServerCommandMessage cmd_msg;
-                if (parsed.extract<process_server_command_message>(&cmd_msg)) {
-                    this->player_->impl_->handle_server_command(cmd_msg);
-                }
+            const bool take_player =
+                this->player_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER);
+            ServerCommandMessage cmd_msg;
+            bool player_valid = false;
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+            const bool take_source =
+                this->source_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::SOURCE);
+            SourceCommand source_cmd{};
+            bool source_valid = false;
+#endif
+            parsed.extract([&]([[maybe_unused]] JsonObject root) {
+#ifdef SENDSPIN_ENABLE_PLAYER
+                player_valid = take_player && process_server_command_message(root, &cmd_msg);
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+                source_valid = take_source && process_server_command_source(root, &source_cmd);
+#endif
+            });
+#ifdef SENDSPIN_ENABLE_PLAYER
+            if (player_valid) {
+                this->player_->impl_->handle_server_command(cmd_msg);
+            }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+            if (source_valid) {
+                // The availability step 3 adopted
+                this->source_->impl_->handle_server_command(source_cmd, *conn,
+                                                            this->adopted_state_available());
             }
 #endif
             break;

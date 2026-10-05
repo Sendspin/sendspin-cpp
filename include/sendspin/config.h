@@ -209,13 +209,15 @@ struct SendspinClientConfig {
                                                       ///< task (ESP-IDF only)
 
     // Task stack derivation (ESP-IDF only), shared by DEFAULT_HTTPD_STACK_SIZE,
-    // DEFAULT_WEBSOCKET_STACK_SIZE and DEFAULT_PROTOCOL_TASK_STACK_SIZE. Each default is the
+    // DEFAULT_WEBSOCKET_STACK_SIZE, DEFAULT_PROTOCOL_TASK_STACK_SIZE and
+    // SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE. Each default is the
     // deepest call chain from the task's entry, a static call-graph upper bound measured with
     // -fstack-usage and -fcallgraph-info on xtensa-esp32 (ESP-IDF 5.5, GCC 14.2) at both -Os
     // (ESPHome's default) and -Og (ESP-IDF's default), taking the larger, with the toolchain's
     // precompiled newlib, libgcc and libstdc++ frames read from their objdump; tools/stack_usage/
     // holds the script, its indirect-call tables and the recipe that re-derive it. Every chain
-    // ends in a shared ESP-IDF tail of about 2.7 KB, an allocation or lwIP call into an error log
+    // ends in a shared ESP-IDF tail of about 2.7 KB (the source task's reaches it straight from a
+    // log line), an allocation or lwIP call into an error log
     // line through newlib's vfprintf (800 bytes alone), its lock and an assert, whose last ~500
     // bytes are a fatal path. Added to that: 384 bytes, which are the FreeRTOS exception frame and
     // coprocessor save area (XT_STK_FRMSZ 192: XtExcFrame 112, the MAC16 save 48, and 32 for the
@@ -647,6 +649,81 @@ struct VisualizerRoleConfig {
 
     /// @brief FreeRTOS priority for the visualization drain thread (ESP-IDF only)
     unsigned priority{DEFAULT_VISUALIZER_PRIORITY};
+};
+
+// ============================================================================
+// Source config types
+// ============================================================================
+
+/// @brief Configuration for the source role (audio capture streamed to the server)
+///
+/// The configured format is the format of every input stream the role opens; write_audio() takes
+/// PCM in exactly this format. An invalid config is rejected, never clamped or repaired: the role
+/// stays added but inert (logged at ERROR, never advertised, never streams).
+struct SourceRoleConfig {
+    /// @brief Chunk duration bounds, roles/source/v1.md "Source Audio Chunks (Binary)": a chunk
+    /// MUST be at most 150 ms and SHOULD be at least 5 ms. A chunk holds whole frames, so its
+    /// duration rounds down.
+    static constexpr uint32_t CHUNK_MIN_MS = 5U;
+    static constexpr uint32_t CHUNK_MAX_MS = 150U;
+
+    /// @brief Default chunk duration: keeps latency and send buffers small and per-chunk framing
+    /// and encryption cost negligible
+    static constexpr uint32_t DEFAULT_CHUNK_MS = 20U;
+
+    /// @brief Default capture buffer: the spec's longest chunk. The buffer bounds the backlog a
+    /// network stall can build up (roles/source/v1.md "Source Audio Chunks (Binary)")
+    static constexpr uint32_t DEFAULT_CAPTURE_BUFFER_MS = CHUNK_MAX_MS;
+
+    /// @brief Default capture sample rate (Hz), the native rate of most capture hardware
+    static constexpr uint32_t DEFAULT_SAMPLE_RATE = 48000U;
+
+    /// @brief Default FreeRTOS priority for the source task (ESP-IDF only). Below the httpd and
+    /// protocol tasks that send what it produces, and the player's sync task, so chunk assembly
+    /// never starves playback; above the artwork and visualizer threads.
+    static constexpr unsigned DEFAULT_SOURCE_TASK_PRIORITY = 3U;
+    static_assert(DEFAULT_SOURCE_TASK_PRIORITY <
+                      SendspinClientConfig::DEFAULT_PROTOCOL_TASK_PRIORITY,
+                  "The source task must stay below the protocol task");
+
+    /// @brief Source task stack size in bytes (ESP-IDF only). The task sends nothing itself (the
+    /// protocol task does), only the chunk assembly and the encode into the outbound ring.
+    /// Deepest chain from the task entry: 2,352 bytes at -Os, 2,368 at -Og, from begin_chunk()'s
+    /// warning into the shared tail; the std::thread entry frames above thread_entry() are not
+    /// counted and come out of the rounding slack. 2,368 + 384 = 2,752, rounded up (see the task
+    /// stack derivation in SendspinClientConfig).
+    static constexpr size_t DEFAULT_SOURCE_TASK_STACK_SIZE = 3072U;
+
+    // 32-bit fields
+    /// @brief Capture sample rate in Hz; must be > 0
+    uint32_t sample_rate{DEFAULT_SAMPLE_RATE};
+
+    /// @brief Chunk duration in milliseconds, within [CHUNK_MIN_MS, CHUNK_MAX_MS]. One chunk, with
+    /// its 9-byte header, must also fit one Noise transport message (65519 bytes), which bounds
+    /// the duration for wide or deep formats.
+    uint32_t chunk_duration_ms{DEFAULT_CHUNK_MS};
+
+    /// @brief Capture buffer in milliseconds of audio in the configured format; must be > 0.
+    /// Approximate: per-write bookkeeping comes out of a fixed 25% margin, so many very small
+    /// write_audio() calls hold less audio than this. A single write longer than half of it (with
+    /// that margin) is always refused.
+    uint32_t capture_buffer_ms{DEFAULT_CAPTURE_BUFFER_MS};
+
+    unsigned priority{DEFAULT_SOURCE_TASK_PRIORITY};  ///< FreeRTOS priority for the source task
+                                                      ///< (ESP-IDF only)
+
+    /// @brief Placement of the capture buffer and the outbound chunk buffer (ESP-IDF only). Bulk
+    /// audio with sequential access, so PSRAM-preferring like the player's audio buffers.
+    MemoryLocation buffer_location{MemoryLocation::PREFER_EXTERNAL};
+
+    // 8-bit fields
+    /// @brief Codec the role streams in. Only PCM (the capture bytes, untouched) is accepted.
+    SendspinCodecFormat codec{SendspinCodecFormat::PCM};
+
+    uint8_t channels{2};      ///< Capture channel count; must be > 0
+    uint8_t bit_depth{16};    ///< Bits per sample: 16, 24 (3 packed bytes), or 32
+    bool line_sense{false};   ///< Advertise signal sensing (see SourceRole::set_signal())
+    bool psram_stack{false};  ///< Allocate the source task stack in PSRAM (ESP-IDF only)
 };
 
 }  // namespace sendspin

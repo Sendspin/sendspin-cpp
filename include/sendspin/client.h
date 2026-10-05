@@ -49,6 +49,9 @@ class MetadataRole;
 #ifdef SENDSPIN_ENABLE_PLAYER
 class PlayerRole;
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+class SourceRole;
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 class VisualizerRole;
 #endif
@@ -438,6 +441,11 @@ public:
     VisualizerRole& add_visualizer(VisualizerRoleConfig config);
 #endif
 
+#ifdef SENDSPIN_ENABLE_SOURCE
+    /// @brief Adds the source role. Returns a reference for setting callbacks
+    SourceRole& add_source(SourceRoleConfig config);
+#endif
+
     // ========================================
     // Role access (nullptr if not added)
     // ========================================
@@ -492,6 +500,16 @@ public:
     /// @brief Returns the player role (const), or nullptr if not added
     const PlayerRole* player() const {
         return this->player_.get();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    /// @brief Returns the source role, or nullptr if not added
+    SourceRole* source() {
+        return this->source_.get();
+    }
+    /// @brief Returns the source role (const), or nullptr if not added
+    const SourceRole* source() const {
+        return this->source_.get();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
@@ -571,7 +589,9 @@ public:
     /// messaging.md "External Source Handling": false only while the device will not yield to
     /// Sendspin, which moves it to a stopped group of its own. An activity Sendspin may interrupt
     /// calls leave() instead. The player discards incoming audio from the client/state the next
-    /// protocol tick sends. Kept across disconnects and stop()/start(). Main loop only.
+    /// protocol tick sends, and the source ends its input stream ahead of that client/state and
+    /// ignores starts while unavailable. Kept across disconnects and stop()/start(). Main loop
+    /// only.
     /// @param available false while the device will not yield to Sendspin.
     void set_available(bool available);
 
@@ -861,13 +881,14 @@ private:
     /// objects of the roles it owns. Protocol task only.
     ///
     /// Nothing for a connection that is not admitted and operational. Held while the snapshot is
-    /// available and `conn` owns an active player with no clock sync yet
+    /// available and `conn` owns an active player or source with no clock sync yet
     /// (AdmittedEntry::state_held); ConnectionManager::run_time_sync() sends it with the first
     /// measurement.
     void publish_client_state(SendspinConnection* conn);
 
     /// @brief Makes `snapshot` the client/state every admitted connection's is built from, and
-    /// sends each admitted connection its copy (publish_client_state()). Protocol task only.
+    /// sends each admitted connection its copy (publish_client_state()). An unavailable snapshot
+    /// first ends the source's input stream. Protocol task only.
     void adopt_client_state(ClientStateMessage&& snapshot);
 
     /// @brief Whether the adopted client/state snapshot reports the client available; false before
@@ -918,9 +939,16 @@ private:
     /// as part of applying the activation. Roles that stay active at the same version are
     /// untouched. Protocol task only, like the disconnect path's teardown, and like it it queues
     /// its listener callbacks for the main loop instead of calling them here.
+    /// @param conn The connection the activation was applied on.
     /// @param removed_roles The roles the connection owned before the activation and no longer
     ///        does, as role_mask_bit() bits.
-    void apply_role_removals(uint16_t removed_roles);
+    void apply_role_removals(SendspinConnection* conn, uint16_t removed_roles);
+
+    /// @brief A server/activate was applied on `conn`, ending any re-handshake quiet window
+    /// (connection.md "Re-handshake"): sends what the roles owed until then, the source's
+    /// client-stream/end. Called by ConnectionManager right after the activation is applied, ahead
+    /// of its role removals and of anything else it sends. Protocol task only.
+    void on_activation_applied(SendspinConnection* conn);
 
     // Pairing and trust notifications. Each is called on the protocol task and queues the
     // listener callback for delivery from the main loop's drain_inbox().
@@ -1010,6 +1038,9 @@ private:
     /// State the protocol task owns at client level (the latest client/state snapshot and the
     /// high-performance ticket count).
     std::unique_ptr<TaskState> task_state_;
+#ifdef SENDSPIN_ENABLE_SOURCE
+    std::unique_ptr<SourceRole> source_;
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     std::unique_ptr<VisualizerRole> visualizer_;
 #endif

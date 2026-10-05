@@ -166,6 +166,27 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # started, so the test publishes and adopts each snapshot and dispatches the chunk itself.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
+# The source suite builds only with the role compiled in, so a SENDSPIN_ENABLE_SOURCE=OFF test
+# build still links. test_source_role.cpp plays the source role's threads on the test thread,
+# which no public call can stop between their steps: SourceTask's process(), run() and
+# event_flags_ (the source task's loop, one step at a time, and its exit), its capture_ring_,
+# outbound_ring_ and protocol_task_ (rings created without the thread, so what a step produced
+# stays to be read), chunk_item_ (a chunk begun but not filled) and chunk_message_bytes_ (the size
+# a completed chunk is acquired at, to write
+# one as the task would); SourceRole's impl_ (the hello and state objects without a server, the
+# stream gate a stream opening sets, the task); and, for the stand-in connection it installs as
+# the protocol task does, SendspinClient's protocol_task_ (stopped), connection_manager_ (its
+# install_admitted(), find_admitted(), close_admission() and liveness_timeout_us_, off so the
+# stand-in's silence does not close it), json_arena_, process_json_message() and protocol_tick(),
+# high_performance_ref_count_ (the stream's hold), SendspinTimeBurst's last_burst_complete_time_
+# (no burst falls due) and SendspinConnection's first_activate_received_ (the quiet window a
+# re-handshake's message 1 opens, which handle_noise_rehandshake() needs a whole re-handshake to
+# reach).
+if(SENDSPIN_ENABLE_SOURCE)
+    target_sources(sendspin_tests PRIVATE test_source_role.cpp)
+    set_source_files_properties(test_source_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
+endif()
+
 # test_json_arena.cpp reads SendspinArenaAllocator's base_, cap_ and offset_: where the bump
 # pointer stands and whether a freed block's bytes, still inside the backing buffer, were wiped
 # are the allocator's whole contract, and nothing on its public surface reports either.

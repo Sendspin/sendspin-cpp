@@ -93,6 +93,13 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
+    set(SENDSPIN_SOURCE_SOURCES
+        ${BASE_DIR}/src/source_role.cpp
+        ${BASE_DIR}/src/source_task.cpp
+
+        PARENT_SCOPE
+    )
+
     # ESP-IDF only sources: networking layer deeply coupled to ESP-IDF APIs
     set(SENDSPIN_ESP_SOURCES
         ${BASE_DIR}/src/esp/server_connection.cpp

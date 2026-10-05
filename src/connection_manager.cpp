@@ -713,6 +713,8 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
     const uint16_t roles_before = conn->get_active_role_mask();
     conn->apply_server_activate(msg.activities, active_roles_to_apply, msg.pairing_method,
                                 msg.pairing_format);
+    // Before anything this activation sends (SendspinClient::on_activation_applied())
+    this->client_->on_activation_applied(conn);
     const bool roles_changed = roles_before != conn->get_active_role_mask();
 
     if (admitted_entry != nullptr) {
@@ -727,7 +729,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
                                                       this->roles_owned_by_others(admitted_entry));
         const auto removed = static_cast<uint16_t>(owned_before & ~admitted_entry->owned_roles);
         if (removed != 0) {
-            this->client_->apply_role_removals(removed);
+            this->client_->apply_role_removals(conn, removed);
         }
         if (admitted_entry->owned_roles != owned_before) {
             this->refresh_published_state();

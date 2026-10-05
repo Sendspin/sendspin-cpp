@@ -83,10 +83,12 @@ indirect call on a task's path (a new virtual send, a new callback), add its tar
 `edges.json`, or the measurement stops at it. An edge source or target that matches nothing is
 reported on stderr, and a source none of whose targets match is not marked `covered`. Expected
 there: the source `httpd_send_all$isra$0`, which exists only at `-Os`; the target
-`httpd_parse_req`, which `-Os` inlines into `httpd_req_new`; and the `std::function` call
+`httpd_parse_req`, which `-Os` inlines into `httpd_req_new`; the `std::function` call
 operator keyed by its mangled name (the new-connection callback), inlined at `-Os`, where the
-edge keyed on its caller (`deliver_upgraded()`) stands in for it. Any other name means a table
-entry has gone stale.
+edge keyed on its caller (`deliver_upgraded()`) stands in for it; and the source task's
+`SourceTask::begin_chunk()` and `finish_chunk()`, which the compiler may inline into
+`process()`, whose edges cover the same encoder calls. Any other name means a table entry has
+gone stale.
 
 Every run counts, on stderr, the call cycles each task reaches; `--cycles` lists them, marking
 those on the deepest path. The ones the current tree reaches, and how deep each really goes:

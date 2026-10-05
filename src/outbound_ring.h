@@ -51,10 +51,11 @@ struct OutboundItemHeader {
     /// When the message's content was captured (platform_time_us()); the protocol task stamps the
     /// message with it.
     int64_t capture_time_us;
-    /// The producer's stream generation; the protocol task returns an item of an older one
+    /// The producer's stream generation; the consumer returns an item of an older one
     /// unsent.
     uint32_t generation;
-    /// Message bytes filled, at most the item's capacity less AEAD_TAG_SIZE.
+    /// Message bytes filled; for an outbound message at most the item's capacity less
+    /// AEAD_TAG_SIZE.
     uint32_t data_len;
 };
 
@@ -89,7 +90,9 @@ inline uint8_t* outbound_item_message(void* item) {
  * consumer
  *
  * The producer is one thread (acquire(), complete()), which completes each item before it
- * acquires the next. The consumer is the protocol task (take()). Any thread returns items
+ * acquires the next. The consumer is one thread (take()): the protocol task for a ring of
+ * outbound messages. The source role's capture ring reuses the class with the source task as its
+ * consumer, capture PCM as its item bytes and no lending (SourceTask). Any thread returns items
  * (return_item()). With one producer completing in order, take() never hands out an uncompleted
  * item on either platform: FreeRTOS marks the filler that ends the storage passed only from the
  * completion of the item placed after it (prvSendItemDoneNoSplit()), so the storage-start guard
@@ -163,10 +166,11 @@ public:
         this->ring_.complete(item);
     }
 
-    /// @brief Takes the oldest completed item. Protocol task only.
+    /// @brief Takes the oldest completed item. The consumer only.
     /// @param[out] message_capacity The message capacity the item was acquired with.
     /// @param timeout_ms As SharedRingBuffer::take(). The protocol task passes 0: it polls the
-    ///        ring from its tick rather than blocking on it.
+    ///        ring from its tick rather than blocking on it. A blocking take also ends on
+    ///        wake_consumer().
     /// @return The item, or nullptr when none is completed.
     void* take(size_t* message_capacity, uint32_t timeout_ms) {
         size_t item_size = 0;
@@ -175,6 +179,12 @@ public:
             *message_capacity = item_size - OUTBOUND_ITEM_HEADER_BYTES;
         }
         return item;
+    }
+
+    /// @brief Ends the consumer's blocking take() at once (SharedRingBuffer::wake_receiver()).
+    /// Any thread.
+    void wake_consumer() {
+        this->ring_.wake_receiver();
     }
 
     /// @brief Returns a taken item to the ring. Any thread (see the class comment for who).

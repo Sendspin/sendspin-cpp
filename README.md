@@ -9,7 +9,7 @@ Standalone C++ library implementing the [Sendspin synchronized audio streaming p
 
 ## Features
 
-- Modular Sendspin role composition: artwork, color, controller, metadata, player, and visualizer
+- Modular Sendspin role composition: artwork, color, controller, metadata, player, source, and visualizer
 - WebSocket client and server support
 - Mandatory Noise KKpsk2 encryption on every connection, with Pairing PSK token and pairing code pairing
 - Decodes FLAC and PCM, plus Opus when built with `SENDSPIN_ENABLE_OPUS` (the default)

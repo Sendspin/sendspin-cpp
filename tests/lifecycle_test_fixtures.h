@@ -410,15 +410,25 @@ protected:
     // itself parse the JSON: callers deserialize it into their own JsonDocument. Caller must hold
     // crypto_mutex_.
     std::optional<std::string> decrypt_json_locked(const std::string& bytes) {
+        auto pt = this->decrypt_locked(bytes);
+        if (!pt.has_value() || pt->front() != MSG_TYPE_JSON_BODY) {
+            return std::nullopt;
+        }
+        return std::string(reinterpret_cast<char*>(pt->data() + 1), pt->size() - 1);
+    }
+
+    // Decrypts an inbound binary frame into its plaintext, type byte first, or nullopt if no
+    // session is active yet or decrypt fails. Caller must hold crypto_mutex_.
+    std::optional<std::vector<uint8_t>> decrypt_locked(const std::string& bytes) {
         if (this->active_.send_cs == nullptr) {
             return std::nullopt;
         }
         std::vector<uint8_t> ct(bytes.begin(), bytes.end());
         auto pt = raw_decrypt(this->active_.recv_cs, std::move(ct));
-        if (pt.empty() || pt[0] != MSG_TYPE_JSON_BODY) {
+        if (pt.empty()) {
             return std::nullopt;
         }
-        return std::string(reinterpret_cast<char*>(pt.data() + 1), pt.size() - 1);
+        return pt;
     }
 
     std::string suite_name_;
@@ -485,10 +495,13 @@ struct FakeEncryptedServerOptions {
     // observe a connection mid-attempt set this; the pairing flows themselves leave it off.
     bool withhold_pair_finalize_ack{false};
     // When true, every client/time is answered with a server/time whose clock is the client's
-    // own (both sides read platform_time_us(), so the offset is ~0 and audio timestamps mean
-    // what they say). Off by default: a peer that never answers keeps the time burst open, which
-    // the liveness and high-performance-hold tests rely on.
+    // own plus server_clock_offset_us (both sides read platform_time_us()). Off by default: a
+    // peer that never answers keeps the time burst open, which the liveness and
+    // high-performance-hold tests rely on.
     bool answer_time{false};
+    // How far the answered server clock runs ahead of the client's. Nonzero lets a test tell a
+    // timestamp mapped onto the server clock from one left on the client's.
+    int64_t server_clock_offset_us{0};
 };
 
 class FakeEncryptedServer : public NoiseInitiatorFixtureBase {
@@ -710,6 +723,20 @@ public:
         return this->client_states_;
     }
 
+    /// One application message the client sent: its JSON type, or "binary" for a role binary
+    /// message, and its body (the JSON text, or the whole binary message, type byte first).
+    struct WireMessage {
+        std::string type;
+        std::vector<uint8_t> body;
+    };
+
+    /// Every application message received after the Noise handshake, in arrival order. Lets a
+    /// test check how JSON messages and binary messages interleave on the wire.
+    std::vector<WireMessage> messages() const {
+        std::lock_guard<std::mutex> lock(this->messages_mutex_);
+        return this->messages_;
+    }
+
     /// pair/abort reasons the client sent, in arrival order.
     std::vector<std::string> pair_abort_reasons() const {
         std::lock_guard<std::mutex> lock(this->pair_mutex_);
@@ -776,16 +803,27 @@ private:
 
     void handle_binary(const std::string& bytes) {
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);
-        auto json_opt = this->decrypt_json_locked(bytes);
-        if (!json_opt.has_value()) {
+        auto plaintext = this->decrypt_locked(bytes);
+        if (!plaintext.has_value()) {
             return;
         }
-        const std::string& json = *json_opt;
+        if (plaintext->front() != MSG_TYPE_JSON_BODY) {
+            // A role binary message (the source's audio chunks): logged whole, type byte first.
+            std::lock_guard<std::mutex> mlock(this->messages_mutex_);
+            this->messages_.push_back({"binary", std::move(plaintext.value())});
+            return;
+        }
+        const std::string json(reinterpret_cast<const char*>(plaintext->data() + 1),
+                               plaintext->size() - 1);
         JsonDocument doc;
         if (deserializeJson(doc, json)) {
             return;
         }
         const char* type = doc["type"] | "";
+        {
+            std::lock_guard<std::mutex> mlock(this->messages_mutex_);
+            this->messages_.push_back({type, std::vector<uint8_t>(json.begin(), json.end())});
+        }
 
         if (std::strcmp(type, "client/hello") == 0) {
             this->client_hello_count_.fetch_add(1);
@@ -819,7 +857,7 @@ private:
             this->got_client_time_.store(true);
             if (this->options_.answer_time) {
                 const long long client_transmitted = doc["payload"]["client_transmitted"] | 0LL;
-                const int64_t now = platform_time_us();
+                const int64_t now = platform_time_us() + this->options_.server_clock_offset_us;
                 this->send_encrypted_locked(
                     std::string(R"({"type":"server/time","payload":{)") +
                     "\"client_transmitted\":" + std::to_string(client_transmitted) +
@@ -989,6 +1027,8 @@ private:
     std::optional<bool> hello_unpaired_access_;
     std::atomic<bool> closed_{false};
 
+    mutable std::mutex messages_mutex_;
+    std::vector<WireMessage> messages_;
     mutable std::mutex pair_mutex_;
     std::vector<std::string> client_states_;
     std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> learned_psk_;
