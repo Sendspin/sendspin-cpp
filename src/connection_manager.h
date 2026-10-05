@@ -419,10 +419,11 @@ public:
     /// @param url WebSocket URL of the server to connect to.
     void connect_to(const std::string& url);
 
-    /// @brief Goodbyes every connected managed connection (SendspinClient::disconnect()). An
-    /// admitted or nursery connection is detached here and dropped by the next loss pass, which
-    /// sees its detached gate; an outbound attempt still connecting is released at once, without
-    /// waiting for its transport (see ReapEntry).
+    /// @brief Goodbyes and drops every connected managed connection (SendspinClient::disconnect())
+    /// through drop_connection(), so the goodbye is the last thing on the wire (the pairing
+    /// dismissal follows it in the inbox). An admitted connection whose transport is already gone
+    /// is left to the loss pass; an outbound attempt still connecting is released at once, without
+    /// a goodbye or waiting for its transport (see ReapEntry).
     /// @param reason The goodbye reason to send before closing.
     void disconnect(SendspinGoodbyeReason reason);
 
