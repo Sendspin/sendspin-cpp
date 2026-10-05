@@ -102,9 +102,17 @@ static constexpr Fp FP_LEGENDRE = {{
 
 /// @brief Returns `x` through an empty asm statement the optimizer must treat as opaque, so a
 /// mask derived from a secret bit cannot be traced back to that bit and turned into a branch.
+///
+/// Deliberately not `volatile`, as in BoringSSL's value_barrier_w(): the asm's output feeds the
+/// mask, so it can neither be removed nor reordered past its use, and leaving it non-volatile
+/// lets the compiler still schedule around it. Every compiler this library builds with (GCC on
+/// ESP-IDF, GCC or Clang on host) takes this path; any other is refused rather than left with
+/// no barrier.
 inline uint32_t ct_value_barrier(uint32_t x) {
 #if defined(__GNUC__) || defined(__clang__)
     __asm__("" : "+r"(x));
+#else
+#error "field25519.h needs GCC or Clang inline asm for its constant-time value barrier"
 #endif
     return x;
 }
