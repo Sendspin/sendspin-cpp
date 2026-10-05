@@ -257,20 +257,18 @@ void ConnectionManager::start() {
         this->ws_server_->set_wake_callback([task]() { task->wake(); });
     }
 
-    // Accepts reopen with admission, before the server can deliver: close_admission() closed both.
+    // Admission reopens before the server can deliver.
     this->client_->protocol_task_->open_accepts();
-    this->accepting_.store(true, std::memory_order_release);
     // Started here when the network is already up, so the server is listening once start()
     // returns; otherwise the protocol task starts it once the provider reports ready.
     (void)this->maybe_start_ws_server(platform_time_us());
 }
 
 void ConnectionManager::close_admission() {
-    this->accepting_.store(false, std::memory_order_release);
-    // Closed together, under the queue lock: an accept is either queued already, and the task's
-    // next or final tick refuses it with a goodbye (accept()), or refused at its push, which
-    // leaves it with its transport (on_new_connection()). None reaches the queue after the final
-    // tick, so nothing is left for the main loop to refuse once the task is joined.
+    // Closed under the queue lock: an accept is either queued already, and the task's next or
+    // final tick refuses it with a goodbye (accept()), or refused at its push, which leaves it
+    // with its transport (on_new_connection()). None reaches the queue after the final tick, so
+    // nothing is left for the main loop to refuse once the task is joined.
     this->client_->protocol_task_->close_accepts();
     this->client_->protocol_task_->wake();
 }
@@ -359,7 +357,7 @@ bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
 // ============================================================================
 
 void ConnectionManager::accept(std::shared_ptr<SendspinConnection> conn) {
-    if (!this->accepting_.load(std::memory_order_acquire)) {
+    if (!this->is_accepting()) {
         this->refuse_accept(std::move(conn));
         return;
     }
@@ -984,7 +982,9 @@ uint32_t ConnectionManager::run_time_sync() {
         // activity is not a gate: pairing.md "Entering and leaving pairing" runs pairing
         // alongside playback, leaving streams open and their timeline unaffected, which a player
         // can only deliver with its time filter still converging. A connection whose transport
-        // is gone waits for its close to be processed.
+        // is gone waits for its close to be processed. The one time-sync gate on the burst path:
+        // burst.loop() relies on it (is_operational() implies the hello handshake), and
+        // send_time_message() checks the transport again before it writes.
         if (conn == nullptr || !conn->is_operational() || !conn->is_connected()) {
             continue;
         }
@@ -1064,6 +1064,14 @@ bool ConnectionManager::has_operational_connection() const {
         }
     }
     return false;
+}
+
+bool ConnectionManager::is_accepting() const {
+    return this->client_->protocol_task_->is_accepting();
+}
+
+bool ConnectionManager::shutdown_pending() const {
+    return !this->is_accepting() && !this->shutdown_done_;
 }
 
 void ConnectionManager::shutdown() {
@@ -1183,8 +1191,7 @@ void ConnectionManager::set_last_played_server_id(const std::string& server_id) 
 // ============================================================================
 
 uint32_t ConnectionManager::maybe_start_ws_server(int64_t now_us) {
-    if (this->ws_server_ == nullptr || this->ws_server_->is_started() ||
-        !this->accepting_.load(std::memory_order_acquire)) {
+    if (this->ws_server_ == nullptr || this->ws_server_->is_started() || !this->is_accepting()) {
         return ProtocolTask::NO_DEADLINE;
     }
     if (now_us < this->ws_server_start_retry_time_us_) {

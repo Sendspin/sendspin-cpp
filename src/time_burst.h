@@ -79,7 +79,9 @@ public:
     // ========================================
 
     /// @brief Drive the burst state machine. Protocol task only.
-    /// @param conn The connection that owns this burst, to send time messages on.
+    /// @param conn The connection that owns this burst, to send time messages on. The caller
+    ///        passes it only while it is connected and operational, which loop() does not check
+    ///        again.
     /// @param now_ms platform_time_us() / US_PER_MS, read once by the caller for this call and
     ///        its starts_burst().
     /// @param may_open_burst Whether a burst that is due may be opened (its first time message

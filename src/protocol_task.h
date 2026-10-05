@@ -24,6 +24,7 @@
 #include "sendspin/controller_role.h"
 #include "sendspin/types.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -201,15 +202,22 @@ public:
     /// runs it too.
     void drop_commands();
 
-    /// @brief Refuses every later ACCEPT_CONNECTION push (push_command() returns false). Set
-    /// under the queue lock, so an accept is either queued before it, and taken by a tick of the
-    /// task (its final one at the latest), or refused at its push, with nothing in between. Main
-    /// loop, from ConnectionManager::close_admission() before stop().
+    /// @brief Closes admission: refuses every later ACCEPT_CONNECTION push (push_command()
+    /// returns false), and the task, reading is_accepting() false, refuses the accepts already
+    /// queued and runs the shutdown pass. Set under the queue lock, so an accept is either queued
+    /// before it, and taken by a tick of the task (its final one at the latest), or refused at
+    /// its push, with nothing in between. Main loop, from ConnectionManager::close_admission()
+    /// before stop().
     void close_accepts();
 
-    /// @brief Takes accepts again; see close_accepts(). Main loop, from
+    /// @brief Opens admission again; see close_accepts(). Main loop, from
     /// ConnectionManager::start() before the platform server can deliver.
     void open_accepts();
+
+    /// @brief Whether admission is open (see accepting_). Any thread, lock-free.
+    bool is_accepting() const {
+        return this->accepting_.load(std::memory_order_acquire);
+    }
 
     /// @brief Whether the thread is running. Main loop only.
     bool is_running() const {
@@ -283,8 +291,8 @@ private:
     /// moved into while empty (moved-from or default), so no heap memory is freed under the
     /// lock.
     std::unique_ptr<ProtocolCommand[]> commands_;
-    /// Guards commands_, the counts, latest_state_ and requests_. A leaf: no lock is taken and
-    /// nothing heap-backed is destroyed under it.
+    /// Guards commands_, the counts, latest_state_, requests_ and the writes to accepting_. A
+    /// leaf: no lock is taken and nothing heap-backed is destroyed under it.
     std::mutex command_mutex_;
     /// Created in the constructor, before any thread that wakes the task exists.
     EventFlags event_flags_;
@@ -310,8 +318,14 @@ private:
     size_t accepts_queued_{0};
 
     // 8-bit fields
-    /// Set by close_accepts(), cleared by open_accepts(); guarded by command_mutex_.
-    bool accepts_closed_{false};
+    /// Whether admission is open. While it is false, push_command() refuses an accept, and the
+    /// task (through ConnectionManager::is_accepting()) refuses the accepts already queued, drops
+    /// consumer requests and runs the shutdown pass. Written by close_accepts() and
+    /// open_accepts() on the main loop under command_mutex_, so push_command() reads it in the
+    /// critical section that queues or refuses an accept; read lock-free (is_accepting())
+    /// everywhere else. True from construction: no platform server exists to deliver an accept
+    /// before ConnectionManager::start() opens admission.
+    std::atomic<bool> accepting_{true};
 };
 
 }  // namespace sendspin
