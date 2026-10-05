@@ -28,6 +28,17 @@ cmake --build build-tsan --target sendspin_tests
 TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
 ```
 
+CI also checks that the CPace generator, which runs on the low-entropy pairing code, takes no
+branch that depends on it (`tests/ct/ct_field25519.cpp`, under valgrind memcheck). It needs an
+optimized build without sanitizers; run it when touching `src/crypto/field25519.h` or the
+Elligator2 map:
+
+```bash
+cmake -B build-ct -DCMAKE_BUILD_TYPE=MinSizeRel -DSENDSPIN_BUILD_TESTS=ON -DBUILD_EXAMPLES=OFF .
+cmake --build build-ct --target ct_field25519
+ctest --test-dir build-ct -R ct_field25519 --output-on-failure
+```
+
 CI also builds the library, the examples, and the tests with the Opus decoder off
 (`-DSENDSPIN_ENABLE_OPUS=OFF`, again under ASan/UBSan). One player test only exists in that
 configuration, so run it too when touching the player's codec handling.

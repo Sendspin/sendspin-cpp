@@ -134,6 +134,34 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1
         run: ctest --test-dir build-tsan --output-on-failure
 
+  ct-check:
+    name: Constant-time check (${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The compiler decides whether a branch survives, so check the optimized builds ESP-IDF
+        # uses: -O2 (performance) and -Os (size, the default).
+        build_type: [Release, MinSizeRel]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libavahi-compat-libdnssd-dev valgrind
+
+      - name: Configure CMake
+        # No sanitizers: valgrind cannot run an ASan/TSan binary.
+        run: cmake -B build-ct -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DBUILD_EXAMPLES=OFF .
+
+      - name: Build
+        run: cmake --build build-ct --target ct_field25519
+
+      - name: Run
+        # tests/ct/ct_field25519.cpp: fails on any branch that depends on the pairing code.
+        run: ctest --test-dir build-ct -R ct_field25519 --output-on-failure
+
   esp-idf:
     name: ESP-IDF ${{ matrix.idf }} build (${{ matrix.config.name }})
     runs-on: ubuntu-latest
@@ -169,7 +197,7 @@ jobs:
 
   ci:
     name: CI
-    needs: [pre-commit, lint, build, test, test-no-opus, test-tsan, esp-idf]
+    needs: [pre-commit, lint, build, test, test-no-opus, test-tsan, ct-check, esp-idf]
     runs-on: ubuntu-latest
     if: always()
     steps:

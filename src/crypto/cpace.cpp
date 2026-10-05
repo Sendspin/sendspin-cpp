@@ -124,8 +124,8 @@ std::array<uint8_t, CPACE_FIELD_BYTES> cpace_elligator2(
     const std::array<uint8_t, CPACE_FIELD_BYTES>& r_le) {
     using namespace field25519;
 
-    static constexpr uint64_t A_CONST = 486662;
-    static constexpr uint64_t Z_CONST = 2;
+    static constexpr uint32_t A_CONST = 486662;
+    static constexpr uint32_t Z_CONST = 2;
 
     // Decode r as a field element, reducing mod p.
     Fp r = fp_from_le(r_le.data());
@@ -139,7 +139,7 @@ std::array<uint8_t, CPACE_FIELD_BYTES> cpace_elligator2(
     Fp zr2 = fp_scale(r2, Z_CONST);
 
     // 1 + Z*r^2
-    Fp one = {{1, 0, 0, 0}};
+    Fp one = {{1}};
     Fp denom = fp_add(one, zr2);
 
     // (1 + Z*r^2)^(-1)
@@ -149,7 +149,7 @@ std::array<uint8_t, CPACE_FIELD_BYTES> cpace_elligator2(
     // = p - scale(denom_inv, A) mod p
     Fp a_fp = fp_scale(denom_inv, A_CONST);
     // -a_fp mod p = p - a_fp
-    Fp v = fp_sub({{0, 0, 0, 0}}, a_fp);  // 0 - a_fp = p - a_fp mod p
+    Fp v = fp_sub(Fp{}, a_fp);  // 0 - a_fp = p - a_fp mod p
 
     // v^2, v^3
     Fp v2 = fp_mul(v, v);
@@ -171,10 +171,7 @@ std::array<uint8_t, CPACE_FIELD_BYTES> cpace_elligator2(
     // A * INV2 (= A/2 mod p)
     static constexpr Fp A_HALF = {{
         // A is even, so A/2 = 243331 exactly (no modular inverse needed).
-        243331ULL,
-        0,
-        0,
-        0,
+        243331U,
     }};
 
     // eps * v
@@ -307,15 +304,13 @@ bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
         return false;
     }
 
-    // Reject all-zero result (low-order point check).
-    bool all_zero = true;
+    // Reject all-zero result (low-order point check). Every byte is read, so the time taken does
+    // not reveal where the shared secret's first nonzero byte is.
+    uint8_t any_set = 0;
     for (uint8_t b : shared) {
-        if (b != 0) {
-            all_zero = false;
-            break;
-        }
+        any_set |= b;
     }
-    if (all_zero) {
+    if (any_set == 0) {
         return false;
     }
 

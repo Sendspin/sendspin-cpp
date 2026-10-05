@@ -286,3 +286,23 @@ include(GoogleTest)
 # Backstop above the 55 s watchdog in main.cpp, which fires first and prints the hung test's
 # stack.
 gtest_discover_tests(sendspin_tests PROPERTIES TIMEOUT 60)
+
+# Constant-time check for the CPace generator (tests/ct/ct_field25519.cpp): the pairing code is
+# marked secret and valgrind memcheck fails the run on any branch that depends on it. Built only
+# where valgrind's headers exist, and registered with CTest only outside the sanitizer builds,
+# which valgrind cannot run. CI runs it in the ct-check job at -O2 and -Os, since the compiler,
+# not the source, decides whether a branch survives.
+find_path(VALGRIND_INCLUDE_DIR valgrind/memcheck.h)
+find_program(VALGRIND_EXECUTABLE valgrind)
+if(VALGRIND_INCLUDE_DIR)
+    add_executable(ct_field25519 ct/ct_field25519.cpp)
+    target_include_directories(ct_field25519 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${VALGRIND_INCLUDE_DIR}
+    )
+    target_link_libraries(ct_field25519 PRIVATE sendspin)
+    if(VALGRIND_EXECUTABLE AND NOT ENABLE_SANITIZERS AND NOT ENABLE_TSAN)
+        add_test(NAME ct_field25519
+            COMMAND ${VALGRIND_EXECUTABLE} --error-exitcode=1 -q $<TARGET_FILE:ct_field25519>)
+    endif()
+endif()
