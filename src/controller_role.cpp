@@ -105,8 +105,9 @@ bool ControllerRole::Impl::send_command(const ClientCommandControllerObject& cmd
         SS_LOGW(TAG, "Dropping '%s': missing or out-of-range parameter", to_cstr(cmd.command));
         return false;
     }
-    std::string command_message = format_client_command_message(cmd);
-    return this->client->send_text(command_message, "controller");
+    // Formatted on the protocol task, in its JSON arena
+    // (SendspinClient::send_controller_command()).
+    return this->client->send_controller_command(cmd);
 }
 
 void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {

@@ -14,17 +14,14 @@
 
 /// @file memory.h
 /// @brief Platform-abstracted memory allocation with selectable SPIRAM-vs-internal preference on
-/// ESP, plus RAII buffer and ArduinoJson allocator helpers
+/// ESP, plus an RAII buffer
 
 #pragma once
 
-#include "platform/secure_zero.h"
 #include "sendspin/types.h"
-#include <ArduinoJson.h>
 
 #include <cstddef>
 #include <cstdlib>
-#include <cstring>
 
 #ifdef ESP_PLATFORM
 
@@ -225,97 +222,5 @@ private:
     // Enum fields
     MemoryLocation location_{MemoryLocation::PREFER_EXTERNAL};
 };
-
-/// @brief ArduinoJson allocator that routes through platform_malloc/platform_realloc/platform_free
-/// so JSON processing uses PSRAM on ESP32
-class PsramJsonAllocator : public ArduinoJson::Allocator {
-public:
-    void* allocate(size_t size) override {
-        return platform_malloc(size);
-    }
-
-    void deallocate(void* ptr) override {
-        platform_free(ptr);
-    }
-
-    void* reallocate(void* ptr, size_t new_size) override {
-        return platform_realloc(ptr, new_size);
-    }
-
-    static PsramJsonAllocator* instance() {
-        static PsramJsonAllocator instance;
-        return &instance;
-    }
-};
-
-/// @brief Creates a JsonDocument that uses PSRAM-preferring allocation
-inline JsonDocument make_json_document() {
-    return JsonDocument(PsramJsonAllocator::instance());
-}
-
-/// @brief ArduinoJson allocator that wipes each block before freeing it, for documents that may
-/// hold key material. `ArduinoJson::Allocator::deallocate()` receives only a pointer, so the size
-/// is stashed in a small header before each block. reallocate() copies into a fresh block rather
-/// than growing in place, so the old PSK-bearing block goes through this class's own wipe.
-/// Not for the protocol hot path (use PsramJsonAllocator): every block pays for the header.
-class ZeroizingJsonAllocator : public ArduinoJson::Allocator {
-public:
-    /// @brief Allocates `size` bytes, plus a hidden header recording that size for deallocate().
-    void* allocate(size_t size) override {
-        void* raw = platform_malloc(HEADER_SIZE + size);
-        if (raw == nullptr) {
-            return nullptr;
-        }
-        *static_cast<size_t*>(raw) = size;
-        return static_cast<uint8_t*>(raw) + HEADER_SIZE;
-    }
-
-    /// @brief Wipes the block, recovering its size from the header, and frees it. Null is a
-    /// no-op.
-    void deallocate(void* ptr) override {
-        if (ptr == nullptr) {
-            return;
-        }
-        uint8_t* raw = static_cast<uint8_t*>(ptr) - HEADER_SIZE;
-        const size_t size = *reinterpret_cast<size_t*>(raw);
-        secure_zero(raw, HEADER_SIZE + size);
-        platform_free(raw);
-    }
-
-    /// @brief Reallocates via a fresh allocate() + copy + deallocate() of the old block, so the
-    /// old block is wiped. Returns nullptr on failure, leaving the old block intact.
-    void* reallocate(void* ptr, size_t new_size) override {
-        if (ptr == nullptr) {
-            return this->allocate(new_size);
-        }
-        uint8_t* raw = static_cast<uint8_t*>(ptr) - HEADER_SIZE;
-        const size_t old_size = *reinterpret_cast<size_t*>(raw);
-
-        void* new_ptr = this->allocate(new_size);
-        if (new_ptr == nullptr) {
-            return nullptr;
-        }
-        std::memcpy(new_ptr, ptr, old_size < new_size ? old_size : new_size);
-        this->deallocate(ptr);
-        return new_ptr;
-    }
-
-    static ZeroizingJsonAllocator* instance() {
-        static ZeroizingJsonAllocator instance;
-        return &instance;
-    }
-
-private:
-    /// Header size: rounded up to alignof(std::max_align_t) so the pointer handed back to
-    /// ArduinoJson (raw + HEADER_SIZE) keeps whatever alignment platform_malloc() guarantees.
-    static constexpr size_t HEADER_SIZE =
-        alignof(std::max_align_t) >= sizeof(size_t) ? alignof(std::max_align_t) : sizeof(size_t);
-};
-
-/// @brief Creates a JsonDocument whose pool is wiped block-by-block as it frees memory, for
-/// parsing/serializing documents that may hold PSK material (see ZeroizingJsonAllocator).
-inline JsonDocument make_zeroizing_json_document() {
-    return JsonDocument(ZeroizingJsonAllocator::instance());
-}
 
 }  // namespace sendspin

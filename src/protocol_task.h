@@ -21,6 +21,7 @@
 #include "platform/event_flags.h"
 #include "protocol_messages.h"
 #include "sendspin/config.h"
+#include "sendspin/controller_role.h"
 #include "sendspin/types.h"
 
 #include <cstddef>
@@ -31,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
 
 namespace sendspin {
 
@@ -42,14 +44,15 @@ class SendspinConnection;
 
 /// @brief What a ProtocolCommand asks the protocol task to do
 enum class ProtocolCommandType : uint8_t {
-    ACCEPT_CONNECTION,       ///< A platform server delivered a WebSocket-upgraded connection
-    CONNECT_TO,              ///< SendspinClient::connect_to()
-    DISCONNECT,              ///< SendspinClient::disconnect()
-    LEAVE,                   ///< SendspinClient::leave()
-    PAIRING_WINDOW_CANCEL,   ///< SendspinClient::cancel_pairing_window()
-    PAIRING_WINDOW_CONFIRM,  ///< SendspinClient::confirm_pairing_window()
-    SEND_TEXT,               ///< SendspinClient::send_text()
-    SET_UNPAIRED_ACCESS,     ///< SendspinClient::set_unpaired_access_enabled()
+    ACCEPT_CONNECTION,        ///< A platform server delivered a WebSocket-upgraded connection
+    CONNECT_TO,               ///< SendspinClient::connect_to()
+    DISCONNECT,               ///< SendspinClient::disconnect()
+    LEAVE,                    ///< SendspinClient::leave()
+    PAIRING_WINDOW_CANCEL,    ///< SendspinClient::cancel_pairing_window()
+    PAIRING_WINDOW_CONFIRM,   ///< SendspinClient::confirm_pairing_window()
+    SEND_CONTROLLER_COMMAND,  ///< SendspinClient::send_controller_command()
+    SEND_TEXT,                ///< SendspinClient::send_text()
+    SET_UNPAIRED_ACCESS,      ///< SendspinClient::set_unpaired_access_enabled()
 };
 
 /**
@@ -137,15 +140,24 @@ private:
     size_t size_{0};
 };
 
+static_assert(std::is_trivially_copyable_v<ClientCommandControllerObject>,
+              "a controller command crosses to the protocol task by copy");
+
 /// @brief One request handed to the protocol task. Only the fields its type names are set.
 /// Move-only, since it may carry a connection reference and a lease. A client/state snapshot is
-/// not a command: it goes through ProtocolTask::publish_state().
+/// not a command: it goes through ProtocolTask::publish_state(). Written by the pushing thread
+/// (any thread for a consumer request, a transport's delivery thread for an accept) and read by
+/// the protocol task, or by the thread joining it at stop(); the queue's lock hands it over.
 struct ProtocolCommand {
     // Struct fields
     /// CONNECT_TO: the URL. SEND_TEXT: the message.
     std::string text{};
     /// A buffer handed over with the command (see CommandLease).
     CommandLease lease{};
+    /// SEND_CONTROLLER_COMMAND: the validated command, formatted on the protocol task. 24 bytes
+    /// on a 32-bit target, in every queue slot: 384 bytes across the default queue
+    /// (CONSUMER_COMMAND_BURST plus ACCEPT_SLOTS_PER_SOCKET for each of the default four sockets).
+    ClientCommandControllerObject controller_command{};
 
     // Pointer fields
     /// ACCEPT_CONNECTION: the delivered connection.
@@ -190,11 +202,12 @@ public:
     /// Queue slots for consumer commands: the gestures one main-loop tick can issue, each
     /// meaningful at most once per tick (connect_to(), disconnect(), leave(),
     /// confirm_pairing_window(), cancel_pairing_window(), set_unpaired_access_enabled()), plus
-    /// two send_text() controller commands. That last term is an assumption: it holds for a
-    /// handler that sends a volume change and a play, not for a rotary encoder that issues a
-    /// volume step per detent faster than the protocol task drains the queue. A command past the
-    /// burst is refused and push_command() returns false, a drop the client must pass back to
-    /// whoever called send_text() rather than swallow. A client/state snapshot takes no slot
+    /// two controller commands, each a SEND_CONTROLLER_COMMAND (ControllerRole::send_command())
+    /// or a SEND_TEXT (send_text()). That last term is an assumption: it holds for a handler that
+    /// sends a volume change and a play, not for a rotary encoder that issues a volume step per
+    /// detent faster than the protocol task drains the queue. A command past the burst is refused
+    /// and push_command() returns false, a drop the client must pass back to whoever called
+    /// send_command() or send_text() rather than swallow. A client/state snapshot takes no slot
     /// (publish_state()), and a transport close is out of band (InboundGate), so neither counts.
     static constexpr size_t CONSUMER_COMMAND_BURST = 8;
 

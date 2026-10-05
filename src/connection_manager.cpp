@@ -62,12 +62,15 @@ static const std::vector<std::string> EMPTY_ROLES{};
 /// @param conn The connection the activation arrived on.
 /// @param why What the activation asked for that the client cannot act on.
 /// @param method The pairing method the activation named, for the diagnostic.
-static void refuse_activate(SendspinConnection* conn, const char* why, const char* method) {
+/// @param arena The client's JSON arena, to build the pair/abort in.
+static void refuse_activate(SendspinConnection* conn, const char* why, const char* method,
+                            SendspinArenaAllocator& arena) {
     SS_LOGW(TAG,
             "server/activate %s (pairing.method=%s) for server_id=%s; replying "
             "pair/abort(method_not_supported), connection stays open",
             why, method, conn->get_server_id().c_str());
-    conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
+    conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED, arena),
+                        nullptr);
 }
 
 /// @brief Transport-establishment progress of a nursery connection, used for reap diagnostics
@@ -333,6 +336,7 @@ bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
                                  this->client_->config_.time_burst_response_timeout_ms);
     conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
     conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
+    conn->set_json_arena(this->json_arena());
     this->setup_connection_callbacks(conn.get());
 
     ProtocolCommand command;
@@ -417,6 +421,7 @@ void ConnectionManager::connect_to(const std::string& url) {
                                  this->client_->config_.websocket_stack_size);
     client_conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
     client_conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
+    client_conn->set_json_arena(this->json_arena());
 
     // Wired before start(): the transport may deliver from its own thread as soon as it runs.
     this->setup_connection_callbacks(client_conn.get());
@@ -507,10 +512,17 @@ void ConnectionManager::leave() {
         return;
     }
     SS_LOGI(TAG, "Leaving the group (client/leave)");
-    conn->send_app_json(format_client_leave_message(), nullptr);
+    conn->send_app_json(format_client_leave_message(this->json_arena()), nullptr);
 }
 
 void ConnectionManager::send_role_text(SendspinRole role, const std::string& text) const {
+    SendspinConnection* conn = this->role_send_target(role);
+    if (conn != nullptr) {
+        conn->send_app_json(text, nullptr);
+    }
+}
+
+SendspinConnection* ConnectionManager::role_send_target(SendspinRole role) const {
     // Routed to the connection that owns the role, whose activation of it is the role's own gate
     // (see owns_role()): the same gate the receive path and the client/state role objects apply.
     // A declared PAIRING activity is not a gate: pairing.md "Entering and leaving pairing" says an
@@ -519,7 +531,7 @@ void ConnectionManager::send_role_text(SendspinRole role, const std::string& tex
     SendspinConnection* conn = this->role_owner(role);
     if (conn == nullptr || !conn->is_connected()) {
         SS_LOGD(TAG, "Dropping a %s message: no admitted connection owns the role", to_cstr(role));
-        return;
+        return nullptr;
     }
     // connection.md "Re-handshake": once the client has received Noise message 1 it sends nothing
     // but the handshake until the new server/activate arrives. Same gate client/leave and
@@ -527,9 +539,9 @@ void ConnectionManager::send_role_text(SendspinRole role, const std::string& tex
     if (!conn->first_activate_received()) {
         SS_LOGD(TAG, "Dropping a %s message: the connection awaits its server/activate",
                 to_cstr(role));
-        return;
+        return nullptr;
     }
-    conn->send_app_json(text, nullptr);
+    return conn;
 }
 
 void ConnectionManager::cancel_pairing_window() {
@@ -674,7 +686,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
     // logs the raw value) cannot start any flow.
     if (is_pairing_activate && !msg.pairing_method.has_value()) {
         refuse_activate(conn, "declares pairing with no usable pairing.method",
-                        "absent or unrecognized");
+                        "absent or unrecognized", this->json_arena());
         return;
     }
 
@@ -697,7 +709,8 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
                 break;
         }
         if (!category_ok || !offered) {
-            refuse_activate(conn, "selects an unsupported pairing method", to_cstr(method));
+            refuse_activate(conn, "selects an unsupported pairing method", to_cstr(method),
+                            this->json_arena());
             return;
         }
 
@@ -707,7 +720,8 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
         // open (pairing.md "Client <-> Server: pair/abort").
         if (method == SendspinPairMethod::DYNAMIC_PAIRING_CODE &&
             !offers_pairing_code_format(this->client_->config_, msg.pairing_format)) {
-            refuse_activate(conn, "names no usable pairing.format", to_cstr(method));
+            refuse_activate(conn, "names no usable pairing.format", to_cstr(method),
+                            this->json_arena());
             return;
         }
     }
@@ -1407,6 +1421,10 @@ uint32_t ConnectionManager::scan_admitted(int64_t now_us) {
 // Connection setup
 // ============================================================================
 
+SendspinArenaAllocator& ConnectionManager::json_arena() const {
+    return *this->client_->json_arena_;
+}
+
 void ConnectionManager::setup_connection_callbacks(SendspinConnection* conn) {
     // Both run on the protocol task (SendspinConnection::process_inbound_message()).
     conn->on_json_message_cb = [this](SendspinConnection& c, const char* data, size_t len,
@@ -1729,7 +1747,8 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
             // displaced pairing attempt); the goodbye after it is a benign over-send, since the
             // transport layer has no close-without-goodbye path to use instead.
             if (conn->has_activity(SendspinActivity::PAIRING)) {
-                conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT),
+                conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT,
+                                                              this->json_arena()),
                                     nullptr);
             }
             this->release_connection(std::move(conn), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);

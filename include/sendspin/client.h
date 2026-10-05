@@ -42,6 +42,7 @@ class ColorRole;
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
 class ControllerRole;
+struct ClientCommandControllerObject;
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
 class MetadataRole;
@@ -692,6 +693,26 @@ public:
     ///         means queued, not sent: the protocol task's role gate can still drop it.
     bool send_text(const std::string& text, const std::string& role_family);
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    /// @brief Queues a controller command for the protocol task, which formats it as a
+    /// client/command and sends it like send_text() sends a "controller" message (same role
+    /// gate, same drops)
+    ///
+    /// A role service, like send_text() and publish_state(): consumers call
+    /// ControllerRole::send_command(), which checks the command against the server's
+    /// supported_commands and its parameter before calling this. This assumes those checks ran
+    /// and repeats neither. The command crosses to the protocol task as the struct, so the
+    /// message is built in the task's JSON arena.
+    ///
+    /// Callable from any thread.
+    /// @param cmd The command, already validated by the controller role.
+    /// @return false when the command was refused before it reached the protocol task: the
+    ///         client is not running, or the command queue is full
+    ///         (ProtocolTask::CONSUMER_COMMAND_BURST requests, logged). true means queued, not
+    ///         sent.
+    bool send_controller_command(const ClientCommandControllerObject& cmd);
+#endif
+
     /// @brief Acquires a ref-counted high-performance networking request. Main loop only: the
     /// first acquire calls the listener inline.
     void acquire_high_performance();
@@ -796,7 +817,8 @@ private:
     void handle_command(ProtocolCommand& command);
 
     /// @brief Runs one of a connection's messages through the receive path and returns its ring
-    /// item unless a role kept it. Protocol task only.
+    /// item unless a role kept it. Resets json_arena_ first (the only reset), so it is called only
+    /// from the tick's top level, with no arena document live. Protocol task only.
     void process_inbound(SendspinConnection& conn, InboundMessage& message);
 
     /// @brief Builds the formatted client hello message from config. Protocol task.
@@ -810,9 +832,9 @@ private:
     // Message processing
     // ========================================
 
-    /// @brief Parses and routes one JSON message from a connection. Protocol task only (it owns
-    /// json_arena_). `data` is not null-terminated and is valid for the duration of the call
-    /// only.
+    /// @brief Parses and routes one JSON message from a connection, in json_arena_ (which
+    /// process_inbound() reset). Protocol task only. `data` is not null-terminated and is valid for
+    /// the duration of the call only.
     void process_json_message(SendspinConnection& connection, const char* data, size_t len,
                               int64_t timestamp);
 
@@ -955,8 +977,10 @@ private:
     /// protocol task starts, and stop() releases it only after the protocol task is joined and
     /// ConnectionManager::finish_stop() has stopped the server and joined its tasks.
     std::unique_ptr<InboundRing> inbound_ring_;
-    /// Internal-RAM scratch arena for parsing incoming JSON; null unless config_.json_arena_size >
-    /// 0. Used by the protocol task only.
+    /// Internal-RAM scratch arena (config_.json_arena_size bytes, all-heap at 0) backing every
+    /// JSON document the protocol task parses or builds. Created with the client. Used by the
+    /// protocol task only: process_inbound() resets it before each inbound message, and the
+    /// connection manager, the connections and the handshake parse and build in it.
     std::unique_ptr<SendspinArenaAllocator> json_arena_;
     SendspinClientListener* listener_{nullptr};
 #ifdef SENDSPIN_ENABLE_METADATA

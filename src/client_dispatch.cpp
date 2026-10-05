@@ -19,6 +19,7 @@
 #include "connection.h"
 #include "connection_manager.h"
 #include "inbound_ring.h"
+#include "noise_handshake.h"
 #include "platform/compiler.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
@@ -50,8 +51,8 @@
 
 #include <algorithm>
 #include <optional>
-#include <string_view>
 #include <utility>
+#include <vector>
 
 static const char* const TAG = "sendspin.client";
 
@@ -236,6 +237,7 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
         case ProtocolCommandType::LEAVE:
         case ProtocolCommandType::PAIRING_WINDOW_CANCEL:
         case ProtocolCommandType::PAIRING_WINDOW_CONFIRM:
+        case ProtocolCommandType::SEND_CONTROLLER_COMMAND:
         case ProtocolCommandType::SEND_TEXT:
         case ProtocolCommandType::SET_UNPAIRED_ACCESS:
             break;
@@ -264,6 +266,18 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
         case ProtocolCommandType::PAIRING_WINDOW_CONFIRM:
             manager.open_pairing_window();
             break;
+        case ProtocolCommandType::SEND_CONTROLLER_COMMAND: {
+            // Formatted here rather than on the caller's thread so the document is built in the
+            // task's JSON arena, and only once the gate a "controller" send_text() meets has
+            // passed, so a command no connection may receive formats nothing.
+            SendspinConnection* conn = manager.role_send_target(SendspinRole::CONTROLLER);
+            if (conn != nullptr) {
+                conn->send_app_json(
+                    format_client_command_message(command.controller_command, *this->json_arena_),
+                    nullptr);
+            }
+            break;
+        }
         case ProtocolCommandType::SEND_TEXT:
             manager.send_role_text(command.role, command.text);
             break;
@@ -277,6 +291,12 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
 }
 
 void SendspinClient::process_inbound(SendspinConnection& conn, InboundMessage& message) {
+    // One reset per inbound message of any kind, the Noise handshake frames included, reclaiming
+    // what the documents of the previous one stranded (see SendspinArenaAllocator). Safe: this is
+    // called only from the tick's top level, where no arena document is live; every document the
+    // task parsed or built since the last reset was destroyed before its parser or builder
+    // returned.
+    this->json_arena_->reset();
     conn.process_inbound_message(message);
     if (message.item != nullptr) {
         this->inbound_ring_->return_item(message.item);
@@ -296,21 +316,24 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                                           size_t len, int64_t timestamp) {
     SendspinConnection* conn = &connection;
     // Every connection's messages are processed on the protocol task, one at a time, so the
-    // shared arena, the parse and the handlers it dispatches to need no lock. Reusing the arena
-    // is safe: the JsonDocument from the previous call was destroyed when that call returned.
-    if (this->json_arena_) {
-        this->json_arena_->reset();
-    }
-    JsonDocument doc =
-        this->json_arena_ ? make_json_document(*this->json_arena_) : make_json_document();
-    DeserializationError error = deserializeJson(doc, data, len);
-    if (error || doc.isNull()) {
+    // shared arena, the parse and the handlers it dispatches to need no lock. process_inbound()
+    // reset the arena before this message.
+    //
+    // Extract, then release, then act: handlers never receive the JsonObject. Each case below
+    // copies the message into its plain struct through parsed.extract(), which releases the
+    // document before any handler runs, so a reply a handler builds (client/state after
+    // server/activate, a pairing reply, a re-handshake's msg2) fits the arena beside nothing. A
+    // case that reads no payload calls parsed.release() before acting.
+    ParsedJsonMessage parsed(*this->json_arena_);
+    if (!parsed.parse(data, len)) {
         SS_LOGW(TAG, "Failed to parse JSON message");
         return;
     }
-    JsonObject root = doc.as<JsonObject>();
 
-    SendspinServerToClientMessageType message_type = determine_message_type(root);
+    // A lambda rather than the function itself: a function passed by reference is an indirect
+    // call to the stack derivation (tools/stack_usage/), a lambda body a direct one.
+    const SendspinServerToClientMessageType message_type =
+        parsed.read([](JsonObject root) { return determine_message_type(root); });
 
     // Role-bound traffic is gated per role on ownership (role_accepts_traffic()): only the
     // admitted connection that owns a role reaches it. The connection is not closed over a
@@ -324,7 +347,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             SS_LOGD(TAG, "Stream Started");
 
             StreamStartMessage stream_msg;
-            if (!process_stream_start_message(root, &stream_msg)) {
+            if (!parsed.extract<process_stream_start_message>(&stream_msg)) {
                 SS_LOGE(TAG, "Failed to parse stream/start message");
                 break;
             }
@@ -359,7 +382,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         }
         case SendspinServerToClientMessageType::STREAM_END: {
             StreamEndMessage end_msg;
-            if (process_stream_end_message(root, &end_msg)) {
+            if (parsed.extract<process_stream_end_message>(&end_msg)) {
                 bool end_player = !end_msg.roles.has_value();
                 bool end_artwork = !end_msg.roles.has_value();
                 bool end_visualizer = !end_msg.roles.has_value();
@@ -409,7 +432,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         }
         case SendspinServerToClientMessageType::STREAM_CLEAR: {
             StreamClearMessage clear_msg;
-            if (process_stream_clear_message(root, &clear_msg)) {
+            if (parsed.extract<process_stream_clear_message>(&clear_msg)) {
                 // messaging.md "stream/clear": only player and visualizer streams clear, and an
                 // omitted roles list clears both.
                 bool clear_player = !clear_msg.roles.has_value();
@@ -450,7 +473,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         }
         case SendspinServerToClientMessageType::SERVER_HELLO: {
             ServerHelloMessage hello_msg;
-            if (process_server_hello_message(root, &hello_msg)) {
+            if (parsed.extract<process_server_hello_message>(&hello_msg)) {
                 // server_id comes from the Noise handshake result (already set on the
                 // connection); server/hello only carries the display name.
                 ServerInformationObject info = conn->get_server_information();
@@ -467,7 +490,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         }
         case SendspinServerToClientMessageType::SERVER_ACTIVATE: {
             ServerActivateMessage activate_msg;
-            if (process_server_activate_message(root, &activate_msg)) {
+            if (parsed.extract<process_server_activate_message>(&activate_msg)) {
                 SS_LOGD(TAG, "server/activate received (activities_count=%zu)",
                         activate_msg.activities.size());
                 // Applied before the next message is parsed: trust enforcement, role
@@ -484,7 +507,11 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             // is ordered with the decrypt of the next frame and with every send
             // (connection.md "Re-handshake").
             SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
-            if (!conn->handle_noise_rehandshake(std::string_view(data, len))) {
+            const std::optional<std::vector<uint8_t>> msg1_bytes =
+                parsed.extract([](JsonObjectConst root) {
+                    return read_noise_handshake_data(root, "re-handshake");
+                });
+            if (!msg1_bytes.has_value() || !conn->handle_noise_rehandshake(msg1_bytes.value())) {
                 SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
                 // Do not leave a half-swapped session. UNAUTHORIZED is the closest available
                 // reason for a crypto failure, though close_silently() never transmits it
@@ -497,7 +524,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         }
         case SendspinServerToClientMessageType::SERVER_TIME: {
             ServerTimeMessage time_msg;
-            if (!process_server_time_message(root, &time_msg)) {
+            if (!parsed.extract<process_server_time_message>(&time_msg)) {
                 break;
             }
             // Only the reply to this connection's frame in flight is taken, so no peer can feed
@@ -519,44 +546,66 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             break;
         }
         case SendspinServerToClientMessageType::SERVER_STATE: {
-            // One section at a time, each in its own scope so the compiler reuses the slots.
-            // Parsing the whole message into an aggregate would hold every section's storage (a
-            // metadata state alone is 200 bytes) in this frame at once, and this runs on the
-            // protocol task, whose stack is a fixed budget on ESP-IDF.
+            // The three sections are live together so one parse serves all three: every section a
+            // role takes is extracted in the one pass that releases the document, at the cost of
+            // the sections' combined size in this frame (the protocol task's stack is a fixed
+            // budget on ESP-IDF). Each section's role gate is decided first, so a section no role
+            // takes is not parsed.
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-            if (this->controller_ &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::CONTROLLER)) {
-                ServerStateControllerObject controller_state;
-                if (process_server_state_controller(root, &controller_state)) {
-                    this->controller_->impl_->handle_server_state(
-                        std::move(controller_state),
-                        this->controller_->impl_->cleanup_generation.load(
-                            std::memory_order_acquire));
-                }
+            const bool take_controller =
+                this->controller_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::CONTROLLER);
+            ServerStateControllerObject controller_state;
+            bool controller_valid = false;
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+            const bool take_metadata =
+                this->metadata_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::METADATA);
+            ServerMetadataStateObject metadata_state;
+            bool metadata_valid = false;
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+            const bool take_color = this->color_ && role_accepts_traffic(*this->connection_manager_,
+                                                                         conn, SendspinRole::COLOR);
+            ServerColorStateObject color_state;
+            bool color_valid = false;
+#endif
+            parsed.extract([&]([[maybe_unused]] JsonObject root) {
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+                controller_valid =
+                    take_controller && process_server_state_controller(root, &controller_state);
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+                metadata_valid =
+                    take_metadata && process_server_state_metadata(root, &metadata_state);
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+                color_valid = take_color && process_server_state_color(root, &color_state);
+#endif
+            });
+
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+            if (controller_valid) {
+                this->controller_->impl_->handle_server_state(
+                    std::move(controller_state),
+                    this->controller_->impl_->cleanup_generation.load(std::memory_order_acquire));
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_METADATA
-            if (this->metadata_ &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::METADATA)) {
-                ServerMetadataStateObject metadata_state;
-                if (process_server_state_metadata(root, &metadata_state)) {
-                    this->metadata_->impl_->handle_server_state(
-                        std::move(metadata_state),
-                        this->metadata_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                }
+            if (metadata_valid) {
+                this->metadata_->impl_->handle_server_state(
+                    std::move(metadata_state),
+                    this->metadata_->impl_->cleanup_generation.load(std::memory_order_acquire));
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_COLOR
-            if (this->color_ &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::COLOR)) {
-                ServerColorStateObject color_state;
-                if (process_server_state_color(root, &color_state)) {
-                    this->color_->impl_->handle_server_state(
-                        color_state,
-                        this->color_->impl_->cleanup_generation.load(std::memory_order_acquire));
-                }
+            if (color_valid) {
+                this->color_->impl_->handle_server_state(
+                    color_state,
+                    this->color_->impl_->cleanup_generation.load(std::memory_order_acquire));
             }
 #endif
             break;
@@ -566,7 +615,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             if (this->player_ &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
                 ServerCommandMessage cmd_msg;
-                if (process_server_command_message(root, &cmd_msg)) {
+                if (parsed.extract<process_server_command_message>(&cmd_msg)) {
                     this->player_->impl_->handle_server_command(
                         cmd_msg,
                         this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
@@ -584,7 +633,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 break;
             }
             GroupUpdateMessage group_msg;
-            if (process_group_update_message(root, &group_msg)) {
+            if (parsed.extract<process_group_update_message>(&group_msg)) {
                 this->merge_group_update(std::move(group_msg.group));
             }
             break;
@@ -601,6 +650,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             // persistence provider is main-loop-only.
             // The payload is spec'd as empty; the message-type dispatch above is the only
             // validation this message needs.
+            parsed.release();
             auto record = conn->take_pending_pairing_record();
             bool stored_record = false;
             if (record.has_value() && this->record_store_ != nullptr) {
@@ -641,7 +691,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::PAIR_ABORT: {
             // pair/abort: the server aborted the pairing exchange.
             PairAbortMessage abort_msg;
-            if (process_pair_abort_message(root, &abort_msg)) {
+            if (parsed.extract<process_pair_abort_message>(&abort_msg)) {
                 SS_LOGW(TAG, "pair/abort received: reason=%s", to_cstr(abort_msg.reason));
                 this->connection_manager_->on_pair_abort(conn, abort_msg.reason);
             } else {
@@ -655,6 +705,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         }
         case SendspinServerToClientMessageType::SERVER_UNPAIR: {
             // server/unpair. Trust gating (LONG_TERM only) happens in handle_server_unpair.
+            parsed.release();
             SS_LOGI(TAG, "server/unpair received (psk_id=%s)", conn->get_psk_id().c_str());
             this->connection_manager_->on_server_unpair(conn);
             break;
@@ -663,7 +714,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             // server/pair-init: nonce_A from the server (the emission format arrived in the
             // activation's pairing object).
             ServerPairInitPayload payload;
-            if (process_server_pair_init_message(root, &payload)) {
+            if (parsed.extract<process_server_pair_init_message>(&payload)) {
                 ServerPairingMessage message;
                 message.kind = PairingMessageKind::PAIR_INIT;
                 message.nonce_a = payload.nonce_a;
@@ -676,7 +727,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::SERVER_PAIR_AUTH: {
             // server/pair-auth: server CPace share.
             ServerPairAuthPayload payload;
-            if (process_server_pair_auth_message(root, &payload)) {
+            if (parsed.extract<process_server_pair_auth_message>(&payload)) {
                 ServerPairingMessage message;
                 message.kind = PairingMessageKind::PAIR_AUTH;
                 message.pake_msg_1 = payload.pake_msg_1;
@@ -689,7 +740,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM: {
             // server/pair-confirm: server CPace confirmation tag.
             ServerPairConfirmPayload payload;
-            if (process_server_pair_confirm_message(root, &payload)) {
+            if (parsed.extract<process_server_pair_confirm_message>(&payload)) {
                 ServerPairingMessage message;
                 message.kind = PairingMessageKind::PAIR_CONFIRM;
                 message.server_kc = payload.server_kc;
@@ -699,9 +750,13 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             }
             break;
         }
-        default:
-            SS_LOGW(TAG, "Unhandled server message type: %s",
-                    root["type"].is<const char*>() ? root["type"].as<const char*>() : "unknown");
+        default: {
+            // Nothing acts on an unhandled message, so its type is read in place.
+            const char* type = parsed.read([](JsonObject root) {
+                return root["type"].is<const char*>() ? root["type"].as<const char*>() : "unknown";
+            });
+            SS_LOGW(TAG, "Unhandled server message type: %s", type);
+        }
     }
 }
 

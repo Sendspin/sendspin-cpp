@@ -4,29 +4,29 @@ Standalone C++ library implementing the Sendspin synchronized audio streaming pr
 
 ## Architecture
 
-The library provides `SendspinClient` as the main public API. It handles the full protocol lifecycle: WebSocket connections, time synchronization, audio decoding/sync, and message routing.
+The library provides `SendspinClient` as the main public API. It handles the full protocol lifecycle: WebSocket connections, time synchronization, audio decoding/sync, and message routing. One library-owned protocol task owns every connection and does all protocol work; transports only receive (into the shared inbound ring or a connection's fallback buffer) and report closes; `loop()` only drains the inbox. `docs/internals.md` has the threads, the cross-thread channels, the tick order and the cross-file invariants.
 
 ### Key classes
 
-- `SendspinClient` (`client.h`): main orchestration class, owns the protocol task, the connection manager, the inbound ring and message routing; `loop()` only drains the inbox on the consumer's main loop, and the requests that act on a connection are queued to the protocol task. Its protocol-task half (the tick, the command handler and the JSON and binary dispatch) is in `client_dispatch.cpp`
-- `ProtocolTask` (`protocol_task.h`): the library-owned `SsProto` thread that owns every connection and does all protocol work (Noise, reassembly, hello, activation, admission, pairing, JSON dispatch, time sync, watchdogs, sends) through `SendspinClient::protocol_tick()`, which returns its next deadline; plus its bounded command queue for main-loop and consumer requests and the latest client/state snapshot slot
-- `ConnectionManager` (`connection_manager.h`): the admitted array with each connection's owned roles, the nursery, the reaping list that holds a released outbound connection until its transport has finished, admission and ownership arbitration, pairing, per-connection time bursts and the watchdogs, and the leaf-locked time filter and server information slot other threads read; runs on the protocol task. Its pairing state machines are in `connection_manager_pairing.cpp`
-- `InboundRing` / `InboundItemList` / `InboundConsumer` / `InboundGate` (`inbound_ring.h`): the one shared ring every admitted connection's transport receives into (over `SharedRingBuffer`, `platform/shared_ring_buffer.h`), the per-role item lists and their consumer ends that hand audio and visualizer frames to their consumer threads in place (charged to per-role quotas), and the per-connection transport/protocol-task hand-off (the fallback message, the in-flight count, the close and the detach)
+- `SendspinClient` (`client.h`): main orchestration class; owns the protocol task, the connection manager, the inbound ring and the message routing. Its protocol-task half (the tick, the command handler, the JSON and binary dispatch) is in `client_dispatch.cpp`
+- `ProtocolTask` (`protocol_task.h`): the `SsProto` thread, its bounded command queue and the latest client/state slot; ticks through `SendspinClient::protocol_tick()` to its next deadline
+- `ConnectionManager` (`connection_manager.h`): the admitted array with role ownership, the nursery, the reaping list, admission and arbitration, time bursts, watchdogs and the published time filter and server information; pairing state machines in `connection_manager_pairing.cpp`
+- `InboundRing` / `InboundItemList` / `InboundConsumer` / `InboundGate` (`inbound_ring.h`): the shared ring every admitted transport receives into (over `SharedRingBuffer`), the intrusive per-role item lists that hand audio and visualizer frames to their consumer threads in place, and the per-connection transport/protocol-task hand-off
 - `PlayerRole` (`player_role.h`): audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
 - `ControllerRole` (`controller_role.h`): sends playback commands to the server
 - `MetadataRole` (`metadata_role.h`): receives track metadata and progress
 - `ArtworkRole` (`artwork_role.h`): receives album artwork images
 - `VisualizerRole` (`visualizer_role.h`): receives spectrum/beat visualization data
 - `ColorRole` (`color_role.h`): receives audio-derived RGB color palette from the server
-- `SyncTask` (`sync_task.h`): decodes encoded audio from its item list in place, synchronizes to server timestamps, writes PCM via audio write callback; starts each stream only on the main loop's acknowledgement of that stream's ordinal
-- `SendspinConnection` (`connection.h`): abstract WebSocket connection base; its transport only receives into the inbound ring or its fallback buffer and reports a close, and everything else on it runs on the protocol task
+- `SyncTask` (`sync_task.h`): decodes encoded audio from its item list in place, synchronizes to server timestamps, writes PCM via audio write callback
+- `SendspinConnection` (`connection.h`): abstract WebSocket connection base
 - `SendspinServerConnection` / `SendspinClientConnection`: platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
-- `NoiseHandshake` (`noise_handshake.h`): drives the Noise KKpsk2 handshake frames on the protocol task and resolves the PSK through `RecordStore`
+- `NoiseHandshake` (`noise_handshake.h`): drives the Noise KKpsk2 handshake frames and resolves the PSK through `RecordStore`
 - `NoiseSession` (`noise_session.h`): noise-c wrapper holding the KKpsk2 handshake and transport cipher states
-- `NoiseTransport` (`noise_transport.h`): per-connection encrypted framing, owns fragmentation and reassembly around the session; protocol task only, so it takes no lock
+- `NoiseTransport` (`noise_transport.h`): per-connection encrypted framing, owns fragmentation and reassembly around the session
 - `RecordStore` (`record_store.h`): pairing records and the Pairing PSK (configured, stored, or generated), seeded from the client config and the persistence provider
-- `Inbox` / `InboxSlot` / `GenerationSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state (the protocol task and role threads produce, the main loop consumes) - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle events; a role's slots stamp each payload with the role's teardown generation
-- `RoleTeardown` / `TeardownTracker` (`teardown_tracker.h`): every role's teardown generation and its `accepts()` check, and the main-loop half of a role's two-half teardown, run once per teardown generation (`catch_up_teardown()`, `take_current_payload()`) before the main loop acts on anything stamped with it
+- `Inbox` / `InboxSlot` / `GenerationSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle events
+- `RoleTeardown` / `TeardownTracker` (`teardown_tracker.h`): every role's teardown generation and the main-loop half of a role's teardown
 - `SendspinTimeFilter` (`time_filter.h`): 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator, one per connection
 - `SendspinDecoder` (`decoder.h`): FLAC/PCM decoder wrapper, plus Opus when built with `SENDSPIN_ENABLE_OPUS`
@@ -76,10 +76,10 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `base64.h`: base64 encoding/decoding
 - `compiler.h`: compiler hints and platform-specific macros
 - `crypto.h`: SHA-256/SHA-512, HMAC-SHA-512, X25519, one-shot ChaChaPoly AEAD, CSPRNG, constant-time compare and secure zero
-- `json_arena.h`: bounded internal-RAM bump-arena ArduinoJson allocator with PSRAM fallback
+- `json_arena.h`: bounded internal-RAM bump-arena ArduinoJson allocator, wiping every block it frees, that backs every JSON document the protocol task parses or builds, plus `ParsedJsonMessage`, the extract-then-release reader every parsed message goes through
 - `network_info.h`: best-effort lookup of the local network interface MAC address
 - `types.h`: platform type abstractions
-- `shared_ring_buffer.h`: multi-producer ring buffer with acquire/complete writes, one ordered consumer, any-order returns and ring-order reclamation (ESP: FreeRTOS no-split `xRingbuffer`, host: a mutex/condition-variable reimplementation of its layout)
+- `shared_ring_buffer.h`: multi-producer ring buffer with acquire/complete writes, one ordered consumer, any-order returns and ring-order reclamation (ESP: FreeRTOS no-split `xRingbuffer`, host: mutex/condition variable over the same layout)
 - `thread_safe_queue.h`: thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
 - `event_flags.h`: event flag group (ESP: FreeRTOS event group, host: mutex/condition variable)
 - `shadow_slot.h`: mutex-protected single-writer/single-reader slot between two threads (the sync task's playback-progress slot); state the main loop reads goes through the inbox (`inbox.h`) instead
@@ -92,7 +92,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies via FetchContent: ArduinoJson, noise-c, IXWebSocket, and, for the player role, micro-flac plus micro-opus when `SENDSPIN_ENABLE_OPUS` is on.
 - **Tests**: `cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tests --target sendspin_tests` and `ctest --test-dir build-tests --output-on-failure`.
 - **ThreadSanitizer tests**: `cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tsan --target sendspin_tests` and `TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure`. `ENABLE_TSAN` applies the thread sanitizer to every target, including the fetched dependencies, and cannot be combined with `ENABLE_SANITIZERS`.
-- **Stack budgets**: the ESP task stack defaults in `config.h` are static call-graph bounds from `tools/stack_usage/` (`-fstack-usage` and `-fcallgraph-info` on xtensa; recipe in its README); re-derive them after a change that deepens a task's call chain.
+- **Stack budgets**: the ESP task stack defaults in `config.h` are static call-graph bounds from `tools/stack_usage/` (recipe in its README); re-derive them after a change that deepens a task's call chain.
 - **ESP dependencies**: ArduinoJson, noise-c, esp_websocket_client, micro-flac, micro-opus (with `SENDSPIN_ENABLE_OPUS`), esp_http_server, mbedtls, pthread, esp_ringbuf, esp_hw_support
 - **Host dependencies**: ArduinoJson, noise-c, micro-flac, micro-opus (with `SENDSPIN_ENABLE_OPUS`), IXWebSocket, pthreads
 
@@ -103,8 +103,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - Namespace: `sendspin`
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
 - Memory: the `platform_malloc` family from `platform/memory.h`, never raw `heap_caps_malloc`/`malloc` in core code (variant semantics under Platform abstraction above)
-- Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer. Connection state belongs to the protocol task; a transport thread is a pipe into the inbound ring; requests that act on a connection go through its command queue, and work bound for the main loop goes through the inbox. Every library lock is a leaf, so there is no lock order.
-- Bounded resources: a holder of inbound ring items is bounded by its own quota, and every drop logs at least a warning
+- Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer. Connection state belongs to the protocol task; requests that act on a connection go through its command queue, and work bound for the main loop goes through the inbox. Every library lock is a leaf, so there is no lock order.
 - Tests: host-only and white-box; a test file that reaches private members compiles with `-fno-access-control` (`tests/CMakeLists.txt` says what and why), never through a production seam
 - Apache 2.0 license headers on all files
 

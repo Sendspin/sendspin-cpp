@@ -28,6 +28,7 @@ add_executable(sendspin_tests
     test_encrypted_lifecycle.cpp
     test_time_filter.cpp
     test_protocol.cpp
+    test_json_arena.cpp
     test_network_info.cpp
     test_thread_safe_queue.cpp
     test_shared_ring_buffer.cpp
@@ -143,6 +144,11 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # other.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
+# test_json_arena.cpp reads SendspinArenaAllocator's base_, cap_ and offset_: where the bump
+# pointer stands and whether a freed block's bytes, still inside the backing buffer, were wiped
+# are the allocator's whole contract, and nothing on its public surface reports either.
+set_source_files_properties(test_json_arena.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
+
 # test_inbound_ring.cpp sets InboundGate's private CONSUMED bit directly to stage a consume bit
 # that lands after the transport has published its next message, an interleaving of two threads
 # no public call can produce on demand.
@@ -207,6 +213,10 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     liveness_timeout_us_: a stand-in connection handed to the nursery is promoted by one
 #     protocol tick, which decides when the first client/state leaves relative to admission and
 #     whether the liveness scan drops the connection.
+#   - SendspinClient::json_arena_ and SendspinArenaAllocator::offset_ and high_water_: whether a
+#     reply a handler builds shares the arena with the parse that triggered it shows only in where
+#     the parse leaves the bump pointer and in the arena's peak, which is rewound so it measures
+#     one delivery; nothing a peer receives depends on either.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

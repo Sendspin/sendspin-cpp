@@ -340,14 +340,23 @@ public:
         return this->ring_.is_created();
     }
 
-    /// @brief The longest message an acquire() can succeed for: what an item of the ring's
-    /// largest size (SharedRingLayout::max_item_size(), half its storage) holds after its header,
-    /// capped at INBOUND_MAX_MESSAGE_BYTES. The derivation sizes the ring for the largest message
-    /// the enabled roles need (InboundRingBudget::largest_message_bytes), so a transport routes a
-    /// longer one through the connection's fallback buffer instead. Written by create(); read by
-    /// any thread after it.
+    /// @brief The longest received message a transport writes into a ring item:
+    /// max_item_message_bytes() capped at INBOUND_MAX_MESSAGE_BYTES, since a conforming peer's
+    /// WebSocket message is at most one Noise frame. The derivation sizes the ring for the
+    /// largest message the enabled roles need (InboundRingBudget::largest_message_bytes), so a
+    /// transport routes a longer one through the connection's fallback buffer instead. Written
+    /// by create(); read by any thread after it.
     size_t max_message_bytes() const {
         return this->max_message_bytes_;
+    }
+
+    /// @brief The longest message any acquire() can succeed for, received or local: what an item
+    /// of the ring's largest size (SharedRingLayout::max_item_size(), half its storage) holds
+    /// after its header. A message the protocol task copies into a LOCAL item (a chunk
+    /// reassembled from several Noise frames) is bounded by this alone, not by
+    /// max_message_bytes(). Written by create(); read by any thread after it.
+    size_t max_item_message_bytes() const {
+        return this->max_item_message_bytes_;
     }
 
     /// @brief The longest message the derivation sized the ring for, at most
@@ -471,9 +480,10 @@ private:
 
     // size_t fields
     size_t pending_len_{0};
-    /// See max_message_bytes() and largest_message_bytes(). Written by create() before any
-    /// producer runs.
+    /// See max_message_bytes(), max_item_message_bytes() and largest_message_bytes(). Written by
+    /// create() before any producer runs.
     size_t max_message_bytes_{0};
+    size_t max_item_message_bytes_{0};
     size_t largest_message_bytes_{0};
 
     // 32-bit fields
@@ -1153,9 +1163,10 @@ static constexpr size_t inbound_hold_seconds(size_t held_bytes, size_t stored_by
  * frame with the artwork role or a player advertising a buffer of a frame or more, which floors
  * the ring at 131,152 bytes; a 16 KiB JSON message with neither, which floors it at 32,880 bytes;
  * and the player's longest chunk in between. A longer message goes through the connection's
- * fallback buffer (InboundGate), and a frame a consumer would hold that arrives that way (a
- * visualizer frame past every requested size) finds no room for its copy and is dropped with a
- * warning; the audio and visualizer frames the roles budget for always fit.
+ * fallback buffer (InboundGate). A chunk or frame not in a ring item is copied into one bounded
+ * by the ring's largest item alone (InboundRing::max_item_message_bytes(), half the storage):
+ * audio and visualizer messages up to one Noise frame always fit, and one reassembled from
+ * several frames that is longer than half the ring is dropped with a warning naming that.
  *
  * Traffic beyond this budget (a burst of large JSON, a lower audio rate or a sparser visualizer
  * stream than budgeted, faster track changes) waits in the transport's acquire and is dropped

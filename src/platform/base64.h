@@ -199,13 +199,16 @@ inline std::string b64url_encode(const uint8_t* data, size_t len) {
 
     // Standard base64 (`+`/`/`, `=`-padded) output length, including room for the trailing NUL
     // both platform_base64_encode implementations write per the mbedtls_base64_encode contract.
+    // Encoded straight into the returned string, which only ever shrinks from here, so no
+    // intermediate heap block holds the encoding: callers encoding secrets (the pairing PSK)
+    // wipe the one string they get back and leave no other copy.
     const size_t padded_len = (len / 3 + (len % 3 != 0 ? 1 : 0)) * 4;
-    std::vector<uint8_t> buf(padded_len + 1);
+    std::string out(padded_len + 1, '\0');
     size_t olen = 0;
-    // buf is sized exactly per platform_base64_encode's own contract, so this cannot fail.
-    platform_base64_encode(buf.data(), buf.size(), &olen, data, len);
+    // out is sized exactly per platform_base64_encode's own contract, so this cannot fail.
+    platform_base64_encode(reinterpret_cast<uint8_t*>(out.data()), out.size(), &olen, data, len);
+    out.resize(olen);
 
-    std::string out(reinterpret_cast<char*>(buf.data()), olen);
     for (char& c : out) {
         if (c == '+') {
             c = '-';

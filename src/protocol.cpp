@@ -13,8 +13,8 @@
 // limitations under the License.
 
 #include "platform/base64.h"
+#include "platform/json_arena.h"
 #include "platform/logging.h"
-#include "platform/memory.h"
 #include "platform/secure_zero.h"
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
@@ -513,13 +513,12 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
     return true;
 }
 
-// server/state is parsed one section at a time rather than into a single aggregate struct. The
-// caller runs on the protocol task (its stack is bounded on ESP-IDF; see
-// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE), and an aggregate would
-// keep every section's fields alive in the caller's frame for the whole parse while the section
-// parser built a second copy of the same fields in its own. Each section here is an out-of-line
-// function that fills a caller-owned struct directly, so only one section's storage is live at a
-// time and nothing is materialized twice.
+// server/state is parsed per section rather than into a single aggregate struct. Each section
+// here is an out-of-line function that fills a caller-owned struct directly, so no section's
+// fields are materialized twice (once in a parser frame, once in the caller's). The caller keeps
+// every section a role takes live together in its own frame for one parse of the document; that
+// combined frame is on the protocol task, whose stack is bounded on ESP-IDF and covers it (see
+// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
 
 bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* metadata) {
     if (metadata == nullptr || !root["payload"]["metadata"].is<JsonObject>()) {
@@ -805,8 +804,9 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
 
 // Message formatting
 
-std::string format_client_hello_message(const ClientHelloMessage* msg) {
-    JsonDocument doc = make_json_document();
+std::string format_client_hello_message(const ClientHelloMessage* msg,
+                                        SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/hello";
@@ -891,8 +891,9 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
     return output;
 }
 
-std::string format_client_state_message(const ClientStateMessage* msg) {
-    JsonDocument doc = make_json_document();
+std::string format_client_state_message(const ClientStateMessage* msg,
+                                        SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/state";
@@ -953,8 +954,8 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
     return output;
 }
 
-std::string format_client_leave_message() {
-    JsonDocument doc = make_json_document();
+std::string format_client_leave_message(SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/leave";
@@ -967,8 +968,9 @@ std::string format_client_leave_message() {
     return output;
 }
 
-std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
-    JsonDocument doc = make_json_document();
+std::string format_client_goodbye_message(SendspinGoodbyeReason reason,
+                                          SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/goodbye";
@@ -1095,8 +1097,9 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
     return static_cast<size_t>(p - buf);
 }
 
-std::string format_client_command_message(const ClientCommandControllerObject& cmd) {
-    JsonDocument doc = make_json_document();
+std::string format_client_command_message(const ClientCommandControllerObject& cmd,
+                                          SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/command";
@@ -1124,11 +1127,12 @@ std::string format_client_command_message(const ClientCommandControllerObject& c
 // Pairing-PSK protocol messages
 // ============================================================================
 
-std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk) {
-    // Zeroizing document: the JSON pool holds the base64 long-term PSK, which admits a server
-    // permanently. The caller wipes the returned string once it has been sent (see
-    // handle_enter_pairing_psk()); everything staged on the way there is wiped here.
-    JsonDocument doc = make_zeroizing_json_document();
+std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk,
+                                                SendspinArenaAllocator& arena) {
+    // The document holds the base64 long-term PSK, which admits a server permanently; the arena
+    // wipes every block it frees, and the caller wipes the returned string once it has been sent
+    // (see handle_enter_pairing_psk()). The encoded copy staged on the way is wiped here.
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
@@ -1137,15 +1141,18 @@ std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& p
     root["payload"]["long_term_psk"] = psk_b64;
     secure_zero(psk_b64.data(), psk_b64.size());
 
+    // Reserved to the exact length so serializeJson() writes in place: a growing string would
+    // leave PSK-bearing copies behind in the heap blocks it outgrew, which nothing wipes.
     std::string output;
+    output.reserve(measureJson(doc));
     serializeJson(doc, output);
     return output;
 }
 
-std::string format_client_pair_finalize_wrapped_message(
-    const std::array<uint8_t, 48>& wrapped_psk) {
-    // Zeroizing document to match format_client_pair_finalize_message(); see the note there.
-    JsonDocument doc = make_zeroizing_json_document();
+std::string format_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
+                                                        SendspinArenaAllocator& arena) {
+    // Wiped like format_client_pair_finalize_message(); see the note there.
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
@@ -1155,13 +1162,15 @@ std::string format_client_pair_finalize_wrapped_message(
     root["payload"]["wrapped_psk"] = wrapped_b64;
     secure_zero(wrapped_b64.data(), wrapped_b64.size());
 
+    // Reserved to the exact length, as in format_client_pair_finalize_message().
     std::string output;
+    output.reserve(measureJson(doc));
     serializeJson(doc, output);
     return output;
 }
 
-std::string format_pair_abort_message(PairAbortReason reason) {
-    JsonDocument doc = make_json_document();
+std::string format_pair_abort_message(PairAbortReason reason, SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "pair/abort";
@@ -1266,8 +1275,9 @@ bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPaylo
     return true;
 }
 
-std::string format_client_pair_pending_message(uint32_t pairing_index) {
-    JsonDocument doc = make_json_document();
+std::string format_client_pair_pending_message(uint32_t pairing_index,
+                                               SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-pending";
@@ -1279,8 +1289,8 @@ std::string format_client_pair_pending_message(uint32_t pairing_index) {
 }
 
 std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
-                                            uint32_t pairing_index) {
-    JsonDocument doc = make_json_document();
+                                            uint32_t pairing_index, SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
@@ -1292,8 +1302,8 @@ std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commi
     return output;
 }
 
-std::string format_client_pair_init_message(uint32_t pairing_index) {
-    JsonDocument doc = make_json_document();
+std::string format_client_pair_init_message(uint32_t pairing_index, SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
@@ -1306,8 +1316,8 @@ std::string format_client_pair_init_message(uint32_t pairing_index) {
     return output;
 }
 
-std::string format_client_pair_retry_message() {
-    JsonDocument doc = make_json_document();
+std::string format_client_pair_retry_message(SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-retry";
@@ -1320,8 +1330,9 @@ std::string format_client_pair_retry_message() {
     return output;
 }
 
-std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2) {
-    JsonDocument doc = make_json_document();
+std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2,
+                                            SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-auth";
@@ -1334,8 +1345,8 @@ std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_
 
 std::string format_client_pair_confirm_message(
     const std::array<uint8_t, 64>& client_kc,
-    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b) {
-    JsonDocument doc = make_json_document();
+    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b, SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";
@@ -1351,8 +1362,9 @@ std::string format_client_pair_confirm_message(
     return output;
 }
 
-std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc) {
-    JsonDocument doc = make_json_document();
+std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
+                                               SendspinArenaAllocator& arena) {
+    JsonDocument doc = make_json_document(arena);
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";

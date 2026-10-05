@@ -93,8 +93,8 @@ SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
     // Goodbye must be sent even when Noise transport is active; route through send_app_json
     // so it is encrypted. allow_before_hello=true because goodbye can precede the hello (e.g.,
     // when rejecting an excess connection before the handshake finishes).
-    return this->send_app_json(format_client_goodbye_message(reason), std::move(on_complete),
-                               /*allow_before_hello=*/true);
+    return this->send_app_json(format_client_goodbye_message(reason, *this->json_arena_),
+                               std::move(on_complete), /*allow_before_hello=*/true);
 }
 
 SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCallback cb,
@@ -187,7 +187,8 @@ std::optional<int64_t> SendspinConnection::claim_time_frame(int64_t client_trans
 void SendspinConnection::init_noise_handshake(const Identity& identity,
                                               const RecordStore& record_store,
                                               const std::string& suite_name) {
-    this->noise_handshake_ = std::make_unique<NoiseHandshake>(identity, record_store, suite_name);
+    this->noise_handshake_ =
+        std::make_unique<NoiseHandshake>(identity, record_store, suite_name, *this->json_arena_);
     // Retain for re-handshake: these pointers outlive connections (owned by the
     // SendspinClient that constructed the manager which called this).
     this->noise_identity_ = &identity;
@@ -259,7 +260,7 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
     // NEED_MORE, or COMPLETE handled above: nothing else to do until the next frame.
 }
 
-bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
+bool SendspinConnection::handle_noise_rehandshake(const std::vector<uint8_t>& msg1_bytes) {
     // Runs on the protocol task (dispatched from the JSON callback for a decrypted
     // "noise/handshake" message, itself only reachable post-COMPLETE, so this always runs on
     // the same thread as the decrypt path, sequential with it and never concurrent).
@@ -299,9 +300,9 @@ bool SendspinConnection::handle_noise_rehandshake(std::string_view msg1_json) {
     }
     const std::string current_server_id = this->server_information_.server_id;
 
-    auto result =
-        run_rehandshake_msg1(msg1_json, current_server_id, *this->noise_identity_,
-                             *this->noise_record_store_, this->noise_suite_name_, prior_h.value());
+    auto result = run_rehandshake_msg1(msg1_bytes, current_server_id, *this->noise_identity_,
+                                       *this->noise_record_store_, this->noise_suite_name_,
+                                       prior_h.value(), *this->json_arena_);
     if (!result.has_value()) {
         SS_LOGW(TAG, "handle_noise_rehandshake: re-handshake failed; closing connection");
         return false;

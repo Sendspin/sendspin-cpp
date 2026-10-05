@@ -41,13 +41,13 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace sendspin {
 
 class ProtocolTask;
+class SendspinArenaAllocator;
 
 /// @brief Callback type for message send completion
 /// @param success True if the message was sent successfully, false otherwise.
@@ -208,20 +208,21 @@ public:
     ///
     /// Called on the protocol task when a decrypted noise/handshake JSON message arrives after
     /// transport is already active (routed here from the dispatch for the "noise/handshake"
-    /// message type). Runs the deferred-PSK-binding msg1 read with prologue = the current
-    /// NoiseTransport's handshake_hash(), then commits the new session via
-    /// NoiseTransport::send_msg2_and_swap() (msg2 sent under the OLD session, then the swap; every
-    /// send runs on this task, so no encrypt falls between the two).
+    /// message type, which reads msg1 out of the envelope and releases it first). Runs the
+    /// deferred-PSK-binding msg1 read with prologue = the current NoiseTransport's
+    /// handshake_hash(), then commits the new session via NoiseTransport::send_msg2_and_swap()
+    /// (msg2 sent under the OLD session, then the swap; every send runs on this task, so no
+    /// encrypt falls between the two).
     ///
     /// Resets first_activate_received_ so the connection waits for the post-swap
     /// server/activate that connection.md "Re-handshake" makes the server's first message under
     /// the new keys; neither hello is re-sent, and the manager's nursery is not involved (the
     /// connection stays current/established throughout, with no drop/reconnect).
     ///
-    /// @param msg1_json  The decrypted noise/handshake JSON string (msg1 envelope).
+    /// @param msg1_bytes  The re-handshake msg1 Noise bytes (read_noise_handshake_data()).
     /// @return true on success (session swapped; a post-swap server/activate is expected next).
     ///         false on any failure (caller should close the WebSocket).
-    bool handle_noise_rehandshake(std::string_view msg1_json);
+    bool handle_noise_rehandshake(const std::vector<uint8_t>& msg1_bytes);
 
     /// @brief Encrypt and send a JSON string as a Noise transport binary frame.
     /// Thin delegate to NoiseTransport::send_json().
@@ -832,6 +833,15 @@ public:
         this->noise_transport_.set_buffer_location(location);
     }
 
+    /// @brief Sets the client's JSON arena, which every JSON document this connection parses or
+    /// builds is allocated from: the Noise handshake and re-handshake frames and the goodbye.
+    /// @param arena The client's arena; outlives the connection.
+    /// @note Must be called before the connection reaches the protocol task, as the manager does
+    /// alongside the buffer locations.
+    void set_json_arena(SendspinArenaAllocator& arena) {
+        this->json_arena_ = &arena;
+    }
+
 protected:
     // ========================================
     // Transport frames
@@ -1022,6 +1032,11 @@ protected:
     /// Retained for re-handshake: pointer to the RecordStore supplied at
     /// init_noise_handshake(). Lifetime is owned by SendspinClient (outlives connections).
     const RecordStore* noise_record_store_{nullptr};
+
+    /// The client's JSON arena, from set_json_arena(). Written once before the connection reaches
+    /// the protocol task (on the transport's delivery thread for an inbound one, published to the
+    /// task by the accept command); read on the protocol task only, which the arena belongs to.
+    SendspinArenaAllocator* json_arena_{nullptr};
 
     /// The shared inbound ring and the protocol task, from attach_inbound(). Written once before
     /// the transport can deliver; read by the transport thread. Owned by SendspinClient: the

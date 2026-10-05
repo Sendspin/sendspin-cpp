@@ -21,6 +21,7 @@
 #include "protocol_messages.h"
 #include "record_store.h"
 #include "sendspin/persistence_codec.h"
+#include "test_util.h"
 
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
@@ -260,7 +261,7 @@ TEST(DynamicPairingCode, FormatClientPairInitWireShape) {
     std::array<uint8_t, 32> commit_b{};
     for (int i = 0; i < 32; ++i) commit_b[i] = static_cast<uint8_t>(i);
 
-    const std::string out = format_client_pair_init_message(commit_b, /*pairing_index=*/3);
+    const std::string out = format_client_pair_init_message(commit_b, /*pairing_index=*/3, TestArena());
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_init produced invalid JSON";
@@ -292,7 +293,7 @@ TEST(DynamicPairingCode, FormatClientPairAuthWireShape) {
     std::array<uint8_t, 32> pake_msg_2{};
     for (int i = 0; i < 32; ++i) pake_msg_2[i] = static_cast<uint8_t>(i + 64);
 
-    const std::string out = format_client_pair_auth_message(pake_msg_2);
+    const std::string out = format_client_pair_auth_message(pake_msg_2, TestArena());
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_auth produced invalid JSON";
@@ -323,7 +324,7 @@ TEST(DynamicPairingCode, FormatClientPairConfirmWireShape) {
         wrapped_nonce[i] = static_cast<uint8_t>(i + 100);
     }
 
-    const std::string out = format_client_pair_confirm_message(client_kc, wrapped_nonce);
+    const std::string out = format_client_pair_confirm_message(client_kc, wrapped_nonce, TestArena());
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_confirm produced invalid JSON";
@@ -439,7 +440,7 @@ TEST(DynamicPairingCode, ClientHelloDescriptorCarriesChannelsAndFormats) {
         SendspinPairingCodeFormat::DIGITS, SendspinPairingCodeFormat::QR_CODE};
     msg.supported_pair_methods.push_back(std::move(dynamic_desc));
 
-    const std::string out = format_client_hello_message(&msg);
+    const std::string out = format_client_hello_message(&msg, TestArena());
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
 
@@ -476,7 +477,7 @@ TEST(StaticPairingCode, ClientHelloDescriptorShape) {
     static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
     msg.supported_pair_methods.push_back(std::move(static_desc));
 
-    const std::string out = format_client_hello_message(&msg);
+    const std::string out = format_client_hello_message(&msg, TestArena());
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
 
@@ -500,7 +501,7 @@ TEST(StaticPairingCode, ClientHelloLocationsHint) {
     static_desc.locations = std::vector<std::string>{"device", "leaflet"};
     msg.supported_pair_methods.push_back(std::move(static_desc));
 
-    const std::string out = format_client_hello_message(&msg);
+    const std::string out = format_client_hello_message(&msg, TestArena());
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
 

@@ -3035,6 +3035,10 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         ASSERT_TRUE(client.start());
         EXPECT_EQ(client.inbound_ring_->storage_.size(), row.expected_bytes);
         EXPECT_EQ(client.inbound_ring_->max_message_bytes(), row.expected_max_message_bytes);
+        // The local-copy bound is the physical one alone, the Noise-frame cap being a fact about
+        // received messages only.
+        EXPECT_EQ(client.inbound_ring_->max_item_message_bytes(),
+                  SharedRingLayout::max_item_size(row.expected_bytes) - sizeof(InboundItemHeader));
         client.stop();
     }
 }

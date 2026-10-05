@@ -361,7 +361,14 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t ge
         // A chunk reassembled from Noise fragments (one larger than a Noise frame) or routed
         // through the fallback buffer (longer than the ring takes) is not in a ring item: copied
         // into one, whole, so its timestamp stays at plaintext bytes 1-8. No wait: audio over a
-        // full ring is dropped, like audio over the quota.
+        // full ring is dropped, like audio over the quota. A chunk longer than the ring's largest
+        // item (half the storage) can never be copied in, which is a sizing fact, not a full
+        // ring, and is logged apart so a device log tells the two apart.
+        if (message.len > inbound.ring()->max_item_message_bytes()) {
+            inbound.note_drop("received an audio chunk longer than the ring's largest item; "
+                              "dropping");
+            return;
+        }
         item = inbound.copy_local(message.data, message.len, message.receive_time_us, 0);
         if (item == nullptr) {
             inbound.note_drop("has no ring space to copy an audio chunk into; dropping");

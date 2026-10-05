@@ -55,10 +55,9 @@ bool InboundRing::create(size_t storage_bytes, MemoryLocation location,
         return false;
     }
     const size_t max_item = SharedRingLayout::max_item_size(storage_bytes);
-    this->max_message_bytes_ =
-        max_item > sizeof(InboundItemHeader)
-            ? std::min(max_item - sizeof(InboundItemHeader), INBOUND_MAX_MESSAGE_BYTES)
-            : 0;
+    this->max_item_message_bytes_ =
+        max_item > sizeof(InboundItemHeader) ? max_item - sizeof(InboundItemHeader) : 0;
+    this->max_message_bytes_ = std::min(this->max_item_message_bytes_, INBOUND_MAX_MESSAGE_BYTES);
     this->largest_message_bytes_ = std::min(largest_message_bytes, this->max_message_bytes_);
     return true;
 }

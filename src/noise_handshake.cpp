@@ -18,8 +18,8 @@
 #include "crypto/keys.h"
 #include "noise_session.h"
 #include "platform/base64.h"
+#include "platform/json_arena.h"
 #include "platform/logging.h"
-#include "platform/memory.h"
 #include <ArduinoJson.h>
 
 #include <cstring>
@@ -37,7 +37,8 @@ namespace sendspin {
 /// @brief Serialize client/init to JSON.
 /// Format: {"type":"client/init","payload":{"client_id":"...","version":1,"suite":"..."}}
 static std::string serialize_client_init(const std::string& client_id,
-                                         const std::string& suite_name) {
+                                         const std::string& suite_name,
+                                         SendspinArenaAllocator& arena) {
     // suite_name is the full name (e.g. NOISE_SUITE_CHACHAPOLY = "Noise_KKpsk2_25519_..."); the
     // wire value is the suffix after "Noise_KKpsk2_" (connection.md "Cipher Suites"). Strip
     // that prefix to produce the wire suite string.
@@ -48,7 +49,7 @@ static std::string serialize_client_init(const std::string& client_id,
         wire_suite = wire_suite.substr(PREFIX_LEN);
     }
 
-    JsonDocument doc = make_json_document();
+    JsonDocument doc = make_json_document(arena);
     doc["type"] = "client/init";
     doc["payload"]["client_id"] = client_id;
     doc["payload"]["version"] = PROTOCOL_VERSION;
@@ -61,10 +62,11 @@ static std::string serialize_client_init(const std::string& client_id,
 
 /// @brief Serialize a noise/handshake frame containing base64url-encoded noise bytes.
 /// Format: {"type":"noise/handshake","payload":{"data":"..."}}
-static std::string serialize_noise_handshake(const std::vector<uint8_t>& noise_bytes) {
+static std::string serialize_noise_handshake(const std::vector<uint8_t>& noise_bytes,
+                                             SendspinArenaAllocator& arena) {
     std::string encoded = b64url_encode(noise_bytes.data(), noise_bytes.size());
 
-    JsonDocument doc = make_json_document();
+    JsonDocument doc = make_json_document(arena);
     doc["type"] = "noise/handshake";
     doc["payload"]["data"] = encoded;
 
@@ -78,31 +80,6 @@ static std::string serialize_noise_handshake(const std::vector<uint8_t>& noise_b
 // ============================================================================
 
 namespace {
-
-/// @brief Parse a JSON envelope and verify its "type" field, logging and returning false on
-/// any failure (parse error or type mismatch). Used by run_rehandshake_msg1, which receives the
-/// raw envelope text rather than a parsed document.
-/// @param text           Raw JSON envelope text.
-/// @param expected_type  Required value of the envelope's "type" field.
-/// @param log_context    Prefix used for the failure log line (caller's function name).
-/// @param[out] doc       Receives the parsed envelope.
-/// @return true on success.
-bool parse_json_envelope(std::string_view text, const char* expected_type, const char* log_context,
-                         JsonDocument* doc) {
-    DeserializationError err = deserializeJson(*doc, text.data(), text.size());
-    if (err || doc->isNull()) {
-        SS_LOGE(TAG, "%s: JSON parse failed", log_context);
-        return false;
-    }
-
-    const char* type = (*doc)["type"] | "";
-    if (std::strcmp(type, expected_type) != 0) {
-        SS_LOGE(TAG, "%s: unexpected type '%s'", log_context, type);
-        return false;
-    }
-
-    return true;
-}
 
 /// @brief Outcome of the shared read-msg1/resolve-psk/set-psk/write-msg2 core.
 /// Carries everything both `NoiseHandshake::handle_msg1` and `run_rehandshake_msg1`
@@ -131,7 +108,7 @@ const char* to_cstr(HandshakeKind kind) {
     return kind == HandshakeKind::INITIAL ? "handshake" : "re-handshake";
 }
 
-/// @brief Run the shared core of Noise msg1 processing: decode msg1 + server_id, read msg1
+/// @brief Run the shared core of Noise msg1 processing: decode server_id, read msg1
 /// to expose psk_id, resolve the PSK via the record store, verify any stored-pubkey
 /// binding, bind the resolved PSK onto the same session, and write msg2.
 ///
@@ -145,26 +122,14 @@ const char* to_cstr(HandshakeKind kind) {
 /// @param server_id     Known/claimed server peer_id (43-char base64url).
 /// @param prologue      Exact prologue bytes for this handshake (caller-specific).
 /// @param prologue_len  Length of `prologue`.
-/// @param msg1_root     Parsed noise/handshake envelope containing msg1.
+/// @param msg1_bytes    The msg1 Noise bytes (read_noise_handshake_data()).
+/// @param arena         The client's JSON arena, to parse msg1's payload in.
 /// @return Populated Msg1CoreResult on success, or nullopt on any failure (caller aborts).
-std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& identity,
-                                            const RecordStore& record_store,
-                                            const std::string& suite_name,
-                                            const std::string& server_id, const uint8_t* prologue,
-                                            size_t prologue_len, JsonObjectConst msg1_root) {
+std::optional<Msg1CoreResult> run_msg1_core(
+    HandshakeKind kind, const Identity& identity, const RecordStore& record_store,
+    const std::string& suite_name, const std::string& server_id, const uint8_t* prologue,
+    size_t prologue_len, const std::vector<uint8_t>& msg1_bytes, SendspinArenaAllocator& arena) {
     const char* log_prefix = to_cstr(kind);
-    const char* data_b64 = msg1_root["payload"]["data"] | "";
-    if (data_b64[0] == '\0') {
-        SS_LOGE(TAG, "%s: missing data field", log_prefix);
-        return std::nullopt;
-    }
-
-    auto msg1_bytes = b64url_decode(data_b64);
-    if (!msg1_bytes.has_value() || msg1_bytes->empty()) {
-        SS_LOGE(TAG, "%s: failed to base64url-decode noise msg1", log_prefix);
-        return std::nullopt;
-    }
-
     auto server_pub = public_key_from_peer_id(server_id);
     if (!server_pub.has_value()) {
         SS_LOGE(TAG, "%s: invalid server_id (cannot decode public key)", log_prefix);
@@ -182,23 +147,28 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
         return std::nullopt;
     }
 
-    auto msg1_payload = session->read_msg1(msg1_bytes->data(), msg1_bytes->size());
+    auto msg1_payload = session->read_msg1(msg1_bytes.data(), msg1_bytes.size());
     if (msg1_payload.empty()) {
         SS_LOGE(TAG, "%s: read_msg1 failed (auth error in msg1 static DH)", log_prefix);
         return std::nullopt;
     }
 
-    // Parse psk_id from the decrypted msg1 payload: {"psk_id":"..."}
-    JsonDocument payload_doc = make_json_document();
-    DeserializationError perr =
-        deserializeJson(payload_doc, msg1_payload.data(), msg1_payload.size());
-    if (perr || payload_doc.isNull()) {
+    // Parse psk_id from the decrypted msg1 payload: {"psk_id":"...","psk_category":"..."}. The
+    // payload is released as soon as its two fields are copied out, so the msg2 envelope the
+    // caller builds has the arena to itself.
+    ParsedJsonMessage payload(arena);
+    if (!payload.parse(reinterpret_cast<const char*>(msg1_payload.data()), msg1_payload.size())) {
         SS_LOGE(TAG, "%s: failed to parse msg1 payload JSON", log_prefix);
         return std::nullopt;
     }
+    std::string psk_id;
+    std::string psk_category_code;
+    payload.extract([&psk_id, &psk_category_code](JsonObjectConst root) {
+        psk_id = root["psk_id"] | "";
+        psk_category_code = root["psk_category"] | "";
+    });
 
-    const char* psk_id = payload_doc["psk_id"] | "";
-    if (psk_id[0] == '\0') {
+    if (psk_id.empty()) {
         SS_LOGE(TAG, "%s: psk_id missing from msg1 payload", log_prefix);
         return std::nullopt;
     }
@@ -206,17 +176,17 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     // messaging.md "noise/handshake": the payload declares which category the server is using the
     // referenced PSK as. A missing or unknown code is a malformed payload, which connection.md
     // "Failure Handling" makes a silent failure.
-    const char* psk_category_code = payload_doc["psk_category"] | "";
-    auto psk_category = psk_category_from_string(std::string(psk_category_code));
+    auto psk_category = psk_category_from_string(psk_category_code);
     if (!psk_category.has_value()) {
         SS_LOGE(TAG, "%s: msg1 payload psk_category missing or unknown ('%s')", log_prefix,
-                psk_category_code);
+                psk_category_code.c_str());
         return std::nullopt;
     }
 
-    SS_LOGD(TAG, "%s: psk_id='%s' psk_category='%s'", log_prefix, psk_id, psk_category_code);
+    SS_LOGD(TAG, "%s: psk_id='%s' psk_category='%s'", log_prefix, psk_id.c_str(),
+            psk_category_code.c_str());
 
-    auto resolved = record_store.resolve_by_psk_id(std::string(psk_id), psk_category.value());
+    auto resolved = record_store.resolve_by_psk_id(psk_id, psk_category.value());
     if (resolved.has_value()) {
         // Post-match check (connection.md "Pre-Shared Key"): every long-term PSK is persisted
         // with the server_id it was minted for. The Pairing and Sentinel PSKs are bound to no
@@ -236,7 +206,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
         // "Pairing Records": an evicted record needs no wire signal of its own). Failing here
         // instead would leave a client that lost its record reconnect-looping with no way back.
         SS_LOGW(TAG, "%s: no '%s' PSK for psk_id='%s'; answering with the Sentinel PSK", log_prefix,
-                psk_category_code, psk_id);
+                psk_category_code.c_str(), psk_id.c_str());
         resolved = record_store.resolve_by_psk_id(SENTINEL_PSK_ID, PskCategory::SENTINEL);
         if (!resolved.has_value()) {
             SS_LOGE(TAG, "%s: the Sentinel PSK did not resolve", log_prefix);
@@ -244,8 +214,8 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
         }
     } else {
         // connection.md "Sentinel Fallback" applies to the initial handshake alone.
-        SS_LOGW(TAG, "%s: no '%s' PSK for psk_id='%s', aborting", log_prefix, psk_category_code,
-                psk_id);
+        SS_LOGW(TAG, "%s: no '%s' PSK for psk_id='%s', aborting", log_prefix,
+                psk_category_code.c_str(), psk_id.c_str());
         return std::nullopt;
     }
 
@@ -284,12 +254,32 @@ NoiseHandshakeResult make_handshake_result(Msg1CoreResult&& core, std::string se
 }  // namespace
 
 // ============================================================================
+// noise/handshake envelope
+// ============================================================================
+
+std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst envelope,
+                                                              const char* log_context) {
+    const char* data_b64 = envelope["payload"]["data"] | "";
+    if (data_b64[0] == '\0') {
+        SS_LOGE(TAG, "%s: missing data field", log_context);
+        return std::nullopt;
+    }
+
+    auto bytes = b64url_decode(data_b64);
+    if (!bytes.has_value() || bytes->empty()) {
+        SS_LOGE(TAG, "%s: failed to base64url-decode noise msg1", log_context);
+        return std::nullopt;
+    }
+    return bytes;
+}
+
+// ============================================================================
 // Constructor
 // ============================================================================
 
 NoiseHandshake::NoiseHandshake(const Identity& identity, const RecordStore& record_store,
-                               const std::string& suite_name)
-    : suite_name_(suite_name), identity_(identity), record_store_(record_store) {}
+                               const std::string& suite_name, SendspinArenaAllocator& arena)
+    : suite_name_(suite_name), arena_(arena), identity_(identity), record_store_(record_store) {}
 
 // ============================================================================
 // Public API
@@ -301,7 +291,8 @@ std::string NoiseHandshake::build_client_init() {
         return {};
     }
 
-    std::string text = serialize_client_init(this->identity_.peer_id(), this->suite_name_);
+    std::string text =
+        serialize_client_init(this->identity_.peer_id(), this->suite_name_, this->arena_);
     this->client_init_text_ = text;
     this->state_ = State::WAIT_SERVER_INIT;
     return text;
@@ -323,38 +314,51 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
         return HandshakeFrameResult::ABORT;
     }
 
-    // One parse per frame: the handlers work from the parsed envelope instead of deserializing
-    // the same bytes again.
-    JsonDocument doc = make_json_document();
-    if (deserializeJson(doc, text) || doc.isNull()) {
+    // One parse per frame. The fields the step needs are copied out and the frame released
+    // before the step runs, so the msg2 envelope it builds has the arena to itself.
+    ParsedJsonMessage frame(this->arena_);
+    if (!frame.parse(text.data(), text.size())) {
         SS_LOGE(TAG, "on_text_frame: JSON parse failed");
         this->state_ = State::ABORTED;
         return HandshakeFrameResult::ABORT;
     }
-    JsonObjectConst root = doc.as<JsonObjectConst>();
-    const char* type = root["type"] | "";
 
     const bool awaiting_server_init = this->state_ == State::WAIT_SERVER_INIT;
     const char* log_context =
         awaiting_server_init ? "awaiting server/init" : "awaiting noise/handshake msg1";
-
-    // messaging.md "server/error": sent in place of server/init when the server cannot accept our
-    // client/init. Recognized in either wait so an abort names the server's reason.
-    if (std::strcmp(type, "server/error") == 0) {
-        this->take_server_error(root, log_context);
-        this->state_ = State::ABORTED;
-        return HandshakeFrameResult::ABORT;
-    }
-
     const char* expected_type = awaiting_server_init ? "server/init" : "noise/handshake";
-    if (std::strcmp(type, expected_type) != 0) {
-        SS_LOGE(TAG, "%s: unexpected type '%s'", log_context, type);
+
+    int version = 0;
+    std::string server_id;
+    std::optional<std::vector<uint8_t>> msg1_bytes;
+    const bool expected = frame.extract([&](JsonObjectConst root) {
+        const char* type = root["type"] | "";
+        // messaging.md "server/error": sent in place of server/init when the server cannot
+        // accept our client/init. Recognized in either wait so an abort names the server's
+        // reason.
+        if (std::strcmp(type, "server/error") == 0) {
+            this->take_server_error(root, log_context);
+            return false;
+        }
+        if (std::strcmp(type, expected_type) != 0) {
+            SS_LOGE(TAG, "%s: unexpected type '%s'", log_context, type);
+            return false;
+        }
+        if (awaiting_server_init) {
+            version = root["payload"]["version"] | 0;
+            server_id = root["payload"]["server_id"] | "";
+        } else {
+            msg1_bytes = read_noise_handshake_data(root, to_cstr(HandshakeKind::INITIAL));
+        }
+        return true;
+    });
+    if (!expected) {
         this->state_ = State::ABORTED;
         return HandshakeFrameResult::ABORT;
     }
 
     if (awaiting_server_init) {
-        if (!this->handle_server_init(root, text)) {
+        if (!this->handle_server_init(version, std::move(server_id), text)) {
             this->state_ = State::ABORTED;
             return HandshakeFrameResult::ABORT;
         }
@@ -362,7 +366,7 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
         return HandshakeFrameResult::NEED_MORE;
     }
 
-    if (!this->handle_msg1(root, send_fn)) {
+    if (!msg1_bytes.has_value() || !this->handle_msg1(msg1_bytes.value(), send_fn)) {
         this->state_ = State::ABORTED;
         return HandshakeFrameResult::ABORT;
     }
@@ -374,15 +378,14 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
 // Private: handle server/init
 // ============================================================================
 
-bool NoiseHandshake::handle_server_init(JsonObjectConst root, const std::string& text) {
-    int version = root["payload"]["version"] | 0;
+bool NoiseHandshake::handle_server_init(int version, std::string server_id,
+                                        const std::string& text) {
     if (version != PROTOCOL_VERSION) {
         SS_LOGE(TAG, "handle_server_init: unsupported version %d (expected %d)", version,
                 PROTOCOL_VERSION);
         return false;
     }
 
-    const char* server_id = root["payload"]["server_id"] | "";
     // Checked here rather than left to the handshake: records and the last-playback server store
     // the key, not the text, so a non-canonical spelling would not match itself after a reboot.
     if (!public_key_from_peer_id(server_id).has_value()) {
@@ -390,10 +393,10 @@ bool NoiseHandshake::handle_server_init(JsonObjectConst root, const std::string&
         return false;
     }
 
-    this->server_id_ = server_id;
+    this->server_id_ = std::move(server_id);
     this->server_init_text_ = text;  // Retain exact bytes for prologue
 
-    SS_LOGD(TAG, "server/init received: server_id=%s", server_id);
+    SS_LOGD(TAG, "server/init received: server_id=%s", this->server_id_.c_str());
     return true;
 }
 
@@ -401,7 +404,7 @@ bool NoiseHandshake::handle_server_init(JsonObjectConst root, const std::string&
 // Private: handle noise/handshake msg1
 // ============================================================================
 
-bool NoiseHandshake::handle_msg1(JsonObjectConst root,
+bool NoiseHandshake::handle_msg1(const std::vector<uint8_t>& msg1_bytes,
                                  const std::function<bool(const std::string&)>& send_fn) {
     // Prologue = exact bytes of client/init || server/init
     std::string prologue_str = this->client_init_text_ + this->server_init_text_;
@@ -409,13 +412,14 @@ bool NoiseHandshake::handle_msg1(JsonObjectConst root,
     size_t prologue_len = prologue_str.size();
 
     auto core = run_msg1_core(HandshakeKind::INITIAL, this->identity_, this->record_store_,
-                              this->suite_name_, this->server_id_, prologue, prologue_len, root);
+                              this->suite_name_, this->server_id_, prologue, prologue_len,
+                              msg1_bytes, this->arena_);
     if (!core.has_value()) {
         return false;
     }
 
     // Send noise/handshake msg2 as a TEXT frame
-    std::string msg2_text = serialize_noise_handshake(core->msg2_bytes);
+    std::string msg2_text = serialize_noise_handshake(core->msg2_bytes, this->arena_);
     if (!send_fn(msg2_text)) {
         SS_LOGE(TAG, "handle_msg1: failed to send noise/handshake msg2");
         return false;
@@ -433,30 +437,22 @@ bool NoiseHandshake::handle_msg1(JsonObjectConst root,
 // Re-handshake helper
 // ============================================================================
 
-std::optional<NoiseHandshakeResult> run_rehandshake_msg1(std::string_view msg1_json,
-                                                         const std::string& server_id,
-                                                         const Identity& identity,
-                                                         const RecordStore& record_store,
-                                                         const std::string& suite_name,
-                                                         const std::array<uint8_t, 32>& prior_h) {
+std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
+    const std::vector<uint8_t>& msg1_bytes, const std::string& server_id, const Identity& identity,
+    const RecordStore& record_store, const std::string& suite_name,
+    const std::array<uint8_t, 32>& prior_h, SendspinArenaAllocator& arena) {
     // Prologue for re-handshake = prior handshake hash h (32 bytes)
     const uint8_t* prologue = prior_h.data();
     const size_t prologue_len = prior_h.size();
 
-    JsonDocument doc = make_json_document();
-    if (!parse_json_envelope(msg1_json, "noise/handshake", to_cstr(HandshakeKind::REHANDSHAKE),
-                             &doc)) {
-        return std::nullopt;
-    }
-
     auto core = run_msg1_core(HandshakeKind::REHANDSHAKE, identity, record_store, suite_name,
-                              server_id, prologue, prologue_len, doc.as<JsonObjectConst>());
+                              server_id, prologue, prologue_len, msg1_bytes, arena);
     if (!core.has_value()) {
         return std::nullopt;
     }
 
     // Serialize the msg2 noise/handshake envelope (caller sends it encrypted)
-    std::string msg2_text = serialize_noise_handshake(core->msg2_bytes);
+    std::string msg2_text = serialize_noise_handshake(core->msg2_bytes, arena);
 
     SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%d", server_id.c_str(),
             static_cast<int>(core->resolved_psk.category));

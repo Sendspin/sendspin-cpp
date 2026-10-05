@@ -14,7 +14,7 @@
 
 /// @file secure_zero.h
 /// @brief Secret erasure that survives dead-store elimination. Its own header so callers that
-/// only need to wipe a buffer (platform/memory.h) do not pull in the crypto primitives.
+/// only need to wipe a buffer (platform/json_arena.h) do not pull in the crypto primitives.
 
 #pragma once
 
