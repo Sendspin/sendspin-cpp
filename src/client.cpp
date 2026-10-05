@@ -919,7 +919,7 @@ void SendspinClient::drain_inbox() {
     // flush (which polls for itself) runs after the notes are taken and before they are
     // dispatched, and every note taken finds its write performed.
     std::vector<PairingNote> notes;
-    const bool notes_taken = (slot_bits & INBOX_TOPIC_PAIRING) &&
+    const bool notes_taken = (slot_bits & INBOX_TOPIC_PAIRING) != 0 &&
                              es.drain_generation == drain_generation && es.pairing_slot.take(notes);
     this->flush_pending_persistence();
     if (notes_taken && es.drain_generation == drain_generation) {
