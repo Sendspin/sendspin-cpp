@@ -99,18 +99,6 @@ static constexpr uint32_t COMMAND_CLEAR = (1 << 2);  // Discard up to the clear 
 // normal flow.
 static constexpr uint8_t ENTRY_TYPE_CLEAR_MARKER = 0xFF;
 
-/// @brief Timeout for acquiring ring space for the clear marker (see
-/// sendspin::INBOUND_ACQUIRE_TIMEOUT_MS). The drain thread is concurrently discarding, so space
-/// frees quickly; if this still times out the boundary is lost and the drain falls back to
-/// discarding everything it finds (matching the player's marker semantics).
-static constexpr uint32_t MARKER_ENQUEUE_TIMEOUT_MS = sendspin::INBOUND_ACQUIRE_TIMEOUT_MS;
-
-/// @brief Fallback wakeup interval for the drain thread's blocking item list take. Stop,
-/// flush, and clear commands wake the take immediately via wake_receiver(), so this is only
-/// a safety net against a missed wake: long enough to keep an idle thread asleep, short enough
-/// that a wake bug degrades to a slow reaction rather than a hang.
-static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 5000U;
-
 // ============================================================================
 // Big-endian helpers
 // ============================================================================
@@ -338,38 +326,16 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
     if (message.len < FRAME_PAYLOAD_OFFSET) {
         return;
     }
-    void* item = std::exchange(message.item, nullptr);
-    size_t item_len = message.item_len;
-    if (item == nullptr) {
-        // A frame reassembled from Noise fragments or routed through the fallback buffer (longer
-        // than the ring takes) is not in a ring item: copied into one, whole, keeping the
-        // transport's receive stamp. A frame longer than the ring's largest item can never be
-        // copied in, which is logged apart from a momentarily full ring.
-        if (message.len > inbound.ring()->max_item_message_bytes()) {
-            inbound.note_drop("received a frame longer than the ring's largest item; dropping");
-            return;
-        }
-        item = inbound.copy_local(message.data, message.len, message.receive_time_us, 0);
-        if (item == nullptr) {
-            inbound.note_drop("has no ring space to copy a frame into; dropping");
-            return;
-        }
-        item_len = message.len;
-    }
-    // Otherwise the frame stays in the ring item it was received and decrypted into.
-    this->hand_item(item, item_len, binary_type,
-                    static_cast<uint32_t>(message.len - FRAME_PAYLOAD_OFFSET), generation);
-}
-
-bool VisualizerRole::Impl::hand_item(void* item, size_t item_len, uint8_t type, uint32_t data_len,
-                                     uint32_t generation) const {
-    InboundItemHeader* header = inbound_item_header(item);
-    header->type = type;
-    const bool marker = type == ENTRY_TYPE_CLEAR_MARKER;
-    header->data_offset = static_cast<uint8_t>(marker ? 0 : FRAME_PAYLOAD_OFFSET);
-    header->data_len = data_len;
-    // A marker is exempt from the quota (InboundConsumer::hand()).
-    return this->drain_task->inbound.hand(item, item_len, generation, /*exempt=*/marker);
+    // The frame stays in the ring item it was received and decrypted into; one not in a ring
+    // item is copied into one whole, keeping the transport's receive stamp
+    // (InboundConsumer::hand_message()).
+    (void)inbound.hand_message(
+        message,
+        {.data_len = static_cast<uint32_t>(message.len - FRAME_PAYLOAD_OFFSET),
+         .serial = 0,
+         .type = binary_type,
+         .data_offset = static_cast<uint8_t>(FRAME_PAYLOAD_OFFSET)},
+        generation);
 }
 
 // ============================================================================
@@ -645,14 +611,16 @@ void VisualizerRole::Impl::signal_clear_marker(uint32_t generation) const {
     this->drain_task->event_flags.set(COMMAND_CLEAR);
     inbound.items().wake_receiver();
 
-    void* item = inbound.copy_local(nullptr, 0, 0, MARKER_ENQUEUE_TIMEOUT_MS);
-    if (item == nullptr) {
+    // The drain thread is discarding meanwhile, so space frees quickly. Exempt from the quota
+    // (InboundConsumer::hand()).
+    if (!inbound.hand_local(
+            nullptr, 0,
+            {.data_len = 0, .serial = 0, .type = ENTRY_TYPE_CLEAR_MARKER, .data_offset = 0},
+            generation)) {
         // Boundary lost: the drain thread will discard to empty instead, so frames appended after
         // this point may be dropped along with the old ones (brief visual gap, no harm).
         SS_LOGW(TAG, "Failed to append clear marker; clear boundary may be imprecise");
-        return;
     }
-    this->hand_item(item, 0, ENTRY_TYPE_CLEAR_MARKER, 0, generation);
 }
 
 void VisualizerRole::Impl::discard_to_clear_marker() const {
@@ -721,8 +689,8 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
 
         // Blocking take; returns early (nullptr) when wake_receiver() signals a stop, flush, or
         // clear. The timeout is only a safety net against a missed wake (see
-        // DRAIN_RECEIVE_TIMEOUT_MS).
-        void* item = self->take_item(DRAIN_RECEIVE_TIMEOUT_MS);
+        // INBOUND_CONSUMER_FALLBACK_WAKE_MS).
+        void* item = self->take_item(INBOUND_CONSUMER_FALLBACK_WAKE_MS);
         if (item == nullptr) {
             continue;
         }

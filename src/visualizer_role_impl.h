@@ -179,10 +179,6 @@ struct VisualizerRole::Impl : RoleTeardown {
     void signal_clear_marker(uint32_t generation) const;
     /// @brief Drain-thread side: returns frames up to and including the marker
     void discard_to_clear_marker() const;
-    /// @brief Fills an item's consumer fields and hands it to the drain thread
-    /// (InboundConsumer::hand()). Protocol task only.
-    bool hand_item(void* item, size_t item_len, uint8_t type, uint32_t data_len,
-                   uint32_t generation) const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
     void enqueue_stream_event(VisualizerEventType event, uint32_t generation) const;

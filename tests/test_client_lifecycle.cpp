@@ -2933,13 +2933,13 @@ void feed_marked_chunks(PlayerRole::Impl& impl, int64_t first_timestamp, int cou
             return;
         }
         std::memcpy(inbound_item_bytes(item), message.data(), message.size());
-        InboundItemHeader* header = inbound_item_header(item);
-        header->type = CHUNK_TYPE_ENCODED_AUDIO;
-        header->data_offset = FRAME_OFFSET;
-        header->data_len = static_cast<uint32_t>(SINK_CHUNK_BYTES);
         ring->complete(item);
         // Over quota, hand() returns the item itself.
         (void)sync_task.inbound().hand(item, message.size(),
+                                       {.data_len = static_cast<uint32_t>(SINK_CHUNK_BYTES),
+                                        .serial = 0,
+                                        .type = CHUNK_TYPE_ENCODED_AUDIO,
+                                        .data_offset = FRAME_OFFSET},
                                        impl.cleanup_generation.load(std::memory_order_acquire),
                                        /*exempt=*/false);
         timestamp += 20 * 1000;

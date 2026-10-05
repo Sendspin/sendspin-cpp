@@ -299,6 +299,7 @@ private:
 // ============================================================================
 
 class InboundItemList;
+struct InboundMessage;
 
 /**
  * @brief The shared inbound ring: a SharedRingBuffer over its own storage, the per-role quotas,
@@ -617,6 +618,28 @@ private:
 // InboundConsumer
 // ============================================================================
 
+/// Fallback wakeup interval for a consumer thread's blocking take (the sync task while idle, the
+/// visualizer drain thread, the artwork decode thread). A stop, the stream commands and a
+/// teardown wake the take at once (InboundItemList::wake_receiver()), as does every path that
+/// reopens an artwork channel's gate for the decode thread's parked-slot recheck; each thread
+/// also re-runs its checks (the decode thread's parked-slot sweep among them) whenever this
+/// timeout expires. So it is only a safety net against a missed wake: long enough to keep an idle
+/// thread asleep, short enough that a wake bug degrades to a slow reaction rather than a hang.
+static constexpr uint32_t INBOUND_CONSUMER_FALLBACK_WAKE_MS = 5000;
+
+/// @brief The consumer-defined InboundItemHeader fields every hand-over fills
+struct InboundItemFields {
+    /// InboundItemHeader::data_len: how many bytes the consumer reads.
+    uint32_t data_len;
+    /// InboundItemHeader::serial: the player's stream ordinal on a codec header, the artwork
+    /// channel or channel mask, 0 otherwise.
+    uint16_t serial;
+    /// InboundItemHeader::type: the consumer-defined item type.
+    uint8_t type;
+    /// InboundItemHeader::data_offset: where the consumer's bytes start in the message bytes.
+    uint8_t data_offset;
+};
+
 /**
  * @brief One holder's end of the ring: the item list its consumer thread takes from, the ring it
  * is bound to for a run, and the protocol task's side of handing items over
@@ -631,8 +654,9 @@ private:
  * Threads: bind() and unbind() run on the main loop with neither the consumer thread nor the
  * protocol task running: SendspinClient::start() binds before it starts the protocol task, and
  * stop() (and a start() that fails part-way) unbinds after joining it. The protocol task hands
- * items over and recalls them (copy_local(), hand(), recall(), note_drop()); the consumer thread
- * takes and returns them. ring() is read on all three, ordered by those thread starts and joins.
+ * items over and recalls them (hand(), hand_message(), hand_local(), recall()); the consumer
+ * thread takes and returns them. ring() is read on all three, ordered by those thread
+ * starts and joins.
  */
 class InboundConsumer {
 public:
@@ -670,19 +694,14 @@ public:
         this->ring()->return_item(item);
     }
 
-    /// @brief Acquires a LOCAL item (InboundRing::acquire_local()), copies `len` bytes into it
-    /// and completes it. Protocol task, inside a run.
-    /// @return The item, ready for hand(), or nullptr when the ring had no room in time.
-    void* copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
-                     uint32_t timeout_ms) const;
-
-    /// @brief Stamps `item` with `generation`, charges it to the holder's quota and appends it.
-    /// Over quota the item is returned to the ring with a throttled warning: the server
-    /// overran the buffer_capacity the role advertises, which the quota covers at the role's
-    /// smallest message. Protocol task, inside a run; the caller fills the item's other consumer
-    /// fields first.
-    /// @param item_len The item's message length (InboundMessage::item_len, or what
-    ///        copy_local() was given).
+    /// @brief Fills `item`'s consumer fields, stamps it with `generation`, charges it to the
+    /// holder's quota and appends it. Over quota the item is returned to the ring with a
+    /// throttled warning: the server overran the buffer_capacity the role advertises, which the
+    /// quota covers at the role's smallest message. Protocol task, inside a run. hand_message()
+    /// and hand_local() end here; a caller that fills an item it acquired itself (a FLAC codec
+    /// header decoded straight into its item) calls it directly.
+    /// @param item_len The item's message length (InboundMessage::item_len, or the length the
+    ///        item was acquired for).
     /// @param exempt Hands the item over without charging the quota: a codec header, an artwork
     ///        announce or a stream boundary marker the protocol task writes itself, one per
     ///        stream/start, stream/clear or image, so refusing it would end or blur a stream over
@@ -691,7 +710,26 @@ public:
     ///        a JSON flood from an authenticated server already holds, inside the pass-through
     ///        budget derive_inbound_ring_bytes() holds.
     /// @return false when the item was returned instead of handed over.
-    bool hand(void* item, size_t item_len, uint32_t generation, bool exempt);
+    bool hand(void* item, size_t item_len, InboundItemFields fields, uint32_t generation,
+              bool exempt);
+
+    /// @brief Hands a received message over, charged to the quota: its ring item itself, which
+    /// the call takes over (clearing message.item), or, for a message not in a ring item (one
+    /// reassembled from Noise fragments, or routed through the fallback buffer as longer than
+    /// the ring takes), a LOCAL copy of the whole message keeping its receive stamp. The copy
+    /// does not wait: a message over a full ring is dropped like one over the quota, and one
+    /// longer than the ring's largest item (InboundRing::max_item_message_bytes()), which only a
+    /// server over the role's advertised capacity sends, is dropped with a warning of its own so
+    /// a device log tells the two apart. Every drop joins the throttled run. Protocol task,
+    /// inside a run.
+    /// @return false when the message was dropped instead of handed over.
+    bool hand_message(InboundMessage& message, InboundItemFields fields, uint32_t generation);
+
+    /// @brief Copies `len` bytes (a codec header, an artwork announce, or none for a marker)
+    /// into a LOCAL item, waiting up to INBOUND_ACQUIRE_TIMEOUT_MS for ring space, and hands it
+    /// over exempt from the quota (see hand()). Protocol task. A no-op outside a run.
+    /// @return false when the consumer is not bound to a ring or the ring had no room in time.
+    bool hand_local(const void* data, size_t len, InboundItemFields fields, uint32_t generation);
 
     /// @brief Returns every item the consumer has not taken to the ring and ends the drop log's
     /// run, since the stream the drops belonged to is gone. The holder role's cleanup(), right
@@ -700,15 +738,30 @@ public:
     /// main loop's cleanup() in SendspinClient::stop() finds the list already unbound.
     void recall();
 
-    /// @brief Counts a drop of an item that never reached hand() in the same throttled run as
-    /// the over-quota drops, logging "<Holder> <message>" when it starts one. Protocol task.
-    void note_drop(const char* message);
-
 private:
+    /// @brief Why a hand-over dropped its item, which picks note_drop()'s warning
+    enum class DropReason : uint8_t {
+        OVER_QUOTA,  ///< hand(): the holder is over its quota
+        TOO_LONG,    ///< hand_message(): longer than the ring's largest item
+        NO_ROOM,     ///< hand_message(): no ring space for the copy
+    };
+
+    /// @brief Counts a drop in the throttled run (InboundDropLog), logging the warning for
+    /// `reason` when the drop starts one. Protocol task.
+    void note_drop(DropReason reason);
+
+    /// @brief Acquires a LOCAL item (InboundRing::acquire_local()), copies `len` bytes into it
+    /// and completes it. Protocol task, inside a run.
+    /// @return The item, ready for hand(), or nullptr when the ring had no room in time.
+    void* copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
+                     uint32_t timeout_ms) const;
+
     /// @brief What end_run() calls the holder's dropped items
     const char* dropped_items_name() const;
-    /// @brief The holder's name, leading note_drop()'s warning
+    /// @brief The holder's name, leading every drop warning
     const char* holder_name() const;
+    /// @brief One of the holder's messages, in the warnings of hand_message()'s drops
+    const char* item_noun() const;
 
     // Struct fields
     /// Appended on the protocol task, taken on the consumer thread, recalled on the protocol task

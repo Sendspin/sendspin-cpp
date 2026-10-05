@@ -15,8 +15,8 @@
 /// @file test_inbound_ring.cpp
 /// @brief Tests for the shared inbound ring's pieces: InboundRing's take after a wrap and its
 /// quota charge and return path, the intrusive per-consumer item list (order, blocking take,
-/// wake, recall), the outstanding-byte quota, the per-connection gate, and the ring size
-/// derivation
+/// wake, recall), a consumer's hand-overs, the outstanding-byte quota, the per-connection gate,
+/// and the ring size derivation
 
 #include "inbound_ring.h"
 #include "sendspin/config.h"
@@ -473,6 +473,105 @@ TEST(InboundItemList, AppendAfterRecallStartsAFreshList) {
     void* item = routed_item(f.ring, 2);
     f.list.append(item);
     EXPECT_EQ(f.list.take(0), item);
+}
+
+// InboundConsumer's hand-overs: hand_message() takes a received message's ring item over in place
+// (no copy) and copies only a message that is not in a ring item, into a LOCAL item keeping its
+// receive stamp; it charges the quota and drops, returning false with nothing charged or listed,
+// a message too long for any item or over the quota. hand_local() hands its copy over exempt from
+// the quota, and hands nothing while the consumer is bound to no ring (the bound row beside it is
+// its control). Every handed item carries the caller's fields and generation.
+TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
+    constexpr size_t RING_BYTES = 1024;
+    constexpr size_t LEN = 40;
+    constexpr uint32_t GENERATION = 7;
+    constexpr uint32_t RECEIVE_STAMP = 0x12345678;
+    constexpr InboundItemFields FIELDS{.data_len = 30, .serial = 3, .type = 9, .data_offset = 10};
+    enum class Source : uint8_t { RING_ITEM, OUTSIDE_THE_RING, TOO_LONG, HAND_LOCAL, UNBOUND };
+    struct Row {
+        const char* name;
+        Source source;
+        size_t quota;
+        bool handed;
+        bool in_place;  // the ring item itself was handed, rather than a LOCAL copy
+        bool charged;
+    };
+    const Row rows[] = {
+        {"Control: a ring item is handed in place", Source::RING_ITEM, RING_BYTES, true, true,
+         true},
+        {"a message outside the ring is copied into a LOCAL item", Source::OUTSIDE_THE_RING,
+         RING_BYTES, true, false, true},
+        {"a message longer than the ring's largest item is dropped", Source::TOO_LONG, RING_BYTES,
+         false, false, false},
+        {"a ring item over the quota is dropped", Source::RING_ITEM, 0, false, false, false},
+        {"hand_local() passes a zero quota, exempt", Source::HAND_LOCAL, 0, true, false, false},
+        {"hand_local() on a consumer never bound to a ring hands nothing", Source::UNBOUND, 0,
+         false, false, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundRing ring;
+        ASSERT_TRUE(ring.create(RING_BYTES, MemoryLocation::PREFER_EXTERNAL));
+        ring.quota(InboundHolder::PLAYER).set_limit(row.quota);
+        InboundConsumer consumer;
+        const bool bound = row.source != Source::UNBOUND;
+        if (bound) {
+            ASSERT_TRUE(consumer.bind(&ring, InboundHolder::PLAYER));
+        }
+
+        const size_t len = row.source == Source::TOO_LONG ? ring.max_item_message_bytes() + 1 : LEN;
+        std::vector<uint8_t> outside(len);
+        for (size_t i = 0; i < len; ++i) {
+            outside[i] = static_cast<uint8_t>(i);
+        }
+        void* ring_item = nullptr;
+        bool handed = false;
+        if (row.source == Source::HAND_LOCAL || row.source == Source::UNBOUND) {
+            handed = consumer.hand_local(outside.data(), len, FIELDS, GENERATION);
+        } else {
+            InboundMessage message;
+            if (row.source == Source::RING_ITEM) {
+                ring_item = routed_item(ring, 0, LEN);
+                ASSERT_NE(ring_item, nullptr);
+                message.item = ring_item;
+                message.item_len = LEN;
+                message.data = inbound_item_bytes(ring_item);
+            } else {
+                message.data = outside.data();
+            }
+            message.len = len;
+            message.receive_time_us = RECEIVE_STAMP;
+            handed = consumer.hand_message(message, FIELDS, GENERATION);
+            EXPECT_EQ(message.item, nullptr)
+                << "a ring item is the consumer's to hand over or return, never the caller's";
+        }
+        EXPECT_EQ(handed, row.handed);
+        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding() > 0, row.charged)
+            << ring.quota(InboundHolder::PLAYER).outstanding() << " bytes outstanding";
+
+        void* taken = consumer.items().take(0);
+        EXPECT_EQ(taken != nullptr, row.handed) << "only a handed message is listed";
+        if (taken != nullptr) {
+            const InboundItemHeader* header = inbound_item_header(taken);
+            EXPECT_EQ(taken == ring_item, row.in_place);
+            EXPECT_EQ(header->kind == InboundKind::LOCAL, !row.in_place);
+            if (!row.in_place) {
+                EXPECT_EQ(std::memcmp(inbound_item_bytes(taken), outside.data(), len), 0);
+                EXPECT_EQ(header->receive_time_us,
+                          row.source == Source::HAND_LOCAL ? 0U : RECEIVE_STAMP);
+            }
+            EXPECT_EQ(header->data_len, FIELDS.data_len);
+            EXPECT_EQ(header->serial, FIELDS.serial);
+            EXPECT_EQ(header->type, FIELDS.type);
+            EXPECT_EQ(header->data_offset, FIELDS.data_offset);
+            EXPECT_EQ(header->generation, GENERATION);
+            consumer.return_item(taken);
+            EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U);
+        }
+        if (bound) {
+            consumer.unbind();
+        }
+    }
 }
 
 // Concurrent charges and releases never let the outstanding total past the limit and leave it at

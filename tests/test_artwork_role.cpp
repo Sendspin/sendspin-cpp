@@ -144,7 +144,7 @@ bool send_image(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t
 // Window for "must NOT fire" checks. Every path that reopens a slot's gate (frame_done or an
 // epoch release) wakes the decode thread, so a spurious replay through that path arrives
 // promptly; this is settle time for that wake. The thread also re-runs the parked-slot sweep
-// when its receive timeout expires (DRAIN_RECEIVE_TIMEOUT_MS in artwork_role.cpp), so a
+// when its receive timeout expires (INBOUND_CONSUMER_FALLBACK_WAKE_MS), so a
 // replay reachable only through that fallback sweep lands outside this window and is not
 // covered here. Every counter it watches is monotonic, so a window that is too short can only
 // miss a regression, never fail a correct run.

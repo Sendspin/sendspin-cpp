@@ -51,17 +51,6 @@ static_assert(ARTWORK_PART_DATA_OFFSET == sendspin::INBOUND_ARTWORK_PART_HEADER_
 /// @brief Every channel's bit, the mask of a stream end's DISCARD marker
 static constexpr uint8_t ARTWORK_ALL_CHANNELS = (1U << sendspin::ARTWORK_MAX_SLOTS) - 1U;
 
-/// @brief Bound on waiting for inbound ring space for an announce or a marker (see
-/// sendspin::INBOUND_ACQUIRE_TIMEOUT_MS): the role's consumer threads free space as they return
-/// items.
-static constexpr uint32_t ITEM_SEND_TIMEOUT_MS = sendspin::INBOUND_ACQUIRE_TIMEOUT_MS;
-
-/// @brief Fallback wakeup interval for the decode thread's blocking take. Stop, teardown and
-/// parked-slot rechecks wake the take immediately via wake_receiver(), so this is only a safety
-/// net against a missed wake: long enough to keep an idle thread asleep, short enough that a wake
-/// bug degrades to a slow reaction rather than a hang.
-static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 5000U;
-
 // Event flag bits for decode thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
 
@@ -308,36 +297,15 @@ ArtworkAnnounce ArtworkRole::Impl::parse_announce(const uint8_t* body) {
     return announce;
 }
 
-bool ArtworkRole::Impl::hand_item(void* item, size_t item_len, ArtworkItemType type,
-                                  uint16_t serial, uint8_t data_offset, uint32_t data_len,
-                                  uint32_t generation, bool exempt) const {
-    InboundItemHeader* header = inbound_item_header(item);
-    header->type = static_cast<uint8_t>(type);
-    header->serial = serial;
-    header->data_offset = data_offset;
-    header->data_len = data_len;
-    return this->drain_task->inbound.hand(item, item_len, generation, exempt);
-}
-
-bool ArtworkRole::Impl::hand_local_item(const void* data, size_t len, ArtworkItemType type,
-                                        uint16_t serial, uint32_t generation) const {
-    InboundConsumer& inbound = this->drain_task->inbound;
-    if (inbound.ring() == nullptr) {
-        return false;
-    }
-    void* item =
-        inbound.copy_local(static_cast<const uint8_t*>(data), len, 0, ITEM_SEND_TIMEOUT_MS);
-    // An announce and a marker are exempt from the quota (InboundConsumer::hand()), so the hand
-    // itself cannot refuse them.
-    return item != nullptr && this->hand_item(item, len, type, serial, 0,
-                                              static_cast<uint32_t>(len), generation, true);
-}
-
 void ArtworkRole::Impl::hand_marker(ArtworkItemType type, uint8_t mask, uint32_t generation) const {
-    if (this->drain_task->inbound.ring() == nullptr) {
-        return;
-    }
-    if (!this->hand_local_item(nullptr, 0, type, mask, generation)) {
+    // Exempt from the quota (InboundConsumer::hand()). A role that is not running hands nothing
+    // and has nothing to warn about.
+    InboundConsumer& inbound = this->drain_task->inbound;
+    if (!inbound.hand_local(
+            nullptr, 0,
+            {.data_len = 0, .serial = mask, .type = static_cast<uint8_t>(type), .data_offset = 0},
+            generation) &&
+        inbound.ring() != nullptr) {
         // The slot epochs, already moved on, still keep a discarded image from being delivered.
         SS_LOGW(TAG, "Failed to append an artwork marker");
     }
@@ -373,13 +341,18 @@ bool ArtworkRole::Impl::begin_transfer(uint8_t slot, const uint8_t* body, uint32
     // the channel's buffer when it takes the announce (or the marker below) handed after it.
     announce.epoch = this->slot_epochs[slot].fetch_add(1, std::memory_order_relaxed) + 1;
     const uint8_t mask = static_cast<uint8_t>(1U << slot);
+    // An announce is exempt from the quota (InboundConsumer::hand()).
+    InboundConsumer& inbound = this->drain_task->inbound;
+    const InboundItemFields announce_fields{.data_len = sizeof(announce),
+                                            .serial = slot,
+                                            .type = static_cast<uint8_t>(ArtworkItemType::ANNOUNCE),
+                                            .data_offset = 0};
 
     // "An announce with total_size 0 completes immediately, with no parts", and is how the server
     // clears a channel. Its announce is all the decode thread needs.
     if (announce.total_size == 0) {
-        if (!this->hand_local_item(&announce, sizeof(announce), ArtworkItemType::ANNOUNCE, slot,
-                                   generation) &&
-            this->drain_task->inbound.ring() != nullptr) {
+        if (!inbound.hand_local(&announce, sizeof(announce), announce_fields, generation) &&
+            inbound.ring() != nullptr) {
             SS_LOGW(TAG, "Failed to append an artwork clear for slot %u; dropping it", slot);
         }
         return true;
@@ -396,9 +369,8 @@ bool ArtworkRole::Impl::begin_transfer(uint8_t slot, const uint8_t* body, uint32
                 "Artwork image of %" PRIu32 " bytes for slot %u exceeds its %" PRIu32 " byte cap",
                 announce.total_size, slot, cap);
     }
-    if (holds && !this->hand_local_item(&announce, sizeof(announce), ArtworkItemType::ANNOUNCE,
-                                        slot, generation)) {
-        if (this->drain_task->inbound.ring() != nullptr) {
+    if (holds && !inbound.hand_local(&announce, sizeof(announce), announce_fields, generation)) {
+        if (inbound.ring() != nullptr) {
             SS_LOGW(TAG, "Failed to append an artwork announce for slot %u; dropping its image",
                     slot);
         }
@@ -432,34 +404,17 @@ bool ArtworkRole::Impl::hand_part(uint8_t slot, InboundMessage& message, uint32_
 
     if (!t.discarding) {
         // The part goes over in the ring item it was received and decrypted into, and the decode
-        // thread copies it out from there. A part reassembled from Noise fragments or routed
-        // through the fallback buffer (longer than the ring takes) is not in a ring item: copied
-        // into one, whole, without waiting, like an audio chunk.
-        InboundConsumer& inbound = this->drain_task->inbound;
-        void* item = std::exchange(message.item, nullptr);
-        size_t item_len = message.item_len;
-        bool handed = false;
-        if (item == nullptr) {
-            if (message.len > inbound.ring()->max_item_message_bytes()) {
-                inbound.note_drop("received an image part longer than the ring's largest item; "
-                                  "dropping its image");
-            } else {
-                item = inbound.copy_local(message.data, message.len, message.receive_time_us, 0);
-                item_len = message.len;
-                if (item == nullptr) {
-                    inbound.note_drop("has no ring space to copy an image part into; dropping "
-                                      "its image");
-                }
-            }
-        }
-        if (item != nullptr) {
-            // Charged to the artwork quota, which bounds the parts waiting for the decode thread
-            // to copy them (INBOUND_ARTWORK_IN_FLIGHT_IMAGES); over it the part is dropped with a
-            // warning.
-            handed = this->hand_item(item, item_len, ArtworkItemType::PART, slot,
-                                     ARTWORK_PART_DATA_OFFSET, static_cast<uint32_t>(part_len),
-                                     generation, false);
-        }
+        // thread copies it out from there; a part not in a ring item is copied into one whole,
+        // without waiting, like an audio chunk (InboundConsumer::hand_message()). Charged to the
+        // artwork quota, which bounds the parts waiting for the decode thread to copy them
+        // (INBOUND_ARTWORK_IN_FLIGHT_IMAGES); over it the part is dropped with a warning.
+        const bool handed = this->drain_task->inbound.hand_message(
+            message,
+            {.data_len = static_cast<uint32_t>(part_len),
+             .serial = slot,
+             .type = static_cast<uint8_t>(ArtworkItemType::PART),
+             .data_offset = ARTWORK_PART_DATA_OFFSET},
+            generation);
         if (!handed) {
             // The image cannot be completed without this part, so the rest of its transfer is
             // followed without handing anything over, and the decode thread drops what it has.
@@ -1083,8 +1038,8 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
 
         // Blocking take; returns early (nullptr) when wake_receiver() signals a stop, a teardown
         // or a parked-slot recheck. The timeout is only a safety net against a missed wake (see
-        // DRAIN_RECEIVE_TIMEOUT_MS); a timeout return simply re-runs the checks above.
-        self->process_next_item(DRAIN_RECEIVE_TIMEOUT_MS);
+        // INBOUND_CONSUMER_FALLBACK_WAKE_MS); a timeout return simply re-runs the checks above.
+        self->process_next_item(INBOUND_CONSUMER_FALLBACK_WAKE_MS);
     }
 
     // A restart begins with nothing assembled or parked: stop() releases the buffers.

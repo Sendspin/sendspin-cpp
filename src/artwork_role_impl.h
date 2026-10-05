@@ -346,15 +346,6 @@ struct ArtworkRole::Impl : RoleTeardown {
     // Counts one part toward the transfer in flight and hands it to the decode thread unless the
     // transfer is discarding. @return false for a malformed sequence.
     bool hand_part(uint8_t slot, InboundMessage& message, uint32_t generation);
-    // Fills `item`'s consumer fields and hands it to the decode thread
-    // (InboundConsumer::hand()), charged to the quota unless `exempt`. Protocol task.
-    // @return false when the item was dropped over quota.
-    bool hand_item(void* item, size_t item_len, ArtworkItemType type, uint16_t serial,
-                   uint8_t data_offset, uint32_t data_len, uint32_t generation, bool exempt) const;
-    // Writes `len` bytes into a LOCAL item (a bounded wait for room) and hands it over, exempt.
-    // Protocol task. @return false when the ring had no room or the role is not running.
-    bool hand_local_item(const void* data, size_t len, ArtworkItemType type, uint16_t serial,
-                         uint32_t generation) const;
     // Hands a DISCARD or RECONFIGURE marker for the channels in `mask`, logging a failure.
     // Protocol task.
     void hand_marker(ArtworkItemType type, uint8_t mask, uint32_t generation) const;
