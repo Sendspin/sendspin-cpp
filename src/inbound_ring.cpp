@@ -131,9 +131,18 @@ void InboundRing::reset() {
     for (;;) {
         if (this->pending_ != nullptr) {
             // Every producer has stopped, so the pending item's completion has happened; wait
-            // for it to be visible rather than return an item that might still be written.
+            // for it to be visible rather than return an item that might still be written. The
+            // wait is bounded all the same, so a producer that broke the contract cannot hang the
+            // stop: the item is then left to the ring's destruction.
+            const int64_t deadline_us =
+                platform_time_us() + static_cast<int64_t>(INBOUND_ACQUIRE_TIMEOUT_MS) * US_PER_MS;
             while (!this->head_takes_completed()) {
-                this->ring_.wait_for_completion(UINT32_MAX);
+                const int64_t now_us = platform_time_us();
+                if (now_us >= deadline_us) {
+                    SS_LOGW(TAG, "An inbound ring item was never completed; leaving it");
+                    return;
+                }
+                this->ring_.wait_for_completion(ms_until(deadline_us, now_us));
             }
             void* item = this->pending_;
             this->pending_ = nullptr;

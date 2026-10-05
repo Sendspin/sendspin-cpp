@@ -1271,6 +1271,42 @@ TEST(ClientLifecycle, AnOpenedOutboundConnectionIsNotHeldForReaping) {
     }
 }
 
+// A full reaping list makes room by dropping the entry parked longest, so the list stays bounded
+// (REAPING_CAPACITY) however fast connections are released. Stand-in connections, whose
+// destructors join no transport, are parked directly (park_for_reaping()) with the test thread
+// playing the protocol task, so no reap pass frees one first. Control: a list filled to capacity
+// drops nothing.
+TEST(ClientLifecycle, AFullReapingListDropsTheConnectionParkedLongest) {
+    TestNetworkProvider network;
+    SendspinClient client(make_config(0));
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    client.protocol_task_->stop();
+    ConnectionManager& manager = *client.connection_manager_;
+
+    std::vector<std::weak_ptr<SendspinConnection>> parked;
+    for (size_t i = 0; i < ConnectionManager::REAPING_CAPACITY; ++i) {
+        auto conn = std::make_shared<StubConnection>();
+        parked.push_back(conn);
+        manager.park_for_reaping(std::move(conn));
+    }
+    ASSERT_EQ(manager.reaping_.size(), ConnectionManager::REAPING_CAPACITY);
+    for (size_t i = 0; i < parked.size(); ++i) {
+        EXPECT_FALSE(parked[i].expired()) << "Control: a list at capacity dropped entry " << i;
+    }
+
+    auto newest = std::make_shared<StubConnection>();
+    manager.park_for_reaping(newest);
+    EXPECT_EQ(manager.reaping_.size(), ConnectionManager::REAPING_CAPACITY);
+    EXPECT_TRUE(parked[0].expired()) << "the entry parked longest was kept";
+    for (size_t i = 1; i < parked.size(); ++i) {
+        EXPECT_FALSE(parked[i].expired()) << "entry " << i << " was dropped in its place";
+    }
+    EXPECT_EQ(manager.reaping_[manager.reaping_.size() - 1].conn, newest);
+    newest.reset();
+    client.stop();
+}
+
 /// Records, in order, the client/leave, client/command and client/state messages and the goodbyes
 /// sent on it.
 class RecordingConnection : public StubConnection {

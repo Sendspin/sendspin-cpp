@@ -305,7 +305,8 @@ TEST(SyncTaskDecodeWholeChunk, DecodesEveryFrameOrLeavesTheBufferEmpty) {
         std::vector<uint32_t> storage = chunk_item(row.chunk);
         context.encoded_item = storage.data();
 
-        EXPECT_EQ(SyncTask::decode_whole_chunk(context), row.output_bytes != 0);
+        EXPECT_EQ(SyncTask::decode_whole_chunk(context) == sendspin::DecodeResult::SUCCESS,
+                  row.output_bytes != 0);
         EXPECT_EQ(context.decode_buffer->available(), row.output_bytes);
         if (row.header_type == sendspin::CHUNK_TYPE_FLAC_HEADER && row.output_bytes != 0) {
             const std::vector<uint8_t> pcm = flac_source_pcm();

@@ -172,7 +172,7 @@ public:
     using Tick = std::function<uint32_t()>;
 
     /// @brief Creates the command queue: CONSUMER_COMMAND_BURST consumer slots plus
-    /// ACCEPT_SLOTS_PER_SOCKET accept slots per socket
+    /// ACCEPT_SLOTS_PER_SOCKET accept slots per socket, and the event flags every wake sets
     /// @param server_max_connections The client's SendspinClientConfig::server_max_connections.
     explicit ProtocolTask(size_t server_max_connections);
     ~ProtocolTask();
@@ -186,7 +186,8 @@ public:
     /// @param stack_size Task stack size in bytes (ESP-IDF only).
     /// @param priority FreeRTOS task priority (ESP-IDF only).
     /// @param stack_in_psram Allocate the stack in PSRAM (ESP-IDF only).
-    /// @return false when the event flags could not be created or the task already runs.
+    /// @return false when the constructor could not create the event flags or the task already
+    ///         runs.
     bool start(Tick tick, size_t stack_size, unsigned priority, bool stack_in_psram);
 
     /// @brief Signals the thread, waits for its final tick and joins it, then drops the state
@@ -285,6 +286,7 @@ private:
     /// Guards commands_, the counts, latest_state_ and requests_. A leaf: no lock is taken and
     /// nothing heap-backed is destroyed under it.
     std::mutex command_mutex_;
+    /// Created in the constructor, before any thread that wakes the task exists.
     EventFlags event_flags_;
     /// The newest client/state snapshot not yet taken. Written by the main loop, taken by the
     /// protocol task; guarded by command_mutex_ and only ever swapped under it.

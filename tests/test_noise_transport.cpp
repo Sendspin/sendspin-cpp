@@ -56,12 +56,14 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2020,31 +2022,53 @@ TEST(InboundReceive, AnAdmittedMessageWithNoRingSpaceClosesTheConnection) {
 // A message larger than the cap in force closes the connection: before admission that is
 // InboundGate::PRE_ADMISSION_MESSAGE_BYTES, after it one Noise frame (INBOUND_MAX_MESSAGE_BYTES).
 // No conforming peer sends either, and the transport learns the length before receiving a byte.
+// The pre-admission cap is judged once the message still pending is consumed, since that message
+// may be the server/activate that admits the connection: the behind-admission row leaves a
+// message pending and has a second thread admit the connection and consume it, as the protocol
+// task's activation does, while the over-cap message waits. The thread sleeps first so the
+// transport is likely waiting already; if it is not, the message finds the connection admitted
+// and the row still passes.
 TEST(InboundReceive, AMessageOverTheCapInForceClosesTheConnection) {
     struct Row {
         const char* name;
         bool admitted;
+        bool admitted_behind_pending;
         size_t len;
         TestConnection::InboundRoute route;
     };
     const Row rows[] = {
-        {"Control: pre-admission, at the cap", false, InboundGate::PRE_ADMISSION_MESSAGE_BYTES,
-         TestConnection::InboundRoute::RECEIVE},
-        {"pre-admission, one byte over", false, InboundGate::PRE_ADMISSION_MESSAGE_BYTES + 1,
+        {"Control: pre-admission, at the cap", false, false,
+         InboundGate::PRE_ADMISSION_MESSAGE_BYTES, TestConnection::InboundRoute::RECEIVE},
+        {"pre-admission, one byte over", false, false, InboundGate::PRE_ADMISSION_MESSAGE_BYTES + 1,
          TestConnection::InboundRoute::CLOSE},
-        {"Control: pre-admission, one byte", false, 1, TestConnection::InboundRoute::RECEIVE},
-        {"pre-admission, zero length", false, 0, TestConnection::InboundRoute::DROP},
-        {"Control: admitted, one Noise frame", true, INBOUND_MAX_MESSAGE_BYTES,
+        {"one byte over behind the pending message that admits it", false, true,
+         InboundGate::PRE_ADMISSION_MESSAGE_BYTES + 1, TestConnection::InboundRoute::RECEIVE},
+        {"Control: pre-admission, one byte", false, false, 1, TestConnection::InboundRoute::RECEIVE},
+        {"pre-admission, zero length", false, false, 0, TestConnection::InboundRoute::DROP},
+        {"Control: admitted, one Noise frame", true, false, INBOUND_MAX_MESSAGE_BYTES,
          TestConnection::InboundRoute::RECEIVE},
-        {"admitted, one byte over a Noise frame", true, INBOUND_MAX_MESSAGE_BYTES + 1,
+        {"admitted, one byte over a Noise frame", true, false, INBOUND_MAX_MESSAGE_BYTES + 1,
          TestConnection::InboundRoute::CLOSE},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         InboundHarness h;
         h.conn.set_admitted(row.admitted);
+        std::thread activation;
+        if (row.admitted_behind_pending) {
+            ASSERT_EQ(h.receive(std::vector<uint8_t>(3, 0x01)),
+                      TestConnection::InboundRoute::RECEIVE);
+            activation = std::thread([&h] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                h.conn.set_admitted(true);
+                h.conn.consume_pending_message();
+            });
+        }
 
         EXPECT_EQ(h.receive(std::vector<uint8_t>(row.len, 0x5A)), row.route);
+        if (activation.joinable()) {
+            activation.join();
+        }
         const bool closed = row.route == TestConnection::InboundRoute::CLOSE;
         EXPECT_EQ(h.conn.close_transport_now_calls_, closed ? 1 : 0);
         EXPECT_EQ(h.conn.inbound_gate().is_detached(), closed)

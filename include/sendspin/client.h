@@ -116,6 +116,8 @@ public:
     /// pairing). trust reflects the PSK category matched during the Noise handshake:
     ///   ConnectionTrust::USER:  long-term record (paired server)
     ///   ConnectionTrust::NONE:  Sentinel or Pairing PSK (unpaired access)
+    /// The last reported trust describes the connection only while is_connected() is true: a
+    /// disconnect fires no on_trust_changed.
     virtual void on_trust_changed(ConnectionTrust /*trust*/) {}
 
     /// @brief Called when a dynamic pairing code should be emitted to the operator.
@@ -301,6 +303,9 @@ struct Identity;
  */
 class SendspinClient {
     friend class ConnectionManager;
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    friend class ControllerRole;
+#endif
 
 public:
     explicit SendspinClient(SendspinClientConfig config);
@@ -676,6 +681,15 @@ public:
     /// the roles that connection owns. Ignored unless the client is running.
     void publish_state();
 
+    /// @brief Acquires a ref-counted high-performance networking request. Main loop only: the
+    /// first acquire calls the listener inline.
+    void acquire_high_performance();
+
+    /// @brief Releases a ref-counted high-performance networking request. Main loop only: the
+    /// last release calls the listener inline.
+    void release_high_performance();
+
+private:
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     /// @brief Queues a controller command for the protocol task, which formats it as a
     /// client/command and sends it to the admitted connection that owns the controller role
@@ -686,13 +700,14 @@ public:
     /// versioned name, the same test the receive path applies. Also dropped, like client/state,
     /// while a re-handshake awaits the server/activate that follows it.
     ///
-    /// A role service, like publish_state(): consumers call ControllerRole::send_command(), which
-    /// checks the command against the server's supported_commands and its parameter before
-    /// calling this. This assumes those checks ran and repeats neither. The command crosses to
-    /// the protocol task as the struct, so the message is built in the task's JSON arena. It
-    /// carries the generation it was validated under, and the protocol task drops it if the role
-    /// has been torn down since (its owner replaced, or the role removed): the supported commands
-    /// it was validated against are retired.
+    /// The controller role's route to the protocol task, private to it (ControllerRole is a
+    /// friend): ControllerRole::send_command() checks the command against the server's
+    /// supported_commands and its parameter before calling this, which assumes those checks ran
+    /// and repeats neither. The command crosses to the protocol task as the struct, so the
+    /// message is built in the task's JSON arena. It carries the generation it was validated
+    /// under, and the protocol task drops it if the role has been torn down since (its owner
+    /// replaced, or the role removed): the supported commands it was validated against are
+    /// retired.
     ///
     /// Callable from any thread.
     /// @param cmd The command, already validated by the controller role.
@@ -705,15 +720,6 @@ public:
     bool send_controller_command(const ClientCommandControllerObject& cmd, uint16_t generation);
 #endif
 
-    /// @brief Acquires a ref-counted high-performance networking request. Main loop only: the
-    /// first acquire calls the listener inline.
-    void acquire_high_performance();
-
-    /// @brief Releases a ref-counted high-performance networking request. Main loop only: the
-    /// last release calls the listener inline.
-    void release_high_performance();
-
-private:
     /// @brief The protocol-task half of a teardown: when `teardown_roles` covers every role, wipes
     /// the event ring, the pending group and time-sync slots, and the pairing notes other than a
     /// dismissal already owed; and runs cleanup() on each role in
@@ -737,8 +743,8 @@ private:
     /// succeeded.
     void flush_pending_persistence();
 
-    /// @brief Drains the inbox: high-performance requests, provider writes, the time-sync report,
-    /// lifecycle events (each role's teardown half caught up ahead of its stamped events),
+    /// @brief Drains the inbox: high-performance requests, the time-sync report, lifecycle events
+    /// (each role's teardown half caught up ahead of its stamped events), provider writes,
     /// pairing notes, role slots, and group updates, dispatching listener callbacks on the
     /// calling (main-loop) thread. Shared by loop() and stop(). A callback that calls stop()
     /// abandons the rest of this drain (EventState::drain_generation).

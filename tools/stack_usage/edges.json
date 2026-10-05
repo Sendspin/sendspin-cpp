@@ -2,17 +2,18 @@
  "_comment": [
   "Indirect-call edges the -fcallgraph-info graph cannot see (function pointers, virtual calls, std::function, ESP-IDF callbacks), and frames for precompiled newlib functions measured from their xtensa 'entry' instruction (objdump -d libc.a). A key or target is a demangled-name substring of at least 13 characters, an exact symbol, or 'sym:' followed by a regular expression over the mangled symbol."
  ],
- "synthetic": {
-  "__sfvwrite_r": 48,
-  "__sprint_r": 32,
-  "__swrite": 32,
-  "_vfprintf_r": 800,
-  "_write_r": 32,
-  "vprintf": 48
- },
  "edges": {
+  "_ZNKSt8functionIFbRKSt10shared_ptrIN8sendspin24SendspinServerConnectionEEEEclES5_": [
+   "sym:_Function_handlerIFbRKSt10shared_ptrIN8sendspin24SendspinServerConnection.*M_invoke"
+  ],
   "_ZNKSt8functionIFmvEEclEv": [
    "sym:SendspinClient5startEvEUlvE_E9_M_invoke"
+  ],
+  "_ZNKSt8functionIFvPN8sendspin18SendspinConnectionEEEclES2_": [
+   "sym:_Function_handlerIFvPN8sendspin18SendspinConnectionEEZ.*M_invoke"
+  ],
+  "_ZNKSt8functionIFvvEEclEv": [
+   "sym:_Function_handlerIFvvEZN8sendspin.*M_invoke"
   ],
   "__sfvwrite_r": [
    "__swrite"
@@ -98,7 +99,7 @@
    "sym:SendspinWsServer14close_callback"
   ],
   "httpd_sess_free_ctx": [
-   "sym:SendspinWsServer13open_callbackEPviENKUlPvE_"
+   "sym:SendspinWsServer13open_callbackEPviE.*UlS1_E_"
   ],
   "httpd_sess_new": [
    "sym:SendspinWsServer13open_callback"
@@ -215,20 +216,33 @@
   "sendspin::TimeBurstResult sendspin::SendspinTimeBurst::loop(": [
    "int64_t sendspin::SendspinConnection::send_time_message()"
   ],
-  "void sendspin::ConnectionManager::release_connection(": [
-   "SendspinServerConnection::disconnect(",
-   "SendspinClientConnection::disconnect(",
-   "SendspinClientConnection::~SendspinClientConnection()",
-   "SendspinServerConnection::~SendspinServerConnection()"
-  ],
   "sym:ProtocolTask12thread_entry": [
    "_ZNKSt8functionIFmvEEclEv"
   ],
   "sym:SendspinClient5startEv.*_M_invoke": [
    "sym:SendspinClient13protocol_tickEv$"
   ],
+  "sym:SendspinClientConnection16handle_connectedEv$": [
+   "sym:_Function_handlerIFvPN8sendspin18SendspinConnectionEEZ.*M_invoke"
+  ],
+  "sym:SendspinConnection12fail_inboundEv$": [
+   "SendspinServerConnection::close_transport_now(",
+   "SendspinClientConnection::close_transport_now("
+  ],
   "sym:SendspinServerConnection16async_send_frame": [
    "sym:_Function_handlerIFvvEZN8sendspin.*M_invoke"
+  ],
+  "sym:SendspinWsServer13open_callbackEPvi$": [
+   "sym:_Function_handlerIFvvEZN8sendspin17ConnectionManager5startEvEUlvE_E9_M_invoke"
+  ],
+  "sym:SendspinWsServer13open_callbackEPviE.*UlS1_E_": [
+   "sym:_Sp_counted_ptr_inplaceIN8sendspin24SendspinServerConnection.*_M_disposeEv"
+  ],
+  "sym:SendspinWsServer16deliver_upgradedEi$": [
+   "sym:_Function_handlerIFbRKSt10shared_ptrIN8sendspin24SendspinServerConnection.*M_invoke"
+  ],
+  "sym:_Sp_counted_ptr_inplaceIN8sendspin24SendspinServerConnection.*_M_disposeEv": [
+   "sym:SendspinServerConnectionD2Ev$"
   ],
   "sym:_State_impl.*ProtocolTask.*_M_runEv": [
    "sym:ProtocolTask12thread_entry"
@@ -239,6 +253,12 @@
   "void sendspin::ConnectionManager::drop_connection(": [
    "SendspinServerConnection::disconnect(",
    "SendspinClientConnection::disconnect("
+  ],
+  "void sendspin::ConnectionManager::release_connection(": [
+   "SendspinServerConnection::disconnect(",
+   "SendspinClientConnection::disconnect(",
+   "SendspinClientConnection::~SendspinClientConnection()",
+   "SendspinServerConnection::~SendspinServerConnection()"
   ],
   "void sendspin::SendspinConnection::close_silently(": [
    "SendspinServerConnection::disconnect(",
@@ -259,5 +279,13 @@
   "vprintf": [
    "_vfprintf_r"
   ]
+ },
+ "synthetic": {
+  "__sfvwrite_r": 48,
+  "__sprint_r": 32,
+  "__swrite": 32,
+  "_vfprintf_r": 800,
+  "_write_r": 32,
+  "vprintf": 48
  }
 }

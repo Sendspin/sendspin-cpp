@@ -364,8 +364,7 @@ struct ArtworkRole::Impl : RoleTeardown {
 
     // Decode thread
     // Takes the next item handed over under the current generation and processes it; false when
-    // none was taken in `timeout_ms`. The decode thread's step, which a test also runs on its own
-    // thread with no decode thread started.
+    // none was taken in `timeout_ms`. The decode thread's step.
     bool process_next_item(uint32_t timeout_ms);
     // Drops every image assembled or parked when `generation` is not the one it was handed under.
     void adopt_generation(uint32_t generation) const;

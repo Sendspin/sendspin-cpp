@@ -261,7 +261,7 @@ SyncTaskState SyncTask::handle_load_chunk(SyncContext& sync_context) {
         return SyncTaskState::LOAD_CHUNK;
     }
     if (decode_result == DecodeResult::ALLOCATION_FAILED) {
-        this->event_flags_.set(EventGroupBits::TASK_ERROR | EventGroupBits::COMMAND_STOP);
+        this->abandon_stream(sync_context);
         return SyncTaskState::LOAD_CHUNK;
     }
     if (sync_context.decode_buffer == nullptr || sync_context.decode_buffer->available() == 0) {
@@ -600,7 +600,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                 sync_context.decode_buffer = TransferBuffer::create(
                     needed, this->player_impl_->config.decode_buffer_location);
                 if (sync_context.decode_buffer == nullptr) {
-                    SS_LOGE(TAG, "Failed to allocate decode buffer");
+                    SS_LOGE(TAG, "Failed to allocate decode buffer; dropping the stream");
                     this->inbound_.return_item(sync_context.encoded_item);
                     sync_context.encoded_item = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
@@ -610,7 +610,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                 }
             } else if (needed > sync_context.decode_buffer->capacity()) {
                 if (!sync_context.decode_buffer->reallocate(needed)) {
-                    SS_LOGE(TAG, "Failed to reallocate decode buffer");
+                    SS_LOGE(TAG, "Failed to reallocate decode buffer; dropping the stream");
                     this->inbound_.return_item(sync_context.encoded_item);
                     sync_context.encoded_item = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
@@ -633,10 +633,11 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             return DecodeResult::SKIPPED;
         }
 
-        if (!decode_whole_chunk(sync_context)) {
+        const DecodeResult decoded = decode_whole_chunk(sync_context);
+        if (decoded != DecodeResult::SUCCESS) {
             this->inbound_.return_item(sync_context.encoded_item);
             sync_context.encoded_item = nullptr;
-            return DecodeResult::FAILED;
+            return decoded;
         }
         sync_context.decoded_timestamp = client_timestamp;
     }
@@ -648,11 +649,12 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
     return DecodeResult::SUCCESS;
 }
 
-bool SyncTask::decode_whole_chunk(SyncContext& sync_context) {
+DecodeResult SyncTask::decode_whole_chunk(SyncContext& sync_context) {
     // Straight from the ring storage the chunk was received and decrypted into.
     const uint8_t* input = encoded_data(sync_context.encoded_item);
     size_t remaining = encoded_size(sync_context.encoded_item);
     size_t produced = 0;
+    bool grow_failed = false;
     // roles/player/v1.md "Server Audio Send Constraints": no chunk is longer than 150 ms, which
     // also caps the buffer at 150 ms plus one decoder unit.
     const size_t max_produced = sync_context.current_stream_info.ms_to_bytes(MAX_AUDIO_CHUNK_MS);
@@ -663,7 +665,8 @@ bool SyncTask::decode_whole_chunk(SyncContext& sync_context) {
         if (sync_context.decode_buffer->free() < needed_free &&
             !sync_context.decode_buffer->reallocate(sync_context.decode_buffer->available() +
                                                     needed_free)) {
-            SS_LOGE(TAG, "Failed to grow decode buffer");
+            SS_LOGE(TAG, "Failed to grow decode buffer; dropping the stream");
+            grow_failed = true;
             break;
         }
 
@@ -688,16 +691,19 @@ bool SyncTask::decode_whole_chunk(SyncContext& sync_context) {
     }
 
     if (remaining == 0 && produced <= max_produced) {
-        return true;
+        return DecodeResult::SUCCESS;
     }
     // All or nothing. The buffer was empty on entry, so this drops just this chunk's output.
     sync_context.decode_buffer->decrease_buffer_length(produced);
+    if (grow_failed) {
+        return DecodeResult::ALLOCATION_FAILED;
+    }
     if (produced > max_produced) {
         SS_LOGE(TAG, "Audio chunk decodes to more than %" PRIu32 " ms", MAX_AUDIO_CHUNK_MS);
     } else {
         SS_LOGE(TAG, "Failed to decode audio chunk");
     }
-    return false;
+    return DecodeResult::FAILED;
 }
 
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
@@ -828,6 +834,12 @@ void SyncTask::discard_to_clear_marker(SyncContext& sync_context) {
     this->apply_stream_clear(sync_context);
 }
 
+void SyncTask::abandon_stream(SyncContext& sync_context) {
+    sync_context.decode_buffer.reset();
+    sync_context.decoder->reset_decoders();
+    sync_context.abandoned = true;
+}
+
 void SyncTask::release_held_item(SyncContext& sync_context) {
     void* item = std::exchange(sync_context.encoded_item, nullptr);
     if (item == nullptr) {
@@ -854,6 +866,7 @@ void SyncTask::reset_context(SyncContext& sync_context) {
     sync_context.hard_syncing = true;
     sync_context.aligning = true;
     sync_context.sync_lost = false;
+    sync_context.abandoned = false;
     sync_context.silence_remaining = 0;
 
     // Empty the decode buffer without deallocating
@@ -999,8 +1012,9 @@ void SyncTask::thread_entry(void* params) {
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
         // Decode the initial codec header
-        if (sync_context.encoded_item != nullptr) {
-            this_task->decode_chunk(sync_context);
+        if (sync_context.encoded_item != nullptr &&
+            this_task->decode_chunk(sync_context) == DecodeResult::ALLOCATION_FAILED) {
+            this_task->abandon_stream(sync_context);
         }
 
         SyncTaskState sync_state = SyncTaskState::INITIAL_SYNC;
@@ -1009,7 +1023,7 @@ void SyncTask::thread_entry(void* params) {
         while (true) {
             uint32_t flags = this_task->event_flags_.get();
             if ((flags & (COMMAND_STOP | COMMAND_STREAM_END)) != 0 ||
-                sync_context.next_header != nullptr) {
+                sync_context.next_header != nullptr || sync_context.abandoned) {
                 break;
             }
             if (flags & COMMAND_STREAM_CLEAR) {

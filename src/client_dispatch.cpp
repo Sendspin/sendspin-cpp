@@ -119,7 +119,7 @@ uint32_t SendspinClient::protocol_tick() {
         manager.shutdown();
     }
 
-    // 3. The newest client/state snapshot, sent to every admitted connection it changes.
+    // 3. The newest client/state snapshot, sent to every admitted connection that can take it.
     {
         ClientStateMessage snapshot;
         if (this->protocol_task_->take_state(snapshot)) {

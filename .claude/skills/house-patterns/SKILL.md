@@ -58,7 +58,8 @@ the descriptions in `docs/internals.md`:
   buffer, reports a close and wakes the protocol task. Connection state is
   touched only on the protocol task, except the transport's own atomics,
   documented at their declaration; any other thread reaches a connection
-  through the command queue.
+  through the command queue or, for a latest-wins lifecycle request, the
+  protocol task's request slot.
 - Every lock is a leaf: a second library lock taken under one, or a lock
   held across a send, a listener or the provider, is a finding. Every
   cross-thread member states its writer and reader threads.

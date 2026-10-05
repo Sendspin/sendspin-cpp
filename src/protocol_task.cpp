@@ -31,6 +31,11 @@ ProtocolTask::ProtocolTask(size_t server_max_connections)
     : accept_slots_(ACCEPT_SLOTS_PER_SOCKET * server_max_connections),
       capacity_(this->accept_slots_ + CONSUMER_COMMAND_BURST) {
     this->commands_ = std::make_unique<ProtocolCommand[]>(this->capacity_);
+    // Here rather than in start(): the client starts its connection manager, whose server can
+    // accept (and wake this task from a transport thread) before the task itself starts.
+    if (!this->event_flags_.create()) {
+        SS_LOGE(TAG, "Couldn't create the protocol task's event flags");
+    }
 }
 
 ProtocolTask::~ProtocolTask() {
@@ -43,8 +48,8 @@ bool ProtocolTask::start(Tick tick, size_t stack_size, unsigned priority, bool s
         SS_LOGW(TAG, "Protocol task already running");
         return false;
     }
-    if (!this->event_flags_.is_created() && !this->event_flags_.create()) {
-        SS_LOGE(TAG, "Couldn't create the protocol task's event flags");
+    if (!this->event_flags_.is_created()) {
+        SS_LOGE(TAG, "Protocol task has no event flags; not starting");
         return false;
     }
     // A restart inherits nothing: no stop or wake left over from the previous run.
@@ -111,8 +116,8 @@ void ProtocolTask::thread_entry(ProtocolTask* self) {
 }
 
 void ProtocolTask::wake() {
-    // The flags exist from the first start() on; nothing produces work for the task before the
-    // client that owns it has started.
+    // Created in the constructor, before any thread that wakes the task exists; a failed create
+    // leaves none to set, and start() then refuses to run the task.
     if (this->event_flags_.is_created()) {
         this->event_flags_.set(WORK_PENDING);
     }

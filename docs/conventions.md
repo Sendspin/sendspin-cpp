@@ -22,8 +22,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
   idempotent latest-wins request (`connect_to()`, `disconnect()`, `leave()`,
   the pairing-window gestures, an unpaired-access change), posting it to the
   protocol task's request slot, which never refuses; a command that the full
-  queue refuses is reported to the caller (`send_controller_command()`
-  returns false, and `ControllerRole::send_command()` with it) or
+  queue refuses is reported to the caller (`ControllerRole::send_command()`
+  returns false) or
   logged, never dropped silently. A connection refused at delivery is left with
   the transport that delivered it, which releases it after the delivery
   returns (on ESP, with its httpd session), so no refusal destroys a connection
@@ -102,8 +102,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
   (`SendspinClientConnection::CONNECT_TIMEOUT_MS`); a drop at the deadline, or
   of the entry parked longest when the list is full, pays a join bounded by
   what remains of the connect. Releasing a connection whose upgrade completed
-  pays the short stop of an open transport on the task (synchronous after a
-  goodbye). The task's tick returns the
+  pays the stop of an open transport on the task (synchronous after a
+  goodbye): on ESP up to the websocket task's one-second read poll on an idle
+  socket. The task's tick returns the
   time to its earliest deadline, or `ProtocolTask::NO_DEADLINE`, and never
   wakes on a fixed period. A transport's wait on the task is bounded too: an
   admitted connection waits at most `INBOUND_ACQUIRE_TIMEOUT_MS` for ring space

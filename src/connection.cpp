@@ -503,17 +503,25 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
     }
 
     if (!this->inbound_gate_.is_admitted()) {
-        if (len > InboundGate::PRE_ADMISSION_MESSAGE_BYTES) {
+        // An empty frame can never be a valid handshake or JSON message.
+        if (len == 0) {
+            return {nullptr, InboundRoute::DROP};
+        }
+        if (len <= InboundGate::PRE_ADMISSION_MESSAGE_BYTES) {
+            return this->route_to_fallback(len, kind, stamp, /*admitted=*/false);
+        }
+        // The message still pending may be the server/activate that admits this connection, so
+        // the cap is judged once the protocol task has consumed it.
+        const InboundRoute waited = this->wait_until_writable();
+        if (waited != InboundRoute::RECEIVE) {
+            return {nullptr, waited};
+        }
+        if (!this->inbound_gate_.is_admitted()) {
             SS_LOGW(TAG, "Pre-admission message of %zu bytes exceeds the %zu-byte cap; closing",
                     len, InboundGate::PRE_ADMISSION_MESSAGE_BYTES);
             this->fail_inbound();
             return {nullptr, InboundRoute::CLOSE};
         }
-        // An empty frame can never be a valid handshake or JSON message.
-        if (len == 0) {
-            return {nullptr, InboundRoute::DROP};
-        }
-        return this->route_to_fallback(len, kind, stamp, /*admitted=*/false);
     }
 
     if (len > INBOUND_MAX_MESSAGE_BYTES) {

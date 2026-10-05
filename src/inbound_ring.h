@@ -398,7 +398,10 @@ public:
     /// behind it.
     /// @param message_len Bytes after the header.
     /// @param timeout_ms As SharedRingBuffer::acquire(). The protocol task is the ring's only
-    ///        taker, so a wait here ends only on returns from the consumers.
+    ///        taker, so a wait here ends only on returns from the consumers. Reclamation is in
+    ///        ring order, so the wait can also be pinned by the message item the task is handling
+    ///        while it acquires (a stream/start's own item, returned only once its handler ends):
+    ///        with that item oldest and the ring otherwise full, the wait runs out.
     /// @return The item, or nullptr.
     void* acquire_local(size_t message_len, uint32_t timeout_ms);
 
@@ -413,10 +416,14 @@ public:
     ///         or the oldest item still being written.
     void* take(size_t* message_len, uint32_t timeout_ms);
 
-    /// @brief Returns every item still in the ring, so a restart begins empty, waiting for a
-    /// pending item's completion first. Call only once every producer has stopped (each acquired
-    /// item is then completed) and every holder has returned or recalled its items; the protocol
-    /// task is the caller or is joined.
+    /// @brief Returns every item still in the ring, supplying the protocol task's ring-order
+    /// return of each item it never took (the missing half of a LOCAL item's two returns), so
+    /// the client's shutdown settles every count before it destroys the ring
+    /// (SendspinClient::release_inbound_ring(); each start creates a fresh one). Waits for a
+    /// pending item's completion first, up to INBOUND_ACQUIRE_TIMEOUT_MS, and leaves the rest to
+    /// the ring's destruction when it never comes. Call only once every producer has stopped
+    /// (each acquired item is then completed) and every holder has returned or recalled its
+    /// items; the protocol task is the caller or is joined.
     void reset();
 
     /// @brief Assigns a taken item to a holder, recording the holder and the charge against its
@@ -766,25 +773,32 @@ public:
     static constexpr size_t PRE_ADMISSION_MESSAGE_BYTES =
         MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES;
 
-    /// Bound on the transport's wait_until_writable() before it closes an unadmitted connection,
-    /// which waits for the one message the protocol task is handling ahead of the pending one: the
-    /// Noise DH operations of a handshake message, or the INBOUND_ACQUIRE_TIMEOUT_MS waits for
-    /// ring space one message can make. A stream/start makes the most, three (the player's codec
-    /// header, the visualizer's marker and the artwork role's RECONFIGURE marker, 300 ms). An
-    /// artwork announce, cancel or stream/end makes one, as does an image part dropped over the
-    /// artwork quota (the DISCARD marker in its place) and the announce of an image over its cap
-    /// (the marker alone); an announce makes two only when handing the announce itself fails and
-    /// its marker follows. Every lock the task takes is a
-    /// leaf held for a copy, so nothing else stretches a message, and a task stalled beyond the
-    /// bound closes the waiting connection rather than parking the transport thread.
+    /// Bound on the transport's wait_until_writable() before it closes an unadmitted connection.
+    /// The protocol tick consumes a pending message in its receive step, so the wait can cover the
+    /// rest of a tick under way: its ring pass of up to MAX_ITEMS_PER_TICK items
+    /// (SendspinClient::protocol_tick()), more than one of which may wait, and the steps after it.
+    /// Most items hand over in microseconds; what waits is the Noise DH operations of a handshake
+    /// message and the INBOUND_ACQUIRE_TIMEOUT_MS waits for ring space a message can make. A
+    /// stream/start makes the most, three (the player's codec header, the visualizer's marker and
+    /// the artwork role's RECONFIGURE marker, 300 ms). An artwork announce, cancel or stream/end
+    /// makes one, as does an image part dropped over the artwork quota (the DISCARD marker in its
+    /// place) and the announce of an image over its cap (the marker alone); an announce makes two
+    /// only when handing the announce itself fails and its marker follows. The bound covers a
+    /// tick with a stream/start and two single-wait messages; a tick with more waits than that,
+    /// with the ring full and the role threads not draining it, closes the waiting connection.
+    /// Every lock the task takes is a leaf held for a copy, so nothing else stretches a tick, and
+    /// a task stalled beyond the bound closes the waiting connection rather than parking the
+    /// transport thread.
     static constexpr uint32_t WRITABLE_WAIT_MS = 500;
 
     InboundGate() {
         this->consumed_flags_.create();
     }
 
-    /// @brief Whether the gate's event group was created. Connection setup checks it and fails
-    /// closed: without it the transport has no way to wait for a consume.
+    /// @brief Whether the gate's event group was created. Connection setup refuses a connection
+    /// whose gate has none (ConnectionManager::on_new_connection() and connect_to()), leaving it
+    /// unattached so its transport drops what it receives: without the group the transport has no
+    /// way to wait for a consume.
     bool is_created() const {
         return this->consumed_flags_.is_created();
     }
@@ -890,10 +904,14 @@ public:
     // ---- Detach ----
 
     /// @brief Records that nothing reads this connection any more and wakes a transport waiting
-    /// in wait_until_writable(). Never cleared.
+    /// in wait_until_writable(). Never cleared. The one gate call a connection refused for a
+    /// missing event group still reaches (its transport failing it), so it sets no bit without
+    /// the group.
     void detach() {
         this->detached_.store(true, std::memory_order_release);
-        this->consumed_flags_.set(CONSUMED);
+        if (this->consumed_flags_.is_created()) {
+            this->consumed_flags_.set(CONSUMED);
+        }
     }
 
     bool is_detached() const {

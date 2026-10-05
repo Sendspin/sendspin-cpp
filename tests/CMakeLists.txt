@@ -96,9 +96,11 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # release no tick follows shows whether the release itself destroyed the connection, then
 # restarts the protocol task (protocol_task_->start()) for the request it takes from another
 # thread; its sibling for an opened connection reads the same two members around a release. The
-# full queue table seeds the controller's supported_commands word (stamped with its
-# cleanup_generation) so a send_command() reaches the queue, reads cleanup_generation for the stamp
-# a direct send_controller_command() carries and moves it on for the row whose command was
+# reaping-capacity test parks stand-ins directly (park_for_reaping(), REAPING_CAPACITY) and reads
+# reaping_, since no public call fills the list faster than a reap pass empties it. The full queue table seeds the controller's
+# supported_commands word (stamped with its cleanup_generation) so a send_command() reaches the
+# queue, reads cleanup_generation for the stamp a direct call of the private
+# send_controller_command() carries and moves it on for the row whose command was
 # validated before a teardown, as cleanup() would without the rest of a teardown, turns the
 # liveness check off (liveness_timeout_us_) so its stand-in's silence does not close it, closes
 # admission
