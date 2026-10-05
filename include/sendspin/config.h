@@ -278,11 +278,16 @@ struct SendspinClientConfig {
     /// @brief Default protocol task stack size in bytes (ESP-IDF only). The protocol task runs
     /// every Noise handshake (X25519, SHA-256), the pairing exchange (CPace, SHA-512, HMAC), the
     /// JSON parse, the role handlers and every send. Deepest chain from the task entry, noise-c and
-    /// libsodium included: 6,352 bytes at -Os and 6,576 at -Og, a pairing confirm whose handler
-    /// drops an outbound connection whose goodbye send fails, which the graph follows from the
-    /// websocket client's error event into the library's event handler, its frame receive and
-    /// fail_inbound()'s close into the shared tail. 6,576 + 384 = 6,960, rounded up (see the task
-    /// stack derivation above).
+    /// libsodium included, as the tool bounds it: 6,560 bytes at -Os and 6,832 at -Og. That
+    /// includes a tail that cannot execute: an esp_websocket_client send error dispatches the
+    /// event loop in the caller, which the graph follows into the library's event handler,
+    /// handle_data() and fail_inbound(), whose virtual close it resolves to the server
+    /// connection's override (httpd_sess_trigger_close), though an outbound connection never
+    /// reaches it. The deepest reachable chain is 6,352 / 6,576, a pairing confirm whose handler
+    /// drops an outbound connection whose goodbye send fails, through the same event handler and
+    /// the client connection's close into the shared tail. 6,576 + 384 = 6,960, rounded up, which
+    /// keeps the default at 7,168; the conservative-bounds paragraph of the task stack derivation
+    /// above covers the unreachable tail.
     static constexpr size_t DEFAULT_PROTOCOL_TASK_STACK_SIZE = 7168U;
 
     size_t protocol_task_stack_size{
