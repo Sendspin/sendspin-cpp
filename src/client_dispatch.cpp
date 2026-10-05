@@ -96,11 +96,9 @@ uint32_t SendspinClient::protocol_tick() {
     // 1. The lifecycle requests posted since the last tick, then the commands in the order they
     //    were queued. A request and a command arriving between the same two ticks are not
     //    ordered against each other, since a request is a slot rather than a queue entry; the
-    //    requests go first. A send queued ahead of a disconnect() is therefore dropped, since the
-    //    disconnect detaches the connection it addresses (ConnectionManager::role_send_target()),
-    //    while an accept queued ahead of it still enters the nursery: a disconnect addresses the
-    //    connections it finds, not a newcomer. Each command's connection is released as the next
-    //    take replaces it.
+    //    requests go first. A send queued ahead of a disconnect() finds its connection dropped;
+    //    an accept queued ahead of it still enters the nursery. Each command's connection is
+    //    released as the next take replaces it.
     {
         LifecycleRequests requests;
         if (this->protocol_task_->take_requests(requests)) {

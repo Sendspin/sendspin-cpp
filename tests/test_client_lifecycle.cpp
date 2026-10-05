@@ -1383,6 +1383,8 @@ public:
             this->events.emplace_back("command");
         } else if (msg.find("client/state") != std::string::npos) {
             this->events.emplace_back("state");
+        } else if (msg.find("client/init") != std::string::npos) {
+            this->events.emplace_back("init");
         }
         return SsErr::OK;
     }
@@ -1428,6 +1430,7 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
         LEAVE,
         DISCONNECT,
         DISCONNECT_AGAIN,
+        DISCONNECT_ON_TASK,
         UNPAIRED_OFF,
         CONNECT,
         SEND_COMMAND,
@@ -1529,6 +1532,11 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
          {Call::DISCONNECT, Call::CLOSE_ADMISSION},
          false,
          {goodbye_event(SendspinGoodbyeReason::SHUTDOWN)}},
+        {"a disconnect applied before admission closed: no second goodbye at the final tick",
+         false,
+         {Call::DISCONNECT_ON_TASK, Call::CLOSE_ADMISSION},
+         false,
+         {user_goodbye}},
     };
     const ClientCommandControllerObject play{.command = SendspinControllerCommand::PLAY};
     for (const Row& row : rows) {
@@ -1589,6 +1597,10 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
                 case Call::DISCONNECT_AGAIN:
                     client.disconnect(SendspinGoodbyeReason::ANOTHER_SERVER);
                     break;
+                case Call::DISCONNECT_ON_TASK:
+                    // The task applying a disconnect before admission closes.
+                    manager.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+                    break;
                 case Call::UNPAIRED_OFF:
                     client.set_unpaired_access_enabled(false);
                     break;
@@ -1632,6 +1644,70 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
         client.stop();
         EXPECT_FALSE(client.send_controller_command(play, current_stamp()))
             << "a stopped client refuses";
+    }
+}
+
+// A disconnect frees the nursery slots it goodbyes before the accept queued with it is taken.
+// The nursery holds connected inbound stand-ins whose client/init went out, as accept() leaves
+// one; one tick takes the posted disconnect and the queued accept, requests first. The test
+// thread plays the protocol task. An admitted newcomer is sent client/init, a refused one a
+// goodbye. The no-disconnect control keeps the capacity check live.
+TEST(ClientLifecycle, AnAcceptBehindADisconnectFindsTheNurserySlotsItFreed) {
+    struct Row {
+        const char* name;
+        size_t occupants;
+        bool disconnect;
+        bool admitted;
+    };
+    const Row rows[] = {
+        {"a full nursery behind a disconnect: admitted", ConnectionManager::NURSERY_CAPACITY, true,
+         true},
+        {"Control: a full nursery with no disconnect: refused", ConnectionManager::NURSERY_CAPACITY,
+         false, false},
+        {"Control: room in the nursery behind a disconnect: admitted",
+         ConnectionManager::NURSERY_CAPACITY - 1, true, true},
+    };
+    const std::string user_goodbye = goodbye_event(SendspinGoodbyeReason::USER_REQUEST);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+
+        std::vector<std::shared_ptr<RecordingConnection>> occupants;
+        for (size_t i = 0; i < row.occupants; ++i) {
+            auto occupant = std::make_shared<RecordingConnection>();
+            // Inside its establish window, as accept() starts it, so the nursery scan keeps it.
+            occupant->set_provisional_time_us(platform_time_us());
+            manager.nursery_.push_back(NurseryEntry{.conn = occupant, .client_init_sent = true});
+            occupants.push_back(occupant);
+        }
+        if (row.disconnect) {
+            client.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+        }
+        auto newcomer = std::make_shared<RecordingConnection>();
+        // What the delivery sets before it queues the accept, for the client/init accept() sends.
+        newcomer->set_json_arena(manager.json_arena());
+        ProtocolCommand command;
+        command.type = ProtocolCommandType::ACCEPT_CONNECTION;
+        command.connection = newcomer;
+        ASSERT_TRUE(client.protocol_task_->push_command(std::move(command)));
+
+        (void) client.protocol_tick();
+        const std::vector<std::string> newcomer_events =
+            row.admitted
+                ? std::vector<std::string>{"init"}
+                : std::vector<std::string>{goodbye_event(SendspinGoodbyeReason::ANOTHER_SERVER)};
+        EXPECT_EQ(newcomer->events, newcomer_events);
+        for (const auto& occupant : occupants) {
+            EXPECT_EQ(occupant->events, row.disconnect ? std::vector<std::string>{user_goodbye}
+                                                       : std::vector<std::string>{});
+        }
+
+        client.stop();
     }
 }
 

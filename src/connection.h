@@ -114,10 +114,10 @@ public:
     }
 
     /// @brief Whether an application message may still be sent: the transport is connected and
-    /// the connection is not detached. A connection the manager releases (disconnect(), a drop)
-    /// is detached before its goodbye while its transport can still read as connected (the ESP
-    /// server's closed flag is set by httpd asynchronously), so this keeps a message the task
-    /// sends later from reaching the wire after the goodbye. Protocol task only.
+    /// the connection is not detached. A connection the manager releases is detached before its
+    /// goodbye while its transport can still read as connected (the ESP server's closed flag is
+    /// set by httpd asynchronously), so this keeps a later send off the wire after the goodbye.
+    /// Protocol task only.
     bool accepts_app_sends() const {
         return this->is_connected() && !this->inbound_gate_.is_detached();
     }

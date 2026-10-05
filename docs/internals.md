@@ -101,9 +101,8 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
    shutdown goodbye once admission is closed; controller commands, dropped once admission is
    closed or when a teardown has moved the controller's generation past the stamp the command
    was validated under. Requests go before the commands queued in the same window, so a send
-   queued before a disconnect finds its connection detached and is dropped, while an accept
-   queued before it still enters the nursery: a disconnect addresses the connections it finds,
-   not a newcomer
+   queued before a disconnect finds its connection dropped, while an accept queued before it
+   still enters the nursery: a disconnect addresses the connections it finds, not a newcomer
 2. Once admission is closed: the shutdown pass (ConnectionManager::shutdown())
 3. The newest client/state snapshot, sent to every admitted connection; its availability
    gates player audio in step 5

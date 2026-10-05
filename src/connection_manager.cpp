@@ -456,30 +456,25 @@ void ConnectionManager::connect_to(const std::string& url) {
 }
 
 void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
-    // The connected connections stay in their slots until the loss pass sees their detached gates
-    // (or the manager is stopped). An unconnected (pre-upgrade) nursery entry has no transport to
-    // goodbye and yields no close while its attempt runs, so it is released here, parked until
-    // its transport finishes (release_connection()), rather than left for the establish deadline.
-    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> to_disconnect;
+    // Collect, then drop: drop_connection() edits the slots being walked. An unconnected nursery
+    // entry (an attempt still connecting, or one whose transport is gone) yields no close, so it
+    // is released here rather than left for the establish deadline.
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> to_drop;
     for (const auto& entry : this->admitted_) {
         if (entry.conn != nullptr && entry.conn->is_connected()) {
-            to_disconnect.push_back(entry.conn);
+            to_drop.push_back(entry.conn);
         }
     }
     for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
         if (it->conn->is_connected()) {
-            to_disconnect.push_back(it->conn);
+            to_drop.push_back(it->conn);
             ++it;
         } else {
             it = this->release_nursery_entry(it, std::nullopt);
         }
     }
-    // Detached before the goodbye, as release_connection() does: an outbound connection's
-    // disconnect() joins its transport thread, which must not be parked waiting on this task
-    // (InboundGate::wait_until_writable() or a ring acquire) while the join waits for it.
-    for (auto& conn : to_disconnect) {
-        conn->detach_inbound();
-        conn->disconnect(reason);
+    for (const auto& conn : to_drop) {
+        this->drop_connection(conn.get(), reason);
     }
 }
 
@@ -876,8 +871,8 @@ void ConnectionManager::on_pairing_succeeded(SendspinConnection* conn) {
 
 void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
     if (this->find_admitted(conn) != nullptr) {
-        // Every close the client makes (a disconnect(), a protocol error it logged) detaches the
-        // gate first; a loss the peer caused reaches this pass with the gate attached.
+        // A close the client makes without a drop (close_silently(), fail_inbound()) detaches
+        // the gate first; a loss the peer caused arrives with it attached.
         if (conn->inbound_gate().is_detached()) {
             SS_LOGD(TAG, "Admitted connection closed by the client");
         } else {
