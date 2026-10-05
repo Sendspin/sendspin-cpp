@@ -133,8 +133,26 @@ public:
         message.len = len;
         message.receive_time_us = static_cast<uint32_t>(receive_time);
         message.kind = kind;
-        this->process_inbound_message(message);
+        InboundMessage complete;
+        switch (this->process_inbound_message(message, complete)) {
+            case InboundDispatch::NONE:
+                break;
+            case InboundDispatch::JSON:
+                if (this->on_json) {
+                    this->on_json(reinterpret_cast<const char*>(complete.data), complete.len);
+                }
+                break;
+            case InboundDispatch::BINARY:
+                if (this->on_binary) {
+                    this->on_binary(complete);
+                }
+                break;
+        }
     }
+
+    /// Stand-ins for the client's dispatch of the complete message.
+    std::function<void(const char* data, size_t len)> on_json;
+    std::function<void(InboundMessage& message)> on_binary;
 
     /// Install a noise session directly (bypasses handshake, for transport-only tests).
     void set_noise_session(std::unique_ptr<NoiseSession> session) {
@@ -445,7 +463,7 @@ TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
 
 TEST(NoiseTransport, ReceiveEncryptedBinary_JsonDispatch) {
     // Verify that a binary WS frame encrypted by the initiator is
-    // correctly decrypted and dispatched to on_json_message_cb.
+    // correctly decrypted and dispatched as JSON.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
 
@@ -472,8 +490,7 @@ TEST(NoiseTransport, ReceiveEncryptedBinary_JsonDispatch) {
 
     // Wire up a JSON dispatch callback
     std::string dispatched_json;
-    conn.on_json_message_cb = [&dispatched_json](SendspinConnection& /*c*/, const char* data,
-                                                  size_t len, int64_t /*ts*/) {
+    conn.on_json = [&dispatched_json](const char* data, size_t len) {
         dispatched_json = std::string(data, len);
     };
 
@@ -805,13 +822,11 @@ class FragmentReceiver {
 public:
     explicit FragmentReceiver(LoopbackResult& r) : server_send_(r.initiator.send_cs) {
         this->conn_.set_noise_session(std::move(r.responder_session));
-        this->conn_.on_json_message_cb = [this](SendspinConnection& /*c*/, const char* d, size_t n,
-                                                int64_t /*t*/) {
+        this->conn_.on_json = [this](const char* d, size_t n) {
             ++this->json_dispatched_;
             this->last_message_.assign(d, d + n);
         };
-        this->conn_.on_binary_message_cb = [this](SendspinConnection& /*c*/,
-                                                  InboundMessage& message) {
+        this->conn_.on_binary = [this](InboundMessage& message) {
             ++this->binary_dispatched_;
             this->last_message_.assign(message.data, message.data + message.len);
         };
@@ -887,6 +902,55 @@ TEST(FragmentSequence, MultiFragmentMessageDispatchesOnTheLastFragment) {
     EXPECT_EQ(rx.last_message_,
               (std::vector<uint8_t>{SENDSPIN_BINARY_PLAYER_AUDIO, 0x01, 0x02, 0x03}));
     EXPECT_FALSE(rx.closed());
+}
+
+// Which of `message` and `complete` holds the received ring item after process_inbound_message().
+// The item is a sentinel no ring sees; only its owner is under test.
+TEST(FragmentSequence, CompleteMessageCarriesTheRingItemOnlyWhenItIsTheReceivedFrame) {
+    struct Row {
+        const char* name;
+        /// Frames fed before the one carrying the item, through the item-less inject path.
+        std::vector<std::vector<uint8_t>> preamble;
+        std::vector<uint8_t> last_frame;
+        SendspinConnection::InboundDispatch expected_dispatch;
+        bool complete_holds_item;
+    };
+    const std::vector<Row> rows = {
+        {"single-frame binary", {}, {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA},
+         SendspinConnection::InboundDispatch::BINARY, true},
+        {"reassembled binary",
+         {{MSG_TYPE_FRAGMENT, FRAGMENT_FLAG_FIRST, SENDSPIN_BINARY_PLAYER_AUDIO, 0x01}},
+         {MSG_TYPE_FRAGMENT, FRAGMENT_FLAG_LAST, 0x02},
+         SendspinConnection::InboundDispatch::BINARY, false},
+        {"single-frame empty JSON body", {}, {MSG_TYPE_JSON_BODY},
+         SendspinConnection::InboundDispatch::NONE, true},
+    };
+
+    int sentinel_storage = 0;
+    void* const sentinel = &sentinel_storage;
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+        FragmentReceiver rx(*r);
+        for (const auto& frame : row.preamble) {
+            rx.inject(frame);
+        }
+
+        std::vector<uint8_t> ct = raw_encrypt(rx.server_send_, row.last_frame);
+        ASSERT_FALSE(ct.empty());
+        InboundMessage message;
+        message.item = sentinel;
+        message.data = ct.data();
+        message.len = ct.size();
+        message.kind = InboundKind::BINARY;
+        InboundMessage complete;
+        EXPECT_EQ(rx.conn_.process_inbound_message(message, complete), row.expected_dispatch);
+
+        EXPECT_FALSE(rx.closed());
+        EXPECT_EQ(complete.item, row.complete_holds_item ? sentinel : nullptr);
+        EXPECT_EQ(message.item, row.complete_holds_item ? nullptr : sentinel);
+    }
 }
 
 // messaging.md "Fragmentation" lists the sequences a receiver must treat as malformed. Each row
@@ -1268,8 +1332,7 @@ static void run_fragment_reassemble_receive(const std::string& suite) {
 
     std::string received;
     int calls = 0;
-    conn.on_json_message_cb = [&received, &calls](SendspinConnection& /*c*/, const char* d,
-                                                  size_t n, int64_t /*t*/) {
+    conn.on_json = [&received, &calls](const char* d, size_t n) {
         received.assign(d, n);
         ++calls;
     };
@@ -1314,10 +1377,8 @@ TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     conn.set_noise_session(std::move(r->responder_session));
 
     int calls = 0;
-    conn.on_json_message_cb = [&calls](SendspinConnection& /*c*/, const char* /*d*/, size_t /*n*/,
-                                       int64_t /*t*/) { ++calls; };
-    conn.on_binary_message_cb = [&calls](SendspinConnection& /*c*/,
-                                         InboundMessage& /*message*/) { ++calls; };
+    conn.on_json = [&calls](const char* /*d*/, size_t /*n*/) { ++calls; };
+    conn.on_binary = [&calls](InboundMessage& /*message*/) { ++calls; };
 
     std::string json = "{\"x\":1}";
     std::vector<uint8_t> pt;
@@ -1348,8 +1409,7 @@ TEST(NoiseTransport, CleartextFrameInTransportModeClosesSilently) {
     TestConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
     int calls = 0;
-    conn.on_json_message_cb = [&calls](SendspinConnection& /*c*/, const char* /*d*/, size_t /*n*/,
-                                       int64_t /*t*/) { ++calls; };
+    conn.on_json = [&calls](const char* /*d*/, size_t /*n*/) { ++calls; };
 
     conn.inject_text_payload(R"({"type":"server/state","payload":{}})");
 

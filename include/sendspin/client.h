@@ -818,9 +818,10 @@ private:
     /// @brief Acts on one command from the queue. Protocol task only.
     void handle_command(ProtocolCommand& command);
 
-    /// @brief Runs one of a connection's messages through the receive path and returns its ring
-    /// item unless a role kept it. Resets json_arena_ first (the only reset), so it is called only
-    /// from the tick's top level, with no arena document live. Protocol task only.
+    /// @brief Runs one of a connection's messages through the receive path and dispatch, and
+    /// returns its ring item unless a role kept it. Resets json_arena_ first (the only reset), so
+    /// it is called only from the tick's top level, with no arena document live. Protocol task
+    /// only.
     void process_inbound(SendspinConnection& conn, InboundMessage& message);
 
     /// @brief Builds the formatted client hello message from config. Protocol task.

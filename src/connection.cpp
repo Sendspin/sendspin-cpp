@@ -243,7 +243,7 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
 }
 
 bool SendspinConnection::handle_noise_rehandshake(const std::vector<uint8_t>& msg1_bytes) {
-    // Runs on the protocol task (dispatched from the JSON callback for a decrypted
+    // Runs on the protocol task (from SendspinClient::process_json_message() for a decrypted
     // "noise/handshake" message, itself only reachable post-COMPLETE, so this always runs on
     // the same thread as the decrypt path, sequential with it and never concurrent).
     if (!this->noise_transport_.is_active()) {
@@ -315,41 +315,35 @@ bool SendspinConnection::handle_noise_rehandshake(const std::vector<uint8_t>& ms
     return true;
 }
 
-void SendspinConnection::dispatch_complete_noise_message(InboundMessage& message) {
-    // A complete (non-fragment, fully reassembled) transport message. data[0] is the message
-    // type; fragment types never reach here.
-    const uint8_t type_byte = message.data[0];
-
-    if (type_byte == MSG_TYPE_JSON_BODY) {
+SendspinConnection::InboundDispatch SendspinConnection::classify_complete_noise_message(
+    InboundMessage& complete) {
+    // data[0] is the message type; fragment types never reach here.
+    if (complete.data[0] == MSG_TYPE_JSON_BODY) {
         // Type 0: JSON control body, routed without the type byte. A frame carrying only
         // the type byte (no body) is a malformed/empty JSON message; drop it.
-        if (message.len < 2) {
+        if (complete.len < 2) {
             SS_LOGW(TAG, "empty JSON body after Noise decrypt; dropping");
-            return;
+            return InboundDispatch::NONE;
         }
-        if (this->on_json_message_cb) {
-            this->on_json_message_cb(
-                *this, reinterpret_cast<const char*>(message.data + 1), message.len - 1,
-                widen_time_stamp_us(message.receive_time_us, platform_time_us()));
-        }
-        return;
+        ++complete.data;
+        --complete.len;
+        return InboundDispatch::JSON;
     }
 
     // All other types: route as binary role message (full type-prefixed plaintext).
-    if (this->on_binary_message_cb) {
-        this->on_binary_message_cb(*this, message);
-    }
+    return InboundDispatch::BINARY;
 }
 
 // ============================================================================
 // Inbound messages: protocol task side
 // ============================================================================
 
-SS_HOT void SendspinConnection::process_inbound_message(InboundMessage& message) {
+SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_message(
+    InboundMessage& message, InboundMessage& complete) {
     // A connection closed or dropped stops dispatching at once, including frames already
     // received before the close was decided.
     if (this->inbound_gate_.is_detached()) {
-        return;
+        return InboundDispatch::NONE;
     }
     // Every application frame is BINARY ciphertext: decrypt, reassemble, and read the message
     // type from the leading plaintext byte. Cleartext TEXT frames carry only the pre-transport
@@ -365,17 +359,17 @@ SS_HOT void SendspinConnection::process_inbound_message(InboundMessage& message)
             // Feed the handshake driver; it handles server/init and noise/handshake frames.
             this->handle_noise_handshake_text(
                 std::string(reinterpret_cast<const char*>(message.data), message.len));
-            return;
+            return InboundDispatch::NONE;
         }
         if (noise_active) {
             // connection.md "Failure Handling": a cleartext message after the switch to transport
             // mode is a silent failure.
             SS_LOGW(TAG, "TEXT frame in transport mode; closing connection");
             this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
-            return;
+            return InboundDispatch::NONE;
         }
         SS_LOGW(TAG, "TEXT frame before the Noise handshake started; dropping");
-        return;
+        return InboundDispatch::NONE;
     }
 
     if (!noise_active) {
@@ -387,10 +381,10 @@ SS_HOT void SendspinConnection::process_inbound_message(InboundMessage& message)
             // per connection.md "Failure Handling": close without any application-level message.
             SS_LOGW(TAG, "Binary frame before the Noise handshake completed; closing connection");
             this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
-            return;
+            return InboundDispatch::NONE;
         }
         SS_LOGW(TAG, "Binary frame before the Noise handshake started; dropping");
-        return;
+        return InboundDispatch::NONE;
     }
 
     // Decrypt in place: the message holds the full ciphertext (plaintext + 16-byte tag), in the
@@ -403,36 +397,36 @@ SS_HOT void SendspinConnection::process_inbound_message(InboundMessage& message)
         // on this connection would fail authentication forever too.
         SS_LOGW(TAG, "Noise AEAD failure in transport mode; closing connection");
         this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
-        return;
+        return InboundDispatch::NONE;
     }
-    // Route through the fragment state machine; dispatch any completed message.
-    NoiseTransport::CompleteMessage complete = this->noise_transport_.accept_plaintext(
+    // Route through the fragment state machine; hand any completed message to the caller.
+    const NoiseTransport::CompleteMessage reassembled = this->noise_transport_.accept_plaintext(
         message.data, pt_len, this->inbound_gate_.is_admitted());
-    if (complete.malformed) {
+    if (reassembled.malformed) {
         // messaging.md "Malformed sequences" is a protocol error the receiver MUST close the
         // connection for; NoiseTransport::CompleteMessage::malformed enumerates the sequences
         // that set it.
         SS_LOGW(TAG, "Malformed fragment sequence; closing connection");
         this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
-        return;
+        return InboundDispatch::NONE;
     }
-    if (complete.data == nullptr) {
-        return;
+    if (reassembled.data == nullptr) {
+        return InboundDispatch::NONE;
     }
-    if (complete.data == message.data) {
-        // A single-frame message: it is the plaintext in place, still in its ring item.
-        message.len = complete.len;
-        this->dispatch_complete_noise_message(message);
-        return;
+    if (reassembled.data == message.data) {
+        // A single-frame message: the plaintext in place, in its ring item.
+        complete = message;
+        complete.len = reassembled.len;
+        message.item = nullptr;
+    } else {
+        // A reassembled message, in the Noise reassembly buffer.
+        complete = InboundMessage{};
+        complete.data = reassembled.data;
+        complete.len = reassembled.len;
+        complete.receive_time_us = message.receive_time_us;
+        complete.kind = InboundKind::BINARY;
     }
-    // A reassembled message lives in the Noise reassembly buffer, not in a ring item; the frame
-    // that completed it (message.item) is the caller's to return.
-    InboundMessage reassembled;
-    reassembled.data = complete.data;
-    reassembled.len = complete.len;
-    reassembled.receive_time_us = message.receive_time_us;
-    reassembled.kind = InboundKind::BINARY;
-    this->dispatch_complete_noise_message(reassembled);
+    return classify_complete_noise_message(complete);
 }
 
 bool SendspinConnection::pending_message(InboundMessage& out) {

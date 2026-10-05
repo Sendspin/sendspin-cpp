@@ -237,13 +237,14 @@ Transport thread (IXWebSocket / esp_http_server / esp_websocket_client)
          │
 Protocol task: SendspinClient::protocol_tick()
   ├─ per connection: its pending fallback message, once its earlier ring items are taken
-  └─ ring items in arrival order → SendspinConnection::process_inbound_message()
+  └─ ring items in arrival order
+     → both through SendspinClient::process_inbound() → SendspinConnection::process_inbound_message()
      ├─ detached connection → dropped (teardown guard)
      ├─ Text frame → handshake driver only (server/init, noise/handshake)
      └─ Binary frame → Noise transport active?
         ├─ no  → refused
         └─ yes → decrypt in place, reassemble Noise-level fragments (copied)
-                 └─ dispatch_complete_noise_message() routes on the plaintext type byte:
+                 └─ SendspinClient::process_inbound() dispatches on the plaintext type byte:
                     ├─ MSG_TYPE_JSON_BODY → SendspinClient::process_json_message()
                     └─ other → SendspinClient::process_binary_message(), which hands
                        a player, visualizer or artwork part message over in its ring item

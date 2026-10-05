@@ -330,7 +330,7 @@ bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
     conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
     conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
     conn->set_json_arena(this->json_arena());
-    this->setup_connection_callbacks(conn.get());
+    conn->attach_inbound(this->client_->inbound_ring_.get(), this->client_->protocol_task_.get());
 
     ProtocolCommand command;
     command.type = ProtocolCommandType::ACCEPT_CONNECTION;
@@ -413,16 +413,10 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
     client_conn->set_json_arena(this->json_arena());
 
-    // Wired before start(): the transport may deliver from its own thread as soon as it runs.
-    this->setup_connection_callbacks(client_conn.get());
-    // Only outbound transports fire this, on the transport thread, once the WebSocket upgrade is
-    // complete; the protocol task starts the Noise handshake on its next tick
-    // (start_upgraded_handshakes()). It can run during the destructor's transport join, so it
-    // touches only the connection it is handed.
-    client_conn->on_connected_cb = [](SendspinConnection* c) {
-        c->mark_ws_upgraded();
-        c->wake_protocol_task();
-    };
+    // Attached before start(): the transport may deliver, or report its upgrade, from its own
+    // thread as soon as it runs.
+    client_conn->attach_inbound(this->client_->inbound_ring_.get(),
+                                this->client_->protocol_task_.get());
 
     client_conn->init_time_filter();
     client_conn->time_burst().configure(this->client_->config_.time_burst_size,
@@ -929,7 +923,7 @@ void ConnectionManager::snapshot_connections(ConnectionSnapshot& out) const {
 }
 
 void ConnectionManager::start_upgraded_handshakes() {
-    // Level-triggered on the upgrade flag the transport sets (on_connected_cb), so a wake that
+    // Level-triggered on the upgrade flag the transport sets (mark_ws_upgraded()), so a wake that
     // carried several upgrades, or one that raced the previous tick, is never missed. An inbound
     // entry sent its client/init at accept().
     for (auto& entry : this->nursery_) {
@@ -1391,18 +1385,6 @@ uint32_t ConnectionManager::scan_admitted(int64_t now_us) {
 
 SendspinArenaAllocator& ConnectionManager::json_arena() const {
     return *this->client_->json_arena_;
-}
-
-void ConnectionManager::setup_connection_callbacks(SendspinConnection* conn) {
-    // Both run on the protocol task (SendspinConnection::process_inbound_message()).
-    conn->on_json_message_cb = [this](SendspinConnection& c, const char* data, size_t len,
-                                      int64_t timestamp) {
-        this->client_->process_json_message(c, data, len, timestamp);
-    };
-    conn->on_binary_message_cb = [this](SendspinConnection& c, InboundMessage& message) {
-        this->client_->process_binary_message(c, message);
-    };
-    conn->attach_inbound(this->client_->inbound_ring_.get(), this->client_->protocol_task_.get());
 }
 
 void ConnectionManager::start_noise_handshake(NurseryEntry& entry) {

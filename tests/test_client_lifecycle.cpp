@@ -1273,11 +1273,10 @@ TEST(ClientLifecycle, AReleasedAttemptStillConnectingIsReapedOffTheProtocolTask)
 // upgrade completed is released in place, since its destructor's stop is the short close of an
 // open transport and no platform reports the close of one stopped that way, and a parked attempt
 // that opens is dropped by the next tick instead of being held to its deadline. The upgrade is
-// staged by marking it (mark_ws_upgraded(), what the transport's Open does through
-// on_connected_cb) once the listener has taken the attempt's TCP connection, so IXWebSocket is
-// inside its handshake and the destructor's close cancels it at once. The test thread plays the
-// protocol task, so nothing ticks between the steps it inspects. Control: an attempt still
-// connecting is parked.
+// staged by marking it (mark_ws_upgraded(), what the transport's Open does) once the listener has
+// taken the attempt's TCP connection, so IXWebSocket is inside its handshake and the destructor's
+// close cancels it at once. The test thread plays the protocol task, so nothing ticks between the
+// steps it inspects. Control: an attempt still connecting is parked.
 TEST(ClientLifecycle, AnOpenedOutboundConnectionIsNotHeldForReaping) {
     enum class Step : uint8_t { OPENED_THEN_RELEASED, RELEASED_THEN_OPENED, STILL_CONNECTING };
     struct Row {
