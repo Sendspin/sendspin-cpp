@@ -642,7 +642,7 @@ public:
 
     /// @brief Returns an item to the ring. The consumer thread once it has taken an item; the
     /// protocol task for an item hand() refuses over quota.
-    void return_item(void* item) {
+    void return_item(void* item) const {
         this->ring()->return_item(item);
     }
 

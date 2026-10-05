@@ -33,7 +33,7 @@
    "sym:^uart_write$"
   ],
   "crypto_scalarmult_curve25519": [
-   "crypto_scalarmult_curve25519_ref10$part$0"
+   "crypto_scalarmult_curve25519_ref10"
   ],
   "esp_event_loop_run": [
    "sym:SendspinClientConnection23websocket_event_handler"
@@ -128,12 +128,11 @@
    "httpd_default_send"
   ],
   "httpd_ws_send_frame_async": [
-   "httpd_ws_send_frame_to",
    "httpd_default_send"
   ],
   "int64_t sendspin::SendspinConnection::send_time_message()": [
    "SendspinServerConnection::send_transport_frame(",
-   "SendspinClientConnection::send_transport_frame(",
+   "SendspinConnection::send_transport_frame(",
    "SendspinServerConnection::send_binary_message(",
    "SendspinClientConnection::send_binary_message("
   ],
@@ -197,17 +196,21 @@
   ],
   "sendspin::NoiseTransport::encrypt_and_send_frame(": [
    "SendspinServerConnection::send_transport_frame(",
-   "SendspinClientConnection::send_transport_frame("
+   "SendspinConnection::send_transport_frame("
   ],
   "sendspin::NoiseTransport::fragment_and_send(": [
    "SendspinServerConnection::send_transport_frame(",
-   "SendspinClientConnection::send_transport_frame("
+   "SendspinConnection::send_transport_frame("
   ],
   "sendspin::SendspinConnection::send_app_json(const char*": [
    "SendspinServerConnection::send_binary_message(",
    "SendspinClientConnection::send_binary_message(",
    "SendspinServerConnection::send_transport_frame(",
-   "SendspinClientConnection::send_transport_frame("
+   "SendspinConnection::send_transport_frame("
+  ],
+  "sendspin::SendspinConnection::send_transport_frame(": [
+   "SendspinServerConnection::send_binary_message(",
+   "SendspinClientConnection::send_binary_message("
   ],
   "sendspin::TimeBurstResult sendspin::SendspinTimeBurst::loop(": [
    "int64_t sendspin::SendspinConnection::send_time_message()"

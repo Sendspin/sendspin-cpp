@@ -52,8 +52,12 @@ public:
     /// The whole connect: esp_transport_connect() runs the TCP connect, the upgrade request's
     /// write and the read of its response, each bounded by NETWORK_TIMEOUT_MS, and
     /// esp_websocket_client_stop() cannot interrupt it. The DNS lookup before them
-    /// (getaddrinfo()) has no bound of its own, so a drop at the deadline still pays whatever a
-    /// slow lookup added, in the destructor's stop, which waits for the websocket task to exit.
+    /// (getaddrinfo()) is not under that timeout but under lwIP's resolver, which gives up on a
+    /// server after 7 s (DNS_MAX_RETRIES of 4 at DNS_TMR_INTERVAL ticks of 1 s, waiting 1, 1, 2
+    /// and 3 ticks) and tries each configured one in turn (CONFIG_LWIP_DNS_MAX_SERVERS, 3 by
+    /// default; an mDNS query tries once). So a drop at the deadline still pays up to that
+    /// resolver bound, about 21 s by default, in the destructor's stop, which waits for the
+    /// websocket task to exit.
     /// The handle is not handed to esp_websocket_client_destroy_on_exit() instead: the event
     /// handler registered on it takes this connection as its argument, so the handle must not
     /// outlive the connection, and nothing short of a stop ends the attempt early.

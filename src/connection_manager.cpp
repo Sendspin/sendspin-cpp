@@ -1310,7 +1310,9 @@ uint32_t ConnectionManager::reap_released(int64_t now_us) {
                     static_cast<unsigned>(SendspinClientConnection::CONNECT_TIMEOUT_MS));
         }
         // The erase drops the list's reference; the destructor's transport join is short once the
-        // transport has closed or opened, and bounded by what remains of its connect otherwise.
+        // transport has closed or opened, and bounded by what remains of its connect otherwise: at
+        // the deadline, on ESP, at most the rest of a slow DNS lookup (CONNECT_TIMEOUT_MS says how
+        // long lwIP's resolver can take).
         it = this->reaping_.erase(it);
     }
     return next;
@@ -1514,7 +1516,8 @@ void ConnectionManager::park_for_reaping(std::shared_ptr<SendspinConnection> con
     if (this->reaping_.size() == REAPING_CAPACITY) {
         // The entry parked longest makes room: its attempt is the furthest along, so the stop in
         // its destructor cancels an upgrade long under way (host) or finds a connect that has
-        // nearly timed out (ESP), and its join is the shortest this release could pay.
+        // nearly timed out (ESP), and its join is the shortest this release could pay: at most
+        // the rest of its connect plus its DNS lookup's resolver bound (CONNECT_TIMEOUT_MS).
         SS_LOGW(TAG, "Reaping list full (%zu); dropping the connection parked longest",
                 REAPING_CAPACITY);
         this->reaping_.erase(this->reaping_.begin());

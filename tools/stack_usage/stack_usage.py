@@ -177,11 +177,19 @@ class Graph:
             sources = self.resolve(source)
             if not sources:
                 print(f"warning: edge source {source!r} matches nothing", file=sys.stderr)
+            resolved = [(target, self.resolve(target)) for target in targets]
+            for target, dsts in resolved:
+                if not dsts:
+                    print(f"warning: edge target {target!r} of {source!r} matches nothing",
+                          file=sys.stderr)
+            # A source counts as covered for --indirect only when a target resolved: a table
+            # whose every target is stale adds no frame.
+            if not any(dsts for _, dsts in resolved):
+                continue
             for src in sources:
                 self.patched.add(src)
-                for target in targets:
-                    for dst in self.resolve(target):
-                        self.edges[src].add(dst)
+                for _, dsts in resolved:
+                    self.edges[src].update(dsts)
 
     def callees(self, sym):
         return sorted(t for t in self.edges.get(sym, ()) if t != INDIRECT)
@@ -196,9 +204,10 @@ class Graph:
             pending.extend(self.callees(sym))
         return seen
 
-    def cyclic(self, roots):
-        """Every function on a call cycle reachable from the roots (Tarjan, iterative)."""
-        index, low, on_stack, stack, cyclic = {}, {}, set(), [], set()
+    def cycles(self, roots):
+        """Every call cycle reachable from the roots, as its strongly connected component (Tarjan,
+        iterative): the sets of functions that can recurse into each other."""
+        index, low, on_stack, stack, cycles = {}, {}, set(), [], []
         counter = [0]
 
         def visit(start):
@@ -236,16 +245,18 @@ class Graph:
                         if member == node:
                             break
                     if len(component) > 1 or node in self.edges.get(node, ()):
-                        cyclic.update(component)
+                        cycles.append(sorted(component))
 
         for root in roots:
             if root not in index:
                 visit(root)
-        return cyclic
+        return cycles
 
     def deepest(self, root):
-        """The deepest simple path from root: memoized outside cycles, exhaustive inside them."""
-        cyclic = self.cyclic([root])
+        """The deepest simple path from root: memoized outside cycles, exhaustive inside them.
+        A path through a cycle visits each of its functions once, so recursion is charged a
+        single pass (README.md, What it does not model)."""
+        cyclic = {sym for cycle in self.cycles([root]) for sym in cycle}
         memo = {}
         sys.setrecursionlimit(100000)
 
@@ -311,6 +322,12 @@ def main():
         "provide: each counts as 0 bytes, so a missing .ci file under-reports silently",
     )
     parser.add_argument(
+        "--cycles",
+        action="store_true",
+        help="list every call cycle a task reaches: the total charges each one a single pass, "
+        "so a recursion deeper than that is not in it",
+    )
+    parser.add_argument(
         "--indirect",
         action="store_true",
         help="list every reachable function that calls through a pointer, marking those "
@@ -361,6 +378,21 @@ def main():
                         frame = graph.frames.get(sym, 0)
                         kind = graph.qualifier.get(sym, "?")
                         print(f"  {frame:6d} {kind:14s} {graph.labels.get(sym, sym)[:120]}")
+                cycles = graph.cycles([root])
+                on_path = set(path)
+                deepest_cycles = [c for c in cycles if on_path.intersection(c)]
+                if cycles:
+                    print(
+                        f"  warning: {len(cycles)} call cycles reachable, {len(deepest_cycles)} "
+                        "on the deepest path, each charged one pass (--cycles lists them)",
+                        file=sys.stderr,
+                    )
+                if args.cycles:
+                    for cycle in cycles:
+                        mark = "ON PATH" if cycle in deepest_cycles else "off path"
+                        names = ", ".join(graph.labels.get(c, c)[:60] for c in cycle[:4])
+                        more = f", +{len(cycle) - 4} more" if len(cycle) > 4 else ""
+                        print(f"  cycle {mark:8s} {len(cycle):3d} functions: {names}{more}")
                 reach = graph.reachable(root) if args.frameless or args.indirect else set()
                 if args.frameless or args.path:
                     frameless = sorted(
