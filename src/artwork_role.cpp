@@ -308,7 +308,7 @@ ArtworkAnnounce ArtworkRole::Impl::parse_announce(const uint8_t* body) {
 
 bool ArtworkRole::Impl::hand_item(void* item, size_t item_len, ArtworkItemType type,
                                   uint16_t serial, uint8_t data_offset, uint32_t data_len,
-                                  uint32_t generation, bool exempt) {
+                                  uint32_t generation, bool exempt) const {
     InboundItemHeader* header = inbound_item_header(item);
     header->type = static_cast<uint8_t>(type);
     header->serial = serial;
@@ -318,7 +318,7 @@ bool ArtworkRole::Impl::hand_item(void* item, size_t item_len, ArtworkItemType t
 }
 
 bool ArtworkRole::Impl::hand_local_item(const void* data, size_t len, ArtworkItemType type,
-                                        uint16_t serial, uint32_t generation) {
+                                        uint16_t serial, uint32_t generation) const {
     InboundConsumer& inbound = this->drain_task->inbound;
     if (inbound.ring() == nullptr) {
         return false;
@@ -331,7 +331,7 @@ bool ArtworkRole::Impl::hand_local_item(const void* data, size_t len, ArtworkIte
                                               static_cast<uint32_t>(len), generation, true);
 }
 
-void ArtworkRole::Impl::hand_marker(ArtworkItemType type, uint8_t mask, uint32_t generation) {
+void ArtworkRole::Impl::hand_marker(ArtworkItemType type, uint8_t mask, uint32_t generation) const {
     if (this->drain_task->inbound.ring() == nullptr) {
         return;
     }
@@ -906,7 +906,7 @@ bool ArtworkRole::Impl::process_next_item(uint32_t timeout_ms) {
     return true;
 }
 
-void ArtworkRole::Impl::adopt_generation(uint32_t generation) {
+void ArtworkRole::Impl::adopt_generation(uint32_t generation) const {
     // A teardown since the decode thread last took an item: what it parks and assembles belongs
     // to the stream that teardown ended.
     if (generation == this->drain_task->assembly_generation) {
@@ -963,7 +963,7 @@ void ArtworkRole::Impl::add_part(uint8_t slot, void* item) {
     }
 }
 
-void ArtworkRole::Impl::drop_assembly(uint8_t slot, bool release_delivered) {
+void ArtworkRole::Impl::drop_assembly(uint8_t slot, bool release_delivered) const {
     this->drain_task->assemblies[slot].state = ArtworkAssembly::State::IDLE;
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     auto& gate = this->drain_task->slot_gates[slot];

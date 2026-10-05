@@ -350,14 +350,14 @@ struct ArtworkRole::Impl : RoleTeardown {
     // (InboundConsumer::hand()), charged to the quota unless `exempt`. Protocol task.
     // @return false when the item was dropped over quota.
     bool hand_item(void* item, size_t item_len, ArtworkItemType type, uint16_t serial,
-                   uint8_t data_offset, uint32_t data_len, uint32_t generation, bool exempt);
+                   uint8_t data_offset, uint32_t data_len, uint32_t generation, bool exempt) const;
     // Writes `len` bytes into a LOCAL item (a bounded wait for room) and hands it over, exempt.
     // Protocol task. @return false when the ring had no room or the role is not running.
     bool hand_local_item(const void* data, size_t len, ArtworkItemType type, uint16_t serial,
-                         uint32_t generation);
+                         uint32_t generation) const;
     // Hands a DISCARD or RECONFIGURE marker for the channels in `mask`, logging a failure.
     // Protocol task.
-    void hand_marker(ArtworkItemType type, uint8_t mask, uint32_t generation);
+    void hand_marker(ArtworkItemType type, uint8_t mask, uint32_t generation) const;
     // Wakes the decode thread out of its blocking take so it re-runs the parked-slot sweep and
     // its generation check at the top of its loop. A no-op while the role is not running.
     void wake_drain_thread() const;
@@ -368,7 +368,7 @@ struct ArtworkRole::Impl : RoleTeardown {
     // thread with no decode thread started.
     bool process_next_item(uint32_t timeout_ms);
     // Drops every image assembled or parked when `generation` is not the one it was handed under.
-    void adopt_generation(uint32_t generation);
+    void adopt_generation(uint32_t generation) const;
     // An announce: drops the channel's pending image and starts assembling the new one.
     void begin_assembly(uint8_t slot, void* item);
     // A part: copied into the buffer (ASSEMBLING) or unused (no image in progress), and its item
@@ -376,7 +376,7 @@ struct ArtworkRole::Impl : RoleTeardown {
     void add_part(uint8_t slot, void* item);
     // Drops the slot's image whatever its state, and the parked flag with it; with
     // `release_delivered` also reopens a DECODE_DELIVERED gate (a RECONFIGURE marker).
-    void drop_assembly(uint8_t slot, bool release_delivered = false);
+    void drop_assembly(uint8_t slot, bool release_delivered = false) const;
     // Delivers a complete image (or empty image): skipped when the channel's epoch moved past it,
     // parked READY when its gate is closed, otherwise decoded and its display handed to the main
     // loop.
