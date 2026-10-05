@@ -55,6 +55,7 @@ cmake/                      - CMake modules (sources.cmake, host.cmake)
 examples/common/            - Shared host-example helpers (PortAudio sink, file-backed persistence provider)
 examples/basic_client/      - Standalone host example with PortAudio audio output
 examples/tui_client/        - Terminal UI host example with PortAudio audio output
+examples/source_client/     - Host example streaming the default PortAudio input (source role)
 tests/                      - Host unit tests (GoogleTest)
 tests/esp_idf/              - Build-only ESP-IDF project checking the component's codec dependencies
 tools/stack_usage/          - Script and indirect-call tables that derive the ESP task stack defaults from -fcallgraph-info
