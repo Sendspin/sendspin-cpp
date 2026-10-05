@@ -631,10 +631,13 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
     // The connection must resume operational under the new session, now with LONG_TERM/USER trust
-    // instead of the PAIRING/none trust it started with.
-    pump_until(client, [&] { return client.is_connected(); });
-    EXPECT_TRUE(listener.trust_ever_reached(ConnectionTrust::USER))
-        << "Trust was never upgraded to USER after pairing completed";
+    // instead of the PAIRING/none trust it started with. Waited for with no timeout: is_connected()
+    // still reads true from before the re-handshake until a tick refreshes it, so only the trust
+    // the re-activation reports tells the new session apart, and a trust that is never upgraded
+    // hangs here for the suite watchdog to name.
+    pump_until(client, [&] {
+        return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
+    });
     EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER)
         << "get_current_trust() must report the rekeyed connection's trust";
     auto info = client.get_server_information();
