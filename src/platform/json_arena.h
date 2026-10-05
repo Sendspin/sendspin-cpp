@@ -295,13 +295,17 @@ public:
     /// @brief Parses @p len bytes of JSON text, copying its strings into the document
     /// @return false on a parse error or an empty (null) document
     bool parse(const char* data, size_t len) {
-        return !deserializeJson(*this->doc_, data, len) && !this->doc_->isNull();
+        if (!this->doc_) {
+            return false;
+        }
+        JsonDocument& doc = *this->doc_;
+        return !deserializeJson(doc, data, len) && !doc.isNull();
     }
 
     /// @brief Calls @p reader with the root object and returns its result, keeping the document
     template <typename Reader>
     auto read(Reader&& reader) {
-        return reader(this->doc_->as<JsonObject>());
+        return reader(this->root());
     }
 
     /// @brief Calls @p extractor with the root object, releases the document, then returns what
@@ -309,10 +313,10 @@ public:
     template <typename Extractor>
     auto extract(Extractor&& extractor) {
         if constexpr (std::is_void_v<std::invoke_result_t<Extractor&, JsonObject>>) {
-            extractor(this->doc_->as<JsonObject>());
+            extractor(this->root());
             this->release();
         } else {
-            auto extracted = extractor(this->doc_->as<JsonObject>());
+            auto extracted = extractor(this->root());
             this->release();
             return extracted;
         }
@@ -323,7 +327,7 @@ public:
     /// it is direct, which keeps it visible to the static stack analysis (tools/stack_usage/)
     template <auto Parser, typename T>
     bool extract(T* out) {
-        const bool valid = Parser(this->doc_->as<JsonObject>(), out);
+        const bool valid = Parser(this->root(), out);
         this->release();
         return valid;
     }
@@ -334,6 +338,11 @@ public:
     }
 
 private:
+    /// @brief The root object, or a null object once the document is released
+    JsonObject root() {
+        return this->doc_ ? this->doc_->as<JsonObject>() : JsonObject();
+    }
+
     // Struct fields
     /// Engaged from construction until release().
     std::optional<JsonDocument> doc_;
