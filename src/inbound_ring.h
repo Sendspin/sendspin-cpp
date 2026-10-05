@@ -745,10 +745,11 @@ public:
     bool hand_local(const void* data, size_t len, InboundItemFields fields, uint32_t generation);
 
     /// @brief Returns every item the consumer has not taken to the ring and ends the drop log's
-    /// run, since the stream the drops belonged to is gone. The holder role's cleanup(), right
-    /// after its generation moves on: on the protocol task, the thread that hands items over, so
-    /// every item recalled carries an earlier generation. A no-op outside a run, where the
-    /// main loop's cleanup() in SendspinClient::stop() finds the list already unbound.
+    /// run, since the stream or stretch the drops belonged to is over. The holder role's
+    /// cleanup(), right after its generation moves on, and the visualizer's stream boundaries:
+    /// on the protocol task, the thread that hands items over, so every item recalled predates
+    /// the teardown or boundary. A no-op outside a run, where the main loop's cleanup() in
+    /// SendspinClient::stop() finds the list already unbound.
     void recall();
 
     /// @brief Why a message was dropped instead of handed over, which picks note_drop()'s warning

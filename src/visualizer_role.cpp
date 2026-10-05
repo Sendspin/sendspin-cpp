@@ -456,11 +456,8 @@ void VisualizerRole::Impl::cleanup() {
     this->stream_active = false;
     this->negotiated_types_mask = 0;
 
-    // Return the frames the drain thread has not taken; one it takes before this carries the
-    // earlier stamp, which its take() discards.
-    this->drain_task->inbound.recall();
-
-    // So the drain thread returns a frame it holds.
+    // Returns the frames the drain thread has not taken (one it takes before this carries the
+    // earlier stamp, which its take() discards) and a frame it holds.
     this->signal_boundary();
 
     // Discard stale slot content. Stale ring-borne events (an in-flight
@@ -554,25 +551,15 @@ VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* p
     return out;
 }
 
-void* VisualizerRole::Impl::take_item(uint32_t timeout_ms) const {
-    // Frames are listed in arrival order and stamped when listed, so the stale ones are a run at
-    // the head.
-    InboundConsumer& inbound = this->drain_task->inbound;
-    void* item = inbound.take(timeout_ms, this->cleanup_generation);
-    while (item != nullptr && this->is_stale(item)) {
-        inbound.return_item(item);
-        item = inbound.take(0, this->cleanup_generation);
-    }
-    return item;
-}
-
 void VisualizerRole::Impl::signal_boundary() {
+    // Every listed frame predates the boundary, since the protocol task is the only appender.
+    InboundConsumer& inbound = this->drain_task->inbound;
+    inbound.recall();
     // Release pairs with is_stale()'s acquire, publishing handle_stream_start()'s config; the
     // signal follows the store so the woken thread reads the new value.
     this->boundary_sequence.store(
         static_cast<uint16_t>(this->boundary_sequence.load(std::memory_order_relaxed) + 1),
         std::memory_order_release);
-    InboundConsumer& inbound = this->drain_task->inbound;
     if (inbound.ring() != nullptr) {
         inbound.items().signal(COMMAND_BOUNDARY);
     }
@@ -613,14 +600,14 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     };
 
     while (true) {
-        // A boundary needs no step here: take_item() returns the frames it made stale.
         uint32_t cmd = items.take_signals(COMMAND_STOP | COMMAND_BOUNDARY, 0);
         if (cmd & COMMAND_STOP) {
             break;
         }
 
         // A command ends the take early with nullptr.
-        void* item = self->take_item(INBOUND_CONSUMER_FALLBACK_WAKE_MS);
+        void* item = self->drain_task->inbound.take(INBOUND_CONSUMER_FALLBACK_WAKE_MS,
+                                                    self->cleanup_generation);
         if (item == nullptr) {
             continue;
         }

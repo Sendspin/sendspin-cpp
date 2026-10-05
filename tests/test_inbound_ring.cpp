@@ -534,16 +534,24 @@ TEST(InboundItemList, AppendAfterRecallStartsAFreshList) {
 }
 
 // hand_message() hands a ring item in place and copies any other message into a LOCAL item
-// keeping its receive stamp; one too long for any item or over the quota is dropped with nothing
-// charged or listed. hand_local() is exempt from the quota and hands nothing while unbound.
-// Every handed item carries the caller's fields and generation.
+// keeping its receive stamp; one too long for any item, with no ring space for the copy, or
+// over the quota is dropped with nothing charged or listed. hand_local() is exempt from the
+// quota and hands nothing while unbound. Every handed item carries the caller's fields and
+// generation.
 TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
     constexpr size_t RING_BYTES = 1024;
     constexpr size_t LEN = 40;
     constexpr uint32_t GENERATION = 7;
     constexpr uint32_t RECEIVE_STAMP = 0x12345678;
     constexpr InboundItemFields FIELDS{.data_len = 30, .serial = 3, .type = 9, .data_offset = 10};
-    enum class Source : uint8_t { RING_ITEM, OUTSIDE_THE_RING, TOO_LONG, HAND_LOCAL, UNBOUND };
+    enum class Source : uint8_t {
+        RING_ITEM,
+        OUTSIDE_THE_RING,
+        TOO_LONG,
+        NO_ROOM,
+        HAND_LOCAL,
+        UNBOUND
+    };
     struct Row {
         const char* name;
         Source source;
@@ -559,6 +567,8 @@ TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
          RING_BYTES, true, false, true},
         {"a message longer than the ring's largest item is dropped", Source::TOO_LONG, RING_BYTES,
          false, false, false},
+        {"a message outside a full ring is dropped", Source::NO_ROOM, RING_BYTES, false, false,
+         false},
         {"a ring item over the quota is dropped", Source::RING_ITEM, 0, false, false, false},
         {"hand_local() passes a zero quota, exempt", Source::HAND_LOCAL, 0, true, false, false},
         {"hand_local() on a consumer never bound to a ring hands nothing", Source::UNBOUND, 0,
@@ -579,6 +589,16 @@ TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
         std::vector<uint8_t> outside(len);
         for (size_t i = 0; i < len; ++i) {
             outside[i] = static_cast<uint8_t>(i);
+        }
+        // Held by no holder, so they fill the ring without touching the quota.
+        std::vector<void*> fillers;
+        if (row.source == Source::NO_ROOM) {
+            while (void* filler = ring.acquire(LEN, 0)) {
+                ring.complete(filler);
+                size_t filler_len = 0;
+                fillers.push_back(ring.take(&filler_len, 0));
+            }
+            ASSERT_FALSE(fillers.empty());
         }
         void* ring_item = nullptr;
         bool handed = false;
@@ -623,6 +643,9 @@ TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
             EXPECT_EQ(header->generation, GENERATION);
             consumer.return_item(taken);
             EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U);
+        }
+        for (void* filler : fillers) {
+            ring.return_item(filler);
         }
         if (bound) {
             consumer.unbind();

@@ -168,11 +168,8 @@ struct VisualizerRole::Impl : RoleTeardown {
     bool signal_stop() const;
     /// @brief Joins the drain thread and returns every frame it had not taken to the ring
     void stop() const;
-    /// @brief Takes the next item of the current teardown generation and boundary sequence,
-    /// returning the stale ones before it. Drain thread.
-    void* take_item(uint32_t timeout_ms) const;
-    /// @brief Moves boundary_sequence on, making every listed frame stale, and signals the drain
-    /// thread when one is running.
+    /// @brief Returns every listed frame to the ring, moves boundary_sequence on and signals the
+    /// drain thread, which returns a frame it holds, when one is running.
     void signal_boundary();
     /// @brief Whether a boundary has passed since `item` was listed. Drain thread.
     bool is_stale(void* item) const;
@@ -204,8 +201,8 @@ struct VisualizerRole::Impl : RoleTeardown {
     std::atomic<bool> tracks_downbeats{false};
     /// Counts stream boundaries (stream/start, stream/end, stream/clear, a teardown), wrapping.
     /// handle_binary() stamps each frame with it (InboundItemHeader::serial); a frame whose stamp
-    /// differs is stale. Equality suffices: a stale frame passes for current only after 65,536
-    /// boundaries, and each one wakes the drain thread to return it. Written by
+    /// differs is stale. Equality suffices: only the frame the drain thread holds can be stale, and
+    /// every boundary wakes the thread to check it. Written by
     /// signal_boundary() on the protocol task (or the main loop in stop() after the join), with
     /// release; read with acquire on the drain thread.
     std::atomic<uint16_t> boundary_sequence{0};

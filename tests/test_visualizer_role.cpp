@@ -526,16 +526,16 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 }
 
 // ============================================================================
-// Stream boundaries: every stream/start, stream/end, stream/clear and teardown moves the role's
-// boundary sequence on, and the drain thread takes only frames stamped with the latest one.
+// Stream boundaries: every stream/start, stream/end, stream/clear and teardown recalls the listed
+// frames and moves the role's boundary sequence on.
 // ============================================================================
 
-// take_item() returns the frames listed before the latest boundary, so only frames sent after it
+// A boundary returns the frames listed before it, so only frames sent after the latest one
 // survive (roles/visualizer/v1.md "stream/end", messaging.md "stream/clear"). The rows drive the
-// handlers with no drain thread, as if it saw every boundary in one wait; the held frame is
-// covered by ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime.
+// handlers with no drain thread; the held frame is covered by
+// ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime.
 // Gap: a current held frame's resumed wait.
-TEST(VisualizerBoundary, ATakeSkipsTheFramesABoundaryMadeStale) {
+TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
     enum class Step { END, START, CLEAR, CLEANUP, FRAME };
     struct Row {
         const char* name;
@@ -600,7 +600,7 @@ TEST(VisualizerBoundary, ATakeSkipsTheFramesABoundaryMadeStale) {
 
         std::vector<uint8_t> surviving;
         void* item = nullptr;
-        while ((item = impl->take_item(0)) != nullptr) {
+        while ((item = impl->drain_task->inbound.take(0, impl->cleanup_generation)) != nullptr) {
             const InboundItemHeader* header = inbound_item_header(item);
             surviving.push_back(inbound_item_bytes(item)[header->data_offset + header->data_len - 1]);
             ring.return_item(item);
@@ -654,7 +654,7 @@ TEST(VisualizerBoundary, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) {
         // frame is not delivered, and one left over is.
         size_t delivered = 0;
         void* item = nullptr;
-        while ((item = impl->take_item(0)) != nullptr) {
+        while ((item = impl->drain_task->inbound.take(0, impl->cleanup_generation)) != nullptr) {
             ++delivered;
             ring.return_item(item);
         }

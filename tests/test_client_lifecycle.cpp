@@ -556,9 +556,10 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
 }
 
 // stream/end, stream/clear and a teardown each return the frame the drain thread holds for its
-// display time, and those listed behind it, undelivered. Stamped an hour ahead, a held frame left
-// waiting hangs the pump; stop() joins the thread before the count is read. Control: the frames
-// were charged before the boundary.
+// display time, and those listed behind it, undelivered. One frame goes first, and the thread
+// holds it once the list is empty with its charge outstanding; stamped an hour ahead, a held
+// frame left waiting hangs the pump. stop() joins the thread before the count is read. Control:
+// the frames were charged before the boundary.
 TEST(ClientLifecycle, AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime) {
     constexpr int64_t HELD_FRAME_LEAD_US = 3600LL * 1000 * 1000;
     enum class Boundary : uint8_t { END, CLEAR, TEARDOWN };
@@ -590,9 +591,13 @@ TEST(ClientLifecycle, AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayT
         ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
         InboundConsumer& inbound = client.visualizer()->impl_->drain_task->inbound;
         const InboundQuota& quota = inbound.ring()->quota(InboundHolder::VISUALIZER);
+        ASSERT_TRUE(server->send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
+                                        platform_time_us() + HELD_FRAME_LEAD_US,
+                                        std::string("\x00\x10", 2)));
+        pump_until(client,
+                   [&] { return inbound.items().is_empty() && quota.outstanding() > 0; });
         send_loudness_until(client, *server, HELD_FRAME_LEAD_US,
-                            [&] { return two_or_more_linked(inbound.items()); });
-        EXPECT_GT(quota.outstanding(), 0U);
+                            [&] { return !inbound.items().is_empty(); });
 
         switch (row.boundary) {
             case Boundary::END:
