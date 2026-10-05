@@ -2208,11 +2208,12 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // is_operational() also covers the latest server/activate: before that we do not know which
     // roles this connection owns.
     AdmittedEntry* entry = this->connection_manager_->find_admitted(conn);
+    const std::optional<ClientStateMessage>& client_state = this->task_state_->client_state;
     if (entry == nullptr || !conn->is_connected() || !conn->is_operational() ||
-        !this->task_state_->client_state.has_value()) {
+        !client_state.has_value()) {
         return;
     }
-    const ClientStateMessage& snapshot = this->task_state_->client_state.value();
+    const ClientStateMessage& snapshot = client_state.value();
 
     // messaging.md "client/state": a player reports `available: true` only after clock
     // synchronization, and `false` would mean it will not yield, so the state waits for this

@@ -56,6 +56,9 @@ void ControllerRole::Impl::attach_inbox(Inbox& inbox) {
     this->event_state->slot.bind(inbox, INBOX_TOPIC_CONTROLLER);
 }
 
+/// @brief The mask half (low 16 bits) of the packed ControllerRole::Impl::supported_commands word.
+static constexpr uint32_t SUPPORTED_COMMANDS_MASK = 0xFFFFU;
+
 /// @brief The command's bit in the mask half of ControllerRole::Impl::supported_commands.
 static uint32_t command_bit(SendspinControllerCommand command) {
     static_assert(static_cast<uint8_t>(SendspinControllerCommand::SEEK_RELATIVE) < 16,
@@ -67,7 +70,7 @@ static uint32_t command_bit(SendspinControllerCommand command) {
 /// the low 16 bits, the generation's low 16 bits above it. One atomic word, so send_command()
 /// reads a mask and its stamp together.
 static uint32_t pack_supported_commands(uint32_t generation, uint32_t mask) {
-    return (generation << 16) | (mask & 0xFFFFU);
+    return (generation << 16) | (mask & SUPPORTED_COMMANDS_MASK);
 }
 
 /// @brief Whether `cmd` carries the parameter roles/controller/v1.md "Command behaviour" requires

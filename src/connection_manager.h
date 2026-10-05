@@ -446,7 +446,7 @@ public:
 
     /// @brief Sends a role message to the admitted connection that owns `role`
     /// (SendspinClient::send_text()).
-    void send_role_text(SendspinRole role, const std::string& text);
+    void send_role_text(SendspinRole role, const std::string& text) const;
 
     /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window()).
     void confirm_pairing_window();

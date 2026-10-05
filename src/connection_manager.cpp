@@ -657,7 +657,7 @@ void ConnectionManager::leave() {
     conn->send_app_json(format_client_leave_message(), nullptr);
 }
 
-void ConnectionManager::send_role_text(SendspinRole role, const std::string& text) {
+void ConnectionManager::send_role_text(SendspinRole role, const std::string& text) const {
     // Routed to the connection that owns the role, whose activation of it is the role's own gate
     // (see owns_role()): the same gate the receive path and the client/state role objects apply.
     // A declared PAIRING activity is not a gate: pairing.md "Entering and leaving pairing" says an
@@ -1328,7 +1328,7 @@ AdmittedEntry* ConnectionManager::primary() {
 uint16_t ConnectionManager::roles_owned_by_others(const AdmittedEntry* except) const {
     uint16_t owned = 0;
     for (const auto& entry : this->admitted_) {
-        if (&entry != except && entry.conn != nullptr) {
+        if (entry.conn != nullptr && &entry != except) {
             owned |= entry.owned_roles;
         }
     }
@@ -1617,6 +1617,7 @@ void ConnectionManager::release_connection(std::shared_ptr<SendspinConnection> c
         conn->close_transport_now();
     }
     // The caller's reference drops here.
+    conn.reset();
 }
 
 // ============================================================================
