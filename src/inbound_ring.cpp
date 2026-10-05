@@ -501,6 +501,10 @@ const char* InboundConsumer::item_noun() const {
 }
 
 void InboundConsumer::note_drop(DropReason reason) {
+    // Outside a run no recall() would end the run, so nothing counts.
+    if (this->ring() == nullptr) {
+        return;
+    }
     // Throttled: only the first drop of a run logs (see InboundDropLog).
     if (!this->drop_log_.note_drop()) {
         return;
@@ -512,6 +516,10 @@ void InboundConsumer::note_drop(DropReason reason) {
         case DropReason::TOO_LONG:
             SS_LOGW(TAG, "%s received %s longer than the ring's largest item; dropping",
                     this->holder_name(), this->item_noun());
+            return;
+        case DropReason::TOO_SHORT:
+            SS_LOGW(TAG, "%s received %s too short for its header; dropping", this->holder_name(),
+                    this->item_noun());
             return;
         case DropReason::NO_ROOM:
             break;

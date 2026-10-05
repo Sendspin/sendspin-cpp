@@ -318,12 +318,14 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
         return;
     }
 
-    // Hand the message over verbatim. Like the player and artwork roles, the protocol task stays
-    // dumb: it records the message and hands it to the drain thread, which owns all structural
-    // validation and per-type truncation. The only other check here is that a timestamp is
-    // present, since the drain thread needs it to schedule the frame. No size cap is applied:
-    // the frame is one ring item, charged against the quota.
+    // Hand the message over verbatim. Beyond the stream and type gates above, the protocol task
+    // checks only that a timestamp is present, since the drain thread needs it to schedule the
+    // frame; the drain thread checks each type's payload length, dropping a short frame and
+    // ignoring trailing bytes (decode_visualizer_message()). No size cap beyond the ring's
+    // largest item (hand_message()): the frame is one ring item, charged against the quota. A
+    // frame with no room for its timestamp joins the hand-overs' throttled drop run.
     if (message.len < FRAME_PAYLOAD_OFFSET) {
+        inbound.note_drop(InboundConsumer::DropReason::TOO_SHORT);
         return;
     }
     // The frame stays in the ring item it was received and decrypted into; one not in a ring

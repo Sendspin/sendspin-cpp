@@ -127,7 +127,7 @@ bool SyncTask::start(InboundRing* ring, bool task_stack_in_psram, unsigned prior
     // between the previous join and this start (cleanup() on a stopped task).
     this->event_flags_.clear_all();
 
-    platform_configure_thread("Sendspin", SYNC_TASK_STACK_SIZE, static_cast<int>(priority),
+    platform_configure_thread("SsSync", SYNC_TASK_STACK_SIZE, static_cast<int>(priority),
                               task_stack_in_psram);
 
     this->sync_thread_ = std::thread(thread_entry, this);

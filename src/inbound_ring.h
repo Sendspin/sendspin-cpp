@@ -654,9 +654,9 @@ struct InboundItemFields {
  * Threads: bind() and unbind() run on the main loop with neither the consumer thread nor the
  * protocol task running: SendspinClient::start() binds before it starts the protocol task, and
  * stop() (and a start() that fails part-way) unbinds after joining it. The protocol task hands
- * items over and recalls them (hand(), hand_message(), hand_local(), recall()); the consumer
- * thread takes and returns them. ring() is read on all three, ordered by those thread
- * starts and joins.
+ * items over, counts drops and recalls items (hand(), hand_message(), hand_local(), note_drop(),
+ * recall()); the consumer thread takes and returns them. ring() is read on all three, ordered by
+ * those thread starts and joins.
  */
 class InboundConsumer {
 public:
@@ -738,18 +738,22 @@ public:
     /// main loop's cleanup() in SendspinClient::stop() finds the list already unbound.
     void recall();
 
-private:
-    /// @brief Why a hand-over dropped its item, which picks note_drop()'s warning
+    /// @brief Why a message was dropped instead of handed over, which picks note_drop()'s warning
     enum class DropReason : uint8_t {
         OVER_QUOTA,  ///< hand(): the holder is over its quota
         TOO_LONG,    ///< hand_message(): longer than the ring's largest item
         NO_ROOM,     ///< hand_message(): no ring space for the copy
+        TOO_SHORT,   ///< The role's handler: too short for the holder's message header
     };
 
     /// @brief Counts a drop in the throttled run (InboundDropLog), logging the warning for
-    /// `reason` when the drop starts one. Protocol task.
+    /// `reason` when the drop starts one, so a run's warning names its first cause. Protocol
+    /// task: the hand-overs call it, and so does a role handler that drops a malformed message
+    /// before handing it over, so a burst of them shares the run's two log lines. A no-op
+    /// outside a run: nothing counts there, since recall() cannot end a run while unbound.
     void note_drop(DropReason reason);
 
+private:
     /// @brief Acquires a LOCAL item (InboundRing::acquire_local()), copies `len` bytes into it
     /// and completes it. Protocol task, inside a run.
     /// @return The item, ready for hand(), or nullptr when the ring had no room in time.
@@ -760,7 +764,7 @@ private:
     const char* dropped_items_name() const;
     /// @brief The holder's name, leading every drop warning
     const char* holder_name() const;
-    /// @brief One of the holder's messages, in the warnings of hand_message()'s drops
+    /// @brief One of the holder's messages, in the warnings of the drops note_drop() logs
     const char* item_noun() const;
 
     // Struct fields

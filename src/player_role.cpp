@@ -338,9 +338,18 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
 
 SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
+    InboundConsumer& inbound = this->sync_task->inbound();
+    if (inbound.ring() == nullptr) {
+        // Verbose because this is the per-chunk path: a player with no listener runs no sync
+        // task, which start() warned about once.
+        SS_LOGV(TAG, "Discarding audio chunk: the sync task is not running");
+        return;
+    }
     auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
     if (!chunk.has_value()) {
-        SS_LOGW(TAG, "Binary message too short for the audio chunk header");
+        // Joins the hand-overs' throttled drop run, so a burst costs two log lines. note_drop()
+        // counts only inside a run, which the ring check above already established.
+        inbound.note_drop(InboundConsumer::DropReason::TOO_SHORT);
         return;
     }
     if (chunk->audio_len == 0) {
@@ -353,11 +362,6 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
     // valid audio.
     if (this->discard_audio.load(std::memory_order_relaxed)) {
         SS_LOGV(TAG, "Discarding audio chunk while unavailable");
-        return;
-    }
-    InboundConsumer& inbound = this->sync_task->inbound();
-    if (inbound.ring() == nullptr) {
-        SS_LOGW(TAG, "Failed to send audio chunk: the sync task is not running");
         return;
     }
     // The zero-copy path: the chunk stays in the ring item it was received and decrypted into,
