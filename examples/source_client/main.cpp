@@ -249,9 +249,9 @@ private:
 
         if (!self->source_->write_audio(static_cast<const uint8_t*>(input),
                                         frame_count * self->bytes_per_frame_, capture_us)) {
-            // Counted here and reported from the main loop, so the audio callback does no I/O.
-            // A refused write means the capture buffer is full, or the stream closed while this
-            // callback was in flight.
+            // Counted here and reported from the main loop; the library itself logs once when a
+            // run of refused writes starts and once when it ends. A refused write means the
+            // capture buffer is full, or the stream closed while this callback was in flight.
             self->dropped_writes_.fetch_add(1, std::memory_order_relaxed);
         }
         return paContinue;
