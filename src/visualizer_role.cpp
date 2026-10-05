@@ -89,15 +89,10 @@ static_assert(fits_advertised_fraction(BEAT_PAYLOAD_SIZE) &&
 
 // Event flag bits for drain thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
-static constexpr uint32_t COMMAND_FLUSH = (1 << 1);  // Drain to empty (producer already stopped)
-static constexpr uint32_t COMMAND_CLEAR = (1 << 2);  // Discard up to the clear marker entry
-
-// Type of the item marking a stream/start or stream/clear boundary on the item list. Frames
-// before the marker predate the boundary and are discarded; frames after it survive. The value
-// is outside the visualizer wire-type range (16-23) so it can never collide with a real message,
-// and the marker carries no timestamp, so the drain loop drops any leftover marker encountered in
-// normal flow.
-static constexpr uint8_t ENTRY_TYPE_CLEAR_MARKER = 0xFF;
+// A stream boundary (stream/start, stream/end, stream/clear or a teardown) moved
+// boundary_sequence on: a frame the drain thread holds for its delivery time is returned if the
+// boundary made it stale, and take_item() returns the stale frames still listed.
+static constexpr uint32_t COMMAND_BOUNDARY = (1 << 1);
 
 // ============================================================================
 // Big-endian helpers
@@ -208,8 +203,8 @@ bool VisualizerRole::Impl::start(InboundRing* ring) {
         return false;
     }
 
-    // The flags survive a stop()/start() cycle, and a flush or clear signalled between the join
-    // and this start (cleanup() on a stopped role) is still set. Clear the whole group so the new
+    // The flags survive a stop()/start() cycle, and a boundary signalled between the join and
+    // this start (cleanup() on a stopped role) is still set. Clear the whole group so the new
     // thread starts from a clean command state whatever bits the role defines (stop() already
     // emptied the list).
     this->drain_task->event_flags.clear_all();
@@ -334,7 +329,7 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
     (void)inbound.hand_message(
         message,
         {.data_len = static_cast<uint32_t>(message.len - FRAME_PAYLOAD_OFFSET),
-         .serial = 0,
+         .serial = this->boundary_sequence.load(std::memory_order_relaxed),
          .type = binary_type,
          .data_offset = static_cast<uint8_t>(FRAME_PAYLOAD_OFFSET)},
         generation);
@@ -390,8 +385,10 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
     this->stream_active = true;
 
     // Mark the config boundary: buffered frames predate this (re)start and must be discarded,
-    // while frames arriving after it belong to the new config and must survive.
-    this->signal_clear_marker(generation);
+    // while frames arriving after it belong to the new config and must survive. The config above
+    // is written before the sequence moves on, so a frame stamped with the new sequence is
+    // decoded under it; the drain thread returns stale frames before decode.
+    this->signal_boundary();
 
     // Write the config to the inbox slot for the main thread, then push the event. Both lock the
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
@@ -406,12 +403,9 @@ void VisualizerRole::Impl::handle_stream_end() {
     this->stream_active = false;
     this->negotiated_types_mask = 0;
 
-    if (this->drain_task->event_flags.is_created()) {
-        // Flag first, then wake, so a drain thread parked in its item list take starts the
-        // flush immediately instead of at its next idle-receive timeout.
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
-        this->drain_task->inbound.items().wake_receiver();
-    }
+    // roles/visualizer/v1.md "stream/end": every listed frame is now stale, and handle_binary()
+    // lists none until the next stream/start, so the drain thread empties the list.
+    this->signal_boundary();
 
     this->enqueue_stream_event(VisualizerEventType::STREAM_END, generation);
 }
@@ -419,9 +413,9 @@ void VisualizerRole::Impl::handle_stream_end() {
 void VisualizerRole::Impl::handle_stream_clear() {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // messaging.md "stream/clear" discards buffered data but the stream stays active; data
-    // received after this message continues to flow. The marker separates the two: a blind
+    // received after this message continues to flow. The sequence separates the two: a blind
     // flush would race this thread and drop post-clear frames it has already appended.
-    this->signal_clear_marker(generation);
+    this->signal_boundary();
 
     this->enqueue_stream_event(VisualizerEventType::STREAM_CLEAR, generation);
 }
@@ -490,11 +484,8 @@ void VisualizerRole::Impl::cleanup() {
     // earlier stamp, which its take() discards.
     this->drain_task->inbound.recall();
 
-    if (this->drain_task->event_flags.is_created()) {
-        // Flag first, then wake, matching handle_stream_end().
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
-        this->drain_task->inbound.items().wake_receiver();
-    }
+    // So the drain thread returns a frame it holds.
+    this->signal_boundary();
 
     // Discard stale slot content. Stale ring-borne events (an in-flight
     // STREAM_START/STREAM_END/STREAM_CLEAR queued before this teardown) need no per-event ring
@@ -587,59 +578,38 @@ VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* p
     return out;
 }
 
-void VisualizerRole::Impl::flush_items() const {
-    InboundConsumer& inbound = this->drain_task->inbound;
-    void* item = nullptr;
-    while ((item = inbound.items().take(0)) != nullptr) {
-        inbound.return_item(item);
-    }
-}
-
 void* VisualizerRole::Impl::take_item(uint32_t timeout_ms) const {
-    return this->drain_task->inbound.take(timeout_ms, this->cleanup_generation);
-}
-
-void VisualizerRole::Impl::signal_clear_marker(uint32_t generation) const {
-    // Protocol-task side of a clear boundary. Set the flag before appending the marker (like
-    // PlayerRole::handle_stream_clear) so the drain thread starts discarding (freeing ring space)
-    // while the marker waits for room.
+    // The list is in arrival order and every frame is stamped when it is listed, so the frames a
+    // boundary made stale are a run at its head: return them and stop at the first current one,
+    // which messaging.md "stream/clear" requires to survive, as it does a frame of a stream that
+    // started after an end or a teardown. With no current frame (an end, or a start and its
+    // frames followed by an end) the list empties.
     InboundConsumer& inbound = this->drain_task->inbound;
-    if (inbound.ring() == nullptr) {
-        return;
-    }
-    // Flag first, then wake, matching the other command signals. The marker's append below
-    // would usually wake the drain thread anyway, but the explicit wake keeps the discard prompt
-    // even when the marker cannot be appended.
-    this->drain_task->event_flags.set(COMMAND_CLEAR);
-    inbound.items().wake_receiver();
-
-    // The drain thread is discarding meanwhile, so space frees quickly. Exempt from the quota
-    // (InboundConsumer::hand()).
-    if (!inbound.hand_local(
-            nullptr, 0,
-            {.data_len = 0, .serial = 0, .type = ENTRY_TYPE_CLEAR_MARKER, .data_offset = 0},
-            generation)) {
-        // Boundary lost: the drain thread will discard to empty instead, so frames appended after
-        // this point may be dropped along with the old ones (brief visual gap, no harm).
-        SS_LOGW(TAG, "Failed to append clear marker; clear boundary may be imprecise");
-    }
-}
-
-void VisualizerRole::Impl::discard_to_clear_marker() const {
-    // Drain-thread side of a clear boundary: discard frames up to and including the marker.
-    // Stopping at the marker preserves frames the protocol task appended after the clear,
-    // which messaging.md "stream/clear" requires to survive. If the list empties without a
-    // marker, either the marker could not be appended or it was already consumed in normal flow
-    // (the drain loop drops it); nothing is left to discard either way.
-    InboundConsumer& inbound = this->drain_task->inbound;
-    void* item = nullptr;
-    while ((item = inbound.items().take(0)) != nullptr) {
-        const bool is_marker = inbound_item_header(item)->type == ENTRY_TYPE_CLEAR_MARKER;
+    void* item = inbound.take(timeout_ms, this->cleanup_generation);
+    while (item != nullptr && this->is_stale(item)) {
         inbound.return_item(item);
-        if (is_marker) {
-            return;
-        }
+        item = inbound.take(0, this->cleanup_generation);
     }
+    return item;
+}
+
+void VisualizerRole::Impl::signal_boundary() {
+    // Release: the drain thread's acquire load of the new value sees what the boundary's handler
+    // wrote before it (handle_stream_start()'s config). Flag after the store and wake after the
+    // flag, so a drain thread that sees the bit reads the new sequence, and one parked in its
+    // item list take starts the discard at once instead of at its fallback wake.
+    this->boundary_sequence.store(
+        static_cast<uint16_t>(this->boundary_sequence.load(std::memory_order_relaxed) + 1),
+        std::memory_order_release);
+    if (this->drain_task->event_flags.is_created()) {
+        this->drain_task->event_flags.set(COMMAND_BOUNDARY);
+        this->drain_task->inbound.items().wake_receiver();
+    }
+}
+
+bool VisualizerRole::Impl::is_stale(void* item) const {
+    return inbound_item_header(item)->serial !=
+           this->boundary_sequence.load(std::memory_order_acquire);
 }
 
 void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
@@ -674,23 +644,15 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     };
 
     while (true) {
-        // Non-blocking check for commands
-        uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, 0);
+        // Non-blocking check for commands. A boundary needs no step of its own here: the take
+        // below returns the frames it made stale, and waiting on its bit clears it.
+        uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_BOUNDARY, false, true, 0);
         if (cmd & COMMAND_STOP) {
             break;
         }
-        if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
-            if (cmd & COMMAND_FLUSH) {
-                self->flush_items();
-            }
-            if (cmd & COMMAND_CLEAR) {
-                self->discard_to_clear_marker();
-            }
-            continue;
-        }
 
-        // Blocking take; returns early (nullptr) when wake_receiver() signals a stop, flush, or
-        // clear. The timeout is only a safety net against a missed wake (see
+        // Blocking take; returns early (nullptr) when wake_receiver() signals a stop or a
+        // boundary. The timeout is only a safety net against a missed wake (see
         // INBOUND_CONSUMER_FALLBACK_WAKE_MS).
         void* item = self->take_item(INBOUND_CONSUMER_FALLBACK_WAKE_MS);
         if (item == nullptr) {
@@ -704,12 +666,6 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // A clear marker whose COMMAND_CLEAR was already handled carries no timestamp: everything
-        // before it was consumed in order, so the boundary it marks has already been honored.
-        if (header->type == ENTRY_TYPE_CLEAR_MARKER) {
-            ring.return_item(item);
-            continue;
-        }
         const uint8_t wire_type = header->type;
         const int64_t server_ts = read_be64(inbound_item_bytes(item) + ENTRY_TYPE_SIZE);
         int64_t client_ts = self->client->get_client_time(server_ts);
@@ -727,27 +683,37 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Sleep until delivery time (interruptible via event flags)
-        const auto wait_ms =
-            static_cast<uint32_t>(std::min<int64_t>(*wait_us / US_PER_MS, UINT32_MAX));
-        if (wait_ms > 0) {
-            cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, wait_ms);
-            if (cmd & COMMAND_STOP) {
-                ring.return_item(item);
+        // Sleep until delivery time, interruptible via event flags. A boundary returns the held
+        // frame when it made it stale, so the next take returns the rest of the stale run; a
+        // frame still current is older than everything listed, so nothing listed is stale either,
+        // and the wait resumes for what is left of it.
+        const int64_t deliver_at_us = now + *wait_us;
+        bool stop = false;
+        bool stale = false;
+        for (int64_t left_us = *wait_us; left_us >= US_PER_MS;
+             left_us = deliver_at_us - platform_time_us()) {
+            const auto wait_ms =
+                static_cast<uint32_t>(std::min<int64_t>(left_us / US_PER_MS, UINT32_MAX));
+            cmd = flags.wait(COMMAND_STOP | COMMAND_BOUNDARY, false, true, wait_ms);
+            stop = (cmd & COMMAND_STOP) != 0;
+            stale = (cmd & COMMAND_BOUNDARY) != 0 && self->is_stale(item);
+            if (stop || stale || (cmd & COMMAND_BOUNDARY) == 0) {
                 break;
             }
-            if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
-                // The held item was taken before the signal, so it predates the boundary and is
-                // discarded along with the queued pre-boundary frames.
-                ring.return_item(item);
-                if (cmd & COMMAND_FLUSH) {
-                    self->flush_items();
-                }
-                if (cmd & COMMAND_CLEAR) {
-                    self->discard_to_clear_marker();
-                }
-                continue;
+        }
+        if (stop || stale) {
+            ring.return_item(item);
+            if (stop) {
+                break;
             }
+            continue;
+        }
+        // A boundary that landed after the take and that the wait did not see. This narrows the
+        // window without closing it: the loop above waits only while at least 1 ms is left, and
+        // a boundary can still land between this check and the decode.
+        if (self->is_stale(item)) {
+            ring.return_item(item);
+            continue;
         }
 
         if (self->listener == nullptr) {

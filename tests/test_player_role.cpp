@@ -509,7 +509,7 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
         EXPECT_FALSE(visualizer->drain_task->inbound.items().is_empty());
 
         EXPECT_EQ(take_all(*player).size(), row.player_items);
-        visualizer->flush_items();
+        visualizer->drain_task->inbound.recall();
         EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
             << "a dropped chunk kept its charge";
         EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U);

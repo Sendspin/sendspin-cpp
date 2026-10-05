@@ -75,7 +75,7 @@ enum class InboundKind : uint8_t {
 /// so it is never charged.
 enum class InboundHolder : uint8_t {
     PLAYER,      ///< Encoded audio chunks and markers held by the sync task
-    VISUALIZER,  ///< Frames and markers held by the visualizer drain thread
+    VISUALIZER,  ///< Frames held by the visualizer drain thread
     ARTWORK,     ///< Image parts, announces and markers held by the artwork decode thread
 };
 
@@ -179,8 +179,8 @@ struct InboundItemHeader {
     /// in-band header the consumer does not need).
     uint8_t data_offset;
     InboundKind kind;
-    /// Consumer-defined item type: the ChunkType for the player, the wire message type or a
-    /// marker for the visualizer, the ArtworkItemType for artwork.
+    /// Consumer-defined item type: the ChunkType for the player, the wire message type for the
+    /// visualizer, the ArtworkItemType for artwork.
     uint8_t type;
     /// The holder the item was handed to; meaningful only while holder_set is non-zero.
     InboundHolder holder;
@@ -192,8 +192,9 @@ struct InboundItemHeader {
     uint8_t local_returns;
     /// Non-zero once InboundRing::charge() assigned the item to `holder`; never cleared.
     uint8_t holder_set;
-    /// Consumer-defined: the player's stream ordinal on a codec header item, the artwork channel
-    /// (or, on a marker, the channel mask) on an artwork item, 0 on every other item.
+    /// Consumer-defined: the player's stream ordinal on a codec header item, the visualizer's
+    /// boundary sequence on a frame, the artwork channel (or, on a marker, the channel mask) on
+    /// an artwork item, 0 on every other item.
     uint16_t serial;
 };
 static_assert(std::is_trivially_copyable_v<InboundItemHeader> &&
@@ -631,8 +632,8 @@ static constexpr uint32_t INBOUND_CONSUMER_FALLBACK_WAKE_MS = 5000;
 struct InboundItemFields {
     /// InboundItemHeader::data_len: how many bytes the consumer reads.
     uint32_t data_len;
-    /// InboundItemHeader::serial: the player's stream ordinal on a codec header, the artwork
-    /// channel or channel mask, 0 otherwise.
+    /// InboundItemHeader::serial: the player's stream ordinal on a codec header, the visualizer's
+    /// boundary sequence on a frame, the artwork channel or channel mask, 0 otherwise.
     uint16_t serial;
     /// InboundItemHeader::type: the consumer-defined item type.
     uint8_t type;
@@ -674,7 +675,7 @@ public:
         return this->ring_;
     }
 
-    /// @brief The item list itself, for a consumer that walks it (a clear marker's discard)
+    /// @brief The item list itself, for a consumer that wakes or inspects it directly
     InboundItemList& items() {
         return this->items_;
     }
@@ -836,15 +837,15 @@ public:
     /// (SendspinClient::protocol_tick()), more than one of which may wait, and the steps after it.
     /// Most items hand over in microseconds; what waits is the Noise DH operations of a handshake
     /// message and the INBOUND_ACQUIRE_TIMEOUT_MS waits for ring space a message can make. A
-    /// stream/start makes the most, three (the player's codec header, the visualizer's marker and
-    /// the artwork role's RECONFIGURE marker, 300 ms). An artwork announce, cancel or stream/end
+    /// stream/start makes the most, two (the player's codec header and the artwork role's
+    /// RECONFIGURE marker, 200 ms). An artwork announce, cancel, stream/end or a stream/clear
     /// makes one, as does an image part dropped over the artwork quota (the DISCARD marker in its
     /// place) and the announce of an image over its cap (the marker alone); an announce makes two
-    /// only when handing the announce itself fails and its marker follows. A stream/start and two
-    /// single-wait messages in one tick add up to five waits, which is the whole bound with
+    /// only when handing the announce itself fails and its marker follows. A stream/start and
+    /// three single-wait messages in one tick add up to five waits, which is the whole bound with
     /// nothing left for the handlers, so that mix, with the ring full and the role threads not
     /// draining it, can close the waiting connection, as can any tick with more waits. This is
-    /// accepted: it takes a stream/start plus two marker-bearing messages from the incumbent in
+    /// accepted: it takes a stream/start plus three marker-bearing messages from the incumbent in
     /// one tick under ring back-pressure, and the closed connection reconnects.
     /// Every lock the task takes is a leaf held for a copy, so nothing else stretches a tick, and
     /// a task stalled beyond the bound closes the waiting connection rather than parking the

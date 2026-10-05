@@ -484,10 +484,7 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
 constexpr int64_t VISUALIZER_LEAD_US = 50 * 1000;
 
 // Pumps until pred() holds, sending one loudness frame per iteration stamped `lead_us` ahead of
-// the current time (the drain thread drops a frame whose display time has passed). A frame
-// can be lost to the ring's documented wake race right after a stream/start (the drain thread
-// may take the clear marker as a stray entry and then discard up to a marker that is gone),
-// which production shrugs off because the next frame follows; so does this.
+// the current time (the drain thread drops a frame whose display time has passed).
 void send_loudness_until(SendspinClient& client, FakeEncryptedServer& server, int64_t lead_us,
                          const std::function<bool()>& pred) {
     pump_until(client, [&] {
