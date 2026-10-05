@@ -187,10 +187,11 @@ SourceRoleConfig source_config;
 source_config.sample_rate = 48000;
 source_config.channels = 2;
 source_config.bit_depth = 16;
+source_config.codec = SendspinCodecFormat::PCM;  // or OPUS, in a build with SENDSPIN_ENABLE_OPUS
 auto& source = client.add_source(source_config);
 ```
 
-An invalid config (see [SourceRoleConfig](#sourceroleconfig)) leaves the role inert; a valid config whose buffers cannot be allocated fails `client.start()` instead.
+An invalid config (see [SourceRoleConfig](#sourceroleconfig)) leaves the role inert; a valid config whose buffers cannot be allocated fails `client.start()` instead. An `OPUS` role streams Opus only to a server whose `server/hello` lists it, and the same capture as PCM otherwise.
 
 Feed the capture to `write_audio()` from one capture thread, with the capture time of each buffer's first sample on the client's clock (`std::chrono::steady_clock` on host, `esp_timer_get_time()` on ESP-IDF), or 0 to have the write stamped as ending now:
 
@@ -1281,8 +1282,8 @@ Available options (all `ON` by default):
 
 | Option | Controls |
 |---|---|
-| `SENDSPIN_ENABLE_PLAYER` | Player role, audio decoders (micro-flac, micro-opus), sync task |
-| `SENDSPIN_ENABLE_OPUS` | Opus decoder (micro-opus) within the player role; no effect when the player is `OFF` |
+| `SENDSPIN_ENABLE_PLAYER` | Player role, audio decoders (micro-flac, and micro-opus with `SENDSPIN_ENABLE_OPUS`), sync task |
+| `SENDSPIN_ENABLE_OPUS` | Opus (micro-opus): the player's decoder and the source's encoder; no effect when both roles are `OFF` |
 | `SENDSPIN_ENABLE_CONTROLLER` | Controller role |
 | `SENDSPIN_ENABLE_METADATA` | Metadata role |
 | `SENDSPIN_ENABLE_ARTWORK` | Artwork role |
@@ -1290,7 +1291,7 @@ Available options (all `ON` by default):
 | `SENDSPIN_ENABLE_COLOR` | Color role |
 | `SENDSPIN_ENABLE_SOURCE` | Source role (audio capture streamed to the server), source task |
 
-When `SENDSPIN_ENABLE_PLAYER` is `OFF`, the micro-flac and micro-opus dependencies are not fetched. `SENDSPIN_ENABLE_OPUS=OFF` drops micro-opus alone, for products that cannot ship Opus (see the patent note in the player role spec); the player then refuses `OPUS` entries in `audio_formats`.
+When `SENDSPIN_ENABLE_PLAYER` is `OFF`, micro-flac is not fetched, and micro-opus is fetched only for the source role. `SENDSPIN_ENABLE_OPUS=OFF` drops micro-opus alone, for products that cannot ship Opus (see the patent note in the player and source role specs); the player then refuses `OPUS` entries in `audio_formats`, and the source refuses an `OPUS` codec in its config.
 
 ### ESP-IDF (Kconfig)
 
@@ -1307,7 +1308,7 @@ CONFIG_SENDSPIN_ENABLE_COLOR=y
 CONFIG_SENDSPIN_ENABLE_SOURCE=y
 ```
 
-The component also selects esp_websocket_client's `ESP_WS_CLIENT_SEPARATE_TX_LOCK`, so sends on an outbound connection (`connect_to()`) take their own lock rather than the one the client task holds while the receive handler waits for inbound ring space.
+The component also selects esp_websocket_client's `ESP_WS_CLIENT_SEPARATE_TX_LOCK`, so sends on an outbound connection (`connect_to()`) take their own lock rather than the one the client task holds while the receive handler waits for inbound ring space. With the source role and Opus enabled, micro-opus must stay in its thread-safe pseudostack allocation mode (the default); the build fails otherwise.
 
 ### Effect on the API
 
@@ -1453,12 +1454,14 @@ Configuration passed to `client.add_source()`. A value that breaks any rule belo
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `codec` | `SendspinCodecFormat` | `PCM` | `PCM`, the capture bytes untouched, is the only codec accepted |
-| `sample_rate` | `uint32_t` | `48000` | Capture rate in Hz, more than 0 |
-| `channels` | `uint8_t` | `2` | Capture channel count, at least 1 |
-| `bit_depth` | `uint8_t` | `16` | 16, 24 (3 packed bytes), or 32 |
-| `chunk_duration_ms` | `uint32_t` | `20` | Audio per chunk, 5 to 150 ms; one chunk with its header must fit one Noise transport message |
+| `codec` | `SendspinCodecFormat` | `PCM` | `PCM` sends the capture bytes untouched; `OPUS` encodes each chunk into one CELT-only Opus packet (needs `SENDSPIN_ENABLE_OPUS`). `FLAC` is not accepted. `OPUS` costs the encoder state plus a micro-opus scratch arena for the source task (about 120 KB, PSRAM-preferring, allocated before the first Opus chunk is encoded), separate from the one the player's sync task holds. |
+| `sample_rate` | `uint32_t` | `48000` | Capture rate in Hz, more than 0. `OPUS` takes 8000, 12000, 16000, 24000, or 48000. |
+| `channels` | `uint8_t` | `2` | Capture channel count, at least 1 (1 or 2 for `OPUS`) |
+| `bit_depth` | `uint8_t` | `16` | 16, 24 (3 packed bytes), or 32; `OPUS` takes 16 |
+| `chunk_duration_ms` | `uint32_t` | `20` | Audio per chunk, 5 to 150 ms; one chunk with its header must fit one Noise transport message. `OPUS` takes 5, 10, 20, 40, or 60. |
 | `capture_buffer_ms` | `uint32_t` | `150` | Capture buffer, more than 0 ms; the bound on the backlog a stall can build before writes are dropped and streaming resumes from live capture. A quarter more is allocated for per-write overhead, so very small writes hold less audio, and a single write longer than half the allocated storage (just under five eighths of `capture_buffer_ms`) is always refused. |
+| `opus_bitrate` | `uint32_t` | `128000` | Opus bitrate in bit/s, 500 to 512000; ignored for `PCM` |
+| `opus_complexity` | `uint8_t` | `2` | Opus encoder complexity, at most 10; ignored for `PCM` |
 | `line_sense` | `bool` | `false` | Advertise signal sensing; see `SourceRole::set_signal()` |
 | `buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Placement of the capture buffer and the chunk buffer (ESP-IDF only) |
 | `priority` | `unsigned` | `3` | FreeRTOS priority for the source task, below the protocol and httpd tasks (ESP-IDF only) |
@@ -1521,8 +1524,8 @@ format arrives as the `format` argument of `on_display_pairing_code`.
 | Value | Description |
 |---|---|
 | `FLAC` | FLAC lossless audio |
-| `OPUS` | Opus lossy audio; decodable only in a build with `SENDSPIN_ENABLE_OPUS` |
-| `PCM` | Raw PCM audio; the source role's codec |
+| `OPUS` | Opus lossy audio; decodable, and encodable by the source role, only in a build with `SENDSPIN_ENABLE_OPUS` |
+| `PCM` | Raw PCM audio |
 | `UNSUPPORTED` | Unsupported codec |
 
 ### SendspinControllerCommand

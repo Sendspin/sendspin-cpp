@@ -100,6 +100,13 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
+    # The source role's Opus encoder, appended when the role and SENDSPIN_ENABLE_OPUS are on
+    set(SENDSPIN_SOURCE_OPUS_SOURCES
+        ${BASE_DIR}/src/source_encoder_opus.cpp
+
+        PARENT_SCOPE
+    )
+
     # ESP-IDF only sources: networking layer deeply coupled to ESP-IDF APIs
     set(SENDSPIN_ESP_SOURCES
         ${BASE_DIR}/src/esp/server_connection.cpp

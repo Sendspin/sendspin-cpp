@@ -52,9 +52,11 @@ if(ESP_IDF_BUILD)
     if(CONFIG_SENDSPIN_ENABLE_PLAYER)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_PLAYER_SOURCES})
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_PLAYER)
-        if(CONFIG_SENDSPIN_ENABLE_OPUS)
-            list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_OPUS)
-        endif()
+    endif()
+
+    # CONFIG_SENDSPIN_ENABLE_OPUS exists only while the player or the source role is enabled
+    if(CONFIG_SENDSPIN_ENABLE_OPUS)
+        list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_OPUS)
     endif()
 
     if(CONFIG_SENDSPIN_ENABLE_CONTROLLER)
@@ -85,6 +87,9 @@ if(ESP_IDF_BUILD)
     if(CONFIG_SENDSPIN_ENABLE_SOURCE)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_SOURCES})
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_SOURCE)
+        if(CONFIG_SENDSPIN_ENABLE_OPUS)
+            list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_OPUS_SOURCES})
+        endif()
     endif()
 
     # Register the component using the assembled source list
@@ -132,8 +137,9 @@ else()
     option(SENDSPIN_ENABLE_VISUALIZER "Enable visualizer role" ON)
     option(SENDSPIN_ENABLE_SOURCE "Enable source role (audio capture)" ON)
 
-    # Codec selection (player role only). Opus is patent-encumbered; see the player role spec.
-    option(SENDSPIN_ENABLE_OPUS "Enable the Opus decoder in the player role" ON)
+    # Codec selection for the player's decoder and the source's encoder. Opus is
+    # patent-encumbered; see the player and source role specs.
+    option(SENDSPIN_ENABLE_OPUS "Enable Opus in the player and source roles" ON)
 
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/host.cmake)
 
@@ -163,6 +169,9 @@ else()
     endif()
     if(SENDSPIN_ENABLE_SOURCE)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_SOURCES})
+        if(SENDSPIN_ENABLE_OPUS)
+            list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_OPUS_SOURCES})
+        endif()
     endif()
 
     # Create the library: core sources, enabled role sources, host networking (via host.cmake)
@@ -171,9 +180,9 @@ else()
     # Add compile definitions for enabled roles
     if(SENDSPIN_ENABLE_PLAYER)
         target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_PLAYER)
-        if(SENDSPIN_ENABLE_OPUS)
-            target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_OPUS)
-        endif()
+    endif()
+    if(SENDSPIN_ENABLE_OPUS AND (SENDSPIN_ENABLE_PLAYER OR SENDSPIN_ENABLE_SOURCE))
+        target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_OPUS)
     endif()
     if(SENDSPIN_ENABLE_CONTROLLER)
         target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_CONTROLLER)

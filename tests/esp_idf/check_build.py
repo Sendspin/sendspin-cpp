@@ -14,7 +14,8 @@
 
 """Checks that a finished build pulled in exactly the codecs its sdkconfig enables.
 
-Run from this project directory after `idf.py build`: `python check_build.py --opus on|off`.
+Run from this project directory after `idf.py build`:
+`python check_build.py --flac on|off --opus on|off`.
 Each codec must be resolved in dependencies.lock, fetched into managed_components, required by
 the sendspin-cpp component, and linked into the app image if and only if it is enabled.
 """
@@ -30,6 +31,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--flac", choices=("on", "off"), required=True)
     parser.add_argument("--opus", choices=("on", "off"), required=True)
     args = parser.parse_args()
 
@@ -48,7 +50,7 @@ def main() -> int:
 
     # (codec, enabled, predicate matching one of its linked symbols)
     codecs = (
-        ("micro-flac", True, lambda s: s.startswith("micro_flac::")),
+        ("micro-flac", args.flac == "on", lambda s: s.startswith("micro_flac::")),
         ("micro-opus", args.opus == "on", lambda s: s.startswith("opus_")),
     )
     failures = []

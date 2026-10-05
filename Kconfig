@@ -21,13 +21,15 @@ menu "sendspin-cpp"
         default y
 
     config SENDSPIN_ENABLE_OPUS
-        bool "Enable the Opus decoder"
-        depends on SENDSPIN_ENABLE_PLAYER
+        bool "Enable Opus"
+        depends on SENDSPIN_ENABLE_PLAYER || SENDSPIN_ENABLE_SOURCE
         default y
         help
-            Compiles the Opus decoder (micro-opus) into the player role so opus can be
-            listed in its audio formats. Opus is covered by third-party patents (see the
-            player role spec); disable to drop the codec and its dependency.
+            Compiles micro-opus into the player role (opus in its audio formats) and the
+            source role (opus streams). Opus is covered by third-party patents (see the
+            player and source role specs); disable to drop the codec and its dependency.
+            The source role's encoder needs micro-opus's thread-safe pseudostack
+            allocation mode (the default).
 
     config SENDSPIN_ENABLE_CONTROLLER
         bool "Enable controller role"

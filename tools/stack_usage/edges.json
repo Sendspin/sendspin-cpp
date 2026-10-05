@@ -220,17 +220,29 @@
   ],
   "sendspin::SourceTask::begin_chunk(": [
    "sendspin::PcmPassthroughEncoder::reset(",
-   "sendspin::SourceEncoder::input_buffer("
+   "sendspin::SourceEncoder::input_buffer(",
+   "sendspin::SourceEncoder::warm_up(",
+   "sendspin::OpusSourceEncoder::reset(",
+   "sendspin::OpusSourceEncoder::input_buffer(",
+   "sendspin::OpusSourceEncoder::warm_up("
   ],
   "sendspin::SourceTask::finish_chunk(": [
    "sendspin::PcmPassthroughEncoder::encode(",
-   "sendspin::PcmPassthroughEncoder::lookahead_us("
+   "sendspin::PcmPassthroughEncoder::lookahead_us(",
+   "sendspin::OpusSourceEncoder::encode(",
+   "sendspin::OpusSourceEncoder::lookahead_us("
   ],
   "sendspin::SourceTask::process(": [
    "sendspin::PcmPassthroughEncoder::reset(",
    "sendspin::SourceEncoder::input_buffer(",
+   "sendspin::SourceEncoder::warm_up(",
    "sendspin::PcmPassthroughEncoder::encode(",
-   "sendspin::PcmPassthroughEncoder::lookahead_us("
+   "sendspin::PcmPassthroughEncoder::lookahead_us(",
+   "sendspin::OpusSourceEncoder::reset(",
+   "sendspin::OpusSourceEncoder::input_buffer(",
+   "sendspin::OpusSourceEncoder::warm_up(",
+   "sendspin::OpusSourceEncoder::encode(",
+   "sendspin::OpusSourceEncoder::lookahead_us("
   ],
   "sendspin::TimeBurstResult sendspin::SendspinTimeBurst::loop(": [
    "int64_t sendspin::SendspinConnection::send_time_message()"

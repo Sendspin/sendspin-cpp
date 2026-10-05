@@ -14,12 +14,14 @@
 
 /// Tests for the source role (roles/source/v1.md): chunk bookkeeping and config validation, the
 /// capture path and chunk assembly played on the test thread, the stream lifecycle on the
-/// protocol task against an in-process stand-in connection over a live Noise session, and a few
-/// wire scenarios end to end against FakeEncryptedServer on loopback.
+/// protocol task against an in-process stand-in connection over a live Noise session, the Opus
+/// encode path (built with SENDSPIN_ENABLE_OPUS), and a few wire scenarios end to end against
+/// FakeEncryptedServer on loopback.
 
 #include "connection_manager.h"
 #include "crypto/constants.h"
 #include "lifecycle_test_fixtures.h"
+#include "log_capture.h"
 #include "loopback_connection.h"
 #include "outbound_ring.h"
 #include "platform/crypto.h"
@@ -32,6 +34,10 @@
 #include "source_role_impl.h"
 #include "source_task.h"
 #include "time_filter.h"
+#ifdef SENDSPIN_ENABLE_OPUS
+#include "source_encoder_opus.h"
+#include <opus.h>
+#endif
 
 #include <gtest/gtest.h>
 
@@ -57,6 +63,13 @@ constexpr uint16_t STREAM_TEST_PORT = 19200;
 constexpr uint16_t CLOCK_GATE_TEST_PORT = 19201;
 constexpr uint16_t CLOCK_GATE_CONTROL_TEST_PORT = 19202;
 constexpr uint16_t CLIENT_RESTART_TEST_PORT = 19203;
+
+/// Whether this build has the Opus encoder; an OPUS config is valid only then.
+#ifdef SENDSPIN_ENABLE_OPUS
+constexpr bool OPUS_ENABLED = true;
+#else
+constexpr bool OPUS_ENABLED = false;
+#endif
 
 /// The default config's chunk: 20 ms of 48 kHz stereo 16-bit PCM.
 constexpr int64_t CHUNK_MS = 20;
@@ -128,8 +141,10 @@ struct CaptureRig {
         this->task.protocol_task_ = this->client.protocol_task_.get();
     }
 
-    /// Opens the gate on `generation`, as the protocol task does when a stream opens.
-    void open(uint32_t generation) {
+    /// Opens the gate on `generation` for a stream of `codec`, as the protocol task does when a
+    /// stream opens.
+    void open(uint32_t generation, SendspinCodecFormat codec = SendspinCodecFormat::PCM) {
+        this->source.impl_->stream_codec.store(codec);
         this->source.impl_->stream_gate.store(SOURCE_GATE_OPEN | generation);
     }
 
@@ -304,9 +319,96 @@ TEST(SourceConfigValidation, RejectsUnusableFormats) {
         {"zero capture buffer", [](SourceRoleConfig& c) { c.capture_buffer_ms = 0; }, false},
         {"capture buffer too large to size",
          [](SourceRoleConfig& c) { c.capture_buffer_ms = UINT32_MAX; }, false},
-        {"opus is not offered", [](SourceRoleConfig& c) { c.codec = SendspinCodecFormat::OPUS; },
-         false},
         {"flac is not offered", [](SourceRoleConfig& c) { c.codec = SendspinCodecFormat::FLAC; },
+         false},
+        // Opus rules: libopus's rates and channel counts, 16-bit, one legal frame per chunk; none
+        // is valid in a build without the encoder
+        {"Control: opus at the defaults",
+         [](SourceRoleConfig& c) { c.codec = SendspinCodecFormat::OPUS; }, OPUS_ENABLED},
+        {"Control: opus at its lowest rate, mono, shortest frame, and top bitrate and complexity",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.sample_rate = 8000;
+             c.channels = 1;
+             c.chunk_duration_ms = 5;
+             c.opus_bitrate = SourceRoleConfig::MAX_OPUS_BITRATE;
+             c.opus_complexity = SourceRoleConfig::MAX_OPUS_COMPLEXITY;
+         },
+         OPUS_ENABLED},
+        {"Control: opus at its longest frame and lowest bitrate",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.chunk_duration_ms = 60;
+             c.opus_bitrate = SourceRoleConfig::MIN_OPUS_BITRATE;
+         },
+         OPUS_ENABLED},
+        {"Control: opus at 12 kHz, 10 ms",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.sample_rate = 12000;
+             c.chunk_duration_ms = 10;
+         },
+         OPUS_ENABLED},
+        {"Control: opus at 24 kHz, 40 ms",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.sample_rate = 24000;
+             c.chunk_duration_ms = 40;
+         },
+         OPUS_ENABLED},
+        {"Control: opus at 16 kHz",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.sample_rate = 16000;
+         },
+         OPUS_ENABLED},
+        {"Control: pcm ignores the opus settings",
+         [](SourceRoleConfig& c) {
+             c.opus_bitrate = 0;
+             c.opus_complexity = SourceRoleConfig::MAX_OPUS_COMPLEXITY + 1;
+         },
+         true},
+        {"opus at 44.1 kHz",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.sample_rate = 44100;
+         },
+         false},
+        {"opus with three channels",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.channels = 3;
+         },
+         false},
+        {"opus from 24-bit capture",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.bit_depth = 24;
+         },
+         false},
+        {"opus 25 ms chunk",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.chunk_duration_ms = 25;
+         },
+         false},
+        {"opus bitrate below libopus's range",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.opus_bitrate = SourceRoleConfig::MIN_OPUS_BITRATE - 1;
+         },
+         false},
+        {"opus bitrate above libopus's range",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.opus_bitrate = SourceRoleConfig::MAX_OPUS_BITRATE + 1;
+         },
+         false},
+        {"opus complexity above libopus's range",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::OPUS;
+             c.opus_complexity = SourceRoleConfig::MAX_OPUS_COMPLEXITY + 1;
+         },
          false},
     };
     for (const Row& row : rows) {
@@ -1067,6 +1169,445 @@ TEST(SourceStream, StopFromTheStoppedCallbackFindsTheHoldReleased) {
     EXPECT_EQ(stopping.releases_after_stop, 1);
     EXPECT_EQ(counter.releases, 1);
 }
+
+// ============================================================================
+// Opus
+// ============================================================================
+
+#ifdef SENDSPIN_ENABLE_OPUS
+
+namespace {
+
+SourceRoleConfig make_opus_config() {
+    SourceRoleConfig config;
+    config.codec = SendspinCodecFormat::OPUS;
+    return config;
+}
+
+/// `len` bytes of reproducible white noise, which spends the most bits; `seed` picks the stretch.
+std::vector<uint8_t> noise_bytes(size_t len, uint32_t seed) {
+    std::vector<uint8_t> bytes(len);
+    uint32_t lcg = seed;
+    for (uint8_t& byte : bytes) {
+        lcg = lcg * 1664525U + 1013904223U;
+        byte = static_cast<uint8_t>(lcg >> 24);
+    }
+    return bytes;
+}
+
+/// Frames one Opus packet decodes to through micro-opus's decoder, configured from the rate and
+/// channels alone as a server's is (roles/source/v1.md "client-stream/start"), or the libopus
+/// error.
+int opus_packet_frames(const std::vector<uint8_t>& packet, uint32_t rate, uint8_t channels) {
+    int err = OPUS_OK;
+    OpusDecoder* decoder =
+        opus_decoder_create(static_cast<opus_int32>(rate), static_cast<int>(channels), &err);
+    if (decoder == nullptr) {
+        return err;
+    }
+    const int max_frames = static_cast<int>(rate / 1000 * 120);  // libopus's longest frame
+    std::vector<opus_int16> pcm(static_cast<size_t>(max_frames) * channels);
+    const int frames = opus_decode(decoder, packet.data(), static_cast<opus_int32>(packet.size()),
+                                   pcm.data(), max_frames, 0);
+    opus_decoder_destroy(decoder);
+    return frames;
+}
+
+/// Gives a rig the Opus encoder its OPUS config's start() would create.
+void install_opus_encoder(CaptureRig& rig, const SourceRoleConfig& config) {
+    auto encoder = std::make_unique<OpusSourceEncoder>();
+    ASSERT_TRUE(encoder->init(config));
+    rig.task.opus_encoder_ = std::move(encoder);
+}
+
+}  // namespace
+
+// The encoder runs CELT only, whose delay is 2.5 ms at every rate (SILK-capable modes report
+// 6.5 ms). OPUS_GET_LOOKAHEAD counts samples at the encoder's rate, so 16 kHz catches a
+// conversion at the wrong rate.
+TEST(SourceOpusEncoder, LookaheadIsCeltOnlyAtEveryRate) {
+    OpusSourceEncoder at48k;
+    ASSERT_TRUE(at48k.init(make_opus_config()));
+    EXPECT_EQ(at48k.lookahead_us(), 2500);
+
+    SourceRoleConfig mono16k = make_opus_config();
+    mono16k.sample_rate = 16000;
+    mono16k.channels = 1;
+    OpusSourceEncoder at16k;
+    ASSERT_TRUE(at16k.init(mono16k));
+    EXPECT_EQ(at16k.lookahead_us(), 2500);
+}
+
+// Where the PCM sits does not change the packet: assembled in input_buffer() as the task does,
+// or in place behind a chunk header (in == out, not int16-aligned), it encodes as from a separate
+// buffer. Anything but one full chunk is refused.
+TEST(SourceOpusEncoder, InputPlacementLeavesThePacket) {
+    constexpr size_t PCM_BYTES = 960 * 4;
+    const std::vector<uint8_t> input = noise_bytes(PCM_BYTES, 1);
+
+    OpusSourceEncoder separate;
+    ASSERT_TRUE(separate.init(make_opus_config()));
+    std::vector<uint8_t> out(OpusSourceEncoder::MAX_PACKET_BYTES);
+    const size_t separate_len = separate.encode(input.data(), PCM_BYTES, out.data(), out.size());
+    ASSERT_GT(separate_len, 0U);
+    out.resize(separate_len);
+
+    OpusSourceEncoder assembled;
+    ASSERT_TRUE(assembled.init(make_opus_config()));
+    std::memcpy(assembled.input_buffer(), input.data(), PCM_BYTES);
+    std::vector<uint8_t> packet(OpusSourceEncoder::MAX_PACKET_BYTES);
+    packet.resize(
+        assembled.encode(assembled.input_buffer(), PCM_BYTES, packet.data(), packet.size()));
+    EXPECT_EQ(packet, out);
+
+    OpusSourceEncoder in_place;
+    ASSERT_TRUE(in_place.init(make_opus_config()));
+    std::vector<uint8_t> item(SOURCE_CHUNK_HEADER_SIZE + OpusSourceEncoder::MAX_PACKET_BYTES);
+    uint8_t* payload = item.data() + SOURCE_CHUNK_HEADER_SIZE;
+    std::memcpy(payload, input.data(), PCM_BYTES);
+    const size_t in_place_len =
+        in_place.encode(payload, PCM_BYTES, payload, OpusSourceEncoder::MAX_PACKET_BYTES);
+    EXPECT_EQ(std::vector<uint8_t>(payload, payload + in_place_len), out);
+
+    EXPECT_EQ(separate.encode(input.data(), PCM_BYTES - 4, out.data(), out.size()), 0U)
+        << "a chunk one frame short was encoded";
+}
+
+// A failed encode returns 0 and logs once per run of failures: the first failure logs, the ones
+// after it do not until an encode succeeds again.
+TEST(SourceOpusEncoder, AFailureLogsOncePerEpisode) {
+    constexpr size_t PCM_BYTES = 960 * 4;
+    const std::vector<uint8_t> input = noise_bytes(PCM_BYTES, 1);
+    OpusSourceEncoder encoder;
+    ASSERT_TRUE(encoder.init(make_opus_config()));
+    std::vector<uint8_t> out(OpusSourceEncoder::MAX_PACKET_BYTES);
+
+    StderrCapture capture;
+    // No room for a packet: libopus refuses the encode (OPUS_BAD_ARG)
+    EXPECT_EQ(encoder.encode(input.data(), PCM_BYTES, out.data(), 0), 0U);
+    EXPECT_EQ(encoder.encode(input.data(), PCM_BYTES, out.data(), 0), 0U);
+    EXPECT_GT(encoder.encode(input.data(), PCM_BYTES, out.data(), out.size()), 0U)
+        << "Control: an encode with room succeeds";
+    EXPECT_EQ(encoder.encode(input.data(), PCM_BYTES, out.data(), 0), 0U);
+    const std::string log = capture.release();
+
+    size_t error_lines = 0;
+    for (size_t at = log.find("E sendspin.source_encoder"); at != std::string::npos;
+         at = log.find("E sendspin.source_encoder", at + 1)) {
+        ++error_lines;
+    }
+    EXPECT_EQ(error_lines, 2U) << log;
+}
+
+// roles/source/v1.md "client-stream/start", codec framing: each chunk is exactly one Opus packet,
+// which decodes to the chunk's frames. The outbound item records the packet's length and is
+// reserved at the larger of an Opus packet's worst case and the PCM chunk (an OPUS role streams
+// PCM to a server without opus), and the stamp names the first sample the decoder emits: the
+// chunk's first captured sample less the encoder's lookahead.
+TEST(SourceOpusChunks, EachChunkIsOnePacketReservedAtTheWorstCase) {
+    struct Row {
+        const char* name;
+        uint32_t sample_rate;
+        uint8_t channels;
+        uint32_t chunk_ms;
+        uint32_t bitrate;
+        size_t reserved_payload;
+        bool packet_outgrows_pcm;
+    };
+    const Row rows[] = {
+        {"Control: the defaults, 20 ms of 48 kHz stereo", 48000, 2, 20,
+         SourceRoleConfig::DEFAULT_OPUS_BITRATE, OpusSourceEncoder::MAX_PACKET_BYTES, false},
+        {"5 ms of 8 kHz mono at the top bitrate: a packet outgrows its 80 bytes of PCM", 8000, 1, 5,
+         SourceRoleConfig::MAX_OPUS_BITRATE, OpusSourceEncoder::MAX_PACKET_BYTES, true},
+        {"60 ms of 48 kHz stereo: the PCM chunk is the larger", 48000, 2, 60,
+         SourceRoleConfig::DEFAULT_OPUS_BITRATE, 11520, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SourceRoleConfig config = make_opus_config();
+        config.sample_rate = row.sample_rate;
+        config.channels = row.channels;
+        config.chunk_duration_ms = row.chunk_ms;
+        config.opus_bitrate = row.bitrate;
+        ASSERT_TRUE(SourceRole::Impl::validate_config(config));
+        CaptureRig rig(config);
+        install_opus_encoder(rig, config);
+        EXPECT_EQ(rig.task.chunk_message_bytes_,
+                  SOURCE_CHUNK_HEADER_SIZE + row.reserved_payload + AEAD_TAG_SIZE);
+
+        const size_t chunk_bytes = source_chunk_bytes(config);
+        const auto chunk_frames = static_cast<int>(chunk_bytes / (2U * row.channels));
+        const int64_t chunk_us = static_cast<int64_t>(row.chunk_ms) * 1000;
+        constexpr int64_t FIRST_CAPTURE_US = 5000000;
+        constexpr int CHUNKS = static_cast<int>(OUTBOUND_RING_ITEM_COUNT);
+        rig.open(1, SendspinCodecFormat::OPUS);
+        for (int n = 0; n < CHUNKS; ++n) {
+            const std::vector<uint8_t> piece = noise_bytes(chunk_bytes, n + 1);
+            const int64_t capture_us = FIRST_CAPTURE_US + n * chunk_us;
+            ASSERT_TRUE(rig.source.write_audio(piece.data(), piece.size(), capture_us));
+            rig.drain();
+        }
+
+        const auto chunks = rig.take_chunks();
+        ASSERT_EQ(chunks.size(), static_cast<size_t>(CHUNKS));
+        size_t largest = 0;
+        for (size_t n = 0; n < chunks.size(); ++n) {
+            SCOPED_TRACE(n);
+            const auto& [header, payload] = chunks[n];
+            ASSERT_FALSE(payload.empty()) << "the chunk was dropped";
+            EXPECT_EQ(header.data_len, SOURCE_CHUNK_HEADER_SIZE + payload.size());
+            EXPECT_EQ(opus_packet_frames(payload, row.sample_rate, row.channels), chunk_frames);
+            EXPECT_EQ(header.capture_time_us,
+                      FIRST_CAPTURE_US + static_cast<int64_t>(n) * chunk_us - 2500);
+            largest = std::max(largest, payload.size());
+        }
+        EXPECT_EQ(largest > chunk_bytes, row.packet_outgrows_pcm) << "largest packet " << largest;
+    }
+}
+
+// Each stream starts the encoder afresh: a second stream fed the same capture opens with the same
+// packet as the first, which libopus produces only from the same encoder state. The control
+// shows the state matters: within one stream the same capture encodes differently later on.
+TEST(SourceOpusChunks, EachStreamResetsTheEncoder) {
+    const SourceRoleConfig config = make_opus_config();
+    CaptureRig rig(config);
+    install_opus_encoder(rig, config);
+    const size_t chunk_bytes = source_chunk_bytes(config);
+    const std::vector<uint8_t> first = noise_bytes(chunk_bytes, 1);
+    const std::vector<uint8_t> second = noise_bytes(chunk_bytes, 2);
+
+    rig.open(1, SendspinCodecFormat::OPUS);
+    for (const auto* piece : {&first, &second, &first}) {
+        ASSERT_TRUE(rig.source.write_audio(piece->data(), piece->size(), 1000000));
+        rig.drain();
+    }
+    auto chunks = rig.take_chunks();  // The ring holds three
+    rig.open(2, SendspinCodecFormat::OPUS);
+    ASSERT_TRUE(rig.source.write_audio(first.data(), first.size(), 2000000));
+    rig.drain();
+    for (auto& chunk : rig.take_chunks()) {
+        chunks.push_back(std::move(chunk));
+    }
+    ASSERT_EQ(chunks.size(), 4U);
+    EXPECT_NE(chunks[2].second, chunks[0].second)
+        << "Control: the same capture later in a stream encoded the same";
+    EXPECT_EQ(chunks[3].second, chunks[0].second)
+        << "the second stream's first packet carries the first stream's encoder state";
+}
+
+namespace {
+
+/// Stands in for the Opus encoder: records the task's calls in order, passes the PCM through, and
+/// fails the encodes it is told to.
+class RecordingEncoder final : public SourceEncoder {
+public:
+    size_t encode(const uint8_t* in, size_t in_len, uint8_t* out, size_t out_capacity) override {
+        this->calls.emplace_back("encode");
+        if (this->failures > 0) {
+            --this->failures;
+            return 0;
+        }
+        return this->passthrough.encode(in, in_len, out, out_capacity);
+    }
+    int64_t lookahead_us() const override {
+        return 0;
+    }
+    void reset() override {
+        this->calls.emplace_back("reset");
+    }
+    void warm_up() override {
+        this->calls.emplace_back("warm_up");
+    }
+
+    PcmPassthroughEncoder passthrough;
+    std::vector<std::string> calls;
+    int failures{0};
+};
+
+}  // namespace
+
+// The Opus encoder is warmed up on the task's thread once, before the first chunk of its first
+// opus stream and ahead of that stream's reset; a stream the protocol task chose pcm for leaves
+// it untouched. Warm-up has no host-observable outcome (it only makes micro-opus allocate the
+// thread's pseudostack early), so the encoder's call record stands in for one.
+TEST(SourceOpusChunks, WarmUpPrecedesTheFirstOpusStreamOnly) {
+    using Codec = SendspinCodecFormat;
+    struct Row {
+        const char* name;
+        std::vector<Codec> streams;  // One chunk each, on generations 1, 2, ...
+        std::vector<std::string> calls;
+    };
+    const Row rows[] = {
+        {"Control: one opus stream", {Codec::OPUS}, {"warm_up", "reset", "encode"}},
+        {"a second opus stream is not warmed up again",
+         {Codec::OPUS, Codec::OPUS},
+         {"warm_up", "reset", "encode", "reset", "encode"}},
+        {"a pcm stream leaves the opus encoder untouched until an opus one",
+         {Codec::PCM, Codec::OPUS},
+         {"warm_up", "reset", "encode"}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        const SourceRoleConfig config = make_opus_config();
+        CaptureRig rig(config);
+        auto encoder = std::make_unique<RecordingEncoder>();
+        RecordingEncoder& recorder = *encoder;
+        rig.task.opus_encoder_ = std::move(encoder);
+
+        const std::vector<uint8_t> piece = counting_bytes(source_chunk_bytes(config), 0);
+        for (size_t i = 0; i < row.streams.size(); ++i) {
+            rig.open(static_cast<uint32_t>(i + 1), row.streams[i]);
+            ASSERT_TRUE(rig.source.write_audio(piece.data(), piece.size(), 1000000));
+            rig.drain();
+        }
+        EXPECT_EQ(recorder.calls, row.calls);
+        EXPECT_EQ(rig.take_chunks().size(), row.streams.size());
+    }
+}
+
+// A failed encode drops its own chunk alone: the item is completed empty, which the protocol task
+// returns unsent, and the next chunk goes out.
+TEST(SourceOpusChunks, AFailedEncodeDropsItsChunkAlone) {
+    struct Row {
+        const char* name;
+        int failures;
+        std::vector<bool> sent;
+    };
+    const Row rows[] = {
+        {"Control: every encode succeeds", 0, {true, true}},
+        {"the first encode fails", 1, {false, true}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        const SourceRoleConfig config = make_opus_config();
+        CaptureRig rig(config);
+        auto encoder = std::make_unique<RecordingEncoder>();
+        encoder->failures = row.failures;
+        rig.task.opus_encoder_ = std::move(encoder);
+
+        const std::vector<uint8_t> piece = counting_bytes(source_chunk_bytes(config), 0);
+        rig.open(1, SendspinCodecFormat::OPUS);
+        for (size_t i = 0; i < row.sent.size(); ++i) {
+            ASSERT_TRUE(rig.source.write_audio(piece.data(), piece.size(), 1000000));
+            rig.drain();
+        }
+        const auto chunks = rig.take_chunks();
+        ASSERT_EQ(chunks.size(), row.sent.size());
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            SCOPED_TRACE(i);
+            EXPECT_EQ(chunks[i].first.data_len != 0, row.sent[i]);
+            if (row.sent[i]) {
+                EXPECT_EQ(chunks[i].second, piece);
+            }
+        }
+    }
+}
+
+// micro-opus's pseudostack is per thread, so each run of the source task (a stop and a start)
+// warms the encoder up again on its own thread before its first opus stream. The real task
+// thread runs; start() keeps the stand-in encoder given to it, and the test thread plays the
+// protocol task. As above, the call record stands in for the unobservable warm-up.
+TEST(SourceOpusStream, EachRunWarmsUpItsOwnThread) {
+    SourceStandIn rig(true, make_opus_config());
+    SourceRole::Impl& impl = *rig.source->impl_;
+    impl.stop();
+    auto encoder = std::make_unique<RecordingEncoder>();
+    RecordingEncoder& recorder = *encoder;
+    impl.task->opus_encoder_ = std::move(encoder);
+    rig.deliver(
+        R"({"type":"server/hello","payload":{"name":"Stand-in","source@v1_support":)"
+        R"({"supported_codecs":["pcm","flac","opus"]}}})");
+
+    const std::vector<uint8_t> pcm = counting_bytes(2 * WRITE_BYTES, 0);
+    for (int run = 1; run <= 2; ++run) {
+        SCOPED_TRACE(run);
+        ASSERT_TRUE(impl.start(rig.client->protocol_task_.get()));
+        rig.deliver(source_command_json("start"));
+        rig.tick();
+        ASSERT_TRUE(rig.source->is_streaming());
+        ASSERT_TRUE(rig.source->write_audio(pcm.data(), pcm.size(), platform_time_us()));
+        // No timeout: a chunk that never arrives hangs here and the suite watchdog names it.
+        while (rig.chunks.size() < static_cast<size_t>(run)) {
+            rig.tick();
+            rig.collect(run);
+            std::this_thread::yield();
+        }
+        rig.deliver(source_command_json("stop"));
+        rig.tick();
+        impl.stop();
+    }
+    EXPECT_EQ(std::count(recorder.calls.begin(), recorder.calls.end(), "warm_up"), 2)
+        << "the second run's thread was not warmed up";
+}
+
+// roles/source/v1.md "client/hello source@v1 support object": a source announces only a codec
+// the server lists, and every server accepts pcm. An OPUS role streams Opus, announced with no
+// codec_header, to a server whose server/hello lists it, ignoring codec ids it does not know, and
+// the same capture as pcm otherwise. The protocol task and the server are played on the test
+// thread; the source task is the real one.
+TEST(SourceOpusStream, OpusIsAnnouncedOnlyWhenTheServerListsIt) {
+    struct Row {
+        const char* name;
+        SendspinCodecFormat role_codec;
+        std::optional<std::string> server_codecs;  // supported_codecs, or no support object
+        const char* announced;
+    };
+    const Row rows[] = {
+        {"Control: the server lists opus", SendspinCodecFormat::OPUS, R"(["pcm","flac","opus"])",
+         "opus"},
+        {"an unknown codec id beside opus is ignored", SendspinCodecFormat::OPUS,
+         R"(["pcm","x-future","flac","opus"])", "opus"},
+        {"the server lists pcm and flac", SendspinCodecFormat::OPUS, R"(["pcm","flac"])", "pcm"},
+        {"the server sends no source@v1 support object", SendspinCodecFormat::OPUS, std::nullopt,
+         "pcm"},
+        {"a pcm role to a server listing opus", SendspinCodecFormat::PCM,
+         R"(["pcm","flac","opus"])", "pcm"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SourceRoleConfig config;
+        config.codec = row.role_codec;
+        SourceStandIn rig(true, config);
+        std::string hello = R"({"type":"server/hello","payload":{"name":"Stand-in")";
+        if (row.server_codecs.has_value()) {
+            hello += R"(,"source@v1_support":{"supported_codecs":)" + *row.server_codecs + "}";
+        }
+        rig.deliver(hello + "}}");
+        rig.deliver(source_command_json("start"));
+        rig.tick();
+        rig.collect(0);
+        ASSERT_EQ(rig.stream_starts.size(), 1U);
+        EXPECT_EQ(rig.stream_starts[0],
+                  std::string(R"({"codec":")") + row.announced +
+                      R"(","channels":2,"sample_rate":48000,"bit_depth":16})");
+
+        const int64_t capture_us = platform_time_us();
+        const std::vector<uint8_t> pcm = noise_bytes(2 * WRITE_BYTES, 1);
+        ASSERT_TRUE(rig.source->write_audio(pcm.data(), WRITE_BYTES, capture_us));
+        ASSERT_TRUE(rig.source->write_audio(pcm.data() + WRITE_BYTES, WRITE_BYTES,
+                                            capture_us + WRITE_MS * 1000));
+        // No timeout: a chunk that never arrives hangs here and the suite watchdog names it.
+        while (rig.chunks.empty()) {
+            rig.tick();
+            rig.collect(1);
+            std::this_thread::yield();
+        }
+
+        const std::vector<uint8_t>& chunk = rig.chunks.front();
+        const std::vector<uint8_t> payload(chunk.begin() + SOURCE_CHUNK_HEADER_SIZE, chunk.end());
+        const bool opus = std::string(row.announced) == "opus";
+        if (opus) {
+            EXPECT_EQ(opus_packet_frames(payload, 48000, 2), 960);
+        } else {
+            EXPECT_EQ(payload, std::vector<uint8_t>(pcm.begin(), pcm.begin() + CHUNK_BYTES));
+        }
+        EXPECT_EQ(be64_to_host(chunk.data() + 1),
+                  rig.conn().get_time_filter()->compute_server_time(capture_us -
+                                                                    (opus ? 2500 : 0)));
+    }
+}
+
+#endif  // SENDSPIN_ENABLE_OPUS
 
 // ============================================================================
 // Wire behavior (loopback)

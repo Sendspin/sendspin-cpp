@@ -209,22 +209,23 @@ struct SendspinClientConfig {
                                                       ///< task (ESP-IDF only)
 
     // Task stack derivation (ESP-IDF only), shared by DEFAULT_HTTPD_STACK_SIZE,
-    // DEFAULT_WEBSOCKET_STACK_SIZE, DEFAULT_PROTOCOL_TASK_STACK_SIZE and
-    // SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE. Each default is the
+    // DEFAULT_WEBSOCKET_STACK_SIZE, DEFAULT_PROTOCOL_TASK_STACK_SIZE,
+    // SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE and
+    // SourceRoleConfig::DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE. Each default is the
     // deepest call chain from the task's entry, a static call-graph upper bound measured with
     // -fstack-usage and -fcallgraph-info on xtensa-esp32 (ESP-IDF 5.5, GCC 14.2) at both -Os
     // (ESPHome's default) and -Og (ESP-IDF's default), taking the larger, with the toolchain's
     // precompiled newlib, libgcc and libstdc++ frames read from their objdump; tools/stack_usage/
     // holds the script, its indirect-call tables and the recipe that re-derive it. Every chain
     // ends in a shared ESP-IDF tail of about 2.7 KB (the source task's reaches it straight from a
-    // log line), an allocation or lwIP call into an error log
-    // line through newlib's vfprintf (800 bytes alone), its lock and an assert, whose last ~500
-    // bytes are a fatal path. Added to that: 384 bytes, which are the FreeRTOS exception frame and
-    // coprocessor save area (XT_STK_FRMSZ 192: XtExcFrame 112, the MAC16 save 48, and 32 for the
-    // interruptee's base save area and nested-function space; XT_CP_SIZE 96) and 96 bytes for the
-    // fixed costs outside any frame (vPortTaskWrapper's 32 under FREERTOS_TASK_FUNCTION_WRAPPER,
-    // the 16-byte overflow canary, 16 of thread-local storage, up to 15 of save-area alignment);
-    // then rounded up to a 512-byte multiple, whose remainder is the only slack. The bounds are
+    // log line), an allocation or lwIP call into an error log line through newlib's vfprintf
+    // (800 bytes alone), its lock and an assert, whose last ~500 bytes are a fatal path. Added to
+    // that: 384 bytes, which are the FreeRTOS exception frame and coprocessor save area
+    // (XT_STK_FRMSZ 192: XtExcFrame 112, the MAC16 save 48, and 32 for the interruptee's base save
+    // area and nested-function space; XT_CP_SIZE 96) and 96 bytes for the fixed costs outside any
+    // frame (vPortTaskWrapper's 32 under FREERTOS_TASK_FUNCTION_WRAPPER, the 16-byte overflow
+    // canary, 16 of thread-local storage, up to 15 of save-area alignment); then rounded up to a
+    // 512-byte multiple, whose remainder is the only slack. The bounds are
     // conservative where the graph cannot tell callees apart: a virtual call reaches every
     // override (SendspinConnection::fail_inbound()'s close reaches both transports'), and
     // esp_event_loop_run() reaches the library's event handler for every event. Not modelled: a
@@ -686,21 +687,48 @@ struct SourceRoleConfig {
                       SendspinClientConfig::DEFAULT_PROTOCOL_TASK_PRIORITY,
                   "The source task must stay below the protocol task");
 
-    /// @brief Source task stack size in bytes (ESP-IDF only). The task sends nothing itself (the
-    /// protocol task does), only the chunk assembly and the encode into the outbound ring.
-    /// Deepest chain from the task entry: 2,352 bytes at -Os, 2,368 at -Og, from begin_chunk()'s
-    /// warning into the shared tail; the std::thread entry frames above thread_entry() are not
-    /// counted and come out of the rounding slack. 2,368 + 384 = 2,752, rounded up (see the task
-    /// stack derivation in SendspinClientConfig).
+    /// @brief Source task stack size in bytes for a PCM config (ESP-IDF only). The task sends
+    /// nothing itself (the protocol task does), only the chunk assembly and the encode into the
+    /// outbound ring. Deepest chain from the task entry: 2,352 bytes at -Os, 2,368 at -Og, from
+    /// begin_chunk()'s warning into the shared tail; the std::thread entry frames above
+    /// thread_entry() are not counted and come out of the rounding slack. 2,368 + 384 = 2,752,
+    /// rounded up (see the task stack derivation in SendspinClientConfig).
     static constexpr size_t DEFAULT_SOURCE_TASK_STACK_SIZE = 3072U;
 
+    /// @brief Source task stack size in bytes for an OPUS config (ESP-IDF only). Deepest chain
+    /// from the task entry with the Opus encoder: 5,152 bytes at -Os, 5,168 at -Og, with CELT's
+    /// quant_partition() recursion charged one pass; it nests four levels deeper, 576 bytes
+    /// more. The std::thread entry frames above thread_entry() are not counted and come out of
+    /// the rounding slack. 5,744 + 384 = 6,128, rounded up (see the task stack derivation in
+    /// SendspinClientConfig).
+    static constexpr size_t DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE = 6656U;
+
+    /// @brief Opus bitrate bounds in bit/s: the range opus.h documents for OPUS_SET_BITRATE (the
+    /// encoder clamps anything outside it). Not named OPUS_BITRATE_*, which opus.h defines as
+    /// macros.
+    static constexpr uint32_t MIN_OPUS_BITRATE = 500U;
+    static constexpr uint32_t MAX_OPUS_BITRATE = 512000U;
+
+    /// @brief Default Opus bitrate (bit/s): transparent-leaning for 48 kHz stereo music. The
+    /// encoder runs CELT only (no SILK speech mode), so mono capture still wants 48000 or more.
+    static constexpr uint32_t DEFAULT_OPUS_BITRATE = 128000U;
+
+    /// @brief Largest Opus encoder complexity libopus's OPUS_SET_COMPLEXITY accepts
+    static constexpr uint8_t MAX_OPUS_COMPLEXITY = 10U;
+
+    /// @brief Default Opus encoder complexity: low, to fit an ESP32-class real-time encode budget.
+    /// A host can raise it toward MAX_OPUS_COMPLEXITY, trading CPU for quality.
+    static constexpr uint8_t DEFAULT_OPUS_COMPLEXITY = 2U;
+
     // 32-bit fields
-    /// @brief Capture sample rate in Hz; must be > 0
+    /// @brief Capture sample rate in Hz; must be > 0. OPUS takes only libopus's rates: 8000,
+    /// 12000, 16000, 24000, or 48000.
     uint32_t sample_rate{DEFAULT_SAMPLE_RATE};
 
     /// @brief Chunk duration in milliseconds, within [CHUNK_MIN_MS, CHUNK_MAX_MS]. One chunk, with
     /// its 9-byte header, must also fit one Noise transport message (65519 bytes), which bounds
-    /// the duration for wide or deep formats.
+    /// the duration for wide or deep formats. OPUS takes only 5, 10, 20, 40, or 60: a chunk is
+    /// one Opus frame.
     uint32_t chunk_duration_ms{DEFAULT_CHUNK_MS};
 
     /// @brief Capture buffer in milliseconds of audio in the configured format; must be > 0.
@@ -708,6 +736,10 @@ struct SourceRoleConfig {
     /// write_audio() calls hold less audio than this. A single write longer than half of it (with
     /// that margin) is always refused.
     uint32_t capture_buffer_ms{DEFAULT_CAPTURE_BUFFER_MS};
+
+    /// @brief Opus bitrate in bit/s, within [MIN_OPUS_BITRATE, MAX_OPUS_BITRATE]. Ignored (and
+    /// not validated) for PCM.
+    uint32_t opus_bitrate{DEFAULT_OPUS_BITRATE};
 
     unsigned priority{DEFAULT_SOURCE_TASK_PRIORITY};  ///< FreeRTOS priority for the source task
                                                       ///< (ESP-IDF only)
@@ -717,11 +749,19 @@ struct SourceRoleConfig {
     MemoryLocation buffer_location{MemoryLocation::PREFER_EXTERNAL};
 
     // 8-bit fields
-    /// @brief Codec the role streams in. Only PCM (the capture bytes, untouched) is accepted.
+    /// @brief Codec the role streams in: PCM (the capture bytes, untouched) or OPUS (each chunk
+    /// encoded into one CELT-only packet; needs SENDSPIN_ENABLE_OPUS). An OPUS role streams PCM
+    /// to a server whose server/hello does not list opus (roles/source/v1.md "server/hello
+    /// source@v1 support object"). OPUS costs the encoder state plus the source task's own
+    /// micro-opus scratch arena (about 120 KB, PSRAM-preferring, allocated before the first opus
+    /// chunk is encoded).
     SendspinCodecFormat codec{SendspinCodecFormat::PCM};
 
-    uint8_t channels{2};      ///< Capture channel count; must be > 0
-    uint8_t bit_depth{16};    ///< Bits per sample: 16, 24 (3 packed bytes), or 32
+    /// @brief Opus encoder complexity, at most MAX_OPUS_COMPLEXITY. Ignored (and not validated)
+    /// for PCM.
+    uint8_t opus_complexity{DEFAULT_OPUS_COMPLEXITY};
+    uint8_t channels{2};      ///< Capture channel count; must be > 0 (1 or 2 for OPUS)
+    uint8_t bit_depth{16};    ///< Bits per sample: 16, 24 (3 packed bytes), or 32 (16 for OPUS)
     bool line_sense{false};   ///< Advertise signal sensing (see SourceRole::set_signal())
     bool psram_stack{false};  ///< Allocate the source task stack in PSRAM (ESP-IDF only)
 };
