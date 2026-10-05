@@ -782,10 +782,15 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
             if (this->player_ &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
                 uint8_t slot = get_binary_slot(binary_type);
-                if (slot == 0) {
-                    this->player_->impl_->handle_binary(message);
-                } else {
+                if (slot != 0) {
                     SS_LOGW(TAG, "Unknown player binary slot %d", slot);
+                } else if (!this->adopted_state_available()) {
+                    // roles/player/v1.md "Audio Chunks (Binary)": an unavailable client discards
+                    // audio. Read from the snapshot step 3 adopted, so the gate flips with the
+                    // client/state it sends.
+                    SS_LOGV(TAG, "Discarding audio chunk while unavailable");
+                } else {
+                    this->player_->impl_->handle_binary(message);
                 }
             }
 #endif

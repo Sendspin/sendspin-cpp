@@ -19,11 +19,14 @@
 /// races a background consumer: the encoded ring and the inbox hold whatever a handler put there.
 /// The binary audio chunk header is parsed directly too.
 
+#include "connection.h"
+#include "connection_manager.h"
 #include "fake_persistence.h"
 #include "inbound_test_helpers.h"
 #include "inbox.h"
 #include "player_role_impl.h"  // build_state_fields(); private access, see tests/CMakeLists.txt
 #include "protocol_messages.h"
+#include "protocol_task.h"
 #include "sync_task.h"
 #include "visualizer_role_impl.h"
 #include "sendspin/client.h"
@@ -340,29 +343,44 @@ std::vector<uint8_t> audio_chunk(uint8_t marker = 0xDE, int64_t server_timestamp
     return chunk;
 }
 
-// Hands one chunk to the role outside any ring item, as for a reassembled chunk.
-void hand_copied_chunk(PlayerRole::Impl& impl, std::vector<uint8_t> chunk) {
-    InboundMessage message = message_over(chunk);
-    impl.handle_binary(message);
-    take_in_ring_order(*impl.sync_task->inbound().ring());
-}
+// An admitted player-owning connection with inert transport calls; dispatch reaches the player
+// only from one.
+class PlayerOwnerConnection : public SendspinConnection {
+public:
+    void start() override {}
+    void disconnect(SendspinGoodbyeReason) override {}
+    void close_transport_now() override {}
+    bool is_connected() const override {
+        return true;
+    }
+    SsErr send_binary_message(const uint8_t*, size_t) override {
+        return SsErr::OK;
+    }
+    SsErr send_text_message(const std::string&) override {
+        return SsErr::OK;
+    }
+};
 
 }  // namespace
 
-// roles/player/v1.md "Audio Chunks (Binary)": while the client is unavailable the player
-// discards incoming audio, whether availability changed before or after the role was added.
+// roles/player/v1.md "Audio Chunks (Binary)": the player discards incoming audio while the
+// adopted client/state snapshot reports the client unavailable; a set_available() takes effect
+// only once its snapshot is adopted. A discarded chunk's ring item stays with the dispatcher,
+// for process_inbound() to return.
 TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
     struct Row {
         const char* name;
-        bool available_when_added;
+        bool available_when_adopted;
         bool available_on_arrival;
+        bool adopted_again;
         bool queued;
     };
     const Row rows[] = {
-        {"available", true, true, true},  // Control:
-        {"became unavailable", true, false, false},
-        {"unavailable before add", false, false, false},
-        {"available again", false, true, true},  // Control:
+        {"Control: available", true, true, false, true},
+        {"unavailable", false, false, false, false},
+        {"unavailable, snapshot not yet adopted", true, false, false, true},
+        {"available again, snapshot not yet adopted", false, true, false, false},
+        {"Control: available again, snapshot adopted", false, true, true, true},
     };
 
     for (const Row& row : rows) {
@@ -370,13 +388,35 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
         InboundRing ring;  // outlives the client, whose sync task holds a pointer to it
         create_test_ring(ring);
         SendspinClient client(make_client_config("player-availability"));
-        client.set_available(row.available_when_added);
         PlayerRole::Impl& impl = *client.add_player(make_player_config()).impl_;
         bind_items(impl, ring);
-        client.set_available(row.available_on_arrival);
+        auto adopt_snapshot = [&client] {
+            client.protocol_task_->publish_state(client.build_client_state());
+            ClientStateMessage snapshot;
+            ASSERT_TRUE(client.protocol_task_->take_state(snapshot));
+            client.adopt_client_state(std::move(snapshot));
+        };
 
-        hand_copied_chunk(impl, audio_chunk());
+        client.set_available(row.available_when_adopted);
+        adopt_snapshot();
+        client.set_available(row.available_on_arrival);
+        if (row.adopted_again) {
+            adopt_snapshot();
+        }
+
+        auto conn = std::make_shared<PlayerOwnerConnection>();
+        conn->apply_server_activate({SendspinActivity::PLAYBACK},
+                                    std::vector<std::string>{"player@v1"}, std::nullopt,
+                                    std::nullopt);
+        client.connection_manager_->install_admitted(conn, role_mask_bit(SendspinRole::PLAYER));
+
+        InboundMessage message = receive_into_ring(ring, audio_chunk(), 0);
+        client.process_binary_message(*conn, message);
         EXPECT_EQ(!impl.sync_task->inbound().items().is_empty(), row.queued);
+        EXPECT_EQ(message.item != nullptr, !row.queued);
+        if (message.item != nullptr) {
+            ring.return_item(message.item);
+        }
     }
 }
 

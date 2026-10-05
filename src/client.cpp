@@ -1044,7 +1044,6 @@ PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
     // start() refreshes it; set here so a delay the consumer sets before start() is saved.
     this->player_->impl_->persistence = this->persistence_provider_;
     this->player_->impl_->attach_inbox(this->event_state_->inbox);
-    this->player_->impl_->discard_audio.store(!this->available_, std::memory_order_relaxed);
     return *this->player_;
 }
 #endif
@@ -1162,11 +1161,6 @@ void SendspinClient::set_available(bool available) {
         return;
     }
     this->available_ = available;
-#ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        this->player_->impl_->discard_audio.store(!available, std::memory_order_relaxed);
-    }
-#endif
     this->publish_state();
 }
 
@@ -1442,6 +1436,11 @@ void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {
     this->task_state_->client_state = std::move(snapshot);
     this->connection_manager_->for_each_admitted(
         [this](AdmittedEntry& entry) { this->publish_client_state(entry.conn.get()); });
+}
+
+bool SendspinClient::adopted_state_available() const {
+    const std::optional<ClientStateMessage>& client_state = this->task_state_->client_state;
+    return client_state.has_value() && client_state->available;
 }
 
 void SendspinClient::merge_group_update(GroupUpdateObject&& delta) {

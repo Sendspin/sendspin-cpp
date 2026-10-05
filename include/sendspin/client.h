@@ -570,8 +570,8 @@ public:
     ///
     /// messaging.md "External Source Handling": false only while the device will not yield to
     /// Sendspin, which moves it to a stopped group of its own. An activity Sendspin may interrupt
-    /// calls leave() instead. While unavailable, the player discards incoming audio. Kept across
-    /// disconnects and stop()/start(). Main loop only.
+    /// calls leave() instead. The player discards incoming audio from the client/state the next
+    /// protocol tick sends. Kept across disconnects and stop()/start(). Main loop only.
     /// @param available false while the device will not yield to Sendspin.
     void set_available(bool available);
 
@@ -868,6 +868,10 @@ private:
     /// @brief Makes `snapshot` the client/state every admitted connection's is built from, and
     /// sends each admitted connection its copy (publish_client_state()). Protocol task only.
     void adopt_client_state(ClientStateMessage&& snapshot);
+
+    /// @brief Whether the adopted client/state snapshot reports the client available; false before
+    /// the first is adopted (adopt_client_state()). Protocol task only.
+    bool adopted_state_available() const;
 
     /// @brief Folds a group/update delta from the primary admitted connection into group_slot
     /// for the main loop. Protocol task only.
