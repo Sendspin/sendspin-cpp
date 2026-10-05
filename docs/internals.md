@@ -110,9 +110,9 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
 5. The receive pass over a snapshot of the managed connections: each connection's message
    pending in its fallback buffer once the ring items it wrote before it are taken, then up to
    MAX_ITEMS_PER_TICK ring items in arrival order
-6. Losses: a connection whose gate is detached or whose close is ready is dropped
-   (ConnectionManager::on_connection_lost()); a fallback message the ring items just taken held
-   back makes the tick run again at once
+6. Losses: a connection whose gate is detached (by a close of the receive path, a failed send
+   or a release) or whose close is ready is dropped (ConnectionManager::on_connection_lost()); a
+   fallback message the ring items just taken held back makes the tick run again at once
 7. ConnectionManager::tick(): the nursery's hello sends, the promotion of operational nursery
    connections, the establish reap; the admitted connections' liveness, re-prove and
    pairing-attempt watchdogs; the pairing window's expiry; the reap of released outbound
@@ -120,11 +120,13 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
    upgrade reap; the WebSocket server start once the network is ready
 8. ConnectionManager::run_time_sync(): each admitted, operational connection's time burst, and
    the client/state that waited for its first measurement
-9. ConnectionManager::refresh_published_state(): the published primary slot (time filter and
-   server information); then publish_connected(), the connected flag other threads read,
-   raised only here, after every handler of the tick, so is_connected() never reads true
-   before the tick's whole effect (the published slots and the events it queued for the
-   drain); a loss lowers it at once
+9. Losses from the sends of steps 7 and 8: a connection a failed send detached is dropped, as in
+   step 6, before anything is published
+10. ConnectionManager::refresh_published_state(): the published primary slot (time filter and
+    server information); then publish_connected(), the connected flag other threads read,
+    raised only here, after every handler of the tick, so is_connected() never reads true
+    before the tick's whole effect (the published slots and the events it queued for the
+    drain); a loss lowers it at once
 ```
 
 The tick returns the milliseconds until the earliest of its timers: a nursery entry's establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a released outbound connection's reaping deadline, a pending upgrade on the ESP server, the WebSocket server retry or network poll (`NETWORK_POLL_INTERVAL_MS`), and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound, or one that freed a held-back fallback message, returns 0 and runs again at once. No timer is periodic except the network poll, which runs only while the server is down, so an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 5, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
@@ -298,6 +300,8 @@ A lookup miss in the initial handshake completes with the Sentinel PSK (connecti
 ### Transport
 
 Once active, each Noise frame carries `[type byte][payload]` in one binary WebSocket frame, and a message too large for one frame is split into `MSG_TYPE_FRAGMENT` frames (messaging.md "Fragmentation"). `MSG_TYPE_JSON_BODY` marks JSON, and every other type is a binary role message.
+
+A send that fails from the encrypt on leaves the peer unable to authenticate any later frame: `NoiseTransport` refuses every later send before its encrypt (`is_send_desynced()`), and the connection closes itself without a goodbye (`SendspinConnection::settle_noise_send()`). The detached gate is the loss report: the tick drops the connection in step 6 for a send of steps 1 to 5 and in step 9 for one of steps 7 and 8. A send refused before its encrypt spends nothing and leaves the connection up. A release detaches the gate before its goodbye, so a failed goodbye closes nothing twice. The ESP server writes on its httpd worker after the send returns, so a write that fails there closes the connection from the worker, reported through `close_callback`.
 
 The server may start a new handshake inside the transport at any time (connection.md "Re-handshake"). The connection swaps its `NoiseSession` once msg2 is written, then goes non-operational until the next `server/activate`; until then the client sends no application message, and a watchdog drops a connection that is never re-activated.
 

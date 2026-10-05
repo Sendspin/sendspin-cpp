@@ -223,6 +223,10 @@
    "SendspinServerConnection::close_transport_now(",
    "SendspinClientConnection::close_transport_now("
   ],
+  "sym:SendspinConnection17settle_noise_send": [
+   "SendspinServerConnection::close_transport_now(",
+   "SendspinClientConnection::close_transport_now("
+  ],
   "sym:SendspinServerConnection16async_send_frame": [
    "sym:_Function_handlerIFvvEZN8sendspin.*M_invoke"
   ],

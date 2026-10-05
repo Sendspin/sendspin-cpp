@@ -103,6 +103,16 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len) {
     return this->send_text_message(std::string(json, len));
 }
 
+SsErr SendspinConnection::settle_noise_send(SsErr err) {
+    if (this->noise_transport_.is_send_desynced() && !this->inbound_gate_.is_detached() &&
+        this->is_connected()) {
+        SS_LOGW(TAG, "Send failed after its frame was encrypted (err=%d); closing the connection",
+                static_cast<int>(err));
+        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+    }
+    return err;
+}
+
 // ============================================================================
 // Time messages
 // ============================================================================
@@ -141,7 +151,8 @@ int64_t SendspinConnection::send_time_message() {
         this->time_frame_sent_us_.store(time_frame_tag(platform_time_us()),
                                         std::memory_order_release);
     };
-    if (this->noise_transport_.send_json(buf, len, before_write) != SsErr::OK) {
+    if (this->settle_noise_send(this->noise_transport_.send_json(buf, len, before_write)) !=
+        SsErr::OK) {
         return 0;
     }
     return now;

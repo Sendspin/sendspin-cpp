@@ -63,41 +63,23 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
             SS_LOGW(TAG, "Time message %u/%u timed out", this->burst_index_ + 1, this->burst_size_);
             conn->cancel_time_frame();
             this->pending_embedded_ = 0;
-            this->burst_index_++;
-
-            // If burst now complete, apply best measurement
-            if (this->burst_index_ >= this->burst_size_) {
-                auto* time_filter = conn->get_time_filter();
-                if (time_filter != nullptr &&
-                    this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
-                    time_filter->update(this->best_offset_, this->best_max_error_,
-                                        this->best_timestamp_);
-                    SS_LOGV(TAG, "Burst complete (with timeouts), best max_error: %" PRId64 " us",
-                            this->best_max_error_);
-                }
-                this->last_burst_complete_time_ = now_ms;
-                return {.sent = false, .burst_completed = true};
-            }
+            return {.sent = false, .burst_completed = this->retire_message(conn, now_ms)};
         }
         return {.sent = false, .burst_completed = false};
     }
 
-    // State 3: Ready to send next message in burst, unless a refused send is still backing off.
-    if (now_ms < this->send_retry_after_ms_) {
-        return {.sent = false, .burst_completed = false};
-    }
+    // State 3: Ready to send next message in burst
     const int64_t embedded = conn->send_time_message();
 
     if (embedded != 0) {
         this->pending_embedded_ = embedded;
         this->current_message_sent_time_ = now_ms;
-        this->send_retry_after_ms_ = 0;
         SS_LOGV(TAG, "Sent time message %u/%u", this->burst_index_ + 1, this->burst_size_);
         return {.sent = true, .burst_completed = false};
     }
 
-    this->send_retry_after_ms_ = now_ms + SEND_RETRY_DELAY_MS;
-    return {.sent = false, .burst_completed = false};
+    SS_LOGD(TAG, "Time message %u/%u not sent", this->burst_index_ + 1, this->burst_size_);
+    return {.sent = false, .burst_completed = this->retire_message(conn, now_ms)};
 }
 
 bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeResponse& response) {
@@ -155,8 +137,6 @@ uint32_t SendspinTimeBurst::ms_until_due(int64_t now_ms) const {
     } else if (this->pending_embedded_ != 0) {
         // loop() times the message out once strictly more than the timeout has passed.
         due_ms = this->current_message_sent_time_ + this->response_timeout_ms_ + 1;
-    } else if (this->send_retry_after_ms_ != 0) {
-        due_ms = this->send_retry_after_ms_;
     }
     return ms_until(due_ms * US_PER_MS, now_ms * US_PER_MS);
 }
@@ -175,10 +155,28 @@ void SendspinTimeBurst::reset() {
     this->current_message_sent_time_ = 0;
     this->pending_burst_completed_ = false;
     this->pending_embedded_ = 0;
-    this->send_retry_after_ms_ = 0;
     this->best_max_error_ = std::numeric_limits<int64_t>::max();
     this->best_offset_ = 0;
     this->best_timestamp_ = 0;
+}
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+bool SendspinTimeBurst::retire_message(SendspinConnection* conn, int64_t now_ms) {
+    this->burst_index_++;
+    if (this->burst_index_ < this->burst_size_) {
+        return false;
+    }
+    auto* time_filter = conn->get_time_filter();
+    if (time_filter != nullptr && this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
+        time_filter->update(this->best_offset_, this->best_max_error_, this->best_timestamp_);
+        SS_LOGV(TAG, "Burst complete (with retired messages), best max_error: %" PRId64 " us",
+                this->best_max_error_);
+    }
+    this->last_burst_complete_time_ = now_ms;
+    return true;
 }
 
 }  // namespace sendspin

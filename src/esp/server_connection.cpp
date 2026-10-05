@@ -312,7 +312,11 @@ void SendspinServerConnection::async_send_frame(void* arg) {
             resp_arg->before_write();
         }
         if (httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt) != ESP_OK) {
-            SS_LOGW(TAG, "Async frame send failed");
+            // An encrypted frame's send nonce is spent, so the peer can authenticate no later
+            // frame (NoiseTransport::is_send_desynced()); the close reaches the protocol task
+            // through close_callback.
+            SS_LOGW(TAG, "Async frame send failed; closing the connection");
+            conn->trigger_close();
         }
     }
 

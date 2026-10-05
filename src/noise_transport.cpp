@@ -47,7 +47,7 @@ std::optional<std::array<uint8_t, 32>> NoiseTransport::handshake_hash() const {
 SsErr NoiseTransport::encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity,
                                              size_t plaintext_len,
                                              const FrameWriteHook& before_write) {
-    if (!this->session_) {
+    if (!this->session_ || !this->frame_sink_ || this->send_desynced_) {
         return SsErr::INVALID_STATE;
     }
 
@@ -58,16 +58,19 @@ SsErr NoiseTransport::encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity,
         return SsErr::FAIL;
     }
 
+    // noise-c advances the send nonce past a failed encrypt too.
     size_t ct_len = this->session_->encrypt(buf, plaintext_len, buf_capacity);
     if (ct_len == 0) {
         SS_LOGE(TAG, "Noise encrypt failed");
+        this->send_desynced_ = true;
         return SsErr::FAIL;
     }
 
-    if (!this->frame_sink_) {
-        return SsErr::INVALID_STATE;
+    const SsErr err = this->frame_sink_(buf, ct_len, before_write);
+    if (err != SsErr::OK) {
+        this->send_desynced_ = true;
     }
-    return this->frame_sink_(buf, ct_len, before_write);
+    return err;
 }
 
 SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, size_t data_len,
@@ -112,6 +115,7 @@ SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, 
         err = this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), cont_frame_len,
                                            is_last ? before_write : nullptr);
         if (err != SsErr::OK) {
+            // Earlier fragments are out; encrypt_and_send_frame() has marked the send desynced.
             return err;
         }
         offset += chunk;

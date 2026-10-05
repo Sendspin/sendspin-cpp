@@ -1222,8 +1222,10 @@ uint32_t ConnectionManager::scan_nursery(int64_t now_us) {
             ++i;
             continue;
         }
-        // Closed without a goodbye, as the re-prove watchdog closes: after a failure past the
-        // encrypt the peer could not decrypt one, and restart would promise a reconnect that
+        // The hello is sent once, so a connection whose hello failed, before or after its
+        // encrypt, can never be established. One that failed after it is closed already
+        // (SendspinConnection::settle_noise_send()), and the tick's loss pass finds it released.
+        // No goodbye, as the re-prove watchdog closes: restart would promise a reconnect that
         // nothing performs for a connect_to() connection. The nullopt release performs the close
         // (non-blocking on every platform).
         this->drop_connection(entry.conn.get(), std::nullopt);
@@ -1522,7 +1524,8 @@ bool ConnectionManager::send_hello_message(SendspinConnection* conn) {
     }
 
     if (err == SsErr::INVALID_STATE) {
-        // The transport is no longer connected: its close drops the connection.
+        // The transport is no longer connected: its close drops the connection, or the tick's
+        // loss pass does for a refusal after the encrypt.
         SS_LOGW(TAG, "No client connected for hello message");
         return true;
     }

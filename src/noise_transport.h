@@ -91,6 +91,15 @@ public:
         return this->active_;
     }
 
+    /// @brief Whether a send failed once its first frame was encrypted. Each encrypt spends a send
+    /// nonce (the Noise specification, section 5.1 "The CipherState object") whether or not the
+    /// frame reaches the socket, and the peer's receive nonce advances only with a frame it
+    /// decrypts, so the peer can authenticate no later frame. Never cleared: every later send,
+    /// a re-handshake's msg2 included, is refused before its encrypt. Protocol task only.
+    bool is_send_desynced() const {
+        return this->send_desynced_;
+    }
+
     // ========================================
     // Outbound (encrypt + send); protocol task only
     // ========================================
@@ -100,7 +109,8 @@ public:
     /// Fragments automatically when the plaintext exceeds MAX_TRANSPORT_PLAINTEXT.
     /// @param before_write Goes to the frame sink with the message's last frame. A synchronous
     ///                     transport runs it inside this call, so it must not block or send.
-    /// @return SsErr::OK on success, INVALID_STATE if the transport is not active.
+    /// @return SsErr::OK on success; INVALID_STATE if the transport is not active or
+    ///         is_send_desynced(); another error otherwise.
     SsErr send_json(const char* json, size_t len, const FrameWriteHook& before_write = nullptr);
 
     /// @brief Convenience overload of send_json(const char*, size_t) for std::string callers.
@@ -147,7 +157,8 @@ public:
     }
 
 private:
-    /// @brief Encrypt one frame and emit it via the frame sink.
+    /// @brief Encrypt one frame and emit it via the frame sink. A failure from the encrypt on
+    /// sets send_desynced_.
     /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + 16 (AEAD tag).
     SsErr encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity, size_t plaintext_len,
                                  const FrameWriteHook& before_write);
@@ -234,6 +245,9 @@ private:
 
     /// True once a transport session exists. See is_active(). Protocol task only.
     bool active_{false};
+
+    /// See is_send_desynced(). Protocol task only.
+    bool send_desynced_{false};
 
     /// True when the in-flight message's data is being thrown away rather than buffered: its
     /// orig_type is a reserved ID nothing implements, it outgrew the reassembly cap in force,

@@ -190,11 +190,11 @@ uint32_t SendspinClient::protocol_tick() {
         this->process_inbound(*conn, message);
     }
 
-    // 6. Losses: a connection the receive path closed, one the manager released, or one whose
-    //    transport closed with every message it sent before the close processed, is dropped. One
-    //    the manager already released this tick is a no-op there, and the next tick's snapshot
-    //    leaves it out. A fallback message held back behind ring items the pass above has now
-    //    taken is due at once.
+    // 6. Losses: a connection the receive path or a failed send closed, one the manager released,
+    //    or one whose transport closed with every message it sent before the close processed, is
+    //    dropped. One the manager already released this tick is a no-op there, and the next
+    //    tick's snapshot leaves it out. A fallback message held back behind ring items the pass
+    //    above has now taken is due at once.
     bool fallback_due = false;
     for (auto& conn : connections) {
         InboundGate& gate = conn->inbound_gate();
@@ -204,9 +204,20 @@ uint32_t SendspinClient::protocol_tick() {
         fallback_due = fallback_due || (gate.has_pending_message() && gate.in_flight() == 0);
     }
 
-    // 7. The lifecycle scans and timers, 8. the time bursts, 9. what other threads read.
+    // 7. The lifecycle scans and timers, 8. the time bursts.
     uint32_t next_deadline = manager.tick(platform_time_us());
     next_deadline = std::min(next_deadline, manager.run_time_sync());
+
+    // 9. Losses from the sends of steps 7 and 8 (SendspinConnection::settle_noise_send()),
+    //    dropped before step 10 publishes. Every connection those steps send on is in the
+    //    snapshot: no step after the commands brings in a new one.
+    for (auto& conn : connections) {
+        if (conn->inbound_gate().is_detached()) {
+            manager.on_connection_lost(conn.get());
+        }
+    }
+
+    // 10. What other threads read.
     manager.refresh_published_state();
     manager.publish_connected();
     if (!ring_drained || fallback_due) {

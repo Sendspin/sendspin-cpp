@@ -85,8 +85,8 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # next-deadline tables also stage each timer state against a fixed clock, which no public call can
 # do: ConnectionManager's liveness_timeout_us_, pairing_window_open_until_us_,
 # ws_server_start_retry_time_us_ and tick(); SendspinTimeBurst's burst_index_,
-# last_burst_complete_time_, pending_embedded_, current_message_sent_time_, send_retry_after_ms_
-# and pending_burst_completed_; and SendspinConnection's first_activate_received_ and
+# last_burst_complete_time_, pending_embedded_, current_message_sent_time_ and
+# pending_burst_completed_; and SendspinConnection's first_activate_received_ and
 # last_receive_time_us_. The stale-command and refused-delivery tests reach the queue and the
 # request slot through protocol_task_ to push a command or post a request, or close admission, the
 # way a race or stop() would, and read ConnectionManager::pairing_window_open() to see a posted
@@ -248,7 +248,16 @@ set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
 # way) and which NoiseTransport exposes nowhere, deliberately: its size is an allocation
 # decision, not protocol state. It also seeds SendspinConnection::time_frame_tag_ and
 # time_frame_sent_us_ directly, for frame states a send cannot produce on demand: a leftover
-# write hook's time earlier than the frame's own, and a write just past the low-32-bit wrap.
+# write hook's time earlier than the frame's own, and a write just past the low-32-bit wrap. The
+# send-failure table plays the protocol task and the main loop on a stand-in admitted connection
+# over a live Noise session, which no public call installs: SendspinClient::connection_manager_,
+# protocol_task_ (stopped), json_arena_ (for the stand-in's goodbye) and protocol_tick();
+# ConnectionManager::install_admitted() and liveness_timeout_us_ (off, so the stand-in's silence
+# does not close it); SendspinTimeBurst::last_burst_complete_time_ (a burst due only in the row
+# that sends client/time); and the controller's impl_, whose supported_commands it seeds, stamped
+# with its cleanup_generation, so a send_command() is queued. The connection-level table removes
+# NoiseTransport::frame_sink_ for one send: the one refusal before the encrypt send_app_json()
+# can meet without a seam.
 set_source_files_properties(test_noise_transport.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
