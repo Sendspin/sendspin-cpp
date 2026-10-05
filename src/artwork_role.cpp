@@ -941,6 +941,7 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
         if (is_clear) {
             delta.clear_mask = static_cast<uint8_t>(1U << slot);
         }
+        // NOLINTNEXTLINE(performance-move-const-arg): merge() takes the delta as T&&
         this->event_state->display_slot.merge(merge_artwork_display_update, std::move(delta),
                                               notif.teardown_generation);
     }

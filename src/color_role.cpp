@@ -81,6 +81,7 @@ void ColorRole::Impl::handle_server_state(const ServerColorStateObject& color,
     // an overlay on the one before it (see coalesce_color_states).
     PendingColorStates arrival;
     arrival.oldest = color;
+    // NOLINTNEXTLINE(performance-move-const-arg): merge() takes the delta as T&&
     this->event_state->slot.merge(coalesce_color_states, std::move(arrival), generation);
 }
 

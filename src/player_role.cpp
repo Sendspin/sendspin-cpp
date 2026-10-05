@@ -712,12 +712,13 @@ void PlayerRole::Impl::complete_teardown() {
 // Impl: Helpers
 // ============================================================================
 
-void PlayerRole::Impl::recall_stale_items(uint32_t generation) {
+void PlayerRole::Impl::recall_stale_items(uint32_t generation) const {
     this->sync_task->inbound().recall_stale(generation);
 }
 
 bool PlayerRole::Impl::hand_item(void* item, size_t item_len, ChunkType chunk_type,
-                                 uint8_t data_offset, uint32_t data_len, uint32_t generation) {
+                                 uint8_t data_offset, uint32_t data_len,
+                                 uint32_t generation) const {
     InboundItemHeader* header = inbound_item_header(item);
     header->type = chunk_type;
     header->data_offset = data_offset;
@@ -736,7 +737,7 @@ bool PlayerRole::Impl::hand_item(void* item, size_t item_len, ChunkType chunk_ty
 }
 
 bool PlayerRole::Impl::hand_local_item(const uint8_t* data, size_t len, ChunkType chunk_type,
-                                       uint32_t generation) {
+                                       uint32_t generation) const {
     InboundConsumer& inbound = this->sync_task->inbound();
     if (inbound.ring() == nullptr) {
         return false;
@@ -746,7 +747,8 @@ bool PlayerRole::Impl::hand_local_item(const uint8_t* data, size_t len, ChunkTyp
            this->hand_item(item, len, chunk_type, 0, static_cast<uint32_t>(len), generation);
 }
 
-bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint32_t generation) {
+bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header,
+                                        uint32_t generation) const {
     InboundRing* ring = this->sync_task->inbound().ring();
     if (ring == nullptr) {
         return false;

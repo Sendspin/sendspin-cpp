@@ -650,7 +650,7 @@ public:
     /// and completes it. Protocol task, inside a run.
     /// @return The item, ready for hand(), or nullptr when the ring had no room in time.
     void* copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
-                     uint32_t timeout_ms);
+                     uint32_t timeout_ms) const;
 
     /// @brief Stamps `item` with `generation`, recalls the list first if a teardown moved the
     /// generation on (recall_stale()), then charges the item to the holder's quota and appends

@@ -381,7 +381,7 @@ void* InboundConsumer::take(uint32_t timeout_ms, const std::atomic<uint32_t>& ge
 }
 
 void* InboundConsumer::copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
-                                  uint32_t timeout_ms) {
+                                  uint32_t timeout_ms) const {
     InboundRing* ring = this->ring();
     void* item = ring->acquire_local(len, timeout_ms);
     if (item == nullptr) {

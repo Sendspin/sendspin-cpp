@@ -147,7 +147,7 @@ struct PlayerRole::Impl : RoleTeardown {
     void stop() const;
 
     /// @brief InboundConsumer::recall_stale() on the sync task's list. Protocol task, each tick.
-    void recall_stale_items(uint32_t generation);
+    void recall_stale_items(uint32_t generation) const;
 
     // ========================================
     // Consumer-facing method implementations
@@ -169,20 +169,20 @@ struct PlayerRole::Impl : RoleTeardown {
     /// @param data_len How many bytes the sync task reads.
     /// @return false when the item was returned instead of handed over.
     bool hand_item(void* item, size_t item_len, ChunkType chunk_type, uint8_t data_offset,
-                   uint32_t data_len, uint32_t generation);
+                   uint32_t data_len, uint32_t generation) const;
 
     /// @brief Copies a PCM or Opus codec header, or a stream/clear marker (len 0), into an item
     /// the protocol task acquires itself, waiting up to HEADER_SEND_TIMEOUT_MS for ring space,
     /// and hands it to the sync task. Protocol task only.
     /// @return false when the sync task is not running or the ring had no room in time.
     bool hand_local_item(const uint8_t* data, size_t len, ChunkType chunk_type,
-                         uint32_t generation);
+                         uint32_t generation) const;
 
     /// @brief Base64-decodes a FLAC codec header straight into an item the protocol task
     /// acquires and hands it to the sync task. Protocol task only.
     /// @return false when the sync task is not running, the header does not decode, or the ring
     ///         had no room in time.
-    bool hand_flac_header(const std::string& codec_header, uint32_t generation);
+    bool hand_flac_header(const std::string& codec_header, uint32_t generation) const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it, and carrying a STREAM_START's `ordinal`.
     void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation,

@@ -354,7 +354,7 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
 }
 
 bool VisualizerRole::Impl::hand_item(void* item, size_t item_len, uint8_t type, uint32_t data_len,
-                                     uint32_t generation) {
+                                     uint32_t generation) const {
     InboundItemHeader* header = inbound_item_header(item);
     header->type = type;
     const bool marker = type == ENTRY_TYPE_CLEAR_MARKER;
@@ -364,7 +364,7 @@ bool VisualizerRole::Impl::hand_item(void* item, size_t item_len, uint8_t type, 
     return this->drain_task->inbound.hand(item, item_len, generation, /*exempt=*/marker);
 }
 
-void VisualizerRole::Impl::recall_stale_items(uint32_t generation) {
+void VisualizerRole::Impl::recall_stale_items(uint32_t generation) const {
     this->drain_task->inbound.recall_stale(generation);
 }
 
@@ -628,7 +628,7 @@ void* VisualizerRole::Impl::take_item(uint32_t timeout_ms) const {
     return this->drain_task->inbound.take(timeout_ms, this->cleanup_generation);
 }
 
-void VisualizerRole::Impl::signal_clear_marker(uint32_t generation) {
+void VisualizerRole::Impl::signal_clear_marker(uint32_t generation) const {
     // Protocol-task side of a clear boundary. Set the flag before appending the marker (like
     // PlayerRole::handle_stream_clear) so the drain thread starts discarding (freeing ring space)
     // while the marker waits for room.

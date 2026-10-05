@@ -177,16 +177,16 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// is joined.
     void flush_items() const;
     /// @brief Protocol-task side of a clear boundary: flags the drain thread and appends a marker
-    void signal_clear_marker(uint32_t generation);
+    void signal_clear_marker(uint32_t generation) const;
     /// @brief Drain-thread side: returns frames up to and including the marker
     void discard_to_clear_marker() const;
     /// @brief InboundConsumer::recall_stale() on the drain thread's list. Protocol task, each
     /// tick.
-    void recall_stale_items(uint32_t generation);
+    void recall_stale_items(uint32_t generation) const;
     /// @brief Fills an item's consumer fields and hands it to the drain thread
     /// (InboundConsumer::hand()). Protocol task only.
     bool hand_item(void* item, size_t item_len, uint8_t type, uint32_t data_len,
-                   uint32_t generation);
+                   uint32_t generation) const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
     void enqueue_stream_event(VisualizerEventType event, uint32_t generation) const;
