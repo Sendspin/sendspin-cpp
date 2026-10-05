@@ -271,7 +271,7 @@ private:
 TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     PairedClientBundle bundle(make_config(PROBE_TEST_PORT));
     SendspinClient& client = bundle.client();
-    // The WS server starts synchronously on the first loop() once the network reports ready.
+    // start() creates the WS server and, with the network ready, starts it before returning.
     ASSERT_TRUE(bundle.start());
 
     // Hold a nursery's worth of raw TCP connections open without ever speaking WebSocket.
@@ -654,9 +654,9 @@ TEST(NextDeadline, MillisecondsUntilADeadlineRoundUp) {
 //
 // Its controls are the "Control:" rows of the table above and of
 // LivenessTickDropsOnlyAStaleCurrentConnection (test_encrypted_lifecycle.cpp), which runs the same
-// check in loop() against a current connection whose last arrival is fresh, together with
-// AnInboundMessageAdvancesTheLivenessStamp there, which shows an answering peer's messages keep
-// that arrival fresh. A control here would have to outlast the timeout, so a scheduling stall
+// check in the protocol tick against a current connection whose last arrival is fresh, together
+// with AnInboundMessageAdvancesTheLivenessStamp there, which shows an answering peer's messages
+// keep that arrival fresh. A control here would have to outlast the timeout, so a scheduling stall
 // could fail it on a correct client.
 TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
     PairedClientBundle bundle(make_liveness_config(LIVENESS_TEST_PORT, 300));
