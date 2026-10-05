@@ -18,9 +18,13 @@ checklists in `.claude/skills/` apply these standards to a diff.
   admission, role ownership, pairing, watchdogs, time bursts) and every send
   run there, so no connection state needs a lock (the transport's own atomics
   state their writer and reader at their declaration). Any other thread
-  reaches a connection only by queueing a `ProtocolCommand`; a request that
-  the full queue refuses is reported to the caller (`send_text()` returns
-  false) or logged, never dropped silently. A connection refused at delivery is left with
+  reaches a connection only by queueing a `ProtocolCommand` or, for an
+  idempotent latest-wins request (`connect_to()`, `disconnect()`, `leave()`,
+  the pairing-window gestures, an unpaired-access change), posting it to the
+  protocol task's request slot, which never refuses; a command that the full
+  queue refuses is reported to the caller (`send_controller_command()`
+  returns false, and `ControllerRole::send_command()` with it) or
+  logged, never dropped silently. A connection refused at delivery is left with
   the transport that delivered it, which releases it after the delivery
   returns (on ESP, with its httpd session), so no refusal destroys a connection
   inside the delivery. Payload validation and
@@ -87,9 +91,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
   stamped with it. A role drain takes its slot before it catches up, then
   applies only a payload stamped with the current generation.
 - A protocol-task step has a bounded wait or none: the Noise DH operations, a
-  ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, a transport send
-  bounded by the transport's own send timeout, and at shutdown the goodbye
-  flush bounded by `GOODBYE_FLUSH_TIMEOUT_MS` per goodbye. A released
+  ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, and a transport send
+  bounded by the transport's own send timeout; no step waits on an
+  asynchronous send's completion, and a goodbye is followed by its close at
+  once. A released
   outbound attempt still connecting, whose destructor would join its
   transport for the rest of the connect, is closed without blocking and
   parked in `ConnectionManager`'s reaping list until its transport reports
@@ -102,7 +107,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   time to its earliest deadline, or `ProtocolTask::NO_DEADLINE`, and never
   wakes on a fixed period. A transport's wait on the task is bounded too: an
   admitted connection waits at most `INBOUND_ACQUIRE_TIMEOUT_MS` for ring space
-  and drops the message with a warning, and an unadmitted one waits at most
+  and is closed with a warning, and an unadmitted one waits at most
   `InboundGate::WRITABLE_WAIT_MS` for its previous message to be consumed and
   is closed if it is not.
 - Every library lock is a leaf: it is held only to copy or update its own
@@ -111,7 +116,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   cite. The leaves are `ConnectionManager::published_mutex_`,
   `RecordStore::mutex_`, the Inbox mutex, each
   `SendspinTimeFilter`'s `state_mutex_`, the inbound ring's, item lists' and
-  protocol task command queue's own locks, `GoodbyeWait`'s, the artwork role's
+  protocol task command queue's own locks, the artwork role's
   slot mutex, `ShadowSlot`'s and the ESP server's pending-upgrade mutex. A
   change that would take a second library lock under one of them is a design
   change, not a local trade-off.

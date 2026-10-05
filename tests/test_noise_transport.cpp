@@ -81,32 +81,21 @@ public:
     // --- Interface stubs ---
 
     void start() override {}
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
+    void disconnect(SendspinGoodbyeReason reason) override {
         disconnect_calls_.push_back(reason);
-        if (on_complete) {
-            on_complete();
-        }
     }
     void close_transport_now() override {
         this->close_transport_now_calls_++;
     }
     bool is_connected() const override { return true; }
 
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb,
-                            bool /*allow_before_hello*/) override {
+    SsErr send_text_message(const std::string& msg) override {
         sent_text_.push_back(msg);
-        if (cb) {
-            cb(true);
-        }
         return SsErr::OK;
     }
 
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                              bool /*allow_before_hello*/) override {
+    SsErr send_binary_message(const uint8_t* data, size_t len) override {
         sent_binary_.push_back(std::vector<uint8_t>(data, data + len));
-        if (cb) {
-            cb(true);
-        }
         return SsErr::OK;
     }
 
@@ -432,7 +421,7 @@ TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
 
     // Before a session: send_app_json must send a raw TEXT frame.
     const std::string pre = "{\"type\":\"client/init\"}";
-    EXPECT_EQ(conn.send_app_json(pre, nullptr, /*allow_before_hello=*/true), SsErr::OK);
+    EXPECT_EQ(conn.send_app_json(pre), SsErr::OK);
     ASSERT_EQ(conn.sent_text_.size(), 1u);
     EXPECT_EQ(conn.sent_text_[0], pre);
     EXPECT_TRUE(conn.sent_binary_.empty());
@@ -440,7 +429,7 @@ TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
     // After installing a session: send_app_json must encrypt (binary frame), no new TEXT frame.
     conn.set_noise_session(std::move(r->responder_session));
     const std::string post = "{\"type\":\"client/state\",\"value\":7}";
-    EXPECT_EQ(conn.send_app_json(post, nullptr), SsErr::OK);
+    EXPECT_EQ(conn.send_app_json(post), SsErr::OK);
     EXPECT_EQ(conn.sent_text_.size(), 1u);  // unchanged
     ASSERT_EQ(conn.sent_binary_.size(), 1u);
 
@@ -1708,11 +1697,9 @@ TEST(NoiseTransport, SendJsonWriteHookRidesTheLastFrame) {
 TEST(NoiseTransport, SendTransportFrameRunsTheHookBeforeTheWrite) {
     class OrderRecordingConnection : public TestConnection {
     public:
-        SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                                  bool allow_before_hello) override {
+        SsErr send_binary_message(const uint8_t* data, size_t len) override {
             this->events_.emplace_back("write");
-            return TestConnection::send_binary_message(data, len, std::move(cb),
-                                                       allow_before_hello);
+            return TestConnection::send_binary_message(data, len);
         }
         std::vector<std::string> events_;
     };
@@ -1738,7 +1725,7 @@ static int64_t sent_client_transmitted(NoiseCipherState* recv_cs, const std::vec
 // A server/time reply is matched by its echo to the one client/time in flight, and only once. A
 // connection that never sent client/time (any nursery peer) has nothing in flight, including for
 // an echo whose low 32 bits are 0, the tag that means "none". Neither does a frame the burst gave
-// up on, nor one on a connection that has stopped dispatching (it is being dropped).
+// up on.
 TEST(NoiseTransport, OnlyTheTimeFrameInFlightIsClaimedAndOnlyOnce) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
@@ -1765,12 +1752,6 @@ TEST(NoiseTransport, OnlyTheTimeFrameInFlightIsClaimedAndOnlyOnce) {
     const int64_t cancelled = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[1]);
     conn.cancel_time_frame();
     EXPECT_FALSE(conn.claim_time_frame(cancelled).has_value());
-
-    ASSERT_NE(conn.send_time_message(), 0);
-    ASSERT_EQ(conn.sent_binary_.size(), 3U);
-    const int64_t dropped = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_[2]);
-    conn.detach_inbound();
-    EXPECT_FALSE(conn.claim_time_frame(dropped).has_value());
 }
 
 // The claim reports when the write hook ran, and never a time before the one the frame carries,
@@ -1808,7 +1789,7 @@ TEST(NoiseTransport, TimeFrameWriteDelaySurvivesTheLow32BitWrap) {
     constexpr uint32_t TAG = 0xFFFFFF00U;
     constexpr int64_t ECHO = (int64_t{5} << 32) | TAG;
     conn.time_frame_sent_us_.store(0x100U);
-    conn.time_frame_tag_.store(TAG);
+    conn.time_frame_tag_ = TAG;
     EXPECT_EQ(conn.claim_time_frame(ECHO), std::optional<int64_t>(ECHO + 0x200));
 }
 
@@ -1937,10 +1918,11 @@ struct InboundHarness {
 // flight before the protocol task has consumed it. An unadmitted connection, which never writes
 // into the shared ring, waits up to InboundGate::WRITABLE_WAIT_MS for that and is then closed
 // rather than parking the transport thread. An admitted connection's message longer than the ring
-// takes waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and is then dropped like
-// one, the connection left open. The Control rows consume the first message in time. The two
-// rows that leave the first message pending wait out those bounds (about 600 ms together): the
-// bound running out is the behavior under test.
+// takes waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and then closes the
+// connection too: a frame never received and decrypted would leave the Noise receive nonce
+// behind. Either way the message in flight is kept. The Control rows consume the first message in
+// time. The two rows that leave the first message pending wait out those bounds (about 600 ms
+// together): the bound running out is the behavior under test.
 TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
     struct Row {
         const char* name;
@@ -1956,7 +1938,7 @@ TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
         {"Control: admitted, consumed before the next arrives", true, true,
          TestConnection::InboundRoute::RECEIVE},
         {"admitted, the next arrives while the first is pending", true, false,
-         TestConnection::InboundRoute::DROP},
+         TestConnection::InboundRoute::CLOSE},
     };
 
     for (const Row& row : rows) {
@@ -1985,6 +1967,51 @@ TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
         EXPECT_EQ(std::vector<uint8_t>(pending.data, pending.data + pending.len), expected)
             << "the message in flight was overwritten or lost";
         const bool closed = row.second_route == TestConnection::InboundRoute::CLOSE;
+        EXPECT_EQ(h.conn.close_transport_now_calls_, closed ? 1 : 0);
+        EXPECT_EQ(h.conn.inbound_gate().is_detached(), closed);
+    }
+}
+
+// An admitted connection's message that finds no ring item within INBOUND_ACQUIRE_TIMEOUT_MS
+// closes the connection rather than being dropped: a frame never received and decrypted would
+// leave the Noise receive nonce behind. Messages of the longest size the ring takes arrive with
+// nothing taken until one finds no room; the Control row takes and returns each item, as the
+// protocol task does, so the ring never fills. The closing row waits out the bound once (about
+// 100 ms): the bound running out is the behavior under test.
+TEST(InboundReceive, AnAdmittedMessageWithNoRingSpaceClosesTheConnection) {
+    struct Row {
+        const char* name;
+        bool take_each;
+        TestConnection::InboundRoute last_route;
+    };
+    const Row rows[] = {
+        {"Control: each item taken before the next arrives", true,
+         TestConnection::InboundRoute::RECEIVE},
+        {"nothing taken until the ring is full", false, TestConnection::InboundRoute::CLOSE},
+    };
+    constexpr int MAX_MESSAGES = 8;
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h(inbound_ring_min_storage_bytes(INBOUND_JSON_MESSAGE_BYTES));
+        h.conn.set_admitted(true);
+        const std::vector<uint8_t> message(h.ring.max_message_bytes(), 0x5A);
+        TestConnection::InboundRoute route = TestConnection::InboundRoute::RECEIVE;
+        int received = 0;
+        for (; received < MAX_MESSAGES; ++received) {
+            route = h.receive(message);
+            if (route != TestConnection::InboundRoute::RECEIVE) {
+                break;
+            }
+            if (row.take_each) {
+                size_t taken_len = 0;
+                void* item = h.ring.take(&taken_len, 0);
+                ASSERT_NE(item, nullptr) << "message " << received << " never reached the ring";
+                h.conn.inbound_gate().note_item_taken();
+                h.ring.return_item(item);
+            }
+        }
+        EXPECT_EQ(route, row.last_route) << "after " << received << " messages";
+        const bool closed = row.last_route == TestConnection::InboundRoute::CLOSE;
         EXPECT_EQ(h.conn.close_transport_now_calls_, closed ? 1 : 0);
         EXPECT_EQ(h.conn.inbound_gate().is_detached(), closed);
     }

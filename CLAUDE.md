@@ -9,7 +9,7 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 ### Key classes
 
 - `SendspinClient` (`client.h`): main orchestration class; owns the protocol task, the connection manager, the inbound ring and the message routing. Its protocol-task half (the tick, the command handler, the JSON and binary dispatch) is in `client_dispatch.cpp`
-- `ProtocolTask` (`protocol_task.h`): the `SsProto` thread, its bounded command queue and the latest client/state slot; ticks through `SendspinClient::protocol_tick()` to its next deadline
+- `ProtocolTask` (`protocol_task.h`): the `SsProto` thread, its bounded command queue, the latest client/state slot and the never-refused lifecycle-request slot; ticks through `SendspinClient::protocol_tick()` to its next deadline
 - `ConnectionManager` (`connection_manager.h`): the admitted array with role ownership, the nursery, the reaping list, admission and arbitration, time bursts, watchdogs and the published time filter and server information; pairing state machines in `connection_manager_pairing.cpp`
 - `InboundRing` / `InboundItemList` / `InboundConsumer` / `InboundGate` (`inbound_ring.h`): the shared ring every admitted transport receives into (over `SharedRingBuffer`), the intrusive per-role item lists that hand audio and visualizer frames to their consumer threads in place, and the per-connection transport/protocol-task hand-off
 - `PlayerRole` (`player_role.h`): audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
@@ -103,7 +103,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - Namespace: `sendspin`
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
 - Memory: the `platform_malloc` family from `platform/memory.h`, never raw `heap_caps_malloc`/`malloc` in core code (variant semantics under Platform abstraction above)
-- Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer. Connection state belongs to the protocol task; requests that act on a connection go through its command queue, and work bound for the main loop goes through the inbox. Every library lock is a leaf, so there is no lock order.
+- Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer. Connection state belongs to the protocol task; requests that act on a connection go through its command queue or, for latest-wins lifecycle requests, its request slot, and work bound for the main loop goes through the inbox. Every library lock is a leaf, so there is no lock order.
 - Tests: host-only and white-box; a test file that reaches private members compiles with `-fno-access-control` (`tests/CMakeLists.txt` says what and why), never through a production seam
 - Apache 2.0 license headers on all files
 

@@ -134,9 +134,8 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
 /// build_client_init() produces the first cleartext frame, on_text_frame() takes each incoming
 /// text frame, and take_result() yields the session once that returns COMPLETE.
 ///
-/// Threading: runs entirely on the protocol task. PSK resolution goes through
-/// RecordStore::resolve_by_psk_id(), which locks the store's mutex internally (see
-/// record_store.h).
+/// Threading: runs entirely on the protocol task, which is where RecordStore::resolve_by_psk_id()
+/// runs (see record_store.h).
 class NoiseHandshake {
 public:
     /// @brief Construct the handshake driver.

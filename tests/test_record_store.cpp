@@ -48,7 +48,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -1865,100 +1864,13 @@ TEST(PskZeroization, EveryPskCarryingStructWipesOnDestruction) {
     }
 }
 
-// Reproduces the two-thread access pattern production runs over records_:
-//
-//   protocol task -> Noise handshake
-//                       -> RecordStore::resolve_by_psk_id()        [reads records_]
-//   main loop     -> an unpair, a playback recency move, a pairing-code commit
-//                       -> mutators that push_back/erase/reorder records_
-//
-// The resolve and the pair-finalize commit (store_record_superseding()) both run on the protocol
-// task, so they never overlap; the concurrency left is a protocol-task resolve against a
-// main-loop mutator, and nothing above RecordStore serializes the two. The writer thread below
-// stands for that mutator, through store_record_superseding()'s push_back/erase. mutex_ is
-// therefore the only thing keeping a resolve off the writer's push_back reallocation; under
-// ThreadSanitizer (-DENABLE_TSAN=ON) dropping either lock_guard is reported against records_ and
-// fails this test.
-//
-// Without TSan the assertions still bind: two records outside the writer's server_id space are
-// stored up front, so every resolve of them must return that record's own psk no matter what
-// the writer is doing to the rest of the array.
-TEST(RecordStoreConcurrency, ResolveByPskIdDoesNotRaceRecordStores) {
-    InMemoryPersistenceProvider provider;
-    RecordStore store(&provider, {.max_pairing_records = 64});
-
-    // Both threads work over an overlapping server_id space so the reader's scan and the
-    // writer's supersede-erase touch the same entries.
-    constexpr int SERVER_ID_SPACE = 8;
-    constexpr int ITERATIONS = 2000;
-
-    // Two records the writer never supersedes or evicts, each carrying its own psk pattern.
-    SendspinPairingRecord anchor_a;
-    anchor_a.psk_id = "psk-anchor-a";
-    anchor_a.psk.fill(0xA1u);
-    anchor_a.server_id = "server-anchor-a";
-    ASSERT_TRUE(store.store_record_superseding(anchor_a, {}));
-    SendspinPairingRecord anchor_b;
-    anchor_b.psk_id = "psk-anchor-b";
-    anchor_b.psk.fill(0xB2u);
-    anchor_b.server_id = "server-anchor-b";
-    ASSERT_TRUE(store.store_record_superseding(anchor_b, {}));
-
-    std::atomic<bool> writer_ready{false};
-
-    std::thread writer([&] {
-        writer_ready.store(true, std::memory_order_release);
-        for (int i = 0; i < ITERATIONS; ++i) {
-            SendspinPairingRecord record;
-            record.psk_id = "psk-" + std::to_string(i);
-            record.psk.fill(static_cast<uint8_t>(i));
-            record.server_id = "server-" + std::to_string(i % SERVER_ID_SPACE);
-            store.store_record_superseding(std::move(record), {});
-        }
-    });
-
-    while (!writer_ready.load(std::memory_order_acquire)) {
-    }
-
-    // Failures are counted rather than asserted in the loop: an ASSERT_* here would return
-    // with the writer still joinable, and an EXPECT_* would print 2000 times.
-    int anchor_misses = 0;
-    int anchor_wrong_record = 0;
-    int churned_wrong_record = 0;
-
-    for (int i = 0; i < ITERATIONS; ++i) {
-        auto anchored_a = store.resolve_by_psk_id("psk-anchor-a", PskCategory::LONG_TERM);
-        auto anchored_b = store.resolve_by_psk_id("psk-anchor-b", PskCategory::LONG_TERM);
-        if (!anchored_a.has_value() || !anchored_b.has_value()) {
-            ++anchor_misses;
-        } else if (anchored_a->psk[0] != 0xA1u || anchored_a->counterparty_id != "server-anchor-a" ||
-                   anchored_b->psk[0] != 0xB2u || anchored_b->counterparty_id != "server-anchor-b") {
-            ++anchor_wrong_record;
-        }
-
-        // The writer may not have reached this psk_id yet, and a later pairing for the same
-        // server supersedes it, so a miss is legal; resolving it to another record is not.
-        auto churned = store.resolve_by_psk_id("psk-" + std::to_string(i), PskCategory::LONG_TERM);
-        if (churned.has_value() && churned->psk[0] != static_cast<uint8_t>(i)) {
-            ++churned_wrong_record;
-        }
-    }
-
-    writer.join();
-
-    EXPECT_EQ(anchor_misses, 0) << "a record the writer never touches must stay resolvable";
-    EXPECT_EQ(anchor_wrong_record, 0) << "a resolve must return the record it matched";
-    EXPECT_EQ(churned_wrong_record, 0) << "a resolve must return the record it matched";
-}
-
-// The persisting paths must not hold mutex_ across the provider's blob write. resolve_by_psk_id()
-// takes that same mutex on the protocol task for every Noise handshake, and on ESP the write is
-// an NVS commit of tens of milliseconds; holding the lock across it stalls a handshake for the
-// length of a flash commit (the post-pairing re-handshake is adjacent to such a write by
-// construction, see docs/internals.md "Pairing").
+// The persisting paths must not hold mutex_ across the provider's blob write. The protocol-task
+// mutators take that same mutex (a pairing commit, an unpair, a playback recency move), and on
+// ESP the write is an NVS commit of tens of milliseconds; holding the lock across it stalls the
+// protocol task for the length of a flash commit.
 //
 // The provider below parks inside save_blob() until this test releases it, which is the whole of
-// that commit window held open. A resolve issued in that window must still return: it is waited
+// that commit window held open. An unpair issued in that window must still return: it is waited
 // on with no timeout, so a regression hangs rather than turning a loaded runner into a failure,
 // and the watchdog in tests/main.cpp names the test.
 namespace {
@@ -1998,7 +1910,7 @@ private:
 
 }  // namespace
 
-TEST(RecordStoreConcurrency, ResolveRunsWhileARecordsWriteIsInFlight) {
+TEST(RecordStoreConcurrency, AMutatorRunsWhileARecordsWriteIsInFlight) {
     BlockingRecordsProvider provider;
     RecordStore store(&provider, {.max_pairing_records = 8});
 
@@ -2012,17 +1924,15 @@ TEST(RecordStoreConcurrency, ResolveRunsWhileARecordsWriteIsInFlight) {
     // A flush that never reaches the provider hangs into the watchdog rather than being timed.
     provider.wait_until_entered();
 
-    std::promise<bool> resolved;
-    std::future<bool> resolved_future = resolved.get_future();
-    std::thread probe([&] {
-        resolved.set_value(store.resolve_by_psk_id(psk_id, PskCategory::LONG_TERM).has_value());
-    });
+    std::promise<bool> removed;
+    std::future<bool> removed_future = removed.get_future();
+    std::thread probe([&] { removed.set_value(store.note_record_removed(psk_id)); });
 
-    // Nothing is released until the resolve returns, so a resolve that waits out the write
-    // hangs here.
-    const bool found = resolved_future.get();
+    // Nothing is released until the unpair returns, so an unpair that waits out the write hangs
+    // here.
+    const bool found = removed_future.get();
     probe.join();
-    EXPECT_TRUE(found) << "the resolve returned, but missed the stored record";
+    EXPECT_TRUE(found) << "the unpair returned, but missed the stored record";
 
     provider.release();
     writer.join();

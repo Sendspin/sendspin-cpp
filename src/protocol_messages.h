@@ -31,7 +31,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
@@ -147,25 +146,6 @@ inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole r
         }
     }
     return false;
-}
-
-/// @brief The role this library implements for a family name, if it implements one.
-///
-/// One version per family is implemented, so a family name identifies a role exactly; a caller
-/// that knows only the family can then use the same exact-version test as the receive gate.
-/// @param family Role family name without the "@vN" suffix.
-inline std::optional<SendspinRole> role_for_family(const std::string& family) {
-    for (uint8_t i = 0; i < static_cast<uint8_t>(SendspinRole::COUNT); ++i) {
-        const auto role = static_cast<SendspinRole>(i);
-        const char* name = to_cstr(role);
-        const char* at = std::strchr(name, '@');
-        const size_t family_len =
-            (at != nullptr) ? static_cast<size_t>(at - name) : std::strlen(name);
-        if (family.size() == family_len && family.compare(0, family_len, name, family_len) == 0) {
-            return role;
-        }
-    }
-    return std::nullopt;
 }
 
 /// @brief Bit that represents `role` in an active-role mask

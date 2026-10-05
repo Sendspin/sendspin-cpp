@@ -96,7 +96,8 @@ bool ControllerRole::Impl::send_command(const ClientCommandControllerObject& cmd
     // A mask stamped with an earlier generation belongs to a torn-down connection.
     const uint32_t packed = this->supported_commands.load(std::memory_order_acquire);
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
-    const uint32_t mask = (packed >> 16) == (generation & 0xFFFFU) ? (packed & 0xFFFFU) : 0;
+    const uint32_t stamp = packed >> 16;
+    const uint32_t mask = stamp == (generation & 0xFFFFU) ? (packed & 0xFFFFU) : 0;
     if ((mask & command_bit(cmd.command)) == 0) {
         SS_LOGW(TAG, "Dropping '%s': not in the server's supported_commands", to_cstr(cmd.command));
         return false;
@@ -106,19 +107,18 @@ bool ControllerRole::Impl::send_command(const ClientCommandControllerObject& cmd
         return false;
     }
     // Formatted on the protocol task, in its JSON arena
-    // (SendspinClient::send_controller_command()).
-    return this->client->send_controller_command(cmd);
+    // (SendspinClient::send_controller_command()), and carrying the stamp it passed under, read in
+    // the same load as the mask, so a teardown between this check and the task's drain drops it
+    // there.
+    return this->client->send_controller_command(cmd, static_cast<uint16_t>(stamp));
 }
 
 void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::CONTROLLER);
 }
 
-void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& state,
-                                               uint32_t generation) const {
-    if (!this->accepts(generation)) {
-        return;
-    }
+void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& state) const {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     this->event_state->slot.write(std::move(state), generation);
 }
 
@@ -143,8 +143,8 @@ void ControllerRole::Impl::drain_events() {
 }
 
 void ControllerRole::Impl::cleanup() {
-    // Bumped first: it invalidates any handler the gate already admitted (see accepts()) and the
-    // supported-commands mask (see supported_commands).
+    // Bumped first, so the drain discards a payload stamped before it (see RoleTeardown), and it
+    // invalidates the supported-commands mask (see supported_commands).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->event_state->slot.reset();

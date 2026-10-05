@@ -65,8 +65,9 @@ void ProtocolTask::stop() {
     this->thread_.join();
 
     // Joined. A snapshot the final tick did not take describes a run that is over. Commands
-    // pushed after the final tick stay queued for the joining thread (take_command() /
-    // drop_commands()), which releases what they hold off this queue's lock.
+    // pushed and requests posted after the final tick stay for the joining thread
+    // (take_command(), take_requests(), drop_commands()), which releases what a command holds
+    // off this queue's lock.
     std::optional<ClientStateMessage> dropped;
     {
         std::lock_guard<std::mutex> lock(this->command_mutex_);
@@ -75,11 +76,13 @@ void ProtocolTask::stop() {
 }
 
 void ProtocolTask::drop_commands() {
-    // One command at a time through one reused local: each may hold a connection or a lease
-    // whose release must not run under the queue lock.
+    // One command at a time through one reused local: each may hold a connection whose release
+    // must not run under the queue lock.
     ProtocolCommand command;
     while (this->take_command(command)) {}
     clear_command(command);
+    LifecycleRequests dropped;
+    (void)this->take_requests(dropped);
 }
 
 void ProtocolTask::close_accepts() {
@@ -99,7 +102,8 @@ void ProtocolTask::thread_entry(ProtocolTask* self) {
         const uint32_t bits =
             self->event_flags_.wait(COMMAND_STOP | WORK_PENDING, false, true, next_deadline_ms);
         if ((bits & COMMAND_STOP) != 0) {
-            // One final tick, so the work queued before stop() was called is seen by the task.
+            // One final tick, so the work queued and posted before stop() was called is seen by
+            // the task.
             self->tick_();
             return;
         }
@@ -175,15 +179,10 @@ bool ProtocolTask::take_command(ProtocolCommand& out) {
 }
 
 void ProtocolTask::clear_command(ProtocolCommand& command) {
-    command.lease.reset();
     command.connection.reset();
-    command.text.clear();
-    command.text.shrink_to_fit();
     command.controller_command = {};
-    command.type = ProtocolCommandType::SEND_TEXT;
-    command.reason = SendspinGoodbyeReason::SHUTDOWN;
-    command.role = SendspinRole::CONTROLLER;
-    command.enabled = false;
+    command.controller_generation = 0;
+    command.type = ProtocolCommandType::SEND_CONTROLLER_COMMAND;
 }
 
 // ============================================================================
@@ -210,6 +209,50 @@ bool ProtocolTask::take_state(ClientStateMessage& out) {
         return false;
     }
     out = std::move(*taken);
+    return true;
+}
+
+// ============================================================================
+// Lifecycle requests
+// ============================================================================
+
+void ProtocolTask::post_requests(LifecycleRequests requests) {
+    // Receives a waiting URL this post drops, so it is destroyed after the lock is released.
+    std::optional<std::string> dropped;
+    {
+        std::lock_guard<std::mutex> lock(this->command_mutex_);
+        LifecycleRequests& waiting = this->requests_;
+        if (requests.disconnect.has_value()) {
+            waiting.disconnect = requests.disconnect;
+            // A disconnect after a connect_to() cancels the attempt the connect would open.
+            dropped.swap(waiting.connect_to);
+        }
+        if (requests.connect_to.has_value()) {
+            // The replaced URL lands in `requests`, destroyed after the lock is released.
+            waiting.connect_to.swap(requests.connect_to);
+        }
+        if (requests.pairing_window != PairingWindowRequest::NONE) {
+            waiting.pairing_window = requests.pairing_window;
+        }
+        waiting.leave = waiting.leave || requests.leave;
+        waiting.unpaired_access_changed =
+            waiting.unpaired_access_changed || requests.unpaired_access_changed;
+    }
+    this->wake();
+}
+
+bool ProtocolTask::take_requests(LifecycleRequests& out) {
+    LifecycleRequests taken;
+    {
+        std::lock_guard<std::mutex> lock(this->command_mutex_);
+        std::swap(taken, this->requests_);
+    }
+    if (!taken.connect_to.has_value() && !taken.disconnect.has_value() &&
+        taken.pairing_window == PairingWindowRequest::NONE && !taken.leave &&
+        !taken.unpaired_access_changed) {
+        return false;
+    }
+    out = std::move(taken);
     return true;
 }
 

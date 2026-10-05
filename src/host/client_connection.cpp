@@ -67,24 +67,16 @@ void SendspinClientConnection::start() {
     SS_LOGD(TAG, "Client connection starting to %s", this->url_.c_str());
 }
 
-void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
-                                          std::function<void()> on_complete) {
+void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason) {
     if (!this->is_connected()) {
-        if (on_complete) {
-            on_complete();
-        }
         return;
     }
 
-    // Send goodbye message then stop
-    this->send_goodbye_reason(reason, [this, on_complete](bool /*success*/) {
-        if (this->ws_) {
-            this->ws_->stop();
-        }
-        if (on_complete) {
-            on_complete();
-        }
-    });
+    // The send is synchronous, so the goodbye has been written (or failed) before the stop.
+    this->send_goodbye_reason(reason);
+    if (this->ws_) {
+        this->ws_->stop();
+    }
 }
 
 void SendspinClientConnection::close_transport_now() {
@@ -107,37 +99,23 @@ void SendspinClientConnection::close_transport_now() {
     }
 }
 
-SsErr SendspinClientConnection::send_text_message(const std::string& message,
-                                                  SendCompleteCallback cb,
-                                                  bool /*allow_before_hello*/) {
+SsErr SendspinClientConnection::send_text_message(const std::string& message) {
     return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
-                               message.size(), cb);
+                               message.size());
 }
 
-SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len,
-                                                    SendCompleteCallback cb,
-                                                    bool /*allow_before_hello*/) {
-    return this->send_ws_frame(true, data, len, cb);
+SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len) {
+    return this->send_ws_frame(true, data, len);
 }
 
-SsErr SendspinClientConnection::send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
-                                              const SendCompleteCallback& cb) {
+SsErr SendspinClientConnection::send_ws_frame(bool is_binary, const uint8_t* data, size_t len) {
     if (!this->is_connected()) {
-        if (cb) {
-            cb(false);
-        }
         return SsErr::INVALID_STATE;
     }
 
     std::string buf(reinterpret_cast<const char*>(data), len);
     auto info = is_binary ? this->ws_->sendBinary(buf) : this->ws_->send(buf);
-    bool success = info.success;
-
-    if (cb) {
-        cb(success);
-    }
-
-    if (!success) {
+    if (!info.success) {
         if (is_binary) {
             SS_LOGE(TAG, "Failed to send binary message");
         } else {
@@ -179,8 +157,6 @@ void SendspinClientConnection::setup_callbacks() {
             case ix::WebSocketMessageType::Close:
                 SS_LOGD(TAG, "WebSocket disconnected from %s", this->url_.c_str());
                 this->connected_ = false;
-                this->client_hello_sent_ = false;
-                this->server_hello_received_ = false;
                 // The protocol task reports the loss once the messages before it are processed.
                 this->notify_transport_closed();
                 break;

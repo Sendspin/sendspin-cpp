@@ -26,7 +26,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <string>
 
 namespace sendspin {
@@ -75,9 +74,9 @@ public:
     /// @brief Starts the connection (initializes websocket client and connects)
     void start() override;
 
-    /// @brief Disconnects from the server with a goodbye message
-    /// @param on_complete Optional; the goodbye is synchronous here, so it runs immediately.
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
+    /// @brief Sends a goodbye message, then stops the client (esp_websocket_client_stop(), which
+    /// waits for the websocket task to exit)
+    void disconnect(SendspinGoodbyeReason reason) override;
 
     /// @brief Closes the transport immediately without blocking (see base class doc comment).
     /// Stops taking frames without touching the transport; the actual
@@ -94,14 +93,11 @@ public:
         return true;
     }
 
-    /// @brief Sends a text message to the server with a completion callback
-    SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
-                            bool allow_before_hello) override;
+    /// @brief Sends a text message to the server
+    SsErr send_text_message(const std::string& message) override;
 
     /// @brief Sends a binary WebSocket frame to the server
-    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                              bool allow_before_hello) override;
+    SsErr send_binary_message(const uint8_t* data, size_t len) override;
 
     // ========================================
     // Client connection-specific configuration

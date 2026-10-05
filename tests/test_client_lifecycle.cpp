@@ -23,7 +23,7 @@
 #include "artwork_role_impl.h"  // The display slot and its epochs; private, see CMakeLists
 #include "color_role_impl.h"       // The applied palette and its slot; private, see CMakeLists
 #include "connection.h"  // StubConnection stands in for a real connection
-#include "connection_manager.h"  // GoodbyeWait, GOODBYE_FLUSH_TIMEOUT_MS
+#include "connection_manager.h"
 #include "controller_role_impl.h"  // The applied controller state and its slot
 #include "crypto/constants.h"
 #include "crypto/keys.h"
@@ -214,38 +214,6 @@ public:
 
 std::string group_update_playing_json() {
     return R"({"type":"group/update","payload":{"playback_state":"playing"}})";
-}
-
-// ============================================================================
-// GoodbyeWait: the bound stop() relies on
-// ============================================================================
-
-// A goodbye whose completion never arrives (an ESP session that closes before its worker runs
-// reports nothing) must not hold stop() open: wait() returns false once the bound elapses.
-// Deleting the bound turns this into a hang the suite watchdog reports.
-TEST(GoodbyeWait, BoundElapsesWhenACompletionNeverArrives) {
-    GoodbyeWait wait;
-    wait.add_pending();
-    EXPECT_FALSE(wait.wait(GOODBYE_FLUSH_TIMEOUT_MS));
-}
-
-// Control: with every registered goodbye completed (from another thread, as a transport worker
-// would) wait() reports success, and with nothing registered it never blocks.
-TEST(GoodbyeWait, CompletionsSatisfyTheWait) {
-    GoodbyeWait idle;
-    EXPECT_TRUE(idle.wait(UINT32_MAX)) << "a wait with nothing registered must not block";
-
-    GoodbyeWait wait;
-    wait.add_pending();
-    wait.add_pending();
-    std::thread worker([&] {
-        wait.complete_one();
-        wait.complete_one();
-    });
-    // No bound: a lost completion hangs here and the watchdog reports it, rather than the
-    // elapsed time deciding the verdict.
-    EXPECT_TRUE(wait.wait(UINT32_MAX));
-    worker.join();
 }
 
 // ============================================================================
@@ -829,72 +797,68 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
 // ============================================================================
 
 /// Connection stand-in with every transport override inert: nothing is sent anywhere, a send
-/// completes inline and reports success, and the connection always reads as connected. Tests that
-/// install one in the manager's slot derive from it and override only the one call they are about
-/// to observe.
+/// reports success, and the connection always reads as connected. Tests that install one in the
+/// manager's slot derive from it and override only the one call they are about to observe.
 class StubConnection : public SendspinConnection {
 public:
     void start() override {}
-    void disconnect(SendspinGoodbyeReason, std::function<void()> on_complete) override {
-        if (on_complete) {
-            on_complete();
-        }
-    }
+    void disconnect(SendspinGoodbyeReason) override {}
     void close_transport_now() override {}
     bool is_connected() const override {
         return true;
     }
-    SsErr send_binary_message(const uint8_t*, size_t, SendCompleteCallback cb, bool) override {
-        if (cb) {
-            cb(true);
-        }
+    SsErr send_binary_message(const uint8_t*, size_t) override {
         return SsErr::OK;
     }
-    SsErr send_text_message(const std::string&, SendCompleteCallback cb, bool) override {
-        if (cb) {
-            cb(true);
-        }
+    SsErr send_text_message(const std::string&) override {
         return SsErr::OK;
     }
 };
 
-/// Counts client/hello sends; `result` is what each send returns. The completion fires inline with
-/// the send's outcome, as the encrypted send_app_json() path reports it.
+/// Counts client/hello sends, `result` being what each returns, and records the goodbye a drop
+/// sends and the transport closes.
 class HelloCountingConnection : public StubConnection {
 public:
     explicit HelloCountingConnection(SsErr result) : result_(result) {}
 
     // No Noise session, so send_app_json() routes the hello here as raw text.
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb, bool) override {
+    SsErr send_text_message(const std::string& msg) override {
         if (msg.find("client/hello") != std::string::npos) {
             ++this->hellos;
-        }
-        if (cb) {
-            cb(this->result_ == SsErr::OK);
         }
         return this->result_;
     }
 
+    void disconnect(SendspinGoodbyeReason reason) override {
+        this->goodbye = reason;
+    }
+
+    void close_transport_now() override {
+        ++this->closes;
+    }
+
     int hellos{0};
+    int closes{0};
+    std::optional<SendspinGoodbyeReason> goodbye;
 
 private:
     SsErr result_;
 };
 
-// A nursery connection's client/hello is armed once, when its Noise handshake completes, and never
-// again: a hello the transport refuses, or one whose attempts run out, is left for the close event
-// or the establish deadline rather than re-armed with a fresh set of attempts. Every tick forces
-// the next attempt due, so the backoff delays do not stretch the test (and are not pinned by it).
-TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
+// A nursery connection's client/hello is sent once, when its Noise handshake completes, and never
+// again. A send that fails on a connected transport cannot be retried (the Noise send nonce is
+// spent by then), so the connection is closed without a goodbye and dropped; one the transport
+// refuses as no longer connected is left for its close event or the establish deadline.
+TEST(ClientLifecycle, NurseryHelloIsSentOnceAndAFailedSendDropsTheConnection) {
     struct Row {
         const char* name;
         SsErr send_result;
-        int expected_hellos;
+        bool dropped;
     };
     const Row rows[] = {
-        {"Control: queued", SsErr::OK, 1},
-        {"refused by the transport", SsErr::INVALID_STATE, 1},
-        {"every attempt fails", SsErr::FAIL, NurseryEntry::MAX_HELLO_ATTEMPTS},
+        {"Control: sent", SsErr::OK, false},
+        {"refused by the transport", SsErr::INVALID_STATE, false},
+        {"the send fails", SsErr::FAIL, true},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -910,13 +874,17 @@ TEST(ClientLifecycle, NurseryHelloIsArmedOnceAndNeverReArmed) {
         conn->set_provisional_time_us(platform_time_us());
         manager.nursery_.push_back(NurseryEntry{.conn = conn, .client_init_sent = true});
 
-        for (int tick = 0; tick < NurseryEntry::MAX_HELLO_ATTEMPTS + 3; ++tick) {
+        for (int tick = 0; tick < 3; ++tick) {
             (void) manager.scan_nursery(platform_time_us());
-            for (auto& entry : manager.nursery_) {
-                entry.hello_due_us = 0;
-            }
         }
-        EXPECT_EQ(conn->hellos, row.expected_hellos);
+        EXPECT_EQ(conn->hellos, 1);
+        const bool in_nursery =
+            std::any_of(manager.nursery_.begin(), manager.nursery_.end(),
+                        [&conn](const NurseryEntry& entry) { return entry.conn == conn; });
+        EXPECT_EQ(in_nursery, !row.dropped);
+        EXPECT_EQ(conn->closes, row.dropped ? 1 : 0);
+        EXPECT_FALSE(conn->goodbye.has_value())
+            << "goodbye sent with reason " << static_cast<int>(*conn->goodbye);
 
         client.stop();
     }
@@ -1072,14 +1040,25 @@ TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
     }
 }
 
-// A command left in the queue after a stop() (a request that raced it on another thread) belongs
-// to the run that ended: the next start() begins with an empty queue, so the stale connect_to()
-// opens nothing. The command is pushed straight onto the stopped client's queue, the state such a
-// race leaves, since the public entry points refuse while stopped. The Control row pushes the same
-// command after start() and sees it acted on.
+// A lifecycle request left in its slot after a stop() (a call that raced it on another thread)
+// belongs to the run that ended: the next start() begins with no request waiting, so a stale
+// connect_to() opens nothing and a stale confirm opens no pairing window. Each is posted straight
+// to the stopped client's task, the state such a race leaves, since the public entry points refuse
+// while stopped. The Control rows post the same after start() and see it acted on.
 TEST(ClientLifecycle, AStaleCommandIsNotCarriedIntoTheNextRun) {
-    for (const bool stale : {true, false}) {
-        SCOPED_TRACE(stale ? "pushed while stopped" : "Control: pushed while running");
+    struct Row {
+        const char* name;
+        bool stale;
+        bool request;
+    };
+    const Row rows[] = {
+        {"a connect_to() posted while stopped", true, false},
+        {"Control: a connect_to() posted while running", false, false},
+        {"a confirm posted while stopped", true, true},
+        {"Control: a confirm posted while running", false, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
         SilentListener silent;
         ASSERT_NE(silent.port(), 0);
         TestNetworkProvider network;
@@ -1088,22 +1067,30 @@ TEST(ClientLifecycle, AStaleCommandIsNotCarriedIntoTheNextRun) {
         ASSERT_TRUE(client.start());
         client.stop();
 
-        ProtocolCommand command;
-        command.type = ProtocolCommandType::CONNECT_TO;
-        // The attempt waits in the nursery: the listener never answers or closes.
-        command.text = "ws://127.0.0.1:" + std::to_string(silent.port()) + "/sendspin";
-        if (stale) {
-            ASSERT_TRUE(client.protocol_task_->push_command(std::move(command)));
+        auto push = [&] {
+            if (row.request) {
+                client.protocol_task_->post_requests(
+                    {.pairing_window = PairingWindowRequest::CONFIRM});
+                return;
+            }
+            // The attempt waits in the nursery: the listener never answers or closes.
+            client.protocol_task_->post_requests(
+                {.connect_to = "ws://127.0.0.1:" + std::to_string(silent.port()) + "/sendspin"});
+        };
+        if (row.stale) {
+            push();
         }
         ASSERT_TRUE(client.start());
         // The test thread plays the protocol task from here, so the nursery is read where it is
         // written.
         client.protocol_task_->stop();
-        if (!stale) {
-            ASSERT_TRUE(client.protocol_task_->push_command(std::move(command)));
+        if (!row.stale) {
+            push();
         }
         (void) client.protocol_tick();
-        EXPECT_EQ(client.connection_manager_->nursery_.size(), stale ? 0U : 1U);
+        const bool acted_on = row.request ? client.connection_manager_->pairing_window_open()
+                                          : client.connection_manager_->nursery_.size() == 1U;
+        EXPECT_EQ(acted_on, !row.stale);
         silent.close();
         client.stop();
     }
@@ -1284,40 +1271,311 @@ TEST(ClientLifecycle, AnOpenedOutboundConnectionIsNotHeldForReaping) {
     }
 }
 
-// send_text() and ControllerRole::send_command() report a request the protocol task will never
-// see: once the consumer burst of the command queue is taken, the next request is refused with
-// false rather than dropped silently. The test thread plays the protocol task, so nothing drains
-// the queue between the requests. The controller's offered command is seeded, stamped with the
-// role's generation as the drain stamps a mask it applies, so the request reaches the queue.
-TEST(ClientLifecycle, SendTextIsRefusedWhenTheCommandQueueIsFull) {
-    TestNetworkProvider network;
-    SendspinClient client(make_config(0));
-    client.set_network_provider(&network);
-    ControllerRole& controller = client.add_controller();
-    ASSERT_TRUE(client.start());
-    client.protocol_task_->stop();
-    controller.impl_->supported_commands =
-        (controller.impl_->cleanup_generation.load() << 16) |
-        (1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY));
-    const ClientCommandControllerObject play{.command = SendspinControllerCommand::PLAY};
-
-    const std::string command = R"({"type":"client/command","payload":{}})";
-    for (size_t i = 0; i < ProtocolTask::CONSUMER_COMMAND_BURST; ++i) {
-        EXPECT_TRUE(client.send_text(command, "controller")) << "Control: request " << i;
+/// Records, in order, the client/leave, client/command and client/state messages and the goodbyes
+/// sent on it.
+class RecordingConnection : public StubConnection {
+public:
+    void disconnect(SendspinGoodbyeReason reason) override {
+        this->events.push_back("goodbye " + std::to_string(static_cast<int>(reason)));
     }
-    EXPECT_FALSE(client.send_text(command, "controller"))
-        << "a request past the consumer burst must be refused";
-    EXPECT_FALSE(controller.send_command(play))
-        << "a controller command past the consumer burst must be refused";
-    // Control: once the task drains the queue, requests are taken again.
-    (void) client.protocol_tick();
-    EXPECT_TRUE(controller.send_command(play)) << "the drained queue takes commands";
-    EXPECT_TRUE(client.send_text(command, "controller")) << "the drained queue takes requests";
-    // A family that names no role is refused on its own, queue or not.
-    EXPECT_FALSE(client.send_text(command, "no-such-role"));
+    // No Noise session, so send_app_json() routes a message here as raw text.
+    SsErr send_text_message(const std::string& msg) override {
+        if (msg.find("client/leave") != std::string::npos) {
+            this->events.emplace_back("leave");
+        } else if (msg.find("client/command") != std::string::npos) {
+            this->events.emplace_back("command");
+        } else if (msg.find("client/state") != std::string::npos) {
+            this->events.emplace_back("state");
+        }
+        return SsErr::OK;
+    }
 
-    client.stop();
-    EXPECT_FALSE(client.send_text(command, "controller")) << "a stopped client refuses";
+    std::vector<std::string> events;
+};
+
+std::string goodbye_event(SendspinGoodbyeReason reason) {
+    return "goodbye " + std::to_string(static_cast<int>(reason));
+}
+
+// The command queue's consumer burst bounds the sends, never the lifecycle requests. Once the burst
+// is taken, send_controller_command() and ControllerRole::send_command() report the request the
+// protocol task will never see by returning false, while connect_to(), disconnect(), leave(), the
+// pairing-window gestures and an unpaired-access change still reach the next tick, which applies
+// each once (a second tick repeats nothing, nor does a later post of another request). Each is
+// latest-wins: a confirm and a cancel resolve to the later, a second disconnect() replaces the
+// first's reason, a leave goes out ahead of the goodbye whatever order they were called in, and a
+// connect_to() and a disconnect() resolve by call order (a disconnect cancels an earlier connect, a
+// later connect opens after the goodbye). The requests go ahead of the sends queued with them, so a
+// controller command queued before a disconnect() is dropped rather than sent after the goodbye, as
+// is a client/state published before it, though the stand-in still reads as connected, as an ESP
+// server connection does until httpd closes it. A controller command validated before a teardown
+// moves the controller's generation on (as a switchover that admits a new owner later in the same
+// tick would) is dropped at the drain rather than sent to the new owner, which never offered it;
+// the row moves the generation on directly, so the stand-in still owns the role and only the
+// stamp check stands between the command and the send. Gap: the same detached check in
+// ConnectionManager::leave() has no row, since the tick applies a leave ahead of a disconnect. A
+// disconnect that only stop()'s final tick sees, once admission is closed, is dropped in favour of
+// the shutdown goodbye. The test thread plays the protocol task, so nothing drains the queue
+// between the calls; the closed-admission row runs the tick that stop() would. The stand-in is an
+// activated Sentinel connection with an active role, so withdrawing unpaired access closes it, and
+// the liveness check is off so silence does not. The controller's offered command is seeded,
+// stamped with the role's generation as the drain stamps a mask it applies, so a command reaches
+// the queue; a row that drops the stand-in tears the controller down, so it is seeded again before
+// the drained queue is tried. The outbound attempts dial a listener that never answers, so an
+// attempt opened stays in the nursery. Control: a confirm with room in the queue, and a controller
+// command and a state change with no disconnect behind them.
+TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
+    enum class Call : uint8_t {
+        CONFIRM,
+        CANCEL,
+        LEAVE,
+        DISCONNECT,
+        DISCONNECT_AGAIN,
+        UNPAIRED_OFF,
+        CONNECT,
+        SEND_COMMAND,
+        TEAR_DOWN_CONTROLLER,
+        TICK,
+        CLOSE_ADMISSION,
+        SET_UNAVAILABLE,
+    };
+    struct Row {
+        const char* name;
+        bool fill_queue;
+        std::vector<Call> calls;
+        bool window_open;
+        std::vector<std::string> events;
+        size_t attempts{0};
+        bool owns_controller{false};
+        /// Whether the stand-in has finished its hello exchange, so a client/state reaches it.
+        bool operational{false};
+    };
+    const std::string user_goodbye = goodbye_event(SendspinGoodbyeReason::USER_REQUEST);
+    const Row rows[] = {
+        {"Control: a confirm with room in the queue", false, {Call::CONFIRM}, true, {}},
+        {"a confirm behind a full queue", true, {Call::CONFIRM}, true, {}},
+        {"a confirm then a cancel end cancelled", true, {Call::CONFIRM, Call::CANCEL}, false, {}},
+        {"a cancel then a confirm end confirmed", true, {Call::CANCEL, Call::CONFIRM}, true, {}},
+        {"a leave behind a full queue", true, {Call::LEAVE}, false, {"leave"}},
+        {"a leave, a tick, then a confirm: the leave is not repeated",
+         false,
+         {Call::LEAVE, Call::TICK, Call::CONFIRM},
+         true,
+         {"leave"}},
+        {"a second disconnect replaces the first's reason",
+         true,
+         {Call::DISCONNECT, Call::DISCONNECT_AGAIN},
+         false,
+         {goodbye_event(SendspinGoodbyeReason::ANOTHER_SERVER)}},
+        {"a disconnect then a leave: the leave goes out first",
+         true,
+         {Call::DISCONNECT, Call::LEAVE},
+         false,
+         {"leave", user_goodbye}},
+        {"unpaired access withdrawn behind a full queue",
+         true,
+         {Call::UNPAIRED_OFF},
+         false,
+         {goodbye_event(SendspinGoodbyeReason::PAIRING_REQUIRED)}},
+        {"a connect_to behind a full queue opens an attempt", true, {Call::CONNECT}, false, {}, 1},
+        {"a connect_to then a disconnect: the attempt is cancelled",
+         false,
+         {Call::CONNECT, Call::DISCONNECT},
+         false,
+         {user_goodbye},
+         0},
+        {"a disconnect then a connect_to: the attempt opens after the goodbye",
+         false,
+         {Call::DISCONNECT, Call::CONNECT},
+         false,
+         {user_goodbye},
+         1},
+        {"Control: a controller command is sent",
+         false,
+         {Call::SEND_COMMAND},
+         false,
+         {"command"},
+         0,
+         true},
+        {"a controller command queued before a disconnect is not sent",
+         false,
+         {Call::SEND_COMMAND, Call::DISCONNECT},
+         false,
+         {user_goodbye},
+         0,
+         true},
+        {"a controller command validated before its owner was torn down is not sent",
+         false,
+         {Call::SEND_COMMAND, Call::TEAR_DOWN_CONTROLLER},
+         false,
+         {},
+         0,
+         true},
+        {"Control: a state change is published",
+         false,
+         {Call::SET_UNAVAILABLE},
+         false,
+         {"state"},
+         0,
+         false,
+         true},
+        {"a state change published before a disconnect is not sent",
+         false,
+         {Call::SET_UNAVAILABLE, Call::DISCONNECT},
+         false,
+         {user_goodbye},
+         0,
+         false,
+         true},
+        {"a disconnect only the final tick sees: the shutdown goodbye instead",
+         false,
+         {Call::DISCONNECT, Call::CLOSE_ADMISSION},
+         false,
+         {goodbye_event(SendspinGoodbyeReason::SHUTDOWN)}},
+    };
+    const ClientCommandControllerObject play{.command = SendspinControllerCommand::PLAY};
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SilentListener silent;
+        ASSERT_NE(silent.port(), 0);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ControllerRole& controller = client.add_controller();
+        client.set_unpaired_access_enabled(true);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+        manager.liveness_timeout_us_ = 0;
+        auto conn = std::make_shared<RecordingConnection>();
+        conn->apply_server_activate({}, std::vector<std::string>{"player@v1", "controller@v1"},
+                                    std::nullopt, std::nullopt);
+        conn->set_client_hello_sent(row.operational);
+        conn->set_server_hello_received(row.operational);
+        manager.install_admitted(
+            conn, row.owns_controller ? role_mask_bit(SendspinRole::CONTROLLER) : 0);
+        auto offer_play = [&controller] {
+            controller.impl_->supported_commands =
+                (controller.impl_->cleanup_generation.load() << 16) |
+                (1U << static_cast<uint8_t>(SendspinControllerCommand::PLAY));
+        };
+        offer_play();
+        // The stamp send_command() passes along with a command it validated.
+        auto current_stamp = [&controller] {
+            return static_cast<uint16_t>(controller.impl_->cleanup_generation.load());
+        };
+
+        if (row.fill_queue) {
+            for (size_t i = 0; i < ProtocolTask::CONSUMER_COMMAND_BURST; ++i) {
+                ASSERT_TRUE(client.send_controller_command(play, current_stamp()))
+                    << "request " << i;
+            }
+            EXPECT_FALSE(client.send_controller_command(play, current_stamp()))
+                << "a send past the consumer burst must be refused";
+            EXPECT_FALSE(controller.send_command(play))
+                << "a controller command past the consumer burst must be refused";
+        }
+        for (const Call call : row.calls) {
+            switch (call) {
+                case Call::CONFIRM:
+                    client.confirm_pairing_window();
+                    break;
+                case Call::CANCEL:
+                    client.cancel_pairing_window();
+                    break;
+                case Call::LEAVE:
+                    client.leave();
+                    break;
+                case Call::DISCONNECT:
+                    client.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+                    break;
+                case Call::DISCONNECT_AGAIN:
+                    client.disconnect(SendspinGoodbyeReason::ANOTHER_SERVER);
+                    break;
+                case Call::UNPAIRED_OFF:
+                    client.set_unpaired_access_enabled(false);
+                    break;
+                case Call::CONNECT:
+                    client.connect_to(loopback_url(silent.port()));
+                    break;
+                case Call::SEND_COMMAND:
+                    ASSERT_TRUE(controller.send_command(play));
+                    break;
+                case Call::TEAR_DOWN_CONTROLLER:
+                    // The bump a switchover's cleanup() makes before it admits the new owner.
+                    controller.impl_->cleanup_generation.fetch_add(1);
+                    break;
+                case Call::TICK:
+                    (void) client.protocol_tick();
+                    break;
+                case Call::CLOSE_ADMISSION:
+                    // What stop() does before the final tick it joins.
+                    manager.close_admission();
+                    break;
+                case Call::SET_UNAVAILABLE:
+                    client.set_available(false);
+                    break;
+            }
+        }
+
+        (void) client.protocol_tick();
+        EXPECT_EQ(manager.pairing_window_open(), row.window_open);
+        EXPECT_EQ(conn->events, row.events);
+        EXPECT_EQ(manager.nursery_.size(), row.attempts) << "outbound attempts in the nursery";
+        EXPECT_TRUE(manager.reaping_.empty()) << "an attempt was opened and then released";
+        (void) client.protocol_tick();
+        EXPECT_EQ(conn->events, row.events) << "a second tick applied a request again";
+
+        // The drained queue takes sends again.
+        offer_play();
+        EXPECT_TRUE(controller.send_command(play));
+        EXPECT_TRUE(client.send_controller_command(play, current_stamp()));
+
+        silent.close();
+        client.stop();
+        EXPECT_FALSE(client.send_controller_command(play, current_stamp()))
+            << "a stopped client refuses";
+    }
+}
+
+// is_connected() is raised only at the end of a tick, after every handler of that tick has run,
+// so a thread that sees it true also sees the tick's whole effect (the published slots and the
+// events it queued for the drain): a connection admitted (install_admitted(), which refreshes
+// the published slots mid-handler) and made operational (on_handshake_complete(), which queues
+// the trust event) reads as not yet connected until the tick ends. A loss lowers the flag at
+// once, without a tick: the
+// drop row refreshes and reads false. The test thread plays the protocol task. The stand-in is a
+// LONG_TERM connection with its hellos and its activation done; the liveness check is off.
+TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
+    for (const bool drop : {false, true}) {
+        SCOPED_TRACE(drop ? "a drop lowers the flag without a tick" : "an admission raises it");
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+        manager.liveness_timeout_us_ = 0;
+        auto conn = std::make_shared<StubConnection>();
+        conn->set_noise_handshake_result("server", PskCategory::LONG_TERM, "psk");
+        conn->set_client_hello_sent(true);
+        conn->set_server_hello_received(true);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::vector<std::string>{},
+                                    std::nullopt, std::nullopt);
+
+        manager.install_admitted(conn, 0);
+        EXPECT_FALSE(client.is_connected()) << "raised by the refresh inside the handler";
+        client.on_handshake_complete(conn.get());
+        EXPECT_FALSE(client.is_connected()) << "raised before the tick ended";
+        (void) client.protocol_tick();
+        ASSERT_TRUE(client.is_connected()) << "the end of the tick did not raise it";
+
+        if (drop) {
+            manager.drop_connection(conn.get(), std::nullopt);
+            EXPECT_FALSE(client.is_connected()) << "a loss waited for the end of a tick";
+        }
+        client.stop();
+    }
 }
 
 // ============================================================================
@@ -1393,7 +1651,6 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         REPROVE,
         ATTEMPT,
         NURSERY,
-        HELLO_RETRY,
         WINDOW,
         WINDOW_AND_LIVENESS,
         NETWORK_POLL,
@@ -1414,7 +1671,6 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         {"the pairing attempt deadline", Stage::ATTEMPT, 2000},
         {"the nursery establish deadline", Stage::NURSERY,
          static_cast<uint32_t>(NURSERY_ESTABLISH_TIMEOUT_US / 1000)},
-        {"a hello retry, due ahead of the establish deadline", Stage::HELLO_RETRY, 200},
         {"the pairing window", Stage::WINDOW, 5000},
         {"the earliest of two", Stage::WINDOW_AND_LIVENESS, 5000},
         {"the network poll while the server is down", Stage::NETWORK_POLL,
@@ -1464,13 +1720,6 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
             case Stage::NURSERY:
                 conn->set_provisional_time_us(NOW_US);
                 manager.nursery_.push_back(NurseryEntry{.conn = conn});
-                break;
-            case Stage::HELLO_RETRY:
-                // A refused hello backed off: the next attempt is armed 200 ms out.
-                conn->set_provisional_time_us(NOW_US);
-                manager.nursery_.push_back(NurseryEntry{.conn = conn,
-                                                        .hello_due_us = NOW_US + 200'000,
-                                                        .hello_step = HelloStep::SENDING});
                 break;
             case Stage::WINDOW:
                 manager.pairing_window_open_until_us_ = NOW_US + 5'000'000;
@@ -1633,7 +1882,7 @@ public:
 /// keeps (`keeps_state`), so its rows expect no clear and A's value where a teardown clears.
 struct StateRoleAccess {
     const char* name;
-    void (*admit)(SendspinClient&, uint8_t value, uint32_t generation);
+    void (*admit)(SendspinClient&, uint8_t value);
     void (*restore)(SendspinClient&, uint8_t value, uint32_t generation);
     void (*teardown)(SendspinClient&);
     void (*drain)(SendspinClient&);
@@ -1700,8 +1949,8 @@ void write_artwork_display(SendspinClient& c, uint8_t value, uint32_t generation
 
 const StateRoleAccess STATE_ROLES[] = {
     {"controller",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.controller_->impl_->handle_server_state(controller_state_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.controller_->impl_->handle_server_state(controller_state_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.controller_->impl_->event_state->slot.write(controller_state_with(v), g);
@@ -1714,8 +1963,8 @@ const StateRoleAccess STATE_ROLES[] = {
      },
      true, false},
     {"metadata",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.metadata_->impl_->handle_server_state(metadata_state_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.metadata_->impl_->handle_server_state(metadata_state_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.metadata_->impl_->event_state->slot.write(
@@ -1729,8 +1978,8 @@ const StateRoleAccess STATE_ROLES[] = {
      },
      true, false},
     {"color",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.color_->impl_->handle_server_state(color_state_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.color_->impl_->handle_server_state(color_state_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.color_->impl_->event_state->slot.write(
@@ -1744,8 +1993,8 @@ const StateRoleAccess STATE_ROLES[] = {
      },
      true, false},
     {"player stream params",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.player_->impl_->handle_stream_start(player_stream_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.player_->impl_->handle_stream_start(player_stream_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          PlayerRole::Impl& impl = *c.player_->impl_;
@@ -1764,8 +2013,8 @@ const StateRoleAccess STATE_ROLES[] = {
      },
      true, false},
     {"player command",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.player_->impl_->handle_server_command(player_volume_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.player_->impl_->handle_server_command(player_volume_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          c.player_->impl_->event_state->command_slot.write(player_volume_with(v), g);
@@ -1776,8 +2025,8 @@ const StateRoleAccess STATE_ROLES[] = {
      [](SendspinClient& c, const StateRoleLog&) { return c.player_->impl_->volume; },
      false, true},
     {"visualizer stream config",
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.visualizer_->impl_->handle_stream_start(visualizer_stream_with(v), g);
+     [](SendspinClient& c, uint8_t v) {
+         c.visualizer_->impl_->handle_stream_start(visualizer_stream_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          VisualizerRole::Impl& impl = *c.visualizer_->impl_;
@@ -1793,7 +2042,9 @@ const StateRoleAccess STATE_ROLES[] = {
      [](SendspinClient&, const StateRoleLog& log) { return log.visualizer_rate; },
      true, false},
     {"artwork display",
-     write_artwork_display,
+     [](SendspinClient& c, uint8_t v) {
+         write_artwork_display(c, v, c.artwork_->impl_->cleanup_generation.load());
+     },
      write_artwork_display,
      [](SendspinClient& c) { c.artwork_->impl_->cleanup(); },
      [](SendspinClient& c) { c.artwork_->impl_->drain_events(); },
@@ -1885,7 +2136,7 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
             SendspinClient& client = harness.client;
 
             // Connection A's state, applied.
-            role.admit(client, 1, role.generation(client));
+            role.admit(client, 1);
             client.loop();
             ASSERT_EQ(log.calls, std::vector<std::string>{"state 1"});
             log.calls.clear();
@@ -1893,15 +2144,15 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
             const uint32_t a_generation = role.generation(client);
             switch (row.stage) {
                 case Stage::CONTROL:
-                    role.admit(client, 2, role.generation(client));
+                    role.admit(client, 2);
                     break;
                 case Stage::ONE_LOOP:
                     role.teardown(client);
-                    role.admit(client, 2, role.generation(client));
+                    role.admit(client, 2);
                     break;
                 case Stage::TAKEN_BEFORE_ITS_CLEARED:
                     role.teardown(client);
-                    role.admit(client, 2, role.generation(client));
+                    role.admit(client, 2);
                     role.drain(client);
                     break;
                 case Stage::STALE_ACROSS:
@@ -2025,15 +2276,13 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
             params.sample_rate = 48000;
             params.channels = 2;
             params.bit_depth = 16;
-            impl.handle_stream_start(params, impl.cleanup_generation.load());
+            impl.handle_stream_start(params);
             pump_until(client, [&] { return impl.sync_task->is_running(); });
-            impl.handle_stream_end(impl.cleanup_generation.load());
+            impl.handle_stream_end();
             pump_until(client, [&] { return !client.is_started(); });
         } else {
-            client.controller_->impl_->handle_server_state(
-                controller_state_with(11), client.controller_->impl_->cleanup_generation.load());
-            client.metadata_->impl_->handle_server_state(
-                metadata_state_with(5), client.metadata_->impl_->cleanup_generation.load());
+            client.controller_->impl_->handle_server_state(controller_state_with(11));
+            client.metadata_->impl_->handle_server_state(metadata_state_with(5));
             client.loop();
         }
 
@@ -2158,13 +2407,13 @@ public:
     }
 };
 
-/// How many client/time frames the burst has written: send_time_message() tags the frame in
-/// flight before handing it to the transport, and nothing in these tests answers or cancels it.
-/// The stand-in has no Noise session, so the frame goes no further than that; the tag is the one
-/// trace a written frame leaves, and the burst retries a refused frame only after
-/// SEND_RETRY_DELAY_MS, past the end of each row.
+/// How many client/time frames the burst has written: send_time_message() seeds the frame's
+/// write time (never 0) before handing it to the transport. The stand-in has no Noise session, so
+/// the frame goes no further than that; the seed is the one trace a written frame leaves that
+/// another thread may read (an atomic, unlike the frame's tag), and the burst retries a refused
+/// frame only after SEND_RETRY_DELAY_MS, past the end of each row.
 int time_frames_written(const SendspinConnection& conn) {
-    return conn.time_frame_tag_.load() != 0 ? 1 : 0;
+    return conn.time_frame_sent_us_.load() != 0 ? 1 : 0;
 }
 
 // A time burst requests the high-performance hold when it comes due and sends its first
@@ -2173,8 +2422,8 @@ int time_frames_written(const SendspinConnection& conn) {
 // reach the listener as a request followed by its release. The test thread plays the protocol
 // task (run_time_sync(), on a stand-in connection in the admitted slot) and the main loop
 // (loop()), so a frame that must not be sent yet is proven unsent by the tick having returned
-// without writing it, not by a wait; the stand-in's frame tag is read for the reason given at
-// time_frames_written(). The Control row's burst is not due, so nothing is requested.
+// without writing it, not by a wait; the stand-in's frame write time is read for the reason given
+// at time_frames_written(). The Control row's burst is not due, so nothing is requested.
 TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
     enum class Stage : uint8_t { NOT_DUE, WAITS_FOR_GRANT, RELEASE_NOT_GATED, STALLED_TICK };
     struct Row {
@@ -2414,9 +2663,9 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params, player.cleanup_generation.load());
+            player.handle_stream_start(params);
         };
-        const auto end = [&] { player.handle_stream_end(player.cleanup_generation.load()); };
+        const auto end = [&] { player.handle_stream_end(); };
 
         switch (row.stage) {
             case Stage::ONE_START:
@@ -2440,7 +2689,7 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
                 // stream to take.
                 start();
                 wait_until([&] { return sync.inbound().items().is_empty(); });
-                player.handle_stream_clear(player.cleanup_generation.load());
+                player.handle_stream_clear();
                 wait_until([&] { return (sync.event_flags_.get() & COMMAND_STREAM_CLEAR) == 0; });
                 break;
             case Stage::START_END_START:
@@ -2504,7 +2753,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params, player.cleanup_generation.load());
+            player.handle_stream_start(params);
         };
 
         start();
@@ -2514,7 +2763,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         sync.inbound().return_item(context.encoded_item);  // Decoded: the stream is playing
         context.encoded_item = nullptr;
         if (row.end_first) {
-            player.handle_stream_end(player.cleanup_generation.load());
+            player.handle_stream_end();
         }
         start();
 
@@ -2758,11 +3007,8 @@ public:
     }
 
     // Counts what the wire would carry: one disconnect() is one goodbye frame.
-    void disconnect(SendspinGoodbyeReason, std::function<void()> on_complete) override {
+    void disconnect(SendspinGoodbyeReason) override {
         this->obs_->goodbyes.fetch_add(1);
-        if (on_complete) {
-            on_complete();
-        }
     }
 
 private:
@@ -2814,7 +3060,7 @@ void start_stream_on(SendspinClient& client, std::shared_ptr<ObservedConnection>
     play_protocol_task(client);
     (void) replace_admitted(*client.connection_manager_, std::move(conn));
     PlayerRole::Impl& impl = *client.player_->impl_;
-    impl.handle_stream_start(pcm_stream_params(), impl.cleanup_generation.load());
+    impl.handle_stream_start(pcm_stream_params());
     SyncTask& sync_task = *impl.sync_task;
     pump_until(client, [&] { return sync_task.is_running(); });
 }
@@ -2939,7 +3185,7 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     InboundMessage message;
     message.data = chunk.data();
     message.len = chunk.size();
-    impl.handle_binary(message, impl.cleanup_generation.load());
+    impl.handle_binary(message);
     ASSERT_GT(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
         << "the chunk never reached the sync task's list";
 
@@ -2963,6 +3209,11 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
 // the default player syncing every second instead of every 10 s holds 88 bursts of 8 replies
 // (312 stored bytes each) behind its 87 s hold instead of 9. Read from the ring the client
 // creates, so every role's figures and the burst configuration have to reach the derivation.
+// Each row also reads the buffer_capacity the stream roles' client/hello advertises, which never
+// exceeds the ring's largest item, so any one chunk the server may send fits an item: the default
+// player's two-thirds share (666,666 bytes) is capped at the default ring's 621,312, while the
+// 25,000-byte player's 16,666, the default player's share in the larger rings and the
+// visualizer's seventh stay as derived.
 TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
     enum : uint8_t {
         PLAYER = 1 << 0,
@@ -2978,25 +3229,30 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         uint8_t roles;
         size_t expected_bytes;
         size_t expected_max_message_bytes;
+        /// The buffer_capacity each stream role's client/hello advertises; 0 without the role.
+        size_t expected_player_advertised;
+        size_t expected_visualizer_advertised;
         int64_t burst_interval_ms{SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS};
     };
     const Row rows[] = {
-        {"no roles: two JSON messages", 0, 32880, 16400},
-        {"controller and metadata: the no-role budget", CONTROLLER_METADATA, 32880, 16400},
+        {"no roles: two JSON messages", 0, 32880, 16400, 0, 0},
+        {"controller and metadata: the no-role budget", CONTROLLER_METADATA, 32880, 16400, 0, 0},
         {"visualizer only: its 4,096-byte quota, 3 s of pass-through, the JSON floor", VISUALIZER,
-         42544, 21232},
+         42544, 21232, 0, 585},
         {"a 140,000-byte visualizer: 69 s of pass-through, two 20,016-byte messages",
-         LARGE_VISUALIZER, 268240, INBOUND_MAX_MESSAGE_BYTES},
-        {"a 25,000-byte player: two of its longest chunks", SMALL_PLAYER, 64016, 31968},
+         LARGE_VISUALIZER, 268240, INBOUND_MAX_MESSAGE_BYTES, 0, 20000},
+        {"a 25,000-byte player: two of its longest chunks, its share advertised uncapped",
+         SMALL_PLAYER, 64016, 31968, 16666, 0},
         {"artwork only: one default image, above two maximal frames", ARTWORK, 131292,
-         INBOUND_MAX_MESSAGE_BYTES},
+         INBOUND_MAX_MESSAGE_BYTES, 0, 0},
         {"artwork capped at 40,000-byte images: still two maximal frames", SMALL_ARTWORK, 131152,
-         INBOUND_MAX_MESSAGE_BYTES},
-        {"Control: the default player", PLAYER, 1242704, INBOUND_MAX_MESSAGE_BYTES},
-        {"the default player, a time burst every second", PLAYER, 1439888,
-         INBOUND_MAX_MESSAGE_BYTES, 1000},
+         INBOUND_MAX_MESSAGE_BYTES, 0, 0},
+        {"Control: the default player, its advertised share capped at the ring's largest item",
+         PLAYER, 1242704, INBOUND_MAX_MESSAGE_BYTES, 621312, 0},
+        {"the default player, a time burst every second: its share fits the larger ring", PLAYER,
+         1439888, INBOUND_MAX_MESSAGE_BYTES, 666666, 0, 1000},
         {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1687004,
-         INBOUND_MAX_MESSAGE_BYTES},
+         INBOUND_MAX_MESSAGE_BYTES, 666666, 585},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -3039,6 +3295,17 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         // received messages only.
         EXPECT_EQ(client.inbound_ring_->max_item_message_bytes(),
                   SharedRingLayout::max_item_size(row.expected_bytes) - sizeof(InboundItemHeader));
+        ClientHelloMessage hello;
+        if (client.player_) {
+            client.player_->impl_->build_hello_fields(hello);
+        }
+        if (client.visualizer_) {
+            client.visualizer_->impl_->build_hello_fields(hello);
+        }
+        EXPECT_EQ(hello.player_v1_support ? hello.player_v1_support->buffer_capacity : 0U,
+                  row.expected_player_advertised);
+        EXPECT_EQ(hello.visualizer_support ? hello.visualizer_support->buffer_capacity : 0U,
+                  row.expected_visualizer_advertised);
         client.stop();
     }
 }

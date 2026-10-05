@@ -161,11 +161,10 @@ public:
     /// (SendspinServerConnection::discard_frame_payload()). httpd hands a frame's payload over
     /// only whole: httpd_ws_recv_frame() needs max_len >= the frame length (httpd_ws.c), so a
     /// dropped frame still needs a buffer of its size. Allocated on the first drop, PSRAM
-    /// preferred, and kept until stop() rather than freed when a run of drops ends: runs end per
-    /// connection while the buffer serves every session, and a run happens when the ring is full,
-    /// so freeing and re-allocating it per run would churn a block of up to 64 KB through the
-    /// heap exactly when memory is tightest. httpd task only: every session shares that one task,
-    /// so one buffer serves them all.
+    /// preferred, and kept until stop(): the buffer serves every session, and the frames it
+    /// drains (a detached connection's, sent while it is torn down) recur with every release, so
+    /// freeing and re-allocating it would churn a block of up to 64 KB through the heap. httpd task
+    /// only: every session shares that one task, so one buffer serves them all.
     /// @return nullptr when it cannot be allocated.
     uint8_t* discard_buffer();
 

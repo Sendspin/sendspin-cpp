@@ -227,9 +227,9 @@ struct SendspinClientConfig {
     // (ESPHome's runs about 100 to 250 bytes deeper than newlib's vprintf chain); noise-c's
     // alloca extras off the worst path; ArduinoJson's virtual allocator chain (about 4.2 KB, under
     // the bound) and its nesting limit of 10 at 64 bytes a level; the shared_ptr disposal when
-    // the tick's connection snapshot drops; std::function send completions; the few assembly
-    // and unused newlib stub functions the script reports as frameless. The on-device high-water
-    // check of each task is still owed.
+    // the tick's connection snapshot drops; the few assembly and unused newlib stub functions
+    // the script reports as frameless. The on-device high-water check of each task is still
+    // owed.
 
     /// @brief Default HTTP server task stack size in bytes (ESP-IDF only). The task runs no Noise
     /// or protocol work (the protocol task does), only esp_http_server itself, the frame receive
@@ -274,11 +274,11 @@ struct SendspinClientConfig {
     /// @brief Default protocol task stack size in bytes (ESP-IDF only). The protocol task runs
     /// every Noise handshake (X25519, SHA-256), the pairing exchange (CPace, SHA-512, HMAC), the
     /// JSON parse, the role handlers and every send. Deepest chain from the task entry, noise-c and
-    /// libsodium included: 5,808 bytes at -Os, a pairing message whose handler drops the
-    /// connection and queues its goodbye through httpd_queue_work() into the shared tail; 6,464 at
+    /// libsodium included: 5,776 bytes at -Os, a pairing message whose handler drops the
+    /// connection and queues its goodbye through httpd_queue_work() into the shared tail; 6,480 at
     /// -Og, a stream/start message, whose parse frame is 1,312 bytes at -Og (464 at -Os), whose
     /// string conversion fails to allocate into libstdc++'s terminate and the shared tail.
-    /// 6,464 + 384 = 6,848, rounded up (see the task stack derivation above).
+    /// 6,480 + 384 = 6,864, rounded up (see the task stack derivation above).
     static constexpr size_t DEFAULT_PROTOCOL_TASK_STACK_SIZE = 7168U;
 
     size_t protocol_task_stack_size{
@@ -386,6 +386,11 @@ struct PlayerRoleConfig {
     /// support object"). Opus may be listed in addition, but only in a build with the Opus decoder
     /// (SENDSPIN_ENABLE_OPUS, on by default). SendspinClient::start() fails and logs otherwise.
     std::vector<AudioSupportedFormatObject> audio_formats{};
+    /// @brief Bytes of the shared inbound ring the player may hold as encoded audio: its quota,
+    /// which the ring is sized to include. The client advertises the two thirds of it that hold
+    /// encoded frames at the smallest chunk size to the server as buffer_capacity. The advertised
+    /// value is at most the ring's largest item so that any single chunk the server may send
+    /// fits.
     size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
     int32_t fixed_delay_us{0};
     uint16_t initial_output_delay_ms{0};
@@ -586,7 +591,9 @@ struct VisualizerSupportObject {
     /// budget holds actual wire data. The client advertises that effective capacity to the
     /// server, not this raw budget, so the server's flow control does not overrun the quota.
     /// VisualizerRole's start fails below 70 bytes, the smallest budget that advertises one
-    /// smallest frame, the default 0 included.
+    /// smallest frame, the default 0 included. The advertised value is at most the ring's largest
+    /// item so that any single chunk the server may send fits, which a seventh of the quota
+    /// always is.
     size_t buffer_capacity{};
 };
 

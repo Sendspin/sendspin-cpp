@@ -91,33 +91,22 @@ public:
     // Interface stubs
 
     void start() override {}
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
+    void disconnect(SendspinGoodbyeReason reason) override {
         this->last_disconnect_reason_ = reason;
         this->disconnect_count_++;
-        if (on_complete) {
-            on_complete();
-        }
     }
     void close_transport_now() override {
         this->close_transport_now_count_++;
     }
     bool is_connected() const override { return this->connected_; }
 
-    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb,
-                            bool /*allow_before_hello*/) override {
+    SsErr send_text_message(const std::string& msg) override {
         sent_text_.push_back(msg);
-        if (cb) {
-            cb(true);
-        }
         return SsErr::OK;
     }
 
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                              bool /*allow_before_hello*/) override {
+    SsErr send_binary_message(const uint8_t* data, size_t len) override {
         sent_binary_.push_back(std::vector<uint8_t>(data, data + len));
-        if (cb) {
-            cb(true);
-        }
         return SsErr::OK;
     }
 
@@ -500,7 +489,7 @@ protected:
     /// Pumps until `conn`'s time burst has a client/time frame in flight. Unbounded: a burst that
     /// stopped sending hangs here and the suite watchdog names the test.
     void pump_until_time_frame(FakeConnection* conn) {
-        while (conn->time_frame_tag_.load() == 0) {
+        while (conn->time_frame_tag_ == 0) {
             this->pump();
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -1315,7 +1304,7 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     // flight before sending, so a nonzero tag shows the burst reached the send.
     // A burst whose send fails retries after SendspinTimeBurst::SEND_RETRY_DELAY_MS, so each wait
     // below pumps until the next attempt; the suite watchdog names a burst that never sends.
-    ASSERT_EQ(conn->time_frame_tag_.load(), 0U);
+    ASSERT_EQ(conn->time_frame_tag_, 0U);
     this->pump_until_time_frame(conn);
 
     // Any change publishes.
@@ -1328,7 +1317,7 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
     this->pump();
     ASSERT_FALSE(conn->has_activity(SendspinActivity::PAIRING));
-    conn->time_frame_tag_.store(0);
+    conn->time_frame_tag_ = 0;
     this->pump_until_time_frame(conn);
 }
 

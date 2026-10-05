@@ -27,7 +27,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <string>
 
 namespace sendspin {
@@ -70,14 +69,12 @@ public:
     /// @brief Starts the connection (initializes time filter, prepares for messages)
     void start() override;
 
-    /// @brief Sends a goodbye carrying @p reason, then calls trigger_close() from the send's
-    /// async completion callback.
-    /// @param on_complete Optional; invoked after the goodbye send completes or fails, on the
-    ///                    httpd worker thread, so it must be safe to run there.
-    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
+    /// @brief Queues a goodbye carrying @p reason to the httpd worker, then calls
+    /// trigger_close(), which httpd serves after the queued goodbye.
+    void disconnect(SendspinGoodbyeReason reason) override;
 
     /// @brief Closes the transport immediately without blocking (see base class doc comment).
-    /// Delegates to trigger_close(), the same async primitive disconnect() already uses.
+    /// Delegates to trigger_close(), the same async primitive disconnect() closes with.
     void close_transport_now() override;
 
     /// @brief Whether the socket connection is valid
@@ -93,15 +90,11 @@ public:
         this->closed_.store(true, std::memory_order_release);
     }
 
-    /// @brief Sends a text message to the server with a completion callback
-    SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
-                            bool allow_before_hello) override;
+    /// @brief Sends a text message to the connected client (async, via httpd worker)
+    SsErr send_text_message(const std::string& message) override;
 
     /// @brief Sends a binary WebSocket frame to the connected client (async, via httpd worker)
-    /// @param on_complete Optional completion callback (best-effort; may be skipped on teardown).
-    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
-    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
-                              bool allow_before_hello) override;
+    SsErr send_binary_message(const uint8_t* data, size_t len) override;
 
     /// @brief Triggers the underlying socket to close
     ///
@@ -109,8 +102,8 @@ public:
     /// It does not send a goodbye message first.
     ///
     /// Relationship with disconnect():
-    /// - disconnect() is the high-level API that sends a goodbye message, then calls
-    ///   trigger_close() in the completion callback after the message is sent.
+    /// - disconnect() is the high-level API that queues a goodbye message, then calls
+    ///   trigger_close(), which httpd serves after the queued goodbye.
     /// - trigger_close() is the low-level mechanism that actually closes the socket.
     ///
     /// Use disconnect() for graceful shutdown. Use trigger_close() only when you
@@ -143,11 +136,8 @@ protected:
     /// @param data              Payload bytes to copy and send.
     /// @param len               Number of bytes in `data`.
     /// @param type              HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY.
-    /// @param on_complete       Completion callback, if any.
-    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
     /// @param before_write      Run by the worker immediately before the write, if set.
     SsErr queue_async_send(const uint8_t* data, size_t len, httpd_ws_type_t type,
-                           SendCompleteCallback on_complete, bool allow_before_hello,
                            const NoiseTransport::FrameWriteHook& before_write);
 
     /// @brief Receives the payload of the frame whose header `ws_pkt` holds into `dest`, which has

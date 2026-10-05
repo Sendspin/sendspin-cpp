@@ -68,20 +68,21 @@ private:
 
 /**
  * @brief A role's teardown state, shared by every role's Impl: its teardown generation, the
- * check each point of effect makes against it, and its TeardownTracker
+ * check each drain makes against it, and its TeardownTracker
  *
  * cleanup() bumps cleanup_generation and stamps everything the role queues from then on with the
- * new value: its events, its slot payloads, the items it hands a role thread. The gate in
- * SendspinClient's role dispatch captures the generation once, before the handler it admits runs,
- * and stop()'s teardown on the main loop can land in between, so each point of effect re-checks
- * it with accepts(), invalidating the whole handler instead of only the part that ran before it.
- * The drains apply the same check to a payload's stamp (event_is_current(), GenerationSlot), and
- * a role thread to an item's (InboundConsumer::take()); a drain also uses it to detect a
- * listener callback that re-entered teardown.
+ * new value: its events, its slot payloads, the items it hands a role thread. Each protocol-task
+ * handler loads the generation once at entry and stamps what it queues with it. A teardown runs
+ * on the protocol task between two handlers, or from stop() once that task is joined, so the
+ * generation stays current for the whole handler and the handler does not check it. The stamp
+ * protects the threads that consume what the handler queued: the drains check a payload's stamp
+ * with accepts() (event_is_current(), GenerationSlot), and a role thread an item's
+ * (InboundConsumer::take()), so a teardown that runs before they take it discards it; a drain also
+ * uses accepts() to detect a listener callback that re-entered teardown.
  */
 struct RoleTeardown {
-    /// @brief Whether an effect admitted at `generation` may still be applied
-    /// @param generation The counter value captured when the message was admitted.
+    /// @brief Whether an effect stamped with `generation` may still be applied
+    /// @param generation The counter value the effect was stamped with.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
     }

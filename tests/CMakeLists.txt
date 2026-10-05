@@ -80,21 +80,35 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # and SendspinConnection's noise_handshake_complete_ (a stand-in's finished handshake) and its
 # transport side, begin_inbound_message() and end_inbound_message() (a stand-in's transport writing
 # a ring item and a fallback message). The ring-size tables read SendspinClient::inbound_ring_ and
-# InboundRing::storage_, the ring a start() created, whose size no public call reports. The
+# InboundRing::storage_, the ring a start() created, whose size no public call reports, and build
+# the player_'s and visualizer_'s client/hello fields through their impl_, the buffer_capacity a
+# hello advertises, which no public call returns. The
 # next-deadline tables also stage each timer state against a fixed clock, which no public call can
 # do: ConnectionManager's liveness_timeout_us_, pairing_window_open_until_us_,
 # ws_server_start_retry_time_us_ and tick(); SendspinTimeBurst's burst_index_,
 # last_burst_complete_time_, pending_embedded_, current_message_sent_time_, send_retry_after_ms_
 # and pending_burst_completed_; and SendspinConnection's first_activate_received_ and
-# last_receive_time_us_. The stale-command and refused-delivery tests reach the queue through
-# protocol_task_ to push a command, or close admission, the way a race or stop() would. The reap
+# last_receive_time_us_. The stale-command and refused-delivery tests reach the queue and the
+# request slot through protocol_task_ to push a command or post a request, or close admission, the
+# way a race or stop() would, and read ConnectionManager::pairing_window_open() to see a posted
+# confirm applied. The reap
 # test releases an outbound attempt on the test thread (ConnectionManager's connect_to(),
 # disconnect() and scan_nursery()) and reads reaping_ and nursery_ right after, since only a
 # release no tick follows shows whether the release itself destroyed the connection, then
 # restarts the protocol task (protocol_task_->start()) for the request it takes from another
 # thread; its sibling for an opened connection reads the same two members around a release. The
-# full queue test seeds the controller's supported_commands word (stamped with its
-# cleanup_generation) so a send_command() reaches the queue. The teardown reorder table interleaves the protocol task
+# full queue table seeds the controller's supported_commands word (stamped with its
+# cleanup_generation) so a send_command() reaches the queue, reads cleanup_generation for the stamp
+# a direct send_controller_command() carries and moves it on for the row whose command was
+# validated before a teardown, as cleanup() would without the rest of a teardown, turns the
+# liveness check off (liveness_timeout_us_) so its stand-in's silence does not close it, closes
+# admission
+# (close_admission()) for the row that runs the tick stop() would, and reads
+# ConnectionManager::pairing_window_open(), nursery_ and reaping_ to see which pairing-window
+# gesture won and whether an outbound attempt opened or was released. The connected-flag test
+# calls SendspinClient::on_handshake_complete() and ConnectionManager::drop_connection() on its
+# stand-in, the two halves of an activation and a loss, to read is_connected() between them and
+# the end of the tick, which no public call can stop at. The teardown reorder table interleaves the protocol task
 # (and, for artwork, the decode thread) with the main loop, which no public call does on demand:
 # it calls each role's handler or teardown (the controller, metadata and color roles'
 # handle_server_state(), the player's handle_stream_start() and handle_server_command(), the
@@ -106,13 +120,13 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # sync thread stopped and the item list bound by hand (SyncTask's stop() and inbound_), so a
 # STREAM_END never waits for a thread to go idle. The high-performance grant tables
 # play the protocol task's run_time_sync() on a stand-in in the admitted slot (find_admitted(),
-# its high_performance_held) and read the stand-in's time_frame_tag_, the one trace of a time
-# frame written without a Noise session; the wake test restarts the protocol task
-# (protocol_task_->start()) with liveness off (liveness_timeout_us_) so the grant is the only
-# wake, and polls the client's Inbox through a role's impl_->inbox, which also lets the reorder
-# table fill the event ring. The stream-events table drives the player's handle_stream_start()
-# and handle_stream_end() as the task would, and stages one interleaving by waiting on the sync
-# task's item list and the player's sync-idle topic bit, and its clear row calls
+# its high_performance_held) and read the stand-in's time_frame_sent_us_, the one trace of a time
+# frame written without a Noise session that another thread may read; the wake test restarts the
+# protocol task (protocol_task_->start()) with liveness off (liveness_timeout_us_) so the grant is
+# the only wake, and polls the client's Inbox through a role's impl_->inbox, which also lets the
+# reorder table fill the event ring. The stream-events table drives the player's
+# handle_stream_start() and handle_stream_end() as the task would, and stages one interleaving by
+# waiting on the sync task's item list and the player's sync-idle topic bit, and its clear row calls
 # handle_stream_clear() the same way. The next-stream header table plays the sync task itself on
 # the test thread, because no public call holds the task between its ACTIVE load and its next
 # IDLE wait: it calls SyncTask's wait_for_codec_header() and load_next_chunk() and returns items
@@ -124,24 +138,24 @@ set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
 # public surface does not expose: the sync task's run state and its item list, the artwork
 # transfer in flight and its drain-side slot buffers, the visualizer's stream flag and list, a
-# state role's held scheduled update and its teardown generation (including a direct
-# handle_server_state() call with that generation), the controller's supported-commands word
-# (seeded, stamped with the role's generation, so a command reaches the inactive-role send gate),
-# plus the queued-event probe that proves
-# ordering without a sleep (a role inbox's topic bits).
+# state role's held scheduled update and its teardown generation (including the metadata slot
+# written with that generation, a payload a drain takes across the removal), the controller's
+# supported-commands word (seeded, stamped with the role's generation, so a command reaches the
+# inactive-role send gate), plus the queued-event probe that proves ordering without a sleep (a
+# role inbox's topic bits).
 set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
-# test_player_role.cpp drives PlayerRole::Impl directly - no connected server, no sync-task
-# thread - which is the only way to see the client/state player object and the only way to hand
-# a handler a stale teardown generation. Reached: Impl's handle_stream_start(), handle_binary(),
-# handle_stream_clear(), handle_server_command(), cleanup(), recall_stale_items(), attach_inbox(),
-# drain_events(), volume, cleanup_generation and event_state's generation-stamped slots (one
-# written with a stamp from before a teardown, the payload a drain on the far side of it would
-# hold); SyncTask's inbound_ (and take_item()), bound to a test ring the way start() binds it but
-# with no thread, so what a handler handed over (or, refused, did not) stays on the list to be
-# read, and discard_to_clear_marker(), the sync thread's stream/clear step. The inbound tests
-# also bind a VisualizerRole::Impl to the same ring, to show one holder's quota does not stop the
-# other.
+# test_player_role.cpp drives PlayerRole::Impl directly - no connected server, no sync-task thread -
+# which is the only way to see the client/state player object and the only way to stage a slot
+# payload stamped before a teardown. Reached: Impl's handle_stream_start(), handle_binary(),
+# handle_stream_clear(), handle_server_command(), cleanup(), attach_inbox(), drain_events(), volume,
+# cleanup_generation (moved on directly to stage a take between a teardown's generation bump and its
+# recall) and event_state's generation-stamped slots (one written with a stamp from before a
+# teardown, the payload a drain on the far side of it would hold); SyncTask's inbound_ (and
+# take_item()), bound to a test ring the way start() binds it but with no thread, so what a handler
+# handed over (or dropped) stays on the list to be read, and discard_to_clear_marker(), the sync
+# thread's stream/clear step. The inbound tests also bind a VisualizerRole::Impl to the same ring,
+# to show one holder's quota does not stop the other.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_json_arena.cpp reads SendspinArenaAllocator's base_, cap_ and offset_: where the bump
@@ -245,8 +259,7 @@ if(ENABLE_SANITIZERS)
 endif()
 
 # ThreadSanitizer, configured separately from ASan/UBSan (the two cannot be combined). The
-# concurrency tests only report a data race when the binary is built this way; see
-# RecordStoreConcurrency in test_record_store.cpp.
+# concurrency tests only report a data race when the binary is built this way.
 if(ENABLE_TSAN)
     target_compile_options(sendspin_tests PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
     target_link_options(sendspin_tests PRIVATE -fsanitize=thread)

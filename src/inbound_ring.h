@@ -108,14 +108,15 @@ private:
 static constexpr uint32_t INBOUND_LIST_END = UINT32_MAX;
 
 /// Bound on a transport's InboundRing::acquire() for an admitted connection's message, after
-/// which the message is dropped with a warning; the protocol task's own acquires for a codec
-/// header or a marker wait the same bound. An acquire waits only while the protocol task is
-/// behind on taking items or ring-order reclamation holds space behind the oldest held item (see
-/// derive_inbound_ring_bytes()). Sized at the bottom of the 100-200 ms stall budget the library's
-/// threads are held to: longer than a tick running a Noise handshake's DH operations (tens of
-/// milliseconds on an ESP32), so a busy task does not cost a message, and short enough that a
-/// stalled one costs a dropped message rather than a parked transport, which on ESP is the httpd
-/// task every inbound session shares.
+/// which the connection is closed with a warning (a frame never decrypted leaves the Noise receive
+/// nonce behind, so the connection could not continue past it); the protocol task's own acquires
+/// for a codec header or a marker wait the same bound. An acquire waits only while the protocol
+/// task is behind on taking items or ring-order reclamation holds space behind the oldest held item
+/// (see derive_inbound_ring_bytes()). Sized at the bottom of the 100-200 ms stall budget the
+/// library's threads are held to: longer than a tick running a Noise handshake's DH operations
+/// (tens of milliseconds on an ESP32), so a busy task does not cost a connection, and short enough
+/// that a stalled one costs the connection rather than a parked transport, which on ESP is the
+/// httpd task every inbound session shares.
 static constexpr uint32_t INBOUND_ACQUIRE_TIMEOUT_MS = 100;
 
 /// The largest WebSocket message a conforming peer sends: one Noise transport frame, plaintext
@@ -614,26 +615,29 @@ private:
  * Shared by the sync task (InboundHolder::PLAYER) and the visualizer drain thread
  * (InboundHolder::VISUALIZER). Every item handed over carries the holder role's teardown
  * generation (InboundItemHeader::generation): a teardown moves the role's `cleanup_generation`
- * on, the protocol task recalls what the consumer has not taken (recall_stale()), and a
- * consumer that takes such an item first returns it unprocessed (take()).
+ * on and its cleanup() recalls what the consumer has not taken (recall()), and a consumer that
+ * takes such an item between the two returns it unprocessed (take()).
  *
- * Threads: bind() and unbind() run on the main loop with the consumer thread not running; the
- * protocol task hands items over (copy_local(), hand(), recall_stale(), note_drop()); the
- * consumer thread takes and returns them. ring() is read on all three.
+ * Threads: bind() and unbind() run on the main loop with neither the consumer thread nor the
+ * protocol task running: SendspinClient::start() binds before it starts the protocol task, and
+ * stop() (and a start() that fails part-way) unbinds after joining it. The protocol task hands
+ * items over and recalls them (copy_local(), hand(), recall(), note_drop()); the consumer thread
+ * takes and returns them. ring() is read on all three, ordered by those thread starts and joins.
  */
 class InboundConsumer {
 public:
     /// @brief Binds the item list to this run's ring as `holder`'s list. Main loop, before the
-    /// consumer thread starts. @return false when the list's event flags cannot be created.
+    /// consumer thread and the protocol task start. @return false when the list's event flags
+    /// cannot be created.
     bool bind(InboundRing* ring, InboundHolder holder);
 
     /// @brief Returns every item left on the list and unbinds it from the ring. Main loop, once
-    /// the consumer thread is joined; bind() binds it again.
+    /// the consumer thread and the protocol task are joined; bind() binds it again.
     void unbind();
 
     /// @brief The ring the list is bound to, or nullptr outside a run
     InboundRing* ring() const {
-        return this->ring_.load(std::memory_order_acquire);
+        return this->ring_;
     }
 
     /// @brief The item list itself, for a consumer that walks it (a clear marker's discard)
@@ -662,9 +666,8 @@ public:
     void* copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
                      uint32_t timeout_ms) const;
 
-    /// @brief Stamps `item` with `generation`, recalls the list first if a teardown moved the
-    /// generation on (recall_stale()), then charges the item to the holder's quota and appends
-    /// it. Over quota the item is returned to the ring with a throttled warning: the server
+    /// @brief Stamps `item` with `generation`, charges it to the holder's quota and appends it.
+    /// Over quota the item is returned to the ring with a throttled warning: the server
     /// overran the buffer_capacity the role advertises, which the quota covers at the role's
     /// smallest message. Protocol task, inside a run; the caller fills the item's other consumer
     /// fields first.
@@ -680,10 +683,12 @@ public:
     /// @return false when the item was returned instead of handed over.
     bool hand(void* item, size_t item_len, uint32_t generation, bool exempt);
 
-    /// @brief Recalls every item not yet taken once `generation` differs from the one the list
-    /// was last recalled for. Protocol task: each tick, and from hand(), so no item stamped with
-    /// the current generation is ever recalled.
-    void recall_stale(uint32_t generation);
+    /// @brief Returns every item the consumer has not taken to the ring and ends the drop log's
+    /// run, since the stream the drops belonged to is gone. The holder role's cleanup(), right
+    /// after its generation moves on: on the protocol task, the thread that hands items over, so
+    /// every item recalled carries an earlier generation. A no-op outside a run, where the
+    /// main loop's cleanup() in SendspinClient::stop() finds the list already unbound.
+    void recall();
 
     /// @brief Counts a drop of an item that never reached hand() in the same throttled run as
     /// the over-quota drops, logging "<Holder> <message>" when it starts one. Protocol task.
@@ -701,13 +706,10 @@ private:
     InboundDropLog drop_log_;
 
     // Pointer fields
-    /// Written by bind() and unbind() on the main loop; read by the protocol task and the
-    /// consumer thread.
-    std::atomic<InboundRing*> ring_{nullptr};
-
-    // 32-bit fields
-    /// The teardown generation the list was last recalled for. Protocol task only.
-    uint32_t recalled_generation_{0};
+    /// Written by bind() and unbind() on the main loop while neither the protocol task nor the
+    /// consumer thread runs; read by both, ordered by their start and join. A role that starts
+    /// while the protocol task runs would need this to be an atomic.
+    InboundRing* ring_{nullptr};
 
     // 8-bit fields
     /// Written by bind() before the protocol task hands anything over.
@@ -994,9 +996,11 @@ static constexpr size_t inbound_held_message_bytes(size_t advertised_capacity) {
 /// the player's and the visualizer's longest message (inbound_held_message_bytes()); with the
 /// artwork role a maximal Noise frame, since its images arrive in maximal frames
 /// (roles/artwork/v1.md "Artwork (Binary)").
-/// @param player_message_bytes inbound_held_message_bytes() of the player's advertised capacity,
-///        0 without the player.
-/// @param visualizer_message_bytes The same for the visualizer.
+/// @param player_message_bytes inbound_held_message_bytes() of the player's share of its quota
+///        (PlayerRole::Impl::buffer_capacity_share(), which the capacity it advertises never
+///        exceeds), 0 without the player.
+/// @param visualizer_message_bytes inbound_held_message_bytes() of the visualizer's advertised
+///        capacity, 0 without the visualizer.
 /// @param artwork Whether the artwork role is enabled.
 static constexpr size_t inbound_largest_message_bytes(size_t player_message_bytes,
                                                       size_t visualizer_message_bytes,
@@ -1018,10 +1022,6 @@ static constexpr size_t inbound_item_stored_bytes(size_t message_len) {
 static constexpr size_t inbound_ring_min_storage_bytes(size_t largest_message_bytes) {
     return 2 * inbound_item_stored_bytes(largest_message_bytes);
 }
-
-/// Ring storage the largest inbound item occupies.
-static constexpr size_t INBOUND_MAX_ITEM_STORED_BYTES =
-    inbound_item_stored_bytes(INBOUND_MAX_MESSAGE_BYTES);
 
 /// The floor of a ring that accepts a maximal message (131,152 bytes).
 static constexpr size_t INBOUND_RING_MIN_STORAGE_BYTES =
@@ -1081,7 +1081,7 @@ static constexpr size_t INBOUND_STATE_BYTES_PER_SECOND = 1024;
 /// The shortest track the artwork budget assumes: one track change, and so one new image per
 /// artwork channel, every 30 seconds. An assumption about listening, not a protocol bound: a
 /// listener skipping tracks faster than this pins more images than budgeted, which the transport
-/// reports as "ring pinned behind held items".
+/// reports as "ring pinned behind held items" when it closes the connection.
 static constexpr size_t INBOUND_MIN_TRACK_SECONDS = 30;
 
 /// @brief The configuration figures the ring size is derived from
@@ -1165,15 +1165,17 @@ static constexpr size_t inbound_hold_seconds(size_t held_bytes, size_t stored_by
  * and the player's longest chunk in between. A longer message goes through the connection's
  * fallback buffer (InboundGate). A chunk or frame not in a ring item is copied into one bounded
  * by the ring's largest item alone (InboundRing::max_item_message_bytes(), half the storage):
- * audio and visualizer messages up to one Noise frame always fit, and one reassembled from
- * several frames that is longer than half the ring is dropped with a warning naming that.
+ * audio and visualizer messages up to one Noise frame always fit, and each stream role
+ * advertises a buffer of at most that bound (PlayerRole::Impl::advertised_buffer_capacity()), so
+ * only a server over its advertised buffer sends one reassembled from several frames that is
+ * longer, which is dropped with a warning naming that.
  *
  * Traffic beyond this budget (a burst of large JSON, a lower audio rate or a sparser visualizer
- * stream than budgeted, faster track changes) waits in the transport's acquire and is dropped
- * after INBOUND_ACQUIRE_TIMEOUT_MS with a warning naming the held items. The derivation assumes a
- * server's visualizer lead never exceeds its audio lead: otherwise audio returned as it plays
- * would stay pinned behind the oldest visualizer frame, which nothing in the configuration
- * bounds.
+ * stream than budgeted, faster track changes) waits in the transport's acquire and, after
+ * INBOUND_ACQUIRE_TIMEOUT_MS, closes the connection with a warning naming the held items. The
+ * derivation assumes a server's visualizer lead never exceeds its audio lead: otherwise audio
+ * returned as it plays would stay pinned behind the oldest visualizer frame, which nothing in the
+ * configuration bounds.
  *
  * With the default configuration (a 1,000,000-byte player quota, no visualizer or artwork) this
  * is 1,000,000 + 111,552 held pass-through bytes (87 s at 1,024 B/s, plus 9 bursts of 8 time

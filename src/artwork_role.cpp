@@ -337,8 +337,7 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
     // clears a channel. There are no bytes to stage, so no buffer is claimed and the notification
     // travels with data_length == 0 (see ArtworkNotification).
     if (total_size == 0) {
-        complete =
-            ArtworkNotification{slot, 0, 0, timestamp, this->image_format(slot), 0, epoch, 0};
+        complete = ArtworkNotification{slot, 0, 0, timestamp, this->image_format(slot), epoch, 0};
         return TransferOutcome::COMPLETED;
     }
 
@@ -386,14 +385,12 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
         return TransferOutcome::ACCEPTED;
     }
 
-    // Bump this buffer's generation so a notification naming it from an earlier transfer is
-    // recognized as stale, then flip write_idx so the next transfer on this slot claims the
-    // other buffer and leaves this one to the decode thread.
-    sb.write_generation[write_idx]++;
+    // A notification naming this buffer from an earlier transfer is stale by the epoch bumped
+    // above. Flip write_idx so the next transfer on this slot claims the other buffer and leaves
+    // this one to the decode thread.
     sb.write_idx = write_idx ^ 1;
     this->transfer = ArtworkTransfer{.timestamp = timestamp,
                                      .total_size = total_size,
-                                     .generation = sb.write_generation[write_idx],
                                      .in_flight = true,
                                      .slot = slot,
                                      .buffer_idx = write_idx};
@@ -405,7 +402,7 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::append_part(uint8_t slot, 
                                                                   ArtworkNotification& complete) {
     // Hold the slot mutex across the whole read-modify-write, the memcpy included, so the decode
     // thread can never observe a buffer mid-write (torn image) and can never have a buffer stolen
-    // out from under it while it still owns the notification for that generation.
+    // out from under it while it still owns the notification for that epoch.
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     auto& t = this->transfer;
     // roles/artwork/v1.md "Artwork (Binary)": "a part received with no transfer in flight or on
@@ -437,7 +434,6 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::append_part(uint8_t slot, 
                                    t.total_size,
                                    t.timestamp,
                                    this->image_format(slot),
-                                   t.generation,
                                    this->slot_epochs[slot].load(std::memory_order_relaxed),
                                    0};
     t = ArtworkTransfer{};
@@ -513,8 +509,7 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 // Stream lifecycle (protocol task)
 // ============================================================================
 
-void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream,
-                                            uint32_t generation) {
+void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream) {
     if (stream.channels.has_value()) {
         const auto& server_channels = stream.channels.value();
         if (server_channels.size() != this->artwork_channels.size()) {
@@ -572,12 +567,6 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         // Protocol messages are serialized on the protocol task, so this runs before any of the
         // new stream's handle_binary() calls.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        // The stream is marked active inside this lock: cleanup() bumps the generation before
-        // taking the same lock to discard, so a teardown that overtook this handler is seen
-        // here, and one that lands afterwards clears what this sets.
-        if (!this->accepts(generation)) {
-            return;
-        }
         this->stream_active = true;
         const uint8_t changed = this->changed_channel_mask(stream);
         this->streamed_channels = stream.channels;
@@ -630,7 +619,8 @@ bool ArtworkRole::Impl::same_channel(const ServerArtworkChannelObject& a,
            a.height == b.height;
 }
 
-void ArtworkRole::Impl::handle_stream_end(uint32_t generation) {
+void ArtworkRole::Impl::handle_stream_end() {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     this->stream_active = false;
     this->discard_all_pending();
 
@@ -873,23 +863,18 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
     size_t decode_length = 0;
     {
         // Validate the notification is still current before touching the buffer: a newer
-        // transfer (epoch changed) or a newer write to the same buffer (write_generation
-        // changed) means this notification is stale and the bytes it names may have already
-        // been overwritten by the protocol task, or are about to be. A fresher notification
-        // for the same slot is already queued or has itself been parked.
+        // transfer, the only thing that writes the buffer again, moved the slot epoch on first,
+        // so this notification is stale and the bytes it names may have already been overwritten
+        // by the protocol task, or are about to be. A fresher notification for the same slot is
+        // already queued or has itself been parked.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
         auto& sb = this->drain_task->slot_buffers[slot];
 
         if (notif.epoch != this->slot_epochs[slot].load(std::memory_order_relaxed)) {
             return;
         }
-        if (!is_clear) {
-            if (notif.generation != sb.write_generation[buf_idx]) {
-                return;
-            }
-            if (sb.buffers[buf_idx].data() == nullptr) {
-                return;
-            }
+        if (!is_clear && sb.buffers[buf_idx].data() == nullptr) {
+            return;
         }
 
         // Ack gate: a slot with require_frame_done set allows only one un-acked delivery in
@@ -963,7 +948,7 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
         // Replay any parked notification whose slot's gate has reopened (ack_state back to
         // IDLE via frame_done() or an epoch-mismatch release in drain_events()).
         // process_notification() revalidates the notification itself, so a since-stale
-        // generation/epoch is simply skipped: correct, since a fresher notification is either
+        // epoch is simply skipped: correct, since a fresher notification is either
         // already queued or has itself been freshly parked. Loop until no parked slot is ready
         // so one wakeup can drain several slots without waiting on separate receive timeouts.
         while (true) {

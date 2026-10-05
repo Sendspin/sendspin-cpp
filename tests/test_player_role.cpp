@@ -269,8 +269,8 @@ TEST(PlayerAudioChunk, ShortChunkIsRejected) {
 }
 
 // ============================================================================
-// Teardown generation: every point of effect re-checks the generation the
-// receive gate captured
+// Teardown generation: handlers stamp what they queue with the generation the
+// dispatch loaded, and the drains and the sync task discard a stale stamp
 // ============================================================================
 
 namespace {
@@ -283,8 +283,8 @@ void bind_items(PlayerRole::Impl& impl, InboundRing& ring) {
 }
 
 // A PlayerRole::Impl whose item list is bound to a ring of its own but whose sync-task thread was
-// never started, bound to its own Inbox. Nothing drains the list or the inbox, so what a refused
-// handler did not do is directly observable; a running task would discard idle-time audio and
+// never started, bound to its own Inbox. Nothing drains the list or the inbox, so what a handler
+// queued, or did not, is directly observable; a running task would discard idle-time audio and
 // make the list say nothing either way. Heap-allocated with program lifetime (static deques,
 // mirroring make_impl() in test_visualizer_role.cpp): Impl holds atomics, so it is neither
 // copyable nor movable, and it keeps a raw SendspinClient* that must outlive it.
@@ -308,13 +308,8 @@ std::unique_ptr<PlayerRole::Impl> make_impl(InboundRing* ring = nullptr) {
     return impl;
 }
 
-// The generation the receive gate hands a handler on a role that has not been torn down.
-uint32_t live_generation(const PlayerRole::Impl& impl) {
-    return impl.cleanup_generation.load(std::memory_order_acquire);
-}
-
 // A stream/start player object the role can serve: PCM sends a synthesized codec header, so the
-// blocking header send succeeds and the handler reaches its post-send generation check.
+// blocking header send succeeds and the handler publishes the stream.
 ServerPlayerStreamObject pcm_stream_params() {
     ServerPlayerStreamObject params;
     params.codec = SendspinCodecFormat::PCM;
@@ -346,123 +341,13 @@ std::vector<uint8_t> audio_chunk(uint8_t marker = 0xDE, int64_t server_timestamp
 }
 
 // Hands one chunk to the role outside any ring item, as for a reassembled chunk.
-void hand_copied_chunk(PlayerRole::Impl& impl, std::vector<uint8_t> chunk, uint32_t generation) {
+void hand_copied_chunk(PlayerRole::Impl& impl, std::vector<uint8_t> chunk) {
     InboundMessage message = message_over(chunk);
-    impl.handle_binary(message, generation);
+    impl.handle_binary(message);
     take_in_ring_order(*impl.sync_task->inbound().ring());
 }
 
-// Drains the inbox and counts the player stream events and teardown markers it held.
-struct StreamEventCounts {
-    int starts{0};
-    int ends{0};
-    int cleared{0};
-};
-
-StreamEventCounts drain_stream_events(PlayerRole::Impl& impl) {
-    StreamEventCounts counts;
-    InboxEvent events[Inbox::EVENT_CAPACITY];
-    const size_t n = impl.inbox->take_events(events, Inbox::EVENT_CAPACITY);
-    for (size_t i = 0; i < n; ++i) {
-        if (events[i].type == InboxEventType::PLAYER_CLEARED) {
-            ++counts.cleared;
-            continue;
-        }
-        if (events[i].type != InboxEventType::PLAYER_STREAM) {
-            continue;
-        }
-        if (static_cast<PlayerStreamCallbackType>(events[i].code) ==
-            PlayerStreamCallbackType::STREAM_START) {
-            ++counts.starts;
-        } else {
-            ++counts.ends;
-        }
-    }
-    return counts;
-}
-
 }  // namespace
-
-// Every point of effect re-checks the generation the receive gate captured with the message,
-// because a teardown can land while the handler is still running: the codec-header send inside
-// handle_stream_start blocks for up to HEADER_SEND_TIMEOUT_MS, the widest such window, and the
-// header is written before the check, which is why the check has to exist rather than the send
-// being skipped. A stale handler that took effect would re-arm the sync task on a header with no
-// audio behind it, buffer audio for a stream the teardown already ended, or place a seek marker
-// in it.
-//
-// Each handler's effect is main-loop state that the role publishes rather than a callback, so the
-// inbox slots and the sync task's item list are read directly: with no main loop running there
-// is nothing a caller or peer can observe that distinguishes a refused handler from one that
-// never ran.
-TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
-    struct Row {
-        const char* name;
-        void (*drive)(PlayerRole::Impl&, uint32_t);
-        bool (*took_effect)(PlayerRole::Impl&);
-    };
-
-    const Row rows[] = {
-        {"stream/start",
-         [](PlayerRole::Impl& impl, uint32_t generation) {
-             impl.handle_stream_start(pcm_stream_params(), generation);
-         },
-         [](PlayerRole::Impl& impl) {
-             ServerPlayerStreamObject published;
-             uint32_t stamp = 0;
-             const bool published_params =
-                 impl.event_state->stream_params_slot.take(published, stamp);
-             const bool queued_start = drain_stream_events(impl).starts > 0;
-             if (published_params) {
-                 EXPECT_EQ(published.sample_rate.value_or(0), 44100u);
-             }
-             return published_params || queued_start;
-         }},
-        {"audio chunk",
-         [](PlayerRole::Impl& impl, uint32_t generation) {
-             hand_copied_chunk(impl, audio_chunk(), generation);
-         },
-         [](PlayerRole::Impl& impl) { return !impl.sync_task->inbound().items().is_empty(); }},
-        // stream/clear enqueues the marker that tells the sync task where the discarded pre-seek
-        // audio ends, so a stale one would place that boundary in an ended stream.
-        {"stream/clear",
-         [](PlayerRole::Impl& impl, uint32_t generation) { impl.handle_stream_clear(generation); },
-         [](PlayerRole::Impl& impl) { return !impl.sync_task->inbound().items().is_empty(); }},
-        {"server/command",
-         [](PlayerRole::Impl& impl, uint32_t generation) {
-             impl.handle_server_command(volume_command(70), generation);
-         },
-         [](PlayerRole::Impl& impl) {
-             ServerCommandMessage merged;
-             uint32_t stamp = 0;
-             if (!impl.event_state->command_slot.take(merged, stamp)) {
-                 return false;
-             }
-             EXPECT_TRUE(merged.player.has_value());
-             EXPECT_EQ(merged.player->volume.value_or(0), 70);
-             return true;
-         }},
-    };
-
-    for (const auto& row : rows) {
-        SCOPED_TRACE(row.name);
-        auto impl = make_impl();
-        const uint32_t captured = live_generation(*impl);
-
-        impl->cleanup();
-        ASSERT_EQ(drain_stream_events(*impl).cleared, 1) << "cleanup() queued no PLAYER_CLEARED";
-        ASSERT_TRUE(impl->sync_task->inbound().items().is_empty());
-
-        row.drive(*impl, captured);
-        take_in_ring_order(*impl->sync_task->inbound().ring());
-        EXPECT_FALSE(row.took_effect(*impl)) << "a stale message reached the main loop";
-
-        // Control: the same message with the generation the role now reports takes effect.
-        row.drive(*impl, live_generation(*impl));
-        take_in_ring_order(*impl->sync_task->inbound().ring());
-        EXPECT_TRUE(row.took_effect(*impl));
-    }
-}
 
 // roles/player/v1.md "Audio Chunks (Binary)": while the client is unavailable the player
 // discards incoming audio, whether availability changed before or after the role was added.
@@ -490,7 +375,7 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
         bind_items(impl, ring);
         client.set_available(row.available_on_arrival);
 
-        hand_copied_chunk(impl, audio_chunk(), live_generation(impl));
+        hand_copied_chunk(impl, audio_chunk());
         EXPECT_EQ(!impl.sync_task->inbound().items().is_empty(), row.queued);
     }
 }
@@ -538,8 +423,8 @@ std::vector<uint8_t> take_all(PlayerRole::Impl& impl) {
 
 // An audio chunk received into a ring item is decoded from that item: the sync task reads the
 // frame and the server timestamp where the transport wrote and the protocol task decrypted them.
-// A chunk outside any ring item (reassembled from Noise fragments, or replayed) is the one case
-// that is copied, into an item of its own.
+// A chunk outside any ring item (reassembled from Noise fragments, or received through the
+// fallback buffer) is the one case that is copied, into an item of its own.
 TEST(PlayerInboundHandOff, AChunkInARingItemIsDecodedInPlace) {
     struct Row {
         const char* name;
@@ -558,7 +443,7 @@ TEST(PlayerInboundHandOff, AChunkInARingItemIsDecodedInPlace) {
             row.in_ring_item ? receive_into_ring(ring, chunk, 7) : message_over(chunk, 7);
         const uint8_t* frame_in_message = message.data + 13;
 
-        impl->handle_binary(message, live_generation(*impl));
+        impl->handle_binary(message);
         take_in_ring_order(ring);
         EXPECT_EQ(message.item, nullptr) << "the role must take the item over, or never had one";
 
@@ -602,24 +487,23 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
         auto visualizer = make_visualizer(ring);
 
         InboundMessage first = receive_into_ring(ring, audio_chunk(0x01), 0);
-        player->handle_binary(first, live_generation(*player));
+        player->handle_binary(first);
         const size_t one_chunk = ring.quota(InboundHolder::PLAYER).outstanding();
         ASSERT_GT(one_chunk, 0U);
         ring.quota(InboundHolder::PLAYER).set_limit(row.player_quota_chunks * one_chunk);
 
         InboundMessage second = receive_into_ring(ring, audio_chunk(0x02), 0);
-        player->handle_binary(second, live_generation(*player));
+        player->handle_binary(second);
         if (row.header_and_marker) {
-            player->handle_stream_start(pcm_stream_params(), live_generation(*player));
-            player->handle_stream_clear(live_generation(*player));
+            player->handle_stream_start(pcm_stream_params());
+            player->handle_stream_clear();
             take_in_ring_order(ring);
         }
         EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(),
                   std::min<size_t>(row.player_items, row.player_quota_chunks) * one_chunk);
 
         InboundMessage frame = receive_into_ring(ring, loudness_frame(), 0);
-        visualizer->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, frame,
-                                  visualizer->cleanup_generation.load());
+        visualizer->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, frame);
         EXPECT_GT(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
             << "the player's quota stopped the visualizer";
         EXPECT_FALSE(visualizer->drain_task->inbound.items().is_empty());
@@ -650,13 +534,13 @@ TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
         auto impl = make_impl();
         InboundRing& ring = *impl->sync_task->inbound().ring();
         InboundMessage before = receive_into_ring(ring, audio_chunk(0x01), 0);
-        impl->handle_binary(before, live_generation(*impl));
+        impl->handle_binary(before);
         if (row.clear) {
-            impl->handle_stream_clear(live_generation(*impl));
+            impl->handle_stream_clear();
             take_in_ring_order(ring);
         }
         InboundMessage after = receive_into_ring(ring, audio_chunk(0x02), 0);
-        impl->handle_binary(after, live_generation(*impl));
+        impl->handle_binary(after);
 
         SyncContext context;
         impl->sync_task->discard_to_clear_marker(context);
@@ -665,21 +549,23 @@ TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
 }
 
 // A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and
-// the old stream's audio never plays: the protocol task's next tick recalls what the sync task has
-// not taken, returning it and its quota charge to the ring, and an item the sync task takes before
-// that tick is dropped by its generation stamp and returned the same way.
+// the old stream's audio never plays: cleanup() recalls what the sync task has not taken,
+// returning it and its quota charge to the ring, and an item the sync task takes between the
+// generation bump and the recall is dropped by its generation stamp and returned the same way.
+// That window has no observable trigger, so its row moves the generation on directly, leaving
+// the items listed.
 TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
+    enum class Teardown { NONE, CLEANUP, GENERATION_ONLY };
     struct Row {
         const char* name;
-        bool teardown;
-        bool recall_tick;
+        Teardown teardown;
         size_t listed_before_take;
         size_t delivered;
     };
     const Row rows[] = {
-        {"Control: no teardown", false, true, 2, 2},
-        {"torn down, recalled by the protocol task's tick", true, true, 0, 0},
-        {"torn down, taken by the sync task before the recall", true, false, 2, 0},
+        {"Control: no teardown", Teardown::NONE, 2, 2},
+        {"torn down, recalled by cleanup()", Teardown::CLEANUP, 0, 0},
+        {"taken by the sync task before the recall", Teardown::GENERATION_ONLY, 2, 0},
     };
 
     for (const Row& row : rows) {
@@ -688,13 +574,12 @@ TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
         InboundRing& ring = *impl->sync_task->inbound().ring();
         for (uint8_t marker : {0x01, 0x02}) {
             InboundMessage message = receive_into_ring(ring, audio_chunk(marker), 0);
-            impl->handle_binary(message, live_generation(*impl));
+            impl->handle_binary(message);
         }
-        if (row.teardown) {
+        if (row.teardown == Teardown::CLEANUP) {
             impl->cleanup();
-        }
-        if (row.recall_tick) {
-            impl->recall_stale_items(live_generation(*impl));  // the protocol task's tick
+        } else if (row.teardown == Teardown::GENERATION_ONLY) {
+            impl->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
         }
 
         EXPECT_EQ(impl->sync_task->inbound().items().is_empty(), row.listed_before_take == 0);
@@ -722,10 +607,10 @@ TEST(PlayerTeardownGeneration, ACommandStampedBeforeATeardownIsNotApplied) {
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        const uint32_t before = live_generation(*impl);
+        const uint32_t before = impl->cleanup_generation.load();
         impl->cleanup();
         impl->event_state->command_slot.write(volume_command(70),
-                                              row.stale ? before : live_generation(*impl));
+                                              row.stale ? before : impl->cleanup_generation.load());
 
         impl->drain_events();
 
@@ -735,10 +620,12 @@ TEST(PlayerTeardownGeneration, ACommandStampedBeforeATeardownIsNotApplied) {
 
 // roles/player/v1.md "client/hello player@v1 support object": the server fills buffer_capacity
 // with encoded frames, and each frame costs the quota its stored size in the inbound ring, so the
-// player advertises the share that holds frames at the smallest chunk size: two thirds of its
-// quota (a 160-byte frame stores in 232 bytes). The server's flow control is sized from this
-// number, so the share is spelled out rather than bounded.
-TEST(PlayerHello, AdvertisesTheShareOfItsQuotaThatHoldsEncodedFrames) {
+// player's advertisement starts from the share that holds frames at the smallest chunk size: two
+// thirds of its quota (a 160-byte frame stores in 232 bytes). The server's flow control is sized
+// from this number, so the share is spelled out rather than bounded. The hello advertises it
+// capped at the ring's largest item, which only a run has; ClientLifecycle's ring-size table
+// covers the capped value.
+TEST(PlayerHello, TheAdvertisedShareOfTheQuotaHoldsEncodedFrames) {
     struct Row {
         const char* name;
         size_t quota;
@@ -754,11 +641,7 @@ TEST(PlayerHello, AdvertisesTheShareOfItsQuotaThatHoldsEncodedFrames) {
         PlayerRoleConfig config = make_player_config();
         config.audio_buffer_capacity = row.quota;
         PlayerRole::Impl& impl = *client.add_player(std::move(config)).impl_;
-
-        ClientHelloMessage hello;
-        impl.build_hello_fields(hello);
-        ASSERT_TRUE(hello.player_v1_support.has_value());
-        EXPECT_EQ(hello.player_v1_support->buffer_capacity, row.advertised);
+        EXPECT_EQ(impl.buffer_capacity_share(), row.advertised);
     }
 }
 
@@ -857,7 +740,7 @@ TEST(PlayerRoleOutputDelay, SetOutputDelayCommandIsIgnoredUnlessAdvertised) {
         player_cmd.output_delay_ms = 300;
         ServerCommandMessage cmd;
         cmd.player = player_cmd;
-        impl->handle_server_command(cmd, live_generation(*impl));
+        impl->handle_server_command(cmd);
         impl->drain_events();
 
         EXPECT_EQ(listener.changes, adjustable ? std::vector<uint16_t>{300} : std::vector<uint16_t>{});

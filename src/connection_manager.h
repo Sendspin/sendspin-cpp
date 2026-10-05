@@ -27,8 +27,6 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -102,17 +100,6 @@ bool liveness_expired(int64_t now_us, uint32_t last_receive_us, int64_t timeout_
 /// @param timeout_us Liveness timeout in microseconds, positive.
 int64_t liveness_remaining_us(int64_t now_us, uint32_t last_receive_us, int64_t timeout_us);
 
-/// @brief Bound (milliseconds, per goodbye) on waiting for the shutdown goodbyes to be sent before
-/// the transports are torn down
-///
-/// The shutdown pass waits this long times the number of goodbyes still outstanding: on the ESP
-/// server path every goodbye is queued to the single httpd worker and handed to lwIP in turn, so a
-/// fixed bound would let the last of several peers lose its goodbye to the close. Per goodbye that
-/// is a few scheduler quanta for the worker to dequeue the frame; the host transports send
-/// synchronously, so the wait resolves before it starts. Send completion is best-effort, so this
-/// caps how long the shutdown blocks, never a guarantee the goodbye arrived.
-static constexpr uint32_t GOODBYE_FLUSH_TIMEOUT_MS = 50;
-
 /// @brief Interval (milliseconds) at which the protocol task re-checks a network that is not ready
 /// before starting the WebSocket server
 ///
@@ -121,70 +108,18 @@ static constexpr uint32_t GOODBYE_FLUSH_TIMEOUT_MS = 50;
 /// second is short beside the reconnect backoff of a server that found no listener.
 static constexpr uint32_t NETWORK_POLL_INTERVAL_MS = 1000;
 
-/// @brief Counts the goodbye sends the shutdown pass is waiting on
-///
-/// Shared by the shutdown pass and each connection's completion callback through a shared_ptr
-/// captured by value, so a late completion touches only this record. The mutex is a leaf: the
-/// completion runs on the transport's send context (the httpd worker on ESP, inline on host).
-struct GoodbyeWait {
-    void add_pending() {
-        std::lock_guard<std::mutex> lock(this->mutex);
-        ++this->pending;
-    }
-
-    void complete_one() {
-        {
-            std::lock_guard<std::mutex> lock(this->mutex);
-            if (this->pending > 0) {
-                --this->pending;
-            }
-        }
-        this->cv.notify_all();
-    }
-
-    /// @brief The registered goodbyes that have not completed yet
-    size_t outstanding() {
-        std::lock_guard<std::mutex> lock(this->mutex);
-        return this->pending;
-    }
-
-    /// @brief Blocks until every registered goodbye has completed, or `timeout_ms` elapses.
-    /// @return true if every goodbye completed, false if the bound elapsed first.
-    bool wait(uint32_t timeout_ms) {
-        std::unique_lock<std::mutex> lock(this->mutex);
-        return this->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                                 [this] { return this->pending == 0; });
-    }
-
-    std::mutex mutex;
-    std::condition_variable cv;
-    size_t pending{0};
-};
-
-/// @brief Progress of a nursery connection's client/hello
-enum class HelloStep : uint8_t {
-    AWAIT_NOISE,  ///< Not armed yet: the Noise handshake has not completed
-    SENDING,      ///< Armed: the next attempt is due at NurseryEntry::hello_due_us
-    /// Queued, refused by the transport, or out of attempts. Never re-armed: the close or the
-    /// establish deadline reaps a connection whose hello never completed.
-    DONE,
-};
-
 /// @brief A connection that has not completed the hello handshake
 ///
-/// The hello is armed once the connection's Noise handshake completes (the hello scan in
-/// ConnectionManager::scan_nursery()), so its send state lives here and leaves the nursery with
-/// the connection.
+/// The hello is sent once, by the hello scan in ConnectionManager::scan_nursery() that first sees
+/// the connection's Noise handshake complete, so whether it was attempted lives here and leaves
+/// the nursery with the connection.
 struct NurseryEntry {
-    static constexpr uint32_t INITIAL_HELLO_RETRY_DELAY_MS = 100U;  ///< First backoff delay
-    static constexpr uint8_t MAX_HELLO_ATTEMPTS = 3;                ///< Sends before giving up
-
     /// The only long-term owner, except for an ESP inbound connection, which its httpd session owns
     std::shared_ptr<SendspinConnection> conn;
-    int64_t hello_due_us{0};  ///< Next hello attempt; read only while SENDING
-    uint32_t hello_retry_delay_ms{INITIAL_HELLO_RETRY_DELAY_MS};  ///< Current backoff delay
-    HelloStep hello_step{HelloStep::AWAIT_NOISE};
-    uint8_t hello_attempts_left{MAX_HELLO_ATTEMPTS};
+    /// Whether the hello scan has made its one send attempt. Never cleared: a failed send drops
+    /// the connection, and the close or the establish deadline reaps one whose hello was skipped
+    /// (see ConnectionManager::send_hello_message()).
+    bool hello_attempted{false};
     /// Whether client/init went out: at once for an inbound connection, once the transport
     /// reports its WebSocket upgrade for an outbound one.
     bool client_init_sent{false};
@@ -193,7 +128,7 @@ struct NurseryEntry {
 /// @brief One admitted connection and the roles it owns
 ///
 /// Every role this client drives has at most one owner among the admitted connections: role
-/// dispatch, role-message routing (send_role_text()) and the client/state role objects all gate
+/// dispatch, role-message routing (role_send_target()) and the client/state role objects all gate
 /// on ownership rather than on admission alone. Protocol task only.
 struct AdmittedEntry {
     /// The admitted connection; null for a free slot.
@@ -334,10 +269,8 @@ public:
     /// do not overlap. These sites still assume one admitted connection and must be revisited
     /// first:
     /// - SendspinClient::cleanup_connection_state() resets the client-wide state (event ring,
-    ///   group, time-sync report, pairing notes, trust) only when the teardown covers every role,
+    ///   group, time-sync report, pairing notes) only when the teardown covers every role,
     ///   which is keyed on no remaining connection owning one.
-    /// - SendspinClient::current_trust_ is one value, overwritten by any connection's handshake
-    ///   and not recomputed for the survivors when one is dropped.
     /// - The time filter and server information slots follow primary() (the player's owner, else
     ///   the first admitted), so a role owned by another connection converts with the wrong clock.
     /// - group/update, leave() and get_server_information() are singular: they follow primary().
@@ -404,9 +337,9 @@ public:
     void close_admission();
 
     /// @brief The main-loop half of the shutdown, once the protocol task is joined: closes the
-    /// transports of every connection the shutdown pass took out of the slots and of every
-    /// connection still parked for reaping, stops the WebSocket server (joining its transport
-    /// threads), then releases those connections, whose destructors may join an outbound
+    /// transport of every connection still parked for reaping (the shutdown pass's disconnect()
+    /// closed the ones it took out of the slots), stops the WebSocket server (joining its
+    /// transport threads), then releases those connections, whose destructors may join an outbound
     /// transport thread. Main loop only.
     ///
     /// Blocks on the transports' own teardown: the host server joins every accepted connection
@@ -426,7 +359,9 @@ public:
 
     /// @brief Returns true if an admitted connection is connected, has completed its handshake
     /// and has its latest server/activate applied. Any thread: reads a flag the protocol task
-    /// refreshes at the end of every tick (refresh_published_state()).
+    /// raises only at the end of a tick (publish_connected()), after every handler of that tick
+    /// has run, so a reader that sees it true sees the tick's whole effect (the published slots
+    /// and the events it queued for the drain); refresh_published_state() lowers it at once.
     bool is_connected() const {
         return this->connected_.load(std::memory_order_acquire);
     }
@@ -490,15 +425,10 @@ public:
     /// @brief Sends client/leave to the primary admitted connection (SendspinClient::leave()).
     void leave();
 
-    /// @brief Sends a role message to the admitted connection that owns `role`
-    /// (SendspinClient::send_text(), and the controller commands
-    /// SendspinClient::send_controller_command() queues).
-    void send_role_text(SendspinRole role, const std::string& text) const;
-
     /// @brief The connection a role message goes to: the admitted, connected owner of `role`
     /// once its server/activate has arrived, or nullptr (logged) when the message must be dropped.
-    /// The gate send_role_text() applies, for a caller that builds the message only once it knows
-    /// it will be sent. Protocol task only.
+    /// The caller builds the message only once it knows it will be sent (the controller commands
+    /// SendspinClient::send_controller_command() queues). Protocol task only.
     SendspinConnection* role_send_target(SendspinRole role) const;
 
     /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window(), the operator
@@ -584,9 +514,16 @@ public:
     uint32_t run_time_sync();
 
     /// @brief Refreshes what other threads read without a protocol-task lock: the time filter and
-    /// server-information slots (from primary()) and the connected flag. Called at the end of
-    /// every tick and after every change to the admitted array.
+    /// server-information slots (from primary()), and lowers the connected flag when no admitted
+    /// connection is operational. Called at the end of every tick and after every change to the
+    /// admitted array.
     void refresh_published_state();
+
+    /// @brief Publishes the connected flag (is_connected()) as it stands, raising it as well as
+    /// lowering it. Called only at the end of the tick, after refresh_published_state(): raised
+    /// mid-handler it would read true before the tick's whole effect (the published slots and
+    /// the events queued for the drain) is in place.
+    void publish_connected();
 
     /// @brief Whether admission is open: false from close_admission() until the next start().
     bool is_accepting() const {
@@ -599,15 +536,9 @@ public:
     }
 
     /// @brief The shutdown pass: snapshots the pairing-UI flags, detaches every managed
-    /// connection, goodbyes each with reason shutdown, waits up to GOODBYE_FLUSH_TIMEOUT_MS per
-    /// goodbye still outstanding (accepts refused this tick included), empties the slots and
-    /// closes the pairing window. The connections are kept for finish_stop() to close and
-    /// release.
+    /// connection, empties the slots, closes the pairing window, and goodbyes and closes each
+    /// connection with reason shutdown. The connections are kept for finish_stop().
     void shutdown();
-
-    /// @brief Waits for the shutdown goodbyes issued since the last wait (the shutdown pass's,
-    /// and refuse_accept()'s), up to GOODBYE_FLUSH_TIMEOUT_MS per goodbye still outstanding.
-    void flush_shutdown_goodbyes();
 
     // ========================================
     // Protocol task: role ownership
@@ -628,6 +559,10 @@ public:
     /// owner of the player role, or the first admitted connection when no connection owns it.
     /// With MAX_ADMITTED 1 that is the admitted connection. nullptr when none is admitted.
     AdmittedEntry* primary();
+
+    /// @brief Whether an admitted connection is connected and operational: what is_connected()
+    /// publishes.
+    bool has_operational_connection() const;
 
     /// @brief The roles owned by every admitted connection but the one `except` holds (all of
     /// them for nullptr).
@@ -728,13 +663,11 @@ private:
                                         std::optional<SendspinGoodbyeReason> reason);
 
     /// @brief Refuses an accept queued before admission closed and taken after: goodbye with
-    /// reason shutdown, registered with the shutdown pass's bounded wait, and the connection kept
-    /// for finish_stop() to close.
+    /// reason shutdown and a close, and the connection kept for finish_stop().
     void refuse_accept(std::shared_ptr<SendspinConnection> conn);
 
-    /// @brief Goodbyes `conn` with reason shutdown, counted in the bounded wait
-    /// flush_shutdown_goodbyes() makes, and keeps it for finish_stop() to close. Its gate must
-    /// be detached.
+    /// @brief Goodbyes and closes `conn` with reason shutdown, and keeps it for finish_stop(). Its
+    /// gate must be detached.
     void goodbye_for_shutdown(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Detaches `conn`, sends `goodbye` if there is one or else closes a still-connected
@@ -754,12 +687,15 @@ private:
     // Hello handshake
     // ========================================
 
-    /// @brief Sends the hello message to a connection, returning true if no retry is needed.
-    /// @param remaining_attempts Number of send attempts remaining before giving up.
+    /// @brief Sends the hello message to a connection whose Noise handshake completed, and marks
+    /// it sent on success.
     /// @param conn The nursery connection to send the hello to.
-    /// @return True if done (sent or connection invalid), false if the send failed and should
-    /// retry.
-    bool send_hello_message(uint8_t remaining_attempts, SendspinConnection* conn);
+    /// @return False if the send failed on a connected transport, which the caller closes without
+    /// a goodbye and drops: the send nonce is spent by then unless the send buffer could not be
+    /// allocated, so neither a resend nor a goodbye could be decrypted. True otherwise, including a
+    /// transport that is not connected or that refuses the send as INVALID_STATE, which the close
+    /// or the establish deadline reaps.
+    bool send_hello_message(SendspinConnection* conn);
 
     // ========================================
     // Connection lifecycle
@@ -988,9 +924,9 @@ private:
     // Released outbound connections waiting for their transports to finish (see ReapEntry).
     // Protocol task, then the main loop's finish_stop() once the task is joined.
     InlineVector<ReapEntry, REAPING_CAPACITY> reaping_;
-    // Connections the shutdown pass took out of the slots, and accepts it refused, kept for
-    // finish_stop() to close and release. Written by the protocol task's shutdown pass, read on
-    // the main loop once the task is joined.
+    // Connections the shutdown pass took out of the slots, and accepts it refused, closed by
+    // their disconnect() and kept for finish_stop() to release. Written by the protocol task's
+    // shutdown pass, read on the main loop once the task is joined.
     std::vector<std::shared_ptr<SendspinConnection>> closing_;
 
     // Pointer fields
@@ -1002,9 +938,6 @@ private:
     // Created by the main loop's start() on first use; started there or by the protocol task,
     // ticked by the task, and stopped by finish_stop() once the task is joined.
     std::unique_ptr<SendspinWsServer> ws_server_;
-    // The bounded wait of the shutdown goodbyes not yet waited for; null once they were waited
-    // for, so a goodbye that never completes is waited for once. Protocol task only.
-    std::shared_ptr<GoodbyeWait> shutdown_wait_;
 
     // String fields
     /// server_id of the last-played server; nullopt if unset. Written on the main loop by
@@ -1052,8 +985,8 @@ private:
     /// task, which refuses every accept and runs the shutdown pass once it reads false.
     std::atomic<bool> accepting_{false};
 
-    /// What is_connected() reports. Written by the protocol task (refresh_published_state()),
-    /// read from any thread.
+    /// What is_connected() reports. Written by the protocol task (raised by publish_connected(),
+    /// lowered by refresh_published_state() too), read from any thread.
     std::atomic<bool> connected_{false};
 
     /// @brief What other threads read of the primary admitted connection, written together

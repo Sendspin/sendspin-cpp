@@ -70,13 +70,6 @@ std::vector<uint8_t> make_image(uint8_t marker, size_t length) {
     return image;
 }
 
-// The generation the receive gate hands a handler on a role that has not been torn down. The
-// dispatch captures it with the gate check and every point of effect re-checks it, so a unit test
-// driving a handler directly passes the live one.
-uint32_t live_generation(const ArtworkRole::Impl& impl) {
-    return impl.cleanup_generation.load(std::memory_order_acquire);
-}
-
 // Returns what handle_binary() reported: false means the message is a protocol error and the
 // connection must be closed.
 bool feed(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t>& body) {
@@ -376,28 +369,12 @@ void wait_slot_state(ArtworkRole::Impl& impl, Pred pred) {
 // (roles/artwork/v1.md "Server -> Client: Artwork (Binary)")
 // ============================================================================
 
-// A teardown that lands after the receive gate admitted a stream/start, while the handler is
-// still running, invalidates it: the generation the dispatch captured no longer matches.
-TEST(ArtworkStreamStart, RefusesAGenerationATeardownOvertook) {
-    auto impl = make_impl(make_single_slot_config(false));
-    const uint32_t captured = live_generation(*impl);
-
-    impl->cleanup();
-
-    impl->handle_stream_start(ServerArtworkStreamObject{}, captured);
-    EXPECT_FALSE(impl->stream_active.load()) << "a stopped role was re-armed by a stale handler";
-
-    // Control: the same stream/start with the generation the role now reports is applied.
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
-    EXPECT_TRUE(impl->stream_active.load());
-}
-
 TEST(ArtworkTransfer, AnnounceThenPartsCompletesOneImage) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "The concatenated data of all parts is the encoded image": the decoded bytes must be the
     // image in order, which a part written at the wrong offset or a dropped part would break.
@@ -419,7 +396,7 @@ TEST(ArtworkTransfer, TransferDeliversNothingUntilItCompletes) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     const std::vector<uint8_t> image = make_image('A', 100);
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
@@ -438,7 +415,7 @@ TEST(ArtworkTransfer, EmptyImageCompletesAtItsAnnounce) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "An announce with total_size 0 completes immediately, with no parts": nothing is left in
     // flight, so the next announce is a legal one rather than the malformed sequence it would be
@@ -455,7 +432,7 @@ TEST(ArtworkTransfer, CancelAbandonsTheTransferInFlight) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
     ASSERT_TRUE(feed(*impl, 0, part_body(make_image('A', 60))));
@@ -478,7 +455,7 @@ TEST(ArtworkTransfer, CancelDiscardsThePendingImage) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // A complete image whose display has not been drained yet is the channel's pending image, and
     // "it discards the channel's pending image", so the display must never fire.
@@ -502,7 +479,7 @@ TEST(ArtworkTransfer, AnnounceDiscardsThePendingImage) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "An announce discards that channel's pending image": A is complete but not yet displayed,
     // so B's announce must leave only B to be displayed. The gated slot is what makes the
@@ -531,7 +508,7 @@ TEST(ArtworkTransfer, AnnounceTimestampIsReadAsSignedBigEndian) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // The gated slot holds the first delivery un-acked, so the second image's notification parks
     // where the test can read it. A negative value pins the sign as well as the byte order.
@@ -555,7 +532,7 @@ TEST(ArtworkMalformedSequence, AnnounceWhileATransferIsInFlightCloses) {
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
     // "At most one image transfer is in flight at a time across all of the role's channels", so
@@ -569,7 +546,7 @@ TEST(ArtworkMalformedSequence, AnnounceAfterTheTransferCompletesIsAccepted) {
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Control for AnnounceWhileATransferIsInFlightCloses: the same two announces, with the first
     // transfer finished in between, are both legal.
@@ -583,7 +560,7 @@ TEST(ArtworkMalformedSequence, PartWithNoTransferInFlightCloses) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     EXPECT_FALSE(feed(*impl, 0, part_body(make_image('A', 20))));
 }
@@ -593,7 +570,7 @@ TEST(ArtworkMalformedSequence, PartOnAnotherChannelCloses) {
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
     EXPECT_FALSE(feed(*impl, 1, part_body(make_image('A', 20))));
@@ -604,7 +581,7 @@ TEST(ArtworkMalformedSequence, PartPastTotalSizeCloses) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
     ASSERT_TRUE(feed(*impl, 0, part_body(make_image('A', 60))));
@@ -617,7 +594,7 @@ TEST(ArtworkMalformedSequence, PartThatExactlyFillsTheImageIsAccepted) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Control for PartPastTotalSizeCloses: one byte fewer is the last part of a complete image.
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
@@ -651,7 +628,7 @@ TEST(ArtworkMalformedMessage, MessageShorterThanTwoBytesCloses) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // A message of just its type byte: nothing is left once the caller strips it.
     const uint8_t* no_body = nullptr;
@@ -665,7 +642,7 @@ TEST(ArtworkMalformedMessage, AnnounceThatIsNotFourteenBytesCloses) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     std::vector<uint8_t> short_announce = announce_body(1, 20);
     short_announce.pop_back();
@@ -684,7 +661,7 @@ TEST(ArtworkMalformedMessage, CancelWithABodyCloses) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     EXPECT_FALSE(feed(*impl, 0, {FLAG_CANCEL, 0x00}));
     // Control: the same cancel without the trailing byte.
@@ -696,7 +673,7 @@ TEST(ArtworkMalformedMessage, ReservedFlagBitsClose) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "Bits 2-7 are reserved and MUST be zero", on every message shape.
     for (int bit = 2; bit < 8; ++bit) {
@@ -719,7 +696,7 @@ TEST(ArtworkMalformedMessage, CancelAndAnnounceFlagsTogetherClose) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     std::vector<uint8_t> both = announce_body(1, 0);
     both[0] = FLAG_ANNOUNCE | FLAG_CANCEL;
@@ -733,7 +710,7 @@ TEST(ArtworkMalformedMessage, MessagePastTheSizeCapCloses) {
     auto impl = make_impl(make_large_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "An artwork message MUST NOT exceed 65519 bytes": a part carries at most 65517 data bytes.
     constexpr size_t MAX_PART_DATA = 65519 - 2;
@@ -768,7 +745,7 @@ TEST(ArtworkImageCap, ImageOverTheCapIsDiscardedAndItsSequenceTracked) {
     auto impl = make_impl(make_capped_slot_config(SMALL_IMAGE_CAP));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // "clients discarding image data MUST still process announces and cancels and count each
     // part's data bytes toward total_size": the transfer runs to its end holding nothing, so the
@@ -797,7 +774,7 @@ TEST(ArtworkImageCap, AnUnsetBudgetIsTheDocumentedDefault) {
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(send_image(*impl, 0, make_image('A', DEFAULT_CAP + 1), /*parts=*/3));
     EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW))
@@ -815,7 +792,7 @@ TEST(ArtworkImageCap, RoleWithNoListenerHoldsNothing) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(false));
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Nowhere to deliver an image, so the role takes the discarding path rather than allocating
     // a buffer for it, while still following the transfer to its end. Not holding the image is
@@ -839,7 +816,7 @@ TEST(ArtworkImageCap, ChannelTheRoleDidNotConfigureHoldsNothing) {
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Channel 2 was never declared in client/state, so the role holds no image for it and does
     // not close on its arrival either.
@@ -915,7 +892,7 @@ TEST(ArtworkStreamStart, PendingImagesSurviveOnlyUnchangedChannels) {
         auto impl = make_impl(make_two_ungated_slot_config());
         impl->listener = &listener;
         ASSERT_TRUE(impl->start());
-        impl->handle_stream_start(two_channel_stream(100, 100), live_generation(*impl));
+        impl->handle_stream_start(two_channel_stream(100, 100));
 
         size_t decoded = 0;
         for (const uint8_t slot : row.pending_slots) {
@@ -924,7 +901,7 @@ TEST(ArtworkStreamStart, PendingImagesSurviveOnlyUnchangedChannels) {
             ++decoded;
         }
 
-        impl->handle_stream_start(row.restart, live_generation(*impl));
+        impl->handle_stream_start(row.restart);
 
         if (row.display_survives) {
             poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
@@ -955,12 +932,12 @@ TEST(ArtworkStreamStart, TransferInFlightSurvivesOnlyAnUnchangedChannel) {
         auto impl = make_impl(make_two_ungated_slot_config());
         impl->listener = &listener;
         ASSERT_TRUE(impl->start());
-        impl->handle_stream_start(two_channel_stream(100, 100), live_generation(*impl));
+        impl->handle_stream_start(two_channel_stream(100, 100));
 
         const std::vector<uint8_t> image = make_image('A', 100);
         ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
         ASSERT_TRUE(feed(*impl, 0, part_body({image.begin(), image.begin() + 60})));
-        impl->handle_stream_start(row.restart, live_generation(*impl));
+        impl->handle_stream_start(row.restart);
 
         // The rest of the image is a valid part only while its transfer is still in flight.
         EXPECT_EQ(feed(*impl, 0, part_body({image.begin() + 60, image.end()})),
@@ -986,13 +963,13 @@ void expect_transfer_dropped_by(const std::function<void(ArtworkRole::Impl&)>& e
     auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
     ASSERT_TRUE(feed(*impl, 0, part_body(make_image('A', 60))));
 
     end_the_stream(*impl);
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     EXPECT_TRUE(send_image(*impl, 0, make_image('B', 40)));
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1014,10 +991,10 @@ TEST(ArtworkTransfer, EveryEndOfTheStreamDropsTheTransferInFlight) {
         std::function<void(ArtworkRole::Impl&)> end_the_stream;
     };
     const Row rows[] = {
-        {"stream/end", [](ArtworkRole::Impl& impl) { impl.handle_stream_end(live_generation(impl)); }},
+        {"stream/end", [](ArtworkRole::Impl& impl) { impl.handle_stream_end(); }},
         {"a new stream/start",
          [](ArtworkRole::Impl& impl) {
-             impl.handle_stream_start(ServerArtworkStreamObject{}, live_generation(impl));
+             impl.handle_stream_start(ServerArtworkStreamObject{});
          }},
         {"a disconnect", [](ArtworkRole::Impl& impl) { impl.cleanup(); }},
     };
@@ -1041,7 +1018,7 @@ TEST(ArtworkFrameDoneGate, GateHoldsSecondFrame) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1064,7 +1041,7 @@ TEST(ArtworkFrameDoneGate, GateHoldsThroughDisplay) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1087,7 +1064,7 @@ TEST(ArtworkFrameDoneGate, SupersedeKeepsNewestParked) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1126,7 +1103,7 @@ TEST(ArtworkFrameDoneGate, ClearIsADeliveryAndDropsParked) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1150,7 +1127,7 @@ TEST(ArtworkFrameDoneGate, ClearIsADeliveryAndDropsParked) {
         << "another image was decoded; decodes: " << listener.decode_count();
 
     // A fresh stream's frame decodes normally: the gate is IDLE again.
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
     send_frame(*impl, 0, 'C');
     listener.wait_until([&] { return listener.decodes.size() >= 2; });
     EXPECT_EQ(listener.decode_marker_at(1), 'C');
@@ -1161,7 +1138,7 @@ TEST(ArtworkFrameDoneGate, ClearGateHoldsNextStreamFirstFrame) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1171,7 +1148,7 @@ TEST(ArtworkFrameDoneGate, ClearGateHoldsNextStreamFirstFrame) {
     impl->handle_stream_ring_event(ArtworkEventType::STREAM_END);
     listener.wait_until([&] { return listener.clears.size() >= 1; });
 
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
     send_frame(*impl, 0, 'B');
     EXPECT_TRUE(
         listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
@@ -1207,7 +1184,7 @@ TEST(ArtworkChannelClear, EmptyPayloadFiresExactlyOneClear) {
         auto impl = make_impl(make_single_slot_config(false));
         impl->listener = &listener;
         ASSERT_TRUE(impl->start());
-        impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+        impl->handle_stream_start(ServerArtworkStreamObject{});
 
         if (row.display_a_frame_first) {
             send_frame(*impl, 0, 'A');
@@ -1235,7 +1212,7 @@ TEST(ArtworkChannelClear, ClearOnlyAffectsItsOwnSlot) {
     auto impl = make_impl(make_two_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Slot 1 (ungated) is cleared; slot 0 (gated) must be left alone entirely: a stream-level
     // clear fires for every configured slot, a per-channel clear for exactly one.
@@ -1257,7 +1234,7 @@ TEST(ArtworkChannelClear, GatedClearParksBehindUnackedFrame) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1286,7 +1263,7 @@ TEST(ArtworkChannelClear, GatedClearOwesExactlyOneAck) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_clear(*impl, 0);
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
@@ -1310,7 +1287,7 @@ TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1344,7 +1321,7 @@ TEST(ArtworkChannelClear, StreamEndOnTopOfUnackedChannelClearFiresAgain) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // A per-channel clear is delivered and left un-acked, e.g. the consumer is running a fade-out.
     send_clear(*impl, 0);
@@ -1358,7 +1335,7 @@ TEST(ArtworkChannelClear, StreamEndOnTopOfUnackedChannelClearFiresAgain) {
 
     // Superseded, not stacked: exactly one ack is owed for the two clears, so a single frame_done()
     // releases the gate for the next stream's first frame.
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
     send_frame(*impl, 0, 'A');
     EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW))
         << "an image was decoded; decodes: " << listener.decode_count();
@@ -1394,7 +1371,7 @@ TEST(ArtworkFrameDoneGate, FrameDoneNoOpWhenIdle) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Nothing outstanding: both calls must be safe no-ops (including the out-of-range slot).
     impl->frame_done(0);
@@ -1414,13 +1391,13 @@ TEST(ArtworkFrameDoneGate, RestartReleasesUndisplayedDecode) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
     // Deliberately never call drain_events() here: A's display must never fire.
 
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));  // restart
+    impl->handle_stream_start(ServerArtworkStreamObject{});  // restart
 
     // Give the decode thread's async display hand-off a chance to land, then confirm the restart
     // (its epoch bump) keeps it from ever reaching the listener.
@@ -1440,13 +1417,13 @@ TEST(ArtworkFrameDoneGate, RestartKeepsPresentedGate) {
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
     poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
 
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));  // restart; PRESENTED stays armed
+    impl->handle_stream_start(ServerArtworkStreamObject{});  // restart; PRESENTED stays armed
 
     send_frame(*impl, 0, 'B');
     EXPECT_TRUE(
@@ -1502,7 +1479,7 @@ TEST(ArtworkRestart, StopDiscardsQueuedFramesAndStartDecodesNewOnes) {
     auto impl = make_impl(make_two_ungated_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });  // Thread parked in A
@@ -1536,7 +1513,7 @@ TEST(ArtworkFrameDoneGate, FrameDoneReentrantFromDisplay) {
     listener.impl = impl.get();
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // Each image is displayed before the next is announced, so neither is discarded as the
     // other's pending image: both must decode and display on the reentrant ack alone, with no
@@ -1562,7 +1539,7 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
     auto impl = make_impl(make_two_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+    impl->handle_stream_start(ServerArtworkStreamObject{});
 
     // wait_until()'s predicate runs under RecordingListener::mutex (via condition_variable's
     // predicate overload), so it must touch listener.decodes directly rather than going through
@@ -1583,7 +1560,7 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
 
     // Slot 1 keeps decoding every frame freely, ungated by slot 0's outstanding delivery. Each
     // send waits for its own decode before the next is sent: slot 1 is double-buffered like any
-    // other slot (see SlotBuffer::write_generation), so three back-to-back writes with nothing
+    // other slot (see SlotBuffer), so three back-to-back writes with nothing
     // draining them could legitimately overwrite an unclaimed buffer and drop a frame: a
     // real (and separately-covered) property of the double-buffering scheme, not of the ack
     // gate this test is about, so it must not be exercised here.
@@ -1847,7 +1824,7 @@ TEST(ArtworkDisplayHandOff, ADisplayStampedBeforeATeardownIsNotShown) {
         auto impl = make_impl(make_single_slot_config(false));
         RecordingListener listener;
         impl->listener = &listener;
-        const uint32_t before = live_generation(*impl);
+        const uint32_t before = impl->cleanup_generation.load();
         impl->cleanup();
         ArtworkDisplayUpdate delta{};
         delta.timestamps[0] = 1;
@@ -1855,7 +1832,7 @@ TEST(ArtworkDisplayHandOff, ADisplayStampedBeforeATeardownIsNotShown) {
         delta.valid_mask = 0x01;
         impl->event_state->display_slot.merge(ArtworkRole::Impl::merge_artwork_display_update,
                                               std::move(delta),
-                                              row.stale ? before : live_generation(*impl));
+                                              row.stale ? before : impl->cleanup_generation.load());
 
         impl->drain_events();
 

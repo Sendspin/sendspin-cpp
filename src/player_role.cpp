@@ -254,6 +254,7 @@ bool PlayerRole::Impl::start(SendspinPersistenceProvider* persistence, InboundRi
     }
 
     this->persistence = persistence;
+    this->largest_ring_item_bytes = ring->max_item_message_bytes();
     this->load_output_delay();
 
     // A player with no listener has nowhere to write audio, so the sync task is not started and
@@ -285,7 +286,7 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::PLAYER);
 
     // Advertise the share of the quota that holds encoded frames at the smallest frame size, so
-    // the server's fill never overruns the quota
+    // the server's fill never overruns the quota, capped so its longest chunk fits one ring item
     PlayerSupportObject player_support = {
         .supported_formats = this->config.audio_formats,
         .buffer_capacity = this->advertised_buffer_capacity(),
@@ -293,9 +294,18 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.player_v1_support = std::move(player_support);
 }
 
-size_t PlayerRole::Impl::advertised_buffer_capacity() const {
+size_t PlayerRole::Impl::buffer_capacity_share() const {
     return this->config.audio_buffer_capacity * (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
            AUDIO_BUFFER_ADVERTISE_DENOMINATOR;
+}
+
+size_t PlayerRole::Impl::advertised_buffer_capacity() const {
+    // roles/player/v1.md "Player Buffer Accounting" lets the server send one chunk as long as the
+    // advertised capacity. One longer than a Noise frame arrives in fragments and is copied whole
+    // into a ring item (handle_binary()), which the ring's largest item bounds; with a large quota
+    // that bound is below the share (about 621 KB against 666,666 bytes by default), so the
+    // advertisement stops there rather than the ring growing for a chunk no stream needs.
+    return std::min(this->buffer_capacity_share(), this->largest_ring_item_bytes);
 }
 
 void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
@@ -329,10 +339,8 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
                       .audio_len = len - AUDIO_CHUNK_HEADER_SIZE};
 }
 
-SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t generation) {
-    if (!this->accepts(generation)) {
-        return;
-    }
+SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
     if (!chunk.has_value()) {
         SS_LOGW(TAG, "Binary message too short for the audio chunk header");
@@ -362,8 +370,9 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t ge
         // through the fallback buffer (longer than the ring takes) is not in a ring item: copied
         // into one, whole, so its timestamp stays at plaintext bytes 1-8. No wait: audio over a
         // full ring is dropped, like audio over the quota. A chunk longer than the ring's largest
-        // item (half the storage) can never be copied in, which is a sizing fact, not a full
-        // ring, and is logged apart so a device log tells the two apart.
+        // item (half the storage) can never be copied in; only a server over the capacity the
+        // role advertises (advertised_buffer_capacity()) sends one, which is not a full ring, and
+        // it is logged apart so a device log tells the two apart.
         if (message.len > inbound.ring()->max_item_message_bytes()) {
             inbound.note_drop("received an audio chunk longer than the ring's largest item; "
                               "dropping");
@@ -382,8 +391,8 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message, uint32_t ge
                     static_cast<uint32_t>(chunk->audio_len), generation);
 }
 
-void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj,
-                                           uint32_t generation) {
+void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
     // This stream's ordinal: hand_item() numbers its codec header with the same
     // stream_ordinal + 1 and its STREAM_START carries it, so the sync task starts it only on its
@@ -433,33 +442,23 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     }
     this->stream_ordinal = ordinal;
 
-    // The codec-header write above waits up to HEADER_SEND_TIMEOUT_MS for ring space, which is the
-    // widest window a teardown can land in between the receive gate and this publication. One
-    // that did land has already ended the stream and queued its own STREAM_END, so publishing
-    // here would re-arm the sync task on the header just written with nothing behind it (the
-    // sync task discards that header too: it carries the generation the teardown left behind).
-    if (!this->accepts(generation)) {
-        return;
-    }
-
     // Write stream params to the inbox slot for the main thread, then signal. The high-performance
     // acquire for playback happens when the main loop drains the STREAM_START event, keeping
     // high_performance_requested_for_playback main-thread-only. Both carry `generation`, so a
-    // teardown that lands between the two Inbox writes (stop()'s, on the main loop) leaves a
-    // START the drain discards and params it never applies (see drain_events()).
+    // teardown that runs before the drain takes them leaves a START the drain discards and params
+    // it never applies (see drain_events()).
     this->event_state->stream_params_slot.write(player_obj, generation);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation, ordinal);
 }
 
-void PlayerRole::Impl::handle_stream_end(uint32_t generation) const {
+void PlayerRole::Impl::handle_stream_end() const {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     this->sync_task->signal_stream_end(this->stream_ordinal);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation, 0);
 }
 
-void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
-    if (!this->accepts(generation)) {
-        return;
-    }
+void PlayerRole::Impl::handle_stream_clear() {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // stream/clear is a seek within the active stream: the server flushes our buffered audio and
     // immediately resumes sending new audio with the same codec/params (no new stream/start). Tell
     // the sync task to discard buffered audio, then append a marker so it knows exactly where the
@@ -475,11 +474,8 @@ void PlayerRole::Impl::handle_stream_clear(uint32_t generation) {
     }
 }
 
-void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
-                                             uint32_t generation) const {
-    if (!this->accepts(generation)) {
-        return;
-    }
+void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) const {
+    const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     if (!cmd.player.has_value()) {
         SS_LOGV(TAG, "Server command has no player commands");
         return;
@@ -684,6 +680,10 @@ void PlayerRole::Impl::cleanup() {
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
+    // Return the items the sync task has not taken; one it takes before this carries the earlier
+    // stamp, which its take() discards.
+    this->sync_task->inbound().recall();
+
     // End the current stream: the sync task drains and returns to idle. (Not signal_stream_clear():
     // that path is a seek within a live stream and expects a marker to follow.)
     this->sync_task->signal_stream_end(this->stream_ordinal);
@@ -718,10 +718,6 @@ void PlayerRole::Impl::complete_teardown() {
 // ============================================================================
 // Impl: Helpers
 // ============================================================================
-
-void PlayerRole::Impl::recall_stale_items(uint32_t generation) const {
-    this->sync_task->inbound().recall_stale(generation);
-}
 
 bool PlayerRole::Impl::hand_item(void* item, size_t item_len, ChunkType chunk_type,
                                  uint8_t data_offset, uint32_t data_len,

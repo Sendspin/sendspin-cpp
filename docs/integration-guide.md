@@ -742,11 +742,11 @@ client.stop();
 
 ## Stopping and Restarting
 
-`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer (a peer whose WebSocket upgrade completes after `stop()` has begun is closed without one), waits up to a short bound (50 ms per peer) for those sends to complete, then closes the server and every connection regardless, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
+`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer and closes each connection right behind its goodbye (a peer whose WebSocket upgrade completes after `stop()` has begun is closed without one). It does not wait for a queued goodbye to be written: the host transports and the ESP outbound connection send synchronously, and the ESP server writes each queued goodbye before the close queued behind it. It then closes the server and every connection still open, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
 
 Restarting is `start()` again; start, stop, and start again can be repeated indefinitely, and a restarted client begins with no connection, no group state, and no role state from before the stop.
 
-`stop()` may block, but the wait is bounded. Besides the goodbye bound it includes:
+`stop()` may block, but the wait is bounded. It includes:
 
 - The transports' own close. The host server joins every accepted connection thread; a WebSocket peer completes its close handshake within about 300 ms, but a raw socket that connected and never completed the upgrade holds the join for the full 3 s handshake timeout. The ESP server waits for the httpd task to exit, which polls at 100 ms and first finishes any queued send, which can take up to httpd's send timeout for a peer that has stopped reading.
 - An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`) and, for a connection whose upgrade is still in flight, can last up to the transport's connect and handshake timeout: 30 s on host (`SendspinClientConnection::HANDSHAKE_TIMEOUT_SECS`, the nursery's establish window), and on ESP esp_websocket_client's `network_timeout_ms` (10 s, `SendspinClientConnection::NETWORK_TIMEOUT_MS`) for each of the connect's three steps (TCP connect, upgrade request, its response), plus the DNS lookup before them, which lwIP's resolver bounds at 7 s per configured DNS server (3 servers by default, so about 21 s). That includes an attempt released earlier by `disconnect()` or a replacing `connect_to()` whose transport has not finished yet.
@@ -758,7 +758,7 @@ Listener callbacks fire from inside `stop()`, after every role and the group sta
 
 `on_request_high_performance()` and `on_release_high_performance()` fire from the main loop with no internal lock held, and their bodies should only toggle the platform networking mode rather than calling back into the client or a role. A time burst waits for the request to have been delivered before it sends its first time message, so a main loop that stalls delays the next clock measurement rather than measuring it in power-save mode; a release is never delayed that way.
 
-Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no role teardown or clear callback; the only listener call is `on_release_high_performance()`, once for each hold the main loop granted and has not released. A request the main loop never delivered is dropped unheard, so the listener never sees a release without its request. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
+Destroying a running client performs the transport half of `stop()` (goodbye, close, join) and dispatches no role teardown or clear callback; the only listener call is `on_release_high_performance()`, once for each hold the main loop granted and has not released. A request the main loop never delivered is dropped unheard, so the listener never sees a release without its request. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
 
 ## Encryption and Pairing
 
@@ -923,7 +923,8 @@ Pairing an already-connected server therefore delivers the callback twice: once 
 `ConnectionTrust::NONE` at admission, then again with `ConnectionTrust::USER` once the
 post-pairing rekey completes. Connections that are rejected (e.g., an unpaired server
 declaring playback or active roles while unpaired access is disabled) do not fire this
-callback.
+callback. The last reported trust describes the connection only while `is_connected()` is
+true: a disconnect fires no `on_trust_changed`.
 
 ### Unpaired Access
 
@@ -995,7 +996,7 @@ controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .o
 
 Fields that do not match the command are ignored when the message is serialized. The client drops, with a warning, a command missing from the latest controller state's `supported_commands`, and one without the field it requires (`volume` in 0-100, `muted`, `position_ms`, `offset_ms`); gate your UI on `supported_commands` so such calls are not made. The server clamps seeks to the seekable range.
 
-A command is sent only to the admitted connection that owns the controller role, and only while the server has `controller@v1` among that connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. `send_command()` checks the command against `supported_commands` and its parameter on the calling thread, then queues the command itself to the protocol task, which formats the `client/command`, applies the gate and sends it. It returns `false` for a command it drops itself (not in `supported_commands`, or a missing parameter) and when the request never reached the task: the client is not running, or the request queue is full. A consumer that formats its own role message hands it to `SendspinClient::send_text()` with the role family (`"controller"`), which is queued and gated the same way and returns `false` for the same reasons, or when the family names no role; the client's own messages do not use it. The queue holds a small fixed burst of consumer requests (eight, shared by controller commands, `send_text()`, `connect_to()`, `disconnect()`, `leave()`, the pairing-window gestures and unpaired-access changes), so a control that fires faster than the protocol task drains it, such as a rotary encoder sending a volume step per detent, sees `send_command()` return `false` and should coalesce and retry. A `false` for an unsupported command or a missing parameter is not one a retry can fix: retry only on a full queue, and gate the UI on `supported_commands` for the rest. `true` means queued, not sent.
+A command is sent only to the admitted connection that owns the controller role, and only while the server has `controller@v1` among that connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. `send_command()` checks the command against `supported_commands` and its parameter on the calling thread, then queues the command itself to the protocol task, which formats the `client/command`, applies the gate and sends it. A command validated against an owner that was replaced before the protocol task handled it is dropped there, since the new owner never offered it. It returns `false` for a command it drops itself (not in `supported_commands`, or a missing parameter) and when the request never reached the task: the client is not running, or the request queue is full. The queue holds a small fixed burst of controller commands (eight; `connect_to()`, `disconnect()`, `leave()`, the pairing-window gestures and unpaired-access changes never take a slot and are never refused), so a control that fires faster than the protocol task drains it, such as a rotary encoder sending a volume step per detent, sees `send_command()` return `false` and should coalesce and retry. A `false` for an unsupported command or a missing parameter is not one a retry can fix: retry only on a full queue, and gate the UI on `supported_commands` for the rest. `true` means queued, not sent.
 
 ## Accessing Roles
 
@@ -1056,7 +1057,8 @@ the server may still take the client over for new playback.
 Leaving is only meaningful while the group is playing; a client in a stopped group keeps its
 grouping by staying. The call needs an admitted connection that has received its first
 `server/activate`, and is ignored (with a log) otherwise. It may be called from any thread: the
-request is queued to the protocol task.
+request is posted to the protocol task, which never refuses it, and calls before the task takes
+it send one `client/leave`.
 
 ### Reporting Unavailability
 
@@ -1083,7 +1085,6 @@ The client and roles expose query methods for polling state in your main loop or
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
 const GroupUpdateObject& group = client.get_group_state();   // Group id, name, playback state (all optional)
-ConnectionTrust trust = client.get_current_trust();          // Active connection's trust; NONE when no connection is active or the handshake has not completed
 
 // Player state
 uint8_t vol = player.get_volume();
@@ -1131,12 +1132,22 @@ called from any thread and must be cheap and non-blocking.
 
 `SendspinClient::send_controller_command()` is callable from any thread too, but it is the controller role's own route to the protocol task and assumes the role's checks already ran: call `ControllerRole::send_command()` instead.
 
-Callable from any thread: `connect_to()`, `disconnect()`, `leave()`, `send_text()`,
+Callable from any thread: `connect_to()`, `disconnect()`, `leave()`,
 `confirm_pairing_window()`, `cancel_pairing_window()`, `set_unpaired_access_enabled()` and the
 getters `is_started()`, `is_connected()`, `is_time_synced()`, `get_client_time()`,
-`get_server_information()`, `get_current_trust()` and `is_unpaired_access_enabled()`. The
-requests are queued to the protocol task and take effect on its next tick; the getters read
-what that task last published. Releasing an outbound attempt that is still connecting (a
+`get_server_information()` and `is_unpaired_access_enabled()`. The
+requests take effect on the protocol task's next tick; the getters read what that task last
+published. Controller commands are queued, so a burst of them can fill the
+queue (see [Sending Commands](#sending-commands)); `connect_to()`, `disconnect()`, `leave()`,
+the pairing-window gestures and `set_unpaired_access_enabled()` are posted instead, never
+refused, and each holds only its latest call (the latest URL, the latest disconnect reason, the
+later of a confirm and a cancel). A `connect_to()` and a `disconnect()` resolve by call order: a
+`connect_to()` after a `disconnect()` opens the new attempt once the goodbyes are sent, and a
+`disconnect()` after a `connect_to()` the task has not acted on cancels it. Posted requests are
+applied ahead of the sends queued in the same window, so a send queued before a `disconnect()`
+is dropped rather than sent after the goodbye, while a server connection that arrived before it
+still goes through admission: a disconnect addresses the current connections, not a newcomer.
+Releasing an outbound attempt that is still connecting (a
 `disconnect()`, or a `connect_to()` that replaces it) does not wait for its transport either:
 the attempt is closed without blocking and freed once its transport has finished, at the latest
 once its connect bound has passed (30 s on host; on ESP-IDF three connect steps of 10 s each,
@@ -1286,7 +1297,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
 | `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
 | `liveness_timeout_ms` | `std::optional<int64_t>` | unset (`60000` with default burst settings) | Milliseconds of inbound silence before the established connection is dropped as dead, with a `restart` goodbye so a server that was only slow reconnects. Unset derives it from the time burst settings, tolerating two consecutive unanswered time messages. An explicit value below `time_burst_interval_ms + time_burst_response_timeout_ms` drops healthy connections. Set or derived, it is capped at `SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS` (30 minutes). `0` disables the check. |
-| `inbound_ring_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the shared inbound ring every admitted connection receives into (sized from the player's `audio_buffer_capacity`, the visualizer's `buffer_capacity` and the largest artwork image, and never below two of the longest messages the enabled roles need in one piece: 131,152 bytes with the artwork role or a player whose advertised buffer reaches a Noise frame, 32,880 with neither and no larger visualizer message, two of the player's longest chunks in between; audio is decoded straight out of it) and each connection's fallback buffer, which holds a pre-admission message or a message longer than the ring takes. `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
+| `inbound_ring_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the shared inbound ring every admitted connection receives into (sized from the player's `audio_buffer_capacity`, the visualizer's `buffer_capacity` and the largest artwork image, and never below two of the longest messages the enabled roles need in one piece: 131,152 bytes with the artwork role or a player whose advertised buffer reaches a Noise frame, 32,880 with neither and no larger visualizer message, two of the player's longest chunks in between; audio is decoded straight out of it) and each connection's fallback buffer, which holds a pre-admission message or a message longer than the ring takes. The sizing budgets the control messages and time replies that arrive while the oldest held audio chunk or visualizer frame is out; an exhausted ring closes the connection ([The Inbound Ring](internals.md#the-inbound-ring)). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
 | `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `inbound_ring_location` (which covers the inbound ring). ESP-IDF only; ignored on host. |
 | `pairing_psk` | `std::optional<SendspinPsk>` | unset | A factory-provisioned Pairing PSK (32 bytes). Outranks a stored one and is never persisted; an all-zero key or the Sentinel PSK makes `start()` fail. Unset loads the stored one or generates and persists one on first boot. See [Pairing PSK](#pairing-psk). |
 | `static_pairing_code` | `std::optional<std::string>` | unset | The device's static pairing code, exactly 8 decimal digits. The `static_pairing_code` method is advertised only when this is set, `pairing_window_supported` is true, and `dynamic_pairing_code` is not advertised. An invalid value makes `start()` fail. |
@@ -1303,7 +1314,7 @@ Configuration passed to `client.add_player()`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports, in priority order; advertised to the server during the hello handshake. The server selects one when establishing a stream. Must list at least one `FLAC` or `PCM` entry, the codecs every server supports; `OPUS` may be listed in addition when the build has the Opus decoder (`SENDSPIN_ENABLE_OPUS`). `start()` fails and logs otherwise. |
-| `audio_buffer_capacity` | `size_t` | `1000000` | Bytes of the shared inbound ring the player may hold as encoded audio (its quota; the ring is sized to include it). Each chunk is charged its stored size, so the client advertises the share that holds encoded frames at the smallest chunk size (2/3 of it) to the server; a server filling that share with frames under 144 bytes overruns the quota, and the excess is dropped with a warning. The ring also holds the traffic that arrives while the oldest chunk is held (`derive_inbound_ring_bytes()` in `src/inbound_ring.h`), so the default quota yields a 1,242,704-byte ring; a visualizer's frame rate and the artwork channels' images add to it (1,505,428 bytes with one 128 KB artwork channel). Larger buffers absorb more jitter at the cost of memory. |
+| `audio_buffer_capacity` | `size_t` | `1000000` | Bytes of the shared inbound ring the player may hold as encoded audio (its quota; the ring is sized to include it). Each chunk is charged its stored size, so the client advertises the share that holds encoded frames at the smallest chunk size (2/3 of it) to the server; a server filling that share with frames under 144 bytes overruns the quota, and the excess is dropped with a warning. The advertised value is at most the ring's largest item so that any single chunk the server may send fits (621,312 bytes with the default ring, below the 666,666-byte share). The ring also holds the traffic that arrives while the oldest chunk is held (`derive_inbound_ring_bytes()` in `src/inbound_ring.h`), so the default quota yields a 1,242,704-byte ring; a visualizer's frame rate and the artwork channels' images add to it (1,505,428 bytes with one 128 KB artwork channel). Larger buffers absorb more jitter at the cost of memory. While the oldest chunk is held, the control messages and time replies have only that pass-through allowance; a sync task stalled in `on_audio_write()` or a server far over the advertised buffer can exhaust it, and an exhausted ring closes the connection with "ring pinned behind held items" ([The Inbound Ring](internals.md#the-inbound-ring)). |
 | `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable output delay. |
 | `initial_output_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable output delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
 | `extra_startup_silence_ms` | `uint16_t` | `50` | Extra silence inserted at stream start, after the first playback notification and before the first decoded chunk reaches the sink. Added on top of the initial-sync priming silence to give the decode pipeline more slack to stay ahead of the sink, preventing the initial-playback stutter caused by the decoder briefly falling behind. Larger values trade a longer startup delay for more underflow protection; set to `0` to disable. |
@@ -1364,7 +1375,7 @@ Configuration passed to `client.add_visualizer()`.
 
 | Field | Type | Description |
 |---|---|---|
-| `buffer_capacity` | `size_t` | Bytes of the shared inbound ring the visualizer may hold (its quota; the ring is sized to include it). Per-item overhead means only ~1/7 holds wire data at the smallest frame size; the client advertises that effective capacity to the server. Below 70 bytes (the smallest budget that advertises one frame) the role refuses to start. The ring's pass-through budget assumes the server fills this quota at `rate_max`, the shortest the oldest frame is held; a sparser stream (a few beats a second) holds it longer and pins more traffic behind it than budgeted, which the transport reports as "ring pinned behind held items" with dropped messages |
+| `buffer_capacity` | `size_t` | Bytes of the shared inbound ring the visualizer may hold (its quota; the ring is sized to include it). Per-item overhead means only ~1/7 holds wire data at the smallest frame size; the client advertises that effective capacity to the server. The advertised value is at most the ring's largest item so that any single chunk the server may send fits, which a seventh of the quota always is. Below 70 bytes (the smallest budget that advertises one frame) the role refuses to start. The ring's pass-through budget assumes the server fills this quota at `rate_max`, the shortest the oldest frame is held; a sparser stream (a few beats a second) holds it longer and pins more traffic behind it than budgeted, which exhausts the ring and closes the connection with "ring pinned behind held items" ([The Inbound Ring](internals.md#the-inbound-ring)) |
 
 `VisualizerStreamConfig` fields:
 

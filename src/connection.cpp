@@ -36,9 +36,6 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.connection";
 
-/// What acquire_drop_log_'s run reports.
-static const char* const DROPPED_MESSAGES = "messages for want of inbound space";
-
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -51,11 +48,7 @@ SendspinConnection::SendspinConnection() {
         });
 }
 
-SendspinConnection::~SendspinConnection() {
-    // The last reference is gone, so no transport callback can still run on this connection:
-    // the drop log is this thread's now, and no delivery will end its run.
-    this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
-}
+SendspinConnection::~SendspinConnection() = default;
 
 // ============================================================================
 // Transport frames
@@ -66,8 +59,7 @@ SsErr SendspinConnection::send_transport_frame(const uint8_t* data, size_t len,
     if (before_write) {
         before_write();
     }
-    // allow_before_hello=true: Noise frames are transport-level and precede the app hello.
-    return this->send_binary_message(data, len, nullptr, /*allow_before_hello=*/true);
+    return this->send_binary_message(data, len);
 }
 
 // ============================================================================
@@ -88,36 +80,27 @@ void SendspinConnection::wake_protocol_task() const {
 // Message sending
 // ============================================================================
 
-SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
-                                              SendCompleteCallback on_complete) {
-    // Goodbye must be sent even when Noise transport is active; route through send_app_json
-    // so it is encrypted. allow_before_hello=true because goodbye can precede the hello (e.g.,
-    // when rejecting an excess connection before the handshake finishes).
-    return this->send_app_json(format_client_goodbye_message(reason, *this->json_arena_),
-                               std::move(on_complete), /*allow_before_hello=*/true);
+SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason) {
+    // Routed through send_app_json() so it is encrypted once the Noise transport is active. A
+    // goodbye can precede the hello (e.g., when rejecting an excess connection before the
+    // handshake finishes).
+    return this->send_app_json(format_client_goodbye_message(reason, *this->json_arena_));
 }
 
-SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCallback cb,
-                                        bool allow_before_hello) {
+SsErr SendspinConnection::send_app_json(const std::string& json) {
     // Delegate to the pointer/length overload: same routing (see that overload).
-    return this->send_app_json(json.data(), json.size(), std::move(cb), allow_before_hello);
+    return this->send_app_json(json.data(), json.size());
 }
 
-SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendCompleteCallback cb,
-                                        bool allow_before_hello) {
+SsErr SendspinConnection::send_app_json(const char* json, size_t len) {
     // Protocol task only, like the re-handshake swap, so the session cannot change between this
     // check and the encrypt.
     if (this->noise_transport_.is_active()) {
-        // Post-handshake: encrypt straight from the caller's buffer. The transport's send path
-        // takes no callback, so fire cb here on the encrypt result (best-effort).
-        SsErr err = this->send_encrypted_text(json, len);
-        if (cb) {
-            cb(err == SsErr::OK);
-        }
-        return err;
+        // Post-handshake: encrypt straight from the caller's buffer.
+        return this->send_encrypted_text(json, len);
     }
     // Pre-handshake cold path: the text-frame API takes a std::string.
-    return this->send_text_message(std::string(json, len), std::move(cb), allow_before_hello);
+    return this->send_text_message(std::string(json, len));
 }
 
 // ============================================================================
@@ -148,9 +131,8 @@ int64_t SendspinConnection::send_time_message() {
     if (len == 0) {
         return 0;
     }
-    // Release: a claim that observes this seed also observes the previous frame's retirement.
     this->time_frame_sent_us_.store(time_frame_tag(now), std::memory_order_release);
-    this->time_frame_tag_.store(time_frame_tag(now), std::memory_order_release);
+    this->time_frame_tag_ = time_frame_tag(now);
 
     // No tag check: a connection's time frames reach the socket in send order, so a hook left
     // over from an earlier frame stores a time no later than the current frame's write. Capturing
@@ -166,14 +148,14 @@ int64_t SendspinConnection::send_time_message() {
 }
 
 std::optional<int64_t> SendspinConnection::claim_time_frame(int64_t client_transmitted) {
-    // Read before the exchange: a later frame's write time is published after this frame was
-    // retired, so observing it makes the exchange fail.
-    const uint32_t sent = this->time_frame_sent_us_.load(std::memory_order_acquire);
-    uint32_t tag = time_frame_tag(client_transmitted);
-    if (tag == 0 ||
-        !this->time_frame_tag_.compare_exchange_strong(tag, 0, std::memory_order_acq_rel)) {
+    const uint32_t tag = time_frame_tag(client_transmitted);
+    if (tag == 0 || tag != this->time_frame_tag_) {
         return std::nullopt;
     }
+    this->time_frame_tag_ = 0;
+    // The frame in flight is this one, so the write time is its seed or what its write hook (or
+    // an earlier frame's, see send_time_message()) stored since.
+    const uint32_t sent = this->time_frame_sent_us_.load(std::memory_order_acquire);
     // Wrapping subtraction, read as signed: a leftover hook that sampled the clock before the seed
     // reads as negative, and the frame then counts as written at the time it carries.
     const auto delay = static_cast<int32_t>(sent - tag);
@@ -202,7 +184,7 @@ void SendspinConnection::send_noise_client_init() {
     }
     std::string client_init = this->noise_handshake_->build_client_init();
     if (!client_init.empty()) {
-        this->send_text_message(client_init, nullptr, /*allow_before_hello=*/true);
+        this->send_text_message(client_init);
     }
 }
 
@@ -212,7 +194,7 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
     }
 
     auto send_fn = [this](const std::string& msg) -> bool {
-        auto err = this->send_text_message(msg, nullptr, /*allow_before_hello=*/true);
+        auto err = this->send_text_message(msg);
         return err == SsErr::OK;
     };
 
@@ -559,27 +541,28 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
     void* item = this->inbound_ring_->acquire(len, INBOUND_ACQUIRE_TIMEOUT_MS);
     if (item == nullptr) {
         this->inbound_gate_.abandon_ring_write();
-        // Throttled: see InboundDropLog. Reclamation is in ring order, so with the player or the
-        // visualizer holding items the space behind the oldest of them is what ran out (see
-        // derive_inbound_ring_bytes()): said so, to tell that limit from a stalled protocol task.
-        if (this->acquire_drop_log_.note_drop()) {
-            const size_t held = this->inbound_ring_->quota(InboundHolder::PLAYER).outstanding() +
-                                this->inbound_ring_->quota(InboundHolder::VISUALIZER).outstanding();
-            if (held > 0) {
-                SS_LOGW(TAG,
-                        "No inbound ring space for a %zu-byte message within %u ms: ring pinned "
-                        "behind held items (%zu bytes held); dropping until there is",
-                        len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), held);
-            } else {
-                SS_LOGW(TAG,
-                        "No inbound ring space for a %zu-byte message within %u ms; dropping "
-                        "until there is",
-                        len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS));
-            }
+        // A frame the transport never decrypts leaves the Noise receive nonce behind, so the
+        // connection cannot continue past it and is closed here rather than at its next frame.
+        // Reclamation is in ring order, so with the player or the visualizer holding items the
+        // space behind the oldest of them is what ran out (see derive_inbound_ring_bytes()):
+        // said so, to tell that limit from a stalled protocol task (docs/internals.md "The
+        // Inbound Ring").
+        const size_t held = this->inbound_ring_->quota(InboundHolder::PLAYER).outstanding() +
+                            this->inbound_ring_->quota(InboundHolder::VISUALIZER).outstanding();
+        if (held > 0) {
+            SS_LOGW(TAG,
+                    "No inbound ring space for a %zu-byte message within %u ms: ring pinned "
+                    "behind held items (%zu bytes held); closing the connection",
+                    len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), held);
+        } else {
+            SS_LOGW(TAG,
+                    "No inbound ring space for a %zu-byte message within %u ms; closing the "
+                    "connection",
+                    len, static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS));
         }
-        return {nullptr, InboundRoute::DROP};
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
     }
-    this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
     InboundItemHeader* header = inbound_item_header(item);
     header->connection_id = static_cast<uint32_t>(this->instance_id);
     header->receive_time_us = stamp;
@@ -594,15 +577,20 @@ SendspinConnection::InboundTarget SendspinConnection::route_to_fallback(size_t l
                                                                         bool admitted) {
     if (admitted) {
         // An admitted connection's message waits for the buffer no longer than one waits for
-        // ring space, and is dropped rather than the connection closed, as a full ring drops it.
+        // ring space, and then closes the connection, as a full ring does: a frame the transport
+        // never decrypts leaves the Noise receive nonce behind, so the connection cannot continue
+        // past it and is closed here rather than at its next frame. A detached connection's
+        // message is dropped, its connection already on its way out.
         if (!this->inbound_gate_.wait_until_writable(INBOUND_ACQUIRE_TIMEOUT_MS)) {
-            if (!this->inbound_gate_.is_detached() && this->acquire_drop_log_.note_drop()) {
-                SS_LOGW(TAG,
-                        "Fallback buffer still holds the previous message after %u ms; dropping "
-                        "a %zu-byte message until it is free",
-                        static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), len);
+            if (this->inbound_gate_.is_detached()) {
+                return {nullptr, InboundRoute::DROP};
             }
-            return {nullptr, InboundRoute::DROP};
+            SS_LOGW(TAG,
+                    "Fallback buffer still holds the previous message after %u ms; closing the "
+                    "connection for a %zu-byte message",
+                    static_cast<unsigned>(INBOUND_ACQUIRE_TIMEOUT_MS), len);
+            this->fail_inbound();
+            return {nullptr, InboundRoute::CLOSE};
         }
     } else {
         const InboundRoute waited = this->wait_until_writable();
@@ -615,9 +603,6 @@ SendspinConnection::InboundTarget SendspinConnection::route_to_fallback(size_t l
         SS_LOGE(TAG, "Failed to allocate %zu bytes for a fallback message; closing", len);
         this->fail_inbound();
         return {nullptr, InboundRoute::CLOSE};
-    }
-    if (admitted) {
-        this->acquire_drop_log_.end_run(TAG, DROPPED_MESSAGES);
     }
     this->fallback_len_ = len;
     this->fallback_kind_ = kind;

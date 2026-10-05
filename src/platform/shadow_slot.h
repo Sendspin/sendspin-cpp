@@ -26,12 +26,11 @@ namespace sendspin {
 /// @brief Thread-safe shadow slot for passing the latest value of T between any two threads: one
 /// writer, one reader, latest-value-wins.
 ///
-/// The writer locks briefly to write or merge a value; the reader locks briefly to move it out
-/// if dirty. Safe between any single-writer/single-reader thread pair, whichever side (if either)
-/// is the main loop: the sync task's playback-progress slot uses it. State bound for the main
-/// loop's read side goes through Inbox / InboxSlot
-/// (see inbox.h) instead, which consolidates many producers onto one mutex and one lock-free
-/// poll() per tick.
+/// The writer locks briefly to merge a delta into the value; the reader locks briefly to move it
+/// out if dirty. Safe between any single-writer/single-reader thread pair, whichever side (if
+/// either) is the main loop: the sync task's playback-progress slot uses it. State bound for the
+/// main loop's read side goes through Inbox / InboxSlot (see inbox.h) instead, which consolidates
+/// many producers onto one mutex and one lock-free poll() per tick.
 template <typename T>
 class ShadowSlot {
 public:
@@ -41,13 +40,6 @@ public:
     // Not copyable or movable
     ShadowSlot(const ShadowSlot&) = delete;
     ShadowSlot& operator=(const ShadowSlot&) = delete;
-
-    /// @brief Overwrite the slot with a new value (latest-wins)
-    void write(T value) {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        this->slot_ = std::move(value);
-        this->dirty_ = true;
-    }
 
     /// @brief Merge a delta into the slot using a callable: fn(T& current, T&& delta)
     template <typename MergeFn>

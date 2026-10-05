@@ -127,8 +127,8 @@ during this review.
 - One behavior per test: not one assertion per test, and not one test per
   bug. Several assertions about the same behavior belong together; a test
   spanning several behaviors is split along the behaviors it conflates.
-  `MetadataNullClearsAndAbsentPreserves` (`tests/test_protocol.cpp`) asserts
-  three things about the single delta-merge rule it covers.
+  `MetadataObjectReplacesEveryFieldItOmits` (`tests/test_protocol.cpp`)
+  asserts three things about the single full-replace rule it covers.
 - A test's assertions establish what its name and comment claim, no more and
   no less; a comment that promises an unchecked property is an overclaim.
 - `ASSERT_*` aborts the test function while `EXPECT_*` continues; reserve

@@ -63,17 +63,18 @@ enum class SlotAckState : uint8_t {
 /// ThreadSafeQueue's internal mutex provides the happens-before guarantee between the
 /// protocol task's writes and the decode thread's reads.
 ///
-/// `generation` and `epoch` let the decode thread detect a stale notification: if the buffer it
-/// names has since been claimed for another transfer (generation mismatch) or the slot has moved
-/// on (epoch mismatch, see ArtworkRole::Impl::slot_epochs), the notification is skipped rather
-/// than decoding torn or superseded data. See ArtworkRole::Impl::drain_thread_func.
+/// `epoch` lets the decode thread detect a stale notification: once the slot has moved on (see
+/// ArtworkRole::Impl::slot_epochs), the notification is skipped rather than decoding torn or
+/// superseded data. That covers a buffer claimed for another transfer too, since every claim
+/// follows an announce that bumps the epoch under the same DrainTask::slot_mutex the decode
+/// thread validates under. See ArtworkRole::Impl::process_notification.
 ///
 /// `teardown_generation` is the role's cleanup_generation when the protocol task handed the
 /// image over; the decode thread stamps the display hand-off with it, so the main loop drops a
 /// display whose role was torn down since (see ArtworkRole::Impl::drain_events()).
 ///
 /// `data_length == 0` marks the protocol's empty image (an announce with `total_size` 0), which
-/// clears the channel. It names no buffer, so `buffer_idx`/`generation` are unused and left at 0;
+/// clears the channel. It names no buffer, so `buffer_idx` is unused and left at 0;
 /// everything else about it (queue ordering, the ack gate, and the timestamp-scheduled hand-off
 /// to the main loop) matches a frame. See handle_binary().
 struct ArtworkNotification {
@@ -82,7 +83,6 @@ struct ArtworkNotification {
     size_t data_length;
     int64_t timestamp;
     SendspinImageFormat format;
-    uint32_t generation;
     uint32_t epoch;
     uint32_t teardown_generation;
 };
@@ -98,7 +98,7 @@ struct ArtworkNotification {
 /// stream lifecycle handlers) and cleared by cleanup(), which runs there too, or on the main
 /// loop in stop() once the protocol task is joined.
 ///
-/// `buffer_idx`/`generation` name the SlotBuffer the parts accumulate into, claimed once at the
+/// `buffer_idx` names the SlotBuffer buffer the parts accumulate into, claimed once at the
 /// announce so every part of the transfer lands in the same buffer. `discarding` marks a transfer
 /// whose image the role will not hold (see ArtworkRole::Impl::image_cap): per "Artwork (Binary)",
 /// a client discarding image data must still count each part's bytes toward `total_size`, so the
@@ -107,7 +107,6 @@ struct ArtworkTransfer {
     int64_t timestamp{0};
     uint32_t total_size{0};
     uint32_t received{0};
-    uint32_t generation{0};
     bool in_flight{false};
     uint8_t slot{0};
     uint8_t buffer_idx{0};
@@ -117,9 +116,8 @@ struct ArtworkTransfer {
 /// @brief Double-buffered image storage for a single artwork slot
 ///
 /// Every field is guarded by DrainTask::slot_mutex and written by both the protocol task and the
-/// decode thread. write_generation[i] is bumped whenever buffers[i] is overwritten, so the decode
-/// thread can compare it against the generation stamped on the notification it dequeued and skip
-/// a buffer that was reused before it could be claimed. ack_state is meaningful only for a slot
+/// decode thread. A buffer reused before the decode thread claimed it shows as a notification
+/// whose slot epoch has moved on (see ArtworkNotification). ack_state is meaningful only for a slot
 /// with require_frame_done (see ack_enabled()); while it is not IDLE, at most one newer
 /// notification is parked here, latest-wins, and replayed once the gate reopens.
 struct SlotBuffer {
@@ -127,7 +125,6 @@ struct SlotBuffer {
     uint8_t write_idx{0};
     bool drain_active{false};
     uint8_t drain_buf_idx{0};
-    uint32_t write_generation[2]{0, 0};
     SlotAckState ack_state{SlotAckState::IDLE};
     bool has_parked{false};
     ArtworkNotification parked{};
@@ -191,10 +188,10 @@ struct ArtworkRole::Impl : RoleTeardown {
     /// @return false when the message is a protocol error per roles/artwork/v1.md "Artwork
     /// (Binary)" and the caller must close the connection; true when processed or ignored.
     bool handle_binary(uint8_t slot, const uint8_t* data, size_t len);
-    // The lifecycle handlers re-check the admitting generation where they take effect; see
-    // accepts().
-    void handle_stream_start(const ServerArtworkStreamObject& stream, uint32_t generation);
-    void handle_stream_end(uint32_t generation);
+    // handle_stream_end() loads the role's teardown generation once at entry and stamps the
+    // events it queues with it; see RoleTeardown.
+    void handle_stream_start(const ServerArtworkStreamObject& stream);
+    void handle_stream_end();
     void handle_stream_ring_event(ArtworkEventType event);
     // True if this tick has drainable artwork work. The display-slot bit covers newly decoded
     // images; a nonzero held_display_mask means displays folded in on a prior tick are still

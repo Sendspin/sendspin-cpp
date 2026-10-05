@@ -51,7 +51,7 @@ struct ControllerRole::Impl : RoleTeardown {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerStateControllerObject&& state, uint32_t generation) const;
+    void handle_server_state(ServerStateControllerObject&& state) const;
     // True if a controller-state delta is waiting in the inbox slot.
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & INBOX_TOPIC_CONTROLLER) != 0;
@@ -99,8 +99,10 @@ struct ControllerRole::Impl : RoleTeardown {
     /// teardown generation the state was admitted under (see pack_supported_commands()).
     /// send_command() treats a stamp other than the current generation's as no commands, so a
     /// teardown retires the mask the instant cleanup() bumps the generation, whatever the main
-    /// loop wrote around it. Written on the main loop (drain_events(), complete_teardown()); read
-    /// by send_command() on any thread.
+    /// loop wrote around it. The stamp a command passed under rides the command queue with it
+    /// (ProtocolCommand::controller_generation), so a teardown after the check and before the
+    /// protocol task's drain still drops it there. Written on the main loop (drain_events(),
+    /// complete_teardown()); read by send_command() on any thread.
     std::atomic<uint32_t> supported_commands{0};
 };
 

@@ -49,10 +49,6 @@ namespace sendspin {
 class ProtocolTask;
 class SendspinArenaAllocator;
 
-/// @brief Callback type for message send completion
-/// @param success True if the message was sent successfully, false otherwise.
-using SendCompleteCallback = std::function<void(bool)>;
-
 /**
  * @brief Abstract base class for Sendspin connections (server-initiated or client-initiated)
  *
@@ -74,14 +70,10 @@ public:
     /// processing)
     virtual void start() = 0;
 
-    /// @brief Disconnects from the server with a goodbye message
+    /// @brief Sends a goodbye message, then closes the transport, whether or not the send
+    /// succeeded. Protocol task only, like every send on a connection.
     /// @param reason The reason for disconnecting (e.g., shutdown, another server).
-    /// @param on_complete Optional callback invoked after goodbye is sent (or send fails/times
-    /// out).
-    ///                    For ESP server connections, invoked on the httpd worker thread, so it
-    ///                    must be safe there. Otherwise invoked synchronously in the calling
-    ///                    thread.
-    virtual void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) = 0;
+    virtual void disconnect(SendspinGoodbyeReason reason) = 0;
 
     /// @brief Closes the underlying transport immediately, without blocking and without ever
     /// joining/stopping the calling thread.
@@ -114,17 +106,24 @@ public:
 
     /// @brief Stops this connection's inbound traffic: detaches the inbound gate, so the
     /// transport drops everything it receives from here on and the protocol task drops what it
-    /// still takes for the connection, and retires the client/time frame in flight, so a
-    /// server/time already being processed cannot claim it and overwrite the next connection's
-    /// measurement. Protocol task (the connection manager when the connection leaves it, and
-    /// close_silently()); the transport thread (fail_inbound()); the thread delivering an accept
-    /// the command queue refused; or the main loop with the protocol task joined.
+    /// still takes for the connection. Protocol task (the connection manager when the connection
+    /// leaves it, and close_silently()); the transport thread (fail_inbound()); the thread
+    /// delivering an accept the command queue refused; or the main loop with the protocol task
+    /// joined.
     ///
     /// A message the protocol task is already dispatching is not recalled: the drop that called
     /// this runs between two of the task's messages, and clears the admitted flag first.
     void detach_inbound() {
         this->inbound_gate_.detach();
-        this->cancel_time_frame();
+    }
+
+    /// @brief Whether an application message may still be sent: the transport is connected and
+    /// the connection is not detached. A connection the manager releases (disconnect(), a drop)
+    /// is detached before its goodbye while its transport can still read as connected (the ESP
+    /// server's closed flag is set by httpd asynchronously), so this keeps a message the task
+    /// sends later from reaching the wire after the goodbye. Protocol task only.
+    bool accepts_app_sends() const {
+        return this->is_connected() && !this->inbound_gate_.is_detached();
     }
 
     /// @brief Checks if the hello handshake has completed successfully
@@ -248,19 +247,18 @@ public:
     /// like every send on a connection. On an ESP outbound connection the transport send blocks
     /// for up to its 10 ms send timeout (src/esp/client_connection.cpp), once per frame.
     /// @return SsErr::OK if queued/sent, error code otherwise.
-    SsErr send_app_json(const std::string& json, SendCompleteCallback cb = nullptr,
-                        bool allow_before_hello = false);
+    SsErr send_app_json(const std::string& json);
 
     /// @brief Pointer/length form of send_app_json(); encrypts straight from the caller's
     /// buffer, and the pre-handshake text fallback builds the string it needs
-    SsErr send_app_json(const char* json, size_t len, SendCompleteCallback cb = nullptr,
-                        bool allow_before_hello = false);
+    SsErr send_app_json(const char* json, size_t len);
 
     /// @brief Returns this connection's process-unique instance id
     /// @return A monotonic id assigned at construction, never reused for the lifetime of the
-    ///         process. Used to identify a connection across a thread-safe queue without a raw
-    ///         pointer, which could ABA-collide with a later connection allocated at the same
-    ///         address. Ids start at 1, so 0 is a safe "no connection" sentinel.
+    ///         process. Identifies a connection without a raw pointer, which could ABA-collide
+    ///         with a later connection allocated at the same address: an inbound ring item's
+    ///         connection_id (its low 32 bits) and ConnectionManager's published primary id.
+    ///         Ids start at 1, so 0 is a safe "no connection" sentinel.
     uint64_t get_instance_id() const {
         return this->instance_id;
     }
@@ -283,18 +281,10 @@ public:
         return this->last_receive_time_us_.load(std::memory_order_relaxed);
     }
 
-    /// @brief Sends a text message to the server with a completion callback
+    /// @brief Sends a text message to the peer.
     /// @param message The message string to send.
-    /// @param cb Callback invoked with the send result. On asynchronous transports it is not
-    ///        guaranteed to fire: if the connection is torn down before the queued send runs, or
-    ///        the message is dropped by the pre-hello gate, the callback is skipped. Treat it as a
-    ///        best-effort completion notification, not an unconditional "send finished" signal.
-    /// @param allow_before_hello Lets the message precede this connection's client/hello (used by
-    ///        the hello itself and by goodbye). Otherwise asynchronous transports drop it, which
-    ///        is what keeps "hello is always first". Synchronous transports ignore the flag.
-    /// @return SsErr::OK if queued successfully, error code otherwise.
-    virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
-                                    bool allow_before_hello = false) = 0;
+    /// @return SsErr::OK if queued/sent, error code otherwise.
+    virtual SsErr send_text_message(const std::string& message) = 0;
 
     /// @brief Sends a client/time message and records it as the frame in flight (see
     /// time_frame_tag_). Needs the Noise transport, which is_operational() implies. Protocol task
@@ -309,27 +299,22 @@ public:
     ///         than the write, or nullopt if no frame in flight carries that value.
     std::optional<int64_t> claim_time_frame(int64_t client_transmitted);
 
-    /// @brief Retires the client/time frame in flight, so a late reply to it no longer matches
+    /// @brief Retires the client/time frame in flight, so a late reply to it is not claimed.
+    /// Protocol task (the burst's response timeout).
     void cancel_time_frame() {
-        this->time_frame_tag_.store(0, std::memory_order_release);
+        this->time_frame_tag_ = 0;
     }
 
     /// @brief Sends a binary WebSocket frame to the peer.
     /// @param data   Pointer to the binary payload bytes.
     /// @param len    Number of bytes to send.
-    /// @param cb     Optional completion callback (best-effort, may be skipped on teardown).
-    /// @param allow_before_hello  If true, bypasses the pre-hello send gate (mirrors the
-    ///               same flag on send_text_message; binary frames should not precede the
-    ///               Noise handshake, so the default is false).
     /// @return SsErr::OK if queued/sent, error code otherwise.
-    virtual SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                                      bool allow_before_hello = false) = 0;
+    virtual SsErr send_binary_message(const uint8_t* data, size_t len) = 0;
 
-    /// @brief Sends a goodbye message with completion callback
+    /// @brief Sends a goodbye message.
     /// @param reason The reason for disconnecting.
-    /// @param on_complete Callback invoked after the goodbye message is sent (or fails).
-    /// @return SsErr::OK if sent successfully, error code otherwise.
-    SsErr send_goodbye_reason(SendspinGoodbyeReason reason, SendCompleteCallback on_complete);
+    /// @return SsErr::OK if queued/sent, error code otherwise.
+    SsErr send_goodbye_reason(SendspinGoodbyeReason reason);
 
     /// @brief Closes the connection without sending any application-level message.
     ///
@@ -801,13 +786,6 @@ public:
         this->inbound_gate_.consume_pending_message();
     }
 
-    /// @brief Records that the protocol task reported this connection lost, so it reports it
-    /// once. Protocol task only.
-    /// @return true the first time, false afterwards.
-    bool mark_loss_reported() {
-        return !std::exchange(this->loss_reported_, true);
-    }
-
     /// @brief Records that the transport closed and wakes the protocol task, which honours the
     /// close once the connection's queued messages are drained (InboundGate::close_ready()).
     /// Transport thread, after its last message is completed or published.
@@ -873,9 +851,8 @@ protected:
     /// begin_inbound_fragment() was asked about
     enum class InboundRoute : uint8_t {
         RECEIVE,  ///< Receive the bytes into InboundTarget::data, then end the message
-        /// Read and discard the bytes; the connection stays open (a detached connection, or an
-        /// admitted one's message that found no ring item or fallback buffer in time; see
-        /// route_to_fallback() for the ESP server's exception).
+        /// Read and discard the bytes (a detached or unattached connection, or the rest of a
+        /// multi-frame message one of those began)
         DROP,
         CLOSE,  ///< Close the connection: fail_inbound() has already run
     };
@@ -934,9 +911,10 @@ protected:
     /// @brief Chooses the destination for a complete message of `len` bytes. Transport thread.
     ///
     /// An admitted connection receives straight into a ring item it acquires here, waiting up to
-    /// INBOUND_ACQUIRE_TIMEOUT_MS for room, and drops the message with a warning when there is
-    /// none; a message longer than INBOUND_MAX_MESSAGE_BYTES closes the connection, since no
-    /// conforming peer sends one (the Noise layer fragments), and one longer than the ring takes
+    /// INBOUND_ACQUIRE_TIMEOUT_MS for room, and is closed with a warning when there is none,
+    /// since a frame never decrypted leaves the Noise receive nonce behind; a message longer than
+    /// INBOUND_MAX_MESSAGE_BYTES closes the connection, since no conforming peer sends one (the
+    /// Noise layer fragments), and one longer than the ring takes
     /// (InboundRing::max_message_bytes()) goes to route_to_fallback(), as does every message of
     /// an unadmitted connection; one over InboundGate::PRE_ADMISSION_MESSAGE_BYTES closes it. A
     /// detached or unattached connection drops everything.
@@ -948,10 +926,9 @@ protected:
     ///
     /// An unadmitted connection waits up to InboundGate::WRITABLE_WAIT_MS and is closed when the
     /// wait times out (wait_until_writable()). An admitted connection's message, one longer than
-    /// the ring takes, waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and is then
-    /// dropped with the same throttled warning, the connection left open; except on the ESP
-    /// server, which must drain the frame into a discard buffer sized to the longest message the
-    /// ring takes, so every admitted fallback drop closes the connection there.
+    /// the ring takes, waits only INBOUND_ACQUIRE_TIMEOUT_MS, as a ring acquire does, and then
+    /// closes the connection with a warning, for the same reason a full ring does (a detached
+    /// connection's message is dropped instead).
     /// @return RECEIVE into the buffer; DROP or CLOSE as above; an allocation failure closes.
     InboundTarget route_to_fallback(size_t len, InboundKind kind, uint32_t stamp, bool admitted);
 
@@ -1120,14 +1097,13 @@ protected:
 
     /// Tag of the client/time frame in flight: the low 32 bits of the client_transmitted it
     /// carries, never 0 for a frame, and 0 once the frame is claimed or cancelled. A failed send
-    /// leaves its tag, which no reply can echo. 32 bits because a 64-bit atomic takes a lock on
-    /// the ESP32 family. Written on the protocol task (send, claim and cancel) and, to cancel, by
-    /// any thread detach_inbound() names; read on the protocol task.
-    std::atomic<uint32_t> time_frame_tag_{0};
+    /// leaves its tag, which no reply can echo. Protocol task only.
+    uint32_t time_frame_tag_{0};
 
     /// Low 32 bits of the client clock when the frame in flight was handed to the socket, seeded
     /// with the tag on the protocol task until the write hook overwrites it on whichever thread
-    /// performs the write; read on the protocol task (claim_time_frame()).
+    /// performs the write (the ESP server's httpd worker); read on the protocol task
+    /// (claim_time_frame()). 32 bits because a 64-bit atomic takes a lock on the ESP32 family.
     std::atomic<uint32_t> time_frame_sent_us_{0};
 
     // 16-bit fields
@@ -1177,11 +1153,9 @@ protected:
     /// Protocol task only.
     bool pairing_finalized_{false};
 
-    /// Hello handshake state. Set on the protocol task by the hello send's completion, which the
-    /// encrypted send path runs inline, and cleared by the outbound transports' disconnect
-    /// handlers (transport thread). Read by is_handshake_complete() on the protocol task and by the
-    /// ESP server's pre-hello send gate on the httpd worker, hence atomic.
-    std::atomic<bool> client_hello_sent_{false};
+    /// Whether client/hello went out. Set when the hello send returns OK, and never cleared: a
+    /// closed connection is not reused. Protocol task only.
+    bool client_hello_sent_{false};
 
     /// True once the Noise transport handshake has completed. Protocol task only.
     bool noise_handshake_complete_{false};
@@ -1190,10 +1164,6 @@ protected:
     /// Written from the transport connected callback (transport thread), read by the manager on
     /// the protocol task, hence atomic. See mark_ws_upgraded().
     std::atomic<bool> ws_upgraded_{false};
-
-    /// Throttles the drop warnings in route_inbound_message() and route_to_fallback(). Transport
-    /// thread only.
-    InboundDropLog acquire_drop_log_;
 
     /// The kind of the message in fallback_buf_ (TEXT or BINARY: a continuation frame does not
     /// carry the type its message started with). Same threads as fallback_len_.
@@ -1212,13 +1182,9 @@ protected:
     /// is accepted only while it is set. Transport thread only.
     bool fragment_assembly_open_{false};
 
-    /// Set once the protocol task has reported this connection lost (mark_loss_reported()).
-    /// Protocol task only.
-    bool loss_reported_{false};
-
-    /// Set by the server/hello handler on the protocol task, cleared by the outbound transports'
-    /// disconnect handlers (transport thread), read on the protocol task; atomic for that clear.
-    std::atomic<bool> server_hello_received_{false};
+    /// Whether server/hello arrived. Set by its handler and never cleared: a closed connection is
+    /// not reused. Protocol task only.
+    bool server_hello_received_{false};
 
     /// True after the first server/activate message has been received and applied, until a
     /// re-handshake or a pairing-finalize ack rewinds it. Protocol task only.

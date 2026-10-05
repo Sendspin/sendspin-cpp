@@ -26,7 +26,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -248,6 +247,7 @@ enum class LogLevel : uint8_t {
 class ConnectionManager;
 class InboundRing;
 struct InboundMessage;
+struct LifecycleRequests;
 struct PairingUiSnapshot;
 struct ProtocolCommand;
 class ProtocolTask;
@@ -329,20 +329,19 @@ public:
 
     /// @brief Stops the client and returns only once it is fully stopped
     ///
-    /// Sends a client/goodbye (reason shutdown) to every peer, waits a short bound for those
-    /// sends to complete, joins the protocol task, then closes the server and every connection
-    /// regardless, joins the role threads, resets every role, and delivers the roles' clear
-    /// callbacks (on_stream_end(),
-    /// on_image_clear(), on_metadata_clear(), ...) before returning. A pairing prompt still
-    /// showing is dismissed the same way (on_clear_pairing_code() / on_close_pairing_window()),
-    /// and every provider write still owed is performed before returning. No-op when stopped.
-    /// Calling start() afterwards restarts on the same identity and record store, unless the
-    /// persistence provider changed in between. Start/stop cycles may be repeated indefinitely.
+    /// Sends a client/goodbye (reason shutdown) to every peer and closes each connection behind
+    /// it, joins the protocol task, then closes the server and every connection still open,
+    /// joins the role threads, resets every role, and delivers the roles' clear callbacks
+    /// (on_stream_end(), on_image_clear(), on_metadata_clear(), ...) before returning. A pairing
+    /// prompt still showing is dismissed the same way (on_clear_pairing_code() /
+    /// on_close_pairing_window()), and every provider write still owed is performed before
+    /// returning. No-op when stopped. Calling start() afterwards restarts on the same identity and
+    /// record store, unless the persistence provider changed in between. Start/stop cycles may be
+    /// repeated indefinitely.
     ///
-    /// Blocking is bounded by the goodbye wait, the transports' own close, and any listener
-    /// callback already running on a role thread, which the join cannot interrupt. The
-    /// per-transport bounds are described in docs/integration-guide.md (Stopping and
-    /// Restarting).
+    /// Blocking is bounded by the transports' own send and close, and any listener callback
+    /// already running on a role thread, which the join cannot interrupt. The per-transport
+    /// bounds are described in docs/integration-guide.md (Stopping and Restarting).
     ///
     /// Listener callbacks fire from inside this call, after every role has been reset, so the
     /// state they observe through the getters is the stopped state. One that calls start() has
@@ -364,21 +363,31 @@ public:
     ///
     /// Ignored (with a warning) unless the client is running, including from a callback fired
     /// inside stop(). start() is where the identity and record store the Noise handshake needs
-    /// are created. Any thread: the request is queued to the library's protocol task, which
-    /// replaces any earlier outbound attempt; a full queue refuses it with a warning. Replacing an
-    /// attempt that is still connecting does not wait for its transport: the attempt is closed
-    /// without blocking and freed once its transport has finished, at the latest once its connect
-    /// bound has passed (30 s on host; on ESP-IDF three connect steps of 10 s each, plus whatever
-    /// a DNS lookup, which has no bound of its own, takes).
+    /// are created. Any thread: the request is posted to the library's protocol task, which
+    /// replaces any earlier outbound attempt. It is never refused, and a second call before the
+    /// task takes it replaces the URL. With disconnect(), the pair resolves by call order: a
+    /// connect_to() after a disconnect() opens the new attempt once the goodbyes are sent, and a
+    /// disconnect() after a connect_to() the task has not taken cancels it, so nothing opens. The
+    /// task applies both ahead of the sends queued since its last tick. Replacing an attempt that
+    /// is still connecting does not wait for its transport: the attempt is closed without
+    /// blocking and freed once its transport has finished, at the latest once its connect bound
+    /// has passed (30 s on host; on ESP-IDF three connect steps of 10 s each, plus whatever a DNS
+    /// lookup, which has no bound of its own, takes).
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
     /// @brief Disconnects from the current server with the given reason
     ///
     /// Ignored unless the client is running, including from a callback fired inside stop(). Any
-    /// thread: the request is queued to the protocol task, which sends the goodbyes; a full
-    /// queue refuses it with a warning. An outbound attempt still connecting is released the
-    /// same way connect_to() releases one it replaces, without waiting for its transport.
+    /// thread: the request is posted to the protocol task, which sends the goodbyes. It is never
+    /// refused, and a second call before the task takes it replaces the reason rather than
+    /// adding a second disconnect. With connect_to() it resolves by call order (see
+    /// connect_to()). The task applies it ahead of the commands queued since its last tick: a
+    /// controller command queued before it in that window is dropped rather than
+    /// sent after the goodbye, while a connection a server delivered before it still enters the
+    /// nursery, since a disconnect addresses the current connections, not a newcomer. An outbound
+    /// attempt still connecting is released the same way connect_to() releases one it replaces,
+    /// without waiting for its transport.
     /// @param reason The goodbye reason to send
     void disconnect(SendspinGoodbyeReason reason);
 
@@ -548,15 +557,6 @@ public:
         return this->group_state_;
     }
 
-    /// @brief Returns the trust level of the active connection. Any thread.
-    /// The same value SendspinClientListener::on_trust_changed reports, queryable at any time; it
-    /// changes on the protocol task, so it can lead the callback by a loop() tick.
-    /// @return The active connection's ConnectionTrust; ConnectionTrust::NONE when no
-    ///         connection is active or the handshake has not completed
-    ConnectionTrust get_current_trust() const {
-        return this->current_trust_.load(std::memory_order_acquire);
-    }
-
     // ========================================
     // State updates
     // ========================================
@@ -576,7 +576,8 @@ public:
     }
 
     /// @brief Leaves the current group with messaging.md "client/leave". Any thread: the request
-    /// is queued to the protocol task.
+    /// is posted to the protocol task, never refused, and calls before the task takes it send one
+    /// client/leave.
     ///
     /// The client no longer wants to take part in its group's playback, for example while
     /// playing a local source. The
@@ -595,8 +596,11 @@ public:
     // ========================================
 
     /// @brief Signals that the operator performed the device pairing-window gesture.
-    /// Any thread: queued to the protocol task; ignored unless the client is running. Opens a
-    /// pairing window (pairing.md "Pairing Window"): a gesture-gated attempt
+    /// Any thread: posted to the protocol task, never refused; ignored unless the client is
+    /// running. With cancel_pairing_window(), whichever of the two is called last before the
+    /// task takes them is the one applied: a confirm then a cancel between two ticks does
+    /// nothing, not even the round-limit reset, and a cancel then a confirm starts a waiting
+    /// attempt. Opens a pairing window (pairing.md "Pairing Window"): a gesture-gated attempt
     /// already waiting proceeds immediately; otherwise the window stands open for 5 minutes and
     /// admits pairing attempts on one connection without a further gesture. It closes before
     /// those 5 minutes are up when a pairing under it succeeds, when the connection it is bound
@@ -605,16 +609,18 @@ public:
     void confirm_pairing_window();
 
     /// @brief Signals that the operator cancelled the pairing window.
-    /// Any thread: queued to the protocol task; ignored unless the client is running. Closes any
-    /// open window, one of the closing events pairing.md "Pairing Window"
-    /// defines, so the next gesture-gated attempt waits for a fresh gesture. An attempt still
-    /// withheld for that gesture ends with pair/abort reason user_cancelled; one already under
-    /// way runs to its own end.
+    /// Any thread: posted to the protocol task like confirm_pairing_window(), and the later of
+    /// the two called between two ticks is the only one applied (see confirm_pairing_window());
+    /// ignored unless the client is running. Closes any open window, one of the closing events
+    /// pairing.md "Pairing Window" defines, so the next gesture-gated attempt waits for a fresh
+    /// gesture. An attempt still withheld for that gesture ends with pair/abort reason
+    /// user_cancelled; one already under way runs to its own end.
     void cancel_pairing_window();
 
     /// @brief Turns unpaired access on or off; it is off until this is called. Any thread: the
     /// value takes effect at once for the next client/hello and admission, and the connections it
-    /// no longer fits are closed by the protocol task.
+    /// no longer fits are closed by the protocol task. Calls between two of its ticks collapse to
+    /// the latest: the task applies the value the last one set, once.
     ///
     /// pairing.md "Unpaired Access": servers with no pairing record may declare playback and
     /// activate roles only while it is on. Turning it off closes every connection that relies on
@@ -670,47 +676,33 @@ public:
     /// the roles that connection owns. Ignored unless the client is running.
     void publish_state();
 
-    /// @brief Sends a role-originated text message to the connection that owns the role
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    /// @brief Queues a controller command for the protocol task, which formats it as a
+    /// client/command and sends it to the admitted connection that owns the controller role
     ///
-    /// Every message sent on a role's behalf carries the role it belongs to, so the activation
-    /// gate cannot be forgotten at a call site. The client's own messages do not come through
-    /// here.
-    ///
-    /// The message is queued to the protocol task, which sends it to the admitted connection that
-    /// owns the role, and drops it there unless that connection has the role active:
+    /// The protocol task drops the command unless that connection has the role active:
     /// messaging.md "server/activate" tolerates inactive-role objects server-side because a client
     /// that received the role removal stops sending them. The activation test is on the
     /// versioned name, the same test the receive path applies. Also dropped, like client/state,
     /// while a re-handshake awaits the server/activate that follows it.
     ///
-    /// Callable from any thread.
-    /// @param text The text message to send
-    /// @param role_family Role family the message belongs to, without the version suffix
-    ///                    (e.g. "controller")
-    /// @return false when the message was refused before it reached the protocol task: the
-    ///         client is not running, the family names no role this library implements, or the
-    ///         command queue is full (ProtocolTask::CONSUMER_COMMAND_BURST requests, logged). true
-    ///         means queued, not sent: the protocol task's role gate can still drop it.
-    bool send_text(const std::string& text, const std::string& role_family);
-
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    /// @brief Queues a controller command for the protocol task, which formats it as a
-    /// client/command and sends it like send_text() sends a "controller" message (same role
-    /// gate, same drops)
-    ///
-    /// A role service, like send_text() and publish_state(): consumers call
-    /// ControllerRole::send_command(), which checks the command against the server's
-    /// supported_commands and its parameter before calling this. This assumes those checks ran
-    /// and repeats neither. The command crosses to the protocol task as the struct, so the
-    /// message is built in the task's JSON arena.
+    /// A role service, like publish_state(): consumers call ControllerRole::send_command(), which
+    /// checks the command against the server's supported_commands and its parameter before
+    /// calling this. This assumes those checks ran and repeats neither. The command crosses to
+    /// the protocol task as the struct, so the message is built in the task's JSON arena. It
+    /// carries the generation it was validated under, and the protocol task drops it if the role
+    /// has been torn down since (its owner replaced, or the role removed): the supported commands
+    /// it was validated against are retired.
     ///
     /// Callable from any thread.
     /// @param cmd The command, already validated by the controller role.
+    /// @param generation The low 16 bits of the controller role's teardown generation that
+    ///        stamped the supported_commands the command was validated against.
     /// @return false when the command was refused before it reached the protocol task: the
     ///         client is not running, or the command queue is full
     ///         (ProtocolTask::CONSUMER_COMMAND_BURST requests, logged). true means queued, not
     ///         sent.
-    bool send_controller_command(const ClientCommandControllerObject& cmd);
+    bool send_controller_command(const ClientCommandControllerObject& cmd, uint16_t generation);
 #endif
 
     /// @brief Acquires a ref-counted high-performance networking request. Main loop only: the
@@ -723,8 +715,8 @@ public:
 
 private:
     /// @brief The protocol-task half of a teardown: when `teardown_roles` covers every role, wipes
-    /// the event ring, the pending group and time-sync slots, the pairing notes other than a
-    /// dismissal already owed, and the trust level; and runs cleanup() on each role in
+    /// the event ring, the pending group and time-sync slots, and the pairing notes other than a
+    /// dismissal already owed; and runs cleanup() on each role in
     /// `teardown_roles`, each of which queues its stamped clear for the main loop. Protocol task,
     /// or the main loop in stop() once every other thread is joined. Each role's main-loop half
     /// runs in drain_inbox() before anything stamped with the new generation is acted on
@@ -804,14 +796,18 @@ private:
     // Protocol task
     // ========================================
 
-    /// @brief The protocol task's work, in order: the command queue, the shutdown pass once
-    /// admission is closed, the client/state snapshot, the role lists' recall check, the
-    /// outbound handshakes, each managed connection's pending pre-admission message, the inbound
-    /// ring, the losses, the lifecycle scans, the time bursts, and the published slots
-    /// (docs/internals.md "The Protocol Task's Tick"). Protocol task only.
+    /// @brief The protocol task's work, in order: the lifecycle requests and the command queue,
+    /// the shutdown pass once admission is closed, the client/state snapshot, the outbound
+    /// handshakes, each managed connection's pending pre-admission message, the inbound ring, the
+    /// losses, the lifecycle scans, the time bursts, and the published slots (docs/internals.md
+    /// "The Protocol Task's Tick"). Protocol task only.
     /// @return Milliseconds until the earliest of the task's timers, 0 to run again at once when
     ///         the ring was not drained within one pass, or ProtocolTask::NO_DEADLINE.
     uint32_t protocol_tick();
+
+    /// @brief Acts on the lifecycle requests taken from the protocol task's request slot.
+    /// Protocol task only.
+    void apply_lifecycle_requests(const LifecycleRequests& requests);
 
     /// @brief Acts on one command from the queue. Protocol task only.
     void handle_command(ProtocolCommand& command);
@@ -994,8 +990,8 @@ private:
 #ifdef SENDSPIN_ENABLE_PLAYER
     std::unique_ptr<PlayerRole> player_;
 #endif
-    /// The protocol thread, its command queue and its state slot. Created with the client and
-    /// started/stopped by start()/stop(), so a transport may wake it at any time.
+    /// The protocol thread, its command queue, its state slot and its request slot. Created with
+    /// the client and started/stopped by start()/stop(), so a transport may wake it at any time.
     std::unique_ptr<ProtocolTask> protocol_task_;
     /// In-memory pairing record store (PSK resolution). Set in start();
     /// outlives every connection the manager hands it out to.
@@ -1022,13 +1018,8 @@ private:
     /// set_unpaired_access_enabled(). Written by the setter on any thread, read by the protocol
     /// task.
     std::atomic<bool> unpaired_access_enabled_{false};
-    /// Trust level of the active connection. Written on the protocol task (on_handshake_complete()
-    /// and cleanup_connection_state()), and by stop()'s cleanup once it is joined; read from any
-    /// thread (get_current_trust()).
-    std::atomic<ConnectionTrust> current_trust_{ConnectionTrust::NONE};
-    /// High-performance requests applied and not yet released. Main loop only; atomic for the
-    /// destructor's release loop.
-    std::atomic<uint8_t> high_performance_ref_count_{0};
+    /// High-performance requests applied and not yet released. Main loop only.
+    uint8_t high_performance_ref_count_{0};
     /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;
     /// atomic so is_started() can be read from any thread. STOPPING covers the whole of stop():
     /// start() is refused and stop()/connect_to()/disconnect() are ignored while it is set, so a

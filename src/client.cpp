@@ -252,7 +252,7 @@ SendspinClient::~SendspinClient() {
         // Every high-performance hold ends with the client. Requests the protocol task queued are
         // dropped, and the holds the main loop applied are released.
         this->event_state_->high_performance_slot.reset();
-        while (this->high_performance_ref_count_.load() > 0) {
+        while (this->high_performance_ref_count_ > 0) {
             this->release_high_performance();
         }
     }
@@ -397,9 +397,9 @@ bool SendspinClient::start() {
         return false;
     }
 
-    // A command queued after the last stop() finished (a request racing it on another thread)
-    // belongs to the run that ended; this run begins with an empty queue. Accepts reopen with
-    // admission, in connection_manager_->start() below.
+    // A command queued or a request posted after the last stop() finished (a call racing it on
+    // another thread) belongs to the run that ended; this run begins with an empty queue and no
+    // request waiting. Accepts reopen with admission, in connection_manager_->start() below.
     this->protocol_task_->drop_commands();
 
     // The first client/state snapshot, taken by the protocol task's first tick: every
@@ -445,8 +445,9 @@ void SendspinClient::stop() {
         return;
     }
     // From here the client reads as stopped: is_started() is false, loop() is a no-op, and
-    // start()/stop() and every request that queues a command are refused, so a listener callback
-    // fired below cannot recurse into the teardown, restart the server, or reach a connection.
+    // start()/stop() and every request that queues a command or posts a request are refused, so
+    // a listener callback fired below cannot recurse into the teardown, restart the server, or
+    // reach a connection.
     this->lifecycle_.store(LifecycleState::STOPPING, std::memory_order_release);
 
     // 1-4. Signal the drain roles, close admission, join the protocol task (its final tick
@@ -506,17 +507,17 @@ PairingUiSnapshot SendspinClient::close_transports() {
     //    transport closes it.
     this->connection_manager_->close_admission();
 
-    // 3. The protocol task: its final tick acts on the commands queued so far (refusing every
-    //    accept with a shutdown goodbye), runs the shutdown pass (detach every connection,
-    //    goodbye each with reason shutdown, wait up to the flush bound), then the join.
+    // 3. The protocol task: its final tick acts on the commands queued and the requests posted
+    //    so far (refusing every accept with a shutdown goodbye), runs the shutdown pass (detach
+    //    every connection, goodbye and close each with reason shutdown), then the join.
     this->protocol_task_->stop();
 
-    // 4. Close every transport the shutdown pass kept, and every released outbound connection
-    //    still parked for reaping, and stop the server, joining every transport thread, then
-    //    release those connections here.
+    // 4. Close every released outbound connection still parked for reaping, and stop the
+    //    server, joining every transport thread, then release those connections and the ones the
+    //    shutdown pass kept here.
     const PairingUiSnapshot pairing_ui = this->connection_manager_->finish_stop();
 
-    // Commands a consumer pushed meanwhile are dropped here, outside any run.
+    // Commands and requests a consumer pushed meanwhile are dropped here, outside any run.
     this->protocol_task_->drop_commands();
     return pairing_ui;
 }
@@ -566,8 +567,10 @@ bool SendspinClient::create_inbound_ring() {
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         budget.audio_hold_bytes = this->player_->impl_->config.audio_buffer_capacity;
+        // The uncapped share: the cap advertised_buffer_capacity() applies is the ring's own
+        // largest item, which this derivation sets.
         player_message_bytes =
-            inbound_held_message_bytes(this->player_->impl_->advertised_buffer_capacity());
+            inbound_held_message_bytes(this->player_->impl_->buffer_capacity_share());
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
@@ -619,10 +622,7 @@ void SendspinClient::connect_to(const std::string& url) {
         SS_LOGW(TAG, "connect_to() ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::CONNECT_TO;
-    command.text = url;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.connect_to = url});
 }
 
 void SendspinClient::disconnect(SendspinGoodbyeReason reason) {
@@ -632,10 +632,7 @@ void SendspinClient::disconnect(SendspinGoodbyeReason reason) {
         SS_LOGD(TAG, "disconnect() ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::DISCONNECT;
-    command.reason = reason;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.disconnect = reason});
 }
 
 void SendspinClient::loop() {
@@ -1175,16 +1172,14 @@ void SendspinClient::set_available(bool available) {
 }
 
 void SendspinClient::leave() {
-    // messaging.md "client/leave". Not a role message, so it does not route through send_text().
-    // The protocol task applies the activation gate every outbound message has
+    // messaging.md "client/leave". Not a role message, so it is not routed to a role owner. The
+    // protocol task applies the activation gate every outbound message has
     // (ConnectionManager::leave()).
     if (!this->is_started()) {
         SS_LOGW(TAG, "client/leave ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::LEAVE;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.leave = true});
 }
 
 // ============================================================================
@@ -1224,35 +1219,11 @@ ClientStateMessage SendspinClient::build_client_state() const {
     return state_msg;
 }
 
-bool SendspinClient::send_text(const std::string& text, const std::string& role_family) {
-    // Choke point for every role-originated message a consumer formats itself; a controller
-    // command takes send_controller_command(), the same route for the struct. Pairing messages
-    // are protocol-internal: connection_manager.cpp sends them via
-    // SendspinConnection::send_app_json() directly. A declared PAIRING activity is not a gate:
-    // pairing.md "Entering and leaving pairing" says an activate that adds it does not by itself
-    // affect active_roles, so an active role keeps driving its own traffic across the attempt.
-    if (!this->is_started()) {
-        SS_LOGD(TAG, "Dropping a %s message: client is not running", role_family.c_str());
-        return false;
-    }
-    // The family names the role this library implements; the protocol task tests ownership and
-    // the exact versioned name on the owning connection (ConnectionManager::send_role_text()).
-    const std::optional<SendspinRole> role = role_for_family(role_family);
-    if (!role.has_value()) {
-        SS_LOGD(TAG, "Dropping a %s message: no such role", role_family.c_str());
-        return false;
-    }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::SEND_TEXT;
-    command.role = role.value();
-    command.text = text;
-    return this->protocol_task_->push_command(std::move(command));
-}
-
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-bool SendspinClient::send_controller_command(const ClientCommandControllerObject& cmd) {
-    // The send_text() path for a command the controller role validated, carried as the struct so
-    // the protocol task builds the message in its JSON arena (handle_command()).
+bool SendspinClient::send_controller_command(const ClientCommandControllerObject& cmd,
+                                             uint16_t generation) {
+    // The command the controller role validated, carried as the struct so the protocol task
+    // builds the message in its JSON arena and applies the role gate (handle_command()).
     if (!this->is_started()) {
         SS_LOGD(TAG, "Dropping a controller command: client is not running");
         return false;
@@ -1260,26 +1231,24 @@ bool SendspinClient::send_controller_command(const ClientCommandControllerObject
     ProtocolCommand command;
     command.type = ProtocolCommandType::SEND_CONTROLLER_COMMAND;
     command.controller_command = cmd;
+    command.controller_generation = generation;
     return this->protocol_task_->push_command(std::move(command));
 }
 #endif
 
 void SendspinClient::acquire_high_performance() {
-    if (this->high_performance_ref_count_.fetch_add(1) == 0 && this->listener_) {
+    if (this->high_performance_ref_count_++ == 0 && this->listener_) {
         this->listener_->on_request_high_performance();
     }
 }
 
 void SendspinClient::release_high_performance() {
-    // Compare-exchange loop so a release at count 0 cannot underflow the counter.
-    uint8_t count = this->high_performance_ref_count_.load();
-    while (count != 0) {
-        if (this->high_performance_ref_count_.compare_exchange_weak(count, count - 1)) {
-            if (count == 1 && this->listener_) {
-                this->listener_->on_release_high_performance();
-            }
-            return;
-        }
+    // A release at count 0 is ignored rather than underflowing the counter.
+    if (this->high_performance_ref_count_ == 0) {
+        return;
+    }
+    if (--this->high_performance_ref_count_ == 0 && this->listener_) {
+        this->listener_->on_release_high_performance();
     }
 }
 
@@ -1317,10 +1286,6 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
             retain_delivered_dismissals(current);
             return !current.empty();
         });
-
-        // The trust level is per-connection state: with no active connection there is nothing to
-        // trust, so the getter reports NONE until the next handshake completes.
-        this->current_trust_.store(ConnectionTrust::NONE, std::memory_order_release);
     }
 
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -1353,10 +1318,6 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
         this->visualizer_->impl_->cleanup();
     }
 #endif
-
-    // The protocol task recalls the items the torn-down stream roles' consumers have not taken
-    // (on its own next tick when this runs on it).
-    this->protocol_task_->wake();
 }
 
 std::string SendspinClient::build_hello_message() {
@@ -1450,7 +1411,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // roles this connection owns.
     AdmittedEntry* entry = this->connection_manager_->find_admitted(conn);
     const std::optional<ClientStateMessage>& client_state = this->task_state_->client_state;
-    if (entry == nullptr || !conn->is_connected() || !conn->is_operational() ||
+    if (entry == nullptr || !conn->accepts_app_sends() || !conn->is_operational() ||
         !client_state.has_value()) {
         return;
     }
@@ -1475,7 +1436,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // after a server/activate carries them all.
     const ClientStateMessage state_msg =
         client_state_for_roles(snapshot, entry->owned_roles & conn->get_active_role_mask());
-    conn->send_app_json(format_client_state_message(&state_msg, *this->json_arena_), nullptr);
+    conn->send_app_json(format_client_state_message(&state_msg, *this->json_arena_));
 }
 
 void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {
@@ -1615,7 +1576,6 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     ConnectionTrust trust = (conn->get_psk_category() == PskCategory::LONG_TERM)
                                 ? ConnectionTrust::USER
                                 : ConnectionTrust::NONE;
-    this->current_trust_.store(trust, std::memory_order_release);
     this->note_trust_changed(trust);
 }
 
@@ -1664,9 +1624,6 @@ void SendspinClient::apply_role_removals([[maybe_unused]] uint16_t removed_roles
         this->visualizer_->impl_->cleanup();
     }
 #endif
-    // The protocol task recalls the items a removed stream role's consumer has not taken, on
-    // its next tick.
-    this->protocol_task_->wake();
 }
 
 void SendspinClient::note_pairing_started(const std::string& server_id) {
@@ -1712,9 +1669,7 @@ void SendspinClient::confirm_pairing_window() {
         SS_LOGD(TAG, "confirm_pairing_window() ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::PAIRING_WINDOW_CONFIRM;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.pairing_window = PairingWindowRequest::CONFIRM});
 }
 
 void SendspinClient::cancel_pairing_window() {
@@ -1722,9 +1677,7 @@ void SendspinClient::cancel_pairing_window() {
         SS_LOGD(TAG, "cancel_pairing_window() ignored: client is not running");
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::PAIRING_WINDOW_CANCEL;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.pairing_window = PairingWindowRequest::CANCEL});
 }
 
 void SendspinClient::set_unpaired_access_enabled(bool enabled) {
@@ -1732,14 +1685,13 @@ void SendspinClient::set_unpaired_access_enabled(bool enabled) {
         return;
     }
     // The new value reaches the next client/hello through the flag. The connections the change
-    // no longer fits are closed by the protocol task; with the client stopped there are none.
+    // no longer fits are closed by the protocol task, which reads the flag when it applies the
+    // request, so a change and its reversal before that tick apply as the value they end on;
+    // with the client stopped there are none.
     if (!this->is_started()) {
         return;
     }
-    ProtocolCommand command;
-    command.type = ProtocolCommandType::SET_UNPAIRED_ACCESS;
-    command.enabled = enabled;
-    (void)this->protocol_task_->push_command(std::move(command));
+    this->protocol_task_->post_requests({.unpaired_access_changed = true});
 }
 
 bool SendspinClient::is_unpaired_access_enabled() const {
