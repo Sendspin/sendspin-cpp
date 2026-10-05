@@ -171,11 +171,13 @@ set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno
 # which no public call can stop between their steps: SourceTask's process(), run() and
 # event_flags_ (the source task's loop, one step at a time, and its exit), its capture_ring_,
 # outbound_ring_ and protocol_task_ (rings created without the thread, so what a step produced
-# stays to be read), chunk_item_ (a chunk begun but not filled) and chunk_message_bytes_ (the size
-# a completed chunk is acquired at, to write
-# one as the task would); SourceRole's impl_ (the hello and state objects without a server, the
-# stream gate a stream opening sets, the task); and, for the stand-in connection it installs as
-# the protocol task does, SendspinClient's protocol_task_ (stopped), connection_manager_ (its
+# stays to be read), chunk_item_ (a chunk begun but not filled), chunk_message_bytes_ (the size
+# a completed chunk is acquired at, to write one as the task would) and opus_encoder_ (the
+# encoder an OPUS config's start() creates, given to a rig without the thread, or a stand-in
+# recording the task's encoder calls, which start() keeps); SourceRole's impl_ (the hello and
+# state objects without a server, the stream gate and codec a stream opening sets, the task);
+# and, for the stand-in connection it installs as the protocol task does, SendspinClient's
+# protocol_task_ (stopped), connection_manager_ (its
 # install_admitted(), find_admitted(), close_admission() and liveness_timeout_us_, off so the
 # stand-in's silence does not close it), json_arena_, process_json_message() and protocol_tick(),
 # high_performance_ref_count_ (the stream's hold), SendspinTimeBurst's last_burst_complete_time_

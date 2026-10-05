@@ -91,8 +91,10 @@ the descriptions in `docs/internals.md`:
   `cmake/sources.cmake` and the dispatch points in
   `include/sendspin/client.h`, `src/client.cpp` and `src/client_dispatch.cpp`;
   the codec gate
-  `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`, and
-  `src/player_role.cpp`. Examples must build with roles (and Opus) disabled:
+  `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`,
+  `src/player_role.cpp`, `src/source_role.cpp`, `src/source_task.cpp`, and
+  the source's Opus encoder list in `cmake/sources.cmake`. Examples must
+  build with roles (and Opus) disabled:
   role and opus usage in `examples/` is guarded like an external consumer
   would guard it. Verify this by grepping the example for the role's types
   and calls and confirming each use sits inside the matching `#ifdef`; do

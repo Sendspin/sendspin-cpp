@@ -62,9 +62,8 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         ARDUINOJSON_USE_LONG_LONG=1
     )
 
-    # micro-flac and micro-opus (audio codec libraries, required by player/decoder)
-    # Only fetched and linked when the player role is enabled; micro-opus also needs
-    # SENDSPIN_ENABLE_OPUS.
+    # Audio codec libraries: micro-flac for the player's FLAC decoder; micro-opus, with
+    # SENDSPIN_ENABLE_OPUS, for the player's Opus decoder and the source's Opus encoder.
     if(SENDSPIN_ENABLE_PLAYER)
         FetchContent_Declare(
             micro_flac
@@ -74,17 +73,17 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         )
         FetchContent_MakeAvailable(micro_flac)
         target_link_libraries(${TARGET_LIB} PUBLIC micro_flac)
+    endif()
 
-        if(SENDSPIN_ENABLE_OPUS)
-            FetchContent_Declare(
-                micro_opus
-                GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git
-                GIT_TAG        v0.3.5
-                GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
-            )
-            FetchContent_MakeAvailable(micro_opus)
-            target_link_libraries(${TARGET_LIB} PUBLIC micro_opus)
-        endif()
+    if(SENDSPIN_ENABLE_OPUS AND (SENDSPIN_ENABLE_PLAYER OR SENDSPIN_ENABLE_SOURCE))
+        FetchContent_Declare(
+            micro_opus
+            GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git
+            GIT_TAG        v0.3.5
+            GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
+        )
+        FetchContent_MakeAvailable(micro_opus)
+        target_link_libraries(${TARGET_LIB} PUBLIC micro_opus)
     endif()
 
     # IXWebSocket (WebSocket server/client for host networking)

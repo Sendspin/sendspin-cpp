@@ -117,8 +117,8 @@ public:
     SourceTask(const SourceTask&) = delete;
     SourceTask& operator=(const SourceTask&) = delete;
 
-    /// @brief Creates the rings and the event flags, then starts the thread, which waits for
-    /// captured audio. Main loop, from SourceRole::Impl::start().
+    /// @brief Creates the rings, the event flags and an OPUS config's encoder, then starts the
+    /// thread, which waits for captured audio. Main loop, from SourceRole::Impl::start().
     /// @param protocol_task Woken whenever a chunk is completed.
     /// @return false on an allocation failure or when the thread is already running.
     bool start(ProtocolTask* protocol_task);
@@ -151,7 +151,8 @@ protected:
 
     /// @brief Starts a chunk at the capture item in progress: acquires its outbound item, waiting
     /// at most chunk_duration_ms, and anchors it on the item's first unread sample. A new
-    /// generation also resets the encoder.
+    /// generation also resets the encoder, warming the Opus encoder up first on this thread's first
+    /// Opus stream.
     /// @return false when the outbound ring had no room: the chunk is dropped and the capture
     ///         backlog flushed to live capture.
     bool begin_chunk(const OutboundItemHeader& capture);
@@ -171,12 +172,16 @@ protected:
     /// from live capture (roles/source/v1.md "Source Audio Chunks (Binary)")
     void flush_to_live();
 
-    /// @brief The encoder for a stream of `codec`
+    /// @brief The encoder for a stream of `codec`: the Opus encoder for opus, the passthrough
+    /// otherwise
     SourceEncoder* encoder_for(SendspinCodecFormat codec);
 
     // Struct fields
     EventFlags event_flags_;
     PcmPassthroughEncoder pcm_encoder_;
+    /// The Opus encoder of an OPUS config, created by the first start() and kept, like the
+    /// capture ring; null otherwise.
+    std::unique_ptr<SourceEncoder> opus_encoder_;
     std::unique_ptr<OutboundRing> capture_ring_;
     std::unique_ptr<OutboundRing> outbound_ring_;
     std::thread task_thread_;
@@ -231,6 +236,9 @@ protected:
     bool producer_frame_warned_{false};
     /// Task-only: an outbound acquire failed and none has succeeded since.
     bool stall_episode_{false};
+    /// Task-only: opus_encoder_ was warmed up on this run's thread (SourceEncoder::warm_up());
+    /// micro-opus's pseudostack is per thread.
+    bool opus_warm_{false};
 };
 
 }  // namespace sendspin

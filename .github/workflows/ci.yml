@@ -93,8 +93,8 @@ jobs:
 
       - name: Configure CMake
         # SENDSPIN_ENABLE_OPUS=OFF must build the library, the examples, and the tests without
-        # micro-opus. The player tests that only exist in this configuration run under ASan/UBSan
-        # here, like the default suite does in the test job.
+        # micro-opus. The player and source tests whose results differ in this configuration run
+        # under ASan/UBSan here, like the default suite does in the test job.
         run: cmake -B build-no-opus -DENABLE_WERROR=ON -DSENDSPIN_ENABLE_OPUS=OFF -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON .
 
       - name: Build
@@ -146,10 +146,17 @@ jobs:
         config:
           - name: default
             sdkconfig_defaults: sdkconfig.defaults
+            flac: 'on'
             opus: 'on'
           - name: no-opus
             sdkconfig_defaults: sdkconfig.defaults;sdkconfig.no_opus
+            flac: 'on'
             opus: 'off'
+          # Player off: micro-opus comes in for the source's encoder alone
+          - name: source-only
+            sdkconfig_defaults: sdkconfig.defaults;sdkconfig.source_only
+            flac: 'off'
+            opus: 'on'
     defaults:
       run:
         shell: bash
@@ -165,7 +172,7 @@ jobs:
       - name: Check codec dependencies
         run: |
           . "$IDF_PATH/export.sh" > /dev/null
-          python check_build.py --opus ${{ matrix.config.opus }}
+          python check_build.py --flac ${{ matrix.config.flac }} --opus ${{ matrix.config.opus }}
 
   ci:
     name: CI

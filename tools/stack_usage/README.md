@@ -87,7 +87,8 @@ there: the source `httpd_send_all$isra$0`, which exists only at `-Os`; the targe
 operator keyed by its mangled name (the new-connection callback), inlined at `-Os`, where the
 edge keyed on its caller (`deliver_upgraded()`) stands in for it; and the source task's
 `SourceTask::begin_chunk()` and `finish_chunk()`, which the compiler may inline into
-`process()`, whose edges cover the same encoder calls. Any other name means a table entry has
+`process()`, whose edges cover the same encoder calls; and, in a build without
+`SENDSPIN_ENABLE_OPUS`, the `OpusSourceEncoder` targets. Any other name means a table entry has
 gone stale.
 
 Every run counts, on stderr, the call cycles each task reaches; `--cycles` lists them, marking
@@ -95,7 +96,9 @@ those on the deepest path. The ones the current tree reaches, and how deep each 
 
 - CELT's `quant_partition` calls itself once per band split, with `LM` one lower each time, so
   at the 20 ms frame size (`LM` 3) it nests five deep where the total charges one: up to 4 x 144
-  bytes more on the sync task.
+  bytes more on the sync task's decode and on the source task's Opus encode; the source task's
+  default for an `OPUS` config (`DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE`) adds that margin to its
+  bound.
 - `opus_decode_frame` and `opus_decode_native` call themselves at most once, for a transition
   or packet-loss frame with no data, which takes the concealment path rather than the band
   decode the total charges.

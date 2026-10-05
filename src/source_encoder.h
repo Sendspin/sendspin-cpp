@@ -48,6 +48,11 @@ public:
     virtual uint8_t* input_buffer() {
         return nullptr;
     }
+
+    /// @brief Prepares the calling thread for encode() so its first chunk allocates nothing.
+    /// Leaves encoder state behind (reset() before streaming) and may overwrite input_buffer(),
+    /// so it is never called with a chunk partly assembled.
+    virtual void warm_up() {}
 };
 
 /// @brief Encoder for pcm streams: the assembled chunk already is the payload

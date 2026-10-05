@@ -144,9 +144,11 @@ checklists in `.claude/skills/` apply these standards to a diff.
   `cmake/sources.cmake` and the dispatch points in
   `include/sendspin/client.h`, `src/client.cpp` and `src/client_dispatch.cpp`,
   and the codec gate
-  `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`, and
-  `src/player_role.cpp`; consumers, including the examples, guard their own
-  role and codec usage (see Public API).
+  `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`,
+  `src/player_role.cpp`, `src/source_role.cpp`, `src/source_task.cpp`, and
+  the source's Opus encoder list in `cmake/sources.cmake`; consumers,
+  including the examples, guard their own role and codec usage (see Public
+  API).
 - Logging uses the `SS_LOG*` macros; allocation uses the `platform_malloc`
   family with an explicit `MemoryLocation` choice where it matters.
 - Code that only builds on one platform still keeps the other platform's build

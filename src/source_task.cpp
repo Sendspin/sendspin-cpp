@@ -21,6 +21,7 @@
 #include "platform/time.h"
 #include "protocol_messages.h"
 #include "protocol_task.h"
+#include "source_encoder_opus.h"
 #include "source_role_impl.h"
 
 #include <algorithm>
@@ -77,9 +78,14 @@ SourceTask::SourceTask(SourceRole::Impl* role)
     : role_(role),
       bytes_per_frame_(source_bytes_per_frame(role->config.channels, role->config.bit_depth)),
       chunk_bytes_(source_chunk_bytes(role->config)),
-      // The largest payload is the PCM chunk itself, which the passthrough encoder writes.
-      // AEAD_TAG_SIZE of room behind the message takes the in-place encrypt's tag.
-      chunk_message_bytes_(SOURCE_CHUNK_HEADER_SIZE + this->chunk_bytes_ + AEAD_TAG_SIZE) {}
+      // The largest payload: the PCM chunk, which an OPUS role still streams to a server that
+      // does not list opus, and for an OPUS config an Opus packet, which can outgrow a short
+      // chunk's PCM. AEAD_TAG_SIZE of room behind the message takes the in-place encrypt's tag.
+      chunk_message_bytes_(SOURCE_CHUNK_HEADER_SIZE +
+                           (role->config.codec == SendspinCodecFormat::OPUS
+                                ? std::max(this->chunk_bytes_, OpusSourceEncoder::MAX_PACKET_BYTES)
+                                : this->chunk_bytes_) +
+                           AEAD_TAG_SIZE) {}
 
 SourceTask::~SourceTask() {
     this->stop();
@@ -103,6 +109,17 @@ bool SourceTask::start(ProtocolTask* protocol_task) {
         }
         this->capture_ring_ = std::move(capture_ring);
     }
+    if (config.codec == SendspinCodecFormat::OPUS && this->opus_encoder_ == nullptr) {
+#ifdef SENDSPIN_ENABLE_OPUS
+        auto opus_encoder = std::make_unique<OpusSourceEncoder>();
+        if (!opus_encoder->init(config)) {
+            return false;  // Logged by the encoder
+        }
+        this->opus_encoder_ = std::move(opus_encoder);
+#else
+        return false;  // Unreachable: validate_config() refuses OPUS without the encoder
+#endif
+    }
     auto outbound_ring = std::make_unique<OutboundRing>();
     if (!outbound_ring->create(
             derive_outbound_ring_bytes(this->chunk_message_bytes_, OUTBOUND_RING_ITEM_COUNT),
@@ -117,13 +134,17 @@ bool SourceTask::start(ProtocolTask* protocol_task) {
     this->chunk_item_ = nullptr;
     this->encoder_generation_ = 0;
     this->stall_episode_ = false;
+    this->opus_warm_ = false;
     // The producer's episode flags too: the gate is closed, so no write admitted from now on
     // touches them until a stream opens
     this->producer_dropped_writes_ = 0;
     this->producer_drop_episode_ = false;
     this->producer_frame_warned_ = false;
-    platform_configure_thread("SsSrc", SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE,
-                              static_cast<int>(config.priority), config.psram_stack);
+    const size_t stack_size = config.codec == SendspinCodecFormat::OPUS
+                                  ? SourceRoleConfig::DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE
+                                  : SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE;
+    platform_configure_thread("SsSrc", stack_size, static_cast<int>(config.priority),
+                              config.psram_stack);
     this->task_thread_ = std::thread(thread_entry, this);
     this->event_flags_.wait(SourceTaskBits::SOURCE_TASK_IDLE | SourceTaskBits::SOURCE_TASK_STOPPED,
                             false, false, UINT32_MAX);
@@ -291,6 +312,12 @@ bool SourceTask::begin_chunk(const OutboundItemHeader& capture) {
         // Read after the gate admitted this generation, which publishes the codec chosen for it
         this->encoder_ =
             this->encoder_for(this->role_->stream_codec.load(std::memory_order_acquire));
+        if (this->encoder_ == this->opus_encoder_.get() && !this->opus_warm_) {
+            // So micro-opus allocates this thread's pseudostack here, before the first Opus
+            // chunk's encode, and a run that never streams opus never allocates it
+            this->encoder_->warm_up();
+            this->opus_warm_ = true;
+        }
         this->encoder_->reset();
         this->encoder_generation_ = capture.generation;
     }
@@ -352,8 +379,12 @@ void SourceTask::flush_to_live() {
     }
 }
 
-SourceEncoder* SourceTask::encoder_for(SendspinCodecFormat /*codec*/) {
-    // PCM is the one codec the role streams (SourceRole::Impl::validate_config())
+SourceEncoder* SourceTask::encoder_for(SendspinCodecFormat codec) {
+    // Opus is chosen only for an OPUS config (SourceRole::Impl::choose_codec()), whose start()
+    // created the encoder
+    if (codec == SendspinCodecFormat::OPUS && this->opus_encoder_ != nullptr) {
+        return this->opus_encoder_.get();
+    }
     return &this->pcm_encoder_;
 }
 
