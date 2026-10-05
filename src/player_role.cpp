@@ -191,10 +191,6 @@ const ServerPlayerStreamObject& PlayerRole::get_current_stream_params() const {
     return this->impl_->current_stream_params;
 }
 
-int32_t PlayerRole::get_fixed_delay_us() const {
-    return this->impl_->config.fixed_delay_us;
-}
-
 bool PlayerRole::get_muted() const {
     return this->impl_->muted;
 }
