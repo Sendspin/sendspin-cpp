@@ -374,6 +374,9 @@ void InboundConsumer::unbind() {
     this->items_.recall();
     this->items_.unbind();
     this->ring_ = nullptr;
+    // The role's cleanup() calls recall() only after this, when it is a no-op, so the run ends
+    // here.
+    this->drop_log_.end_run(TAG, this->dropped_items_name());
 }
 
 void* InboundConsumer::take(uint32_t timeout_ms, const std::atomic<uint32_t>& generation) {
@@ -403,18 +406,54 @@ void* InboundConsumer::copy_local(const uint8_t* data, size_t len, uint32_t rece
     return item;
 }
 
-bool InboundConsumer::hand(void* item, size_t item_len, uint32_t generation, bool exempt) {
+bool InboundConsumer::hand(void* item, size_t item_len, InboundItemFields fields,
+                           uint32_t generation, bool exempt) {
     InboundRing* ring = this->ring();
-    inbound_item_header(item)->generation = generation;
+    InboundItemHeader* header = inbound_item_header(item);
+    header->data_len = fields.data_len;
+    header->serial = fields.serial;
+    header->type = fields.type;
+    header->data_offset = fields.data_offset;
+    header->generation = generation;
     if (!ring->charge(item, item_len, this->holder_, exempt)) {
-        // Throttled: see InboundDropLog.
-        this->note_drop("over its buffer; dropping items until it drains");
+        this->note_drop(DropReason::OVER_QUOTA);
         ring->return_item(item);
         return false;
     }
     this->items_.append(item);
     this->drop_log_.end_run(TAG, this->dropped_items_name());
     return true;
+}
+
+bool InboundConsumer::hand_message(InboundMessage& message, InboundItemFields fields,
+                                   uint32_t generation) {
+    void* item = std::exchange(message.item, nullptr);
+    size_t item_len = message.item_len;
+    if (item == nullptr) {
+        // Copied whole, so the consumer finds the message where it would in a received item.
+        if (message.len > this->ring()->max_item_message_bytes()) {
+            this->note_drop(DropReason::TOO_LONG);
+            return false;
+        }
+        item = this->copy_local(message.data, message.len, message.receive_time_us, 0);
+        if (item == nullptr) {
+            this->note_drop(DropReason::NO_ROOM);
+            return false;
+        }
+        item_len = message.len;
+    }
+    return this->hand(item, item_len, fields, generation, /*exempt=*/false);
+}
+
+bool InboundConsumer::hand_local(const void* data, size_t len, InboundItemFields fields,
+                                 uint32_t generation) {
+    if (this->ring() == nullptr) {
+        return false;
+    }
+    void* item =
+        this->copy_local(static_cast<const uint8_t*>(data), len, 0, INBOUND_ACQUIRE_TIMEOUT_MS);
+    // Exempt, so the hand itself cannot refuse it.
+    return item != nullptr && this->hand(item, len, fields, generation, /*exempt=*/true);
 }
 
 void InboundConsumer::recall() {
@@ -452,10 +491,43 @@ const char* InboundConsumer::holder_name() const {
     return "Artwork";
 }
 
-void InboundConsumer::note_drop(const char* message) {
-    if (this->drop_log_.note_drop()) {
-        SS_LOGW(TAG, "%s %s", this->holder_name(), message);
+const char* InboundConsumer::item_noun() const {
+    switch (this->holder_) {
+        case InboundHolder::PLAYER:
+            return "an audio chunk";
+        case InboundHolder::VISUALIZER:
+            return "a frame";
+        case InboundHolder::ARTWORK:
+            break;
     }
+    return "an image part";
+}
+
+void InboundConsumer::note_drop(DropReason reason) {
+    if (this->ring() == nullptr) {
+        return;
+    }
+    // Only a run's first drop logs (InboundDropLog).
+    if (!this->drop_log_.note_drop()) {
+        return;
+    }
+    switch (reason) {
+        case DropReason::OVER_QUOTA:
+            SS_LOGW(TAG, "%s over its buffer; dropping items until it drains", this->holder_name());
+            return;
+        case DropReason::TOO_LONG:
+            SS_LOGW(TAG, "%s received %s longer than the ring's largest item; dropping",
+                    this->holder_name(), this->item_noun());
+            return;
+        case DropReason::TOO_SHORT:
+            SS_LOGW(TAG, "%s received %s too short for its header; dropping", this->holder_name(),
+                    this->item_noun());
+            return;
+        case DropReason::NO_ROOM:
+            break;
+    }
+    SS_LOGW(TAG, "%s has no ring space to copy %s into; dropping", this->holder_name(),
+            this->item_noun());
 }
 
 }  // namespace sendspin

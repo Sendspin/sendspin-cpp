@@ -394,7 +394,6 @@ std::unique_ptr<VisualizerRole::Impl> make_visualizer(InboundRing& ring) {
     impl->attach_inbox(inboxes.emplace_back());
     impl->stream_active = true;
     impl->negotiated_types_mask = 0x1F;
-    EXPECT_TRUE(impl->drain_task->event_flags.create());
     EXPECT_TRUE(impl->drain_task->inbound.bind(&ring, InboundHolder::VISUALIZER));
     return impl;
 }
@@ -509,7 +508,7 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
         EXPECT_FALSE(visualizer->drain_task->inbound.items().is_empty());
 
         EXPECT_EQ(take_all(*player).size(), row.player_items);
-        visualizer->flush_items();
+        visualizer->drain_task->inbound.recall();
         EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
             << "a dropped chunk kept its charge";
         EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U);

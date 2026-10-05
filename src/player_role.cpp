@@ -49,9 +49,6 @@ static constexpr size_t AUDIO_CHUNK_HEADER_SIZE = BINARY_TIMESTAMP_SIZE + BINARY
 /// @brief Upper bound on the output delay, per roles/player/v1.md "Output delay": clients MUST
 /// clamp output_delay_ms to the range 0-5000.
 static constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000U;
-/// @brief Bound on waiting for inbound ring space for a codec header or a stream/clear marker
-/// (see sendspin::INBOUND_ACQUIRE_TIMEOUT_MS): the sync task frees space as it plays.
-static constexpr uint32_t HEADER_SEND_TIMEOUT_MS = sendspin::INBOUND_ACQUIRE_TIMEOUT_MS;
 /// @brief Offset of an audio chunk's encoded frame in its plaintext: the message type byte, then
 /// the chunk header.
 static constexpr size_t AUDIO_FRAME_OFFSET = 1 + AUDIO_CHUNK_HEADER_SIZE;
@@ -341,9 +338,15 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
 
 SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
+    InboundConsumer& inbound = this->sync_task->inbound();
+    if (inbound.ring() == nullptr) {
+        // Verbose on the per-chunk path: start() already warned once.
+        SS_LOGV(TAG, "Discarding audio chunk: the sync task is not running");
+        return;
+    }
     auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
     if (!chunk.has_value()) {
-        SS_LOGW(TAG, "Binary message too short for the audio chunk header");
+        inbound.note_drop(InboundConsumer::DropReason::TOO_SHORT);
         return;
     }
     if (chunk->audio_len == 0) {
@@ -358,45 +361,21 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
         SS_LOGV(TAG, "Discarding audio chunk while unavailable");
         return;
     }
-    InboundConsumer& inbound = this->sync_task->inbound();
-    if (inbound.ring() == nullptr) {
-        SS_LOGW(TAG, "Failed to send audio chunk: the sync task is not running");
-        return;
-    }
-    void* item = std::exchange(message.item, nullptr);
-    size_t item_len = message.item_len;
-    if (item == nullptr) {
-        // A chunk reassembled from Noise fragments (one larger than a Noise frame) or routed
-        // through the fallback buffer (longer than the ring takes) is not in a ring item: copied
-        // into one, whole, so its timestamp stays at plaintext bytes 1-8. No wait: audio over a
-        // full ring is dropped, like audio over the quota. A chunk longer than the ring's largest
-        // item (half the storage) can never be copied in; only a server over the capacity the
-        // role advertises (advertised_buffer_capacity()) sends one, which is not a full ring, and
-        // it is logged apart so a device log tells the two apart.
-        if (message.len > inbound.ring()->max_item_message_bytes()) {
-            inbound.note_drop("received an audio chunk longer than the ring's largest item; "
-                              "dropping");
-            return;
-        }
-        item = inbound.copy_local(message.data, message.len, message.receive_time_us, 0);
-        if (item == nullptr) {
-            inbound.note_drop("has no ring space to copy an audio chunk into; dropping");
-            return;
-        }
-        item_len = message.len;
-    }
-    // Otherwise the zero-copy path: the chunk stays in the ring item it was received and
-    // decrypted into, and the sync task decodes it from there.
-    this->hand_item(item, item_len, CHUNK_TYPE_ENCODED_AUDIO, AUDIO_FRAME_OFFSET,
-                    static_cast<uint32_t>(chunk->audio_len), generation);
+    // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
+    // advertised buffer_capacity, which the quota covers at the smallest chunk size.
+    (void)inbound.hand_message(message,
+                               {.data_len = static_cast<uint32_t>(chunk->audio_len),
+                                .serial = 0,
+                                .type = CHUNK_TYPE_ENCODED_AUDIO,
+                                .data_offset = AUDIO_FRAME_OFFSET},
+                               generation);
 }
 
 void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
-    // This stream's ordinal: hand_item() numbers its codec header with the same
-    // stream_ordinal + 1 and its STREAM_START carries it, so the sync task starts it only on its
-    // own acknowledgement.
+    // Numbers the codec header and the STREAM_START, so the sync task starts the stream only on
+    // its own acknowledgement. Adopted once the header is handed over.
     const auto ordinal = static_cast<uint16_t>(this->stream_ordinal + 1);
 
     if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
@@ -416,8 +395,12 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
                                        ? CHUNK_TYPE_PCM_DUMMY_HEADER
                                        : CHUNK_TYPE_OPUS_DUMMY_HEADER;
 
-            header_sent = this->hand_local_item(reinterpret_cast<const uint8_t*>(&header),
-                                                sizeof(DummyHeader), chunk_type, generation);
+            header_sent = this->sync_task->inbound().hand_local(&header, sizeof(DummyHeader),
+                                                                {.data_len = sizeof(DummyHeader),
+                                                                 .serial = ordinal,
+                                                                 .type = chunk_type,
+                                                                 .data_offset = 0},
+                                                                generation);
             if (!header_sent) {
                 SS_LOGE(TAG, "Failed to send codec header");
             }
@@ -425,7 +408,8 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
             if (!player_obj.codec_header.has_value()) {
                 SS_LOGE(TAG, "FLAC codec header missing");
             } else {
-                header_sent = this->hand_flac_header(player_obj.codec_header.value(), generation);
+                header_sent =
+                    this->hand_flac_header(player_obj.codec_header.value(), ordinal, generation);
                 if (!header_sent) {
                     SS_LOGE(TAG, "Failed to send codec header");
                 }
@@ -466,7 +450,10 @@ void PlayerRole::Impl::handle_stream_clear() {
     // so the sync task starts draining (freeing ring space) before the marker is written.
     // No listener callback: a seek is not a stream lifecycle event for the consumer.
     this->sync_task->signal_stream_clear();
-    if (!this->hand_local_item(nullptr, 0, CHUNK_TYPE_STREAM_CLEAR_MARKER, generation)) {
+    if (!this->sync_task->inbound().hand_local(
+            nullptr, 0,
+            {.data_len = 0, .serial = 0, .type = CHUNK_TYPE_STREAM_CLEAR_MARKER, .data_offset = 0},
+            generation)) {
         // The marker couldn't be appended (no ring space). The sync task will
         // still drain to empty and apply the clear, but the pre-seek/post-seek boundary is lost,
         // so new audio may be discarded along with the old.
@@ -719,44 +706,14 @@ void PlayerRole::Impl::complete_teardown() {
 // Impl: Helpers
 // ============================================================================
 
-bool PlayerRole::Impl::hand_item(void* item, size_t item_len, ChunkType chunk_type,
-                                 uint8_t data_offset, uint32_t data_len,
-                                 uint32_t generation) const {
-    InboundItemHeader* header = inbound_item_header(item);
-    header->type = chunk_type;
-    header->data_offset = data_offset;
-    header->data_len = data_len;
-    const bool audio = chunk_type == CHUNK_TYPE_ENCODED_AUDIO;
-    if (!audio && chunk_type != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
-        // A codec header numbers the stream it starts; handle_stream_start() computes the same
-        // ordinal for its STREAM_START and adopts it once the header is handed over. Every other
-        // item keeps acquire()'s 0.
-        header->serial = static_cast<uint16_t>(this->stream_ordinal + 1);
-    }
-    // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
-    // advertised buffer_capacity, which the quota covers at the smallest chunk size. A codec
-    // header and a clear marker are exempt (InboundConsumer::hand()).
-    return this->sync_task->inbound().hand(item, item_len, generation, /*exempt=*/!audio);
-}
-
-bool PlayerRole::Impl::hand_local_item(const uint8_t* data, size_t len, ChunkType chunk_type,
-                                       uint32_t generation) const {
-    InboundConsumer& inbound = this->sync_task->inbound();
-    if (inbound.ring() == nullptr) {
-        return false;
-    }
-    void* item = inbound.copy_local(data, len, 0, HEADER_SEND_TIMEOUT_MS);
-    return item != nullptr &&
-           this->hand_item(item, len, chunk_type, 0, static_cast<uint32_t>(len), generation);
-}
-
-bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header,
+bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint16_t ordinal,
                                         uint32_t generation) const {
-    InboundRing* ring = this->sync_task->inbound().ring();
+    InboundConsumer& inbound = this->sync_task->inbound();
+    InboundRing* ring = inbound.ring();
     if (ring == nullptr) {
         return false;
     }
-    // Decoded straight into the item the sync task reads it from.
+    // Decoded straight into the item, saving hand_local()'s second buffer and copy.
     const auto* input = reinterpret_cast<const unsigned char*>(codec_header.data());
     size_t decoded_len = 0;
     platform_base64_decode(nullptr, 0, &decoded_len, input, codec_header.size());
@@ -764,7 +721,7 @@ bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header,
         SS_LOGW(TAG, "FLAC codec header of %zu bytes is out of range", decoded_len);
         return false;
     }
-    void* item = ring->acquire_local(decoded_len, HEADER_SEND_TIMEOUT_MS);
+    void* item = ring->acquire_local(decoded_len, INBOUND_ACQUIRE_TIMEOUT_MS);
     if (item == nullptr) {
         return false;
     }
@@ -781,8 +738,13 @@ bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header,
         ring->return_item(item);
         return false;
     }
-    return this->hand_item(item, decoded_len, CHUNK_TYPE_FLAC_HEADER, 0,
-                           static_cast<uint32_t>(written), generation);
+    // Exempt, like every codec header.
+    return inbound.hand(item, decoded_len,
+                        {.data_len = static_cast<uint32_t>(written),
+                         .serial = ordinal,
+                         .type = CHUNK_TYPE_FLAC_HEADER,
+                         .data_offset = 0},
+                        generation, /*exempt=*/true);
 }
 
 void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation,

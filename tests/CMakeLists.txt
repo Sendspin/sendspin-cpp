@@ -166,7 +166,8 @@ set_source_files_properties(test_json_arena.cpp PROPERTIES COMPILE_OPTIONS -fno-
 
 # test_inbound_ring.cpp sets InboundGate's private CONSUMED bit directly to stage a consume bit
 # that lands after the transport has published its next message, an interleaving of two threads
-# no public call can produce on demand.
+# no public call can produce on demand, and reads an InboundConsumer's private drop-run count,
+# which nothing public reports.
 set_source_files_properties(test_inbound_ring.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_record_store.cpp reads records_ directly and calls the store's private locked-context

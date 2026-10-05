@@ -198,7 +198,6 @@ std::unique_ptr<VisualizerRole::Impl> make_impl() {
     impl->negotiated_types_mask = 0x1F;
     InboundRing& ring = rings.emplace_back();
     create_test_ring(ring);
-    EXPECT_TRUE(impl->drain_task->event_flags.create());
     EXPECT_TRUE(impl->drain_task->inbound.bind(&ring, InboundHolder::VISUALIZER));
     return impl;
 }
@@ -218,8 +217,8 @@ void hand(VisualizerRole::Impl& impl, uint8_t type, const std::vector<uint8_t>& 
     take_in_ring_order(*impl.drain_task->inbound.ring());
 }
 
-// One item the drain thread would take: its item type (the wire type, or the clear marker's),
-// the transport's receive stamp, and the message bytes it carries (empty for a marker).
+// One item the drain thread would take: its item type (the wire type), the transport's receive
+// stamp, and the message bytes it carries.
 struct Entry {
     uint8_t type{0};
     uint32_t receive_time_us{0};
@@ -513,11 +512,7 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
     impl->handle_stream_start(stream);
     take_in_ring_order(*impl->drain_task->inbound.ring());
 
-    // stream/start appends a boundary marker, which carries no message bytes; consume it first.
     Entry entry;
-    ASSERT_TRUE(pop_entry(*impl, entry));
-    ASSERT_TRUE(entry.message.empty());
-
     std::vector<uint8_t> data;
     put_be64(data, 1);
     data.push_back(0x01);
@@ -531,106 +526,89 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 }
 
 // ============================================================================
-// Clear-boundary marker: stream/clear (and stream/start) enqueue a sentinel so
-// the drain thread discards exactly the entries that predate the boundary.
+// Stream boundaries: every stream/start, stream/end, stream/clear and teardown recalls the listed
+// frames and moves the role's boundary sequence on.
 // ============================================================================
 
-TEST(VisualizerClearMarker, StreamClearEnqueuesMarker) {
-    auto impl = make_impl();
-
-    impl->handle_stream_clear();
-
-    take_in_ring_order(*impl->drain_task->inbound.ring());
-
-    // The marker's item type lies outside the visualizer wire-type range, so it can never be
-    // mistaken for a message: the exact value is an internal encoding, the range is the contract.
-    Entry entry;
-    ASSERT_TRUE(pop_entry(*impl, entry));
-    ASSERT_TRUE(entry.message.empty());
-    EXPECT_TRUE(entry.type < SENDSPIN_BINARY_VISUALIZER_FIRST ||
-                entry.type > SENDSPIN_BINARY_VISUALIZER_LAST)
-        << "the clear marker collides with wire type " << static_cast<int>(entry.type);
-}
-
-// A clear marker is exempt from the quota (InboundConsumer::hand()): a server that overran the
-// buffer_capacity it was told still gets its stream/clear boundary, or the drain thread would
-// blur the old stream into the new one. Control: a frame over the same quota is refused, so the
-// quota does bind.
-TEST(VisualizerClearMarker, AClearMarkerPassesAQuotaTheServersFramesExhausted) {
+// A boundary returns the frames listed before it, so only frames sent after the latest one
+// survive (roles/visualizer/v1.md "stream/end", messaging.md "stream/clear"). The rows drive the
+// handlers with no drain thread; the held frame is covered by
+// ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime.
+// Gap: a current held frame's resumed wait.
+TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
+    enum class Step { END, START, CLEAR, CLEANUP, FRAME };
     struct Row {
         const char* name;
-        bool marker;
-        bool listed;
+        std::vector<Step> steps;
+        std::vector<uint8_t> surviving;  // the last payload byte of each frame taken
     };
+    // Every row first lists two frames of the running stream (payload 0x01); each FRAME step
+    // lists one carrying the next value from 0x02.
     const Row rows[] = {
-        {"Control: a frame over quota is refused", false, false},
-        {"a clear marker over quota is still handed over", true, true},
+        {"Control: no boundary keeps the running stream's frames", {}, {0x01, 0x01}},
+        {"an end with no stream after it empties the list", {Step::END}, {}},
+        {"an end then a start keeps the new stream's frame",
+         {Step::END, Step::START, Step::FRAME},
+         {0x02}},
+        {"a clear keeps the frame sent after it", {Step::CLEAR, Step::FRAME}, {0x02}},
+        {"a start and its frame followed by an end empties the list",
+         {Step::START, Step::FRAME, Step::END},
+         {}},
+        {"two starts keep only the second stream's frame",
+         {Step::START, Step::FRAME, Step::START, Step::FRAME},
+         {0x03}},
+        {"a teardown then a start keeps the new stream's frame",
+         {Step::CLEANUP, Step::START, Step::FRAME},
+         {0x02}},
+    };
+
+    ServerVisualizerStreamObject stream;
+    stream.types = {VisualizerDataType::LOUDNESS};
+    auto loudness = [](uint8_t value) {
+        std::vector<uint8_t> data;
+        put_be64(data, value);
+        put_be16(data, value);
+        return data;
     };
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
         InboundRing& ring = *impl->drain_task->inbound.ring();
-        ring.quota(InboundHolder::VISUALIZER).set_limit(0);
-
-        if (row.marker) {
-            impl->handle_stream_clear();
-            take_in_ring_order(ring);
-        } else {
-            std::vector<uint8_t> data;
-            put_be64(data, 1);
-            put_be16(data, 0x0001);
-            hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+        hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, loudness(0x01));
+        hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, loudness(0x01));
+        uint8_t next_value = 0x02;
+        for (Step step : row.steps) {
+            switch (step) {
+                case Step::END:
+                    impl->handle_stream_end();
+                    break;
+                case Step::START:
+                    impl->handle_stream_start(stream);
+                    break;
+                case Step::CLEAR:
+                    impl->handle_stream_clear();
+                    break;
+                case Step::CLEANUP:
+                    impl->cleanup();
+                    break;
+                case Step::FRAME:
+                    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, loudness(next_value++));
+                    break;
+            }
         }
 
-        Entry entry;
-        EXPECT_EQ(pop_entry(*impl, entry), row.listed);
-        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U);
+        std::vector<uint8_t> surviving;
+        void* item = nullptr;
+        while ((item = impl->drain_task->inbound.take(0, impl->cleanup_generation)) != nullptr) {
+            const InboundItemHeader* header = inbound_item_header(item);
+            surviving.push_back(inbound_item_bytes(item)[header->data_offset + header->data_len - 1]);
+            ring.return_item(item);
+        }
+        EXPECT_EQ(surviving, row.surviving);
+        EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
+            << "a stale frame kept its charge";
     }
-}
-
-TEST(VisualizerClearMarker, DiscardPreservesPostClearFrames) {
-    auto impl = make_impl();
-
-    std::vector<uint8_t> pre;
-    put_be64(pre, 1);
-    put_be16(pre, 0x0001);
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, pre);
-
-    impl->handle_stream_clear();
-
-    take_in_ring_order(*impl->drain_task->inbound.ring());
-
-    std::vector<uint8_t> post;
-    put_be64(post, 2);
-    put_be16(post, 0x0002);
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, post);
-
-    impl->discard_to_clear_marker();
-
-    // The pre-clear frame and the marker are gone; the post-clear frame survives.
-    Entry entry;
-    ASSERT_TRUE(pop_entry(*impl, entry));
-    EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
-    EXPECT_EQ(entry.message.back(), 0x02);
-    EXPECT_FALSE(pop_entry(*impl, entry));
-}
-
-TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
-    // If the marker is missing (failed enqueue or already consumed), the discard degrades to
-    // draining whatever is buffered.
-    auto impl = make_impl();
-
-    std::vector<uint8_t> data;
-    put_be64(data, 1);
-    put_be16(data, 0x0001);
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
-
-    impl->discard_to_clear_marker();
-
-    Entry entry;
-    EXPECT_FALSE(pop_entry(*impl, entry));
 }
 
 // A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and
@@ -639,7 +617,7 @@ TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
 // between the generation bump and the recall is dropped by its generation stamp and returned the
 // same way. That window has no observable trigger, so its row moves the generation on directly,
 // leaving the frames listed.
-TEST(VisualizerClearMarker, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) {
+TEST(VisualizerBoundary, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) {
     enum class Teardown { NONE, CLEANUP, GENERATION_ONLY };
     struct Row {
         const char* name;
@@ -676,7 +654,7 @@ TEST(VisualizerClearMarker, ATeardownRecallsTheFramesTheDrainThreadHasNotTaken) 
         // frame is not delivered, and one left over is.
         size_t delivered = 0;
         void* item = nullptr;
-        while ((item = impl->take_item(0)) != nullptr) {
+        while ((item = impl->drain_task->inbound.take(0, impl->cleanup_generation)) != nullptr) {
             ++delivered;
             ring.return_item(item);
         }

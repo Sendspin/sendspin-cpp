@@ -127,7 +127,7 @@ bool SyncTask::start(InboundRing* ring, bool task_stack_in_psram, unsigned prior
     // between the previous join and this start (cleanup() on a stopped task).
     this->event_flags_.clear_all();
 
-    platform_configure_thread("Sendspin", SYNC_TASK_STACK_SIZE, static_cast<int>(priority),
+    platform_configure_thread("SsSync", SYNC_TASK_STACK_SIZE, static_cast<int>(priority),
                               task_stack_in_psram);
 
     this->sync_thread_ = std::thread(thread_entry, this);
@@ -707,11 +707,7 @@ DecodeResult SyncTask::decode_whole_chunk(SyncContext& sync_context) {
 }
 
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
-    // Wait for a codec header to arrive on the item list, discarding stale audio chunks.
-    // Stop and stream commands wake the receive immediately via wake_receiver(), so the timeout
-    // is only a safety net against a missed wake: long enough to keep an idle task asleep, short
-    // enough that a wake bug degrades to a slow reaction rather than a hang.
-    static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 5000;
+    // Waits for a codec header on the item list, discarding stale audio chunks.
 
     // The next stream's codec header, taken while the stream before it was still active
     // (load_next_chunk()). Its stream may have ended since.
@@ -733,7 +729,7 @@ bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
         // the acknowledgement is stale, and returning to idle clears it and notes the idle state
         // the main loop's held STREAM_END waits for.
         const bool start_pending = (this->event_flags_.get() & COMMAND_START) != 0;
-        void* item = this->take_item(start_pending ? 0 : IDLE_RECEIVE_TIMEOUT_MS);
+        void* item = this->take_item(start_pending ? 0 : INBOUND_CONSUMER_FALLBACK_WAKE_MS);
         if (item == nullptr) {
             if (start_pending) {
                 return false;

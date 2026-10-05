@@ -19,7 +19,6 @@
 
 #include "inbound_ring.h"
 #include "inbox.h"
-#include "platform/event_flags.h"
 #include "sendspin/visualizer_role.h"
 #include "teardown_tracker.h"
 
@@ -100,10 +99,10 @@ struct VisualizerRole::Impl : RoleTeardown {
     // ========================================
 
     /// @brief Persistent drain thread context and the visualizer's end of the inbound ring,
-    /// through which the protocol task hands it frames and clear markers
+    /// through which the protocol task hands it frames
     struct DrainTask {
-        InboundConsumer inbound;  ///< InboundConsumer states its threads.
-        EventFlags event_flags;
+        /// Its item list's flags also carry the drain thread's command bits.
+        InboundConsumer inbound;
         std::thread drain_thread;
     };
 
@@ -169,20 +168,11 @@ struct VisualizerRole::Impl : RoleTeardown {
     bool signal_stop() const;
     /// @brief Joins the drain thread and returns every frame it had not taken to the ring
     void stop() const;
-    /// @brief Takes the next item of the role's current teardown generation
-    /// (InboundConsumer::take()). Drain thread.
-    void* take_item(uint32_t timeout_ms) const;
-    /// @brief Returns every frame on the list to the ring. Drain thread, or the main loop once it
-    /// is joined.
-    void flush_items() const;
-    /// @brief Protocol-task side of a clear boundary: flags the drain thread and appends a marker
-    void signal_clear_marker(uint32_t generation) const;
-    /// @brief Drain-thread side: returns frames up to and including the marker
-    void discard_to_clear_marker() const;
-    /// @brief Fills an item's consumer fields and hands it to the drain thread
-    /// (InboundConsumer::hand()). Protocol task only.
-    bool hand_item(void* item, size_t item_len, uint8_t type, uint32_t data_len,
-                   uint32_t generation) const;
+    /// @brief Returns every listed frame to the ring, moves boundary_sequence on and signals the
+    /// drain thread, which returns a frame it holds, when one is running.
+    void signal_boundary();
+    /// @brief Whether a boundary has passed since `item` was listed. Drain thread.
+    bool is_stale(void* item) const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
     void enqueue_stream_event(VisualizerEventType event, uint32_t generation) const;
@@ -209,6 +199,13 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// task; read on the drain thread.
     std::atomic<uint8_t> spectrum_bin_count{0};
     std::atomic<bool> tracks_downbeats{false};
+    /// Counts stream boundaries (stream/start, stream/end, stream/clear, a teardown), wrapping.
+    /// handle_binary() stamps each frame with it (InboundItemHeader::serial); a frame whose stamp
+    /// differs is stale. Equality suffices: only the frame the drain thread holds can be stale, and
+    /// every boundary wakes the thread to check it. Written by
+    /// signal_boundary() on the protocol task (or the main loop in stop() after the join), with
+    /// release; read with acquire on the drain thread.
+    std::atomic<uint16_t> boundary_sequence{0};
 
     // 8-bit fields
     /// Bitmask of negotiated wire types, bit N = wire type SENDSPIN_BINARY_VISUALIZER_FIRST + N.

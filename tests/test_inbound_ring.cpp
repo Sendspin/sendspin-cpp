@@ -15,8 +15,8 @@
 /// @file test_inbound_ring.cpp
 /// @brief Tests for the shared inbound ring's pieces: InboundRing's take after a wrap and its
 /// quota charge and return path, the intrusive per-consumer item list (order, blocking take,
-/// wake, recall), the outstanding-byte quota, the per-connection gate, and the ring size
-/// derivation
+/// wake, recall), a consumer's hand-overs, the outstanding-byte quota, the per-connection gate,
+/// and the ring size derivation
 
 #include "inbound_ring.h"
 #include "sendspin/config.h"
@@ -406,6 +406,64 @@ TEST(InboundItemList, WakeReceiverEndsABlockingTake) {
     EXPECT_EQ(got, nullptr);
 }
 
+// signal() ends a blocking take with nothing and take_signals() reports it once; an append is not
+// a consumer signal, and clear_signals() drops a pending one. The take has no timeout, so a
+// signal that does not wake it hangs here.
+TEST(InboundItemList, ASignalEndsATakeAndStaysPendingForItsOwnWait) {
+    constexpr uint32_t BIT = InboundItemList::FIRST_CONSUMER_BIT;
+    enum class Step { NONE, SIGNAL, APPEND, SIGNAL_THEN_CLEAR };
+    struct Row {
+        const char* name;
+        Step step;
+        uint32_t first;
+    };
+    const Row rows[] = {
+        {"Control: nothing signalled", Step::NONE, 0},
+        {"a signal is reported once", Step::SIGNAL, BIT},
+        {"an append is not a consumer signal", Step::APPEND, 0},
+        {"clear_signals() drops a pending signal", Step::SIGNAL_THEN_CLEAR, 0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Fixture f(1024);
+        switch (row.step) {
+            case Step::NONE:
+                break;
+            case Step::SIGNAL:
+                f.list.signal(BIT);
+                EXPECT_EQ(f.list.take(UINT32_MAX), nullptr);
+                break;
+            case Step::APPEND:
+                f.list.append(routed_item(f.ring, 1));
+                break;
+            case Step::SIGNAL_THEN_CLEAR:
+                f.list.signal(BIT);
+                f.list.clear_signals();
+                break;
+        }
+        EXPECT_EQ(f.list.take_signals(BIT, 0), row.first);
+        EXPECT_EQ(f.list.take_signals(BIT, 0), 0U) << "a signal was reported twice";
+        f.list.recall();
+    }
+}
+
+// A blocking take_signals() ignores an append and a wake_receiver() (the visualizer's
+// delivery-time wait relies on it) and ends on its signal; one woken by the list's bits returns 0.
+TEST(InboundItemList, ABlockingSignalWaitIgnoresTheListsOwnBits) {
+    constexpr uint32_t BIT = InboundItemList::FIRST_CONSUMER_BIT;
+    Fixture f(1024);
+    uint32_t got = UINT32_MAX;  // poisoned so a wait that never ran is visible
+    std::thread consumer([&] { got = f.list.take_signals(BIT, UINT32_MAX); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(PARK_MS));
+    f.list.append(routed_item(f.ring, 1));
+    f.list.wake_receiver();
+    std::this_thread::sleep_for(std::chrono::milliseconds(PARK_MS));
+    f.list.signal(BIT);
+    consumer.join();
+    EXPECT_EQ(got, BIT);
+    f.list.recall();
+}
+
 // recall() unlinks every item not yet taken and returns each through the ring's return path:
 // the space is reclaimed (with an unlisted item returned at once between them, as a JSON message
 // is, recalling the listed items frees the whole ring) and their quota charges are released.
@@ -473,6 +531,147 @@ TEST(InboundItemList, AppendAfterRecallStartsAFreshList) {
     void* item = routed_item(f.ring, 2);
     f.list.append(item);
     EXPECT_EQ(f.list.take(0), item);
+}
+
+// hand_message() hands a ring item in place and copies any other message into a LOCAL item
+// keeping its receive stamp; one too long for any item, with no ring space for the copy, or
+// over the quota is dropped with nothing charged or listed. hand_local() is exempt from the
+// quota and hands nothing while unbound. Every handed item carries the caller's fields and
+// generation.
+TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
+    constexpr size_t RING_BYTES = 1024;
+    constexpr size_t LEN = 40;
+    constexpr uint32_t GENERATION = 7;
+    constexpr uint32_t RECEIVE_STAMP = 0x12345678;
+    constexpr InboundItemFields FIELDS{.data_len = 30, .serial = 3, .type = 9, .data_offset = 10};
+    enum class Source : uint8_t {
+        RING_ITEM,
+        OUTSIDE_THE_RING,
+        TOO_LONG,
+        NO_ROOM,
+        HAND_LOCAL,
+        UNBOUND
+    };
+    struct Row {
+        const char* name;
+        Source source;
+        size_t quota;
+        bool handed;
+        bool in_place;  // the ring item itself was handed, rather than a LOCAL copy
+        bool charged;
+    };
+    const Row rows[] = {
+        {"Control: a ring item is handed in place", Source::RING_ITEM, RING_BYTES, true, true,
+         true},
+        {"a message outside the ring is copied into a LOCAL item", Source::OUTSIDE_THE_RING,
+         RING_BYTES, true, false, true},
+        {"a message longer than the ring's largest item is dropped", Source::TOO_LONG, RING_BYTES,
+         false, false, false},
+        {"a message outside a full ring is dropped", Source::NO_ROOM, RING_BYTES, false, false,
+         false},
+        {"a ring item over the quota is dropped", Source::RING_ITEM, 0, false, false, false},
+        {"hand_local() passes a zero quota, exempt", Source::HAND_LOCAL, 0, true, false, false},
+        {"hand_local() on a consumer never bound to a ring hands nothing", Source::UNBOUND, 0,
+         false, false, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundRing ring;
+        ASSERT_TRUE(ring.create(RING_BYTES, MemoryLocation::PREFER_EXTERNAL));
+        ring.quota(InboundHolder::PLAYER).set_limit(row.quota);
+        InboundConsumer consumer;
+        const bool bound = row.source != Source::UNBOUND;
+        if (bound) {
+            ASSERT_TRUE(consumer.bind(&ring, InboundHolder::PLAYER));
+        }
+
+        const size_t len = row.source == Source::TOO_LONG ? ring.max_item_message_bytes() + 1 : LEN;
+        std::vector<uint8_t> outside(len);
+        for (size_t i = 0; i < len; ++i) {
+            outside[i] = static_cast<uint8_t>(i);
+        }
+        // Held by no holder, so they fill the ring without touching the quota.
+        std::vector<void*> fillers;
+        if (row.source == Source::NO_ROOM) {
+            while (void* filler = ring.acquire(LEN, 0)) {
+                ring.complete(filler);
+                size_t filler_len = 0;
+                fillers.push_back(ring.take(&filler_len, 0));
+            }
+            ASSERT_FALSE(fillers.empty());
+        }
+        void* ring_item = nullptr;
+        bool handed = false;
+        if (row.source == Source::HAND_LOCAL || row.source == Source::UNBOUND) {
+            handed = consumer.hand_local(outside.data(), len, FIELDS, GENERATION);
+        } else {
+            InboundMessage message;
+            if (row.source == Source::RING_ITEM) {
+                ring_item = routed_item(ring, 0, LEN);
+                ASSERT_NE(ring_item, nullptr);
+                message.item = ring_item;
+                message.item_len = LEN;
+                message.data = inbound_item_bytes(ring_item);
+            } else {
+                message.data = outside.data();
+            }
+            message.len = len;
+            message.receive_time_us = RECEIVE_STAMP;
+            handed = consumer.hand_message(message, FIELDS, GENERATION);
+            EXPECT_EQ(message.item, nullptr)
+                << "a ring item is the consumer's to hand over or return, never the caller's";
+        }
+        EXPECT_EQ(handed, row.handed);
+        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding() > 0, row.charged)
+            << ring.quota(InboundHolder::PLAYER).outstanding() << " bytes outstanding";
+
+        void* taken = consumer.items().take(0);
+        EXPECT_EQ(taken != nullptr, row.handed) << "only a handed message is listed";
+        if (taken != nullptr) {
+            const InboundItemHeader* header = inbound_item_header(taken);
+            EXPECT_EQ(taken == ring_item, row.in_place);
+            EXPECT_EQ(header->kind == InboundKind::LOCAL, !row.in_place);
+            if (!row.in_place) {
+                EXPECT_EQ(std::memcmp(inbound_item_bytes(taken), outside.data(), len), 0);
+                EXPECT_EQ(header->receive_time_us,
+                          row.source == Source::HAND_LOCAL ? 0U : RECEIVE_STAMP);
+            }
+            EXPECT_EQ(header->data_len, FIELDS.data_len);
+            EXPECT_EQ(header->serial, FIELDS.serial);
+            EXPECT_EQ(header->type, FIELDS.type);
+            EXPECT_EQ(header->data_offset, FIELDS.data_offset);
+            EXPECT_EQ(header->generation, GENERATION);
+            consumer.return_item(taken);
+            EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U);
+        }
+        for (void* filler : fillers) {
+            ring.return_item(filler);
+        }
+        if (bound) {
+            consumer.unbind();
+        }
+    }
+}
+
+// unbind() ends the drop run, since the role's cleanup() recall() after it is a no-op; an open run
+// would swallow the next run's first warning (the count is private, hence -fno-access-control).
+// Control: the over-quota drop opened a run.
+TEST(InboundConsumer, UnbindEndsTheDropRun) {
+    InboundRing ring;
+    ASSERT_TRUE(ring.create(1024, MemoryLocation::PREFER_EXTERNAL));
+    ring.quota(InboundHolder::PLAYER).set_limit(0);
+    InboundConsumer consumer;
+    ASSERT_TRUE(consumer.bind(&ring, InboundHolder::PLAYER));
+    InboundMessage message;
+    message.item = routed_item(ring, 0);
+    ASSERT_NE(message.item, nullptr);
+    message.item_len = 16;
+    message.data = inbound_item_bytes(message.item);
+    message.len = 16;
+    ASSERT_FALSE(consumer.hand_message(message, InboundItemFields{}, 0));
+    EXPECT_EQ(consumer.drop_log_.dropped_, 1U);
+    consumer.unbind();
+    EXPECT_EQ(consumer.drop_log_.dropped_, 0U);
 }
 
 // Concurrent charges and releases never let the outstanding total past the limit and leave it at

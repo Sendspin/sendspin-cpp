@@ -75,7 +75,7 @@ enum class InboundKind : uint8_t {
 /// so it is never charged.
 enum class InboundHolder : uint8_t {
     PLAYER,      ///< Encoded audio chunks and markers held by the sync task
-    VISUALIZER,  ///< Frames and markers held by the visualizer drain thread
+    VISUALIZER,  ///< Frames held by the visualizer drain thread
     ARTWORK,     ///< Image parts, announces and markers held by the artwork decode thread
 };
 
@@ -87,10 +87,10 @@ static constexpr size_t INBOUND_HOLDER_COUNT = 3;
 /// The first drop of a run logs (note_drop() returns true), the drops after it are only counted,
 /// and the next delivery at the site ends the run, logging its count (end_run()). A run that no
 /// delivery follows (the stream or the connection ended) is ended where its site's owner tears
-/// down: a role's recall after a teardown, a connection's destructor. A drop is therefore never
-/// silent, and a sustained overrun costs two log lines rather than one per message. Not
-/// thread-safe: each instance belongs to the one thread that runs its site, or to whichever
-/// thread tears it down once that one is joined.
+/// down: a role's recall after a teardown, a consumer's unbind() at stop, a connection's
+/// destructor. A drop is therefore never silent, and a sustained overrun costs two log lines
+/// rather than one per message. Not thread-safe: each instance belongs to the one thread that
+/// runs its site, or to whichever thread tears it down once that one is joined.
 class InboundDropLog {
 public:
     /// @brief Counts a drop. @return true for the first drop of a run, which the site logs.
@@ -179,8 +179,8 @@ struct InboundItemHeader {
     /// in-band header the consumer does not need).
     uint8_t data_offset;
     InboundKind kind;
-    /// Consumer-defined item type: the ChunkType for the player, the wire message type or a
-    /// marker for the visualizer, the ArtworkItemType for artwork.
+    /// Consumer-defined item type: the ChunkType for the player, the wire message type for the
+    /// visualizer, the ArtworkItemType for artwork.
     uint8_t type;
     /// The holder the item was handed to; meaningful only while holder_set is non-zero.
     InboundHolder holder;
@@ -192,8 +192,9 @@ struct InboundItemHeader {
     uint8_t local_returns;
     /// Non-zero once InboundRing::charge() assigned the item to `holder`; never cleared.
     uint8_t holder_set;
-    /// Consumer-defined: the player's stream ordinal on a codec header item, the artwork channel
-    /// (or, on a marker, the channel mask) on an artwork item, 0 on every other item.
+    /// Consumer-defined: the player's stream ordinal on a codec header item, the visualizer's
+    /// boundary sequence on a frame, the artwork channel (or, on a marker, the channel mask) on
+    /// an artwork item, 0 on every other item.
     uint16_t serial;
 };
 static_assert(std::is_trivially_copyable_v<InboundItemHeader> &&
@@ -299,6 +300,7 @@ private:
 // ============================================================================
 
 class InboundItemList;
+struct InboundMessage;
 
 /**
  * @brief The shared inbound ring: a SharedRingBuffer over its own storage, the per-role quotas,
@@ -555,15 +557,40 @@ public:
     /// @param timeout_ms Milliseconds to wait for an item: 0 does not wait, UINT32_MAX waits
     ///        indefinitely.
     /// @return The item, which the consumer hands to InboundRing::return_item() when done, or
-    ///         nullptr on timeout, on a wake_receiver() interruption, or on a wake left by an
-    ///         append whose item an earlier take already removed. Treat nullptr as "re-check
-    ///         state and retry".
+    ///         nullptr on timeout, on a wake_receiver() or signal() interruption, or on a wake
+    ///         left by an append whose item an earlier take already removed. Treat nullptr as
+    ///         "re-check state and retry".
     void* take(uint32_t timeout_ms);
 
     /// @brief Wakes the consumer out of a blocking take(); one-shot, and redundant wakes
     /// collapse. Any thread.
     void wake_receiver() {
         this->flags_.set(WAKE);
+    }
+
+    /// The lowest consumer command bit; the bits below it are the list's own (ITEMS_APPENDED,
+    /// WAKE).
+    static constexpr uint32_t FIRST_CONSUMER_BIT = 1U << 2;
+    /// The highest consumer command bit: the eighth, the last every platform's group exposes
+    /// (EventFlags::USABLE_BITS).
+    static constexpr uint32_t LAST_CONSUMER_BIT = 1U << 7;
+
+    /// @brief Sets consumer `bits` and wakes a blocking take(). Any thread, once the list is
+    /// created.
+    void signal(uint32_t bits) {
+        this->flags_.set(bits | WAKE);
+    }
+
+    /// @brief Waits up to `timeout_ms` for any of consumer `bits`, clearing those set. Consumer
+    /// only.
+    /// @return The bits among `bits` that were set; 0 on timeout.
+    uint32_t take_signals(uint32_t bits, uint32_t timeout_ms) {
+        return this->flags_.wait(bits, false, true, timeout_ms) & bits;
+    }
+
+    /// @brief Clears every bit. Before the consumer thread starts, while the list is empty.
+    void clear_signals() {
+        this->flags_.clear_all();
     }
 
     /// @brief Unlinks every item not yet taken and returns each through
@@ -592,7 +619,8 @@ private:
     }
 
     // Struct fields
-    /// Set by append() and wake_receiver(); a blocking take() waits on it.
+    /// Set by append(), wake_receiver() and signal(); take() waits on the list's own bits,
+    /// take_signals() on the consumer's.
     EventFlags flags_;
     /// Guards head_, tail_ and the links of linked items; a leaf lock (see the class comment).
     mutable std::mutex mutex_;
@@ -617,6 +645,19 @@ private:
 // InboundConsumer
 // ============================================================================
 
+/// Fallback wake for a consumer thread's blocking take (the sync task while idle, the visualizer
+/// drain thread, the artwork decode thread). Every command, teardown and artwork gate reopening
+/// wakes the take at once, so this only turns a missed wake into a slow reaction, not a hang.
+static constexpr uint32_t INBOUND_CONSUMER_FALLBACK_WAKE_MS = 5000;
+
+/// @brief The consumer-defined InboundItemHeader fields every hand-over fills (documented there)
+struct InboundItemFields {
+    uint32_t data_len;
+    uint16_t serial;
+    uint8_t type;
+    uint8_t data_offset;
+};
+
 /**
  * @brief One holder's end of the ring: the item list its consumer thread takes from, the ring it
  * is bound to for a run, and the protocol task's side of handing items over
@@ -631,8 +672,9 @@ private:
  * Threads: bind() and unbind() run on the main loop with neither the consumer thread nor the
  * protocol task running: SendspinClient::start() binds before it starts the protocol task, and
  * stop() (and a start() that fails part-way) unbinds after joining it. The protocol task hands
- * items over and recalls them (copy_local(), hand(), recall(), note_drop()); the consumer thread
- * takes and returns them. ring() is read on all three, ordered by those thread starts and joins.
+ * items over, counts drops and recalls items (hand(), hand_message(), hand_local(), note_drop(),
+ * recall()); the consumer thread takes and returns them. ring() is read on all three, ordered by
+ * those thread starts and joins.
  */
 class InboundConsumer {
 public:
@@ -641,8 +683,9 @@ public:
     /// cannot be created.
     bool bind(InboundRing* ring, InboundHolder holder);
 
-    /// @brief Returns every item left on the list and unbinds it from the ring. Main loop, once
-    /// the consumer thread and the protocol task are joined; bind() binds it again.
+    /// @brief Returns every item left on the list, unbinds it from the ring and ends the drop
+    /// log's run. Main loop, once the consumer thread and the protocol task are joined; bind()
+    /// binds it again.
     void unbind();
 
     /// @brief The ring the list is bound to, or nullptr outside a run
@@ -650,7 +693,7 @@ public:
         return this->ring_;
     }
 
-    /// @brief The item list itself, for a consumer that walks it (a clear marker's discard)
+    /// @brief The item list itself, for a consumer that wakes or inspects it directly
     InboundItemList& items() {
         return this->items_;
     }
@@ -670,19 +713,13 @@ public:
         this->ring()->return_item(item);
     }
 
-    /// @brief Acquires a LOCAL item (InboundRing::acquire_local()), copies `len` bytes into it
-    /// and completes it. Protocol task, inside a run.
-    /// @return The item, ready for hand(), or nullptr when the ring had no room in time.
-    void* copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
-                     uint32_t timeout_ms) const;
-
-    /// @brief Stamps `item` with `generation`, charges it to the holder's quota and appends it.
-    /// Over quota the item is returned to the ring with a throttled warning: the server
-    /// overran the buffer_capacity the role advertises, which the quota covers at the role's
-    /// smallest message. Protocol task, inside a run; the caller fills the item's other consumer
-    /// fields first.
-    /// @param item_len The item's message length (InboundMessage::item_len, or what
-    ///        copy_local() was given).
+    /// @brief Fills `item`'s consumer fields, stamps it with `generation`, charges it to the
+    /// holder's quota and appends it. Over quota the item is returned to the ring with a
+    /// throttled warning: the server overran the buffer_capacity the role advertises, which the
+    /// quota covers at the role's smallest message. Protocol task, inside a run. Called directly
+    /// only for an item the caller acquired itself (a FLAC codec header decoded into its item).
+    /// @param item_len The item's message length (InboundMessage::item_len, or the length the
+    ///        item was acquired for).
     /// @param exempt Hands the item over without charging the quota: a codec header, an artwork
     ///        announce or a stream boundary marker the protocol task writes itself, one per
     ///        stream/start, stream/clear or image, so refusing it would end or blur a stream over
@@ -691,30 +728,63 @@ public:
     ///        a JSON flood from an authenticated server already holds, inside the pass-through
     ///        budget derive_inbound_ring_bytes() holds.
     /// @return false when the item was returned instead of handed over.
-    bool hand(void* item, size_t item_len, uint32_t generation, bool exempt);
+    bool hand(void* item, size_t item_len, InboundItemFields fields, uint32_t generation,
+              bool exempt);
+
+    /// @brief Hands a received message over, charged to the quota: its ring item in place
+    /// (clearing message.item), or else a LOCAL copy of the whole message keeping its receive
+    /// stamp. The copy does not wait; a message with no ring space, or longer than the ring's
+    /// largest item, is dropped. Protocol task, inside a run.
+    /// @return false when the message was dropped instead of handed over.
+    bool hand_message(InboundMessage& message, InboundItemFields fields, uint32_t generation);
+
+    /// @brief Copies `len` bytes (a codec header, an artwork announce, or none for a marker)
+    /// into a LOCAL item, waiting up to INBOUND_ACQUIRE_TIMEOUT_MS for ring space, and hands it
+    /// over exempt from the quota (see hand()). Protocol task.
+    /// @return false when the consumer is not bound to a ring or the ring had no room in time.
+    bool hand_local(const void* data, size_t len, InboundItemFields fields, uint32_t generation);
 
     /// @brief Returns every item the consumer has not taken to the ring and ends the drop log's
-    /// run, since the stream the drops belonged to is gone. The holder role's cleanup(), right
-    /// after its generation moves on: on the protocol task, the thread that hands items over, so
-    /// every item recalled carries an earlier generation. A no-op outside a run, where the
-    /// main loop's cleanup() in SendspinClient::stop() finds the list already unbound.
+    /// run, since the stream or stretch the drops belonged to is over. The holder role's
+    /// cleanup(), right after its generation moves on, and the visualizer's stream boundaries:
+    /// on the protocol task, the thread that hands items over, so every item recalled predates
+    /// the teardown or boundary. A no-op outside a run, where the main loop's cleanup() in
+    /// SendspinClient::stop() finds the list already unbound.
     void recall();
 
-    /// @brief Counts a drop of an item that never reached hand() in the same throttled run as
-    /// the over-quota drops, logging "<Holder> <message>" when it starts one. Protocol task.
-    void note_drop(const char* message);
+    /// @brief Why a message was dropped instead of handed over, which picks note_drop()'s warning
+    enum class DropReason : uint8_t {
+        OVER_QUOTA,  ///< hand(): the holder is over its quota
+        TOO_LONG,    ///< hand_message(): longer than the ring's largest item
+        NO_ROOM,     ///< hand_message(): no ring space for the copy
+        TOO_SHORT,   ///< The role's handler: too short for the holder's message header
+    };
+
+    /// @brief Counts a drop in the throttled run (InboundDropLog), logging `reason`'s warning
+    /// when the drop starts one. Protocol task: the hand-overs, and a role handler dropping a
+    /// malformed message. A no-op outside a run.
+    void note_drop(DropReason reason);
 
 private:
+    /// @brief Acquires a LOCAL item (InboundRing::acquire_local()), copies `len` bytes into it
+    /// and completes it. Protocol task, inside a run.
+    /// @return The item, ready for hand(), or nullptr when the ring had no room in time.
+    void* copy_local(const uint8_t* data, size_t len, uint32_t receive_time_us,
+                     uint32_t timeout_ms) const;
+
     /// @brief What end_run() calls the holder's dropped items
     const char* dropped_items_name() const;
-    /// @brief The holder's name, leading note_drop()'s warning
+    /// @brief The holder's name, leading every drop warning
     const char* holder_name() const;
+    /// @brief One of the holder's messages, for the drop warnings
+    const char* item_noun() const;
 
     // Struct fields
     /// Appended on the protocol task, taken on the consumer thread, recalled on the protocol task
     /// or, once the consumer is joined, on the main loop.
     InboundItemList items_;
-    /// Every drop of the holder's items. Protocol task only.
+    /// Every drop of the holder's items. Protocol task, or the main loop's unbind() once the
+    /// protocol task is joined.
     InboundDropLog drop_log_;
 
     // Pointer fields
@@ -779,15 +849,15 @@ public:
     /// (SendspinClient::protocol_tick()), more than one of which may wait, and the steps after it.
     /// Most items hand over in microseconds; what waits is the Noise DH operations of a handshake
     /// message and the INBOUND_ACQUIRE_TIMEOUT_MS waits for ring space a message can make. A
-    /// stream/start makes the most, three (the player's codec header, the visualizer's marker and
-    /// the artwork role's RECONFIGURE marker, 300 ms). An artwork announce, cancel or stream/end
+    /// stream/start makes the most, two (the player's codec header and the artwork role's
+    /// RECONFIGURE marker, 200 ms). An artwork announce, cancel, stream/end or a stream/clear
     /// makes one, as does an image part dropped over the artwork quota (the DISCARD marker in its
     /// place) and the announce of an image over its cap (the marker alone); an announce makes two
-    /// only when handing the announce itself fails and its marker follows. A stream/start and two
-    /// single-wait messages in one tick add up to five waits, which is the whole bound with
+    /// only when handing the announce itself fails and its marker follows. A stream/start and
+    /// three single-wait messages in one tick add up to five waits, which is the whole bound with
     /// nothing left for the handlers, so that mix, with the ring full and the role threads not
     /// draining it, can close the waiting connection, as can any tick with more waits. This is
-    /// accepted: it takes a stream/start plus two marker-bearing messages from the incumbent in
+    /// accepted: it takes a stream/start plus three marker-bearing messages from the incumbent in
     /// one tick under ring back-pressure, and the closed connection reconnects.
     /// Every lock the task takes is a leaf held for a copy, so nothing else stretches a tick, and
     /// a task stalled beyond the bound closes the waiting connection rather than parking the
