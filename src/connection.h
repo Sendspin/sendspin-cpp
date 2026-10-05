@@ -362,6 +362,14 @@ public:
         return this->server_information_;
     }
 
+    /// @brief Whether server/hello's source@v1 support object lists `codec` among the codecs the
+    /// server accepts in client-stream/start (roles/source/v1.md "server/hello source@v1 support
+    /// object"). False for every codec before server/hello, or when it carried no valid object.
+    /// Protocol task only.
+    bool server_accepts_source_codec(SendspinCodecFormat codec) const {
+        return (this->server_source_codecs_ & source_codec_bit(codec)) != 0;
+    }
+
     // ========================================
     // server/activate state accessors
     // ========================================
@@ -721,6 +729,13 @@ public:
     /// @note Called by hub when SERVER_HELLO is processed.
     void set_server_hello_received(bool received) {
         this->server_hello_received_ = received;
+    }
+
+    /// @brief Records the codecs server/hello's source@v1 support object lists
+    /// (ServerHelloMessage::source_codecs); nullopt for a hello without a valid object. Protocol
+    /// task only, from the server/hello dispatch.
+    void set_server_source_codecs(std::optional<uint8_t> codecs) {
+        this->server_source_codecs_ = codecs.value_or(0);
     }
 
     /// @brief Sets the server information (from server/hello message)
@@ -1208,6 +1223,10 @@ protected:
     /// Whether server/hello arrived. Set by its handler and never cleared: a closed connection is
     /// not reused. Protocol task only.
     bool server_hello_received_{false};
+
+    /// The codecs server/hello's source@v1 support object lists, one source_codec_bit() each (see
+    /// server_accepts_source_codec()). Protocol task only.
+    uint8_t server_source_codecs_{0};
 
     /// True after the first server/activate message has been received and applied, until a
     /// re-handshake or a pairing-finalize ack rewinds it. Protocol task only.

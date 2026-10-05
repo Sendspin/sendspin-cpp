@@ -7,7 +7,7 @@ This guide describes what you need to implement in order to integrate sendspin-c
 Integration follows this pattern:
 
 1. Create a `SendspinClient` with a configuration struct
-2. Add roles (player, controller, metadata, artwork, visualizer, color) depending on what your application needs
+2. Add roles (player, controller, metadata, artwork, visualizer, color, source) depending on what your application needs
 3. Implement listener interfaces for the roles you added
 4. Implement a network provider (required) and optionally a persistence provider
 5. Wire listeners and providers to the client and roles
@@ -27,6 +27,7 @@ Include `sendspin/client.h` for the client class, config types, and shared types
 #include "sendspin/artwork_role.h"    // ArtworkRole, ArtworkRoleListener
 #include "sendspin/visualizer_role.h" // VisualizerRole, VisualizerRoleListener
 #include "sendspin/color_role.h"      // ColorRole, ColorRoleListener
+#include "sendspin/source_role.h"     // SourceRole, SourceRoleListener
 ```
 
 Only include the role headers you need. `client.h` includes `sendspin/config.h` (all configuration structs, including `SendspinClientConfig`) and `sendspin/types.h` transitively.
@@ -177,13 +178,42 @@ Receives an RGB color palette derived by the server from the currently playing a
 auto& color = client.add_color();
 ```
 
+### Source Role (Audio Capture)
+
+Streams audio captured on the device (a line input or a microphone) to the server. The server decides when: its `start` command opens the stream and its `stop` closes it (roles/source/v1.md "Source command semantics"). The `SourceRoleConfig` passed to `add_source()` is the format of every stream the role opens:
+
+```cpp
+SourceRoleConfig source_config;
+source_config.sample_rate = 48000;
+source_config.channels = 2;
+source_config.bit_depth = 16;
+auto& source = client.add_source(source_config);
+```
+
+An invalid config (see [SourceRoleConfig](#sourceroleconfig)) leaves the role inert; a valid config whose buffers cannot be allocated fails `client.start()` instead.
+
+Feed the capture to `write_audio()` from one capture thread, with the capture time of each buffer's first sample on the client's clock (`std::chrono::steady_clock` on host, `esp_timer_get_time()` on ESP-IDF), or 0 to have the write stamped as ending now:
+
+```cpp
+source.write_audio(pcm_bytes, len, capture_time_us);
+```
+
+It never waits or allocates. It refuses audio while the stream is closed, a write that is not a whole number of frames, and a write that finds the capture buffer full; after a stall the stream resumes from live capture rather than sending the stale backlog. Start capturing in `on_streaming_started()` and stop in `on_streaming_stopped()` (see [SourceRoleListener](#sourcerolelistener)); the client holds high-performance networking (`on_request_high_performance()`) between the two, as it does during playback. Stop calling `write_audio()` before destroying the client.
+
+A role configured with `line_sense` reports the capture input's signal state from the main loop thread, which goes to the server in `client/state`:
+
+```cpp
+source.set_signal(SourceSignal::PRESENT);  // or ABSENT
+```
+
 ## Step 3: Implement Listener Interfaces
 
 A role you add is configured and ready, but only the server decides which roles a session actually
 uses, and it may change that set at any time. When an activation removes a role, the library tears
 that role down on the spot: a stream role stops its output, drops its buffers, and reports the end
-(`on_stream_end()`, `on_visualizer_stream_end()`, `on_image_clear()` for every slot), and a state
-role drops its state and reports the clear (`on_metadata_clear()`, `on_color_clear()`,
+(`on_stream_end()`, `on_visualizer_stream_end()`, `on_image_clear()` for every slot; the source
+closes its open input stream with `client-stream/end` and reports `on_streaming_stopped()`), and a
+state role drops its state and reports the clear (`on_metadata_clear()`, `on_color_clear()`,
 `on_controller_state_clear()`). The connection stays up and the other roles keep running. A clear
 callback is therefore not proof that the server is gone; treat it as "this role has nothing to
 show" and make it idempotent. Until the server adds the role back, anything it still sends for
@@ -438,6 +468,24 @@ The `ServerColorStateObject` contains a `timestamp` and six optional `RgbColor` 
 | `on_light` | Dark foreground for use on light backgrounds |
 
 Every `on_color()` call carries the full palette: a color the server left out of that update is `nullopt`, whatever an earlier update reported for it, so listeners render from the palette they are handed rather than merging it into the one they already hold.
+
+### SourceRoleListener
+
+Both callbacks are optional and fire on the main loop thread, in pairs:
+
+```cpp
+struct MySourceListener : SourceRoleListener {
+    void on_streaming_started() override {
+        // client-stream/start was sent; write_audio() accepts audio from here on
+        capture.start();
+    }
+    void on_streaming_stopped() override {
+        // A server stop, the role's removal, the client becoming unavailable, the connection
+        // ending, or the client stopping; write_audio() refuses audio again
+        capture.stop();
+    }
+};
+```
 
 ## Step 4: Implement Providers
 
@@ -742,7 +790,7 @@ client.stop();
 
 ## Stopping and Restarting
 
-`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer and closes each connection right behind its goodbye (a peer whose WebSocket upgrade completes after `stop()` has begun is closed without one). It does not wait for a queued goodbye to be written: the host transports and the ESP outbound connection send synchronously, and the ESP server writes each queued goodbye before the close queued behind it. It then closes the server and every connection still open, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
+`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer and closes each connection right behind its goodbye (a peer whose WebSocket upgrade completes after `stop()` has begun is closed without one). It does not wait for a queued goodbye to be written: the host transports and the ESP outbound connection send synchronously, and the ESP server writes each queued goodbye before the close queued behind it. It then closes the server and every connection still open, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`, `on_streaming_stopped()`) before returning. An open source stream is ended with `client-stream/end` ahead of its connection's goodbye, except inside a re-handshake's quiet window (connection.md "Re-handshake"): there the end waits for a `server/activate` a stopping client never receives, so the goodbye alone ends the stream. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
 
 Restarting is `start()` again; start, stop, and start again can be repeated indefinitely, and a restarted client begins with no connection, no group state, and no role state from before the stop.
 
@@ -1015,6 +1063,7 @@ if (auto* m = client.metadata()) {
 if (auto* a = client.artwork()) { /* ... */ }
 if (auto* v = client.visualizer()) { /* ... */ }
 if (auto* col = client.color()) { /* ... */ }
+if (auto* s = client.source()) { /* ... */ }
 ```
 
 Use these accessors when the role reference from `add_*()` is out of scope.
@@ -1073,8 +1122,10 @@ bool available = client.is_available();
 
 The server moves an unavailable client into a stopped group of its own and does not take it over
 until it is available again. Until the server ends the stream, the player discards the audio
-that still arrives. Availability is kept across disconnects and `stop()`/`start()`, and only a
-change publishes a `client/state`. Call it from the main loop thread.
+that still arrives. An open source stream closes with `client-stream/end` before the
+`client/state` reporting `available: false`, and a start received while unavailable is ignored.
+Availability is kept across disconnects and `stop()`/`start()`, and only a change publishes a
+`client/state`. Call it from the main loop thread.
 
 ## Querying State
 
@@ -1122,6 +1173,8 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 `PlayerRole::notify_audio_played()` is thread-safe and is designed to be called from an audio output callback thread.
 
 `ControllerRole::send_command()` is callable from any thread.
+
+`SourceRole::write_audio()` is for exactly one capture thread; the library does not serialize concurrent writers. `SourceRole::set_signal()` and `is_streaming()` are main loop only.
 
 `ArtworkRole::frame_done()` must be called from the main loop thread (typically from inside `on_image_display()`/`on_image_clear()` or when a cross-fade animation completes).
 
@@ -1220,7 +1273,8 @@ cmake -B build -DSENDSPIN_ENABLE_CONTROLLER=OFF \
                -DSENDSPIN_ENABLE_METADATA=OFF \
                -DSENDSPIN_ENABLE_ARTWORK=OFF \
                -DSENDSPIN_ENABLE_VISUALIZER=OFF \
-               -DSENDSPIN_ENABLE_COLOR=OFF
+               -DSENDSPIN_ENABLE_COLOR=OFF \
+               -DSENDSPIN_ENABLE_SOURCE=OFF
 ```
 
 Available options (all `ON` by default):
@@ -1234,6 +1288,7 @@ Available options (all `ON` by default):
 | `SENDSPIN_ENABLE_ARTWORK` | Artwork role |
 | `SENDSPIN_ENABLE_VISUALIZER` | Visualizer role |
 | `SENDSPIN_ENABLE_COLOR` | Color role |
+| `SENDSPIN_ENABLE_SOURCE` | Source role (audio capture streamed to the server), source task |
 
 When `SENDSPIN_ENABLE_PLAYER` is `OFF`, the micro-flac and micro-opus dependencies are not fetched. `SENDSPIN_ENABLE_OPUS=OFF` drops micro-opus alone, for products that cannot ship Opus (see the patent note in the player role spec); the player then refuses `OPUS` entries in `audio_formats`.
 
@@ -1249,6 +1304,7 @@ CONFIG_SENDSPIN_ENABLE_METADATA=y
 CONFIG_SENDSPIN_ENABLE_ARTWORK=y
 CONFIG_SENDSPIN_ENABLE_VISUALIZER=y
 CONFIG_SENDSPIN_ENABLE_COLOR=y
+CONFIG_SENDSPIN_ENABLE_SOURCE=y
 ```
 
 The component also selects esp_websocket_client's `ESP_WS_CLIENT_SEPARATE_TX_LOCK`, so sends on an outbound connection (`connect_to()`) take their own lock rather than the one the client task holds while the receive handler waits for inbound ring space.
@@ -1391,6 +1447,25 @@ Configuration passed to `client.add_visualizer()`.
 | `f_min` | `uint16_t` | Minimum frequency in Hz |
 | `f_max` | `uint16_t` | Maximum frequency in Hz |
 
+### SourceRoleConfig
+
+Configuration passed to `client.add_source()`. A value that breaks any rule below logs at ERROR and leaves the role inert, neither advertised nor streaming; values are never clamped.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `codec` | `SendspinCodecFormat` | `PCM` | `PCM`, the capture bytes untouched, is the only codec accepted |
+| `sample_rate` | `uint32_t` | `48000` | Capture rate in Hz, more than 0 |
+| `channels` | `uint8_t` | `2` | Capture channel count, at least 1 |
+| `bit_depth` | `uint8_t` | `16` | 16, 24 (3 packed bytes), or 32 |
+| `chunk_duration_ms` | `uint32_t` | `20` | Audio per chunk, 5 to 150 ms; one chunk with its header must fit one Noise transport message |
+| `capture_buffer_ms` | `uint32_t` | `150` | Capture buffer, more than 0 ms; the bound on the backlog a stall can build before writes are dropped and streaming resumes from live capture. A quarter more is allocated for per-write overhead, so very small writes hold less audio, and a single write longer than half the allocated storage (just under five eighths of `capture_buffer_ms`) is always refused. |
+| `line_sense` | `bool` | `false` | Advertise signal sensing; see `SourceRole::set_signal()` |
+| `buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Placement of the capture buffer and the chunk buffer (ESP-IDF only) |
+| `priority` | `unsigned` | `3` | FreeRTOS priority for the source task, below the protocol and httpd tasks (ESP-IDF only) |
+| `psram_stack` | `bool` | `false` | Allocate the source task stack in PSRAM (ESP-IDF only) |
+
+The capture buffer is allocated by the first `start()` and kept until the client is destroyed, since the capture thread may write at any time; the chunk buffer, which holds a few chunks for the protocol task to send, lives from each `start()` to its `stop()`.
+
 ---
 
 ## Enums Reference
@@ -1447,7 +1522,7 @@ format arrives as the `format` argument of `on_display_pairing_code`.
 |---|---|
 | `FLAC` | FLAC lossless audio |
 | `OPUS` | Opus lossy audio; decodable only in a build with `SENDSPIN_ENABLE_OPUS` |
-| `PCM` | Raw PCM audio |
+| `PCM` | Raw PCM audio; the source role's codec |
 | `UNSUPPORTED` | Unsupported codec |
 
 ### SendspinControllerCommand
@@ -1541,6 +1616,15 @@ These represent commands the server can send to the player. The player advertise
 | `LOG` | Logarithmic scale |
 | `LIN` | Linear scale |
 
+### SourceSignal
+
+| Value | Description |
+|---|---|
+| `PRESENT` | Audio signal detected on the capture input |
+| `ABSENT` | No audio signal on the capture input |
+
+Reported with `SourceRole::set_signal()`; meaningful only with `SourceRoleConfig::line_sense` set.
+
 ### LogLevel
 
 | Value | Description |
@@ -1561,4 +1645,4 @@ Set with `SendspinClient::set_log_level()`. Only affects host builds; ESP-IDF bu
 | `PREFER_EXTERNAL` | Prefer SPIRAM, fall back to internal RAM (ESP-IDF only) |
 | `PREFER_INTERNAL` | Prefer internal RAM, fall back to SPIRAM (ESP-IDF only) |
 
-Used by `SendspinClientConfig::inbound_ring_location` to control where the shared inbound ring and the per-connection fallback buffers are allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and fragmentation buffers are allocated, and by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated. Ignored on host platforms (no internal/external distinction).
+Used by `SendspinClientConfig::inbound_ring_location` to control where the shared inbound ring and the per-connection fallback buffers are allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and fragmentation buffers are allocated, by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated, and by `SourceRoleConfig::buffer_location` to control where the source's capture and chunk buffers are allocated. Ignored on host platforms (no internal/external distinction).

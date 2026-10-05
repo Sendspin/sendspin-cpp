@@ -78,6 +78,8 @@ enum class InboxEventType : uint8_t {
     ARTWORK_CLEARED,     // Artwork torn down; epoch = the teardown's generation
     VISUALIZER_STREAM,   // Visualizer stream lifecycle; code = VisualizerEventType
     VISUALIZER_CLEARED,  // Visualizer torn down; epoch = the teardown's generation
+    SOURCE_STREAM,       // Source input stream lifecycle; code = SourceStreamEventType
+    SOURCE_CLEARED,      // Source torn down; epoch = the teardown's generation
 };
 
 /// @brief One entry in the shared event ring

@@ -12,13 +12,15 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `ProtocolTask` (`protocol_task.h`): the `SsProto` thread, its bounded command queue, the latest client/state slot and the never-refused lifecycle-request slot; ticks through `SendspinClient::protocol_tick()` to its next deadline
 - `ConnectionManager` (`connection_manager.h`): the admitted array with role ownership, the nursery, the reaping list, admission and arbitration, time bursts, watchdogs and the published time filter and server information; pairing state machines in `connection_manager_pairing.cpp`
 - `InboundRing` / `InboundItemList` / `InboundConsumer` / `InboundGate` (`inbound_ring.h`): the shared ring every admitted transport receives into (over `SharedRingBuffer`), the intrusive per-role item lists that hand audio, visualizer frames and artwork image parts to their consumer threads in place, and the per-connection transport/protocol-task hand-off
-- `OutboundRing` (`outbound_ring.h`): a ring one producer thread writes outbound binary messages into; the protocol task encrypts each in place and lends its item to the transport, which returns it once the frame is written
+- `OutboundRing` (`outbound_ring.h`): a ring one producer thread (the source task) writes outbound binary messages into; the protocol task encrypts each in place and lends its item to the transport, which returns it once the frame is written. The source's capture ring reuses the class
 - `PlayerRole` (`player_role.h`): audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
 - `ControllerRole` (`controller_role.h`): sends playback commands to the server
 - `MetadataRole` (`metadata_role.h`): receives track metadata and progress
 - `ArtworkRole` (`artwork_role.h`): receives album artwork images; its decode thread takes each image's announce, parts and discard markers from its item list, copies each part into one buffer per channel and returns its item at once, and parks a complete image there while the channel's `frame_done()` gate is closed
 - `VisualizerRole` (`visualizer_role.h`): receives spectrum/beat visualization data
 - `ColorRole` (`color_role.h`): receives audio-derived RGB color palette from the server
+- `SourceRole` (`source_role.h`): streams captured audio to the server (source@v1); takes PCM through `write_audio()` from the consumer's capture thread, and runs the input stream's lifecycle and chunk sends on the protocol task
+- `SourceTask` (`source_task.h`): assembles the capture ring's writes into timestamped chunks, encoded through the `SourceEncoder` seam (`source_encoder.h`) into the source's outbound ring for the protocol task to send
 - `SyncTask` (`sync_task.h`): decodes encoded audio from its item list in place, synchronizes to server timestamps, writes PCM via audio write callback
 - `SendspinConnection` (`connection.h`): abstract WebSocket connection base
 - `SendspinServerConnection` / `SendspinClientConnection`: platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)

@@ -218,6 +218,20 @@
    "SendspinServerConnection::send_binary_message(",
    "SendspinClientConnection::send_binary_message("
   ],
+  "sendspin::SourceTask::begin_chunk(": [
+   "sendspin::PcmPassthroughEncoder::reset(",
+   "sendspin::SourceEncoder::input_buffer("
+  ],
+  "sendspin::SourceTask::finish_chunk(": [
+   "sendspin::PcmPassthroughEncoder::encode(",
+   "sendspin::PcmPassthroughEncoder::lookahead_us("
+  ],
+  "sendspin::SourceTask::process(": [
+   "sendspin::PcmPassthroughEncoder::reset(",
+   "sendspin::SourceEncoder::input_buffer(",
+   "sendspin::PcmPassthroughEncoder::encode(",
+   "sendspin::PcmPassthroughEncoder::lookahead_us("
+  ],
   "sendspin::TimeBurstResult sendspin::SendspinTimeBurst::loop(": [
    "int64_t sendspin::SendspinConnection::send_time_message()"
   ],
