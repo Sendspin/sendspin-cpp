@@ -92,7 +92,7 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     FetchContent_Declare(
         IXWebSocket
         GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
-        GIT_TAG        v11.4.5
+        GIT_TAG        v12.0.1
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(IXWebSocket)
