@@ -675,7 +675,7 @@ struct SourceRoleConfig {
     /// @brief Default capture buffer. The buffer bounds the backlog a network stall can build up
     /// (roles/source/v1.md "Source Audio Chunks (Binary)"), so it is also about the longest send
     /// stall the stream rides out without a gap: 500 ms covers the routine stalls of an ESP32 WiFi
-    /// link. About 117 KiB at 48 kHz stereo 16-bit, PSRAM-preferring (buffer_location).
+    /// link.
     static constexpr uint32_t DEFAULT_CAPTURE_BUFFER_MS = 500U;
 
     /// @brief Default capture sample rate (Hz), the native rate of most capture hardware
