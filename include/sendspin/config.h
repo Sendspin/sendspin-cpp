@@ -672,10 +672,11 @@ struct SourceRoleConfig {
     /// and encryption cost negligible
     static constexpr uint32_t DEFAULT_CHUNK_MS = 20U;
 
-    /// @brief Default capture buffer: the spec's longest chunk. The buffer bounds the backlog a
-    /// network stall can build up (roles/source/v1.md "Source Audio Chunks (Binary)"), so it is
-    /// also about the longest send stall the stream rides out without a gap
-    static constexpr uint32_t DEFAULT_CAPTURE_BUFFER_MS = CHUNK_MAX_MS;
+    /// @brief Default capture buffer. The buffer bounds the backlog a network stall can build up
+    /// (roles/source/v1.md "Source Audio Chunks (Binary)"), so it is also about the longest send
+    /// stall the stream rides out without a gap: 500 ms covers the routine stalls of an ESP32 WiFi
+    /// link. About 117 KiB at 48 kHz stereo 16-bit, PSRAM-preferring (buffer_location).
+    static constexpr uint32_t DEFAULT_CAPTURE_BUFFER_MS = 500U;
 
     /// @brief Default capture sample rate (Hz), the native rate of most capture hardware
     static constexpr uint32_t DEFAULT_SAMPLE_RATE = 48000U;
