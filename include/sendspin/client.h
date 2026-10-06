@@ -94,7 +94,8 @@ public:
     ///
     /// server_id is the base64url public key of the server entering pairing. Fires once per
     /// attempt whatever the method; the exchange ends at on_pairing_succeeded or
-    /// on_pairing_failed.
+    /// on_pairing_failed, or at neither when the server cancels it with a server/activate
+    /// (pairing.md "Entering and leaving pairing").
     virtual void on_pairing_started(const std::string& /*server_id*/) {}
 
     /// @brief Called when a pairing exchange completes and a long-term record is stored
@@ -928,7 +929,8 @@ private:
     // ========================================
 
     /// @brief Publishes the initial client state once an admitted connection goes operational,
-    /// clears its pairing state and reports its trust level. Protocol task only.
+    /// clears its pairing state, dismissing any prompt the attempt left showing, and reports its
+    /// trust level. Protocol task only.
     /// @param conn The connection that completed the handshake
     void on_handshake_complete(SendspinConnection* conn);
 
@@ -973,6 +975,10 @@ private:
 
     /// @brief Queue an on_close_pairing_window notification
     void note_close_pairing_window();
+
+    /// @brief Queue on_clear_pairing_code and/or on_close_pairing_window for each prompt `ui`
+    /// records as showing
+    void note_pairing_ui_dismissals(const PairingUiSnapshot& ui);
 
     /// @brief Queue an on_trust_changed notification
     void note_trust_changed(ConnectionTrust trust);

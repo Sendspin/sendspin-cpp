@@ -598,9 +598,8 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     EXPECT_EQ(pair_init->pairing_index, 1U);
     EXPECT_FALSE(pair_init->has_commit_b);
 
-    // handle_enter_pairing's Pairing-PSK branch must fire on_pairing_started, exactly like the
-    // pairing-code branches do, so the started/succeeded/failed callback trio stays
-    // method-agnostic.
+    // handle_enter_pairing must fire on_pairing_started for the Pairing-PSK flow too, so the
+    // started/succeeded/failed callback trio stays method-agnostic.
     ASSERT_TRUE(listener.pairing_started_server_id().has_value())
         << "on_pairing_started was never fired for the pairing-token (Pairing-PSK) flow";
     EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());

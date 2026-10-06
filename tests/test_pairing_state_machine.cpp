@@ -2469,6 +2469,159 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
     EXPECT_EQ(conn->pairing_session().attempt_deadline_us, 0);
 }
 
+// A cancelling server/activate (pairing.md "Entering and leaving pairing") dismisses the code or
+// window prompt its attempt left showing, exactly once, and fires no on_pairing_failed. An open
+// pairing window stays open and bound (pairing.md "Pairing Window"). The control row cancels before
+// anything was shown. A pairing activate after an in-band re-handshake, which clears only the
+// in-progress flag, still dismisses the earlier attempt's prompt before the new one starts.
+TEST_F(PairingStateMachineTest, CancellingActivateDismissesThePromptItLeftShowing) {
+    struct Row {
+        const char* name;
+        SendspinPairMethod method;
+        bool emit_code;         // dynamic: drive server/pair-init so the code is emitted
+        bool confirm_window;    // static: confirm the gesture so the attempt runs under a window
+        bool reselect_pairing;  // the cancelling activate selects the same method again
+        bool rehandshake;       // a re-handshake lands before the cancelling activate
+        int expected_clear_code;
+        int expected_close_window;
+        bool expected_window_open;
+    };
+    const Row rows[] = {
+        {"Control: dynamic, cancelled before the code was emitted",
+         SendspinPairMethod::DYNAMIC_PAIRING_CODE, false, false, false, false, 0, 0, false},
+        {"dynamic, code emitted", SendspinPairMethod::DYNAMIC_PAIRING_CODE, true, false, false,
+         false, 1, 0, false},
+        {"static, gesture prompt showing", SendspinPairMethod::STATIC_PAIRING_CODE, false, false,
+         false, false, 0, 1, false},
+        {"static, attempt running under a confirmed window",
+         SendspinPairMethod::STATIC_PAIRING_CODE, false, true, false, false, 0, 1, true},
+        {"static, cancel that selects pairing again", SendspinPairMethod::STATIC_PAIRING_CODE,
+         false, false, true, false, 0, 1, false},
+        {"static, pairing activate after a re-handshake", SendspinPairMethod::STATIC_PAIRING_CODE,
+         false, false, true, true, 0, 1, false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        FakeConnection* conn = nullptr;
+        if (row.method == SendspinPairMethod::DYNAMIC_PAIRING_CODE) {
+            this->init_client(/*pairing_code_emission_supported=*/true,
+                              /*pairing_window_supported=*/true);
+            this->listener_.events_.clear();
+            conn = this->enter_dynamic_code_pairing("server-cancel");
+            if (row.emit_code) {
+                CodeEmissionResult display;
+                ASSERT_NO_FATAL_FAILURE(
+                    this->drive_to_code_emitted(conn, /*nonce_a_seed=*/11, display));
+            }
+        } else {
+            this->configure_static_pairing_code("13572468");
+            this->listener_.events_.clear();
+            conn = this->inject_current_connection("server-cancel", row.method);
+            this->enter_pairing(conn);
+            this->pump();
+            ASSERT_EQ(this->listener_.count(PairingEventKind::OPEN_WINDOW), 1);
+            if (row.confirm_window) {
+                this->client_->confirm_pairing_window();
+                this->pump();
+                ASSERT_EQ(this->window_connection(), conn);
+            }
+        }
+        ASSERT_TRUE(conn->is_pairing_in_progress());
+        ASSERT_EQ(this->listener_.count(PairingEventKind::CLEAR_CODE), 0);
+        ASSERT_EQ(this->listener_.count(PairingEventKind::CLOSE_WINDOW), 0);
+        const size_t events_before_cancel = this->listener_.events_.size();
+
+        if (row.rehandshake) {
+            // What SendspinConnection::handle_noise_rehandshake() leaves behind: the hello
+            // exchange done, the next activate a first one, and the attempt no longer marked in
+            // progress though its session is untouched.
+            conn->client_hello_sent_ = true;
+            conn->server_hello_received_ = true;
+            this->set_awaiting_activate(conn, true);
+            conn->set_pairing_in_progress(false);
+        }
+        if (row.reselect_pairing) {
+            this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+                                row.method);
+        } else {
+            this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+        }
+        this->pump();
+
+        EXPECT_EQ(this->listener_.count(PairingEventKind::CLEAR_CODE), row.expected_clear_code);
+        EXPECT_EQ(this->listener_.count(PairingEventKind::CLOSE_WINDOW),
+                  row.expected_close_window);
+        EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED))
+            << "a server cancel is not a pairing failure";
+        EXPECT_EQ(this->window_deadline() != 0, row.expected_window_open);
+        if (row.expected_window_open) {
+            EXPECT_EQ(this->window_connection(), conn)
+                << "a cancelled attempt must not unbind the window from its connection";
+        }
+
+        if (row.reselect_pairing) {
+            // The new attempt's prompt follows the old one's dismissal.
+            const std::vector<PairingEventKind> expected = {PairingEventKind::CLOSE_WINDOW,
+                                                            PairingEventKind::STARTED,
+                                                            PairingEventKind::OPEN_WINDOW};
+            std::vector<PairingEventKind> actual;
+            for (size_t i = events_before_cancel; i < this->listener_.events_.size(); ++i) {
+                actual.push_back(this->listener_.events_[i].kind);
+            }
+            EXPECT_EQ(actual, expected);
+            EXPECT_TRUE(conn->is_pairing_in_progress());
+        } else {
+            EXPECT_FALSE(conn->is_pairing_in_progress());
+        }
+    }
+}
+
+// Pairing notes reach the listener in queue order, however many one drain takes: a pair/abort and
+// a re-activate that both land before one drain still end the old attempt and close its prompt
+// before the new attempt starts and prompts. The control row drains between the two.
+TEST_F(PairingStateMachineTest, AbortThenRestartReachesTheListenerInOrder) {
+    struct Row {
+        const char* name;
+        bool drain_between;
+    };
+    const Row rows[] = {
+        {"Control: a drain between the abort and the activate", true},
+        {"abort and activate taken by one drain", false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        this->configure_static_pairing_code("13572468");
+        this->listener_.events_.clear();
+        FakeConnection* conn = this->inject_current_connection(
+            "server-restart", SendspinPairMethod::STATIC_PAIRING_CODE);
+        this->enter_pairing(conn);
+        this->pump();
+        ASSERT_EQ(this->listener_.count(PairingEventKind::OPEN_WINDOW), 1);
+        const size_t events_before_abort = this->listener_.events_.size();
+
+        this->client_->connection_manager_->on_pair_abort(conn, PairAbortReason::USER_CANCELLED);
+        if (row.drain_between) {
+            this->pump();
+        }
+        this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+                            SendspinPairMethod::STATIC_PAIRING_CODE);
+        this->pump();
+
+        const std::vector<PairingEventKind> expected = {
+            PairingEventKind::FAILED, PairingEventKind::CLOSE_WINDOW, PairingEventKind::STARTED,
+            PairingEventKind::OPEN_WINDOW};
+        std::vector<PairingEventKind> actual;
+        for (size_t i = events_before_abort; i < this->listener_.events_.size(); ++i) {
+            actual.push_back(this->listener_.events_[i].kind);
+        }
+        EXPECT_EQ(actual, expected);
+        EXPECT_EQ(conn->pairing_session().step,
+                  SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
+    }
+}
+
 // ============================================================================
 // pairing_index counter (pairing.md "Pairing index")
 // ============================================================================

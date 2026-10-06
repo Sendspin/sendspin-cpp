@@ -57,6 +57,7 @@
 #endif
 
 #include <algorithm>
+#include <optional>
 #include <utility>
 
 static const char* const TAG = "sendspin.client";
@@ -65,11 +66,8 @@ namespace sendspin {
 
 namespace {
 
-/// @brief Discriminates PairingNote entries. Enumerator order is the dispatch precedence: the
-/// drain fires all notes of one type before any note of the next, regardless of queue order (e.g.
-/// on_pairing_started before the on_open_pairing_window prompt it gated). The dispatch walks this
-/// enum by value and switches on it exhaustively with no default, so -Werror forces a new
-/// enumerator to be placed in the order and given a case.
+/// @brief Discriminates PairingNote entries. The drain switches on it exhaustively with no
+/// default, so -Werror forces a new enumerator to be given a case.
 enum class PairingNoteType : uint8_t {
     PAIRING_STARTED,
     PAIRING_SUCCEEDED,
@@ -79,7 +77,13 @@ enum class PairingNoteType : uint8_t {
     CLEAR_PAIRING_CODE,
     OPEN_PAIRING_WINDOW,
     CLOSE_PAIRING_WINDOW,
-    COUNT,  ///< Not a note type; bounds the dispatch walk. Keep last.
+};
+
+/// @brief The pairing-UI prompt a PairingNote shows or dismisses
+enum class PairingPrompt : uint8_t {
+    NONE,
+    CODE,
+    WINDOW,
 };
 
 /// @brief One deferred pairing/trust listener notification, queued by the note_*() methods on
@@ -95,8 +99,21 @@ struct PairingNote {
     SendspinPairingCodeFormat format{};
 };
 
-/// @brief True for note types that coalesce to at most one callback per tick, keeping the
-/// single-flag semantics of the window and code-withdrawal notifications
+/// @brief Returns the prompt `type` shows or dismisses, or PairingPrompt::NONE
+constexpr PairingPrompt prompt_of(PairingNoteType type) {
+    if (type == PairingNoteType::DISPLAY_PAIRING_CODE ||
+        type == PairingNoteType::CLEAR_PAIRING_CODE) {
+        return PairingPrompt::CODE;
+    }
+    if (type == PairingNoteType::OPEN_PAIRING_WINDOW ||
+        type == PairingNoteType::CLOSE_PAIRING_WINDOW) {
+        return PairingPrompt::WINDOW;
+    }
+    return PairingPrompt::NONE;
+}
+
+/// @brief True for note types the drain skips when they repeat the last note it delivered for
+/// their prompt in the batch
 constexpr bool is_coalesced_note(PairingNoteType type) {
     return type == PairingNoteType::CLEAR_PAIRING_CODE ||
            type == PairingNoteType::OPEN_PAIRING_WINDOW ||
@@ -104,25 +121,25 @@ constexpr bool is_coalesced_note(PairingNoteType type) {
 }
 
 /// @brief Drops every pending note except a dismissal whose prompt reached the listener in an
-/// earlier drain: a CLEAR_PAIRING_CODE with no DISPLAY_PAIRING_CODE pending, a
-/// CLOSE_PAIRING_WINDOW with no OPEN_PAIRING_WINDOW pending. A prompt still pending is never
-/// shown, so its dismissal goes with it. Runs under the Inbox mutex: a pure data operation.
+/// earlier drain: a CLEAR_PAIRING_CODE with no DISPLAY_PAIRING_CODE pending ahead of it, a
+/// CLOSE_PAIRING_WINDOW with no OPEN_PAIRING_WINDOW pending ahead of it. A prompt still pending is
+/// never shown, so the dismissals behind it go with it. Runs under the Inbox mutex: a pure data
+/// operation.
 void retain_delivered_dismissals(std::vector<PairingNote>& notes) {
     bool code_pending = false;
     bool window_pending = false;
+    size_t kept = 0;
     for (const PairingNote& note : notes) {
-        code_pending |= note.type == PairingNoteType::DISPLAY_PAIRING_CODE;
-        window_pending |= note.type == PairingNoteType::OPEN_PAIRING_WINDOW;
+        const PairingNoteType type = note.type;
+        code_pending |= type == PairingNoteType::DISPLAY_PAIRING_CODE;
+        window_pending |= type == PairingNoteType::OPEN_PAIRING_WINDOW;
+        if ((type == PairingNoteType::CLEAR_PAIRING_CODE && !code_pending) ||
+            (type == PairingNoteType::CLOSE_PAIRING_WINDOW && !window_pending)) {
+            // Payload-free, so rebuilt rather than moved (possibly onto itself).
+            notes[kept++] = PairingNote{.type = type};
+        }
     }
-    std::erase_if(notes, [code_pending, window_pending](const PairingNote& note) {
-        if (note.type == PairingNoteType::CLEAR_PAIRING_CODE) {
-            return code_pending;
-        }
-        if (note.type == PairingNoteType::CLOSE_PAIRING_WINDOW) {
-            return window_pending;
-        }
-        return true;
-    });
+    notes.resize(kept);
 }
 
 /// @brief The provider writes the main loop owes, accumulated by request_persist() and
@@ -487,12 +504,7 @@ void SendspinClient::stop() {
     // Queue the dismissals now, after cleanup_connection_state() dropped the pending notes, so the
     // drain below delivers them (same ordering rule as the ConnectionManager drop paths). One an
     // earlier drop left pending survived that cleanup; the two coalesce into one callback.
-    if (pairing_ui.code_was_emitted) {
-        this->note_clear_pairing_code();
-    }
-    if (pairing_ui.window_was_shown) {
-        this->note_close_pairing_window();
-    }
+    this->note_pairing_ui_dismissals(pairing_ui);
 
     // 7. Deliver what the teardown owes, now rather than on a loop() tick that is not coming:
     //    each role's main-loop half (its clear callback, the player's on_stream_end()), the
@@ -958,56 +970,50 @@ void SendspinClient::drain_inbox() {
     this->flush_pending_persistence();
     if (notes_taken && es.drain_generation == drain_generation) {
         if (this->listener_ != nullptr) {
-            // Set when a re-entrant stop() bumps the generation, abandoning the rest of the
-            // batch.
-            bool notes_aborted = false;
-            // Grouped by type in PairingNoteType declaration order, not queue order, firing
-            // coalesced types at most once; see the enum and is_coalesced_note(). The listener
-            // is set before start() and must outlive the client (see set_listener), so it cannot
-            // become null mid-dispatch.
-            for (uint8_t i = 0; i < static_cast<uint8_t>(PairingNoteType::COUNT) && !notes_aborted;
-                 ++i) {
-                const auto type = static_cast<PairingNoteType>(i);
-                for (const PairingNote& note : notes) {
-                    if (note.type != type) {
+            // In queue order, skipping a coalesced type (is_coalesced_note()) that repeats its
+            // prompt's last delivered note. The listener is set before start() and must outlive
+            // the client (see set_listener), so it cannot become null mid-dispatch.
+            std::optional<PairingNoteType> last_code_note;
+            std::optional<PairingNoteType> last_window_note;
+            for (const PairingNote& note : notes) {
+                const PairingPrompt prompt = prompt_of(note.type);
+                if (prompt != PairingPrompt::NONE) {
+                    std::optional<PairingNoteType>& last_note =
+                        prompt == PairingPrompt::CODE ? last_code_note : last_window_note;
+                    if (is_coalesced_note(note.type) && last_note == note.type) {
                         continue;
                     }
-                    switch (type) {
-                        case PairingNoteType::PAIRING_STARTED:
-                            this->listener_->on_pairing_started(note.text);
-                            break;
-                        case PairingNoteType::PAIRING_SUCCEEDED:
-                            this->listener_->on_pairing_succeeded(note.text);
-                            break;
-                        case PairingNoteType::TRUST_CHANGED:
-                            this->listener_->on_trust_changed(note.trust);
-                            break;
-                        case PairingNoteType::PAIRING_FAILED:
-                            this->listener_->on_pairing_failed(note.text, note.reason);
-                            break;
-                        case PairingNoteType::DISPLAY_PAIRING_CODE:
-                            this->listener_->on_display_pairing_code(note.text, note.format);
-                            break;
-                        case PairingNoteType::CLEAR_PAIRING_CODE:
-                            this->listener_->on_clear_pairing_code();
-                            break;
-                        case PairingNoteType::OPEN_PAIRING_WINDOW:
-                            this->listener_->on_open_pairing_window();
-                            break;
-                        case PairingNoteType::CLOSE_PAIRING_WINDOW:
-                            this->listener_->on_close_pairing_window();
-                            break;
-                        case PairingNoteType::COUNT:
-                            // Unreachable: the walk above stops before COUNT.
-                            break;
-                    }
-                    if (es.drain_generation != drain_generation) {
-                        notes_aborted = true;
+                    last_note = note.type;
+                }
+                switch (note.type) {
+                    case PairingNoteType::PAIRING_STARTED:
+                        this->listener_->on_pairing_started(note.text);
                         break;
-                    }
-                    if (is_coalesced_note(type)) {
+                    case PairingNoteType::PAIRING_SUCCEEDED:
+                        this->listener_->on_pairing_succeeded(note.text);
                         break;
-                    }
+                    case PairingNoteType::TRUST_CHANGED:
+                        this->listener_->on_trust_changed(note.trust);
+                        break;
+                    case PairingNoteType::PAIRING_FAILED:
+                        this->listener_->on_pairing_failed(note.text, note.reason);
+                        break;
+                    case PairingNoteType::DISPLAY_PAIRING_CODE:
+                        this->listener_->on_display_pairing_code(note.text, note.format);
+                        break;
+                    case PairingNoteType::CLEAR_PAIRING_CODE:
+                        this->listener_->on_clear_pairing_code();
+                        break;
+                    case PairingNoteType::OPEN_PAIRING_WINDOW:
+                        this->listener_->on_open_pairing_window();
+                        break;
+                    case PairingNoteType::CLOSE_PAIRING_WINDOW:
+                        this->listener_->on_close_pairing_window();
+                        break;
+                }
+                // A re-entrant stop() bumped the generation: abandon the rest of the batch.
+                if (es.drain_generation != drain_generation) {
+                    break;
                 }
             }
         }
@@ -1642,7 +1648,9 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     // stray pair/abort on an operational connection. This is the one place every "connection is
     // now operational" path converges (normal activate, leftover activate, and winning promotion).
     // Idempotent no-op for a connection that never paired.
+    const PairingUiSnapshot pairing_ui = snapshot_pairing_ui(conn);
     conn->clear_pairing_state();
+    this->note_pairing_ui_dismissals(pairing_ui);
 
     this->publish_client_state(conn);
 
@@ -1750,6 +1758,15 @@ void SendspinClient::note_open_pairing_window() {
 
 void SendspinClient::note_close_pairing_window() {
     this->event_state_->push_pairing_note({.type = PairingNoteType::CLOSE_PAIRING_WINDOW});
+}
+
+void SendspinClient::note_pairing_ui_dismissals(const PairingUiSnapshot& ui) {
+    if (ui.code_was_emitted) {
+        this->note_clear_pairing_code();
+    }
+    if (ui.window_was_shown) {
+        this->note_close_pairing_window();
+    }
 }
 
 void SendspinClient::note_trust_changed(ConnectionTrust trust) {
