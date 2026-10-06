@@ -178,6 +178,14 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     // conn is an admitted connection whose activate selects pairing: one that just won admission
     // (see promote_or_arbitrate_nursery_entry()) or one already admitted (on_server_activate()).
 
+    // A new attempt inherits nothing from an earlier one. on_handshake_complete() has already
+    // reset the session on most paths here, but an in-band re-handshake (connection.md
+    // "Re-handshake") clears only pairing_in_progress_, so a pairing-only activate after one still
+    // finds the earlier attempt's session and any prompt it showed.
+    const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
+    conn->clear_pairing_state();
+    this->client_->note_pairing_ui_dismissals(ui);
+
     // An attempt is in flight from here until it finalizes or aborts: pairing messages are only
     // routed while it is (pairing.md "Entering and leaving pairing"). Playback is untouched.
     conn->set_pairing_in_progress(true);

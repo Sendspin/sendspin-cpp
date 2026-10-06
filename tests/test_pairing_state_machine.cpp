@@ -2472,7 +2472,8 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
 // A cancelling server/activate (pairing.md "Entering and leaving pairing") dismisses the code or
 // window prompt its attempt left showing, exactly once, and fires no on_pairing_failed. An open
 // pairing window stays open and bound (pairing.md "Pairing Window"). The control row cancels before
-// anything was shown.
+// anything was shown. A pairing activate after an in-band re-handshake, which clears only the
+// in-progress flag, still dismisses the earlier attempt's prompt before the new one starts.
 TEST_F(PairingStateMachineTest, CancellingActivateDismissesThePromptItLeftShowing) {
     struct Row {
         const char* name;
@@ -2480,21 +2481,24 @@ TEST_F(PairingStateMachineTest, CancellingActivateDismissesThePromptItLeftShowin
         bool emit_code;         // dynamic: drive server/pair-init so the code is emitted
         bool confirm_window;    // static: confirm the gesture so the attempt runs under a window
         bool reselect_pairing;  // the cancelling activate selects the same method again
+        bool rehandshake;       // a re-handshake lands before the cancelling activate
         int expected_clear_code;
         int expected_close_window;
         bool expected_window_open;
     };
     const Row rows[] = {
         {"control: dynamic, cancelled before the code was emitted",
-         SendspinPairMethod::DYNAMIC_PAIRING_CODE, false, false, false, 0, 0, false},
-        {"dynamic, code emitted", SendspinPairMethod::DYNAMIC_PAIRING_CODE, true, false, false, 1,
-         0, false},
+         SendspinPairMethod::DYNAMIC_PAIRING_CODE, false, false, false, false, 0, 0, false},
+        {"dynamic, code emitted", SendspinPairMethod::DYNAMIC_PAIRING_CODE, true, false, false,
+         false, 1, 0, false},
         {"static, gesture prompt showing", SendspinPairMethod::STATIC_PAIRING_CODE, false, false,
-         false, 0, 1, false},
+         false, false, 0, 1, false},
         {"static, attempt running under a confirmed window",
-         SendspinPairMethod::STATIC_PAIRING_CODE, false, true, false, 0, 1, true},
+         SendspinPairMethod::STATIC_PAIRING_CODE, false, true, false, false, 0, 1, true},
         {"static, cancel that selects pairing again", SendspinPairMethod::STATIC_PAIRING_CODE,
-         false, false, true, 0, 1, false},
+         false, false, true, false, 0, 1, false},
+        {"static, pairing activate after a re-handshake", SendspinPairMethod::STATIC_PAIRING_CODE,
+         false, false, true, true, 0, 1, false},
     };
 
     for (const Row& row : rows) {
@@ -2528,6 +2532,15 @@ TEST_F(PairingStateMachineTest, CancellingActivateDismissesThePromptItLeftShowin
         ASSERT_EQ(this->listener_.count(PairingEventKind::CLOSE_WINDOW), 0);
         const size_t events_before_cancel = this->listener_.events_.size();
 
+        if (row.rehandshake) {
+            // What SendspinConnection::handle_noise_rehandshake() leaves behind: the hello
+            // exchange done, the next activate a first one, and the attempt no longer marked in
+            // progress though its session is untouched.
+            conn->client_hello_sent_ = true;
+            conn->server_hello_received_ = true;
+            this->set_awaiting_activate(conn, true);
+            conn->set_pairing_in_progress(false);
+        }
         if (row.reselect_pairing) {
             this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                                 row.method);

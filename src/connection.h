@@ -487,8 +487,7 @@ public:
         SendspinPairingCodeFormat format{SendspinPairingCodeFormat::DIGITS};
         PairingStep step{PairingStep::IDLE};
         bool code_emitted{false};  ///< True once a code was surfaced via on_display_pairing_code.
-        bool window_shown{false};  ///< True once on_open_pairing_window was surfaced, so
-                                   ///< abort/teardown knows to fire on_close_pairing_window.
+        bool window_shown{false};  ///< True once on_open_pairing_window was surfaced.
 
         PairingSession() = default;
 

@@ -764,7 +764,8 @@ private:
     /// @brief Enters the pairing exchange for the given connection.
     /// Called when an admitted server/activate declares the PAIRING activity with a
     /// pairing.method the client offers. PLAYBACK may ride along, and the activate need not be
-    /// the connection's first.
+    /// the connection's first. Starts from a clean pairing session, dismissing any prompt an
+    /// earlier attempt left showing.
     /// @param conn The connection entering pairing. Must be non-null.
     void handle_enter_pairing(SendspinConnection* conn);
 
