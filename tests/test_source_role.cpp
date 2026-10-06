@@ -254,7 +254,7 @@ TEST(SourceBookkeeping, ChunkBytesFitOneTransportMessage) {
 }
 
 // The capture ring's margin covers the per-write overhead down to 0.5 ms writes: the default ring
-// takes nearly all of its 150 ms in 96-byte writes. A size too large to compute, or too small for
+// takes nearly all of its DEFAULT_CAPTURE_BUFFER_MS in 96-byte writes. A size too large to compute, or too small for
 // a ring, is refused.
 TEST(SourceBookkeeping, CaptureRingHoldsTheBufferWithItsMargin) {
     constexpr size_t HALF_MS_WRITE = 96;  // 24 frames of 48 kHz stereo 16-bit
@@ -266,7 +266,9 @@ TEST(SourceBookkeeping, CaptureRingHoldsTheBufferWithItsMargin) {
         ring.complete(item);
         ++writes;
     }
-    EXPECT_GE(writes / 2, 140U) << "the margin did not cover the 0.5 ms writes' overhead";
+    // Nearly all: 14/15 of it, short only by the ring's own bookkeeping
+    EXPECT_GE(writes / 2, SourceRoleConfig::DEFAULT_CAPTURE_BUFFER_MS * 14 / 15)
+        << "writes=" << writes << ": the margin did not cover the 0.5 ms writes' overhead";
 
     struct Row {
         const char* name;
