@@ -2487,7 +2487,7 @@ TEST_F(PairingStateMachineTest, CancellingActivateDismissesThePromptItLeftShowin
         bool expected_window_open;
     };
     const Row rows[] = {
-        {"control: dynamic, cancelled before the code was emitted",
+        {"Control: dynamic, cancelled before the code was emitted",
          SendspinPairMethod::DYNAMIC_PAIRING_CODE, false, false, false, false, 0, 0, false},
         {"dynamic, code emitted", SendspinPairMethod::DYNAMIC_PAIRING_CODE, true, false, false,
          false, 1, 0, false},
@@ -2586,7 +2586,7 @@ TEST_F(PairingStateMachineTest, AbortThenRestartReachesTheListenerInOrder) {
         bool drain_between;
     };
     const Row rows[] = {
-        {"control: a drain between the abort and the activate", true},
+        {"Control: a drain between the abort and the activate", true},
         {"abort and activate taken by one drain", false},
     };
 

@@ -236,7 +236,10 @@ target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
 # directly. Disabling access checking for that one translation unit keeps every test seam
 # out of the production headers (no friend declarations); access control is a compile-time
 # check only, so this has no ABI effect. GCC and Clang both support the flag, and the test
-# suite is host-only. The fixture's accessor methods document each seam and why it exists.
+# suite is host-only. The fixture's accessor methods document each seam and why it exists. The
+# re-handshake row of CancellingActivateDismissesThePromptItLeftShowing also sets
+# SendspinConnection's client_hello_sent_ and server_hello_received_ directly, to recreate the
+# state handle_noise_rehandshake() leaves behind without the Noise transport this harness lacks.
 set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
