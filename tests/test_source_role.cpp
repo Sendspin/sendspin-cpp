@@ -254,7 +254,7 @@ TEST(SourceBookkeeping, ChunkBytesFitOneTransportMessage) {
 }
 
 // The capture ring's margin covers the per-write overhead down to 0.5 ms writes: the default ring
-// takes nearly all of its 150 ms in 96-byte writes. A size too large to compute, or too small for
+// takes nearly all of its DEFAULT_CAPTURE_BUFFER_MS in 96-byte writes. A size too large to compute, or too small for
 // a ring, is refused.
 TEST(SourceBookkeeping, CaptureRingHoldsTheBufferWithItsMargin) {
     constexpr size_t HALF_MS_WRITE = 96;  // 24 frames of 48 kHz stereo 16-bit
@@ -266,7 +266,9 @@ TEST(SourceBookkeeping, CaptureRingHoldsTheBufferWithItsMargin) {
         ring.complete(item);
         ++writes;
     }
-    EXPECT_GE(writes / 2, 140U) << "the margin did not cover the 0.5 ms writes' overhead";
+    // Nearly all: 14/15 of it, short only by the ring's own bookkeeping
+    EXPECT_GE(writes / 2, SourceRoleConfig::DEFAULT_CAPTURE_BUFFER_MS * 14 / 15)
+        << "writes=" << writes << ": the margin did not cover the 0.5 ms writes' overhead";
 
     struct Row {
         const char* name;
@@ -653,17 +655,19 @@ TEST(SourceChunks, AChunkNeverOutlivesItsStream) {
 
 // roles/source/v1.md "Source Audio Chunks (Binary)": after a stall the source resumes from live
 // capture rather than burst stale audio. A full capture ring refuses the write and the task drops
-// the backlog, and the chunk it has begun, as it takes its next capture item; an outbound ring with
-// no room for a chunk drops the chunk and the backlog alike. Either way the next chunk with audio
-// starts at the first write made after. A write too long for any capture item is refused without
-// counting as a stall, so the backlog stays.
+// the backlog, and the chunk it has begun, as it takes its next capture item or as it waits for
+// outbound room; the next chunk with audio then starts at the first write made after. An outbound
+// ring with no room for a chunk is a send stall the capture ring rides out, so the backlog stays,
+// as it does for a write too long for any capture item, which is refused without counting as a
+// stall.
 TEST(SourceChunks, AStallResumesFromLiveCapture) {
     enum class Stall : uint8_t {
         NONE,
         OVERSIZED_WRITE,
         CAPTURE_FULL,
         CAPTURE_FULL_MID_CHUNK,
-        OUTBOUND_FULL
+        OUTBOUND_FULL,
+        OUTBOUND_FULL_THEN_CAPTURE_FULL
     };
     struct Row {
         const char* name;
@@ -674,14 +678,18 @@ TEST(SourceChunks, AStallResumesFromLiveCapture) {
         {"a write too long for any capture item keeps the backlog", Stall::OVERSIZED_WRITE},
         {"the capture ring overflows", Stall::CAPTURE_FULL},
         {"the capture ring overflows part-way through a chunk", Stall::CAPTURE_FULL_MID_CHUNK},
-        {"the outbound ring has no room", Stall::OUTBOUND_FULL},
+        {"the outbound ring has no room: the backlog waits", Stall::OUTBOUND_FULL},
+        {"the capture ring overflows while the outbound ring has no room",
+         Stall::OUTBOUND_FULL_THEN_CAPTURE_FULL},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         CaptureRig rig;
         rig.open(1);
         std::vector<void*> held;
-        if (row.stall == Stall::OUTBOUND_FULL) {
+        const bool outbound_full = row.stall == Stall::OUTBOUND_FULL ||
+                                   row.stall == Stall::OUTBOUND_FULL_THEN_CAPTURE_FULL;
+        if (outbound_full) {
             // Every item completed and never taken, as behind a protocol task that cannot send
             OutboundRing& outbound = *rig.task.outbound_ring_;
             while (void* item = outbound.acquire(rig.task.chunk_message_bytes_, 0)) {
@@ -709,16 +717,27 @@ TEST(SourceChunks, AStallResumesFromLiveCapture) {
                 0);
             ASSERT_FALSE(rig.source.write_audio(oversized.data(), oversized.size(), stamp));
         }
-        if (row.stall == Stall::CAPTURE_FULL || row.stall == Stall::CAPTURE_FULL_MID_CHUNK) {
+        if (outbound_full) {
+            rig.task.process(0);  // Takes the first write and finds no outbound room
+        }
+        if (row.stall == Stall::CAPTURE_FULL || row.stall == Stall::CAPTURE_FULL_MID_CHUNK ||
+            row.stall == Stall::OUTBOUND_FULL_THEN_CAPTURE_FULL) {
             while (rig.write(stamp)) {
                 stamp += WRITE_MS * 1000;
             }
         }
-        if (row.stall != Stall::NONE && row.stall != Stall::OVERSIZED_WRITE) {
-            rig.task.process(0);  // The next capture item taken, at which the backlog goes
+        const bool stalled = row.stall == Stall::CAPTURE_FULL ||
+                             row.stall == Stall::CAPTURE_FULL_MID_CHUNK ||
+                             row.stall == Stall::OUTBOUND_FULL_THEN_CAPTURE_FULL;
+        if (stalled || outbound_full) {
+            // The next capture item taken, or the next wait for outbound room, at which an
+            // overflowed backlog goes
+            rig.task.process(0);
             size_t capacity = 0;
-            EXPECT_EQ(rig.task.capture_ring_->take(&capacity, 0), nullptr)
-                << "the backlog was kept";
+            if (stalled) {
+                EXPECT_EQ(rig.task.capture_ring_->take(&capacity, 0), nullptr)
+                    << "the backlog was kept";
+            }
             for (size_t i = 0; i < held.size(); ++i) {
                 ASSERT_NE(rig.task.outbound_ring_->take(&capacity, 0), nullptr);
             }
@@ -736,7 +755,6 @@ TEST(SourceChunks, AStallResumesFromLiveCapture) {
             return chunk.first.data_len != 0;
         });
         ASSERT_NE(first_audio, chunks.end());
-        const bool stalled = row.stall != Stall::NONE && row.stall != Stall::OVERSIZED_WRITE;
         EXPECT_EQ(first_audio->first.capture_time_us, stalled ? LIVE_US : BACKLOG_US);
     }
 }

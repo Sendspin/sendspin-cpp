@@ -154,8 +154,9 @@ protected:
     /// at most chunk_duration_ms, and anchors it on the item's first unread sample. A new
     /// generation also resets the encoder, warming the Opus encoder up first on this thread's first
     /// Opus stream.
-    /// @return false when the outbound ring had no room: the chunk is dropped and the capture
-    ///         backlog flushed to live capture.
+    /// @return false when the outbound ring had no room: the capture item stays held for the next
+    ///         attempt, unless the capture ring overflowed meanwhile, when the backlog is flushed
+    ///         to live capture.
     bool begin_chunk(const OutboundItemHeader& capture);
 
     /// @brief Encodes the full chunk into its outbound item, stamps the header, completes it and
@@ -240,8 +241,6 @@ protected:
     /// item, since its last accepted write.
     bool producer_partial_warned_{false};
     bool producer_oversize_warned_{false};
-    /// Task-only: an outbound acquire failed and none has succeeded since.
-    bool stall_episode_{false};
     /// Task-only: opus_encoder_ was warmed up on this run's thread (SourceEncoder::warm_up());
     /// micro-opus's pseudostack is per thread.
     bool opus_warm_{false};

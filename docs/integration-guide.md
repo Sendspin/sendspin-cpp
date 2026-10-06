@@ -1461,7 +1461,7 @@ Configuration passed to `client.add_source()`. A value that breaks any rule belo
 | `channels` | `uint8_t` | `2` | Capture channel count, at least 1 (1 or 2 for `OPUS`) |
 | `bit_depth` | `uint8_t` | `16` | 16, 24 (3 packed bytes), or 32; `OPUS` takes 16 |
 | `chunk_duration_ms` | `uint32_t` | `20` | Audio per chunk, 5 to 150 ms; one chunk with its header must fit one Noise transport message. `OPUS` takes 5, 10, 20, 40, or 60. |
-| `capture_buffer_ms` | `uint32_t` | `150` | Capture buffer, more than 0 ms; the bound on the backlog a stall can build before writes are dropped and streaming resumes from live capture. A quarter more is allocated for per-write overhead, so very small writes hold less audio, and a single write longer than half the allocated storage (just under five eighths of `capture_buffer_ms`) is always refused, without disturbing the audio already queued. |
+| `capture_buffer_ms` | `uint32_t` | `500` | More than 0 ms; about the longest network stall the stream rides out without a gap; a longer one resumes from live capture. A single write must fit in just under 5/8 of it. |
 | `opus_bitrate` | `uint32_t` | `128000` | Opus bitrate in bit/s, 500 to 512000; ignored for `PCM` |
 | `opus_complexity` | `uint8_t` | `2` | Opus encoder complexity, at most 10; ignored for `PCM` |
 | `line_sense` | `bool` | `false` | Advertise signal sensing; see `SourceRole::set_signal()` |
