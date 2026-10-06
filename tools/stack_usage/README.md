@@ -154,8 +154,8 @@ Notes per task:
   above `thread_entry()` are not counted and come out of the rounding slack. 1,168 + 384 = 1,552,
   rounded up.
 - source, Opus: `quant_partition()` nests four levels deeper than charged, 576 bytes more, so
-  5,168 + 576 = 5,744, + 384 = 6,128, rounded up. The `std::thread` entry frames come out of the
-  rounding slack as for PCM.
+  5,168 + 576 = 5,744, + 384 = 6,128. Rounding up to 6,144 would leave 16 bytes of slack for the
+  uncounted `std::thread` entry frames, so the default takes one more 512-byte step, 6,656.
 
 ## Margin and rounding
 
