@@ -241,8 +241,6 @@ protected:
     /// item, since its last accepted write.
     bool producer_partial_warned_{false};
     bool producer_oversize_warned_{false};
-    /// Task-only: an outbound acquire failed and none has succeeded since (a send stall).
-    bool stall_episode_{false};
     /// Task-only: opus_encoder_ was warmed up on this run's thread (SourceEncoder::warm_up());
     /// micro-opus's pseudostack is per thread.
     bool opus_warm_{false};

@@ -133,7 +133,6 @@ bool SourceTask::start(ProtocolTask* protocol_task) {
     this->capture_item_ = nullptr;
     this->chunk_item_ = nullptr;
     this->encoder_generation_ = 0;
-    this->stall_episode_ = false;
     this->opus_warm_ = false;
     const size_t stack_size = config.codec == SendspinCodecFormat::OPUS
                                   ? SourceRoleConfig::DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE
@@ -307,10 +306,6 @@ bool SourceTask::begin_chunk(const OutboundItemHeader& capture) {
     this->chunk_item_ = this->outbound_ring_->acquire(this->chunk_message_bytes_,
                                                       this->role_->config.chunk_duration_ms);
     if (this->chunk_item_ == nullptr) {
-        if (!this->stall_episode_) {
-            this->stall_episode_ = true;
-            SS_LOGW(TAG, "Source chunk sends stalled; holding captured audio");
-        }
         // The capture ring overflowed during the stall: the backlog is stale, so resume from live
         // capture (roles/source/v1.md "Source Audio Chunks (Binary)"). The write path logged it.
         uint32_t overflowed = capture.generation;
@@ -319,10 +314,6 @@ bool SourceTask::begin_chunk(const OutboundItemHeader& capture) {
             this->flush_to_live();
         }
         return false;
-    }
-    if (this->stall_episode_) {
-        this->stall_episode_ = false;
-        SS_LOGI(TAG, "Source chunks queue again");
     }
     if (capture.generation != this->encoder_generation_) {
         // Read after the gate admitted this generation, which publishes the codec chosen for it
