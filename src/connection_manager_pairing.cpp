@@ -181,6 +181,9 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     // An attempt is in flight from here until it finalizes or aborts: pairing messages are only
     // routed while it is (pairing.md "Entering and leaving pairing"). Playback is untouched.
     conn->set_pairing_in_progress(true);
+    // Queued before any other note of the attempt, so the queue-order drain delivers it ahead of
+    // the attempt's prompt or failure.
+    this->client_->note_pairing_started(conn->get_server_id());
 
     // The pairing server/activate counter (pairing.md "Pairing index") was already bumped at the
     // point this activate was received (on_server_activate()). Do not bump again here: this
@@ -288,15 +291,12 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
                     "waiting for the server to cancel the attempt",
                     to_cstr(ps.method), server_id.c_str());
         }
-
-        this->client_->note_pairing_started(server_id);
         return;
     }
 
     // Not gated, or a standing window is already open: start the attempt immediately
     // (start_pairing_attempt binds an open window to this connection; it does not spend it).
     this->start_pairing_attempt(conn);
-    this->client_->note_pairing_started(server_id);
 }
 
 void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
@@ -325,8 +325,6 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
     // Hold the pending record: committed to the RecordStore by the server/pair-finalize handler
     // on ack.
     conn->set_pending_pairing_record(std::move(outcome.record));
-
-    this->client_->note_pairing_started(server_id);
 }
 
 void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortReason reason) {
@@ -359,15 +357,6 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
         to_public_abort_reason(reason), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
 }
 
-void ConnectionManager::dismiss_pairing_ui(bool code_was_emitted, bool window_was_shown) {
-    if (code_was_emitted) {
-        this->client_->note_clear_pairing_code();
-    }
-    if (window_was_shown) {
-        this->client_->note_close_pairing_window();
-    }
-}
-
 void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
                                               std::optional<PairAbortReason> wire_abort_reason,
                                               PairingDropAction drop_action,
@@ -396,7 +385,7 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
 
     // Queued after any drop_connection() so they survive to be dispatched on the main loop.
     this->client_->note_pairing_failed(server_id, public_reason);
-    this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
+    this->client_->note_pairing_ui_dismissals(ui);
 }
 
 // ============================================================================
@@ -688,7 +677,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
 
     // Reset both flags immediately after dismissing: clear_pairing_state() does not run on this
     // success path, so a later inspection must not dismiss the same attempt's UI twice.
-    this->dismiss_pairing_ui(ps.code_emitted, ps.window_shown);
+    this->client_->note_pairing_ui_dismissals(snapshot_pairing_ui(conn));
     ps.code_emitted = false;
     ps.window_shown = false;
 

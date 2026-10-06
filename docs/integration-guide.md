@@ -863,6 +863,11 @@ observes pairing via `SendspinClientListener` callbacks:
    Either way, do not treat this callback as a disconnect notification; poll `is_connected()`
    if the application needs to track that.
 
+A server can also end an attempt with a `server/activate` in place of the next pairing message
+(`pairing.md` "Entering and leaving pairing"). Neither `on_pairing_succeeded` nor
+`on_pairing_failed` fires then, but `on_clear_pairing_code` / `on_close_pairing_window` still
+withdraw any prompt the attempt showed; a pairing window the operator opened stays open.
+
 #### Pairing PSK
 
 `pairing_psk` is the pairing method every client must implement, so it is always offered and a

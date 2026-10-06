@@ -154,7 +154,7 @@ The tick returns the milliseconds until the earliest of its timers: a nursery en
    └─ PLAYER/ARTWORK/VISUALIZER/SOURCE_STREAM → a current event's handler, after the catch-up
 5. Take the pairing and trust notes, then perform the provider writes owed since the last
    drain (flush_pending_persistence(), which polls for itself)
-6. Dispatch the notes taken in step 5, grouped by type
+6. Dispatch the notes taken in step 5 in queue order, coalescing repeats
 7. Role drains: each role's impl_->drain_events(), gated on impl_->needs_drain(slot_bits)
 8. Drain group_slot: apply deltas, fire on_group_update
 ```

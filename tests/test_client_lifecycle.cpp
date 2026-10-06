@@ -2497,10 +2497,11 @@ public:
 // drop (or stop()) before the main loop runs must not wipe it, or the code or window stays on the
 // operator's screen. A prompt still pending goes with its dismissal, since the operator never saw
 // it, and a dismissal the teardown's own path queues again beside a surviving one is delivered
-// once. The notes are queued and the teardown run directly, as the protocol task's handlers do,
+// once. A later prompt pending behind a shown prompt's dismissal takes only its own dismissals
+// with it. The notes are queued and the teardown run directly, as the protocol task's handlers do,
 // because no public call stages two drops inside one main-loop tick.
 TEST(ClientLifecycle, AFullTeardownKeepsTheDismissalsOfShownPrompts) {
-    enum class Pending : uint8_t { DISMISSALS, PROMPTS_AND_DISMISSALS };
+    enum class Pending : uint8_t { DISMISSALS, PROMPTS_AND_DISMISSALS, DISMISSALS_THEN_CYCLE };
     struct Row {
         const char* name;
         Pending pending;
@@ -2517,6 +2518,10 @@ TEST(ClientLifecycle, AFullTeardownKeepsTheDismissalsOfShownPrompts) {
          true, true, 0, 1},
         {"a prompt and its dismissal both pending are dropped together",
          Pending::PROMPTS_AND_DISMISSALS, true, false, 0, 0},
+        {"Control: a shown prompt's dismissal then a whole cycle, no teardown",
+         Pending::DISMISSALS_THEN_CYCLE, false, false, 1, 2},
+        {"a later prompt and dismissal behind a shown prompt's dismissal are dropped, not it",
+         Pending::DISMISSALS_THEN_CYCLE, true, false, 0, 1},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -2534,6 +2539,12 @@ TEST(ClientLifecycle, AFullTeardownKeepsTheDismissalsOfShownPrompts) {
         }
         client.note_clear_pairing_code();
         client.note_close_pairing_window();
+        if (row.pending == Pending::DISMISSALS_THEN_CYCLE) {
+            client.note_display_pairing_code("123456", SendspinPairingCodeFormat::DIGITS);
+            client.note_open_pairing_window();
+            client.note_clear_pairing_code();
+            client.note_close_pairing_window();
+        }
         if (row.teardown) {
             client.cleanup_connection_state(ALL_ROLES_MASK);
         }

@@ -206,8 +206,7 @@ struct ServerPairingMessage {
 /// conn->pairing_session().code_emitted / .window_shown are the sole record of whether a pairing
 /// code or pairing-window prompt is still showing, and every path that ends a pairing attempt
 /// clears that state before it gets a chance to dismiss the prompt. Capture the flags first,
-/// then dismiss afterward (dismiss_pairing_ui(), or the client's note_*() calls on the stop()
-/// path).
+/// then dismiss (SendspinClient::note_pairing_ui_dismissals()).
 struct PairingUiSnapshot {
     bool code_was_emitted;
     bool window_was_shown;
@@ -350,8 +349,8 @@ public:
     /// (esp_websocket_client_stop() / ix::WebSocket::stop()), up to its connect timeout
     /// (SendspinClientConnection::CONNECT_TIMEOUT_MS) for one still connecting.
     /// @return The pairing prompts the dropped connections left showing. The caller dismisses
-    ///         them (SendspinClient::note_clear_pairing_code() / note_close_pairing_window()) after
-    ///         its own cleanup_connection_state(), which would otherwise wipe the queued notes.
+    ///         them (SendspinClient::note_pairing_ui_dismissals()) after its own
+    ///         cleanup_connection_state(), which would otherwise wipe the queued notes.
     PairingUiSnapshot finish_stop();
 
     // ========================================
@@ -797,21 +796,15 @@ private:
     /// @param reason The abort reason.
     void handle_pair_abort(SendspinConnection* conn, PairAbortReason reason);
 
-    /// @brief Fires on_clear_pairing_code and/or on_open_pairing_window's counterpart for a
-    /// pairing UI element that was left showing (queued for the main loop).
-    /// @param code_was_emitted Whether a pairing code was being emitted.
-    /// @param window_was_shown Whether the pairing-window gesture prompt was open.
-    void dismiss_pairing_ui(bool code_was_emitted, bool window_was_shown);
-
     /// @brief Shared cleanup for every path that locally ends a pairing attempt on `conn`.
     ///
     /// Captures the code-emission / pairing-window flags before clear_pairing_state() resets
     /// them, optionally sends a wire pair/abort, clears the pairing state, optionally drops the
     /// connection, then queues on_pairing_failed and dismisses any pairing UI left showing (via
-    /// dismiss_pairing_ui()). When `drop_action` is not KEEP_OPEN, drop_connection() -> the
-    /// admitted-slot cleanup runs before the note_* calls, matching the ordering every call site
-    /// needs (the cleanup wipes the queued pairing notes).
-    /// `conn` must be non-null.
+    /// SendspinClient::note_pairing_ui_dismissals()). When `drop_action` is not KEEP_OPEN,
+    /// drop_connection() -> the admitted-slot cleanup runs before the note_* calls, matching the
+    /// ordering every call site needs (the cleanup wipes the queued pairing notes). `conn` must be
+    /// non-null.
     ///
     /// @param wire_abort_reason  If set, sends pair/abort(wire_abort_reason) to the peer first
     ///        (best-effort). Leave nullopt when the abort was received from the peer, or when

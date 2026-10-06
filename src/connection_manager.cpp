@@ -1598,7 +1598,7 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
             static_cast<uint16_t>(ALL_ROLES_MASK & ~this->roles_owned_by_others(nullptr)));
         this->refresh_published_state();
         this->release_connection(std::move(dropped), goodbye);
-        this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
+        this->client_->note_pairing_ui_dismissals(ui);
         return;
     }
 
@@ -1609,7 +1609,7 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         // reads. Snapshot before release for the same reason as the admitted path above.
         const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         this->release_nursery_entry(it, goodbye);
-        this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
+        this->client_->note_pairing_ui_dismissals(ui);
     }
     // Not a managed connection: nothing to do (already released).
 }
