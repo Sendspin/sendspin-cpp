@@ -66,7 +66,8 @@ call graphs GCC writes with `-fcallgraph-info=su`. The `DEFAULT_*_STACK_SIZE` de
    cycle once (see below). Totals do not depend on iteration order; `PYTHONHASHSEED=0` only keeps
    the choice between equally deep paths the same from run to run.
 
-4. Add the headroom stated in `config.h` (384 bytes) and round up to a 512-byte multiple.
+4. Add the 384-byte margin (see [Margin and rounding](#margin-and-rounding)) and round up to a
+   512-byte multiple.
 
 ## Keeping the tables current
 
@@ -109,7 +110,7 @@ those on the deepest path. The ones the current tree reaches, and how deep each 
   made while printing one: a second pass of the error-log tail every total already ends in.
   libstdc++'s terminate cycle closes only through a throw during termination.
 - ArduinoJson's parser, serializer and `VariantData::clear()`, one level per nesting level up
-  to its limit of 10 (`config.h` lists it), and at `-Og` its `pow10()`, once per exponent bit.
+  to its limit of 10, and at `-Og` its `pow10()`, once per exponent bit.
 
 ## What it does not model
 
@@ -117,4 +118,54 @@ The result is a static upper bound over the call graph, not a measured high-wate
 not include: recursion deeper than one pass (`--cycles` above), a second interrupt frame, an
 `esp_log_set_vprintf()` hook deeper than newlib's `vprintf()`, noise-c's `alloca` extras off
 the worst path, ArduinoJson's virtual allocator chain, or the `shared_ptr` disposal at the end
-of a protocol tick. `config.h` lists the figures; the on-device high-water check is still owed.
+of a protocol tick. The bounds are also conservative where the graph cannot tell callees apart:
+a virtual call reaches every override (`SendspinConnection::fail_inbound()`'s close reaches both
+transports'), and `esp_event_loop_run()` reaches the library's event handler for every event.
+
+Sizes of what is left out: a second interrupt frame is 192 bytes; ESPHome's logging hook runs
+about 100 to 250 bytes deeper than newlib's `vprintf()` chain; ArduinoJson's virtual allocator
+chain is about 4.2 KB, under every bound that reaches it, and its nesting costs 64 bytes a level.
+
+## Current figures
+
+Measured on xtensa-esp32 with ESP-IDF 5.5 and GCC 14.2, at `-Os` (ESPHome's default) and `-Og`
+(ESP-IDF's default). This table and the `DEFAULT_*_STACK_SIZE` constants in
+`include/sendspin/config.h` are updated together.
+
+| Task | Root | Deepest chain | -Os | -Og | Default | Chain ends in |
+| --- | --- | --- | --- | --- | --- | --- |
+| httpd | `httpd_thread` | esp_http_server's own WebSocket upgrade response (544 to 576 bytes) | 4,032 | 3,968 | 4,608 (`DEFAULT_HTTPD_STACK_SIZE`) | shared ESP-IDF tail |
+| websocket client | `esp_websocket_client_task` | library event handler (3,520 / 3,584) closing on a stalled protocol task via `fail_inbound()` through the inbound transport's close | 3,904 | 3,952 | 4,608 (`DEFAULT_WEBSOCKET_STACK_SIZE`) | shared ESP-IDF tail |
+| protocol task | task entry | as bounded: an esp_websocket_client send error into the event handler, `handle_data()`, `fail_inbound()` and `httpd_sess_trigger_close` (unreachable); reachable: a pairing confirm dropping an outbound connection whose goodbye send fails (6,352 / 6,576) | 6,560 | 6,832 | 7,168 (`DEFAULT_PROTOCOL_TASK_STACK_SIZE`) | shared ESP-IDF tail |
+| source, PCM | `thread_entry()` | `begin_chunk()`'s outbound acquire | 1,104 | 1,168 | 2,048 (`DEFAULT_SOURCE_TASK_STACK_SIZE`) | FreeRTOS critical-section assert |
+| source, Opus | `thread_entry()` | the Opus encode, `quant_partition()` charged one pass | 5,152 | 5,168 | 6,656 (`DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE`) | shared ESP-IDF tail |
+
+Notes per task:
+
+- httpd: the task runs no Noise or protocol work. The library's own frame receive
+  (`handle_data()` through `httpd_ws_recv_frame()`) is 3,504 / 3,568. 4,032 + 384 = 4,416,
+  rounded up.
+- websocket client: the close path in the chain is one the graph cannot rule out but no outbound
+  connection takes. 3,952 + 384 = 4,336, rounded up.
+- protocol task: noise-c and libsodium included. The bounded chain's tail cannot execute (an
+  outbound connection never reaches the server connection's close override), so the default is
+  sized from the reachable chain: 6,576 + 384 = 6,960, rounded up to 7,168.
+- source, PCM: the task sends nothing itself and logs nothing. The `std::thread` entry frames
+  above `thread_entry()` are not counted and come out of the rounding slack. 1,168 + 384 = 1,552,
+  rounded up.
+- source, Opus: `quant_partition()` nests four levels deeper than charged, 576 bytes more, so
+  5,168 + 576 = 5,744, + 384 = 6,128. Rounding up to 6,144 would leave 16 bytes of slack for the
+  uncounted `std::thread` entry frames, so the default takes one more 512-byte step, 6,656.
+
+## Margin and rounding
+
+Every chain except the PCM source task's ends in a shared ESP-IDF tail of about 2.7 KB: an
+allocation or lwIP call into an error log line through newlib's `vfprintf` (800 bytes alone), its
+lock and an assert, whose last ~500 bytes are a fatal path.
+
+Each default adds 384 bytes to the larger of the two totals: the FreeRTOS exception frame and
+coprocessor save area (`XT_STK_FRMSZ` 192: `XtExcFrame` 112, the MAC16 save 48, and 32 for the
+interruptee's base save area and nested-function space; `XT_CP_SIZE` 96), and 96 bytes for the
+fixed costs outside any frame (`vPortTaskWrapper`'s 32 under `FREERTOS_TASK_FUNCTION_WRAPPER`, the
+16-byte overflow canary, 16 of thread-local storage, up to 15 of save-area alignment). The sum is
+rounded up to a 512-byte multiple, whose remainder is the only slack.
