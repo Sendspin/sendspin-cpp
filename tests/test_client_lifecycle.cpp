@@ -3356,7 +3356,9 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     message.data = chunk.data();
     message.len = chunk.size();
     impl.handle_binary(message);
-    ASSERT_GT(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
+    // The idle sync task may already have discarded the chunk, so the hand-over is read from the
+    // drop log the test thread owns while it plays the protocol task, not from the quota.
+    ASSERT_EQ(impl.sync_task->inbound().drop_log_.dropped_, 0U)
         << "the chunk never reached the sync task's list";
 
     // The idle sync task discards a chunk with no stream behind it, which is its holder's return.

@@ -452,7 +452,9 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     EXPECT_EQ(server_a.goodbye_reason().value_or(""), "another_server")
         << "a displaced incumbent must be told why it was released";
     EXPECT_FALSE(server_b.closed()) << "the preferred server must keep the slot it won";
-    EXPECT_TRUE(client.is_connected()) << "the handoff must leave a current connection behind";
+    // The handoff leaves a current connection behind once the winner's first server/activate
+    // makes it count as connected, which can follow its admission by a tick.
+    pump_until(client, [&] { return client.is_connected(); });
 }
 
 // Rejection path: with the nursery full of peers that have proven they speak the protocol (they
@@ -780,11 +782,13 @@ TEST(ConnectionLifecycle, TwoPeersAtOnceSettleOnThePreferredOne) {
     const std::string reason = server_a.goodbye_reason().value_or("");
     EXPECT_TRUE(reason == "another_server" || reason == "concurrent_attempt")
         << "the other server must be told why it was released, not '" << reason << "'";
+    // Server information is published when a connection is admitted, before its first
+    // server/activate makes it count as connected, so both are waited on.
     wait_until([&] {
         auto info = client.get_server_information();
-        return info.has_value() && info->server_id == peer_b.server_identity.peer_id();
+        return client.is_connected() && info.has_value() &&
+               info->server_id == peer_b.server_identity.peer_id();
     });
-    EXPECT_TRUE(client.is_connected());
     EXPECT_FALSE(server_b.closed()) << "the preferred server must keep the slot";
 
     client.stop();
