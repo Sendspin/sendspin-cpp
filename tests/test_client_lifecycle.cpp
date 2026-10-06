@@ -3356,10 +3356,18 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     message.data = chunk.data();
     message.len = chunk.size();
     impl.handle_binary(message);
-    // The idle sync task may already have discarded the chunk, so the hand-over is read from the
-    // drop log the test thread owns while it plays the protocol task, not from the quota.
+    // The idle sync task may already have discarded the chunk and emptied the quota, so the
+    // hand-over is read from state the sync thread cannot change: the chunk was copied into the
+    // ring, where it waits for a ring-order take only this thread (as the protocol task) makes,
+    // and was not dropped, which an over-quota hand-over does after the copy.
+    size_t waiting = 0;
+    {
+        std::lock_guard<std::mutex> lock(ring.ring_.mtx_);
+        waiting = ring.ring_.items_waiting_;
+    }
+    ASSERT_EQ(waiting, 1U) << "the chunk was never copied into the ring";
     ASSERT_EQ(impl.sync_task->inbound().drop_log_.dropped_, 0U)
-        << "the chunk never reached the sync task's list";
+        << "the chunk was copied but dropped instead of handed to the sync task";
 
     // The idle sync task discards a chunk with no stream behind it, which is its holder's return.
     wait_until([&] { return ring.quota(InboundHolder::PLAYER).outstanding() == 0; });

@@ -452,8 +452,8 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     EXPECT_EQ(server_a.goodbye_reason().value_or(""), "another_server")
         << "a displaced incumbent must be told why it was released";
     EXPECT_FALSE(server_b.closed()) << "the preferred server must keep the slot it won";
-    // The handoff leaves a current connection behind once the winner's first server/activate
-    // makes it count as connected, which can follow its admission by a tick.
+    // The connected flag falls with the incumbent's drop and rises again only at the end of the
+    // tick that installed the winner, after its server information was published.
     pump_until(client, [&] { return client.is_connected(); });
 }
 
@@ -782,8 +782,8 @@ TEST(ConnectionLifecycle, TwoPeersAtOnceSettleOnThePreferredOne) {
     const std::string reason = server_a.goodbye_reason().value_or("");
     EXPECT_TRUE(reason == "another_server" || reason == "concurrent_attempt")
         << "the other server must be told why it was released, not '" << reason << "'";
-    // Server information is published when a connection is admitted, before its first
-    // server/activate makes it count as connected, so both are waited on.
+    // Server information names the winner as soon as it is installed; the connected flag rises
+    // only at the end of that tick, so both are waited on.
     wait_until([&] {
         auto info = client.get_server_information();
         return client.is_connected() && info.has_value() &&

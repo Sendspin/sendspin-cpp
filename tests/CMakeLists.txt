@@ -83,8 +83,10 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # InboundRing::storage_, the ring a start() created, whose size no public call reports, and build
 # the player_'s and visualizer_'s client/hello fields through their impl_, the buffer_capacity a
 # hello advertises, which no public call returns. The returned-LOCAL-item destruction test reads
-# the sync task's InboundConsumer::drop_log_ and its InboundDropLog::dropped_, the one record of
-# its chunk's hand-over that the sync thread's discard does not erase. The
+# InboundRing::ring_'s host items_waiting_ under its mtx_ (the chunk was copied into the ring) and
+# the sync task's InboundConsumer::drop_log_ and its InboundDropLog::dropped_ (it was not dropped
+# after the copy): together the proof of its hand-over that the sync thread's discard does not
+# erase. The
 # next-deadline tables also stage each timer state against a fixed clock, which no public call can
 # do: ConnectionManager's liveness_timeout_us_, pairing_window_open_until_us_,
 # ws_server_start_retry_time_us_ and tick(); SendspinTimeBurst's burst_index_,
