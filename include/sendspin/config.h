@@ -673,7 +673,8 @@ struct SourceRoleConfig {
     static constexpr uint32_t DEFAULT_CHUNK_MS = 20U;
 
     /// @brief Default capture buffer: the spec's longest chunk. The buffer bounds the backlog a
-    /// network stall can build up (roles/source/v1.md "Source Audio Chunks (Binary)")
+    /// network stall can build up (roles/source/v1.md "Source Audio Chunks (Binary)"), so it is
+    /// also about the longest send stall the stream rides out without a gap
     static constexpr uint32_t DEFAULT_CAPTURE_BUFFER_MS = CHUNK_MAX_MS;
 
     /// @brief Default capture sample rate (Hz), the native rate of most capture hardware

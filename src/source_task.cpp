@@ -301,15 +301,23 @@ void SourceTask::process(uint32_t take_timeout_ms) {
 }
 
 bool SourceTask::begin_chunk(const OutboundItemHeader& capture) {
-    // A full ring waits at most one chunk's duration: by then the sends are behind real time.
+    // A full ring waits one chunk's duration at a time, so stop() and a closed gate are seen
+    // between waits. The capture item stays held and the backlog builds in the capture ring,
+    // which bounds the send stall the stream rides out (capture_buffer_ms).
     this->chunk_item_ = this->outbound_ring_->acquire(this->chunk_message_bytes_,
                                                       this->role_->config.chunk_duration_ms);
     if (this->chunk_item_ == nullptr) {
         if (!this->stall_episode_) {
             this->stall_episode_ = true;
-            SS_LOGW(TAG, "No room to queue a source chunk; dropping to live capture");
+            SS_LOGW(TAG, "Source chunk sends stalled; holding captured audio");
         }
-        this->flush_to_live();
+        // The capture ring overflowed during the stall: the backlog is stale, so resume from live
+        // capture (roles/source/v1.md "Source Audio Chunks (Binary)"). The write path logged it.
+        uint32_t overflowed = capture.generation;
+        if (this->overflow_generation_.compare_exchange_strong(overflowed, 0,
+                                                               std::memory_order_acq_rel)) {
+            this->flush_to_live();
+        }
         return false;
     }
     if (this->stall_episode_) {
