@@ -125,7 +125,6 @@ transports'), and `esp_event_loop_run()` reaches the library's event handler for
 Sizes of what is left out: a second interrupt frame is 192 bytes; ESPHome's logging hook runs
 about 100 to 250 bytes deeper than newlib's `vprintf()` chain; ArduinoJson's virtual allocator
 chain is about 4.2 KB, under every bound that reaches it, and its nesting costs 64 bytes a level.
-The on-device high-water check of each task is still owed.
 
 ## Current figures
 

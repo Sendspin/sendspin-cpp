@@ -208,11 +208,8 @@ struct SendspinClientConfig {
     unsigned httpd_priority{DEFAULT_HTTPD_PRIORITY};  ///< FreeRTOS priority for the HTTP server
                                                       ///< task (ESP-IDF only)
 
-    /// @brief Default HTTP server task stack size in bytes (ESP-IDF only): esp_http_server, the
-    /// frame receive into the inbound ring and the queued sends. Static call-graph bound plus
-    /// margin; derivation in tools/stack_usage/README.md. A custom esp_log_set_vprintf() hook runs
-    /// deeper than newlib's vprintf; raise this if you install one. The on-device high-water check
-    /// is still owed.
+    /// @brief Default HTTP server task stack size in bytes (ESP-IDF only). Derived in
+    /// tools/stack_usage/README.md.
     static constexpr size_t DEFAULT_HTTPD_STACK_SIZE = 4608U;
 
     size_t httpd_stack_size{DEFAULT_HTTPD_STACK_SIZE};  ///< HTTP server task stack size in bytes
@@ -222,9 +219,8 @@ struct SendspinClientConfig {
     unsigned websocket_priority{5};  ///< FreeRTOS priority for the WebSocket client task
                                      ///< (ESP-IDF only)
 
-    /// @brief Default esp_websocket_client task stack size in bytes (ESP-IDF only), the outbound
-    /// connection's transport task. Static call-graph bound plus margin; derivation, logging-hook
-    /// and high-water caveats as for DEFAULT_HTTPD_STACK_SIZE.
+    /// @brief Default esp_websocket_client task stack size in bytes (ESP-IDF only). Derived in
+    /// tools/stack_usage/README.md.
     static constexpr size_t DEFAULT_WEBSOCKET_STACK_SIZE = 4608U;
 
     size_t websocket_stack_size{
@@ -245,10 +241,8 @@ struct SendspinClientConfig {
                                                                       ///< the protocol task
                                                                       ///< (ESP-IDF only)
 
-    /// @brief Default protocol task stack size in bytes (ESP-IDF only): every Noise handshake, the
-    /// pairing exchange, the JSON parse, the role handlers and every send. Static call-graph bound
-    /// plus margin; derivation, logging-hook and high-water caveats as for
-    /// DEFAULT_HTTPD_STACK_SIZE.
+    /// @brief Default protocol task stack size in bytes (ESP-IDF only). Derived in
+    /// tools/stack_usage/README.md.
     static constexpr size_t DEFAULT_PROTOCOL_TASK_STACK_SIZE = 7168U;
 
     size_t protocol_task_stack_size{
@@ -647,15 +641,12 @@ struct SourceRoleConfig {
                       SendspinClientConfig::DEFAULT_PROTOCOL_TASK_PRIORITY,
                   "The source task must stay below the protocol task");
 
-    /// @brief Source task stack size in bytes for a PCM config (ESP-IDF only): chunk assembly and
-    /// the encode into the outbound ring. Static call-graph bound plus margin;
-    /// derivation in tools/stack_usage/README.md. The on-device high-water check is still owed.
+    /// @brief Source task stack size in bytes for a PCM config (ESP-IDF only). Derived in
+    /// tools/stack_usage/README.md.
     static constexpr size_t DEFAULT_SOURCE_TASK_STACK_SIZE = 2048U;
 
-    /// @brief Source task stack size in bytes for an OPUS config (ESP-IDF only). Static call-graph
-    /// bound plus margin, including margin for CELT's quant_partition() recursion; derivation in
-    /// tools/stack_usage/README.md. A custom esp_log_set_vprintf() hook runs deeper than newlib's
-    /// vprintf; raise this if you install one. The on-device high-water check is still owed.
+    /// @brief Source task stack size in bytes for an OPUS config (ESP-IDF only). Derived in
+    /// tools/stack_usage/README.md.
     static constexpr size_t DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE = 6656U;
 
     /// @brief Opus bitrate bounds in bit/s: the range opus.h documents for OPUS_SET_BITRATE (the
