@@ -208,41 +208,11 @@ struct SendspinClientConfig {
     unsigned httpd_priority{DEFAULT_HTTPD_PRIORITY};  ///< FreeRTOS priority for the HTTP server
                                                       ///< task (ESP-IDF only)
 
-    // Task stack derivation (ESP-IDF only), shared by DEFAULT_HTTPD_STACK_SIZE,
-    // DEFAULT_WEBSOCKET_STACK_SIZE, DEFAULT_PROTOCOL_TASK_STACK_SIZE,
-    // SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE and
-    // SourceRoleConfig::DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE. Each default is the
-    // deepest call chain from the task's entry, a static call-graph upper bound measured with
-    // -fstack-usage and -fcallgraph-info on xtensa-esp32 (ESP-IDF 5.5, GCC 14.2) at both -Os
-    // (ESPHome's default) and -Og (ESP-IDF's default), taking the larger, with the toolchain's
-    // precompiled newlib, libgcc and libstdc++ frames read from their objdump; tools/stack_usage/
-    // holds the script, its indirect-call tables and the recipe that re-derive it. Every chain
-    // ends in a shared ESP-IDF tail of about 2.7 KB (except the PCM source task's, which logs
-    // nothing and ends in a FreeRTOS critical-section assert), an allocation or lwIP call into an
-    // error log line through newlib's vfprintf (800 bytes alone), its lock and an assert, whose
-    // last ~500 bytes are a fatal path. Added to that: 384 bytes, which are the FreeRTOS exception
-    // frame and coprocessor save area (XT_STK_FRMSZ 192: XtExcFrame 112, the MAC16 save 48, and 32
-    // for the interruptee's base save area and nested-function space; XT_CP_SIZE 96) and 96 bytes
-    // for the fixed costs outside any frame (vPortTaskWrapper's 32 under
-    // FREERTOS_TASK_FUNCTION_WRAPPER, the 16-byte overflow canary, 16 of thread-local storage, up
-    // to 15 of save-area alignment); then rounded up to a 512-byte multiple, whose remainder is the
-    // only slack. The bounds are conservative where the graph cannot tell callees apart: a virtual
-    // call reaches every override (SendspinConnection::fail_inbound()'s close reaches both
-    // transports'), and esp_event_loop_run() reaches the library's event handler for every event.
-    // Not modelled: a rare second interrupt frame (192 bytes); a logging hook installed with
-    // esp_log_set_vprintf() (ESPHome's runs about 100 to 250 bytes deeper than newlib's vprintf
-    // chain); noise-c's alloca extras off the worst path; ArduinoJson's virtual allocator chain
-    // (about 4.2 KB, under the bound) and its nesting limit of 10 at 64 bytes a level; the
-    // shared_ptr disposal when the tick's connection snapshot drops; the few assembly and unused
-    // newlib stub functions the script reports as frameless. The on-device high-water check of each
-    // task is still owed.
-
-    /// @brief Default HTTP server task stack size in bytes (ESP-IDF only). The task runs no Noise
-    /// or protocol work (the protocol task does), only esp_http_server itself, the frame receive
-    /// into the inbound ring and the queued sends. Deepest chain from httpd_thread: 4,032 bytes at
-    /// -Os, 3,968 at -Og, esp_http_server's own WebSocket upgrade response (544 to 576 bytes) into
-    /// the shared tail; the library's frame receive (handle_data() through httpd_ws_recv_frame())
-    /// is 3,504 / 3,568. 4,032 + 384 = 4,416, rounded up (see the task stack derivation above).
+    /// @brief Default HTTP server task stack size in bytes (ESP-IDF only): esp_http_server, the
+    /// frame receive into the inbound ring and the queued sends. Static call-graph bound plus
+    /// margin; derivation in tools/stack_usage/README.md. A custom esp_log_set_vprintf() hook runs
+    /// deeper than newlib's vprintf; raise this if you install one. The on-device high-water check
+    /// is still owed.
     static constexpr size_t DEFAULT_HTTPD_STACK_SIZE = 4608U;
 
     size_t httpd_stack_size{DEFAULT_HTTPD_STACK_SIZE};  ///< HTTP server task stack size in bytes
@@ -253,11 +223,8 @@ struct SendspinClientConfig {
                                      ///< (ESP-IDF only)
 
     /// @brief Default esp_websocket_client task stack size in bytes (ESP-IDF only), the outbound
-    /// connection's transport task. Deepest chain from esp_websocket_client_task: 3,904 bytes at
-    /// -Os, 3,952 at -Og, the library's event handler (3,520 / 3,584) closing the connection on a
-    /// stalled protocol task (fail_inbound()) through the inbound transport's close, a path the
-    /// graph cannot rule out but no outbound connection takes. 3,952 + 384 = 4,336, rounded up
-    /// (see the task stack derivation above).
+    /// connection's transport task. Static call-graph bound plus margin; derivation, logging-hook
+    /// and high-water caveats as for DEFAULT_HTTPD_STACK_SIZE.
     static constexpr size_t DEFAULT_WEBSOCKET_STACK_SIZE = 4608U;
 
     size_t websocket_stack_size{
@@ -278,19 +245,10 @@ struct SendspinClientConfig {
                                                                       ///< the protocol task
                                                                       ///< (ESP-IDF only)
 
-    /// @brief Default protocol task stack size in bytes (ESP-IDF only). The protocol task runs
-    /// every Noise handshake (X25519, SHA-256), the pairing exchange (CPace, SHA-512, HMAC), the
-    /// JSON parse, the role handlers and every send. Deepest chain from the task entry, noise-c and
-    /// libsodium included, as the tool bounds it: 6,560 bytes at -Os and 6,832 at -Og. That
-    /// includes a tail that cannot execute: an esp_websocket_client send error dispatches the
-    /// event loop in the caller, which the graph follows into the library's event handler,
-    /// handle_data() and fail_inbound(), whose virtual close it resolves to the server
-    /// connection's override (httpd_sess_trigger_close), though an outbound connection never
-    /// reaches it. The deepest reachable chain is 6,352 / 6,576, a pairing confirm whose handler
-    /// drops an outbound connection whose goodbye send fails, through the same event handler and
-    /// the client connection's close into the shared tail. 6,576 + 384 = 6,960, rounded up, which
-    /// keeps the default at 7,168; the conservative-bounds paragraph of the task stack derivation
-    /// above covers the unreachable tail.
+    /// @brief Default protocol task stack size in bytes (ESP-IDF only): every Noise handshake, the
+    /// pairing exchange, the JSON parse, the role handlers and every send. Static call-graph bound
+    /// plus margin; derivation, logging-hook and high-water caveats as for
+    /// DEFAULT_HTTPD_STACK_SIZE.
     static constexpr size_t DEFAULT_PROTOCOL_TASK_STACK_SIZE = 7168U;
 
     size_t protocol_task_stack_size{
@@ -689,20 +647,15 @@ struct SourceRoleConfig {
                       SendspinClientConfig::DEFAULT_PROTOCOL_TASK_PRIORITY,
                   "The source task must stay below the protocol task");
 
-    /// @brief Source task stack size in bytes for a PCM config (ESP-IDF only). The task sends
-    /// nothing itself (the protocol task does), only the chunk assembly and the encode into the
-    /// outbound ring. Deepest chain from the task entry: 1,104 bytes at -Os, 1,168 at -Og, from
-    /// begin_chunk()'s outbound acquire into FreeRTOS's critical-section assert; the std::thread
-    /// entry frames above thread_entry() are not counted and come out of the rounding slack.
-    /// 1,168 + 384 = 1,552, rounded up (see the task stack derivation in SendspinClientConfig).
+    /// @brief Source task stack size in bytes for a PCM config (ESP-IDF only): chunk assembly and
+    /// the encode into the outbound ring. Static call-graph bound plus margin;
+    /// derivation in tools/stack_usage/README.md. The on-device high-water check is still owed.
     static constexpr size_t DEFAULT_SOURCE_TASK_STACK_SIZE = 2048U;
 
-    /// @brief Source task stack size in bytes for an OPUS config (ESP-IDF only). Deepest chain
-    /// from the task entry with the Opus encoder: 5,152 bytes at -Os, 5,168 at -Og, with CELT's
-    /// quant_partition() recursion charged one pass; it nests four levels deeper, 576 bytes
-    /// more. The std::thread entry frames above thread_entry() are not counted and come out of
-    /// the rounding slack. 5,744 + 384 = 6,128, rounded up (see the task stack derivation in
-    /// SendspinClientConfig).
+    /// @brief Source task stack size in bytes for an OPUS config (ESP-IDF only). Static call-graph
+    /// bound plus margin, including margin for CELT's quant_partition() recursion; derivation in
+    /// tools/stack_usage/README.md. A custom esp_log_set_vprintf() hook runs deeper than newlib's
+    /// vprintf; raise this if you install one. The on-device high-water check is still owed.
     static constexpr size_t DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE = 6656U;
 
     /// @brief Opus bitrate bounds in bit/s: the range opus.h documents for OPUS_SET_BITRATE (the
