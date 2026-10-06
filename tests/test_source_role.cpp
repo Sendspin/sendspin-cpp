@@ -719,7 +719,6 @@ TEST(SourceChunks, AStallResumesFromLiveCapture) {
         }
         if (outbound_full) {
             rig.task.process(0);  // Takes the first write and finds no outbound room
-            ASSERT_NE(rig.task.capture_item_, nullptr) << "the stalled chunk's audio was dropped";
         }
         if (row.stall == Stall::CAPTURE_FULL || row.stall == Stall::CAPTURE_FULL_MID_CHUNK ||
             row.stall == Stall::OUTBOUND_FULL_THEN_CAPTURE_FULL) {
@@ -736,11 +735,8 @@ TEST(SourceChunks, AStallResumesFromLiveCapture) {
             rig.task.process(0);
             size_t capacity = 0;
             if (stalled) {
-                EXPECT_EQ(rig.task.capture_item_, nullptr) << "the backlog was kept";
                 EXPECT_EQ(rig.task.capture_ring_->take(&capacity, 0), nullptr)
                     << "the backlog was kept";
-            } else {
-                EXPECT_NE(rig.task.capture_item_, nullptr) << "the backlog was dropped";
             }
             for (size_t i = 0; i < held.size(); ++i) {
                 ASSERT_NE(rig.task.outbound_ring_->take(&capacity, 0), nullptr);

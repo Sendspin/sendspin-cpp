@@ -217,25 +217,25 @@ struct SendspinClientConfig {
     // (ESPHome's default) and -Og (ESP-IDF's default), taking the larger, with the toolchain's
     // precompiled newlib, libgcc and libstdc++ frames read from their objdump; tools/stack_usage/
     // holds the script, its indirect-call tables and the recipe that re-derive it. Every chain
-    // ends in a shared ESP-IDF tail of about 2.7 KB (the source task's reaches it straight from a
-    // log line), an allocation or lwIP call into an error log line through newlib's vfprintf
-    // (800 bytes alone), its lock and an assert, whose last ~500 bytes are a fatal path. Added to
-    // that: 384 bytes, which are the FreeRTOS exception frame and coprocessor save area
-    // (XT_STK_FRMSZ 192: XtExcFrame 112, the MAC16 save 48, and 32 for the interruptee's base save
-    // area and nested-function space; XT_CP_SIZE 96) and 96 bytes for the fixed costs outside any
-    // frame (vPortTaskWrapper's 32 under FREERTOS_TASK_FUNCTION_WRAPPER, the 16-byte overflow
-    // canary, 16 of thread-local storage, up to 15 of save-area alignment); then rounded up to a
-    // 512-byte multiple, whose remainder is the only slack. The bounds are
-    // conservative where the graph cannot tell callees apart: a virtual call reaches every
-    // override (SendspinConnection::fail_inbound()'s close reaches both transports'), and
-    // esp_event_loop_run() reaches the library's event handler for every event. Not modelled: a
-    // rare second interrupt frame (192 bytes); a logging hook installed with esp_log_set_vprintf()
-    // (ESPHome's runs about 100 to 250 bytes deeper than newlib's vprintf chain); noise-c's
-    // alloca extras off the worst path; ArduinoJson's virtual allocator chain (about 4.2 KB, under
-    // the bound) and its nesting limit of 10 at 64 bytes a level; the shared_ptr disposal when
-    // the tick's connection snapshot drops; the few assembly and unused newlib stub functions
-    // the script reports as frameless. The on-device high-water check of each task is still
-    // owed.
+    // ends in a shared ESP-IDF tail of about 2.7 KB (except the PCM source task's, which logs
+    // nothing and ends in a FreeRTOS critical-section assert), an allocation or lwIP call into an
+    // error log line through newlib's vfprintf (800 bytes alone), its lock and an assert, whose
+    // last ~500 bytes are a fatal path. Added to that: 384 bytes, which are the FreeRTOS exception
+    // frame and coprocessor save area (XT_STK_FRMSZ 192: XtExcFrame 112, the MAC16 save 48, and 32
+    // for the interruptee's base save area and nested-function space; XT_CP_SIZE 96) and 96 bytes
+    // for the fixed costs outside any frame (vPortTaskWrapper's 32 under
+    // FREERTOS_TASK_FUNCTION_WRAPPER, the 16-byte overflow canary, 16 of thread-local storage, up
+    // to 15 of save-area alignment); then rounded up to a 512-byte multiple, whose remainder is the
+    // only slack. The bounds are conservative where the graph cannot tell callees apart: a virtual
+    // call reaches every override (SendspinConnection::fail_inbound()'s close reaches both
+    // transports'), and esp_event_loop_run() reaches the library's event handler for every event.
+    // Not modelled: a rare second interrupt frame (192 bytes); a logging hook installed with
+    // esp_log_set_vprintf() (ESPHome's runs about 100 to 250 bytes deeper than newlib's vprintf
+    // chain); noise-c's alloca extras off the worst path; ArduinoJson's virtual allocator chain
+    // (about 4.2 KB, under the bound) and its nesting limit of 10 at 64 bytes a level; the
+    // shared_ptr disposal when the tick's connection snapshot drops; the few assembly and unused
+    // newlib stub functions the script reports as frameless. The on-device high-water check of each
+    // task is still owed.
 
     /// @brief Default HTTP server task stack size in bytes (ESP-IDF only). The task runs no Noise
     /// or protocol work (the protocol task does), only esp_http_server itself, the frame receive
@@ -691,11 +691,11 @@ struct SourceRoleConfig {
 
     /// @brief Source task stack size in bytes for a PCM config (ESP-IDF only). The task sends
     /// nothing itself (the protocol task does), only the chunk assembly and the encode into the
-    /// outbound ring. Deepest chain from the task entry: 2,352 bytes at -Os, 2,368 at -Og, from
-    /// begin_chunk()'s warning into the shared tail; the std::thread entry frames above
-    /// thread_entry() are not counted and come out of the rounding slack. 2,368 + 384 = 2,752,
-    /// rounded up (see the task stack derivation in SendspinClientConfig).
-    static constexpr size_t DEFAULT_SOURCE_TASK_STACK_SIZE = 3072U;
+    /// outbound ring. Deepest chain from the task entry: 1,104 bytes at -Os, 1,168 at -Og, from
+    /// begin_chunk()'s outbound acquire into FreeRTOS's critical-section assert; the std::thread
+    /// entry frames above thread_entry() are not counted and come out of the rounding slack.
+    /// 1,168 + 384 = 1,552, rounded up (see the task stack derivation in SendspinClientConfig).
+    static constexpr size_t DEFAULT_SOURCE_TASK_STACK_SIZE = 2048U;
 
     /// @brief Source task stack size in bytes for an OPUS config (ESP-IDF only). Deepest chain
     /// from the task entry with the Opus encoder: 5,152 bytes at -Os, 5,168 at -Og, with CELT's
