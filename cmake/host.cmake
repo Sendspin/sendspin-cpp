@@ -138,60 +138,66 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         cmake_policy(SET CMP0169 OLD)
     endif()
 
-    FetchContent_Declare(
-        noise_c
-        GIT_REPOSITORY https://github.com/esphome-libs/noise-c.git
-        GIT_TAG        v0.1.13
-        GIT_SHALLOW    TRUE
-    )
-    FetchContent_GetProperties(noise_c)
-    if(NOT noise_c_POPULATED)
-        FetchContent_Populate(noise_c)
+    # A parent project that already defines a noise_c target (for example one built with
+    # AES-GCM) provides it instead. That target must offer 25519, ChaChaPoly and SHA-256, export
+    # noise-c's include directory, and define NOISE_USE_CUSTOM_RAND=0 with rand_os.c, since the
+    # host build supplies no noise_rand_bytes().
+    if(NOT TARGET noise_c)
+        FetchContent_Declare(
+            noise_c
+            GIT_REPOSITORY https://github.com/esphome-libs/noise-c.git
+            GIT_TAG        v0.1.13
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_GetProperties(noise_c)
+        if(NOT noise_c_POPULATED)
+            FetchContent_Populate(noise_c)
+        endif()
+
+        # Build the noise_c static library with the reference backend.
+        # noise-c is a separate target, so our own -Wall -Wextra -Wpedantic flags do not reach it.
+        add_library(noise_c STATIC
+            # Protocol state machine
+            ${noise_c_SOURCE_DIR}/src/protocol/cipherstate.c
+            ${noise_c_SOURCE_DIR}/src/protocol/dhstate.c
+            ${noise_c_SOURCE_DIR}/src/protocol/errors.c
+            ${noise_c_SOURCE_DIR}/src/protocol/handshakestate.c
+            ${noise_c_SOURCE_DIR}/src/protocol/hashstate.c
+            ${noise_c_SOURCE_DIR}/src/protocol/internal.c
+            ${noise_c_SOURCE_DIR}/src/protocol/names.c
+            ${noise_c_SOURCE_DIR}/src/protocol/patterns.c
+            ${noise_c_SOURCE_DIR}/src/protocol/rand_os.c
+            ${noise_c_SOURCE_DIR}/src/protocol/randstate.c
+            ${noise_c_SOURCE_DIR}/src/protocol/signstate.c
+            ${noise_c_SOURCE_DIR}/src/protocol/symmetricstate.c
+            ${noise_c_SOURCE_DIR}/src/protocol/util.c
+
+            # Reference backend: ChaChaPoly + Curve25519 + SHA-256
+            ${noise_c_SOURCE_DIR}/src/backend/ref/cipher-chachapoly.c
+            ${noise_c_SOURCE_DIR}/src/backend/ref/dh-curve25519.c
+            ${noise_c_SOURCE_DIR}/src/backend/ref/hash-sha256.c
+
+            # Low-level crypto primitives
+            ${noise_c_SOURCE_DIR}/src/crypto/chacha/chacha.c
+            ${noise_c_SOURCE_DIR}/src/crypto/donna/poly1305-donna.c
+            ${noise_c_SOURCE_DIR}/src/crypto/sha2/sha256.c
+            ${noise_c_SOURCE_DIR}/src/crypto/x25519/x25519.c
+        )
+
+        target_include_directories(noise_c PUBLIC
+            ${noise_c_SOURCE_DIR}/include
+            ${noise_c_SOURCE_DIR}/src
+        )
+
+        target_compile_definitions(noise_c PUBLIC
+            NOISE_USE_REFERENCE_BACKEND=1
+            NOISE_USE_AES=0
+            NOISE_USE_LIBSODIUM=0
+            NOISE_USE_CUSTOM_RAND=0
+        )
+
+        set_target_properties(noise_c PROPERTIES C_STANDARD 99)
     endif()
-
-    # Build the noise_c static library with the reference backend.
-    # noise-c is a separate target, so our own -Wall -Wextra -Wpedantic flags do not reach it.
-    add_library(noise_c STATIC
-        # Protocol state machine
-        ${noise_c_SOURCE_DIR}/src/protocol/cipherstate.c
-        ${noise_c_SOURCE_DIR}/src/protocol/dhstate.c
-        ${noise_c_SOURCE_DIR}/src/protocol/errors.c
-        ${noise_c_SOURCE_DIR}/src/protocol/handshakestate.c
-        ${noise_c_SOURCE_DIR}/src/protocol/hashstate.c
-        ${noise_c_SOURCE_DIR}/src/protocol/internal.c
-        ${noise_c_SOURCE_DIR}/src/protocol/names.c
-        ${noise_c_SOURCE_DIR}/src/protocol/patterns.c
-        ${noise_c_SOURCE_DIR}/src/protocol/rand_os.c
-        ${noise_c_SOURCE_DIR}/src/protocol/randstate.c
-        ${noise_c_SOURCE_DIR}/src/protocol/signstate.c
-        ${noise_c_SOURCE_DIR}/src/protocol/symmetricstate.c
-        ${noise_c_SOURCE_DIR}/src/protocol/util.c
-
-        # Reference backend: ChaChaPoly + Curve25519 + SHA-256
-        ${noise_c_SOURCE_DIR}/src/backend/ref/cipher-chachapoly.c
-        ${noise_c_SOURCE_DIR}/src/backend/ref/dh-curve25519.c
-        ${noise_c_SOURCE_DIR}/src/backend/ref/hash-sha256.c
-
-        # Low-level crypto primitives
-        ${noise_c_SOURCE_DIR}/src/crypto/chacha/chacha.c
-        ${noise_c_SOURCE_DIR}/src/crypto/donna/poly1305-donna.c
-        ${noise_c_SOURCE_DIR}/src/crypto/sha2/sha256.c
-        ${noise_c_SOURCE_DIR}/src/crypto/x25519/x25519.c
-    )
-
-    target_include_directories(noise_c PUBLIC
-        ${noise_c_SOURCE_DIR}/include
-        ${noise_c_SOURCE_DIR}/src
-    )
-
-    target_compile_definitions(noise_c PUBLIC
-        NOISE_USE_REFERENCE_BACKEND=1
-        NOISE_USE_AES=0
-        NOISE_USE_LIBSODIUM=0
-        NOISE_USE_CUSTOM_RAND=0
-    )
-
-    set_target_properties(noise_c PROPERTIES C_STANDARD 99)
 
     target_link_libraries(${TARGET_LIB} PUBLIC noise_c)
 
