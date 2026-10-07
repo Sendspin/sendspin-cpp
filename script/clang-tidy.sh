@@ -70,4 +70,11 @@ if [ "$(uname)" = "Darwin" ] && command -v xcrun &> /dev/null; then
 fi
 
 echo "Running clang-tidy..."
-$CLANG_TIDY -p "$BUILD_DIR" $FIX_FLAG "${EXTRA_ARGS[@]}" $SOURCES
+if [ -n "$FIX_FLAG" ]; then
+    # Serial, so two files that include the same header cannot apply conflicting fixes to it
+    $CLANG_TIDY -p "$BUILD_DIR" $FIX_FLAG "${EXTRA_ARGS[@]}" $SOURCES
+else
+    # One process per file across every core; xargs exits non-zero if any file fails
+    JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+    printf '%s\n' $SOURCES | xargs -P "$JOBS" -n 1 "$CLANG_TIDY" -p "$BUILD_DIR" "${EXTRA_ARGS[@]}"
+fi
