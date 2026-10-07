@@ -2317,13 +2317,13 @@ TEST(InboundReceive, AMultiFrameMessageIsCappedOnItsRunningTotal) {
         const size_t first_len = row.cap - 10;
 
         const TestConnection::InboundTarget first = h.conn.begin_inbound_fragment(
-            first_len, /*first=*/true, /*is_text=*/false, platform_time_us());
+            first_len, /*first=*/true, /*is_text=*/false);
         ASSERT_EQ(first.route, TestConnection::InboundRoute::RECEIVE);
         std::memset(first.data, 0x11, first_len);
         h.conn.end_inbound_fragment(first_len, /*last=*/false, platform_time_us());
 
         const TestConnection::InboundTarget second = h.conn.begin_inbound_fragment(
-            row.second_len, /*first=*/false, /*is_text=*/false, platform_time_us());
+            row.second_len, /*first=*/false, /*is_text=*/false);
         EXPECT_EQ(second.route, row.route);
         EXPECT_EQ(h.conn.close_transport_now_calls_,
                   row.route == TestConnection::InboundRoute::CLOSE ? 1 : 0);
@@ -2501,7 +2501,7 @@ TEST(InboundReceive, AFrameOutOfFragmentSequenceClosesTheConnection) {
             ASSERT_EQ(h.receive(single), TestConnection::InboundRoute::RECEIVE);
         } else {
             const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
-                first.size(), /*first=*/true, /*is_text=*/false, platform_time_us());
+                first.size(), /*first=*/true, /*is_text=*/false);
             ASSERT_EQ(target.route, TestConnection::InboundRoute::RECEIVE);
             std::memcpy(target.data, first.data(), first.size());
             h.conn.end_inbound_fragment(first.size(), row.before == Before::PENDING_ASSEMBLED,
@@ -2518,7 +2518,7 @@ TEST(InboundReceive, AFrameOutOfFragmentSequenceClosesTheConnection) {
         if (row.second != Second::SINGLE_FRAME) {
             const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
                 second.size(), /*first=*/row.second == Second::FIRST_FRAGMENT,
-                /*is_text=*/false, platform_time_us());
+                /*is_text=*/false);
             route = target.route;
             if (route == TestConnection::InboundRoute::RECEIVE) {
                 std::memcpy(target.data, second.data(), second.size());
@@ -2611,7 +2611,7 @@ TEST(InboundReceive, TheLivenessStampIsTakenWhenAMessageCompletes) {
             }
         } else {
             const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
-                bytes.size(), /*first=*/true, /*is_text=*/false, platform_time_us());
+                bytes.size(), /*first=*/true, /*is_text=*/false);
             ASSERT_EQ(target.route, route);
             size_t received = 0;
             if (target.route == TestConnection::InboundRoute::RECEIVE) {
@@ -2622,7 +2622,7 @@ TEST(InboundReceive, TheLivenessStampIsTakenWhenAMessageCompletes) {
             EXPECT_EQ(h.conn.get_last_receive_time_us(), 0U) << "stamped before completion";
             if (row.complete) {
                 const TestConnection::InboundTarget last = h.conn.begin_inbound_fragment(
-                    0, /*first=*/false, /*is_text=*/false, platform_time_us());
+                    0, /*first=*/false, /*is_text=*/false);
                 ASSERT_EQ(last.route, route);
                 h.conn.end_inbound_fragment(0, /*last=*/true, platform_time_us());
             }
@@ -2639,9 +2639,9 @@ TEST(InboundReceive, TheLivenessStampIsTakenWhenAMessageCompletes) {
     }
 }
 
-// A message up to SINGLE_SEGMENT_MESSAGE_BYTES keeps its first stamp, a longer one its completion
-// stamp, on every route.
-TEST(InboundReceive, AMessageIsStampedAtFirstSightUpToOneSegmentAndAtCompletionPastIt) {
+// A single-frame message up to SINGLE_SEGMENT_MESSAGE_BYTES keeps its first stamp; a longer one,
+// or a multi-frame message of any length, gets its completion stamp.
+TEST(InboundReceive, ASmallSingleFrameMessageKeepsItsFirstStampAndOthersTheirCompletion) {
     enum class Shape : uint8_t { SINGLE_FRAME, MULTI_FRAME };
     struct Row {
         const char* name;
@@ -2656,11 +2656,11 @@ TEST(InboundReceive, AMessageIsStampedAtFirstSightUpToOneSegmentAndAtCompletionP
         {"ring item past the bound", true, Shape::SINGLE_FRAME, BOUND + 1, true},
         {"fallback buffer at the bound", false, Shape::SINGLE_FRAME, BOUND, false},
         {"fallback buffer past the bound", false, Shape::SINGLE_FRAME, BOUND + 1, true},
-        {"multi-frame into a ring item at the bound", true, Shape::MULTI_FRAME, BOUND, false},
+        {"multi-frame into a ring item at the bound", true, Shape::MULTI_FRAME, BOUND, true},
         {"multi-frame into a ring item past the bound", true, Shape::MULTI_FRAME, BOUND + 1,
          true},
         {"multi-frame into the fallback buffer at the bound", false, Shape::MULTI_FRAME, BOUND,
-         false},
+         true},
         {"multi-frame into the fallback buffer past the bound", false, Shape::MULTI_FRAME,
          BOUND + 1, true},
     };
@@ -2683,12 +2683,12 @@ TEST(InboundReceive, AMessageIsStampedAtFirstSightUpToOneSegmentAndAtCompletionP
         } else {
             const size_t first_len = bytes.size() / 2;
             const TestConnection::InboundTarget first = h.conn.begin_inbound_fragment(
-                first_len, /*first=*/true, /*is_text=*/false, FIRST_US);
+                first_len, /*first=*/true, /*is_text=*/false);
             ASSERT_EQ(first.route, TestConnection::InboundRoute::RECEIVE);
             std::memcpy(first.data, bytes.data(), first_len);
             h.conn.end_inbound_fragment(first_len, /*last=*/false, MIDDLE_US);
             const TestConnection::InboundTarget second = h.conn.begin_inbound_fragment(
-                bytes.size() - first_len, /*first=*/false, /*is_text=*/false, MIDDLE_US);
+                bytes.size() - first_len, /*first=*/false, /*is_text=*/false);
             ASSERT_EQ(second.route, TestConnection::InboundRoute::RECEIVE);
             std::memcpy(second.data, bytes.data() + first_len, bytes.size() - first_len);
             h.conn.end_inbound_fragment(bytes.size() - first_len, /*last=*/true, COMPLETE_US);

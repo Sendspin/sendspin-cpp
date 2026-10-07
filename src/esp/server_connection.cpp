@@ -298,8 +298,7 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
     }
 
     // A frame of a multi-frame message (the rare path; see begin_inbound_fragment()).
-    const InboundTarget target =
-        this->begin_inbound_fragment(ws_pkt.len, !continuation, is_text, receive_time);
+    const InboundTarget target = this->begin_inbound_fragment(ws_pkt.len, !continuation, is_text);
     if (target.route == InboundRoute::CLOSE) {
         return ESP_FAIL;
     }

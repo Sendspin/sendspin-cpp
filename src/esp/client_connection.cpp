@@ -288,8 +288,7 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
     // A chunk of a multi-frame message (the rare path; see begin_inbound_fragment()).
     const bool first = !continuation && offset == 0;
     const bool last = data->fin && frame_done;
-    const InboundTarget target =
-        this->begin_inbound_fragment(chunk_len, first, is_text, receive_time);
+    const InboundTarget target = this->begin_inbound_fragment(chunk_len, first, is_text);
     if (target.route == InboundRoute::RECEIVE) {
         if (chunk_len > 0) {
             std::memcpy(target.data, data->data_ptr, chunk_len);

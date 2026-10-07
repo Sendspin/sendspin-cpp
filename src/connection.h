@@ -898,9 +898,9 @@ protected:
         InboundRoute route{InboundRoute::DROP};
     };
 
-    /// A message up to this size fits one TCP segment (default MSS, RFC 1122 section 4.2.2.6,
-    /// less TCP options and a masked frame header), so it keeps the stamp from when the
-    /// transport first saw it; a longer one is stamped when it finished arriving.
+    /// A single-frame message up to this size fits one TCP segment (default MSS, RFC 1122
+    /// section 4.2.2.6, less TCP options and a masked frame header), so it keeps the stamp from
+    /// when the transport first saw it; a longer one is stamped when it finished arriving.
     static constexpr size_t SINGLE_SEGMENT_MESSAGE_BYTES = 536 - 40 - 8;
 
     /// @brief Starts a complete single-frame WebSocket message of `len` bytes, routed by
@@ -932,9 +932,7 @@ protected:
     /// @param len Bytes this frame (or this chunk of it) carries.
     /// @param first Whether these are the first bytes of the message.
     /// @param is_text Whether the message's first frame is a text frame; read when `first`.
-    /// @param receive_time_us platform_time_us() when the transport received these bytes.
-    InboundTarget begin_inbound_fragment(size_t len, bool first, bool is_text,
-                                         int64_t receive_time_us);
+    InboundTarget begin_inbound_fragment(size_t len, bool first, bool is_text);
 
     /// @brief Commits the bytes begin_inbound_fragment() routed to RECEIVE and, on the message's
     /// last bytes, publishes the assembled message. Transport thread.

@@ -710,8 +710,8 @@ void SendspinConnection::abandon_inbound_message() {
     this->fragment_assembly_open_ = false;
 }
 
-SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
-    size_t len, bool first, bool is_text, int64_t receive_time_us) {
+SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(size_t len, bool first,
+                                                                             bool is_text) {
     // The rare path (see the declaration): a multi-frame WebSocket message is assembled in the
     // fallback buffer whatever the admission state, and routed when its last bytes arrive.
     if (first && this->fragment_assembly_open_) {
@@ -739,7 +739,6 @@ SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
             // connection's pending message through them.
             this->fallback_len_ = 0;
             this->fallback_kind_ = is_text ? InboundKind::TEXT : InboundKind::BINARY;
-            this->fallback_receive_time_us_ = static_cast<uint32_t>(receive_time_us);
         }
     } else if (!this->fragment_assembly_open_) {
         // RFC 6455 section 5.4: a continuation frame continues a fragmented message, so one with
@@ -789,6 +788,8 @@ void SendspinConnection::end_inbound_fragment(size_t len, bool last, int64_t com
     if (!last) {
         return;
     }
+    // A multi-frame message may span segments.
+    this->fallback_receive_time_us_ = static_cast<uint32_t>(complete_time_us);
     if (!this->inbound_gate_.is_admitted()) {
         this->inbound_to_fallback_ = true;
         this->end_inbound_message(true, complete_time_us);
