@@ -477,7 +477,7 @@ void VisualizerRole::Impl::complete_teardown() const {
 std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int32_t display_offset_ms,
                                                    int64_t now) {
     const int64_t deliver_at_us = client_ts - static_cast<int64_t>(display_offset_ms) * US_PER_MS;
-    if (now > deliver_at_us + VISUALIZER_MAX_DELIVERY_LAG_US) {
+    if (now - VISUALIZER_MAX_DELIVERY_LAG_US > deliver_at_us) {
         return std::nullopt;
     }
     return std::max<int64_t>(deliver_at_us - now, 0);

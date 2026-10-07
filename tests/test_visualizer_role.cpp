@@ -285,7 +285,9 @@ TEST(VisualizerHandleBinary, ForwardsTheWholeFrameInARingItem) {
 
 // roles/visualizer/v1.md "Visualization Data (Binary)": a frame is delivered display_offset_ms
 // ahead of its display time, or at once when that has passed, and dropped once it is more than the
-// lag bound past that delivery time.
+// lag bound past that delivery time. A server sends one message per visualization type for each
+// analysis frame, all with the same timestamp, so a slow listener leaves the drain thread
+// reaching the later ones after that timestamp; the bound lets those through.
 TEST(VisualizerDeliveryWait, DropsLateFramesAndShiftsByTheOffset) {
     constexpr int64_t MS = 1000;
     constexpr int64_t LAG = sendspin::VISUALIZER_MAX_DELIVERY_LAG_US;
@@ -319,32 +321,6 @@ TEST(VisualizerDeliveryWait, DropsLateFramesAndShiftsByTheOffset) {
         SCOPED_TRACE(row.name);
         EXPECT_EQ(sendspin::visualizer_delivery_wait_us(row.client_ts, row.offset_ms, row.now),
                   row.wait_us);
-    }
-}
-
-// A server sends one message per visualization type for each analysis frame, all with the same
-// timestamp, and a listener that takes 3 ms per frame leaves the drain thread reaching each
-// sibling after that timestamp. Each is delivered at once as long as the drain thread is within
-// the lag bound of the display time.
-TEST(VisualizerDeliveryWait, SiblingsSharingATimestampAreAllDelivered) {
-    constexpr int64_t MS = 1000;
-    constexpr int64_t TS = 2'000'000;
-    struct Row {
-        const char* name;
-        int64_t now;
-        std::optional<int64_t> wait_us;
-    };
-    const Row rows[] = {
-        {"first sibling, reached at its display time", TS, 0},
-        {"second sibling, 3 ms behind", TS + 3 * MS, 0},
-        {"third sibling, 6 ms behind", TS + 6 * MS, 0},
-        {"fourth sibling, 9 ms behind", TS + 9 * MS, 0},
-        {"Control: a sibling reached past the lag bound",
-         TS + sendspin::VISUALIZER_MAX_DELIVERY_LAG_US + 1, std::nullopt},
-    };
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        EXPECT_EQ(sendspin::visualizer_delivery_wait_us(TS, 0, row.now), row.wait_us);
     }
 }
 
