@@ -33,6 +33,9 @@ CI also builds the library, the examples, and the tests with Opus off
 validation rows run differently in that configuration, so run it too when touching either
 role's codec handling.
 
+Standalone host builds use [ccache](https://ccache.dev) when installed, so branch
+switches reuse earlier compiles. Disable with `-DSENDSPIN_USE_CCACHE=OFF`.
+
 On ESP-IDF the library is consumed as a component via `idf_component.yml`; the
 source lists live in `cmake/sources.cmake`.
 

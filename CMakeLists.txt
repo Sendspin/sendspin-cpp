@@ -128,6 +128,26 @@ if(ESP_IDF_BUILD)
 else()
     project(sendspin VERSION 0.1.0 LANGUAGES C CXX)
 
+    set(_sendspin_is_top_level OFF)
+    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+        set(_sendspin_is_top_level ON)
+    endif()
+
+    # ccache keys compiles on content, so branch switches reuse earlier builds. Set before any
+    # target so the FetchContent dependencies are cached too.
+    option(SENDSPIN_USE_CCACHE "Compile through ccache when it is installed" ${_sendspin_is_top_level})
+    if(SENDSPIN_USE_CCACHE)
+        find_program(SENDSPIN_CCACHE_PROGRAM ccache)
+        if(SENDSPIN_CCACHE_PROGRAM)
+            foreach(_lang C CXX)
+                if(NOT DEFINED CMAKE_${_lang}_COMPILER_LAUNCHER)
+                    set(CMAKE_${_lang}_COMPILER_LAUNCHER ${SENDSPIN_CCACHE_PROGRAM})
+                endif()
+            endforeach()
+            message(STATUS "Using ccache: ${SENDSPIN_CCACHE_PROGRAM}")
+        endif()
+    endif()
+
     # Role selection options
     option(SENDSPIN_ENABLE_PLAYER "Enable player role (audio decoding)" ON)
     option(SENDSPIN_ENABLE_CONTROLLER "Enable controller role" ON)
@@ -228,10 +248,6 @@ else()
     # Examples build by default for standalone development, but not when sendspin is pulled into
     # a larger project via add_subdirectory (where the consumer doesn't want the example deps,
     # e.g. FTXUI). Override either way with -DBUILD_EXAMPLES=ON/OFF.
-    set(_sendspin_is_top_level OFF)
-    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-        set(_sendspin_is_top_level ON)
-    endif()
     option(BUILD_EXAMPLES "Build host examples" ${_sendspin_is_top_level})
 
     # Apply host configuration
