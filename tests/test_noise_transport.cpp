@@ -2114,10 +2114,10 @@ struct InboundHarness {
     // Receives one complete message as a single-frame transport does.
     TestConnection::InboundRoute receive(const std::vector<uint8_t>& bytes) {
         const TestConnection::InboundTarget target =
-            this->conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+            this->conn.begin_inbound_message(bytes.size(), /*is_text=*/false);
         if (target.route == TestConnection::InboundRoute::RECEIVE) {
             std::memcpy(target.data, bytes.data(), bytes.size());
-            this->conn.end_inbound_message(true);
+            this->conn.end_inbound_message(true, platform_time_us());
         }
         return target.route;
     }
@@ -2317,13 +2317,13 @@ TEST(InboundReceive, AMultiFrameMessageIsCappedOnItsRunningTotal) {
         const size_t first_len = row.cap - 10;
 
         const TestConnection::InboundTarget first = h.conn.begin_inbound_fragment(
-            first_len, /*first=*/true, /*is_text=*/false, platform_time_us());
+            first_len, /*first=*/true, /*is_text=*/false);
         ASSERT_EQ(first.route, TestConnection::InboundRoute::RECEIVE);
         std::memset(first.data, 0x11, first_len);
-        h.conn.end_inbound_fragment(first_len, /*last=*/false);
+        h.conn.end_inbound_fragment(first_len, /*last=*/false, platform_time_us());
 
         const TestConnection::InboundTarget second = h.conn.begin_inbound_fragment(
-            row.second_len, /*first=*/false, /*is_text=*/false, platform_time_us());
+            row.second_len, /*first=*/false, /*is_text=*/false);
         EXPECT_EQ(second.route, row.route);
         EXPECT_EQ(h.conn.close_transport_now_calls_,
                   row.route == TestConnection::InboundRoute::CLOSE ? 1 : 0);
@@ -2331,7 +2331,7 @@ TEST(InboundReceive, AMultiFrameMessageIsCappedOnItsRunningTotal) {
             continue;
         }
         std::memset(second.data, 0x22, row.second_len);
-        h.conn.end_inbound_fragment(row.second_len, /*last=*/true);
+        h.conn.end_inbound_fragment(row.second_len, /*last=*/true, platform_time_us());
 
         // The whole message reaches the protocol task: in a ring item once admitted (the one
         // copy this path costs), as the pending message before.
@@ -2435,7 +2435,7 @@ TEST(InboundReceive, AnAbandonedRingItemIsNeverHandedToTheProtocolTask) {
         h.conn.set_admitted(true);
 
         const TestConnection::InboundTarget target =
-            h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+            h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false);
         ASSERT_EQ(target.route, TestConnection::InboundRoute::RECEIVE);
         ASSERT_TRUE(in_ring_storage(h.ring, target.data)) << "an admitted message skipped the ring";
         std::memcpy(target.data, bytes.data(), bytes.size() / 2);
@@ -2444,7 +2444,7 @@ TEST(InboundReceive, AnAbandonedRingItemIsNeverHandedToTheProtocolTask) {
         } else {
             std::memcpy(target.data + bytes.size() / 2, bytes.data() + bytes.size() / 2,
                         bytes.size() - bytes.size() / 2);
-            h.conn.end_inbound_message(true);
+            h.conn.end_inbound_message(true, platform_time_us());
         }
 
         size_t len = 0;
@@ -2501,10 +2501,11 @@ TEST(InboundReceive, AFrameOutOfFragmentSequenceClosesTheConnection) {
             ASSERT_EQ(h.receive(single), TestConnection::InboundRoute::RECEIVE);
         } else {
             const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
-                first.size(), /*first=*/true, /*is_text=*/false, platform_time_us());
+                first.size(), /*first=*/true, /*is_text=*/false);
             ASSERT_EQ(target.route, TestConnection::InboundRoute::RECEIVE);
             std::memcpy(target.data, first.data(), first.size());
-            h.conn.end_inbound_fragment(first.size(), row.before == Before::PENDING_ASSEMBLED);
+            h.conn.end_inbound_fragment(first.size(), row.before == Before::PENDING_ASSEMBLED,
+                                        platform_time_us());
         }
         InboundMessage pending;
         const uint8_t* pending_data = nullptr;
@@ -2517,11 +2518,11 @@ TEST(InboundReceive, AFrameOutOfFragmentSequenceClosesTheConnection) {
         if (row.second != Second::SINGLE_FRAME) {
             const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
                 second.size(), /*first=*/row.second == Second::FIRST_FRAGMENT,
-                /*is_text=*/false, platform_time_us());
+                /*is_text=*/false);
             route = target.route;
             if (route == TestConnection::InboundRoute::RECEIVE) {
                 std::memcpy(target.data, second.data(), second.size());
-                h.conn.end_inbound_fragment(second.size(), /*last=*/true);
+                h.conn.end_inbound_fragment(second.size(), /*last=*/true, platform_time_us());
             }
         } else {
             route = h.receive(second);
@@ -2599,31 +2600,31 @@ TEST(InboundReceive, TheLivenessStampIsTakenWhenAMessageCompletes) {
 
         if (row.shape == Shape::SINGLE_FRAME) {
             const TestConnection::InboundTarget target =
-                h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+                h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false);
             ASSERT_EQ(target.route, route);
             if (target.route == TestConnection::InboundRoute::RECEIVE) {
                 std::memcpy(target.data, bytes.data(), bytes.size());
                 EXPECT_EQ(h.conn.get_last_receive_time_us(), 0U) << "stamped before completion";
                 if (row.complete) {
-                    h.conn.end_inbound_message(true);
+                    h.conn.end_inbound_message(true, platform_time_us());
                 }
             }
         } else {
             const TestConnection::InboundTarget target = h.conn.begin_inbound_fragment(
-                bytes.size(), /*first=*/true, /*is_text=*/false, platform_time_us());
+                bytes.size(), /*first=*/true, /*is_text=*/false);
             ASSERT_EQ(target.route, route);
             size_t received = 0;
             if (target.route == TestConnection::InboundRoute::RECEIVE) {
                 std::memcpy(target.data, bytes.data(), bytes.size());
                 received = bytes.size();
             }
-            h.conn.end_inbound_fragment(received, /*last=*/false);
+            h.conn.end_inbound_fragment(received, /*last=*/false, platform_time_us());
             EXPECT_EQ(h.conn.get_last_receive_time_us(), 0U) << "stamped before completion";
             if (row.complete) {
                 const TestConnection::InboundTarget last = h.conn.begin_inbound_fragment(
-                    0, /*first=*/false, /*is_text=*/false, platform_time_us());
+                    0, /*first=*/false, /*is_text=*/false);
                 ASSERT_EQ(last.route, route);
-                h.conn.end_inbound_fragment(0, /*last=*/true);
+                h.conn.end_inbound_fragment(0, /*last=*/true, platform_time_us());
             }
         }
         EXPECT_EQ(h.conn.get_last_receive_time_us() != 0U, row.stamped);
@@ -2634,6 +2635,65 @@ TEST(InboundReceive, TheLivenessStampIsTakenWhenAMessageCompletes) {
         while (void* item = h.ring.take(&len, 0)) {
             h.conn.inbound_gate().note_item_taken();
             h.ring.return_item(item);
+        }
+    }
+}
+
+// A message's receive stamp is its completion stamp on every route.
+TEST(InboundReceive, AMessageIsStampedWhenItFinishesArriving) {
+    enum class Shape : uint8_t { SINGLE_FRAME, MULTI_FRAME };
+    struct Row {
+        const char* name;
+        bool admitted;  // admitted: a ring item; unadmitted: the fallback buffer
+        Shape shape;
+    };
+    const Row rows[] = {
+        {"single frame into a ring item", true, Shape::SINGLE_FRAME},
+        {"single frame into the fallback buffer", false, Shape::SINGLE_FRAME},
+        {"multi-frame into a ring item", true, Shape::MULTI_FRAME},
+        {"multi-frame into the fallback buffer", false, Shape::MULTI_FRAME},
+    };
+    constexpr int64_t MIDDLE_US = 3'000;
+    constexpr int64_t COMPLETE_US = 5'000;
+    const std::vector<uint8_t> bytes(64, 0x42);
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+        h.conn.set_admitted(row.admitted);
+
+        if (row.shape == Shape::SINGLE_FRAME) {
+            const TestConnection::InboundTarget target =
+                h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false);
+            ASSERT_EQ(target.route, TestConnection::InboundRoute::RECEIVE);
+            std::memcpy(target.data, bytes.data(), bytes.size());
+            h.conn.end_inbound_message(true, COMPLETE_US);
+        } else {
+            const size_t first_len = bytes.size() / 2;
+            const TestConnection::InboundTarget first = h.conn.begin_inbound_fragment(
+                first_len, /*first=*/true, /*is_text=*/false);
+            ASSERT_EQ(first.route, TestConnection::InboundRoute::RECEIVE);
+            std::memcpy(first.data, bytes.data(), first_len);
+            h.conn.end_inbound_fragment(first_len, /*last=*/false, MIDDLE_US);
+            const TestConnection::InboundTarget second = h.conn.begin_inbound_fragment(
+                bytes.size() - first_len, /*first=*/false, /*is_text=*/false);
+            ASSERT_EQ(second.route, TestConnection::InboundRoute::RECEIVE);
+            std::memcpy(second.data, bytes.data() + first_len, bytes.size() - first_len);
+            h.conn.end_inbound_fragment(bytes.size() - first_len, /*last=*/true, COMPLETE_US);
+        }
+
+        if (row.admitted) {
+            size_t len = 0;
+            void* item = h.ring.take(&len, 0);
+            ASSERT_NE(item, nullptr) << "the admitted message skipped the ring";
+            EXPECT_EQ(inbound_item_header(item)->receive_time_us, COMPLETE_US);
+            h.conn.inbound_gate().note_item_taken();
+            h.ring.return_item(item);
+        } else {
+            InboundMessage pending;
+            ASSERT_TRUE(h.conn.pending_message(pending));
+            EXPECT_EQ(pending.receive_time_us, COMPLETE_US);
+            h.conn.consume_pending_message();
         }
     }
 }

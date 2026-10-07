@@ -100,12 +100,12 @@ void SendspinServerConnection::handle_message(const std::string& data, bool is_b
     // IXWebSocket hands over each message reassembled, so every message takes the single-frame
     // path: one copy, from IXWebSocket's string into a ring item (or, before admission, into
     // the fallback buffer).
-    const InboundTarget target = this->begin_inbound_message(data.size(), !is_binary, receive_time);
+    const InboundTarget target = this->begin_inbound_message(data.size(), !is_binary);
     if (target.route != InboundRoute::RECEIVE) {
         return;
     }
     std::copy(data.begin(), data.end(), target.data);
-    this->end_inbound_message(true);
+    this->end_inbound_message(true, receive_time);
 }
 
 }  // namespace sendspin

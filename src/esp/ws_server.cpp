@@ -320,9 +320,6 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
 }
 
 SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
-    // Capture timestamp immediately for accurate time synchronization
-    int64_t receive_time = esp_timer_get_time();
-
     // Look up the connection via httpd's per-session ctx. The slot was pinned in open_callback and
     // is freed only after this handler unwinds for a given session, so the shared_ptr copy below
     // is always valid. Copying the shared_ptr keeps the conn alive for the duration of dispatch
@@ -355,7 +352,7 @@ SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     // inbound gate, so a still-alive session-pinned conn does not leak messages into freshly-reset
     // role queues. A frame on a never-delivered connection (its session outliving a
     // tick() reap by a moment) has no inbound ring to go to and is dropped the same way.
-    return conn->handle_data(req, receive_time, server);
+    return conn->handle_data(req, server);
 }
 
 }  // namespace sendspin

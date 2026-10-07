@@ -903,14 +903,15 @@ protected:
     /// is being assembled closes the connection (RFC 6455 section 5.4).
     /// @param len Message length in bytes.
     /// @param is_text Whether the message arrived in a text frame.
-    /// @param receive_time_us platform_time_us() when the transport received it.
-    InboundTarget begin_inbound_message(size_t len, bool is_text, int64_t receive_time_us);
+    InboundTarget begin_inbound_message(size_t len, bool is_text);
 
     /// @brief Ends the message begin_inbound_message() routed to RECEIVE: publishes it to the
     /// protocol task and wakes it. Transport thread.
     /// @param received false when the receive failed after the start: a ring item is completed
     ///        as InboundKind::DISCARD, a fallback message is not published.
-    void end_inbound_message(bool received);
+    /// @param complete_time_us platform_time_us() when the message finished arriving: its
+    ///        receive time.
+    void end_inbound_message(bool received, int64_t complete_time_us);
 
     /// @brief Starts receiving `len` more bytes of a multi-frame WebSocket message (a message
     /// sent as a frame plus continuation frames), assembled in the fallback buffer. Transport
@@ -926,15 +927,14 @@ protected:
     /// @param len Bytes this frame (or this chunk of it) carries.
     /// @param first Whether these are the first bytes of the message.
     /// @param is_text Whether the message's first frame is a text frame; read when `first`.
-    /// @param receive_time_us platform_time_us() when the transport received these bytes.
-    InboundTarget begin_inbound_fragment(size_t len, bool first, bool is_text,
-                                         int64_t receive_time_us);
+    InboundTarget begin_inbound_fragment(size_t len, bool first, bool is_text);
 
     /// @brief Commits the bytes begin_inbound_fragment() routed to RECEIVE and, on the message's
     /// last bytes, publishes the assembled message. Transport thread.
     /// @param len Bytes received into the target.
     /// @param last Whether these complete the message.
-    void end_inbound_fragment(size_t len, bool last);
+    /// @param complete_time_us platform_time_us() when these bytes finished arriving.
+    void end_inbound_fragment(size_t len, bool last, int64_t complete_time_us);
 
     /// @brief Gives up on the message being received, for a transport that stops part-way
     /// through one (a message delivered in several chunks): a ring item is completed as
@@ -955,7 +955,7 @@ protected:
     /// the message still pending to be consumed (it may be the one that admits the connection,
     /// wait_until_writable()) and closes the connection if it is still unadmitted then. A
     /// detached or unattached connection drops everything.
-    InboundTarget route_inbound_message(size_t len, InboundKind kind, uint32_t stamp);
+    InboundTarget route_inbound_message(size_t len, InboundKind kind);
 
     /// @brief Routes a complete message of `len` bytes to the fallback buffer, in order with the
     /// connection's ring items, once the protocol task has consumed the previous one, allocating
@@ -967,7 +967,7 @@ protected:
     /// closes the connection with a warning, for the same reason a full ring does (a detached
     /// connection's message is dropped instead).
     /// @return RECEIVE into the buffer; DROP or CLOSE as above; an allocation failure closes.
-    InboundTarget route_to_fallback(size_t len, InboundKind kind, uint32_t stamp, bool admitted);
+    InboundTarget route_to_fallback(size_t len, InboundKind kind, bool admitted);
 
     /// @brief InboundGate::wait_until_writable() bounded by InboundGate::WRITABLE_WAIT_MS; a
     /// timeout on a connection that is not detached closes it through fail_inbound(). Transport

@@ -495,8 +495,8 @@ void SendspinConnection::fail_inbound() {
     }
 }
 
-SS_HOT SendspinConnection::InboundTarget SendspinConnection::begin_inbound_message(
-    size_t len, bool is_text, int64_t receive_time_us) {
+SS_HOT SendspinConnection::InboundTarget SendspinConnection::begin_inbound_message(size_t len,
+                                                                                   bool is_text) {
     if (this->fragment_assembly_open_) {
         // RFC 6455 section 5.4: the fragments of one message are not interleaved with another
         // data message. Failing here also keeps the assembly's continuations off a fallback
@@ -506,8 +506,7 @@ SS_HOT SendspinConnection::InboundTarget SendspinConnection::begin_inbound_messa
         return {nullptr, InboundRoute::CLOSE};
     }
     const InboundTarget target =
-        this->route_inbound_message(len, is_text ? InboundKind::TEXT : InboundKind::BINARY,
-                                    static_cast<uint32_t>(receive_time_us));
+        this->route_inbound_message(len, is_text ? InboundKind::TEXT : InboundKind::BINARY);
     if (target.route == InboundRoute::DROP) {
         // A dropped message is read and discarded without holding anything, so its start
         // stands in for its completion as proof the peer is alive.
@@ -522,8 +521,7 @@ SS_HOT SendspinConnection::InboundTarget SendspinConnection::begin_inbound_messa
 }
 
 SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size_t len,
-                                                                            InboundKind kind,
-                                                                            uint32_t stamp) {
+                                                                            InboundKind kind) {
     if (this->inbound_ring_ == nullptr || this->inbound_gate_.is_detached()) {
         return {nullptr, InboundRoute::DROP};
     }
@@ -534,7 +532,7 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
             return {nullptr, InboundRoute::DROP};
         }
         if (len <= InboundGate::PRE_ADMISSION_MESSAGE_BYTES) {
-            return this->route_to_fallback(len, kind, stamp, /*admitted=*/false);
+            return this->route_to_fallback(len, kind, /*admitted=*/false);
         }
         // The message still pending may be the server/activate that admits this connection, so
         // the cap is judged once the protocol task has consumed it.
@@ -562,7 +560,7 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
     // ring items (see InboundGate). The rare path; the buffer is allocated for it and released at
     // the next ring write.
     if (len > this->inbound_ring_->max_message_bytes()) {
-        return this->route_to_fallback(len, kind, stamp, /*admitted=*/true);
+        return this->route_to_fallback(len, kind, /*admitted=*/true);
     }
     // A pre-admission message still pending from before the admission holds every later write
     // back, so the protocol task sees this connection's messages in order.
@@ -600,7 +598,6 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
     }
     InboundItemHeader* header = inbound_item_header(item);
     header->connection_id = static_cast<uint32_t>(this->instance_id);
-    header->receive_time_us = stamp;
     header->kind = kind;
     this->inbound_item_ = item;
     return {inbound_item_bytes(item), InboundRoute::RECEIVE};
@@ -608,7 +605,6 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
 
 SendspinConnection::InboundTarget SendspinConnection::route_to_fallback(size_t len,
                                                                         InboundKind kind,
-                                                                        uint32_t stamp,
                                                                         bool admitted) {
     if (admitted) {
         // An admitted connection's message waits for the buffer no longer than one waits for
@@ -641,7 +637,6 @@ SendspinConnection::InboundTarget SendspinConnection::route_to_fallback(size_t l
     }
     this->fallback_len_ = len;
     this->fallback_kind_ = kind;
-    this->fallback_receive_time_us_ = stamp;
     this->inbound_to_fallback_ = true;
     return {this->fallback_buf_.data(), InboundRoute::RECEIVE};
 }
@@ -664,13 +659,14 @@ void SendspinConnection::note_message_completed() {
                                       std::memory_order_relaxed);
 }
 
-void SendspinConnection::end_inbound_message(bool received) {
+void SendspinConnection::end_inbound_message(bool received, int64_t complete_time_us) {
     if (received) {
         this->note_message_completed();
     }
     if (this->inbound_item_ != nullptr) {
         void* item = std::exchange(this->inbound_item_, nullptr);
         if (received) {
+            inbound_item_header(item)->receive_time_us = static_cast<uint32_t>(complete_time_us);
             this->inbound_ring_->complete(item);
         } else {
             // FreeRTOS cannot cancel an acquire: complete it as DISCARD, which take() returns
@@ -681,7 +677,11 @@ void SendspinConnection::end_inbound_message(bool received) {
         }
     } else if (this->inbound_to_fallback_) {
         this->inbound_to_fallback_ = false;
-        if (!received || !this->inbound_gate_.publish_pending_message()) {
+        if (!received) {
+            return;
+        }
+        this->fallback_receive_time_us_ = static_cast<uint32_t>(complete_time_us);
+        if (!this->inbound_gate_.publish_pending_message()) {
             return;
         }
     } else {
@@ -692,15 +692,15 @@ void SendspinConnection::end_inbound_message(bool received) {
 
 void SendspinConnection::abandon_inbound_message() {
     if (this->inbound_item_ != nullptr) {
-        this->end_inbound_message(false);
+        this->end_inbound_message(false, 0);
     }
     this->inbound_to_fallback_ = false;
     this->fragment_dropping_ = false;
     this->fragment_assembly_open_ = false;
 }
 
-SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
-    size_t len, bool first, bool is_text, int64_t receive_time_us) {
+SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(size_t len, bool first,
+                                                                             bool is_text) {
     // The rare path (see the declaration): a multi-frame WebSocket message is assembled in the
     // fallback buffer whatever the admission state, and routed when its last bytes arrive.
     if (first && this->fragment_assembly_open_) {
@@ -728,7 +728,6 @@ SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
             // connection's pending message through them.
             this->fallback_len_ = 0;
             this->fallback_kind_ = is_text ? InboundKind::TEXT : InboundKind::BINARY;
-            this->fallback_receive_time_us_ = static_cast<uint32_t>(receive_time_us);
         }
     } else if (!this->fragment_assembly_open_) {
         // RFC 6455 section 5.4: a continuation frame continues a fragmented message, so one with
@@ -763,7 +762,7 @@ SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
     return {this->fallback_buf_.data() + this->fallback_len_, InboundRoute::RECEIVE};
 }
 
-void SendspinConnection::end_inbound_fragment(size_t len, bool last) {
+void SendspinConnection::end_inbound_fragment(size_t len, bool last, int64_t complete_time_us) {
     if (last) {
         this->fragment_assembly_open_ = false;
         this->note_message_completed();
@@ -780,27 +779,26 @@ void SendspinConnection::end_inbound_fragment(size_t len, bool last) {
     }
     if (!this->inbound_gate_.is_admitted()) {
         this->inbound_to_fallback_ = true;
-        this->end_inbound_message(true);
+        this->end_inbound_message(true, complete_time_us);
         return;
     }
     // Admitted: copy the assembled message into a ring item, the one copy this path costs over
     // a single-frame message, and release the buffer.
     const size_t total = this->fallback_len_;
-    const InboundTarget target =
-        this->route_inbound_message(total, this->fallback_kind_, this->fallback_receive_time_us_);
+    const InboundTarget target = this->route_inbound_message(total, this->fallback_kind_);
     if (target.route != InboundRoute::RECEIVE) {
         return;
     }
     if (this->inbound_item_ == nullptr) {
         // Routed to the fallback buffer it is already in: longer than the ring takes, or the
         // admission flag cleared in between.
-        this->end_inbound_message(true);
+        this->end_inbound_message(true, complete_time_us);
         return;
     }
     std::memcpy(target.data, this->fallback_buf_.data(), total);
     this->fallback_buf_.reset();
     this->fallback_len_ = 0;
-    this->end_inbound_message(true);
+    this->end_inbound_message(true, complete_time_us);
 }
 
 // ============================================================================

@@ -18,6 +18,7 @@
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "platform/time.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "sendspin/types.h"
@@ -259,8 +260,7 @@ void SendspinServerConnection::trigger_close() {
     httpd_sess_trigger_close(this->server_, this->sockfd_);
 }
 
-SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receive_time,
-                                                       SendspinWsServer* server) {
+SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, SendspinWsServer* server) {
     // The connection was delivered (and wired to the inbound ring) from the upgrade GET before any
     // frame can arrive; a frame on a never-delivered or released connection is dropped by the
     // inbound routing (begin_inbound_message()).
@@ -284,7 +284,7 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
     if (!continuation && ws_pkt.final) {
         // A single-frame message, the only kind a conforming peer sends: received straight into
         // its destination, a ring item once the connection is admitted.
-        const InboundTarget target = this->begin_inbound_message(ws_pkt.len, is_text, receive_time);
+        const InboundTarget target = this->begin_inbound_message(ws_pkt.len, is_text);
         if (target.route == InboundRoute::CLOSE) {
             return ESP_FAIL;
         }
@@ -292,19 +292,18 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
             return SendspinServerConnection::discard_frame_payload(req, ws_pkt, server);
         }
         ret = SendspinServerConnection::receive_frame_payload(req, ws_pkt, target.data);
-        this->end_inbound_message(ret == ESP_OK);
+        this->end_inbound_message(ret == ESP_OK, platform_time_us());
         return ret;
     }
 
     // A frame of a multi-frame message (the rare path; see begin_inbound_fragment()).
-    const InboundTarget target =
-        this->begin_inbound_fragment(ws_pkt.len, !continuation, is_text, receive_time);
+    const InboundTarget target = this->begin_inbound_fragment(ws_pkt.len, !continuation, is_text);
     if (target.route == InboundRoute::CLOSE) {
         return ESP_FAIL;
     }
     if (target.route == InboundRoute::DROP) {
         ret = SendspinServerConnection::discard_frame_payload(req, ws_pkt, server);
-        this->end_inbound_fragment(0, ws_pkt.final);
+        this->end_inbound_fragment(0, ws_pkt.final, platform_time_us());
         return ret;
     }
     ret = SendspinServerConnection::receive_frame_payload(req, ws_pkt, target.data);
@@ -312,7 +311,7 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
         // httpd closes the session over the error; nothing assembled so far is published.
         return ret;
     }
-    this->end_inbound_fragment(ws_pkt.len, ws_pkt.final);
+    this->end_inbound_fragment(ws_pkt.len, ws_pkt.final, platform_time_us());
     return ESP_OK;
 }
 
