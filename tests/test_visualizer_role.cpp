@@ -217,11 +217,10 @@ void hand(VisualizerRole::Impl& impl, uint8_t type, const std::vector<uint8_t>& 
     take_in_ring_order(*impl.drain_task->inbound.ring());
 }
 
-// One item the drain thread would take: its item type (the wire type), the transport's receive
-// stamp, and the message bytes it carries.
+// One item the drain thread would take: its item type (the wire type) and the message bytes it
+// carries.
 struct Entry {
     uint8_t type{0};
-    uint32_t receive_time_us{0};
     std::vector<uint8_t> message;
     const uint8_t* data{nullptr};
 };
@@ -235,7 +234,6 @@ bool pop_entry(VisualizerRole::Impl& impl, Entry& out) {
     }
     const InboundItemHeader* header = inbound_item_header(item);
     out.type = header->type;
-    out.receive_time_us = header->receive_time_us;
     const uint8_t* bytes = inbound_item_bytes(item);
     out.message.assign(bytes, bytes + header->data_offset + header->data_len);
     out.data = bytes;
@@ -245,18 +243,16 @@ bool pop_entry(VisualizerRole::Impl& impl, Entry& out) {
 
 }  // namespace
 
-// The frame reaches the drain thread whole, with the transport's receive stamp, which the drain
-// thread widens into the arrival time it judges staleness against (not when it takes the item).
-// A frame received into a ring item stays in it; one outside any (reassembled from Noise
-// fragments, or received through the fallback buffer) is copied into an item of its own.
-TEST(VisualizerHandleBinary, ForwardsTheMessageWithItsReceiveStamp) {
+// The frame reaches the drain thread whole. A frame received into a ring item stays in it; one
+// outside any (reassembled from Noise fragments, or received through the fallback buffer) is
+// copied into an item of its own.
+TEST(VisualizerHandleBinary, ForwardsTheWholeFrameInARingItem) {
     struct Row {
         const char* name;
         bool in_ring_item;
     };
     const Row rows[] = {{"received into a ring item", true},
                         {"Control: outside a ring item, copied", false}};
-    constexpr uint32_t STAMP = 0xFEDC1234;
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -271,7 +267,7 @@ TEST(VisualizerHandleBinary, ForwardsTheMessageWithItsReceiveStamp) {
         data.insert(data.end(), 64, 0xEE);
         std::vector<uint8_t> bytes = frame_message(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
         InboundMessage message =
-            row.in_ring_item ? receive_into_ring(ring, bytes, STAMP) : message_over(bytes, STAMP);
+            row.in_ring_item ? receive_into_ring(ring, bytes, 0) : message_over(bytes);
         const uint8_t* received_at = message.data;
 
         impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, message);
@@ -281,41 +277,21 @@ TEST(VisualizerHandleBinary, ForwardsTheMessageWithItsReceiveStamp) {
         ASSERT_TRUE(pop_entry(*impl, entry));
         EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
         EXPECT_EQ(entry.message, bytes);
-        EXPECT_EQ(entry.receive_time_us, STAMP) << "the drain thread would date the frame wrongly";
         EXPECT_TRUE(in_ring_storage(ring, entry.data));
         EXPECT_EQ(entry.data == received_at, row.in_ring_item)
             << "the frame was copied out of the item it arrived in";
     }
 }
 
-// An item header stores only the low 32 bits of the receive time; the full value comes back from
-// the age those bits give against `now`, including across the low word's wrap.
-TEST(InboundReceiveStamp, RecoversTheReceiveTimeAcrossTheLowWordWrap) {
-    constexpr int64_t WRAP = int64_t{1} << 32;
-    struct Row {
-        const char* name;
-        int64_t arrival_us;
-        int64_t now;
-    };
-    const Row rows[] = {
-        {"same low word", 5'000'000, 5'001'234},
-        {"low word wrapped since arrival", WRAP - 50, WRAP + 100},
-        {"several wraps into the clock", 3 * WRAP + 7, 3 * WRAP + 1'000'007},
-    };
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        EXPECT_EQ(sendspin::widen_time_stamp_us(static_cast<uint32_t>(row.arrival_us), row.now),
-                  row.arrival_us);
-    }
-}
-
-// roles/visualizer/v1.md "Visualization Data (Binary)": a frame already in the past on arrival is
-// dropped. Everything else is delivered display_offset_ms ahead of its display time, or on
-// arrival when that is later, unless the drain thread is more than the lag bound behind that.
-TEST(VisualizerDeliveryWait, DropsLateArrivalsAndBacklogAndShiftsByTheOffset) {
+// roles/visualizer/v1.md "Visualization Data (Binary)": a frame is delivered display_offset_ms
+// ahead of its display time, or at once when that has passed, and dropped once it is more than the
+// lag bound past that delivery time. A server sends one message per visualization type for each
+// analysis frame, all with the same timestamp, so a slow listener leaves the drain thread
+// reaching the later ones after that timestamp; the bound lets those through.
+TEST(VisualizerDeliveryWait, DropsLateFramesAndShiftsByTheOffset) {
     constexpr int64_t MS = 1000;
     constexpr int64_t LAG = sendspin::VISUALIZER_MAX_DELIVERY_LAG_US;
-    constexpr int64_t ARRIVAL = 1'000'000;
+    constexpr int64_t NOW = 1'000'000;
     struct Row {
         const char* name;
         int64_t client_ts;
@@ -324,52 +300,27 @@ TEST(VisualizerDeliveryWait, DropsLateArrivalsAndBacklogAndShiftsByTheOffset) {
         std::optional<int64_t> wait_us;
     };
     const Row rows[] = {
-        {"Control: in time, waits for the display time", ARRIVAL + 50 * MS, 0, ARRIVAL, 50 * MS},
-        {"already past on arrival", ARRIVAL - 1, 0, ARRIVAL, std::nullopt},
-        {"Control: due exactly on arrival", ARRIVAL, 0, ARRIVAL, 0},
-        {"reached after its display time behind a sibling", ARRIVAL + 10 * MS, 0,
-         ARRIVAL + 15 * MS, 0},
-        {"Control: at the lag bound", ARRIVAL + 10 * MS, 0, ARRIVAL + 10 * MS + LAG, 0},
-        {"past the lag bound", ARRIVAL + 10 * MS, 0, ARRIVAL + 10 * MS + LAG + 1, std::nullopt},
-        {"positive offset fires early", ARRIVAL + 50 * MS, 15, ARRIVAL, 35 * MS},
-        {"negative offset delays", ARRIVAL + 50 * MS, -10, ARRIVAL, 60 * MS},
-        {"offset beyond the lead delivers on arrival", ARRIVAL + 50 * MS, 100, ARRIVAL, 0},
-        {"Control: lag from arrival, at the bound", ARRIVAL + 50 * MS, 100, ARRIVAL + LAG, 0},
-        {"lag from arrival, past the bound", ARRIVAL + 50 * MS, 100, ARRIVAL + LAG + 1,
+        {"Control: in time, waits for the display time", NOW + 50 * MS, 0, NOW, 50 * MS},
+        {"Control: due exactly now", NOW, 0, NOW, 0},
+        {"reached after its display time behind a sibling", NOW - 5 * MS, 0, NOW, 0},
+        {"Control: at the lag bound", NOW - LAG, 0, NOW, 0},
+        {"past the lag bound", NOW - LAG - 1, 0, NOW, std::nullopt},
+        {"positive offset fires early", NOW + 50 * MS, 15, NOW, 35 * MS},
+        {"negative offset delays", NOW + 50 * MS, -10, NOW, 60 * MS},
+        {"offset beyond the lead delivers at once", NOW + 50 * MS, 60, NOW, 0},
+        {"Control: a positive offset moves the bound earlier, at it", NOW + 100 * MS - LAG, 100,
+         NOW, 0},
+        {"a positive offset moves the bound earlier, past it", NOW + 100 * MS - LAG - 1, 100, NOW,
+         std::nullopt},
+        {"Control: a negative offset moves the bound later, at it", NOW - 10 * MS - LAG, -10, NOW,
+         0},
+        {"a negative offset moves the bound later, past it", NOW - 10 * MS - LAG - 1, -10, NOW,
          std::nullopt},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        EXPECT_EQ(
-            sendspin::visualizer_delivery_wait_us(row.client_ts, ARRIVAL, row.offset_ms, row.now),
-            row.wait_us);
-    }
-}
-
-// A server sends one message per visualization type for each analysis frame, all with the same
-// timestamp, and a listener that takes 3 ms per frame leaves the drain thread reaching each
-// sibling after that timestamp. Every sibling arrived in time, so each is delivered at once as
-// long as the drain thread is within the lag bound of the display time: lateness is judged on
-// arrival, not on when the drain thread reaches the frame.
-TEST(VisualizerDeliveryWait, SiblingsSharingATimestampAreAllDelivered) {
-    constexpr int64_t MS = 1000;
-    constexpr int64_t TS = 2'000'000;
-    struct Row {
-        const char* name;
-        int64_t arrival;
-        int64_t now;
-        std::optional<int64_t> wait_us;
-    };
-    const Row rows[] = {
-        {"first sibling, reached at its display time", TS - 50 * MS, TS, 0},
-        {"second sibling, 3 ms behind", TS - 50 * MS, TS + 3 * MS, 0},
-        {"third sibling, 6 ms behind", TS - 50 * MS, TS + 6 * MS, 0},
-        {"fourth sibling, 9 ms behind", TS - 50 * MS, TS + 9 * MS, 0},
-        {"Control: a sibling that arrived after the timestamp", TS + 1, TS + 3 * MS, std::nullopt},
-    };
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        EXPECT_EQ(sendspin::visualizer_delivery_wait_us(TS, row.arrival, 0, row.now), row.wait_us);
+        EXPECT_EQ(sendspin::visualizer_delivery_wait_us(row.client_ts, row.offset_ms, row.now),
+                  row.wait_us);
     }
 }
 

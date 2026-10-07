@@ -776,13 +776,13 @@ protected:
     std::unique_ptr<FakeEncryptedServer> server;
 };
 
-// roles/visualizer/v1.md "Visualization Data (Binary)": data already in the past on arrival is
-// dropped. The ring is FIFO, so once an in-time frame sent after them is delivered, every late
-// frame ahead of it has been judged.
-TEST_F(VisualizerDelivery, FramesAlreadyInThePastOnArrivalAreDropped) {
+// roles/visualizer/v1.md "Visualization Data (Binary)": data more than the lag bound past its
+// delivery time is dropped. The ring is FIFO, so once an in-time frame sent after them is
+// delivered, every late frame ahead of it has been judged.
+TEST_F(VisualizerDelivery, FramesPastTheLagBoundAreDropped) {
     ASSERT_NO_FATAL_FAILURE(this->start(VISUALIZER_STALE_TEST_PORT));
     for (int i = 0; i < 5; ++i) {
-        this->send_frame_at(platform_time_us() - 10 * 1000, 1);
+        this->send_frame_at(platform_time_us() - VISUALIZER_MAX_DELIVERY_LAG_US - 10 * 1000, 1);
     }
     pump_until(this->client(), [&] {
         if (this->listener.delivered(2) > 0) {
@@ -793,7 +793,7 @@ TEST_F(VisualizerDelivery, FramesAlreadyInThePastOnArrivalAreDropped) {
         return false;
     });
 
-    EXPECT_EQ(this->listener.delivered(1), 0U) << "a frame late on arrival was delivered";
+    EXPECT_EQ(this->listener.delivered(1), 0U) << "a frame past the lag bound was delivered";
 }
 
 // VisualizerRoleConfig::display_offset_ms shifts delivery from the display time, which the

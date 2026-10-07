@@ -290,7 +290,7 @@ Role-bound traffic reaches a role only from the admitted connection that owns it
 | `server/pair-finalize` | Commits the pending record to `RecordStore` in RAM and queues the provider write |
 | Player audio (binary) | Discarded while the adopted client/state snapshot reports the client unavailable (`SendspinClient::adopted_state_available()`), so the gate flips with the `client/state` the tick sends; otherwise `PlayerRole::Impl::handle_binary()` charges the chunk's ring item to the player's quota and appends it to the sync task's list (a reassembled chunk is first copied into an item); over quota, or too short for its header, it is dropped with a throttled warning |
 | Artwork (binary) | `ArtworkRole::Impl::handle_binary()` checks the transfer sequence and hands the decode thread an announce item, then each part in its ring item, charged to the artwork quota (a reassembled part is first copied into an item); a cancel, a refused image or a part dropped over quota hands a marker that discards the channel's pending image instead |
-| Visualizer (binary) | `VisualizerRole::Impl::handle_binary()` hands the frame's ring item, stamped with the boundary sequence (see `stream/end`), to the drain thread the same way, against the visualizer's quota (a frame too short for its timestamp is dropped with the same throttled warning); the drain thread dates it from the transport's receive stamp |
+| Visualizer (binary) | `VisualizerRole::Impl::handle_binary()` hands the frame's ring item, stamped with the boundary sequence (see `stream/end`), to the drain thread the same way, against the visualizer's quota (a frame too short for its timestamp is dropped with the same throttled warning) |
 
 ## Source Streaming Pipeline
 

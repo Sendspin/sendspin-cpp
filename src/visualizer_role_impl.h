@@ -68,26 +68,23 @@ VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* p
                                              bool tracks_downbeats,
                                              std::vector<uint16_t>& spectrum_out);
 
-/// @brief How far behind its delivery time a frame that arrived in time may still be delivered. A
-/// frame only falls this far behind when the listener has held the drain thread; past it, the
-/// backlog is dropped rather than replayed late.
+/// @brief How far past its delivery time a frame may still be delivered, so frames sharing a
+/// timestamp all reach the listener when it takes them one after another; past it, the frame is
+/// dropped rather than replayed late.
 static constexpr int64_t VISUALIZER_MAX_DELIVERY_LAG_US = 20000;
 
 /// @brief Decides when the drain thread delivers a frame. Pure, so the timing rules are unit
 /// tested with `now` as an argument.
 ///
-/// roles/visualizer/v1.md "Visualization Data (Binary)": a frame already in the past on arrival
-/// is dropped. The rest are delivered display_offset_ms ahead of the display time (negative
-/// delays them), or on arrival when that is later, unless the drain thread has fallen more than
-/// VISUALIZER_MAX_DELIVERY_LAG_US behind that point.
+/// roles/visualizer/v1.md "Visualization Data (Binary)": a frame is delivered display_offset_ms
+/// ahead of its display time (negative delays it), or at once when that has passed, and dropped
+/// once it is more than VISUALIZER_MAX_DELIVERY_LAG_US past that delivery time.
 /// @param client_ts         Display time in client time.
-/// @param arrival_us        When the transport received the frame (widen_time_stamp_us() of its
-///                          ring item's receive_time_us).
 /// @param display_offset_ms VisualizerRoleConfig::display_offset_ms.
 /// @param now               The current platform_time_us().
 /// @return Microseconds to wait before delivering (0 to deliver now), or std::nullopt to drop.
-std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int64_t arrival_us,
-                                                   int32_t display_offset_ms, int64_t now);
+std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int32_t display_offset_ms,
+                                                   int64_t now);
 
 /// @brief Private implementation of the visualizer role
 struct VisualizerRole::Impl : RoleTeardown {
