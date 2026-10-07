@@ -22,6 +22,7 @@
 
 #ifdef ESP_PLATFORM
 
+#include "platform/logging.h"
 #include <esp_heap_caps.h>
 #include <esp_pthread.h>
 
@@ -41,9 +42,14 @@ inline void platform_configure_thread(const char* name, size_t stack_size, int p
     cfg.prio = priority;
     cfg.thread_name = name;
     if (stack_in_psram) {
-        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM;
+        // esp_pthread_set_cfg() rejects stack caps without MALLOC_CAP_8BIT.
+        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     }
-    esp_pthread_set_cfg(&cfg);
+    // A rejected config leaves the calling thread's previous (or the default) one in place.
+    if (esp_pthread_set_cfg(&cfg) != ESP_OK) {
+        SS_LOGE("sendspin.thread",
+                "%s config rejected; it starts with the previous or default config", name);
+    }
 }
 
 }  // namespace sendspin
