@@ -2114,7 +2114,7 @@ struct InboundHarness {
     // Receives one complete message as a single-frame transport does.
     TestConnection::InboundRoute receive(const std::vector<uint8_t>& bytes) {
         const TestConnection::InboundTarget target =
-            this->conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+            this->conn.begin_inbound_message(bytes.size(), /*is_text=*/false);
         if (target.route == TestConnection::InboundRoute::RECEIVE) {
             std::memcpy(target.data, bytes.data(), bytes.size());
             this->conn.end_inbound_message(true, platform_time_us());
@@ -2435,7 +2435,7 @@ TEST(InboundReceive, AnAbandonedRingItemIsNeverHandedToTheProtocolTask) {
         h.conn.set_admitted(true);
 
         const TestConnection::InboundTarget target =
-            h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+            h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false);
         ASSERT_EQ(target.route, TestConnection::InboundRoute::RECEIVE);
         ASSERT_TRUE(in_ring_storage(h.ring, target.data)) << "an admitted message skipped the ring";
         std::memcpy(target.data, bytes.data(), bytes.size() / 2);
@@ -2600,7 +2600,7 @@ TEST(InboundReceive, TheLivenessStampIsTakenWhenAMessageCompletes) {
 
         if (row.shape == Shape::SINGLE_FRAME) {
             const TestConnection::InboundTarget target =
-                h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false, platform_time_us());
+                h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false);
             ASSERT_EQ(target.route, route);
             if (target.route == TestConnection::InboundRoute::RECEIVE) {
                 std::memcpy(target.data, bytes.data(), bytes.size());
@@ -2639,44 +2639,32 @@ TEST(InboundReceive, TheLivenessStampIsTakenWhenAMessageCompletes) {
     }
 }
 
-// A single-frame message up to SINGLE_SEGMENT_MESSAGE_BYTES keeps its first stamp; a longer one,
-// or a multi-frame message of any length, gets its completion stamp.
-TEST(InboundReceive, ASmallSingleFrameMessageKeepsItsFirstStampAndOthersTheirCompletion) {
+// A message's receive stamp is its completion stamp on every route.
+TEST(InboundReceive, AMessageIsStampedWhenItFinishesArriving) {
     enum class Shape : uint8_t { SINGLE_FRAME, MULTI_FRAME };
     struct Row {
         const char* name;
         bool admitted;  // admitted: a ring item; unadmitted: the fallback buffer
         Shape shape;
-        size_t len;
-        bool completion_stamp;
     };
-    constexpr size_t BOUND = TestConnection::SINGLE_SEGMENT_MESSAGE_BYTES;
     const Row rows[] = {
-        {"ring item at the bound", true, Shape::SINGLE_FRAME, BOUND, false},
-        {"ring item past the bound", true, Shape::SINGLE_FRAME, BOUND + 1, true},
-        {"fallback buffer at the bound", false, Shape::SINGLE_FRAME, BOUND, false},
-        {"fallback buffer past the bound", false, Shape::SINGLE_FRAME, BOUND + 1, true},
-        {"multi-frame into a ring item at the bound", true, Shape::MULTI_FRAME, BOUND, true},
-        {"multi-frame into a ring item past the bound", true, Shape::MULTI_FRAME, BOUND + 1,
-         true},
-        {"multi-frame into the fallback buffer at the bound", false, Shape::MULTI_FRAME, BOUND,
-         true},
-        {"multi-frame into the fallback buffer past the bound", false, Shape::MULTI_FRAME,
-         BOUND + 1, true},
+        {"single frame into a ring item", true, Shape::SINGLE_FRAME},
+        {"single frame into the fallback buffer", false, Shape::SINGLE_FRAME},
+        {"multi-frame into a ring item", true, Shape::MULTI_FRAME},
+        {"multi-frame into the fallback buffer", false, Shape::MULTI_FRAME},
     };
-    constexpr int64_t FIRST_US = 1'000;
     constexpr int64_t MIDDLE_US = 3'000;
     constexpr int64_t COMPLETE_US = 5'000;
+    const std::vector<uint8_t> bytes(64, 0x42);
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         InboundHarness h;
         h.conn.set_admitted(row.admitted);
-        const std::vector<uint8_t> bytes(row.len, 0x42);
 
         if (row.shape == Shape::SINGLE_FRAME) {
             const TestConnection::InboundTarget target =
-                h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false, FIRST_US);
+                h.conn.begin_inbound_message(bytes.size(), /*is_text=*/false);
             ASSERT_EQ(target.route, TestConnection::InboundRoute::RECEIVE);
             std::memcpy(target.data, bytes.data(), bytes.size());
             h.conn.end_inbound_message(true, COMPLETE_US);
@@ -2694,21 +2682,17 @@ TEST(InboundReceive, ASmallSingleFrameMessageKeepsItsFirstStampAndOthersTheirCom
             h.conn.end_inbound_fragment(bytes.size() - first_len, /*last=*/true, COMPLETE_US);
         }
 
-        const uint32_t expected =
-            static_cast<uint32_t>(row.completion_stamp ? COMPLETE_US : FIRST_US);
         if (row.admitted) {
             size_t len = 0;
             void* item = h.ring.take(&len, 0);
             ASSERT_NE(item, nullptr) << "the admitted message skipped the ring";
-            EXPECT_EQ(len, bytes.size());
-            EXPECT_EQ(inbound_item_header(item)->receive_time_us, expected);
+            EXPECT_EQ(inbound_item_header(item)->receive_time_us, COMPLETE_US);
             h.conn.inbound_gate().note_item_taken();
             h.ring.return_item(item);
         } else {
             InboundMessage pending;
             ASSERT_TRUE(h.conn.pending_message(pending));
-            EXPECT_EQ(pending.len, bytes.size());
-            EXPECT_EQ(pending.receive_time_us, expected);
+            EXPECT_EQ(pending.receive_time_us, COMPLETE_US);
             h.conn.consume_pending_message();
         }
     }

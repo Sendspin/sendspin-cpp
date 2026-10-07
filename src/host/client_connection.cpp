@@ -168,8 +168,7 @@ void SendspinClientConnection::setup_callbacks() {
                 // single-frame path: one copy, from IXWebSocket's string into a ring item (or,
                 // before admission, into the fallback buffer).
                 const std::string& data = msg->str;
-                const InboundTarget target =
-                    this->begin_inbound_message(data.size(), !msg->binary, receive_time);
+                const InboundTarget target = this->begin_inbound_message(data.size(), !msg->binary);
                 if (target.route == InboundRoute::RECEIVE) {
                     std::copy(data.begin(), data.end(), target.data);
                     this->end_inbound_message(true, receive_time);

@@ -260,8 +260,7 @@ void SendspinServerConnection::trigger_close() {
     httpd_sess_trigger_close(this->server_, this->sockfd_);
 }
 
-SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receive_time,
-                                                       SendspinWsServer* server) {
+SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, SendspinWsServer* server) {
     // The connection was delivered (and wired to the inbound ring) from the upgrade GET before any
     // frame can arrive; a frame on a never-delivered or released connection is dropped by the
     // inbound routing (begin_inbound_message()).
@@ -285,7 +284,7 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
     if (!continuation && ws_pkt.final) {
         // A single-frame message, the only kind a conforming peer sends: received straight into
         // its destination, a ring item once the connection is admitted.
-        const InboundTarget target = this->begin_inbound_message(ws_pkt.len, is_text, receive_time);
+        const InboundTarget target = this->begin_inbound_message(ws_pkt.len, is_text);
         if (target.route == InboundRoute::CLOSE) {
             return ESP_FAIL;
         }

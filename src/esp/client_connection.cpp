@@ -268,8 +268,7 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
         // connection is admitted. The destination is chosen on the first chunk, from the frame's
         // full length.
         if (offset == 0) {
-            const InboundTarget target =
-                this->begin_inbound_message(frame_len, is_text, receive_time);
+            const InboundTarget target = this->begin_inbound_message(frame_len, is_text);
             this->chunk_dest_ = target.route == InboundRoute::RECEIVE ? target.data : nullptr;
         }
         if (this->chunk_dest_ == nullptr) {

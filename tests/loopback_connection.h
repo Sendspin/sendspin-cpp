@@ -94,7 +94,6 @@ public:
     using SendspinConnection::end_inbound_message;
     using SendspinConnection::InboundRoute;
     using SendspinConnection::InboundTarget;
-    using SendspinConnection::SINGLE_SEGMENT_MESSAGE_BYTES;
 
     // --- Test helpers ---
 

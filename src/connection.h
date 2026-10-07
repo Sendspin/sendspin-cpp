@@ -898,24 +898,19 @@ protected:
         InboundRoute route{InboundRoute::DROP};
     };
 
-    /// A single-frame message up to this size fits one TCP segment (default MSS, RFC 1122
-    /// section 4.2.2.6, less TCP options and a masked frame header), so it keeps the stamp from
-    /// when the transport first saw it; a longer one is stamped when it finished arriving.
-    static constexpr size_t SINGLE_SEGMENT_MESSAGE_BYTES = 536 - 40 - 8;
-
     /// @brief Starts a complete single-frame WebSocket message of `len` bytes, routed by
     /// route_inbound_message(). Transport thread. A message arriving while a multi-frame message
     /// is being assembled closes the connection (RFC 6455 section 5.4).
     /// @param len Message length in bytes.
     /// @param is_text Whether the message arrived in a text frame.
-    /// @param receive_time_us platform_time_us() when the transport received it.
-    InboundTarget begin_inbound_message(size_t len, bool is_text, int64_t receive_time_us);
+    InboundTarget begin_inbound_message(size_t len, bool is_text);
 
     /// @brief Ends the message begin_inbound_message() routed to RECEIVE: publishes it to the
     /// protocol task and wakes it. Transport thread.
     /// @param received false when the receive failed after the start: a ring item is completed
     ///        as InboundKind::DISCARD, a fallback message is not published.
-    /// @param complete_time_us platform_time_us() when the message finished arriving.
+    /// @param complete_time_us platform_time_us() when the message finished arriving: its
+    ///        receive time.
     void end_inbound_message(bool received, int64_t complete_time_us);
 
     /// @brief Starts receiving `len` more bytes of a multi-frame WebSocket message (a message
@@ -960,7 +955,7 @@ protected:
     /// the message still pending to be consumed (it may be the one that admits the connection,
     /// wait_until_writable()) and closes the connection if it is still unadmitted then. A
     /// detached or unattached connection drops everything.
-    InboundTarget route_inbound_message(size_t len, InboundKind kind, uint32_t stamp);
+    InboundTarget route_inbound_message(size_t len, InboundKind kind);
 
     /// @brief Routes a complete message of `len` bytes to the fallback buffer, in order with the
     /// connection's ring items, once the protocol task has consumed the previous one, allocating
@@ -972,7 +967,7 @@ protected:
     /// closes the connection with a warning, for the same reason a full ring does (a detached
     /// connection's message is dropped instead).
     /// @return RECEIVE into the buffer; DROP or CLOSE as above; an allocation failure closes.
-    InboundTarget route_to_fallback(size_t len, InboundKind kind, uint32_t stamp, bool admitted);
+    InboundTarget route_to_fallback(size_t len, InboundKind kind, bool admitted);
 
     /// @brief InboundGate::wait_until_writable() bounded by InboundGate::WRITABLE_WAIT_MS; a
     /// timeout on a connection that is not detached closes it through fail_inbound(). Transport
@@ -1082,9 +1077,6 @@ protected:
     /// Bytes of fallback_buf_ holding the message being assembled or the pending message. Written
     /// by the transport thread; read by the protocol task while a message is pending.
     size_t fallback_len_{0};
-
-    /// Length of the message in inbound_item_. Transport thread only.
-    size_t inbound_item_len_{0};
 
     // 32-bit fields
 

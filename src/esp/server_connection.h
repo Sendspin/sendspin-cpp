@@ -150,10 +150,9 @@ public:
     /// message straight into its ring item (or, before admission, the fallback buffer), a frame of
     /// a multi-frame message into the fallback buffer it is assembled in. On the httpd task.
     /// @param req The httpd request containing the WebSocket frame.
-    /// @param receive_time Timestamp when the data was received.
     /// @param server The server whose discard buffer a dropped frame is read into.
     /// @return ESP_OK on success; an error makes httpd close the session.
-    esp_err_t handle_data(httpd_req_t* req, int64_t receive_time, SendspinWsServer* server);
+    esp_err_t handle_data(httpd_req_t* req, SendspinWsServer* server);
 
 protected:
     /// @brief Queues the frame like send_binary_message(), carrying `before_write` to the httpd

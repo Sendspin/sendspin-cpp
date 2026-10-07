@@ -1946,7 +1946,7 @@ TEST(NextDeadline, AFallbackMessageHeldBehindARingItemRunsTheNextTickAtOnce) {
 
         // The transport side: a ring item, then the second message.
         const auto receive = [&](size_t len) {
-            const auto target = conn->begin_inbound_message(len, false, platform_time_us());
+            const auto target = conn->begin_inbound_message(len, false);
             ASSERT_EQ(target.route, SendspinConnection::InboundRoute::RECEIVE);
             std::memset(target.data, 0x5A, len);
             conn->end_inbound_message(true, platform_time_us());
