@@ -139,9 +139,10 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     endif()
 
     # A parent project that already defines a noise_c target (for example one built with
-    # AES-GCM) provides it instead. That target must offer 25519, ChaChaPoly and SHA-256, export
-    # noise-c's include directory, and define NOISE_USE_CUSTOM_RAND=0 with rand_os.c, since the
-    # host build supplies no noise_rand_bytes().
+    # AES-GCM) provides it instead, and the backend, suite and RNG notes above describe only the
+    # fallback. That target must offer 25519, ChaChaPoly and SHA-256, export noise-c's include
+    # directory, and supply randomness: either NOISE_USE_CUSTOM_RAND=0 with rand_os.c, or its
+    # own noise_rand_bytes() (the host build defines none).
     if(NOT TARGET noise_c)
         FetchContent_Declare(
             noise_c
