@@ -674,6 +674,27 @@ TEST(InboundConsumer, UnbindEndsTheDropRun) {
     EXPECT_EQ(consumer.drop_log_.dropped_, 0U);
 }
 
+// An item header stores only the low 32 bits of the receive time; the full value comes back from
+// the age those bits give against `now`, including across the low word's wrap.
+TEST(InboundReceiveStamp, RecoversTheReceiveTimeAcrossTheLowWordWrap) {
+    constexpr int64_t WRAP = int64_t{1} << 32;
+    struct Row {
+        const char* name;
+        int64_t arrival_us;
+        int64_t now;
+    };
+    const Row rows[] = {
+        {"same low word", 5'000'000, 5'001'234},
+        {"low word wrapped since arrival", WRAP - 50, WRAP + 100},
+        {"several wraps into the clock", 3 * WRAP + 7, 3 * WRAP + 1'000'007},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(widen_time_stamp_us(static_cast<uint32_t>(row.arrival_us), row.now),
+                  row.arrival_us);
+    }
+}
+
 // Concurrent charges and releases never let the outstanding total past the limit and leave it at
 // zero once every charge is released. Under TSan this also proves the accounting race-free.
 TEST(InboundQuota, ConcurrentChargesNeverExceedTheLimit) {

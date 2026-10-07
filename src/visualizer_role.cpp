@@ -32,10 +32,10 @@ static const char* const TAG = "sendspin.visualizer";
 // ============================================================================
 
 // Each frame stays in the inbound ring item it arrived in: its plaintext is
-// [wire_type(1)][server_ts(8)][payload], the item header carries the wire type, the payload's
-// offset and length, and the transport's receive stamp. buffer_capacity is the visualizer's quota
-// of ring storage, not a wire-data quota: each frame also costs the ring's per-item overhead, so
-// effective wire-data capacity is smaller (see the buffer_capacity note in config.h).
+// [wire_type(1)][server_ts(8)][payload], and the item header carries the wire type and the
+// payload's offset and length. buffer_capacity is the visualizer's quota of ring storage, not a
+// wire-data quota: each frame also costs the ring's per-item overhead, so effective wire-data
+// capacity is smaller (see the buffer_capacity note in config.h).
 static constexpr size_t ENTRY_TYPE_SIZE = 1;
 /// @brief Offset of a frame's payload in its plaintext
 static constexpr size_t FRAME_PAYLOAD_OFFSET = ENTRY_TYPE_SIZE + sendspin::BINARY_TIMESTAMP_SIZE;
@@ -474,15 +474,10 @@ void VisualizerRole::Impl::complete_teardown() const {
 // Drain thread helpers
 // ============================================================================
 
-std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int64_t arrival_us,
-                                                   int32_t display_offset_ms, int64_t now) {
-    // A frame that arrived in time and only waited behind others sharing its timestamp is not
-    // stale.
-    if (client_ts < arrival_us) {
-        return std::nullopt;
-    }
+std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int32_t display_offset_ms,
+                                                   int64_t now) {
     const int64_t deliver_at_us = client_ts - static_cast<int64_t>(display_offset_ms) * US_PER_MS;
-    if (now - std::max(deliver_at_us, arrival_us) > VISUALIZER_MAX_DELIVERY_LAG_US) {
+    if (now > deliver_at_us + VISUALIZER_MAX_DELIVERY_LAG_US) {
         return std::nullopt;
     }
     return std::max<int64_t>(deliver_at_us - now, 0);
@@ -619,8 +614,8 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         }
 
         const int64_t now = platform_time_us();
-        const std::optional<int64_t> wait_us = visualizer_delivery_wait_us(
-            client_ts, widen_time_stamp_us(header->receive_time_us, now), offset_ms, now);
+        const std::optional<int64_t> wait_us =
+            visualizer_delivery_wait_us(client_ts, offset_ms, now);
         if (!wait_us.has_value()) {
             continue;
         }

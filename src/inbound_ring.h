@@ -229,8 +229,8 @@ inline uint8_t* inbound_item_data(void* item) {
 /// InboundItemHeader::receive_time_us, against the current clock
 ///
 /// Exact while the stamped moment is less than 2^32 us (about 71 minutes) before `now`, which an
-/// inbound message's life never approaches. Shared by the protocol task (server/time keeps the
-/// transport stamp) and the visualizer drain thread (a frame's arrival).
+/// inbound message's life never approaches. The protocol task uses it for server/time, which
+/// keeps the transport stamp.
 /// @param stamp The low 32 bits of the earlier reading.
 /// @param now   The current platform_time_us().
 inline int64_t widen_time_stamp_us(uint32_t stamp, int64_t now) {
