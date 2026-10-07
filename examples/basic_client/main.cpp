@@ -27,6 +27,7 @@
 ///   -u URL    Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)
 ///   -p PORT   Listen on PORT (default: 8928)
 ///   -s CODE   Offer the static pairing code CODE (8 digits) instead of the dynamic one
+///   -a        Enable unpaired access, so a server can stream without pairing first
 ///   -l LEVEL  Set log level: none, error, warn, info (default), debug, verbose
 ///   -v        Verbose logging (same as -l verbose)
 ///   -q        Quiet logging (same as -l error)
@@ -166,6 +167,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  -s CODE       Offer the static pairing code CODE (8 digits) instead of\n");
     fprintf(stderr, "                the dynamic one; SIGUSR1 is the pairing-window gesture and\n");
     fprintf(stderr, "                SIGUSR2 cancels it\n");
+    fprintf(stderr, "  -a            Enable unpaired access, so a server can stream without\n");
+    fprintf(stderr, "                pairing first\n");
     fprintf(stderr, "  -l LEVEL      Log level: none, error, warn, info (default), debug, verbose\n");
     fprintf(stderr, "  -v            Verbose logging (same as -l verbose)\n");
     fprintf(stderr, "  -q            Quiet logging (same as -l error)\n");
@@ -203,9 +206,10 @@ int main(int argc, char* argv[]) {
     LogLevel log_level = LogLevel::INFO;
     std::string connect_url;
     std::string static_pairing_code;
+    bool unpaired_access = false;
     uint16_t server_port = DEFAULT_SENDSPIN_PORT;
     int opt;
-    while ((opt = getopt(argc, argv, "u:p:s:l:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:s:al:vqh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
@@ -218,6 +222,9 @@ int main(int argc, char* argv[]) {
                     print_usage(argv[0]);
                     return 1;
                 }
+                break;
+            case 'a':
+                unpaired_access = true;
                 break;
             case 'p':
                 if (!parse_port(optarg, server_port)) {
@@ -289,6 +296,7 @@ int main(int argc, char* argv[]) {
 
     SendspinClient client(std::move(config));
     client.set_persistence_provider(&persistence_provider);
+    client.set_unpaired_access_enabled(unpaired_access);
 
     // Add roles
 #ifdef SENDSPIN_ENABLE_PLAYER
