@@ -105,7 +105,7 @@ void SendspinServerConnection::handle_message(const std::string& data, bool is_b
         return;
     }
     std::copy(data.begin(), data.end(), target.data);
-    this->end_inbound_message(true);
+    this->end_inbound_message(true, receive_time);
 }
 
 }  // namespace sendspin

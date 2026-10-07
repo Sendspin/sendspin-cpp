@@ -1949,7 +1949,7 @@ TEST(NextDeadline, AFallbackMessageHeldBehindARingItemRunsTheNextTickAtOnce) {
             const auto target = conn->begin_inbound_message(len, false, platform_time_us());
             ASSERT_EQ(target.route, SendspinConnection::InboundRoute::RECEIVE);
             std::memset(target.data, 0x5A, len);
-            conn->end_inbound_message(true);
+            conn->end_inbound_message(true, platform_time_us());
         };
         receive(3);
         receive(client.inbound_ring_->max_message_bytes() + row.extra_len);

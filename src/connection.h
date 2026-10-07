@@ -898,6 +898,11 @@ protected:
         InboundRoute route{InboundRoute::DROP};
     };
 
+    /// A message up to this size fits one TCP segment (default MSS, RFC 1122 section 4.2.2.6,
+    /// less TCP options and a masked frame header), so it keeps the stamp from when the
+    /// transport first saw it; a longer one is stamped when it finished arriving.
+    static constexpr size_t SINGLE_SEGMENT_MESSAGE_BYTES = 536 - 40 - 8;
+
     /// @brief Starts a complete single-frame WebSocket message of `len` bytes, routed by
     /// route_inbound_message(). Transport thread. A message arriving while a multi-frame message
     /// is being assembled closes the connection (RFC 6455 section 5.4).
@@ -910,7 +915,8 @@ protected:
     /// protocol task and wakes it. Transport thread.
     /// @param received false when the receive failed after the start: a ring item is completed
     ///        as InboundKind::DISCARD, a fallback message is not published.
-    void end_inbound_message(bool received);
+    /// @param complete_time_us platform_time_us() when the message finished arriving.
+    void end_inbound_message(bool received, int64_t complete_time_us);
 
     /// @brief Starts receiving `len` more bytes of a multi-frame WebSocket message (a message
     /// sent as a frame plus continuation frames), assembled in the fallback buffer. Transport
@@ -934,7 +940,8 @@ protected:
     /// last bytes, publishes the assembled message. Transport thread.
     /// @param len Bytes received into the target.
     /// @param last Whether these complete the message.
-    void end_inbound_fragment(size_t len, bool last);
+    /// @param complete_time_us platform_time_us() when these bytes finished arriving.
+    void end_inbound_fragment(size_t len, bool last, int64_t complete_time_us);
 
     /// @brief Gives up on the message being received, for a transport that stops part-way
     /// through one (a message delivered in several chunks): a ring item is completed as
@@ -1077,6 +1084,9 @@ protected:
     /// Bytes of fallback_buf_ holding the message being assembled or the pending message. Written
     /// by the transport thread; read by the protocol task while a message is pending.
     size_t fallback_len_{0};
+
+    /// Length of the message in inbound_item_. Transport thread only.
+    size_t inbound_item_len_{0};
 
     // 32-bit fields
 

@@ -280,7 +280,7 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
         }
         if (frame_done) {
             this->chunk_dest_ = nullptr;
-            this->end_inbound_message(true);
+            this->end_inbound_message(true, receive_time);
         }
         return;
     }
@@ -294,9 +294,9 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
         if (chunk_len > 0) {
             std::memcpy(target.data, data->data_ptr, chunk_len);
         }
-        this->end_inbound_fragment(chunk_len, last);
+        this->end_inbound_fragment(chunk_len, last, receive_time);
     } else if (target.route == InboundRoute::DROP) {
-        this->end_inbound_fragment(0, last);
+        this->end_inbound_fragment(0, last, receive_time);
     }
 }
 

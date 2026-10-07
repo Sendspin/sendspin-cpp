@@ -603,6 +603,7 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
     header->receive_time_us = stamp;
     header->kind = kind;
     this->inbound_item_ = item;
+    this->inbound_item_len_ = len;
     return {inbound_item_bytes(item), InboundRoute::RECEIVE};
 }
 
@@ -664,13 +665,17 @@ void SendspinConnection::note_message_completed() {
                                       std::memory_order_relaxed);
 }
 
-void SendspinConnection::end_inbound_message(bool received) {
+void SendspinConnection::end_inbound_message(bool received, int64_t complete_time_us) {
     if (received) {
         this->note_message_completed();
     }
     if (this->inbound_item_ != nullptr) {
         void* item = std::exchange(this->inbound_item_, nullptr);
         if (received) {
+            if (this->inbound_item_len_ > SINGLE_SEGMENT_MESSAGE_BYTES) {
+                inbound_item_header(item)->receive_time_us =
+                    static_cast<uint32_t>(complete_time_us);
+            }
             this->inbound_ring_->complete(item);
         } else {
             // FreeRTOS cannot cancel an acquire: complete it as DISCARD, which take() returns
@@ -681,7 +686,13 @@ void SendspinConnection::end_inbound_message(bool received) {
         }
     } else if (this->inbound_to_fallback_) {
         this->inbound_to_fallback_ = false;
-        if (!received || !this->inbound_gate_.publish_pending_message()) {
+        if (!received) {
+            return;
+        }
+        if (this->fallback_len_ > SINGLE_SEGMENT_MESSAGE_BYTES) {
+            this->fallback_receive_time_us_ = static_cast<uint32_t>(complete_time_us);
+        }
+        if (!this->inbound_gate_.publish_pending_message()) {
             return;
         }
     } else {
@@ -692,7 +703,7 @@ void SendspinConnection::end_inbound_message(bool received) {
 
 void SendspinConnection::abandon_inbound_message() {
     if (this->inbound_item_ != nullptr) {
-        this->end_inbound_message(false);
+        this->end_inbound_message(false, 0);
     }
     this->inbound_to_fallback_ = false;
     this->fragment_dropping_ = false;
@@ -763,7 +774,7 @@ SendspinConnection::InboundTarget SendspinConnection::begin_inbound_fragment(
     return {this->fallback_buf_.data() + this->fallback_len_, InboundRoute::RECEIVE};
 }
 
-void SendspinConnection::end_inbound_fragment(size_t len, bool last) {
+void SendspinConnection::end_inbound_fragment(size_t len, bool last, int64_t complete_time_us) {
     if (last) {
         this->fragment_assembly_open_ = false;
         this->note_message_completed();
@@ -780,7 +791,7 @@ void SendspinConnection::end_inbound_fragment(size_t len, bool last) {
     }
     if (!this->inbound_gate_.is_admitted()) {
         this->inbound_to_fallback_ = true;
-        this->end_inbound_message(true);
+        this->end_inbound_message(true, complete_time_us);
         return;
     }
     // Admitted: copy the assembled message into a ring item, the one copy this path costs over
@@ -794,13 +805,13 @@ void SendspinConnection::end_inbound_fragment(size_t len, bool last) {
     if (this->inbound_item_ == nullptr) {
         // Routed to the fallback buffer it is already in: longer than the ring takes, or the
         // admission flag cleared in between.
-        this->end_inbound_message(true);
+        this->end_inbound_message(true, complete_time_us);
         return;
     }
     std::memcpy(target.data, this->fallback_buf_.data(), total);
     this->fallback_buf_.reset();
     this->fallback_len_ = 0;
-    this->end_inbound_message(true);
+    this->end_inbound_message(true, complete_time_us);
 }
 
 // ============================================================================

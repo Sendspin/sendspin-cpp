@@ -172,7 +172,7 @@ void SendspinClientConnection::setup_callbacks() {
                     this->begin_inbound_message(data.size(), !msg->binary, receive_time);
                 if (target.route == InboundRoute::RECEIVE) {
                     std::copy(data.begin(), data.end(), target.data);
-                    this->end_inbound_message(true);
+                    this->end_inbound_message(true, receive_time);
                 }
                 break;
             }

@@ -18,6 +18,7 @@
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "platform/time.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "sendspin/types.h"
@@ -292,7 +293,7 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
             return SendspinServerConnection::discard_frame_payload(req, ws_pkt, server);
         }
         ret = SendspinServerConnection::receive_frame_payload(req, ws_pkt, target.data);
-        this->end_inbound_message(ret == ESP_OK);
+        this->end_inbound_message(ret == ESP_OK, platform_time_us());
         return ret;
     }
 
@@ -304,7 +305,7 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
     }
     if (target.route == InboundRoute::DROP) {
         ret = SendspinServerConnection::discard_frame_payload(req, ws_pkt, server);
-        this->end_inbound_fragment(0, ws_pkt.final);
+        this->end_inbound_fragment(0, ws_pkt.final, platform_time_us());
         return ret;
     }
     ret = SendspinServerConnection::receive_frame_payload(req, ws_pkt, target.data);
@@ -312,7 +313,7 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
         // httpd closes the session over the error; nothing assembled so far is published.
         return ret;
     }
-    this->end_inbound_fragment(ws_pkt.len, ws_pkt.final);
+    this->end_inbound_fragment(ws_pkt.len, ws_pkt.final, platform_time_us());
     return ESP_OK;
 }
 
