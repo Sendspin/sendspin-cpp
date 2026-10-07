@@ -44,30 +44,63 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    # The host CMake build compiles through ccache once it is installed. Every host job restores
+    # its newest cache, but only pushes to main save one, so PR runs reuse main's objects without
+    # filling the repository's cache quota.
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 300M
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libavahi-compat-libdnssd-dev
+          sudo apt-get install -y ccache libavahi-compat-libdnssd-dev
+
+      - name: Restore ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-build-${{ github.sha }}
+          restore-keys: ccache-build-
 
       - name: Configure CMake
         run: cmake -B build -DENABLE_WERROR=ON .
 
       - name: Build
-        run: cmake --build build
+        run: |
+          ccache --zero-stats
+          cmake --build build
+          ccache --show-stats
+
+      - name: Save ccache
+        if: github.event_name == 'push'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-build-${{ github.sha }}
 
   test:
     name: Unit tests
     runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 300M
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libavahi-compat-libdnssd-dev
+          sudo apt-get install -y ccache libavahi-compat-libdnssd-dev
+
+      - name: Restore ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ github.sha }}
+          restore-keys: ccache-test-
 
       - name: Configure CMake
         # BUILD_EXAMPLES=OFF so the test job configures only sendspin + tests and skips the
@@ -75,7 +108,17 @@ jobs:
         run: cmake -B build-tests -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .
 
       - name: Build tests
-        run: cmake --build build-tests --target sendspin_tests
+        run: |
+          ccache --zero-stats
+          cmake --build build-tests --target sendspin_tests
+          ccache --show-stats
+
+      - name: Save ccache
+        if: github.event_name == 'push'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ github.sha }}
 
       - name: Run tests
         run: ctest --test-dir build-tests --output-on-failure
@@ -83,13 +126,23 @@ jobs:
   test-no-opus:
     name: Build and test without Opus
     runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 300M
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libavahi-compat-libdnssd-dev
+          sudo apt-get install -y ccache libavahi-compat-libdnssd-dev
+
+      - name: Restore ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-no-opus-${{ github.sha }}
+          restore-keys: ccache-test-no-opus-
 
       - name: Configure CMake
         # SENDSPIN_ENABLE_OPUS=OFF must build the library, the examples, and the tests without
@@ -98,7 +151,17 @@ jobs:
         run: cmake -B build-no-opus -DENABLE_WERROR=ON -DSENDSPIN_ENABLE_OPUS=OFF -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON .
 
       - name: Build
-        run: cmake --build build-no-opus
+        run: |
+          ccache --zero-stats
+          cmake --build build-no-opus
+          ccache --show-stats
+
+      - name: Save ccache
+        if: github.event_name == 'push'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-no-opus-${{ github.sha }}
 
       - name: Run tests
         run: ctest --test-dir build-no-opus --output-on-failure
@@ -106,13 +169,23 @@ jobs:
   test-tsan:
     name: Unit tests (ThreadSanitizer)
     runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 300M
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libavahi-compat-libdnssd-dev
+          sudo apt-get install -y ccache libavahi-compat-libdnssd-dev
+
+      - name: Restore ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-tsan-${{ github.sha }}
+          restore-keys: ccache-test-tsan-
 
       - name: Configure CMake
         # ENABLE_TSAN instead of ENABLE_SANITIZERS: TSan cannot be combined with ASan/UBSan, and
@@ -120,7 +193,17 @@ jobs:
         run: cmake -B build-tsan -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .
 
       - name: Build tests
-        run: cmake --build build-tsan --target sendspin_tests
+        run: |
+          ccache --zero-stats
+          cmake --build build-tsan --target sendspin_tests
+          ccache --show-stats
+
+      - name: Save ccache
+        if: github.event_name == 'push'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-tsan-${{ github.sha }}
 
       - name: Reduce mmap randomization
         # TSan aborts at startup with "unexpected memory mapping" under the 32-bit mmap
