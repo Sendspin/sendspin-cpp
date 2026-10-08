@@ -789,8 +789,8 @@ int main(int argc, char* argv[]) {
         }
 
         void on_open_pairing_window() override {
-            // The pairing-window gesture is not implemented in the tui_client example, so
-            // pairing_window_supported stays false and this never fires.
+            // The tui_client example implements no pairing-window gesture, so an attempt held
+            // back by the round limit waits until the server cancels it.
         }
 
         void on_close_pairing_window() override {

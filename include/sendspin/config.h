@@ -114,6 +114,10 @@ struct SendspinPsk {
     }
 };
 
+// The implicit copy and move members touch the deprecated pairing_window_supported; only a
+// consumer's own use of it should warn.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start()
 struct SendspinClientConfig {
@@ -150,11 +154,10 @@ struct SendspinClientConfig {
     /// listener receives. Empty leaves dynamic_pairing_code unadvertised.
     std::vector<SendspinPairingCodeFormat> pairing_code_formats{};
 
-    /// @brief When true, the platform implements the operator pairing-window gesture.
-    /// Set this to true when the application implements on_open_pairing_window /
-    /// on_close_pairing_window callbacks on its SendspinClientListener. When false,
-    /// static_pairing_code is not advertised even if `static_pairing_code` is set, and a dynamic
-    /// attempt held back by the round limit has no way to resume.
+    /// @brief Has no effect.
+    /// @deprecated Ignored: the pairing-window callbacks always fire for a gesture-gated attempt.
+    /// Removal is planned for v0.10.0.
+    [[deprecated("ignored; delete the assignment, removal is planned for v0.10.0")]]
     bool pairing_window_supported{false};
 
     /// @brief The Pairing PSK the device shipped with, for an application that provisions one
@@ -169,10 +172,9 @@ struct SendspinClientConfig {
 
     /// @brief The static pairing code the device shipped with: exactly 8 decimal digits, drawn
     /// from a CSPRNG per device (pairing.md "Static Pairing Code Flow"). static_pairing_code is
-    /// advertised only when this is set, `pairing_window_supported` is true, and
-    /// dynamic_pairing_code is not advertised (messaging.md "client/hello" permits at most one
-    /// pairing-code method). A value that is not 8 decimal digits is rejected: start() logs an
-    /// error and returns false.
+    /// advertised only when this is set and dynamic_pairing_code is not advertised (messaging.md
+    /// "client/hello" permits at most one pairing-code method). A value that is not 8 decimal
+    /// digits is rejected: start() logs an error and returns false.
     std::optional<std::string> static_pairing_code{};
 
     /// @brief Where the operator can find the Pairing PSK the device shipped with (as a pairing
@@ -320,6 +322,7 @@ struct SendspinClientConfig {
     /// arena is a plain scratch buffer. Used by the protocol task only.
     size_t json_arena_size{DEFAULT_JSON_ARENA_SIZE};
 };
+#pragma GCC diagnostic pop
 
 // ============================================================================
 // Player config types

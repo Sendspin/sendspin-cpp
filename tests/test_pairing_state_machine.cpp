@@ -414,24 +414,21 @@ struct CodeEmissionResult {
 class PairingStateMachineTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // This harness exercises both dynamic and static pairing-code device flows, so the platform
-        // capability flags gating their advertisement/admissibility default to both set (spec
-        // "PAKE"'s pairing-method admissibility check in ConnectionManager::on_server_activate()
-        // mirrors build_hello_message()'s gating exactly, including these). Tests that need a
-        // different capability shape call init_client() again with other flags.
-        this->init_client(/*pairing_code_emission_supported=*/true,
-                          /*pairing_window_supported=*/true);
+        // The harness defaults to a device able to emit a dynamic pairing code (spec "PAKE"'s
+        // pairing-method admissibility check in ConnectionManager::on_server_activate() mirrors
+        // build_hello_message()'s gating exactly). Tests that need a different capability shape
+        // call init_client() again.
+        this->init_client(/*pairing_code_emission_supported=*/true);
     }
 
-    /// (Re)build the SendspinClient under test with the given platform capability flags, and
+    /// (Re)build the SendspinClient under test with the given platform capability, and
     /// optionally the factory locations hints the client/hello descriptors advertise.
     /// `pairing_code_emission_supported` stands for the pair of config fields that make a device
     /// able to emit a dynamic pairing code at all: an out-channel and an emission format.
-    void init_client(bool pairing_code_emission_supported, bool pairing_window_supported,
+    void init_client(bool pairing_code_emission_supported,
                      std::vector<std::string> pairing_psk_locations = {},
                      std::vector<std::string> static_pairing_code_locations = {}) {
         this->pairing_code_emission_supported_ = pairing_code_emission_supported;
-        this->pairing_window_supported_ = pairing_window_supported;
         this->pairing_psk_locations_ = std::move(pairing_psk_locations);
         this->static_pairing_code_locations_ = std::move(static_pairing_code_locations);
         this->build_client();
@@ -465,7 +462,6 @@ protected:
             config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS,
                                            SendspinPairingCodeFormat::QR_CODE};
         }
-        config.pairing_window_supported = this->pairing_window_supported_;
         config.pairing_psk_locations = this->pairing_psk_locations_;
         config.static_pairing_code_locations = this->static_pairing_code_locations_;
         config.static_pairing_code = this->static_pairing_code_;
@@ -979,7 +975,6 @@ protected:
 
     // Construction-time inputs replayed by build_client() on every rebuild.
     bool pairing_code_emission_supported_{true};
-    bool pairing_window_supported_{true};
     bool unpaired_access_enabled_{false};
     std::vector<std::string> pairing_psk_locations_;
     std::vector<std::string> static_pairing_code_locations_;
@@ -1953,36 +1948,6 @@ TEST_F(PairingStateMachineTest, OperatorCancellationClosesAStandingWindow) {
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
 }
 
-// A gesture-gated attempt on a device with no pairing-window gesture UI
-// (pairing_window_supported=false) must not fire the on_open_pairing_window prompt, whose
-// contract requires the flag. The client/pair-pending the spec requires still goes out, and the
-// attempt remains recoverable by a window opened through confirm_pairing_window(), which drives
-// the same open_pairing_window() path.
-TEST_F(PairingStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
-    this->init_client(/*pairing_code_emission_supported=*/true,
-                      /*pairing_window_supported=*/false);
-    this->configure_static_pairing_code("24681357");
-
-    FakeConnection* conn = this->inject_current_connection(
-        "server-static-nowindow", SendspinPairMethod::STATIC_PAIRING_CODE);
-    this->enter_pairing(conn);
-    this->pump();
-
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
-    EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
-    EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
-    EXPECT_FALSE(this->listener_.fired(PairingEventKind::OPEN_WINDOW))
-        << "on_open_pairing_window must not fire when pairing_window_supported is false";
-    EXPECT_FALSE(conn->pairing_session().window_shown);
-
-    // A window opened later still starts the waiting attempt.
-    this->client_->confirm_pairing_window();
-    this->pump();
-    ASSERT_EQ(conn->sent_text_.size(), 2u);
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
-}
-
 // ============================================================================
 // Static pairing code: happy path
 // ============================================================================
@@ -2082,8 +2047,7 @@ TEST_F(PairingStateMachineTest, SubsequentActivateEntersPairingForEitherCodeMeth
         if (row.method == SendspinPairMethod::STATIC_PAIRING_CODE) {
             this->configure_static_pairing_code("13572468");
         } else {
-            this->init_client(/*pairing_code_emission_supported=*/true,
-                              /*pairing_window_supported=*/true);
+            this->init_client(/*pairing_code_emission_supported=*/true);
         }
         FakeConnection* conn = this->inject_provisional_current_connection("server-sub");
 
@@ -2129,8 +2093,7 @@ TEST_F(PairingStateMachineTest, SubsequentActivateEntersPairingForEitherCodeMeth
 // (messaging.md "server/activate").
 TEST_F(PairingStateMachineTest, UnofferedFormatOnActivationIsRejected) {
     // A device that offers only `digits`, so `qr_code` is a format it does not currently offer.
-    this->init_client(/*pairing_code_emission_supported=*/false,
-                      /*pairing_window_supported=*/true);
+    this->init_client(/*pairing_code_emission_supported=*/false);
     {
         SendspinClientConfig& cfg = this->client_->config_;
         cfg.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
@@ -2218,8 +2181,7 @@ TEST_F(PairingStateMachineTest, PairingActivateWithoutMethodIsAborted) {
 // however completely it is configured.
 TEST_F(PairingStateMachineTest, UnofferedPairingMethodOnActivationIsRejected) {
     this->configure_static_pairing_code("13572468");
-    this->init_client(/*pairing_code_emission_supported=*/true,
-                      /*pairing_window_supported=*/true);
+    this->init_client(/*pairing_code_emission_supported=*/true);
     FakeConnection* conn = this->inject_provisional_current_connection("server-unoffered-method");
 
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
@@ -2505,8 +2467,7 @@ TEST_F(PairingStateMachineTest, CancellingActivateDismissesThePromptItLeftShowin
         SCOPED_TRACE(row.name);
         FakeConnection* conn = nullptr;
         if (row.method == SendspinPairMethod::DYNAMIC_PAIRING_CODE) {
-            this->init_client(/*pairing_code_emission_supported=*/true,
-                              /*pairing_window_supported=*/true);
+            this->init_client(/*pairing_code_emission_supported=*/true);
             this->listener_.events_.clear();
             conn = this->enter_dynamic_code_pairing("server-cancel");
             if (row.emit_code) {
@@ -3007,7 +2968,7 @@ TEST_F(PairingStateMachineTest, NoteLastPlayedServerSkipsDuplicateWrite) {
 // client/hello (pairing.md "client/hello pair-method descriptor").
 TEST_F(PairingStateMachineTest, HelloAdvertisesConfiguredLocationsForShippedSecrets) {
     this->init_client(/*pairing_code_emission_supported=*/false,
-                      /*pairing_window_supported=*/true, /*pairing_psk_locations=*/{"device"},
+                      /*pairing_psk_locations=*/{"device"},
                       /*static_pairing_code_locations=*/{"leaflet", "operator"});
     this->configure_static_pairing_code("13572468");
 

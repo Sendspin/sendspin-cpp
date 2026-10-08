@@ -149,9 +149,6 @@ public:
     /// gesture-gated pairing attempt (pairing.md "Pairing Window"): every static_pairing_code
     /// attempt, and a dynamic_pairing_code attempt held back by the round limit.
     ///
-    /// Only called when SendspinClientConfig::pairing_window_supported is true; a device
-    /// offering dynamic_pairing_code should therefore also implement this
-    /// gesture UI, or such an attempt stalls until the server cancels it.
     /// Always followed by on_close_pairing_window when the attempt concludes. The application
     /// confirms the gesture by calling SendspinClient::confirm_pairing_window().
     virtual void on_open_pairing_window() {}

@@ -47,14 +47,12 @@ inline bool offers_dynamic_pairing_code(const SendspinClientConfig& config) {
 }
 
 /// @brief Whether the client offers the static pairing code.
-/// Needs a configured code (start() refuses a malformed one) and the operator gesture the flow is
-/// gated on (pairing.md "Pairing Window"). A client that offers the dynamic pairing code offers
-/// that one instead: messaging.md "client/hello" permits at most one pairing-code method in
-/// `supported_pair_methods`, and pairing.md "Methods" prefers the dynamic code wherever an
-/// out-channel exists.
+/// Needs a configured code (start() refuses a malformed one). A client that offers the dynamic
+/// pairing code offers that one instead: messaging.md "client/hello" permits at most one
+/// pairing-code method in `supported_pair_methods`, and pairing.md "Methods" prefers the dynamic
+/// code wherever an out-channel exists.
 inline bool offers_static_pairing_code(const SendspinClientConfig& config) {
-    return config.pairing_window_supported && config.static_pairing_code.has_value() &&
-           !offers_dynamic_pairing_code(config);
+    return config.static_pairing_code.has_value() && !offers_dynamic_pairing_code(config);
 }
 
 /// @brief Whether `format` is one the client advertises in its `formats` list.
