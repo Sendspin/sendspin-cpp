@@ -402,7 +402,7 @@ public:
     /// @brief Delivers what the library's threads produced since the last call: the listener and
     /// role callbacks, the persistence provider's writes, and the high-performance requests. Call
     /// from the main loop. While the client is stopped it only frees an outbound attempt stop()
-    /// left connecting, once its transport has closed.
+    /// left connecting, once its transport has closed or opened.
     ///
     /// Connection work (handshakes, time sync, sends, watchdogs) runs on the library's protocol
     /// task and does not wait for this call.

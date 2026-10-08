@@ -307,7 +307,9 @@ public:
     /// pass can reach. A release that finds it full logs a warning and drops the entry parked
     /// longest, whose destructor's join is then paid on the protocol task: the shortest of the
     /// parked ones, since its attempt is the furthest along, and at most what remains of its
-    /// connect timeout.
+    /// connect timeout. The shutdown pass does not evict: the list has one spare entry beyond the
+    /// capacity for the one outbound attempt it can park, so stop() does not pay that join
+    /// (unless the spare is still held by an attempt left over from the previous run).
     static constexpr size_t REAPING_CAPACITY = MAX_NURSERY_ENTRIES + MAX_ADMITTED;
 
     /// @brief Every managed connection at one moment: the admitted ones and the nursery.
@@ -342,8 +344,8 @@ public:
     /// transport of every connection still parked for reaping (the shutdown pass's disconnect()
     /// closed the ones it took out of the slots), stops the WebSocket server (joining its
     /// transport threads), then releases those connections, whose destructors may join an outbound
-    /// transport thread, and the parked ones whose transport has closed (reap_closed()). Main loop
-    /// only.
+    /// transport thread, and the parked ones whose transport has closed (reap_finished()). Main
+    /// loop only.
     ///
     /// Blocks on the transports' own teardown: the host server joins every accepted connection
     /// thread, including a raw socket that never completed its WebSocket upgrade, which can hold
@@ -357,9 +359,11 @@ public:
     PairingUiSnapshot finish_stop();
 
     /// @brief Drops the connections parked for reaping whose transport has closed, so their
-    /// destructors' joins are short. Main loop, while the client is stopped (finish_stop() and
-    /// SendspinClient::loop()).
-    void reap_closed();
+    /// destructors' joins are short, and with `drop_one_opened` also the first one whose upgrade
+    /// completed after its release, whose destructor stops an open transport (on ESP up to the
+    /// websocket task's one-second read poll). Main loop, while the client is stopped:
+    /// finish_stop() drops only the closed ones, SendspinClient::loop() one opened one per call.
+    void reap_finished(bool drop_one_opened);
 
     // ========================================
     // Any thread
@@ -928,7 +932,7 @@ private:
     InlineVector<NurseryEntry, MAX_NURSERY_ENTRIES> nursery_;
     // Released outbound connections waiting for their transports to finish (see ReapEntry).
     // Protocol task, then the main loop while the client is stopped.
-    InlineVector<ReapEntry, REAPING_CAPACITY> reaping_;
+    InlineVector<ReapEntry, REAPING_CAPACITY + 1> reaping_;
     // Connections the shutdown pass took out of the slots, and accepts it refused, closed by
     // their disconnect() and kept for finish_stop() to release. Written by the protocol task's
     // shutdown pass, read on the main loop once the task is joined.

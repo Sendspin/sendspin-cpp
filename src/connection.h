@@ -1055,7 +1055,8 @@ protected:
     /// The shared inbound ring and the protocol task, from attach_inbound(). Written once before
     /// the transport can deliver; read by the transport thread. Owned by SendspinClient: the
     /// task for the client's life, the ring for one start()/stop() run, and every transport that
-    /// could write into it is joined before stop() releases it.
+    /// could write into it is joined, or detached so it never touches it, before stop() releases
+    /// it.
     InboundRing* inbound_ring_{nullptr};
     ProtocolTask* inbound_task_{nullptr};
 

@@ -280,7 +280,7 @@ PairingUiSnapshot ConnectionManager::finish_stop() {
     // is detached, so no transport thread the stop joins is parked on one, and one in a ring
     // acquire gives up within INBOUND_ACQUIRE_TIMEOUT_MS. The connections still parked for reaping
     // are closed here too, so one that opened after its release closes now (host); one still
-    // connecting stays parked (see reap_closed()).
+    // connecting stays parked (see reap_finished()).
     for (auto& entry : this->reaping_) {
         entry.conn->close_transport_now();
     }
@@ -288,23 +288,25 @@ PairingUiSnapshot ConnectionManager::finish_stop() {
         this->ws_server_->stop();
     }
     // Released here, after the server stop: an outbound connection's destructor stops its
-    // transport synchronously, and every one of these had opened.
+    // transport synchronously, and every outbound one of these had opened.
     std::vector<std::shared_ptr<SendspinConnection>> releasing;
     releasing.swap(this->closing_);
     releasing.clear();
-    this->reap_closed();
+    this->reap_finished(false);
 
     const PairingUiSnapshot ui = this->shutdown_ui_;
     this->shutdown_ui_ = {false, false};
     return ui;
 }
 
-void ConnectionManager::reap_closed() {
-    // Only a closed transport: its destructor's join is short. An attempt still connecting, or
-    // one that opened after its release (on ESP still open, its stop up to the websocket task's
-    // read poll), stays parked for the next run's reap pass or the client's destruction.
+void ConnectionManager::reap_finished(bool drop_one_opened) {
+    // An attempt still connecting stays parked for the next run's reap pass or the client's
+    // destruction. One that opened after its release is still open on ESP, which never closes it
+    // from the websocket task, so it is dropped here, one per call to bound the main loop's wait.
     for (auto it = this->reaping_.begin(); it != this->reaping_.end();) {
-        if (it->conn->inbound_gate().is_transport_closed()) {
+        const bool closed = it->conn->inbound_gate().is_transport_closed();
+        if (closed || (drop_one_opened && it->conn->is_ws_upgraded())) {
+            drop_one_opened = drop_one_opened && closed;
             it = this->reaping_.erase(it);
         } else {
             ++it;
@@ -1508,7 +1510,10 @@ void ConnectionManager::park_for_reaping(std::shared_ptr<SendspinConnection> con
     // reports its close once its connect fails or its peer closes, and the destructor stops what
     // is left at the deadline.
     conn->close_transport_now();
-    if (this->reaping_.size() == REAPING_CAPACITY) {
+    // The shutdown pass parks into the spare entry (REAPING_CAPACITY), unless one left over from
+    // the previous run still holds it.
+    const size_t limit = REAPING_CAPACITY + (this->shutdown_done_ ? 1U : 0U);
+    while (this->reaping_.size() >= limit) {
         // The entry parked longest makes room: its attempt is the furthest along, so the stop in
         // its destructor cancels an upgrade long under way (host) or finds a connect that has
         // nearly timed out (ESP), and its join is the shortest this release could pay: at most
