@@ -166,9 +166,9 @@ public:
 
     /// @brief Returns true if the network (WiFi/Ethernet) is ready for connections
     ///
-    /// Called from any thread: from start() on the main loop, then from the library's protocol
-    /// task, which polls it while the WebSocket server is down. Must be cheap and non-blocking, a
-    /// read of state the platform keeps current, and must not call back into the library.
+    /// Called from the main loop only: by start() and by every loop() while the client runs. Must
+    /// be cheap and non-blocking, a read of state the platform keeps current, and must not call
+    /// back into the library.
     virtual bool is_network_ready() = 0;
 };
 
@@ -325,9 +325,9 @@ public:
     /// @brief Starts the role threads and the protocol task, and arms the WebSocket server
     ///
     /// The server starts listening before this returns when the network provider already reports
-    /// ready, and otherwise as soon as it does, on the protocol task. If a role fails to start,
-    /// the roles that did start are stopped again so a corrected retry begins from the stopped
-    /// state. A rejected configured pairing secret (SendspinClientConfig::pairing_psk or
+    /// ready, and otherwise on the protocol task once a loop() finds it ready. If a role fails to
+    /// start, the roles that did start are stopped again so a corrected retry begins from the
+    /// stopped state. A rejected configured pairing secret (SendspinClientConfig::pairing_psk or
     /// static_pairing_code) fails every start() of this instance, since the config is fixed at
     /// construction. Main-loop thread only.
     /// @return true if the client is running (including when it already was), false on failure
@@ -405,7 +405,8 @@ public:
     /// left connecting, once its transport has closed or opened.
     ///
     /// Connection work (handshakes, time sync, sends, watchdogs) runs on the library's protocol
-    /// task and does not wait for this call.
+    /// task and does not wait for this call. Each call while running also polls the network
+    /// provider, which is what starts a WebSocket server the network kept down at start().
     void loop();
 
     // ========================================
@@ -756,6 +757,10 @@ private:
     /// and under any library lock: it takes only the Inbox mutex.
     void request_persist();
 
+    /// @brief Polls the network provider and publishes the result to the protocol task
+    /// (network_ready_), waking it when the network comes up. Main loop only.
+    void poll_network_provider();
+
     /// @brief Performs the provider writes owed since the last call: the record store's dirty
     /// keys and a changed last-played server. Main loop only, with no library lock held: on ESP
     /// each write is a flash write.
@@ -1068,6 +1073,9 @@ private:
     std::atomic<bool> unpaired_access_enabled_{false};
     /// High-performance requests applied and not yet released. Main loop only.
     uint8_t high_performance_ref_count_{0};
+    /// The network provider's last answer (poll_network_provider()). Written on the main loop by
+    /// start() and loop(), read by the protocol task before it starts the WebSocket server.
+    std::atomic<bool> network_ready_{false};
     /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;
     /// atomic so is_started() can be read from any thread. STOPPING covers the whole of stop():
     /// start() is refused and stop()/connect_to()/disconnect() are ignored while it is set, so a

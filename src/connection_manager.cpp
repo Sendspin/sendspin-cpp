@@ -261,7 +261,7 @@ void ConnectionManager::start() {
 
     this->client_->protocol_task_->open_accepts();
     // Started here when the network is already up, so the server is listening once start()
-    // returns; otherwise the protocol task starts it once the provider reports ready.
+    // returns; otherwise the protocol task starts it once a loop() finds the network ready.
     (void)this->maybe_start_ws_server(platform_time_us());
 }
 
@@ -1204,13 +1204,10 @@ uint32_t ConnectionManager::maybe_start_ws_server(int64_t now_us) {
     if (now_us < this->ws_server_start_retry_time_us_) {
         return ms_until(this->ws_server_start_retry_time_us_, now_us);
     }
-    // is_network_ready() is called here, on the protocol task, and from start() on the main loop
-    // (see SendspinNetworkProvider).
-    if (this->client_->network_provider_ == nullptr) {
+    // The main loop polls the provider (SendspinClient::poll_network_provider()) and wakes the
+    // task once the network is up.
+    if (!this->client_->network_ready_.load(std::memory_order_acquire)) {
         return ProtocolTask::NO_DEADLINE;
-    }
-    if (!this->client_->network_provider_->is_network_ready()) {
-        return NETWORK_POLL_INTERVAL_MS;
     }
     // A dropped frame is drained into a buffer of the longest message a conforming server sends
     // a live connection (see SendspinWsServer::set_discard_capacity()).

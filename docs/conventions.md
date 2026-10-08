@@ -32,16 +32,16 @@ checklists in `.claude/skills/` apply these standards to a diff.
   roles establish; the protocol task hands audio, visualizer frames and artwork
   image parts over in the ring item they arrived in rather than copying them.
 - All main-loop-bound cross-thread state goes through the `Inbox`
-  (`src/inbox.h`). `loop()` runs the Inbox drain and nothing else (while the
-  client is stopped it only frees the outbound attempts `stop()` left parked):
-  do not add mutex-protected endpoints or atomics that `loop()` polls for
-  work. The
-  protocol task calls no listener, a role thread calls only the data-path
-  callbacks `docs/integration-guide.md` names for it (`on_audio_write()` on
-  the sync task, `on_image_decode()` on the artwork decode thread, the
-  visualizer data callbacks on its drain thread), and only the main loop
-  calls the persistence provider: everything else a consumer hears it hears
-  from the main loop's drain. A thread that must wait for the main loop to
+  (`src/inbox.h`). `loop()` runs the Inbox drain and, ahead of it, the network
+  provider poll, nothing else (while the client is stopped it only frees the
+  outbound attempts `stop()` left parked): do not add mutex-protected endpoints
+  or atomics that `loop()` polls for work. The protocol task calls no
+  listener, a role thread calls only the data-path callbacks
+  `docs/integration-guide.md` names for it (`on_audio_write()` on the sync
+  task, `on_image_decode()` on the artwork decode thread, the visualizer data
+  callbacks on its drain thread), and only the main loop calls the persistence
+  and network providers: everything else a consumer hears it hears from the
+  main loop's drain. A thread that must wait for the main loop to
   have called a listener waits for a grant the drain publishes (the
   high-performance grant), never for the main loop itself.
 - The Inbox event ring is for ordered lifecycle events only (stream start and
@@ -82,8 +82,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
   calls for in place (an activation's trust check, admission and role
   ownership, a pairing step, a `noise/handshake` re-handshake, the RAM commit
   of a pairing record), and hands role and consumer work on through Inbox
-  slots, role item lists and buffers. It never calls a listener or the
-  persistence provider, and it does not wait on the main loop: those belong on
+  slots, role item lists and buffers. It never calls a listener or a
+  provider, and it does not wait on the main loop: those belong on
   the main-loop drain, and one connection's message must not delay every other
   connection's. The roles a teardown takes away are torn down in two halves:
   the protocol task resets what its handlers and the role threads reach and

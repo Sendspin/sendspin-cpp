@@ -100,14 +100,6 @@ bool liveness_expired(int64_t now_us, uint32_t last_receive_us, int64_t timeout_
 /// @param timeout_us Liveness timeout in microseconds, positive.
 int64_t liveness_remaining_us(int64_t now_us, uint32_t last_receive_us, int64_t timeout_us);
 
-/// @brief Interval (milliseconds) at which the protocol task re-checks a network that is not ready
-/// before starting the WebSocket server
-///
-/// The network provider has no readiness event, so the task polls it while the server is down.
-/// The interval bounds the delay between the network coming up and the server listening; a
-/// second is short beside the reconnect backoff of a server that found no listener.
-static constexpr uint32_t NETWORK_POLL_INTERVAL_MS = 1000;
-
 /// @brief A connection that has not completed the hello handshake
 ///
 /// The hello is sent once, by the hello scan in ConnectionManager::scan_nursery() that first sees
@@ -329,8 +321,8 @@ public:
     ///
     /// Server configuration is read from the client's config when the server object is created;
     /// a restart reuses the object. A server that did not start here is started by the protocol
-    /// task once the network is ready (maybe_start_ws_server()). Main loop only, before the
-    /// protocol task starts: everything it writes is the task's from then on.
+    /// task once the main loop finds the network ready (maybe_start_ws_server()). Main loop only,
+    /// before the protocol task starts: everything it writes is the task's from then on.
     void start();
 
     /// @brief Closes admission (ProtocolTask::close_accepts()) and wakes the protocol task.
@@ -611,10 +603,11 @@ private:
     // Tick steps
     // ========================================
 
-    /// @brief Starts the WS server once the network becomes ready. A persistent failure (e.g. the
-    /// server port is already in use) is retried with backoff instead of on every tick, which
-    /// would spam the log. Nothing while admission is closed.
-    /// @return Milliseconds until the next attempt or readiness poll, or NO_DEADLINE once started.
+    /// @brief Starts the WS server once the main loop has found the network ready. A persistent
+    /// failure (e.g. the server port is already in use) is retried with backoff instead of on
+    /// every tick, which would spam the log. Nothing while admission is closed.
+    /// @return Milliseconds until an armed retry is due; otherwise NO_DEADLINE once started or
+    ///         while the network is down (the main loop wakes the task when it comes up).
     uint32_t maybe_start_ws_server(int64_t now_us);
 
     /// @brief Arms hellos for nursery connections whose Noise handshake just completed and sends
