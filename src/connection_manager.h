@@ -606,8 +606,8 @@ private:
     /// @brief Starts the WS server once the main loop has found the network ready. A persistent
     /// failure (e.g. the server port is already in use) is retried with backoff instead of on
     /// every tick, which would spam the log. Nothing while admission is closed.
-    /// @return Milliseconds until the next attempt, or NO_DEADLINE once started or while the
-    ///         network is down (the main loop wakes the task when it comes up).
+    /// @return Milliseconds until an armed retry is due; otherwise NO_DEADLINE once started or
+    ///         while the network is down (the main loop wakes the task when it comes up).
     uint32_t maybe_start_ws_server(int64_t now_us);
 
     /// @brief Arms hellos for nursery connections whose Noise handshake just completed and sends

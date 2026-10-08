@@ -140,9 +140,9 @@ struct LifecycleRequests {
 class ProtocolTask {
 public:
     /// What a tick returns when none of its timers is pending: the task then waits for a wake
-    /// alone. Every source of work wakes the task (wake(), push_command(), publish_state(),
-    /// post_requests()), and every timer-driven step reports its own deadline, the
-    /// network-readiness poll included, so no periodic re-evaluation is needed.
+    /// alone. Every source of work wakes the task (wake(), including the main loop's wake when the
+    /// network comes up, push_command(), publish_state(), post_requests()), and every timer-driven
+    /// step reports its own deadline, so no periodic re-evaluation is needed.
     static constexpr uint32_t NO_DEADLINE = UINT32_MAX;
 
     /// Queue slots for consumer sends, each a SEND_CONTROLLER_COMMAND
