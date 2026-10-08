@@ -283,22 +283,8 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
         conn->send_app_json(
             format_client_pair_pending_message(ps.pairing_index, this->json_arena()));
 
-        // Surface the pairing-window prompt to the operator, but only when the platform
-        // implements the gesture UI (on_open_pairing_window's contract is that it fires only
-        // when pairing_window_supported is true). A static_pairing_code attempt never gets here
-        // without that flag (see offers_static_pairing_code()); a dynamic attempt held back by
-        // the round limit does, and then has no way to proceed and waits for the server's own
-        // timeout to cancel it.
-        if (this->client_->config_.pairing_window_supported) {
-            this->client_->note_open_pairing_window();
-            ps.window_shown = true;
-        } else {
-            SS_LOGW(TAG,
-                    "Gesture-gated %s attempt for server_id=%s but "
-                    "pairing_window_supported=false: no operator prompt can be shown; "
-                    "waiting for the server to cancel the attempt",
-                    to_cstr(ps.method), server_id.c_str());
-        }
+        this->client_->note_open_pairing_window();
+        ps.window_shown = true;
         return;
     }
 

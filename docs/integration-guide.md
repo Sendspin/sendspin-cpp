@@ -914,7 +914,7 @@ provisioning is needed.
 
 The library also supports the two pairing-code methods, gated by
 `SendspinClientConfig::pairing_code_out_channels` / `pairing_code_formats` /
-`pairing_window_supported` and the `SendspinClientListener::on_display_pairing_code` /
+`static_pairing_code`, and driven by the `SendspinClientListener::on_display_pairing_code` /
 `on_clear_pairing_code` / `on_open_pairing_window` / `on_close_pairing_window` callbacks
 documented in Step 3 above. A method is advertised only when the platform can carry it: a client
 that names no out-channel and no format never offers `dynamic_pairing_code`, and the server is
@@ -943,13 +943,11 @@ whose verification failed, when that connection drops, on `cancel_pairing_window
 gesture performed before the activation arrives leaves the window standing open, so the next attempt
 within its lifetime proceeds without a prompt.
 
-A device that leaves `pairing_window_supported` false cannot show the `on_open_pairing_window`
-prompt, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for the
-server's own timeout to cancel it. For a `dynamic_pairing_code` device that also means a standing
-round limit can never be cleared: `pairing.md` "Rounds" has only a deliberate operator action
-clear it, and the gesture is that action, so every later attempt sits at `client/pair-pending`
-until the server gives up. A device that offers either pairing-code method should therefore set
-`pairing_window_supported` and implement the gesture callbacks.
+The gesture is also the deliberate operator action `pairing.md` "Rounds" requires to clear a
+standing dynamic round limit. A device that offers either pairing-code method should therefore
+implement the gesture: prompt on `on_open_pairing_window` and call `confirm_pairing_window()` once
+the operator performs it. Without that a gated attempt waits at `client/pair-pending` until the
+server's own timeout cancels it.
 
 #### The locations hint
 
@@ -1341,7 +1339,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
 | `pairing_code_out_channels` | `std::vector<SendspinPairingCodeChannel>` | `{}` | Where the device can emit a dynamic pairing code: `DISPLAY`, `SPEAKER`. Advertised as the descriptor's `out_channels`. Empty (or an empty `pairing_code_formats`) means the device cannot emit one, so `dynamic_pairing_code` is not advertised. |
 | `pairing_code_formats` | `std::vector<SendspinPairingCodeFormat>` | `{}` | How the device can render a dynamic pairing code: `DIGITS` (six decimal digits), `QR_CODE` (a pairing token to render). Advertised as the descriptor's `formats`; the server picks one from this list. |
-| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, the `static_pairing_code` method is not advertised even if `static_pairing_code` is set. Dynamic-pairing-code devices should also set it: an attempt held back by the round limit is gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
+| `pairing_window_supported` | `bool` | `false` | Deprecated and ignored; removal is planned for v0.10.0. The pairing-window callbacks always fire for a gesture-gated attempt. |
 | `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains. See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
@@ -1361,7 +1359,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `inbound_ring_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the shared inbound ring every admitted connection receives into (sized from the player's `audio_buffer_capacity`, the visualizer's `buffer_capacity`, one image per artwork channel in flight plus the artwork images that arrive behind a held audio chunk, and a baseline every configuration pays, which is also its floor, of two of the longest messages the enabled roles need in one piece: 131,152 bytes with the artwork role or a player whose advertised buffer reaches a Noise frame, 32,880 with neither and no larger visualizer message, two of the player's longest chunks in between; audio is decoded straight out of it) and each connection's fallback buffer, which holds a pre-admission message or a message longer than the ring takes. The sizing budgets the control messages and time replies that arrive while the oldest held audio chunk or visualizer frame, or an artwork part waiting for the decode thread to copy it, is out; an exhausted ring closes the connection ([The Inbound Ring](internals.md#the-inbound-ring)). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
 | `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `inbound_ring_location` (which covers the inbound ring). ESP-IDF only; ignored on host. |
 | `pairing_psk` | `std::optional<SendspinPsk>` | unset | A factory-provisioned Pairing PSK (32 bytes). Outranks a stored one and is never persisted; an all-zero key or the Sentinel PSK makes `start()` fail. Unset loads the stored one or generates and persists one on first boot. See [Pairing PSK](#pairing-psk). |
-| `static_pairing_code` | `std::optional<std::string>` | unset | The device's static pairing code, exactly 8 decimal digits. The `static_pairing_code` method is advertised only when this is set, `pairing_window_supported` is true, and `dynamic_pairing_code` is not advertised. An invalid value makes `start()` fail. |
+| `static_pairing_code` | `std::optional<std::string>` | unset | The device's static pairing code, exactly 8 decimal digits. The `static_pairing_code` method is advertised only when this is set and `dynamic_pairing_code` is not advertised. An invalid value makes `start()` fail. |
 | `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
 | `static_pairing_code_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static pairing code the device shipped with, same values as above. Advertised on the `static_pairing_code` descriptor in `client/hello`; empty omits the hint. |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer that backs every JSON document the protocol task works with: the parse of each incoming protocol message and every message it builds, instead of PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the protocol task on every message. The arena holds one document at a time: a parsed message is released before the reply it triggers (the `client/state` after a `server/activate`, a pairing reply, a re-handshake's second message) is built. The default covers one steady-state protocol message, including the FLAC stream-start header; a document larger than the budget on its own, such as a large track-metadata message, falls back to PSRAM (those arrive only once per song). That holds on a 32-bit target, where ArduinoJson allocates each variant pool as one 1,024-byte block. Every freed block is wiped, so a document that held key material leaves none behind. Set to `0` to send every document to PSRAM. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer, and since a variant pool alone is 4 KB there, the default fits no document's pool on host. |

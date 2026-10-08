@@ -33,32 +33,27 @@ using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local c
 
 // The pairing-code offers are a function of SendspinClientConfig alone. The dynamic code needs an
 // out-channel and a format, which its descriptor cannot be built without (pairing.md "client/hello
-// pair-method descriptor"). The static code needs a configured code and the pairing-window gesture
-// its flow is gated on (pairing.md "Pairing Window"), and yields to the dynamic code: messaging.md
-// "client/hello" permits at most one pairing-code method, and pairing.md "Methods" prefers the
-// dynamic one wherever an out-channel exists.
+// pair-method descriptor"). The static code needs a configured code and yields to the dynamic code:
+// messaging.md "client/hello" permits at most one pairing-code method, and pairing.md "Methods"
+// prefers the dynamic one wherever an out-channel exists.
 TEST(PairingOffers, PairingCodeOffersFollowTheConfig) {
     struct Row {
         const char* name;
         bool out_channel;
         bool format;
-        bool window;
         std::optional<std::string> static_code;
         bool expect_dynamic;
         bool expect_static;
     };
     const Row rows[] = {
-        {"Control: an out-channel and a format offer the dynamic code", true, true, false,
-         std::nullopt, true, false},
-        {"no out-channel", false, true, false, std::nullopt, false, false},
-        {"no format", true, false, false, std::nullopt, false, false},
-        {"Control: a valid static code with the pairing window", false, false, true, "13572468",
-         false, true},
-        {"static code without the pairing window", false, false, false, "13572468", false,
-         false},
-        {"pairing window without a static code", false, false, true, std::nullopt, false, false},
-        {"static and dynamic both configured offer only the dynamic code", true, true, true,
-         "13572468", true, false},
+        {"Control: an out-channel and a format offer the dynamic code", true, true, std::nullopt,
+         true, false},
+        {"no out-channel", false, true, std::nullopt, false, false},
+        {"no format", true, false, std::nullopt, false, false},
+        {"Control: a valid static code", false, false, "13572468", false, true},
+        {"no static code", false, false, std::nullopt, false, false},
+        {"static and dynamic both configured offer only the dynamic code", true, true, "13572468",
+         true, false},
     };
 
     for (const Row& row : rows) {
@@ -70,7 +65,6 @@ TEST(PairingOffers, PairingCodeOffersFollowTheConfig) {
         if (row.format) {
             config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
         }
-        config.pairing_window_supported = row.window;
         config.static_pairing_code = row.static_code;
 
         EXPECT_EQ(offers_dynamic_pairing_code(config), row.expect_dynamic);

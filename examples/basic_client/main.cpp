@@ -279,7 +279,6 @@ int main(int argc, char* argv[]) {
         // with an out-channel offers the dynamic code, so offering the static one means leaving
         // the out-channel unset. Every static_pairing_code attempt is gesture-gated
         // (pairing.md "Pairing Window"), which SIGUSR1 stands in for here.
-        config.pairing_window_supported = true;
         config.static_pairing_code = static_pairing_code;
         config.static_pairing_code_locations = {"device"};
     }
