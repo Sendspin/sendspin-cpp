@@ -102,8 +102,12 @@ set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-acc
 # restarts the protocol task (protocol_task_->start()) for the request it takes from another
 # thread; its sibling for an opened connection reads the same two members around a release. The
 # reaping-capacity test parks stand-ins directly (park_for_reaping(), REAPING_CAPACITY) and reads
-# reaping_, since no public call fills the list faster than a reap pass empties it. The
-# nursery-capacity table fills nursery_ with stand-ins directly and hands its newcomer the arena
+# reaping_, since no public call fills the list faster than a reap pass empties it; it also
+# pushes a pending outbound stand-in onto nursery_ to see where the shutdown pass parks it. The
+# stop() reap test stages its attempt the same way and reads reaping_ once stop() has joined the
+# task, since only the parked entry shows that stop() left the attempt unjoined; the deadline test
+# calls reap_released() at a staged clock, since no public call reaches a deadline without
+# waiting it out. The nursery-capacity table fills nursery_ with stand-ins directly and hands its newcomer the arena
 # ConnectionManager::json_arena() returns, the one a delivery sets for the client/init accept()
 # sends. The full queue table seeds the controller's
 # supported_commands word (stamped with its cleanup_generation) so a send_command() reaches the

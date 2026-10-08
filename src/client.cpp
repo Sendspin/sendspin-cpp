@@ -664,8 +664,12 @@ void SendspinClient::disconnect(SendspinGoodbyeReason reason) {
 }
 
 void SendspinClient::loop() {
-    // A stopped client is quiescent: no connections, no threads, nothing to deliver.
+    // A stopped client has no connections and nothing to deliver. It only frees the outbound
+    // attempts stop() left connecting, once their transports have closed or opened.
     if (!this->is_started()) {
+        if (this->lifecycle_.load(std::memory_order_relaxed) == LifecycleState::STOPPED) {
+            this->connection_manager_->reap_finished(true);
+        }
         return;
     }
     this->drain_inbox();

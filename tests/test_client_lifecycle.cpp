@@ -100,6 +100,7 @@ constexpr uint16_t VISUALIZER_HELD_END_TEST_PORT = 19099;
 constexpr uint16_t VISUALIZER_HELD_CLEAR_TEST_PORT = 19100;
 constexpr uint16_t VISUALIZER_HELD_TEARDOWN_TEST_PORT = 19104;
 constexpr uint16_t HELLO_TEST_PORT = 19090;
+constexpr uint16_t OUTBOUND_GOODBYE_TEST_PORT = 19069;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -1334,8 +1335,167 @@ TEST(ClientLifecycle, AnOpenedOutboundConnectionIsNotHeldForReaping) {
     }
 }
 
+// stop() never joins an outbound attempt still connecting, whether it is pending in the nursery
+// or was released before the stop: the shutdown pass parks it, and finish_stop() leaves it parked
+// rather than destroying it, which on host waits out the handshake timeout (IXWebSocket's close
+// takes the mutex the handshake holds). Each row dials a listener that takes the TCP connection
+// and never answers, so the attempt is inside its handshake when stop() runs on the real protocol
+// task. Right after stop() the attempt is alive, parked and its transport still connecting, which
+// a stop() that joined it cannot produce. The attempt is then freed once it finishes: by loop()
+// while the client stays stopped (not before), once its listener closes or once it opens (staged
+// by marking the upgrade, what the transport's Open does; ESP never closes one that opens after
+// its release), or by the protocol task of a restarted client. Control: an attempt whose
+// transport closed before the stop is freed by finish_stop() itself (the protocol task is left
+// stopped for that row, so no tick reaps it first and no shutdown pass runs).
+TEST(ClientLifecycle, StopDoesNotWaitForAnOutboundAttemptStillConnecting) {
+    enum class Then : uint8_t { LOOP, OPENS, RESTART };
+    struct Row {
+        const char* name;
+        bool released_before_stop;
+        bool closed_before_stop;
+        Then then;
+    };
+    const Row rows[] = {
+        {"a pending attempt, freed by loop()", false, false, Then::LOOP},
+        {"an attempt released before the stop, freed by loop()", true, false, Then::LOOP},
+        {"a pending attempt that opens after the stop, freed by loop()", false, false, Then::OPENS},
+        {"a pending attempt, freed by the restarted client", false, false, Then::RESTART},
+        {"Control: an attempt whose transport closed is freed by stop()", true, true, Then::LOOP},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SilentListener silent;
+        ASSERT_NE(silent.port(), 0);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        // The test thread plays the protocol task to stage the attempt, then the real task runs
+        // the stop.
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+        manager.connect_to(loopback_url(silent.port()));
+        ASSERT_EQ(manager.nursery_.size(), 1U);
+        const std::weak_ptr<SendspinConnection> attempt = manager.nursery_[0].conn;
+        int fd = silent.accept_connection();
+        ASSERT_GE(fd, 0);
+        if (row.released_before_stop) {
+            manager.disconnect(SendspinGoodbyeReason::USER_REQUEST);
+            ASSERT_EQ(manager.reaping_.size(), 1U);
+        }
+        if (row.closed_before_stop) {
+            ::close(fd);
+            fd = -1;
+            silent.close();
+            wait_until([&] { return attempt.lock()->inbound_gate().is_transport_closed(); });
+        } else {
+            ASSERT_TRUE(client.protocol_task_->start(
+                [&client] { return client.protocol_tick(); },
+                SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE, 1, false));
+        }
+
+        client.stop();
+
+        if (row.closed_before_stop) {
+            EXPECT_TRUE(attempt.expired()) << "stop() kept an attempt whose transport had closed";
+            EXPECT_TRUE(manager.reaping_.empty());
+            continue;
+        }
+        ASSERT_FALSE(attempt.expired()) << "stop() destroyed the attempt, joining its transport";
+        ASSERT_EQ(manager.reaping_.size(), 1U);
+        EXPECT_EQ(manager.reaping_[0].conn, attempt.lock());
+        EXPECT_FALSE(attempt.lock()->inbound_gate().is_transport_closed());
+        client.loop();
+        EXPECT_FALSE(attempt.expired()) << "loop() dropped an attempt still connecting";
+
+        if (row.then == Then::OPENS) {
+            attempt.lock()->mark_ws_upgraded();
+            client.loop();
+            EXPECT_TRUE(attempt.expired()) << "loop() kept an attempt that opened";
+            ::close(fd);
+            continue;
+        }
+        if (row.then == Then::RESTART) {
+            ASSERT_TRUE(client.start());
+        }
+        ::close(fd);
+        silent.close();
+        if (row.then == Then::RESTART) {
+            wait_until([&] { return attempt.expired(); });
+        } else {
+            wait_until([&] { return attempt.lock()->inbound_gate().is_transport_closed(); });
+            client.loop();
+            EXPECT_TRUE(attempt.expired()) << "loop() kept an attempt whose transport closed";
+        }
+        client.stop();
+    }
+}
+
+// Once the shutdown pass has run, the reap pass no longer drops a parked attempt at its deadline:
+// that drop joins the transport for what remains of its connect, which would hold up stop()'s
+// join of the protocol task. Stand-in connections, whose destructors join no transport, are parked
+// with the test thread playing the protocol task and the clock staged past the deadline. Control:
+// before the shutdown pass the deadline drops it.
+TEST(ClientLifecycle, TheReapDeadlineWaitsForTheNextRunOnceTheShutdownPassRan) {
+    for (const bool shutdown : {true, false}) {
+        SCOPED_TRACE(shutdown ? "after the shutdown pass" : "Control: before the shutdown pass");
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        ConnectionManager& manager = *client.connection_manager_;
+
+        auto conn = std::make_shared<StubConnection>();
+        const std::weak_ptr<SendspinConnection> parked = conn;
+        manager.park_for_reaping(std::move(conn));
+        if (shutdown) {
+            manager.shutdown();
+        }
+        // An hour on: past every platform's reaping deadline.
+        (void) manager.reap_released(platform_time_us() + 3600LL * 1000 * 1000);
+        EXPECT_EQ(parked.expired(), !shutdown);
+        client.stop();
+    }
+}
+
+// An outbound connection whose upgrade completed is still goodbyed by stop() (reason shutdown):
+// only an attempt still connecting is parked instead.
+TEST(ClientLifecycle, StopGoodbyesAnOpenOutboundConnection) {
+    TestNetworkProvider network;
+    InMemoryPersistenceProvider persistence;
+    SendspinClient client(make_config(0));
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    FakeOutboundEncryptedServer server(OUTBOUND_GOODBYE_TEST_PORT,
+                                       std::string(NOISE_SUITE_CHACHAPOLY),
+                                       Identity::generate().value(), std::string(SENTINEL_PSK_ID),
+                                       SENTINEL_PSK, R"({"activities":[],"active_roles":[]})");
+    ASSERT_TRUE(server.listen());
+    server.start();
+    client.connect_to(server_url(OUTBOUND_GOODBYE_TEST_PORT));
+    pump_until(client, [&] { return client.is_connected(); });
+
+    client.stop();
+
+    wait_until([&] { return server.goodbye_reason().has_value(); });
+    EXPECT_EQ(server.goodbye_reason().value_or(""), "shutdown");
+    EXPECT_TRUE(client.connection_manager_->reaping_.empty());
+}
+
+/// A stand-in outbound attempt whose upgrade never completes.
+class OutboundStubConnection : public StubConnection {
+public:
+    bool is_outbound() const override {
+        return true;
+    }
+};
+
 // A full reaping list makes room by dropping the entry parked longest, so the list stays bounded
-// (REAPING_CAPACITY) however fast connections are released. Stand-in connections, whose
+// (REAPING_CAPACITY) however fast connections are released, except by the one spare entry the
+// shutdown pass parks into. Stand-in connections, whose
 // destructors join no transport, are parked directly (park_for_reaping()) with the test thread
 // playing the protocol task, so no reap pass frees one first. Control: a list filled to capacity
 // drops nothing.
@@ -1367,6 +1527,21 @@ TEST(ClientLifecycle, AFullReapingListDropsTheConnectionParkedLongest) {
     }
     EXPECT_EQ(manager.reaping_[manager.reaping_.size() - 1].conn, newest);
     newest.reset();
+
+    // The shutdown pass parks the pending outbound attempt into the spare entry: it evicts
+    // nothing, since an eviction's join would hold up stop().
+    for (size_t i = 1; i < parked.size(); ++i) {
+        ASSERT_FALSE(parked[i].expired());
+    }
+    auto pending = std::make_shared<OutboundStubConnection>();
+    const std::weak_ptr<SendspinConnection> pending_ref = pending;
+    manager.nursery_.push_back(NurseryEntry{.conn = std::move(pending)});
+    manager.shutdown();
+    EXPECT_EQ(manager.reaping_.size(), ConnectionManager::REAPING_CAPACITY + 1);
+    for (size_t i = 1; i < parked.size(); ++i) {
+        EXPECT_FALSE(parked[i].expired()) << "the shutdown pass evicted entry " << i;
+    }
+    EXPECT_EQ(manager.reaping_[manager.reaping_.size() - 1].conn, pending_ref.lock());
     client.stop();
 }
 

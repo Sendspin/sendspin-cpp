@@ -32,8 +32,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
   roles establish; the protocol task hands audio, visualizer frames and artwork
   image parts over in the ring item they arrived in rather than copying them.
 - All main-loop-bound cross-thread state goes through the `Inbox`
-  (`src/inbox.h`). `loop()` runs the Inbox drain and nothing else: do not add
-  mutex-protected endpoints or atomics that `loop()` polls for work. The
+  (`src/inbox.h`). `loop()` runs the Inbox drain and nothing else (while the
+  client is stopped it only frees the outbound attempts `stop()` left parked):
+  do not add mutex-protected endpoints or atomics that `loop()` polls for
+  work. The
   protocol task calls no listener, a role thread calls only the data-path
   callbacks `docs/integration-guide.md` names for it (`on_audio_write()` on
   the sync task, `on_image_decode()` on the artwork decode thread, the

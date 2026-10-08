@@ -4,7 +4,7 @@ Standalone C++ library implementing the Sendspin synchronized audio streaming pr
 
 ## Architecture
 
-The library provides `SendspinClient` as the main public API. It handles the full protocol lifecycle: WebSocket connections, time synchronization, audio decoding/sync, and message routing. One library-owned protocol task owns every connection and does all protocol work; transports only receive (into the shared inbound ring or a connection's fallback buffer) and report closes; `loop()` only drains the inbox. `docs/internals.md` has the threads, the cross-thread channels, the tick order and the cross-file invariants.
+The library provides `SendspinClient` as the main public API. It handles the full protocol lifecycle: WebSocket connections, time synchronization, audio decoding/sync, and message routing. One library-owned protocol task owns every connection and does all protocol work; transports only receive (into the shared inbound ring or a connection's fallback buffer) and report closes; `loop()` only drains the inbox (and, while stopped, frees parked outbound attempts). `docs/internals.md` has the threads, the cross-thread channels, the tick order and the cross-file invariants.
 
 ### Key classes
 
