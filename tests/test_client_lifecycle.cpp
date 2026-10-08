@@ -101,6 +101,7 @@ constexpr uint16_t VISUALIZER_HELD_CLEAR_TEST_PORT = 19100;
 constexpr uint16_t VISUALIZER_HELD_TEARDOWN_TEST_PORT = 19104;
 constexpr uint16_t HELLO_TEST_PORT = 19090;
 constexpr uint16_t OUTBOUND_GOODBYE_TEST_PORT = 19069;
+constexpr uint16_t NETWORK_PROVIDER_TEST_PORT = 19086;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -1980,10 +1981,59 @@ public:
     }
 };
 
+/// Network provider that records the threads it is called on, reporting the network ready once
+/// the test sets `ready`.
+class ThreadRecordingNetworkProvider : public SendspinNetworkProvider {
+public:
+    bool is_network_ready() override {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        this->callers.push_back(std::this_thread::get_id());
+        return this->ready.load();
+    }
+
+    std::atomic<bool> ready{false};
+    std::mutex mutex;
+    std::vector<std::thread::id> callers;
+};
+
+// The network provider is called on the main loop only, by start() and loop(), never by the
+// protocol task while the server waits for the network. The provider reports the network down
+// through start() and a run of loop() calls, while the protocol task runs its first ticks, then
+// up: a later loop() finds it and wakes the task, which starts the server with no timer of its
+// own. Every call the provider saw is on the test thread: the calling thread is the contract under
+// test, since a call off the main loop races the platform state the provider reads and has no
+// other observable outcome. Control: the provider was called, by start() and by loop().
+TEST(ClientLifecycle, TheNetworkProviderIsCalledOnTheMainLoopOnly) {
+    ThreadRecordingNetworkProvider network;
+    SendspinClient client(make_config(NETWORK_PROVIDER_TEST_PORT));
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    const std::thread::id main_loop = std::this_thread::get_id();
+    size_t start_calls = 0;
+    {
+        std::lock_guard<std::mutex> lock(network.mutex);
+        start_calls = network.callers.size();
+    }
+    EXPECT_EQ(start_calls, 1U) << "Control: start() did not poll the provider";
+
+    pump_for(client, 100);
+    EXPECT_FALSE(port_accepts(NETWORK_PROVIDER_TEST_PORT));
+    network.ready = true;
+    pump_until(client, [&] { return port_accepts(NETWORK_PROVIDER_TEST_PORT); });
+    client.stop();
+
+    std::lock_guard<std::mutex> lock(network.mutex);
+    EXPECT_GT(network.callers.size(), start_calls) << "Control: loop() did not poll the provider";
+    for (const std::thread::id caller : network.callers) {
+        EXPECT_EQ(caller, main_loop) << "the provider was called off the main loop";
+    }
+}
+
 // ConnectionManager::tick() returns the milliseconds until the earliest of its timers, one row per
 // timer, so the protocol task sleeps exactly until the next one is due; with none armed it
 // returns NO_DEADLINE and the task waits for a wake alone. The Control rows hold a connection, or
-// a stopped server, whose timer is not armed; the running host server in the first has no
+// a server the network keeps down (the main loop wakes the task when the network comes up, so
+// there is nothing to poll), whose timer is not armed; the running host server in the first has no
 // upgrade reap to report (the ESP server's reap deadline, SendspinWsServer::tick(), only builds
 // for ESP). The test thread plays the protocol task and stages each timer directly against a
 // fixed clock.
@@ -1999,7 +2049,7 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         NURSERY,
         WINDOW,
         WINDOW_AND_LIVENESS,
-        NETWORK_POLL,
+        NETWORK_DOWN,
         SERVER_RETRY,
     };
     struct Row {
@@ -2019,8 +2069,8 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
          static_cast<uint32_t>(NURSERY_ESTABLISH_TIMEOUT_US / 1000)},
         {"the pairing window", Stage::WINDOW, 5000},
         {"the earliest of two", Stage::WINDOW_AND_LIVENESS, 5000},
-        {"the network poll while the server is down", Stage::NETWORK_POLL,
-         NETWORK_POLL_INTERVAL_MS},
+        {"Control: the server down for the network", Stage::NETWORK_DOWN,
+         ProtocolTask::NO_DEADLINE},
         {"the server start retry", Stage::SERVER_RETRY, 3000},
     };
     for (const Row& row : rows) {
@@ -2029,7 +2079,7 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         OfflineNetworkProvider offline;
         SendspinClient client(make_config(0));
         const bool server_down =
-            row.stage == Stage::NETWORK_POLL || row.stage == Stage::SERVER_RETRY;
+            row.stage == Stage::NETWORK_DOWN || row.stage == Stage::SERVER_RETRY;
         if (server_down) {
             client.set_network_provider(&offline);
         } else {
@@ -2044,7 +2094,7 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
         conn->last_receive_time_us_.store(static_cast<uint32_t>(NOW_US));
         switch (row.stage) {
             case Stage::NOTHING:
-            case Stage::NETWORK_POLL:
+            case Stage::NETWORK_DOWN:
                 break;
             case Stage::ADMITTED_UNARMED:
                 manager.install_admitted(conn, 0);

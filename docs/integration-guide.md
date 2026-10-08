@@ -512,10 +512,11 @@ struct HostNetworkProvider : SendspinNetworkProvider {
 };
 ```
 
-`is_network_ready()` is called from any thread: from `start()` on the main loop, then from the
-library's protocol task, which polls it about once a second while the WebSocket server is down.
-Keep it cheap and non-blocking (a read of a flag the platform keeps current), and do not call
-back into the client from it.
+`is_network_ready()` is called on the main loop only, like the persistence provider: once from
+`start()`, then from every `loop()` while the client runs. A server the network kept down at
+`start()` starts listening on the protocol task right after the `loop()` that finds the network
+ready. Keep it cheap and non-blocking (a read of a flag the platform keeps current), and do not
+call back into the client from it.
 
 ### SendspinPersistenceProvider (Optional)
 
@@ -769,7 +770,8 @@ client.set_persistence_provider(&persistence_provider); // Optional
 
 ```cpp
 // Start the role threads and the protocol task, and arm the WebSocket server (it listens before
-// start() returns when the network provider already reports ready, otherwise as soon as it does).
+// start() returns when the network provider already reports ready, otherwise once loop() finds it
+// ready).
 // Task priorities and PSRAM settings are taken from SendspinClientConfig.
 if (!client.start()) {
     // Handle failure
@@ -1188,7 +1190,8 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 
 `SendspinPersistenceProvider` calls are on the main loop thread for every key (see the
 `SendspinPersistenceProvider` section above). `SendspinNetworkProvider::is_network_ready()` is
-called from any thread and must be cheap and non-blocking.
+also called on the main loop only, from `start()` and `loop()`, and must be cheap and
+non-blocking.
 
 Callable from any thread: `connect_to()`, `disconnect()`, `leave()`,
 `confirm_pairing_window()`, `cancel_pairing_window()`, `set_unpaired_access_enabled()` and the

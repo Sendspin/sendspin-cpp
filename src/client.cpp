@@ -434,6 +434,9 @@ bool SendspinClient::start() {
     // connection's client/state is built from the newest snapshot the task holds.
     this->protocol_task_->publish_state(this->build_client_state());
 
+    // The network provider is polled on the main loop only, here and in loop().
+    this->poll_network_provider();
+
     // Open admission and create the WebSocket server, started here when the network is already
     // up. Before the protocol task starts: everything the manager writes here is the task's from
     // then on, and an accept the server delivers meanwhile waits in the command queue for the
@@ -672,11 +675,22 @@ void SendspinClient::loop() {
         }
         return;
     }
+    this->poll_network_provider();
     this->drain_inbox();
 }
 
 void SendspinClient::request_persist() {
     this->event_state_->persist_slot.merge(merge_persist_request, PersistRequest{});
+}
+
+void SendspinClient::poll_network_provider() {
+    const bool ready =
+        this->network_provider_ != nullptr && this->network_provider_->is_network_ready();
+    // The protocol task has no timer for the network, so the rising edge wakes it to start the
+    // server.
+    if (!this->network_ready_.exchange(ready, std::memory_order_release) && ready) {
+        this->protocol_task_->wake();
+    }
 }
 
 void SendspinClient::flush_pending_persistence() {
