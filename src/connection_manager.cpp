@@ -195,8 +195,10 @@ ConnectionManager::ConnectionManager(SendspinClient* client)
 
 ConnectionManager::~ConnectionManager() {
     // The protocol task is joined (or never ran) and finish_stop() released what the shutdown pass
-    // kept, so anything left here is released on the thread destroying the client. Detach first:
-    // a destructor below can join its transport thread, which must not be parked on its gate.
+    // kept, so anything left here is released on the thread destroying the client, including an
+    // outbound attempt still parked for reaping, whose destructor joins its transport for the
+    // rest of the connect. Detach first: a destructor below can join its transport thread, which
+    // must not be parked on its gate.
     for (auto& entry : this->admitted_) {
         if (entry.conn != nullptr) {
             entry.conn->detach_inbound();
@@ -277,8 +279,8 @@ PairingUiSnapshot ConnectionManager::finish_stop() {
     // connected, so the server stop's join does not wait out a peer that never closes. Every gate
     // is detached, so no transport thread the stop joins is parked on one, and one in a ring
     // acquire gives up within INBOUND_ACQUIRE_TIMEOUT_MS. The connections still parked for reaping
-    // are closed here, before the stop, so one that opened after its release does not hold its
-    // join; one still connecting is stopped by its destructor below.
+    // are closed here too, so one that opened after its release closes now (host); one still
+    // connecting stays parked (see reap_closed()).
     for (auto& entry : this->reaping_) {
         entry.conn->close_transport_now();
     }
@@ -286,15 +288,28 @@ PairingUiSnapshot ConnectionManager::finish_stop() {
         this->ws_server_->stop();
     }
     // Released here, after the server stop: an outbound connection's destructor stops its
-    // transport synchronously, up to its connect timeout for one still connecting.
+    // transport synchronously, and every one of these had opened.
     std::vector<std::shared_ptr<SendspinConnection>> releasing;
     releasing.swap(this->closing_);
     releasing.clear();
-    this->reaping_.clear();
+    this->reap_closed();
 
     const PairingUiSnapshot ui = this->shutdown_ui_;
     this->shutdown_ui_ = {false, false};
     return ui;
+}
+
+void ConnectionManager::reap_closed() {
+    // Only a closed transport: its destructor's join is short. An attempt still connecting, or
+    // one that opened after its release (on ESP still open, its stop up to the websocket task's
+    // read poll), stays parked for the next run's reap pass or the client's destruction.
+    for (auto it = this->reaping_.begin(); it != this->reaping_.end();) {
+        if (it->conn->inbound_gate().is_transport_closed()) {
+            it = this->reaping_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // ============================================================================
@@ -1093,9 +1108,14 @@ void ConnectionManager::shutdown() {
     this->shutdown_ui_.window_was_shown |= ui.window_was_shown;
 
     // Each disconnect() sends its goodbye and closes its transport; one already disconnected
-    // does neither.
+    // does neither. An outbound attempt still connecting has no peer to goodbye and is parked
+    // instead: finish_stop() would otherwise join its transport for the rest of the connect.
     for (auto& conn : to_goodbye) {
-        this->goodbye_for_shutdown(std::move(conn));
+        if (conn->is_outbound() && !conn->is_ws_upgraded()) {
+            this->park_for_reaping(std::move(conn));
+        } else {
+            this->goodbye_for_shutdown(std::move(conn));
+        }
     }
 }
 
@@ -1274,6 +1294,12 @@ uint32_t ConnectionManager::reap_released(int64_t now_us) {
         // release_connection()); the transport's upgrade report wakes the task for it.
         const bool closed = it->conn->inbound_gate().is_transport_closed();
         const bool opened = it->conn->is_ws_upgraded();
+        // Once the shutdown pass has run, the deadline drop waits for the next run: its join
+        // would hold up stop(), which joins this task.
+        if (!closed && !opened && this->shutdown_done_) {
+            ++it;
+            continue;
+        }
         if (!closed && !opened && now_us < it->deadline_us) {
             next = std::min(next, ms_until(it->deadline_us, now_us));
             ++it;

@@ -346,7 +346,9 @@ public:
     /// repeated indefinitely.
     ///
     /// Blocking is bounded by the transports' own send and close, and any listener callback
-    /// already running on a role thread, which the join cannot interrupt. The per-transport
+    /// already running on a role thread, which the join cannot interrupt. An outbound
+    /// connect_to() attempt still connecting is not waited for: it is closed without blocking and
+    /// freed once its transport has finished, by loop() or the next start(). The per-transport
     /// bounds are described in docs/integration-guide.md (Stopping and Restarting).
     ///
     /// Listener callbacks fire from inside this call, after every role has been reset, so the
@@ -399,7 +401,8 @@ public:
 
     /// @brief Delivers what the library's threads produced since the last call: the listener and
     /// role callbacks, the persistence provider's writes, and the high-performance requests. Call
-    /// from the main loop. A no-op while the client is stopped.
+    /// from the main loop. While the client is stopped it only frees an outbound attempt stop()
+    /// left connecting, once its transport has closed.
     ///
     /// Connection work (handshakes, time sync, sends, watchdogs) runs on the library's protocol
     /// task and does not wait for this call.
