@@ -909,22 +909,26 @@ private:
     SsErr result_;
 };
 
-// A nursery connection's client/hello is sent once, when its Noise handshake completes, and never
-// again. A send that fails on a connected transport is not retried, so the connection is closed
-// without a goodbye and dropped; one the transport refuses as no longer connected is left for its
-// close event or the establish deadline. The stand-in has no Noise session, so the drop is the
+// A nursery connection's client/hello is sent once, when its server/hello has arrived, and never
+// again; nothing is sent before then, even with the Noise handshake complete. A send that fails on
+// a connected transport is not retried, so the connection is closed without a goodbye and
+// dropped; one the transport refuses as no longer connected is left for its close event or the
+// establish deadline. The stand-in has no Noise session, so the drop is the
 // hello scan's own; the close after the encrypt is covered for other sends by
 // NoiseTransport.ASendFailureAfterTheEncryptDropsTheConnectionInItsTick.
 TEST(ClientLifecycle, NurseryHelloIsSentOnceAndAFailedSendDropsTheConnection) {
     struct Row {
         const char* name;
+        bool server_hello_received;
         SsErr send_result;
+        int hellos;
         bool dropped;
     };
     const Row rows[] = {
-        {"Control: sent", SsErr::OK, false},
-        {"refused by the transport", SsErr::INVALID_STATE, false},
-        {"the send fails", SsErr::FAIL, true},
+        {"Control: sent", true, SsErr::OK, 1, false},
+        {"no server/hello yet", false, SsErr::OK, 0, false},
+        {"refused by the transport", true, SsErr::INVALID_STATE, 1, false},
+        {"the send fails", true, SsErr::FAIL, 1, true},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -937,13 +941,14 @@ TEST(ClientLifecycle, NurseryHelloIsSentOnceAndAFailedSendDropsTheConnection) {
         client.protocol_task_->stop();
         auto conn = std::make_shared<HelloCountingConnection>(row.send_result);
         conn->noise_handshake_complete_ = true;
+        conn->set_server_hello_received(row.server_hello_received);
         conn->set_provisional_time_us(platform_time_us());
         manager.nursery_.push_back(NurseryEntry{.conn = conn, .client_init_sent = true});
 
         for (int tick = 0; tick < 3; ++tick) {
             (void) manager.scan_nursery(platform_time_us());
         }
-        EXPECT_EQ(conn->hellos, 1);
+        EXPECT_EQ(conn->hellos, row.hellos);
         const bool in_nursery =
             std::any_of(manager.nursery_.begin(), manager.nursery_.end(),
                         [&conn](const NurseryEntry& entry) { return entry.conn == conn; });

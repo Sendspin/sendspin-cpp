@@ -514,8 +514,8 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 info.name = hello_msg.name;
                 conn->set_server_information(std::move(info));
                 conn->set_server_source_codecs(hello_msg.source_codecs);
-                // The nursery scan on this task observes is_handshake_complete() and
-                // establishes the connection; nothing needs to be scheduled here.
+                // The nursery scan later in this tick sends client/hello in reply; nothing
+                // needs to be scheduled here.
                 conn->set_server_hello_received(true);
 
                 SS_LOGD(TAG, "Connected to server '%s' (server_id=%s)", hello_msg.name.c_str(),

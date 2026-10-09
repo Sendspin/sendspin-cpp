@@ -725,6 +725,11 @@ public:
         this->psk_id_ = psk_id;
     }
 
+    /// @brief Returns whether server/hello has arrived on this connection.
+    bool has_server_hello_received() const {
+        return this->server_hello_received_;
+    }
+
     /// @brief Sets the server hello received flag
     /// @param received True if server hello message has been received.
     /// @note Called by hub when SERVER_HELLO is processed.
@@ -1170,10 +1175,9 @@ protected:
     ///    re-handshaking admitted connection is admitted but not operational.
     ///
     /// Each flag's own comment below names its writers and threads. Do not fold them into one
-    /// phase enum: client_hello_sent_ and server_hello_received_ complete in either order, and
-    /// handle_noise_rehandshake() / note_pairing_finalize_ack() rewind first_activate_received_
-    /// from the protocol task. Derive a phase on demand instead, as SetupStage in
-    /// connection_manager.cpp does for reap diagnostics.
+    /// phase enum: handle_noise_rehandshake() / note_pairing_finalize_ack() rewind
+    /// first_activate_received_ from the protocol task. Derive a phase on demand instead, as
+    /// SetupStage in connection_manager.cpp does for reap diagnostics.
 
     /// PSK category resolved by the Noise handshake (set at COMPLETE, or re-handshake). Protocol
     /// task only.

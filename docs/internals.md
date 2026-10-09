@@ -387,8 +387,8 @@ Every role this client drives has at most one owner among the admitted connectio
 ### Handshake and Admission
 
 1. An inbound connection is delivered by the platform server once its WebSocket upgrade completes, as an accept in the command queue; the protocol task takes it into the nursery and sends `client/init`. An outbound connection enters the nursery from `connect_to()` and sends `client/init` once its upgrade completes. The rest of the Noise handshake runs on the protocol task as messages arrive.
-2. Once transport is active, the nursery scan sends `client/hello`.
-3. The connection is operational once both hellos are exchanged and its first `server/activate` arrives, in either order. That activate is checked against the connection's trust when it is processed, and a rejected one closes the connection.
+2. Once `server/hello` arrives, the nursery scan sends `client/hello` (messaging.md "Client -> Server: client/hello").
+3. The connection is operational once both hellos are exchanged and its first `server/activate` arrives, in either order relative to the hellos. That activate is checked against the connection's trust when it is processed, and a rejected one closes the connection.
 4. The activation handler admits a connection the activation makes operational before it returns (the nursery scan covers a hello that completes after the activation), arbitrating against the admitted connections it conflicts with, mainly by highest activity (playback over pairing over none); `should_admit_connection()` in `src/admission.h` has the full rules.
 5. A losing newcomer is released with a goodbye; a displaced incumbent is dropped, and the roles no remaining connection owns are torn down.
 

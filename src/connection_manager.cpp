@@ -1229,12 +1229,13 @@ uint32_t ConnectionManager::maybe_start_ws_server(int64_t now_us) {
 uint32_t ConnectionManager::scan_nursery(int64_t now_us) {
     uint32_t next = ProtocolTask::NO_DEADLINE;
 
-    // Hello scan: one send per entry, in the first scan that sees its Noise handshake complete
-    // (the receive pass earlier in the same tick sets that flag, with no event of its own). A
-    // failed send drops the connection, which erases its entry, so the index is not advanced.
+    // Hello scan: one send per entry, in the first scan that sees its server/hello arrived
+    // (messaging.md "Client -> Server: client/hello"; the receive pass earlier in the same tick
+    // sets that flag, with no event of its own). A failed send drops the connection, which
+    // erases its entry, so the index is not advanced.
     for (size_t i = 0; i < this->nursery_.size();) {
         NurseryEntry& entry = this->nursery_[i];
-        if (entry.hello_attempted || !entry.conn->is_noise_handshake_complete()) {
+        if (entry.hello_attempted || !entry.conn->has_server_hello_received()) {
             ++i;
             continue;
         }
@@ -1414,7 +1415,7 @@ SendspinArenaAllocator& ConnectionManager::json_arena() const {
 void ConnectionManager::start_noise_handshake(NurseryEntry& entry) {
     // client/init is sent proactively: the client is always the Noise responder regardless of
     // who opened the socket, but it still sends client/init first as the Sendspin protocol
-    // client. The hello is armed later, once the Noise handshake completes (the hello scan in
+    // client. The hello is sent later, once server/hello arrives (the hello scan in
     // scan_nursery()).
     entry.conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
                                      NOISE_SUITE_CHACHAPOLY);
@@ -1542,7 +1543,7 @@ bool ConnectionManager::send_hello_message(SendspinConnection* conn) {
     std::string hello_message = this->client_->build_hello_message();
 
     // send_app_json (not send_text_message): client/hello is encrypted like every other
-    // post-handshake message. The hello is only sent once the Noise handshake completes, so
+    // post-handshake message. The hello is only sent once server/hello arrives, so
     // send_app_json always routes to the active Noise transport here.
     const SsErr err = conn->send_app_json(hello_message);
     if (err == SsErr::OK) {
