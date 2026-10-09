@@ -256,7 +256,7 @@ protected:
     /// (InboundConsumer::take()). Sync thread.
     void* take_item(uint32_t timeout_ms);
 
-    /// @brief Removes last decoded frame, blending into the second-to-last to minimize glitches
+    /// @brief Removes the first decoded frame, blending it into the second to minimize glitches
     /// Returns -1 if a frame was removed, 0 if preconditions not met.
     int32_t soft_sync_drop_frame(SyncContext& sync_context);
 
