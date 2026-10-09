@@ -1288,6 +1288,7 @@ TEST(Protocol, ServerActivateParsesTheActivitiesList) {
          R"(["playback","pairing"])",
          {SendspinActivity::PLAYBACK, SendspinActivity::PAIRING}},
         {"none", "[]", {}},
+        {"an escaped NUL does not cut a value short", R"(["playback\u0000x"])", {}},
     };
 
     for (const Row& row : rows) {

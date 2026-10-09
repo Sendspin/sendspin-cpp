@@ -36,6 +36,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -57,7 +58,7 @@ enum class PskCategory : uint8_t {
 /// messaging.md "noise/handshake": 'lt' (long-term), 'pr' (pairing), 'sn' (Sentinel).
 /// @param code The wire code.
 /// @return The category, or nullopt if the code is not one of the three.
-inline std::optional<PskCategory> psk_category_from_string(const std::string& code) {
+inline std::optional<PskCategory> psk_category_from_string(std::string_view code) {
     if (code == "lt") {
         return PskCategory::LONG_TERM;
     }
