@@ -93,7 +93,7 @@ static std::optional<bool> read_bool_field(JsonVariantConst var, const char* nam
 /// reject the whole message).
 template <typename E>
 static std::optional<E> read_enum_field(JsonVariantConst var, const char* name,
-                                        std::optional<E> (*from_string)(const std::string&)) {
+                                        std::optional<E> (*from_string)(std::string_view)) {
     if (var.isUnbound() || var.isNull()) {
         return std::nullopt;
     }
@@ -101,7 +101,7 @@ static std::optional<E> read_enum_field(JsonVariantConst var, const char* name,
         SS_LOGW(TAG, "Ignoring field '%s': expected string", name);
         return std::nullopt;
     }
-    std::optional<E> value = from_string(var.as<std::string>());
+    std::optional<E> value = from_string(var.as<const char*>());
     if (!value) {
         SS_LOGW(TAG, "Ignoring field '%s': unknown value '%s'", name, var.as<const char*>());
     }
@@ -126,8 +126,7 @@ static bool process_player_stream_object(const JsonObject player_object,
     }
 
     if (player_object["codec"].is<JsonVariant>()) {
-        std::string codec_type = player_object["codec"].as<std::string>();
-        auto codec = codec_format_from_string(codec_type);
+        auto codec = codec_format_from_string(player_object["codec"] | "");
         player_obj->codec = codec.value_or(SendspinCodecFormat::UNSUPPORTED);
     }
 
@@ -201,11 +200,9 @@ static bool process_server_player_command_object(const JsonObject player_object,
         return false;
     }
 
-    std::string command_str = player_object["command"].as<std::string>();
-    auto command = player_command_from_string(command_str);
-
+    auto command = read_enum_field(player_object["command"], "command", player_command_from_string);
     if (!command.has_value()) {
-        SS_LOGE(TAG, "Invalid server player command type: %s", command_str.c_str());
+        SS_LOGE(TAG, "Invalid server player command");
         return false;
     }
     player_cmd->command = command.value();
@@ -369,7 +366,7 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
                     all_strings = false;
                     break;
                 }
-                if (auto format = codec_format_from_string(codec.as<std::string>())) {
+                if (auto format = codec_format_from_string(codec.as<const char*>())) {
                     accepted |= source_codec_bit(*format);
                 }
             }
@@ -400,7 +397,7 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
     JsonArrayConst activities_array = root["payload"]["activities"].as<JsonArrayConst>();
     for (JsonVariantConst act_var : activities_array) {
         if (act_var.is<const char*>()) {
-            auto act = activity_from_string(act_var.as<std::string>());
+            auto act = activity_from_string(act_var.as<const char*>());
             if (act.has_value()) {
                 activate_msg->activities.push_back(act.value());
             }
@@ -1294,10 +1291,10 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
         return true;
     }
 
-    const std::string reason_str = root["payload"]["reason"].as<std::string>();
+    const char* reason_str = root["payload"]["reason"] | "";
     auto reason = pair_abort_reason_from_string(reason_str);
     if (!reason.has_value()) {
-        SS_LOGW(TAG, "pair/abort: unrecognized reason '%s'", reason_str.c_str());
+        SS_LOGW(TAG, "pair/abort: unrecognized reason '%s'", reason_str);
         return false;
     }
 

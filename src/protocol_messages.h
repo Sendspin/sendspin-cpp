@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -224,7 +225,7 @@ inline const char* to_cstr(SendspinActivity activity) {
 }
 
 /// @brief Parses a wire string into a SendspinActivity; nullopt if unrecognized
-inline std::optional<SendspinActivity> activity_from_string(const std::string& str) {
+inline std::optional<SendspinActivity> activity_from_string(std::string_view str) {
     if (str == "playback") {
         return SendspinActivity::PLAYBACK;
     }
@@ -256,7 +257,7 @@ inline const char* to_cstr(SendspinPairMethod method) {
 }
 
 /// @brief Parses a wire string into a SendspinPairMethod; nullopt if unrecognized
-inline std::optional<SendspinPairMethod> pair_method_from_string(const std::string& str) {
+inline std::optional<SendspinPairMethod> pair_method_from_string(std::string_view str) {
     if (str == "pairing_psk") {
         return SendspinPairMethod::PAIRING_PSK;
     }
@@ -283,7 +284,7 @@ inline const char* to_cstr(SendspinPairingCodeFormat format) {
 
 /// @brief Parses a wire string into a pairing-code emission format; nullopt if unrecognized
 inline std::optional<SendspinPairingCodeFormat> pairing_code_format_from_string(
-    const std::string& str) {
+    std::string_view str) {
     if (str == "digits") {
         return SendspinPairingCodeFormat::DIGITS;
     }
@@ -353,7 +354,7 @@ inline SendspinPairAbortReason to_public_abort_reason(PairAbortReason reason) {
 }
 
 /// @brief Parses a wire string into a PairAbortReason; nullopt if unrecognized
-inline std::optional<PairAbortReason> pair_abort_reason_from_string(const std::string& str) {
+inline std::optional<PairAbortReason> pair_abort_reason_from_string(std::string_view str) {
     if (str == "attempt_timeout") {
         return PairAbortReason::ATTEMPT_TIMEOUT;
     }
@@ -411,7 +412,7 @@ inline const char* to_cstr(SendspinPlaybackState state) {
     }
 }
 
-inline std::optional<SendspinPlaybackState> playback_state_from_string(const std::string& str) {
+inline std::optional<SendspinPlaybackState> playback_state_from_string(std::string_view str) {
     if (str == "playing") {
         return SendspinPlaybackState::PLAYING;
     }
@@ -444,7 +445,7 @@ inline const char* to_cstr(SendspinCodecFormat format) {
     }
 }
 
-inline std::optional<SendspinCodecFormat> codec_format_from_string(const std::string& str) {
+inline std::optional<SendspinCodecFormat> codec_format_from_string(std::string_view str) {
     if (str == "flac") {
         return SendspinCodecFormat::FLAC;
     }
@@ -470,7 +471,7 @@ inline const char* to_cstr(SendspinPlayerCommand cmd) {
     }
 }
 
-inline std::optional<SendspinPlayerCommand> player_command_from_string(const std::string& str) {
+inline std::optional<SendspinPlayerCommand> player_command_from_string(std::string_view str) {
     if (str == "volume") {
         return SendspinPlayerCommand::VOLUME;
     }
@@ -542,7 +543,7 @@ inline const char* to_cstr(SendspinControllerCommand cmd) {
 }
 
 inline std::optional<SendspinControllerCommand> controller_command_from_string(
-    const std::string& str) {
+    std::string_view str) {
     if (str == "play") {
         return SendspinControllerCommand::PLAY;
     }
@@ -604,7 +605,7 @@ inline const char* to_cstr(SendspinRepeatMode mode) {
     }
 }
 
-inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::string& str) {
+inline std::optional<SendspinRepeatMode> repeat_mode_from_string(std::string_view str) {
     if (str == "off") {
         return SendspinRepeatMode::OFF;
     }
@@ -630,7 +631,7 @@ inline const char* to_cstr(SendspinImageFormat format) {
     }
 }
 
-inline std::optional<SendspinImageFormat> image_format_from_string(const std::string& str) {
+inline std::optional<SendspinImageFormat> image_format_from_string(std::string_view str) {
     if (str == "jpeg") {
         return SendspinImageFormat::JPEG;
     }
@@ -652,7 +653,7 @@ inline const char* to_cstr(SendspinImageSource source) {
     }
 }
 
-inline std::optional<SendspinImageSource> image_source_from_string(const std::string& str) {
+inline std::optional<SendspinImageSource> image_source_from_string(std::string_view str) {
     if (str == "album") {
         return SendspinImageSource::ALBUM;
     }
@@ -722,7 +723,7 @@ inline const char* to_cstr(VisualizerDataType type) {
     }
 }
 
-inline std::optional<VisualizerDataType> visualizer_data_type_from_string(const std::string& str) {
+inline std::optional<VisualizerDataType> visualizer_data_type_from_string(std::string_view str) {
     if (str == "beat") {
         return VisualizerDataType::BEAT;
     }
@@ -755,7 +756,7 @@ inline const char* to_cstr(VisualizerSpectrumScale scale) {
 }
 
 inline std::optional<VisualizerSpectrumScale> visualizer_spectrum_scale_from_string(
-    const std::string& str) {
+    std::string_view str) {
     if (str == "mel") {
         return VisualizerSpectrumScale::MEL;
     }
@@ -786,7 +787,7 @@ enum class SourceCommand : uint8_t {
     STOP,   // Clear any pending authorization and end the input stream
 };
 
-inline std::optional<SourceCommand> source_command_from_string(const std::string& str) {
+inline std::optional<SourceCommand> source_command_from_string(std::string_view str) {
     if (str == "start") {
         return SourceCommand::START;
     }
