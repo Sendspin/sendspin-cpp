@@ -103,8 +103,8 @@ int64_t liveness_remaining_us(int64_t now_us, uint32_t last_receive_us, int64_t 
 /// @brief A connection that has not completed the hello handshake
 ///
 /// The hello is sent once, by the hello scan in ConnectionManager::scan_nursery() that first sees
-/// the connection's Noise handshake complete, so whether it was attempted lives here and leaves
-/// the nursery with the connection.
+/// the connection's server/hello arrived, so whether it was attempted lives here and leaves the
+/// nursery with the connection.
 struct NurseryEntry {
     /// The only long-term owner, except for an ESP inbound connection, which its httpd session owns
     std::shared_ptr<SendspinConnection> conn;

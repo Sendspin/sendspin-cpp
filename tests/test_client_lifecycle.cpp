@@ -941,7 +941,7 @@ TEST(ClientLifecycle, NurseryHelloIsSentOnceAndAFailedSendDropsTheConnection) {
         client.protocol_task_->stop();
         auto conn = std::make_shared<HelloCountingConnection>(row.send_result);
         conn->noise_handshake_complete_ = true;
-        conn->server_hello_received_ = row.server_hello_received;
+        conn->set_server_hello_received(row.server_hello_received);
         conn->set_provisional_time_us(platform_time_us());
         manager.nursery_.push_back(NurseryEntry{.conn = conn, .client_init_sent = true});
 
