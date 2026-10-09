@@ -413,7 +413,7 @@ public:
     /// If the inbound slots are full (outbound entries do not count), or admission is closed, the
     /// newcomer is refused with a goodbye, which reaches the peer because its session is already
     /// upgraded. Sends client/init immediately: the connection is already WS-upgraded, so there is
-    /// no earlier signal to wait for; the hello is armed once the Noise handshake completes.
+    /// no earlier signal to wait for; the hello is sent once server/hello arrives.
     void accept(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Initiates an outbound connection to a Sendspin server (SendspinClient::connect_to()).
@@ -610,9 +610,9 @@ private:
     ///         while the network is down (the main loop wakes the task when it comes up).
     uint32_t maybe_start_ws_server(int64_t now_us);
 
-    /// @brief Arms hellos for nursery connections whose Noise handshake just completed and sends
-    /// the ones that are due (the level-triggered hello scan), admits the ones that are now
-    /// operational, and reaps the ones that miss the establish deadline.
+    /// @brief Sends hellos for nursery connections whose server/hello has arrived (the
+    /// level-triggered hello scan), admits the ones that are now operational, and reaps the ones
+    /// that miss the establish deadline.
     /// @return Milliseconds until the next hello attempt or establish deadline.
     uint32_t scan_nursery(int64_t now_us);
 
@@ -692,7 +692,7 @@ private:
     // Hello handshake
     // ========================================
 
-    /// @brief Sends the hello message to a connection whose Noise handshake completed, and marks
+    /// @brief Sends the hello message to a connection whose server/hello arrived, and marks
     /// it sent on success.
     /// @param conn The nursery connection to send the hello to.
     /// @return False if the send failed on a connected transport, which the caller closes without

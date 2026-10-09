@@ -497,11 +497,6 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
 // Liveness timeout
 // ============================================================================
 
-// A peer that sends server/hello before the client's own client/hello (main's
-// EarlyServerHelloDoesNotWedge scenario) needs no test of its own here: FakeEncryptedServer
-// sends its server/hello the moment the Noise handshake completes, before any client/hello
-// arrives, so every establishment above already runs that ordering.
-
 namespace {
 
 constexpr uint16_t LIVENESS_TEST_PORT = 18983;
