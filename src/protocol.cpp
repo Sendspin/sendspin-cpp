@@ -101,9 +101,11 @@ static std::optional<E> read_enum_field(JsonVariantConst var, const char* name,
         SS_LOGW(TAG, "Ignoring field '%s': expected string", name);
         return std::nullopt;
     }
-    std::optional<E> value = from_string(var.as<const char*>());
+    const auto text = var.as<std::string_view>();
+    std::optional<E> value = from_string(text);
     if (!value) {
-        SS_LOGW(TAG, "Ignoring field '%s': unknown value '%s'", name, var.as<const char*>());
+        SS_LOGW(TAG, "Ignoring field '%s': unknown value '%.*s'", name,
+                static_cast<int>(text.size()), text.data());
     }
     return value;
 }
@@ -126,7 +128,7 @@ static bool process_player_stream_object(const JsonObject player_object,
     }
 
     if (player_object["codec"].is<JsonVariant>()) {
-        auto codec = codec_format_from_string(player_object["codec"] | "");
+        auto codec = codec_format_from_string(player_object["codec"].as<std::string_view>());
         player_obj->codec = codec.value_or(SendspinCodecFormat::UNSUPPORTED);
     }
 
@@ -366,7 +368,7 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
                     all_strings = false;
                     break;
                 }
-                if (auto format = codec_format_from_string(codec.as<const char*>())) {
+                if (auto format = codec_format_from_string(codec.as<std::string_view>())) {
                     accepted |= source_codec_bit(*format);
                 }
             }
@@ -397,7 +399,7 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
     JsonArrayConst activities_array = root["payload"]["activities"].as<JsonArrayConst>();
     for (JsonVariantConst act_var : activities_array) {
         if (act_var.is<const char*>()) {
-            auto act = activity_from_string(act_var.as<const char*>());
+            auto act = activity_from_string(act_var.as<std::string_view>());
             if (act.has_value()) {
                 activate_msg->activities.push_back(act.value());
             }
@@ -1291,10 +1293,11 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
         return true;
     }
 
-    const char* reason_str = root["payload"]["reason"] | "";
+    const auto reason_str = root["payload"]["reason"].as<std::string_view>();
     auto reason = pair_abort_reason_from_string(reason_str);
     if (!reason.has_value()) {
-        SS_LOGW(TAG, "pair/abort: unrecognized reason '%s'", reason_str);
+        SS_LOGW(TAG, "pair/abort: unrecognized reason '%.*s'", static_cast<int>(reason_str.size()),
+                reason_str.data());
         return false;
     }
 
