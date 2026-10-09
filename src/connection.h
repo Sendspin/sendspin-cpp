@@ -40,6 +40,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -174,9 +175,10 @@ public:
     /// initial NoiseHandshake object is destroyed.
     /// @param identity     Client static X25519 identity.
     /// @param record_store Record store for psk_id resolution.
-    /// @param suite_name   Noise suite name string.
+    /// @param suite_name   Noise suite name; a null-terminated static string such as
+    ///                     NOISE_SUITE_CHACHAPOLY, retained by pointer for the connection lifetime.
     void init_noise_handshake(const Identity& identity, const RecordStore& record_store,
-                              const std::string& suite_name);
+                              const char* suite_name);
 
     /// @brief Return true once the Noise handshake has completed and transport is encrypted.
     bool is_noise_handshake_complete() const {
@@ -189,10 +191,10 @@ public:
     }
 
     /// @brief Return the full Noise suite name supplied at init_noise_handshake() (e.g.
-    /// "Noise_KKpsk2_25519_ChaChaPoly_SHA256"), or an empty string if none was set.
+    /// "Noise_KKpsk2_25519_ChaChaPoly_SHA256"), or nullptr if none was set.
     /// Used to select the AEAD cipher for pairing.md "Wrapping" (see
     /// platform/crypto.h aead_cipher_name_from_noise_suite()).
-    virtual const std::string& get_noise_suite_name() const {
+    virtual const char* get_noise_suite_name() const {
         return this->noise_suite_name_;
     }
 
@@ -694,7 +696,7 @@ public:
     /// On HandshakeFrameResult::ABORT (spec Failure Handling: malformed cleartext message,
     /// unsupported version, unknown suite, psk_id lookup miss, or a msg1 auth failure), this
     /// closes the connection itself via close_silently(); the caller has nothing left to do.
-    void handle_noise_handshake_text(const std::string& text);
+    void handle_noise_handshake_text(std::string_view text);
 
     /// @brief Returns whether this connection has successfully sent its client/hello.
     /// @return true once a client/hello send has completed on this connection.
@@ -1094,7 +1096,7 @@ protected:
     // String fields
 
     /// Retained for re-handshake: Noise suite name supplied at init_noise_handshake().
-    std::string noise_suite_name_{};
+    const char* noise_suite_name_ = nullptr;
 
     /// psk_id of the PSK matched by the Noise handshake (empty for Sentinel, or when no
     /// Noise handshake has completed). Written at handshake COMPLETE and at every in-band

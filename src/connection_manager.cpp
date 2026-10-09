@@ -1417,7 +1417,7 @@ void ConnectionManager::start_noise_handshake(NurseryEntry& entry) {
     // client. The hello is armed later, once the Noise handshake completes (the hello scan in
     // scan_nursery()).
     entry.conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
-                                     std::string(NOISE_SUITE_CHACHAPOLY));
+                                     NOISE_SUITE_CHACHAPOLY);
     entry.conn->send_noise_client_init();
     entry.client_init_sent = true;
 }

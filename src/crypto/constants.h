@@ -59,7 +59,7 @@ extern const std::string SENTINEL_PSK_ID;
 /// every target, no AES hardware dependency). The Sendspin client builds its Noise session from
 /// its own client/init proposal and never reads server/init's suite field back, so a single
 /// suite is sufficient; there is nothing to negotiate.
-static constexpr std::string_view NOISE_SUITE_CHACHAPOLY{"Noise_KKpsk2_25519_ChaChaPoly_SHA256"};
+static constexpr const char* NOISE_SUITE_CHACHAPOLY = "Noise_KKpsk2_25519_ChaChaPoly_SHA256";
 
 // ============================================================================
 // Transport framing constants

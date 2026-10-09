@@ -120,8 +120,8 @@ public:
 
     /// Report a canned Noise suite name without an active Noise session, so the wrapping
     /// (pairing.md "Wrapping") can resolve an AEAD cipher during the PAIR_CONFIRM step.
-    const std::string& get_noise_suite_name() const override {
-        return this->canned_suite_name_;
+    const char* get_noise_suite_name() const override {
+        return this->canned_suite_name_.c_str();
     }
 
     // Accumulated outgoing messages / disconnect bookkeeping

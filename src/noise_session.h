@@ -81,7 +81,7 @@ public:
     /// @param prologue    Exact prologue bytes (init messages, or prior hash on re-handshake).
     /// @param psk         32-byte PSK, or nullptr to bind it later via `set_psk`.
     /// @return Session ready for `read_msg1`, or nullopt on error.
-    static std::optional<NoiseSession> as_responder(const std::string& suite_name,
+    static std::optional<NoiseSession> as_responder(const char* suite_name,
                                                     const uint8_t* local_priv,
                                                     const uint8_t* remote_pub,
                                                     const uint8_t* prologue, size_t prologue_len,
