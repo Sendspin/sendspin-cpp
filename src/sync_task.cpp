@@ -351,11 +351,11 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
         }
 
         if (raw_error > SOFT_SYNC_THRESHOLD_US) {
-            // Slightly behind - add one interpolated frame between the last two decoded frames
+            // Slightly behind: add one interpolated frame between the last two decoded frames
             // Playtime estimate is advanced by transfer_audio() when the extra frame is sent
             this->soft_sync_insert_frame(sync_context);
         } else if (raw_error < -SOFT_SYNC_THRESHOLD_US) {
-            // Slightly ahead - remove last frame, blend into second-to-last
+            // Slightly ahead: remove first frame, blend into second
             // Playtime estimate naturally reflects the removed frame: transfer_audio() sends
             // fewer bytes
             this->soft_sync_drop_frame(sync_context);
@@ -488,29 +488,24 @@ bool SyncTask::load_next_chunk(SyncContext& sync_context) {
 
 int32_t SyncTask::soft_sync_drop_frame(SyncContext& sync_context) {
     // Small sync adjustment after getting slightly ahead.
-    // Removes the last frame in the chunk to get in sync. The second to last frame is replaced with
-    // the average of it and the removed frame to minimize audible glitches.
+    // Removes the first frame in the chunk to get in sync. The second frame is replaced with the
+    // average of it and the removed frame to minimize audible glitches.
 
     const uint32_t num_channels = sync_context.current_stream_info.get_channels();
     const uint32_t bytes_per_sample = sync_context.bytes_per_frame / num_channels;
 
     if (sync_context.decode_buffer->available() >= 2 * sync_context.bytes_per_frame) {
+        uint8_t* first_frame = sync_context.decode_buffer->get_buffer_start();
+        uint8_t* second_frame = first_frame + sync_context.bytes_per_frame;
         for (uint32_t chan = 0; chan < num_channels; ++chan) {
             const size_t chan_offset =
                 static_cast<size_t>(chan) * static_cast<size_t>(bytes_per_sample);
             const int32_t first_sample =
-                unpack_audio_sample_to_q31(sync_context.decode_buffer->get_buffer_end() -
-                                               2 * sync_context.bytes_per_frame + chan_offset,
-                                           bytes_per_sample);
+                unpack_audio_sample_to_q31(first_frame + chan_offset, bytes_per_sample);
             const int32_t second_sample =
-                unpack_audio_sample_to_q31(sync_context.decode_buffer->get_buffer_end() -
-                                               sync_context.bytes_per_frame + chan_offset,
-                                           bytes_per_sample);
-            int32_t replacement_sample = first_sample / 2 + second_sample / 2;
-            pack_q31_as_audio_sample(replacement_sample,
-                                     sync_context.decode_buffer->get_buffer_end() -
-                                         2 * sync_context.bytes_per_frame + chan_offset,
-                                     bytes_per_sample);
+                unpack_audio_sample_to_q31(second_frame + chan_offset, bytes_per_sample);
+            const int32_t blended_sample = first_sample / 2 + second_sample / 2;
+            pack_q31_as_audio_sample(blended_sample, second_frame + chan_offset, bytes_per_sample);
         }
 
         sync_context.decode_buffer->decrease_buffer_length(sync_context.bytes_per_frame);
