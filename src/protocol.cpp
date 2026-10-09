@@ -86,11 +86,11 @@ static std::optional<bool> read_bool_field(JsonVariantConst var, const char* nam
     return var.as<bool>();
 }
 
-/// @brief Reads an optional enum field parsed from a wire string via `from_string`. Absent or null
-/// returns nullopt silently; a present non-string, or a string that `from_string` does not
-/// recognize, is logged and dropped. For enum fields whose policy is "apply if valid, otherwise
-/// leave the current value untouched" (not for fields that map unknown values to a sentinel or that
-/// reject the whole message).
+/// @brief Reads an enum field parsed from a wire string via `from_string`. Absent or null returns
+/// nullopt silently; a present non-string, or a string that `from_string` does not recognize, is
+/// logged and returns nullopt. The caller picks the policy: an optional field leaves its current
+/// value untouched, a required field rejects the message. Not for fields that map unknown values to
+/// a sentinel.
 template <typename E>
 static std::optional<E> read_enum_field(JsonVariantConst var, const char* name,
                                         std::optional<E> (*from_string)(std::string_view)) {
