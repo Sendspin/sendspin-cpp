@@ -50,6 +50,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -122,8 +123,8 @@ std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst en
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
     const std::vector<uint8_t>& msg1_bytes, const std::string& server_id, const Identity& identity,
-    const RecordStore& record_store, const std::string& suite_name,
-    const std::array<uint8_t, 32>& prior_h, SendspinArenaAllocator& arena);
+    const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
+    SendspinArenaAllocator& arena);
 
 // ============================================================================
 // NoiseHandshake class (initial handshake state machine)
@@ -140,11 +141,12 @@ class NoiseHandshake {
 public:
     /// @brief Construct the handshake driver.
     /// @param record_store Record store for psk_id resolution (read-only on protocol task).
-    /// @param suite_name   Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
+    /// @param suite_name   Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h);
+    ///                     a null-terminated static string, retained by pointer.
     /// @param arena        The client's JSON arena, which every frame the handshake parses or
     ///                     builds is allocated from; outlives the handshake.
     NoiseHandshake(const Identity& identity, const RecordStore& record_store,
-                   const std::string& suite_name, SendspinArenaAllocator& arena);
+                   const char* suite_name, SendspinArenaAllocator& arena);
 
     ~NoiseHandshake() = default;
 
@@ -166,7 +168,7 @@ public:
     /// Must be called in sequence: server/init, then noise/handshake msg1.
     /// @param send_fn  Callable that sends a TEXT frame to the peer.
     ///                 Signature: `bool send_fn(const std::string& text)`.
-    HandshakeFrameResult on_text_frame(const std::string& text,
+    HandshakeFrameResult on_text_frame(std::string_view text,
                                        const std::function<bool(const std::string&)>& send_fn);
 
     /// @brief The reason carried by a server/error received during the handshake, or empty.
@@ -201,7 +203,7 @@ private:
     /// @param version   payload.version (0 when absent).
     /// @param server_id payload.server_id (empty when absent).
     /// @param text      Exact received bytes, retained for the handshake prologue.
-    bool handle_server_init(int version, std::string server_id, const std::string& text);
+    bool handle_server_init(int version, std::string server_id, std::string_view text);
 
     /// @brief Authenticate and respond to the noise/handshake msg1.
     /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data()).
@@ -226,7 +228,7 @@ private:
     /// Exact bytes of the server/init frame we received (retained for prologue).
     std::string server_init_text_;
 
-    std::string suite_name_;
+    const char* suite_name_;
 
     // Pointer fields
     // Reference members, grouped with pointers: both are non-owning indirections to

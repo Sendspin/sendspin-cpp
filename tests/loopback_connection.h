@@ -252,7 +252,7 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     // Create the NoiseHandshake (our responder driver)
     // -----------------------------------------------------------------
     TestArena arena;
-    NoiseHandshake nh(client_id, rs, suite_name, arena);
+    NoiseHandshake nh(client_id, rs, suite_name.c_str(), arena);
 
     // Step 1: client sends client/init
     std::string client_init = nh.build_client_init();

@@ -200,7 +200,7 @@ std::optional<int64_t> SendspinConnection::claim_time_frame(int64_t client_trans
 
 void SendspinConnection::init_noise_handshake(const Identity& identity,
                                               const RecordStore& record_store,
-                                              const std::string& suite_name) {
+                                              const char* suite_name) {
     this->noise_handshake_ =
         std::make_unique<NoiseHandshake>(identity, record_store, suite_name, *this->json_arena_);
     // Retain for re-handshake: these pointers outlive connections (owned by the
@@ -220,7 +220,7 @@ void SendspinConnection::send_noise_client_init() {
     }
 }
 
-void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
+void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
     if (!this->noise_handshake_) {
         return;
     }
@@ -283,7 +283,7 @@ bool SendspinConnection::handle_noise_rehandshake(const std::vector<uint8_t>& ms
         return false;
     }
     if (this->noise_identity_ == nullptr || this->noise_record_store_ == nullptr ||
-        this->noise_suite_name_.empty()) {
+        this->noise_suite_name_ == nullptr) {
         SS_LOGE(TAG, "handle_noise_rehandshake: missing identity/record_store/suite; "
                      "init_noise_handshake() was not called");
         return false;
@@ -390,7 +390,7 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
         if (noise_pending) {
             // Feed the handshake driver; it handles server/init and noise/handshake frames.
             this->handle_noise_handshake_text(
-                std::string(reinterpret_cast<const char*>(message.data), message.len));
+                std::string_view(reinterpret_cast<const char*>(message.data), message.len));
             return InboundDispatch::NONE;
         }
         if (noise_active) {

@@ -91,15 +91,14 @@ NoiseSession& NoiseSession::operator=(NoiseSession&& other) noexcept {
 
 /// @brief Allocate and configure a KKpsk2 responder handshakestate.
 /// Returns nullptr on any error; the caller must free on failure.
-static NoiseHandshakeState* build_responder_hs(const std::string& suite_name,
-                                               const uint8_t* local_priv, const uint8_t* remote_pub,
-                                               const uint8_t* prologue, size_t prologue_len,
-                                               const uint8_t* psk) {
+static NoiseHandshakeState* build_responder_hs(const char* suite_name, const uint8_t* local_priv,
+                                               const uint8_t* remote_pub, const uint8_t* prologue,
+                                               size_t prologue_len, const uint8_t* psk) {
     NoiseHandshakeState* hs = nullptr;
-    const int err = noise_handshakestate_new_by_name(&hs, suite_name.c_str(), NOISE_ROLE_RESPONDER);
+    const int err = noise_handshakestate_new_by_name(&hs, suite_name, NOISE_ROLE_RESPONDER);
     if (err != NOISE_ERROR_NONE) {
         SS_LOGE(TAG, "noise_handshakestate_new_by_name failed for suite %s (error 0x%04x)",
-                suite_name.c_str(), err);
+                suite_name, err);
         return nullptr;
     }
 
@@ -153,7 +152,7 @@ static NoiseHandshakeState* build_responder_hs(const std::string& suite_name,
 // Factory
 // ============================================================================
 
-std::optional<NoiseSession> NoiseSession::as_responder(const std::string& suite_name,
+std::optional<NoiseSession> NoiseSession::as_responder(const char* suite_name,
                                                        const uint8_t* local_priv,
                                                        const uint8_t* remote_pub,
                                                        const uint8_t* prologue, size_t prologue_len,

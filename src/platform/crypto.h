@@ -479,8 +479,8 @@ static constexpr size_t AEAD_ONESHOT_NONCE_SIZE = 12;
 /// ever negotiates ChaChaPoly, so this validates the suite string rather than selecting between
 /// alternatives. Returns nullptr if the suite name does not contain the expected cipher
 /// component.
-inline const char* aead_cipher_name_from_noise_suite(const std::string& noise_suite_name) {
-    if (noise_suite_name.find("ChaChaPoly") != std::string::npos) {
+inline const char* aead_cipher_name_from_noise_suite(const char* noise_suite_name) {
+    if (noise_suite_name != nullptr && std::strstr(noise_suite_name, "ChaChaPoly") != nullptr) {
         return "ChaChaPoly";
     }
     return nullptr;

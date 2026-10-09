@@ -36,17 +36,16 @@ namespace sendspin {
 
 /// @brief Serialize client/init to JSON.
 /// Format: {"type":"client/init","payload":{"client_id":"...","version":1,"suite":"..."}}
-static std::string serialize_client_init(const std::string& client_id,
-                                         const std::string& suite_name,
+static std::string serialize_client_init(const std::string& client_id, const char* suite_name,
                                          SendspinArenaAllocator& arena) {
     // suite_name is the full name (e.g. NOISE_SUITE_CHACHAPOLY = "Noise_KKpsk2_25519_..."); the
     // wire value is the suffix after "Noise_KKpsk2_" (connection.md "Cipher Suites"). Strip
     // that prefix to produce the wire suite string.
     static constexpr const char* PREFIX = "Noise_KKpsk2_";
     constexpr size_t PREFIX_LEN = std::char_traits<char>::length(PREFIX);
-    std::string wire_suite = suite_name;
-    if (wire_suite.size() > PREFIX_LEN && wire_suite.substr(0, PREFIX_LEN) == PREFIX) {
-        wire_suite = wire_suite.substr(PREFIX_LEN);
+    std::string_view wire_suite(suite_name);
+    if (wire_suite.size() > PREFIX_LEN && wire_suite.starts_with(PREFIX)) {
+        wire_suite.remove_prefix(PREFIX_LEN);
     }
 
     JsonDocument doc = make_json_document(arena);
@@ -125,10 +124,12 @@ const char* to_cstr(HandshakeKind kind) {
 /// @param msg1_bytes    The msg1 Noise bytes (read_noise_handshake_data()).
 /// @param arena         The client's JSON arena, to parse msg1's payload in.
 /// @return Populated Msg1CoreResult on success, or nullopt on any failure (caller aborts).
-std::optional<Msg1CoreResult> run_msg1_core(
-    HandshakeKind kind, const Identity& identity, const RecordStore& record_store,
-    const std::string& suite_name, const std::string& server_id, const uint8_t* prologue,
-    size_t prologue_len, const std::vector<uint8_t>& msg1_bytes, SendspinArenaAllocator& arena) {
+std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& identity,
+                                            const RecordStore& record_store, const char* suite_name,
+                                            const std::string& server_id, const uint8_t* prologue,
+                                            size_t prologue_len,
+                                            const std::vector<uint8_t>& msg1_bytes,
+                                            SendspinArenaAllocator& arena) {
     const char* log_prefix = to_cstr(kind);
     auto server_pub = public_key_from_peer_id(server_id);
     if (!server_pub.has_value()) {
@@ -278,7 +279,7 @@ std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst en
 // ============================================================================
 
 NoiseHandshake::NoiseHandshake(const Identity& identity, const RecordStore& record_store,
-                               const std::string& suite_name, SendspinArenaAllocator& arena)
+                               const char* suite_name, SendspinArenaAllocator& arena)
     : suite_name_(suite_name), arena_(arena), identity_(identity), record_store_(record_store) {}
 
 // ============================================================================
@@ -307,7 +308,7 @@ void NoiseHandshake::take_server_error(JsonObjectConst root, const char* log_con
 }
 
 HandshakeFrameResult NoiseHandshake::on_text_frame(
-    const std::string& text, const std::function<bool(const std::string&)>& send_fn) {
+    std::string_view text, const std::function<bool(const std::string&)>& send_fn) {
     if (this->state_ != State::WAIT_SERVER_INIT && this->state_ != State::WAIT_MSG1) {
         SS_LOGE(TAG, "on_text_frame: no frame expected in this state");
         this->state_ = State::ABORTED;
@@ -378,8 +379,7 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
 // Private: handle server/init
 // ============================================================================
 
-bool NoiseHandshake::handle_server_init(int version, std::string server_id,
-                                        const std::string& text) {
+bool NoiseHandshake::handle_server_init(int version, std::string server_id, std::string_view text) {
     if (version != PROTOCOL_VERSION) {
         SS_LOGE(TAG, "handle_server_init: unsupported version %d (expected %d)", version,
                 PROTOCOL_VERSION);
@@ -439,8 +439,8 @@ bool NoiseHandshake::handle_msg1(const std::vector<uint8_t>& msg1_bytes,
 
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
     const std::vector<uint8_t>& msg1_bytes, const std::string& server_id, const Identity& identity,
-    const RecordStore& record_store, const std::string& suite_name,
-    const std::array<uint8_t, 32>& prior_h, SendspinArenaAllocator& arena) {
+    const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
+    SendspinArenaAllocator& arena) {
     // Prologue for re-handshake = prior handshake hash h (32 bytes)
     const uint8_t* prologue = prior_h.data();
     const size_t prologue_len = prior_h.size();
