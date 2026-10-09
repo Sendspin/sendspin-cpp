@@ -21,9 +21,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef ESP_PLATFORM
@@ -223,8 +223,8 @@ inline std::string b64url_encode(const uint8_t* data, size_t len) {
 }
 
 /// @brief Decode base64url, tolerating missing `=` padding; nullopt on invalid input.
-inline std::optional<std::vector<uint8_t>> b64url_decode(const char* s) {
-    size_t slen = std::strlen(s);
+inline std::optional<std::vector<uint8_t>> b64url_decode(std::string_view s) {
+    size_t slen = s.size();
 
     while (slen > 0 && s[slen - 1] == '=') {
         --slen;
@@ -270,11 +270,6 @@ inline std::optional<std::vector<uint8_t>> b64url_decode(const char* s) {
     }
     out.resize(olen);
     return out;
-}
-
-/// @brief Decode base64url from a std::string, tolerating missing `=` padding.
-inline std::optional<std::vector<uint8_t>> b64url_decode(const std::string& s) {
-    return b64url_decode(s.c_str());
 }
 
 }  // namespace sendspin

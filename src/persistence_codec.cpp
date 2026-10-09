@@ -106,7 +106,7 @@ std::string base64url_encode(const uint8_t* data, size_t len) {
 }
 
 std::optional<std::vector<uint8_t>> base64url_decode(std::string_view s) {
-    return b64url_decode(std::string(s));
+    return b64url_decode(s);
 }
 
 }  // namespace sendspin
