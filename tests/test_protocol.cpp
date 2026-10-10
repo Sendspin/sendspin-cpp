@@ -559,7 +559,7 @@ TEST(Protocol, StreamStartArtworkFieldsRequiredUnlessSourceNone) {
     };
     const Case cases[] = {
         {R"([{"source":"none"},{"source":"album","format":"jpeg","width":100,"height":100}])",
-         true},
+         true}, // Control:
         {R"([{"source":"album","format":"jpeg","width":100}])", false},
         {R"([{"source":"album","format":"jpeg","height":100}])", false},
         {R"([{"source":"album","width":100,"height":100}])", false},
