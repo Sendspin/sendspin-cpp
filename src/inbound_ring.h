@@ -143,7 +143,8 @@ static constexpr size_t INBOUND_ITEM_STORED_OVERHEAD_BYTES =
  * receive_time_us and kind, and every other field stays zero until the protocol task fills it.
  * The protocol task fills the consumer fields (next, data_offset, data_len, generation, type) and,
  * through InboundRing::charge(), charge and holder, before it appends the item to a consumer's
- * InboundItemList; from then on only that consumer touches the item until it returns it. A
+ * InboundItemList; from then on only that consumer touches the item until it returns it, but for
+ * the charge InboundItemList::release_charges() clears while the item is still linked. A
  * chunk's or frame's server timestamp is not copied here: the consumer reads it from plaintext
  * bytes 1 to 8, where it arrived.
  *
@@ -165,7 +166,7 @@ struct InboundItemHeader {
     /// the current clock with widen_time_stamp_us().
     uint32_t receive_time_us;
     /// Ring-stored bytes charged to holder's quota, 0 for an uncharged item; released by
-    /// InboundRing::return_item().
+    /// InboundRing::return_item(), or while linked by InboundItemList::release_charges().
     uint32_t charge;
     /// Teardown generation the consumer's role was at when the item was appended; a consumer
     /// discards an item whose stamp no longer matches its role's generation.
@@ -247,8 +248,8 @@ inline int64_t widen_time_stamp_us(uint32_t stamp, int64_t now) {
  *
  * try_charge() and release() are lock-free atomic updates, so the charging thread (the protocol
  * task) and the releasing thread (a consumer returning an item, or the protocol task recalling
- * one) need no common lock. Charges are in ring-stored bytes (SharedRingLayout::stored_size()),
- * the cost an item actually has in the ring.
+ * one or releasing a stream's listed items) need no common lock. Charges are in ring-stored bytes
+ * (SharedRingLayout::stored_size()), the cost an item actually has in the ring.
  */
 class InboundQuota {
 public:
@@ -478,7 +479,8 @@ private:
     // Struct fields
     SharedRingBuffer ring_;
     PlatformBuffer storage_;
-    /// Charged by the protocol task, released by whichever thread returns a charged item.
+    /// Charged by the protocol task, released by whichever thread returns a charged item or by the
+    /// protocol task at a stream boundary (InboundItemList::release_charges()).
     std::array<InboundQuota, INBOUND_HOLDER_COUNT> quotas_{};
     /// Each holder's list (register_list()), whose mutex guards the return count of a LOCAL item
     /// charged to it. Written before any item is charged.
@@ -519,10 +521,10 @@ private:
  * thread, take()); recall()
  * may run on the protocol task, or on any thread once the consumer is joined.
  *
- * mutex_ guards head_, tail_ and every next link of a linked item, and the return count of a
- * LOCAL item charged to this list's holder (InboundRing::return_item()). It is a leaf: nothing
- * is called under it, and the ring's lock is taken only after it is released (recall() detaches
- * the chain first, then returns the items).
+ * mutex_ guards head_, tail_ and every next link and charge of a linked item, and the return
+ * count of a LOCAL item charged to this list's holder (InboundRing::return_item()). It is a leaf:
+ * nothing is called under it, and the ring's lock is taken only after it is released (recall()
+ * detaches the chain first, then returns the items).
  */
 class InboundItemList {
 public:
@@ -599,6 +601,10 @@ public:
     /// @return The number of items returned.
     size_t recall();
 
+    /// @brief Releases the quota charge of every item not yet taken, leaving each linked for the
+    /// consumer to take and return. Protocol task.
+    void release_charges();
+
     /// @brief Whether no item is linked. Any thread.
     bool is_empty() const {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -622,7 +628,8 @@ private:
     /// Set by append(), wake_receiver() and signal(); take() waits on the list's own bits,
     /// take_signals() on the consumer's.
     EventFlags flags_;
-    /// Guards head_, tail_ and the links of linked items; a leaf lock (see the class comment).
+    /// Guards head_, tail_ and the links and charges of linked items; a leaf lock (see the class
+    /// comment).
     mutable std::mutex mutex_;
 
     // Pointer fields
@@ -751,6 +758,13 @@ public:
     /// the teardown or boundary. A no-op outside a run, where the main loop's cleanup() in
     /// SendspinClient::stop() finds the list already unbound.
     void recall();
+
+    /// @brief Releases the quota charge of every item the consumer has not taken, leaving them
+    /// listed for it to take and discard. For a stream boundary whose earlier items the consumer
+    /// discards when it reaches them: the server may refill the whole advertised buffer before
+    /// then. Protocol task, the thread that hands items over, so every item released
+    /// predates the boundary. A no-op outside a run.
+    void release_charges();
 
     /// @brief Why a message was dropped instead of handed over, which picks note_drop()'s warning
     enum class DropReason : uint8_t {

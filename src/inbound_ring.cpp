@@ -339,6 +339,23 @@ size_t InboundItemList::recall() {
     return returned;
 }
 
+void InboundItemList::release_charges() {
+    size_t released = 0;
+    {
+        // A linked item has not been taken, and take() pops under this lock, so the consumer's
+        // return_item() reads the zeroed charge and releases nothing twice.
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        for (uint32_t offset = this->head_; offset != INBOUND_LIST_END;) {
+            InboundItemHeader* header = inbound_item_header(this->item_at(offset));
+            released += std::exchange(header->charge, 0);
+            offset = header->next;
+        }
+    }
+    if (released != 0) {
+        this->ring_->quota(this->holder_).release(released);
+    }
+}
+
 void* InboundItemList::pop() {
     std::lock_guard<std::mutex> lock(this->mutex_);
     if (this->head_ == INBOUND_LIST_END) {
@@ -465,6 +482,13 @@ void InboundConsumer::recall() {
     this->items_.recall();
     // The stream the drops belonged to is gone, so no delivery will end their run.
     this->drop_log_.end_run(TAG, this->dropped_items_name());
+}
+
+void InboundConsumer::release_charges() {
+    if (this->ring() == nullptr) {
+        return;
+    }
+    this->items_.release_charges();
 }
 
 const char* InboundConsumer::dropped_items_name() const {

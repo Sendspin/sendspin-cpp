@@ -161,17 +161,18 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # test_player_role.cpp drives PlayerRole::Impl directly - no connected server, no sync-task thread -
 # which is the only way to see the client/state player object and the only way to stage a slot
 # payload stamped before a teardown. Reached: Impl's handle_stream_start(), handle_binary(),
-# handle_stream_clear(), handle_server_command(), cleanup(), attach_inbox(), drain_events(), volume,
-# cleanup_generation (moved on directly to stage a take between a teardown's generation bump and its
-# recall) and event_state's generation-stamped slots (one written with a stamp from before a
-# teardown, the payload a drain on the far side of it would hold); SyncTask's inbound_ (and
-# take_item()), bound to a test ring the way start() binds it but with no thread, so what a handler
-# handed over (or dropped) stays on the list to be read, and discard_to_clear_marker(), the sync
-# thread's stream/clear step. The inbound tests also bind a VisualizerRole::Impl to the same ring,
-# to show one holder's quota does not stop the other. The availability table reaches
-# SendspinClient's protocol_task_, build_client_state(), adopt_client_state(),
-# connection_manager_ (its install_admitted()) and process_binary_message(): the client is never
-# started, so the test publishes and adopts each snapshot and dispatches the chunk itself.
+# handle_stream_clear(), handle_stream_end(), handle_server_command(), cleanup(), attach_inbox(),
+# drain_events(), volume, cleanup_generation (moved on directly to stage a take between a teardown's
+# generation bump and its recall) and event_state's generation-stamped slots (one written with a
+# stamp from before a teardown, the payload a drain on the far side of it would hold); SyncTask's
+# inbound_ (and take_item()), bound to a test ring the way start() binds it but with no thread, so
+# what a handler handed over (or dropped) stays on the list to be read, and
+# discard_to_clear_marker(), the sync thread's stream/clear step. The inbound tests also bind a
+# VisualizerRole::Impl to the same ring, to show one holder's quota does not stop the other. The
+# availability table reaches SendspinClient's protocol_task_, build_client_state(),
+# adopt_client_state(), connection_manager_ (its install_admitted()) and process_binary_message():
+# the client is never started, so the test publishes and adopts each snapshot and dispatches the
+# chunk itself.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # The source suite builds only with the role compiled in, so a SENDSPIN_ENABLE_SOURCE=OFF test
