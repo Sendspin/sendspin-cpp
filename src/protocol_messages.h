@@ -681,9 +681,15 @@ struct ServerArtworkChannelObject {
     std::optional<uint16_t> width;
     std::optional<uint16_t> height;
 
-    /// @brief Returns true if all fields in this channel have received data
+    /// @brief Returns true if the channel carries every field its source requires
+    /// format, width and height are optional on a 'none' channel (spec "stream/start artwork
+    /// object").
     bool is_complete() const {
-        return source.has_value() && format.has_value() && width.has_value() && height.has_value();
+        if (!source.has_value()) {
+            return false;
+        }
+        return source.value() == SendspinImageSource::NONE ||
+               (format.has_value() && width.has_value() && height.has_value());
     }
 };
 

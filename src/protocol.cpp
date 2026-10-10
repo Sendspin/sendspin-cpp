@@ -159,20 +159,9 @@ static bool process_player_stream_object(const JsonObject player_object,
 }
 
 static bool process_artwork_channel_object(const JsonObject channel_object,
-                                           ServerArtworkChannelObject* channel,
-                                           bool require_all_fields) {
+                                           ServerArtworkChannelObject* channel) {
     if (channel == nullptr) {
         return false;
-    }
-
-    if (require_all_fields) {
-        if (!channel_object["source"].is<JsonVariant>() ||
-            !channel_object["format"].is<JsonVariant>() ||
-            !channel_object["width"].is<JsonVariant>() ||
-            !channel_object["height"].is<JsonVariant>()) {
-            SS_LOGE(TAG, "Invalid artwork channel: missing required fields");
-            return false;
-        }
     }
 
     if (auto source =
@@ -738,7 +727,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         JsonArray channels_array = root["payload"]["artwork"]["channels"].as<JsonArray>();
         for (JsonObject channel_json : channels_array) {
             ServerArtworkChannelObject channel{};
-            if (process_artwork_channel_object(channel_json, &channel, true)) {
+            if (process_artwork_channel_object(channel_json, &channel)) {
                 if (!channel.is_complete()) {
                     SS_LOGE(TAG, "Invalid stream/start message: incomplete artwork channel");
                     stream_msg->artwork.reset();

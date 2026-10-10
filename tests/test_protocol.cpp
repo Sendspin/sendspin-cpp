@@ -549,6 +549,39 @@ TEST(Protocol, StreamStartWithAMalformedPlayerDropsAValidArtworkSection) {
     EXPECT_EQ(ok.artwork->channels->size(), 1u);
 }
 
+// Spec "stream/start artwork object": format, width and height are required unless source is
+// 'none', so a bare 'none' channel ahead of a streamed one is valid, while a streamed channel
+// missing any of them still rejects the message.
+TEST(Protocol, StreamStartArtworkFieldsRequiredUnlessSourceNone) {
+    struct Case {
+        const char* channels;
+        bool accepted;
+    };
+    const Case cases[] = {
+        {R"([{"source":"none"},{"source":"album","format":"jpeg","width":100,"height":100}])",
+         true}, // Control:
+        {R"([{"source":"album","format":"jpeg","width":100}])", false},
+        {R"([{"source":"album","format":"jpeg","height":100}])", false},
+        {R"([{"source":"album","width":100,"height":100}])", false},
+        {R"([{"format":"jpeg","width":100,"height":100}])", false},
+    };
+    for (const Case& c : cases) {
+        JsonDocument doc;
+        JsonObject root;
+        std::string json = std::string(R"({"type":"stream/start","payload":{"artwork":{"channels":)") +
+                           c.channels + "}}}";
+        ASSERT_TRUE(parse(json.c_str(), doc, root));
+        StreamStartMessage msg;
+        EXPECT_EQ(process_stream_start_message(root, &msg), c.accepted) << c.channels;
+        EXPECT_EQ(msg.artwork.has_value(), c.accepted) << c.channels;
+        if (c.accepted) {
+            ASSERT_EQ(msg.artwork->channels->size(), 2u);
+            EXPECT_EQ((*msg.artwork->channels)[0].source, SendspinImageSource::NONE);
+            EXPECT_FALSE((*msg.artwork->channels)[0].format.has_value());
+        }
+    }
+}
+
 // Enum fields are validated against the known wire strings: a recognized value is applied, an
 // unrecognized one is dropped (leaving the field untouched) rather than clearing or storing garbage.
 TEST(Protocol, GroupUpdatePlaybackStateValidation) {
