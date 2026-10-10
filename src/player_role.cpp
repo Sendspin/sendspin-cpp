@@ -418,6 +418,9 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
 void PlayerRole::Impl::handle_stream_end() const {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     this->sync_task->signal_stream_end(this->stream_ordinal);
+    // The sync task discards the ended stream's audio when it reaches it; its charge goes now,
+    // since the next stream may refill the whole buffer first (see handle_stream_clear()).
+    this->sync_task->inbound().release_charges();
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation, 0);
 }
 
@@ -430,6 +433,10 @@ void PlayerRole::Impl::handle_stream_clear() {
     // so the sync task starts draining (freeing ring space) before the marker is written.
     // No listener callback: a seek is not a stream lifecycle event for the consumer.
     this->sync_task->signal_stream_clear();
+    // roles/player/v1.md "Player Buffer Accounting": the clear resets the server's count, so it
+    // may refill the whole advertised buffer before the sync task discards the old audio. Release
+    // the old audio's charge now so that refill is not dropped over quota.
+    this->sync_task->inbound().release_charges();
     if (!this->sync_task->inbound().hand_local(
             nullptr, 0,
             {.data_len = 0, .serial = 0, .type = CHUNK_TYPE_STREAM_CLEAR_MARKER, .data_offset = 0},

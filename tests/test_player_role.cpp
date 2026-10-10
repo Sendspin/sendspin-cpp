@@ -515,7 +515,8 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
     const Row rows[] = {
         {"Control: room for both chunks", 2, false, 2},
         {"room for one chunk", 1, false, 1},
-        {"room for one chunk: its codec header and clear marker still pass", 1, true, 3},
+        {"room for one chunk, held by the sync task: its codec header and clear marker still pass",
+         1, true, 2},
     };
 
     for (const Row& row : rows) {
@@ -533,13 +534,19 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
 
         InboundMessage second = receive_into_ring(ring, audio_chunk(0x02), 0);
         player->handle_binary(second);
+        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(),
+                  std::min<size_t>(2, row.player_quota_chunks) * one_chunk);
+        void* held = nullptr;
         if (row.header_and_marker) {
+            // A chunk the sync task holds keeps its charge through the clear, so the quota is
+            // still full when the marker is handed over.
+            held = player->sync_task->take_item(0);
+            ASSERT_NE(held, nullptr);
             player->handle_stream_start(pcm_stream_params());
             player->handle_stream_clear();
             take_in_ring_order(ring);
+            EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), one_chunk);
         }
-        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(),
-                  std::min<size_t>(row.player_items, row.player_quota_chunks) * one_chunk);
 
         InboundMessage frame = receive_into_ring(ring, loudness_frame(), 0);
         visualizer->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, frame);
@@ -548,6 +555,9 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
         EXPECT_FALSE(visualizer->drain_task->inbound.items().is_empty());
 
         EXPECT_EQ(take_all(*player).size(), row.player_items);
+        if (held != nullptr) {
+            player->sync_task->inbound().return_item(held);
+        }
         visualizer->drain_task->inbound.recall();
         EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
             << "a dropped chunk kept its charge";
@@ -584,6 +594,53 @@ TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
         SyncContext context;
         impl->sync_task->discard_to_clear_marker(context);
         EXPECT_EQ(take_all(*impl), row.survivors);
+    }
+}
+
+// roles/player/v1.md "Player Buffer Accounting": a stream/clear or stream/end resets the server's
+// count, so it may refill the whole buffer before the sync task discards the audio queued ahead
+// of the boundary. The boundary releases that audio's charge at once, so the refill is kept, and
+// the sync task's later return of the old items releases nothing twice.
+TEST(PlayerInboundHandOff, AStreamBoundaryFreesTheQuotaForTheRefillBehindIt) {
+    enum class Boundary { NONE, CLEAR, END };
+    struct Row {
+        const char* name;
+        Boundary boundary;
+        std::vector<uint8_t> listed;
+    };
+    const Row rows[] = {
+        {"Control: no boundary, the full quota drops the refill", Boundary::NONE, {0x01, 0x11}},
+        // 0x00 is the clear marker, which carries no encoded bytes.
+        {"stream/clear", Boundary::CLEAR, {0x01, 0x11, 0x00, 0x02, 0x12}},
+        {"stream/end", Boundary::END, {0x01, 0x11, 0x02, 0x12}},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        InboundRing& ring = *impl->sync_task->inbound().ring();
+        for (uint8_t marker : {0x01, 0x11}) {
+            InboundMessage old_chunk = receive_into_ring(ring, audio_chunk(marker), 0);
+            impl->handle_binary(old_chunk);
+        }
+        const size_t full = ring.quota(InboundHolder::PLAYER).outstanding();
+        ASSERT_GT(full, 0U);
+        ring.quota(InboundHolder::PLAYER).set_limit(full);
+
+        if (row.boundary == Boundary::CLEAR) {
+            impl->handle_stream_clear();
+            take_in_ring_order(ring);
+        } else if (row.boundary == Boundary::END) {
+            impl->handle_stream_end();
+        }
+        for (uint8_t marker : {0x02, 0x12}) {
+            InboundMessage refill = receive_into_ring(ring, audio_chunk(marker), 0);
+            impl->handle_binary(refill);
+        }
+
+        EXPECT_EQ(take_all(*impl), row.listed);
+        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
+            << "an item's charge was kept or released twice";
     }
 }
 
