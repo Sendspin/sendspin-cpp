@@ -741,6 +741,45 @@ TEST(PlayerHello, TheAdvertisedShareOfTheQuotaHoldsEncodedFrames) {
     }
 }
 
+// roles/player/v1.md "stream/start player object" ignores bit_depth for opus, which decodes to
+// 16-bit samples whatever the server sent. The codec header the sync task decodes with and the
+// params the consumer configures its output from both carry the decoded depth.
+TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
+    struct Row {
+        const char* name;
+        SendspinCodecFormat codec;
+        uint8_t decoded_bit_depth;
+    };
+    const Row rows[] = {
+        {"Control: pcm keeps the server's depth", SendspinCodecFormat::PCM, 24},
+#ifdef SENDSPIN_ENABLE_OPUS
+        {"opus publishes the decoder's depth", SendspinCodecFormat::OPUS, 16},
+#endif
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        ServerPlayerStreamObject params = pcm_stream_params();
+        params.codec = row.codec;
+        params.sample_rate = 48000;
+        params.bit_depth = 24;
+        impl->handle_stream_start(params);
+
+        void* header_item = impl->sync_task->take_item(0);
+        ASSERT_NE(header_item, nullptr);
+        DummyHeader header{};
+        ASSERT_EQ(SyncTask::encoded_size(header_item), sizeof(header));
+        std::memcpy(&header, SyncTask::encoded_data(header_item), sizeof(header));
+        impl->sync_task->inbound().return_item(header_item);
+        EXPECT_EQ(header.bits_per_sample, row.decoded_bit_depth);
+
+        ServerPlayerStreamObject published;
+        uint32_t generation = 0;
+        ASSERT_TRUE(impl->event_state->stream_params_slot.take(published, generation));
+        EXPECT_EQ(published.bit_depth, row.decoded_bit_depth);
+    }
+}
+
 // ============================================================================
 // Output delay: spec clamp, write avoidance, and the persisted-value range
 // ============================================================================
