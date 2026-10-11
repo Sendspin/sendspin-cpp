@@ -109,7 +109,7 @@ struct PlayerRole::Impl : RoleTeardown {
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted chunk; `data` points at its message type byte.
     void handle_binary(InboundMessage& message);
-    void handle_stream_start(const ServerPlayerStreamObject& player_obj);
+    void handle_stream_start(ServerPlayerStreamObject player_obj);
     void handle_stream_end() const;
     void handle_stream_clear();
     void handle_server_command(const ServerCommandMessage& cmd) const;

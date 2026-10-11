@@ -351,7 +351,7 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
                                generation);
 }
 
-void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) {
+void PlayerRole::Impl::handle_stream_start(ServerPlayerStreamObject player_obj) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
     // Numbers the codec header and the STREAM_START, so the sync task starts the stream only on
@@ -363,6 +363,12 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
         SS_LOGE(TAG, "Stream start message missing required audio parameters");
     } else {
         auto codec = player_obj.codec.value();
+        if (codec == SendspinCodecFormat::OPUS) {
+            // The codec header below and the params the consumer configures its output from both
+            // carry the depth the decoder writes, not stream/start's bit_depth, which is ignored
+            // for opus (roles/player/v1.md "stream/start player object").
+            player_obj.bit_depth = OPUS_DECODED_BITS_PER_SAMPLE;
+        }
 
         if (codec == SendspinCodecFormat::PCM ||
             (OPUS_DECODER_ENABLED && codec == SendspinCodecFormat::OPUS)) {
@@ -411,7 +417,7 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     // high_performance_requested_for_playback main-thread-only. Both carry `generation`, so a
     // teardown that runs before the drain takes them leaves a START the drain discards and params
     // it never applies (see drain_events()).
-    this->event_state->stream_params_slot.write(player_obj, generation);
+    this->event_state->stream_params_slot.write(std::move(player_obj), generation);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation, ordinal);
 }
 

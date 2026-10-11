@@ -34,6 +34,11 @@ namespace sendspin {
 /// Constraints").
 static constexpr uint32_t MAX_AUDIO_CHUNK_MS = 150U;
 
+/// @brief Bits per sample of decoded Opus audio, whatever stream/start's bit_depth says
+/// (roles/player/v1.md "stream/start player object": bit_depth is ignored for opus). The decoder
+/// writes opus_decode()'s 16-bit samples.
+static constexpr uint8_t OPUS_DECODED_BITS_PER_SAMPLE = 16U;
+
 /**
  * @brief Audio decoder wrapper supporting FLAC, raw PCM, and (with SENDSPIN_ENABLE_OPUS) Opus
  *
