@@ -24,10 +24,12 @@
 #include "fake_persistence.h"
 #include "inbound_test_helpers.h"
 #include "inbox.h"
+#include "platform/time.h"
 #include "player_role_impl.h"  // build_state_fields(); private access, see tests/CMakeLists.txt
 #include "protocol_messages.h"
 #include "protocol_task.h"
 #include "sync_task.h"
+#include "transfer_buffer.h"
 #include "visualizer_role_impl.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
@@ -921,4 +923,89 @@ TEST(PlayerRoleOutputDelay, PersistedValueIsLoadedOnlyWithinTheSpecRange) {
         DelayClient fixture(provider, /*initial_delay_ms=*/77);
         EXPECT_EQ(fixture.player->get_output_delay_ms(), row.expected_delay_ms);
     }
+}
+
+// ============================================================================
+// Hard sync after an underrun: the gap is measured from now
+// ============================================================================
+
+// The estimate an underrun leaves behind (the end of the last audio played) is moved up to the
+// current time once it trails it by more than the hard-sync threshold.
+TEST(PlayerHardSync, AStarvedEstimateIsFlooredAtNow) {
+    constexpr int64_t NOW = 1'000'000'000;
+    struct Row {
+        const char* name;
+        int64_t playtime;
+        int64_t expected;
+    };
+    const Row rows[] = {
+        {"Control: ahead of now", NOW + 50'000, NOW + 50'000},
+        {"Control: behind by exactly the threshold", NOW - 5'000, NOW - 5'000},
+        {"behind by just over the threshold", NOW - 5'001, NOW},
+        {"behind by a long underrun", NOW - 20'000'000, NOW},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(SyncTask::starved_playtime_floor(row.playtime, NOW), row.expected);
+    }
+}
+
+namespace {
+
+// A sink that accepts every write and records the bytes in order.
+struct RecordingSink : PlayerRoleListener {
+    size_t on_audio_write(uint8_t* data, size_t length, uint32_t /*timeout_ms*/) override {
+        written.insert(written.end(), data, data + length);
+        return length;
+    }
+    std::vector<uint8_t> written;
+};
+
+}  // namespace
+
+// roles/player/v1.md "Large errors and startup": after a long underrun the estimate still ends
+// where the last audio did. Measured from there, a chunk due shortly would get the whole underrun
+// as silence ahead of it; measured from now it gets at most its own lead.
+TEST(PlayerHardSync, AfterAnUnderrunTheGapIsMeasuredFromNow) {
+    constexpr uint8_t CHUNK_SAMPLE = 0x7F;
+    constexpr uint32_t LEAD_FRAMES = 44100;  // 1 s at 44.1 kHz
+    constexpr uint32_t CHUNK_FRAMES = 441;
+    auto impl = make_impl();
+    RecordingSink sink;
+    impl->listener = &sink;
+
+    // One decoded chunk due 1 s from now, against an estimate left 20 s behind. The lead is long
+    // enough that the chunk still needs a hard sync however slowly this runs.
+    SyncContext context;
+    context.current_stream_info = AudioStreamInfo(16, 2, 44100);
+    context.bytes_per_frame = context.current_stream_info.frames_to_bytes(1);
+    const size_t chunk_bytes = context.current_stream_info.frames_to_bytes(CHUNK_FRAMES);
+    context.decode_buffer = TransferBuffer::create(chunk_bytes + context.bytes_per_frame,
+                                                   MemoryLocation::PREFER_INTERNAL);
+    context.decode_buffer->set_listener(&sink);
+    std::memset(context.decode_buffer->get_buffer_end(), CHUNK_SAMPLE, chunk_bytes);
+    context.decode_buffer->increase_buffer_length(chunk_bytes);
+    const int64_t now = platform_time_us();
+    context.new_audio_client_playtime = now - 20'000'000;
+    context.decoded_timestamp = now + 1'000'000;
+    context.hard_syncing = false;
+    context.aligning = false;
+
+    // The SYNCHRONIZE_AUDIO/TRANSFER_AUDIO states, as the sync thread runs them, until the chunk
+    // is out.
+    SyncTask& task = *impl->sync_task;
+    SyncTaskState state = task.handle_synchronize_audio(context);
+    while (state != SyncTaskState::LOAD_CHUNK) {
+        state = state == SyncTaskState::SYNCHRONIZE_AUDIO ? task.handle_synchronize_audio(context)
+                                                          : task.handle_transfer_audio(context);
+    }
+
+    const auto first_chunk_byte = std::find(sink.written.begin(), sink.written.end(), CHUNK_SAMPLE);
+    const uint32_t silence_frames = context.current_stream_info.bytes_to_frames(
+        static_cast<size_t>(first_chunk_byte - sink.written.begin()));
+    // Time passing only shortens the lead, so the bound holds however slowly this runs.
+    EXPECT_LE(silence_frames, LEAD_FRAMES);
+    // Control: the chunk follows the silence whole.
+    EXPECT_EQ(sink.written.end() - first_chunk_byte, static_cast<std::ptrdiff_t>(chunk_bytes));
 }

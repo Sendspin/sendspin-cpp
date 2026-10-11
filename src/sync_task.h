@@ -233,6 +233,11 @@ protected:
     /// speaker. These two must always be updated together to keep the playtime estimate consistent.
     void track_sent_audio(SyncContext& sync_context, size_t bytes_sent);
 
+    /// @brief The playtime estimate floored at `now_us` once it trails it by more than
+    /// HARD_SYNC_THRESHOLD_US: every frame sent has played, so the sink starved, and the silence
+    /// it played on its own went unreported. New audio starts no earlier than now.
+    static int64_t starved_playtime_floor(int64_t playtime_us, int64_t now_us);
+
     /// @brief Sends one chunk of pending silence (initial-sync priming or hard-sync gap fill) to
     /// the sink and updates the playtime estimate. No-op when no silence is pending.
     void send_pending_silence(SyncContext& sync_context);

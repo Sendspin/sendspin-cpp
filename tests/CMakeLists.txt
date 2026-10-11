@@ -167,7 +167,9 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # stamp from before a teardown, the payload a drain on the far side of it would hold); SyncTask's
 # inbound_ (and take_item()), bound to a test ring the way start() binds it but with no thread, so
 # what a handler handed over (or dropped) stays on the list to be read, and
-# discard_to_clear_marker(), the sync thread's stream/clear step. The inbound tests also bind a
+# discard_to_clear_marker(), the sync thread's stream/clear step; and SyncTask's
+# handle_synchronize_audio(), handle_transfer_audio() and starved_playtime_floor(), the inner
+# loop's hard-sync steps driven without the thread. The inbound tests also bind a
 # VisualizerRole::Impl to the same ring, to show one holder's quota does not stop the other. The
 # availability table reaches SendspinClient's protocol_task_, build_client_state(),
 # adopt_client_state(), connection_manager_ (its install_admitted()) and process_binary_message():

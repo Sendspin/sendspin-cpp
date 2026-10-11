@@ -18,6 +18,7 @@
 #include "constants.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
+#include "platform/time.h"
 #include "player_role_impl.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
@@ -272,6 +273,11 @@ SyncTaskState SyncTask::handle_load_chunk(SyncContext& sync_context) {
 }
 
 SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
+    // roles/player/v1.md "Large errors and startup": recovery from an underrun snaps to the chunk's
+    // timestamp, so measure from now rather than from where the last audio ended.
+    sync_context.new_audio_client_playtime =
+        starved_playtime_floor(sync_context.new_audio_client_playtime, platform_time_us());
+
     // Predicted error: positive means chunk should play later than our current buffer endpoint
     int64_t raw_error = sync_context.decoded_timestamp - sync_context.new_audio_client_playtime;
 
@@ -382,6 +388,13 @@ void SyncTask::track_sent_audio(SyncContext& sync_context, size_t bytes_sent) {
     sync_context.buffered_frames += frames_sent;
     sync_context.new_audio_client_playtime +=
         sync_context.current_stream_info.frames_to_microseconds(frames_sent);
+}
+
+int64_t SyncTask::starved_playtime_floor(int64_t playtime_us, int64_t now_us) {
+    if (playtime_us < now_us - HARD_SYNC_THRESHOLD_US) {
+        return now_us;
+    }
+    return playtime_us;
 }
 
 void SyncTask::send_pending_silence(SyncContext& sync_context) {
