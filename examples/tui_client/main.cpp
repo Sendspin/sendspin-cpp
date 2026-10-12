@@ -21,8 +21,11 @@
 ///   name:  Optional friendly name (default: "TUI Client")
 ///
 /// Options:
+///   -u URL    Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)
 ///   -p PORT   Listen on PORT (default: 8928)
 ///   -f FORMAT Audio format as codec:rate:bits:channels (repeatable)
+///   -a        Enable unpaired access, so a server can stream without pairing first
+///   -V        Disable visualizer
 ///   -h        Show usage
 
 #include "tui.h"
@@ -437,6 +440,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "                Can be specified multiple times. Codecs: %s\n",
             SUPPORTED_CODECS);
     fprintf(stderr, "                At least one flac or pcm format is required\n");
+    fprintf(stderr, "  -a            Enable unpaired access, so a server can stream without\n");
+    fprintf(stderr, "                pairing first\n");
     fprintf(stderr, "  -V            Disable visualizer\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
@@ -444,11 +449,12 @@ static void print_usage(const char* prog) {
 int main(int argc, char* argv[]) {
     // Parse command line options
     bool enable_visualizer = true;
+    bool unpaired_access = false;
     std::string connect_url;
     uint16_t server_port = DEFAULT_SENDSPIN_PORT;
     std::vector<sendspin::AudioSupportedFormatObject> audio_formats;
     int opt;
-    while ((opt = getopt(argc, argv, "u:p:f:Vh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:f:aVh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
@@ -468,6 +474,9 @@ int main(int argc, char* argv[]) {
                 audio_formats.push_back(fmt);
                 break;
             }
+            case 'a':
+                unpaired_access = true;
+                break;
             case 'V':
                 enable_visualizer = false;
                 break;
@@ -576,6 +585,7 @@ int main(int argc, char* argv[]) {
 
     SendspinClient client(std::move(config));
     client.set_persistence_provider(&persistence_provider);
+    client.set_unpaired_access_enabled(unpaired_access);
 
     // Add roles
 #ifdef SENDSPIN_ENABLE_PLAYER

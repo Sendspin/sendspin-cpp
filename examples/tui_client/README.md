@@ -44,6 +44,7 @@ brew install portaudio
 ./build/examples/tui_client/tui_client "My Player"            # custom name
 ./build/examples/tui_client/tui_client -u ws://192.168.1.10:8928/sendspin  # connect to a specific server
 ./build/examples/tui_client/tui_client -p 8930                # listen on a custom port
+./build/examples/tui_client/tui_client -a                     # allow unpaired access
 ./build/examples/tui_client/tui_client -V                     # disable visualizer
 ```
 
@@ -51,6 +52,6 @@ Press `q` to quit.
 
 ## Pairing
 
-The example does not enable unpaired access, so a server has to pair with the client before it can stream. The Server panel shows the connection's trust and, when a server pairs with a code, the six-digit code to enter there. A Pairing Token panel holds the Pairing PSK token to paste into a server that pairs via `pairing_psk`, and disappears once the connection is paired.
+By default the example does not enable unpaired access, so a server has to pair with the client before it can stream; with `-a`, a server can stream without pairing once its operator approves the client. The Server panel shows the connection's trust and, when a server pairs with a code, the six-digit code to enter there. A Pairing Token panel holds the Pairing PSK token to paste into a server that pairs via `pairing_psk`, and disappears once the connection is paired.
 
 Identity and pairing records are stored in `~/.sendspin_tui.json`, separate from basic_client's file; delete it to re-provision the client from scratch.
