@@ -28,6 +28,7 @@
 ///   -u URL    Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)
 ///   -p PORT   Listen on PORT (default: 8928)
 ///   -o        Stream Opus-encoded audio instead of PCM (needs SENDSPIN_ENABLE_OPUS)
+///   -s DBFS   Report line sense: signal present while the input's level is at or above DBFS
 ///   -l LEVEL  Set log level: none, error, warn, info (default), debug, verbose
 ///   -v        Verbose logging (same as -l verbose)
 ///   -q        Quiet logging (same as -l error)
@@ -61,6 +62,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -76,6 +78,10 @@ static const char* SENDSPIN_PATH = "/sendspin";
 static constexpr uint32_t CAPTURE_SAMPLE_RATE = 48000;
 static constexpr uint8_t CAPTURE_BIT_DEPTH = 16;
 static constexpr unsigned long CAPTURE_FRAMES_PER_BUFFER = CAPTURE_SAMPLE_RATE / 50;
+
+// How long the input level must stay across the line sense threshold to flip the signal
+static constexpr uint32_t SIGNAL_PRESENT_HOLD_MS = 100;
+static constexpr uint32_t SIGNAL_ABSENT_HOLD_MS = 2000;
 
 #ifdef SENDSPIN_HAS_MDNS
 // Manages mDNS service advertisement via dns_sd.h
@@ -121,9 +127,9 @@ private:
 };
 #endif  // SENDSPIN_HAS_MDNS
 
-/// @brief Captures the default PortAudio input device and feeds the source role: the input
-/// callback forwards each buffer to write_audio(), which never blocks, with its capture time
-/// mapped onto the client's clock; the listener callbacks start and stop the capture stream.
+/// @brief Captures the default PortAudio input device and feeds the source role: while the
+/// input stream is open, the input callback forwards each buffer to write_audio(), which never
+/// blocks, with its capture time mapped onto the client's clock.
 class PortAudioCapture {
 public:
     PortAudioCapture() {
@@ -171,7 +177,10 @@ public:
             return false;
         }
         source_ = &source;
+        channels_ = channels;
         bytes_per_frame_ = static_cast<size_t>(channels) * (CAPTURE_BIT_DEPTH / 8U);
+        present_hold_frames_ = sample_rate / 1000U * SIGNAL_PRESENT_HOLD_MS;
+        absent_hold_frames_ = sample_rate / 1000U * SIGNAL_ABSENT_HOLD_MS;
 
         PaStreamParameters params;
         memset(&params, 0, sizeof(params));
@@ -217,6 +226,24 @@ public:
         }
     }
 
+    /// @brief Meters each buffer's RMS level against threshold_dbfs; call before start()
+    void enable_line_sense(double threshold_dbfs) {
+        // Compared as a mean square, so the callback needs no logarithm
+        constexpr double FULL_SCALE = 32768.0;
+        threshold_mean_square_ = FULL_SCALE * FULL_SCALE * std::pow(10.0, threshold_dbfs / 10.0);
+        line_sense_ = true;
+    }
+
+    /// @brief Whether the metered input currently counts as carrying a signal
+    bool signal_present() const {
+        return signal_present_.load(std::memory_order_relaxed);
+    }
+
+    /// @brief Gates forwarding to write_audio(); set from the source listener callbacks
+    void set_streaming(bool streaming) {
+        streaming_.store(streaming, std::memory_order_relaxed);
+    }
+
     /// @brief The number of refused writes since the last call, resetting the count
     uint32_t take_dropped_writes() {
         return dropped_writes_.exchange(0, std::memory_order_relaxed);
@@ -229,6 +256,12 @@ private:
         auto* self = static_cast<PortAudioCapture*>(user_data);
         if (input == nullptr) {
             return paContinue;  // Input overflow gap; nothing to forward
+        }
+        if (self->line_sense_) {
+            self->meter(static_cast<const int16_t*>(input), frame_count);
+        }
+        if (!self->streaming_.load(std::memory_order_relaxed)) {
+            return paContinue;
         }
 
         // Only the buffer's age (currentTime - inputBufferAdcTime) is portable across PortAudio
@@ -257,10 +290,43 @@ private:
         return paContinue;
     }
 
+    /// @brief Updates the signal state from one buffer's level, applying the hold times
+    void meter(const int16_t* samples, unsigned long frame_count) {
+        const size_t sample_count = static_cast<size_t>(frame_count) * channels_;
+        if (sample_count == 0) {
+            return;
+        }
+        double sum_squares = 0.0;
+        for (size_t i = 0; i < sample_count; ++i) {
+            const double sample = samples[i];
+            sum_squares += sample * sample;
+        }
+        const bool loud = sum_squares / static_cast<double>(sample_count) >= threshold_mean_square_;
+
+        const bool present = signal_present_.load(std::memory_order_relaxed);
+        if (loud == present) {
+            contrary_frames_ = 0;
+            return;
+        }
+        contrary_frames_ += frame_count;
+        if (contrary_frames_ >= (present ? absent_hold_frames_ : present_hold_frames_)) {
+            signal_present_.store(loud, std::memory_order_relaxed);
+            contrary_frames_ = 0;
+        }
+    }
+
     SourceRole* source_{nullptr};
     PaStream* stream_{nullptr};
     size_t bytes_per_frame_{0};
     std::atomic<uint32_t> dropped_writes_{0};
+    std::atomic<bool> streaming_{false};
+    std::atomic<bool> signal_present_{false};
+    double threshold_mean_square_{0.0};
+    uint64_t contrary_frames_{0};  // Frames the level has disagreed with the reported signal
+    uint32_t present_hold_frames_{0};
+    uint32_t absent_hold_frames_{0};
+    uint8_t channels_{0};
+    bool line_sense_{false};
     bool initialized_{false};
 };
 
@@ -279,6 +345,7 @@ static void print_usage(const char* prog) {
 #ifdef SENDSPIN_ENABLE_OPUS
     fprintf(stderr, "  -o            Stream Opus-encoded audio instead of PCM\n");
 #endif
+    fprintf(stderr, "  -s DBFS       Report line sense: signal present at or above DBFS (e.g. -50)\n");
     fprintf(stderr, "  -l LEVEL      Log level: none, error, warn, info (default), debug, verbose\n");
     fprintf(stderr, "  -v            Verbose logging (same as -l verbose)\n");
     fprintf(stderr, "  -q            Quiet logging (same as -l error)\n");
@@ -293,6 +360,16 @@ static bool parse_log_level(const char* str, LogLevel& level) {
     if (strcmp(str, "debug") == 0) { level = LogLevel::DEBUG; return true; }
     if (strcmp(str, "verbose") == 0) { level = LogLevel::VERBOSE; return true; }
     return false;
+}
+
+static bool parse_dbfs(const char* str, double& dbfs) {
+    char* end = nullptr;
+    double value = strtod(str, &end);
+    if (*str == '\0' || *end != '\0' || !std::isfinite(value) || value > 0.0) {
+        return false;
+    }
+    dbfs = value;
+    return true;
 }
 
 static bool parse_port(const char* str, uint16_t& port) {
@@ -315,8 +392,9 @@ int main(int argc, char* argv[]) {
     std::string connect_url;
     uint16_t server_port = DEFAULT_SENDSPIN_PORT;
     bool use_opus = false;
+    std::optional<double> line_sense_dbfs;
     int opt;
-    while ((opt = getopt(argc, argv, "u:p:ol:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:os:l:vqh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
@@ -336,6 +414,17 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "-o needs a library built with SENDSPIN_ENABLE_OPUS\n");
                 return 1;
 #endif
+            case 's': {
+                double dbfs = 0.0;
+                if (!parse_dbfs(optarg, dbfs)) {
+                    fprintf(stderr, "Invalid line sense threshold (dBFS, at most 0): %s\n",
+                            optarg);
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                line_sense_dbfs = dbfs;
+                break;
+            }
             case 'l':
                 if (!parse_log_level(optarg, log_level)) {
                     fprintf(stderr, "Unknown log level: %s\n", optarg);
@@ -402,20 +491,29 @@ int main(int argc, char* argv[]) {
     source_config.channels = channels;
     source_config.bit_depth = CAPTURE_BIT_DEPTH;
     source_config.codec = use_opus ? SendspinCodecFormat::OPUS : SendspinCodecFormat::PCM;
+    source_config.line_sense = line_sense_dbfs.has_value();
     auto& source = client.add_source(std::move(source_config));
 
     if (!capture.open(source, CAPTURE_SAMPLE_RATE, channels)) {
         return 1;
+    }
+    if (line_sense_dbfs.has_value()) {
+        capture.enable_line_sense(*line_sense_dbfs);
+        if (!capture.start()) {
+            return 1;
+        }
     }
 
     // --- Listener implementations ---
 
     struct CaptureSourceListener : SourceRoleListener {
         PortAudioCapture& capture;
-        explicit CaptureSourceListener(PortAudioCapture& c) : capture(c) {}
+        bool line_sense;
+        CaptureSourceListener(PortAudioCapture& c, bool sense) : capture(c), line_sense(sense) {}
 
         void on_streaming_started() override {
             fprintf(stderr, ">>> Streaming started\n");
+            capture.set_streaming(true);
             if (!capture.start()) {
                 // The stream is open on the wire but capture cannot run; leave the main loop so
                 // shutdown closes the stream rather than leave the server waiting on silence.
@@ -426,7 +524,10 @@ int main(int argc, char* argv[]) {
 
         void on_streaming_stopped() override {
             fprintf(stderr, ">>> Streaming stopped\n");
-            capture.stop();
+            capture.set_streaming(false);
+            if (!line_sense) {
+                capture.stop();
+            }
         }
     };
 
@@ -481,7 +582,7 @@ int main(int argc, char* argv[]) {
         bool is_network_ready() override { return true; }
     };
 
-    CaptureSourceListener source_listener(capture);
+    CaptureSourceListener source_listener(capture, line_sense_dbfs.has_value());
     SourceClientListener client_listener;
     HostNetworkProvider network_provider;
 
@@ -537,14 +638,23 @@ int main(int argc, char* argv[]) {
     // Main loop
     constexpr auto DROP_REPORT_INTERVAL = std::chrono::seconds(5);
     auto next_drop_report = std::chrono::steady_clock::now() + DROP_REPORT_INTERVAL;
+    std::optional<bool> reported_signal;
     while (running.load()) {
         client.loop();
+        if (line_sense_dbfs.has_value()) {
+            bool present = capture.signal_present();
+            if (reported_signal != present) {
+                reported_signal = present;
+                source.set_signal(present ? SourceSignal::PRESENT : SourceSignal::ABSENT);
+                fprintf(stderr, ">>> Line sense: signal %s\n", present ? "present" : "absent");
+            }
+        }
         // Surface capture drops off the audio callback, which only counts them
         if (std::chrono::steady_clock::now() >= next_drop_report) {
             next_drop_report += DROP_REPORT_INTERVAL;
             uint32_t dropped = capture.take_dropped_writes();
             if (dropped > 0) {
-                // A stop also refuses the few callbacks still in flight before capture stops
+                // A stop also refuses the callbacks until on_streaming_stopped() runs
                 fprintf(stderr, ">>> Refused %u capture writes in the last %lld s\n", dropped,
                         static_cast<long long>(DROP_REPORT_INTERVAL.count()));
             }

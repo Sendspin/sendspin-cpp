@@ -207,7 +207,9 @@ A role configured with `line_sense` reports the capture input's signal state fro
 source.set_signal(SourceSignal::PRESENT);  // or ABSENT
 ```
 
-`examples/source_client/` is a working reference: it captures the default PortAudio input device and feeds `write_audio()` from the capture callback with each buffer's capture time on the client's clock.
+Detecting the signal is up to the application (a jack-detect pin, a link state, or a level meter on the input); call `set_signal()` on each change. The server decides what to do with it (roles/source/v1.md "Default streaming behavior").
+
+`examples/source_client/` is a working reference: it captures the default PortAudio input device and feeds `write_audio()` from the capture callback with each buffer's capture time on the client's clock. With `-s` it also reports line sense from the input's level.
 
 ## Step 3: Implement Listener Interfaces
 
