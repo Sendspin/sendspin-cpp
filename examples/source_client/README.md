@@ -50,7 +50,7 @@ Press Ctrl+C to stop.
 
 ## Line sense
 
-With `-s DBFS` the client reports whether the input's RMS level is at or above the threshold, which the server may use to decide when to start the stream. Pick a threshold a little above the input's noise floor. Capture then runs from startup, so a microphone's in-use indicator stays on.
+With `-s DBFS` the client reports line sense from the input's RMS level: present after 100 ms at or above the threshold, absent after 2 s below. The server may use it to decide when to start the stream. Pick a threshold a little above the input's noise floor. Capture then runs from startup, so a microphone's in-use indicator stays on.
 
 ## Pairing
 

@@ -128,8 +128,8 @@ private:
 #endif  // SENDSPIN_HAS_MDNS
 
 /// @brief Captures the default PortAudio input device and feeds the source role: while the
-/// input stream is open, the input callback forwards each buffer to write_audio(), which never
-/// blocks, with its capture time mapped onto the client's clock.
+/// source role is streaming, the input callback forwards each buffer to write_audio(), which
+/// never blocks, with its capture time mapped onto the client's clock.
 class PortAudioCapture {
 public:
     PortAudioCapture() {
