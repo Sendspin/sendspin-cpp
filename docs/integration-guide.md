@@ -230,7 +230,7 @@ the other is `SendspinNetworkProvider::is_network_ready()`.
 
 ```cpp
 struct MyPlayerListener : PlayerRoleListener {
-    // REQUIRED: Write decoded PCM audio to your audio output.
+    // REQUIRED: Write decoded PCM audio (interleaved, little-endian) to your audio output.
     // Called from a background thread. May block up to timeout_ms.
     // Must return the number of bytes actually written.
     size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {

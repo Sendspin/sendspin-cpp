@@ -15,6 +15,7 @@
 #include "source_encoder_opus.h"
 
 #include "opus_state_location.h"
+#include "pcm_byte_order.h"
 #include "platform/logging.h"
 #include "source_task.h"
 #include <opus.h>
@@ -87,6 +88,7 @@ size_t OpusSourceEncoder::encode(const uint8_t* in, size_t in_len, uint8_t* out,
     if (in != this->pcm_scratch_.data()) {
         std::memcpy(this->pcm_scratch_.data(), in, in_len);
     }
+    pcm16_le_to_from_host(this->pcm_scratch_.data(), in_len);
     // max_data_bytes is a hard packet cap: libopus lowers quality to fit rather than failing.
     // The task offers at least MAX_PACKET_BYTES, so its chunks never degrade.
     const auto capacity =
