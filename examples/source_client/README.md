@@ -1,6 +1,6 @@
 # Source Client Example
 
-Runs the sendspin-cpp client with the source role on a host computer (macOS/Linux), capturing the default PortAudio input device and streaming it to a Sendspin server. The server gates streaming: capture starts on its start command and stops on its stop. When built with mDNS support, it advertises via mDNS so Sendspin servers discover and connect automatically; otherwise connect to a server manually with `-u ws://<server-host>:<port>/<path>`.
+Runs the sendspin-cpp client with the source role on a host computer (macOS/Linux), capturing the default PortAudio input device and streaming it to a Sendspin server. The server gates streaming: audio flows from its start command until its stop. When built with mDNS support, it advertises via mDNS so Sendspin servers discover and connect automatically; otherwise connect to a server manually with `-u ws://<server-host>:<port>/<path>`.
 
 ## Build
 
@@ -39,6 +39,7 @@ macOS has mDNS support built in; no extra dependencies needed.
 ./build/examples/source_client/source_client "Line In"    # custom name
 ./build/examples/source_client/source_client -o           # stream Opus instead of PCM
 ./build/examples/source_client/source_client -p 8930      # listen on a custom port
+./build/examples/source_client/source_client -s -50       # report line sense at -50 dBFS
 ```
 
 The client listens on port 8928 by default. When mDNS is enabled it advertises `_sendspin._tcp` with the configured port so Sendspin servers on the local network discover and connect automatically; otherwise tell the server to connect with `ws://<this-host>:8928/sendspin`, replacing `8928` if you passed `-p`.
@@ -46,6 +47,10 @@ The client listens on port 8928 by default. When mDNS is enabled it advertises `
 Audio is captured at 48 kHz / 16-bit from the default input device (mono or stereo, following the device), in 20 ms chunks. Chunks are raw PCM by default; with `-o` they are Opus-encoded when the server accepts Opus, and PCM otherwise.
 
 Press Ctrl+C to stop.
+
+## Line sense
+
+With `-s DBFS` the client reports line sense from the input's RMS level: present after 100 ms at or above the threshold, absent after 2 s below. The server may use it to decide when to start the stream. Pick a threshold a little above the input's noise floor. Capture then runs from startup, so a microphone's in-use indicator stays on.
 
 ## Pairing
 
