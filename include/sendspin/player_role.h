@@ -81,7 +81,7 @@ public:
     /// @brief Writes decoded PCM audio to the platform's audio output
     ///
     /// Fires on the sync task's background thread. May block up to timeout_ms.
-    /// @param data Pointer to the decoded PCM audio data
+    /// @param data Decoded PCM audio data, interleaved and little-endian
     /// @param length Number of bytes to write; always a whole number of PCM frames
     /// @param timeout_ms Maximum time to wait for the write to complete
     /// @return Number of bytes actually written. Partial writes are allowed but must be a

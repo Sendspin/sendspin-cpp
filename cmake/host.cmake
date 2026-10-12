@@ -68,7 +68,7 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         FetchContent_Declare(
             micro_flac
             GIT_REPOSITORY https://github.com/esphome-libs/micro-flac.git
-            GIT_TAG        v0.1.1
+            GIT_TAG        v0.3.0
             GIT_SUBMODULES "lib/micro-ogg-demuxer"
         )
         FetchContent_MakeAvailable(micro_flac)

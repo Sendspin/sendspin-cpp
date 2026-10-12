@@ -15,6 +15,7 @@
 #include "decoder.h"
 
 #include "opus_state_location.h"
+#include "pcm_byte_order.h"
 #include "platform/logging.h"
 
 #include <algorithm>
@@ -197,6 +198,7 @@ bool SendspinDecoder::decode_audio_chunk(const uint8_t* data, size_t data_size,
         }
         *consumed = data_size;
         *decoded_size = this->current_stream_info_.frames_to_bytes(output_frames);
+        pcm16_le_to_from_host(output_buffer, *decoded_size);
 #endif
     } else {
         return false;
