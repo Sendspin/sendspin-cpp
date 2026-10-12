@@ -25,12 +25,8 @@
 namespace sendspin {
 
 /// @brief Converts 16-bit samples between little-endian and host byte order, in place
-///
-/// The library's PCM buffers are little-endian; libopus reads and writes host-order opus_int16.
-/// The conversion is its own inverse, so one call serves both directions. A no-op on
-/// little-endian hosts.
-/// @param data Sample buffer; needs no alignment.
-/// @param size Buffer size in bytes; an odd trailing byte is left alone.
+/// @param data Sample buffer; needs no alignment
+/// @param size Buffer size in bytes
 inline void pcm16_le_to_from_host(uint8_t* data, size_t size) {
     if constexpr (std::endian::native == std::endian::big) {
         for (size_t i = 0; i + 1 < size; i += 2) {
