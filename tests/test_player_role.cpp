@@ -901,10 +901,11 @@ TEST(PlayerRoleSupportedCommands, VolumeAndMuteCommandsAreIgnoredUnlessAdvertise
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         LevelListener listener;  // Outlives the role that holds it
-        auto impl = make_impl();
-        impl->listener = &listener;
-        impl->volume_adjustable = row.volume;
-        impl->mute_adjustable = row.mute;
+        SendspinClient client(make_client_config("player-command-gate"));
+        auto& player = client.add_player(make_player_config());
+        player.set_listener(&listener);
+        player.set_volume_adjustable(row.volume);
+        player.set_mute_adjustable(row.mute);
 
         ServerPlayerCommandObject player_cmd;
         player_cmd.command = SendspinPlayerCommand::VOLUME;
@@ -912,13 +913,13 @@ TEST(PlayerRoleSupportedCommands, VolumeAndMuteCommandsAreIgnoredUnlessAdvertise
         player_cmd.mute = true;
         ServerCommandMessage cmd;
         cmd.player = player_cmd;
-        impl->handle_server_command(cmd);
-        impl->drain_events();
+        player.impl_->handle_server_command(cmd);
+        player.impl_->drain_events();
 
         EXPECT_EQ(listener.volumes, row.volume ? std::vector<uint8_t>{70} : std::vector<uint8_t>{});
         EXPECT_EQ(listener.mutes, row.mute ? std::vector<bool>{true} : std::vector<bool>{});
-        EXPECT_EQ(impl->volume, row.volume ? 70 : 0);
-        EXPECT_EQ(impl->muted, row.mute);
+        EXPECT_EQ(player.get_volume(), row.volume ? 70 : 0);
+        EXPECT_EQ(player.get_muted(), row.mute);
     }
 }
 
