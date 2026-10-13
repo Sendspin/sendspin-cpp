@@ -25,6 +25,8 @@
 ///   -p PORT   Listen on PORT (default: 8928)
 ///   -f FORMAT Audio format as codec:rate:bits:channels (repeatable)
 ///   -a        Enable unpaired access, so a server can stream without pairing first
+///   -F        The server cannot set the volume, which starts at full scale
+///   -M        The server cannot set the mute state
 ///   -V        Disable visualizer
 ///   -h        Show usage
 
@@ -442,6 +444,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "                At least one flac or pcm format is required\n");
     fprintf(stderr, "  -a            Enable unpaired access, so a server can stream without\n");
     fprintf(stderr, "                pairing first\n");
+    fprintf(stderr, "  -F            The server cannot set the volume, which starts at full scale\n");
+    fprintf(stderr, "  -M            The server cannot set the mute state\n");
     fprintf(stderr, "  -V            Disable visualizer\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
@@ -450,11 +454,13 @@ int main(int argc, char* argv[]) {
     // Parse command line options
     bool enable_visualizer = true;
     bool unpaired_access = false;
+    bool server_volume = true;
+    bool server_mute = true;
     std::string connect_url;
     uint16_t server_port = DEFAULT_SENDSPIN_PORT;
     std::vector<sendspin::AudioSupportedFormatObject> audio_formats;
     int opt;
-    while ((opt = getopt(argc, argv, "u:p:f:aVh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:f:aFMVh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
@@ -476,6 +482,12 @@ int main(int argc, char* argv[]) {
             }
             case 'a':
                 unpaired_access = true;
+                break;
+            case 'F':
+                server_volume = false;
+                break;
+            case 'M':
+                server_mute = false;
                 break;
             case 'V':
                 enable_visualizer = false;
@@ -593,6 +605,11 @@ int main(int argc, char* argv[]) {
     player_config.audio_formats = std::move(audio_formats);
     auto& player = client.add_player(std::move(player_config));
     player.set_output_delay_adjustable(true);
+    player.set_volume_adjustable(server_volume);
+    player.set_mute_adjustable(server_mute);
+    if (!server_volume) {
+        player.update_volume(100);
+    }
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     // Added for its side effect: the client offers the role and accepts server/state for it.

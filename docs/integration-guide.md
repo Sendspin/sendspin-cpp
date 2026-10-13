@@ -1094,6 +1094,11 @@ player.update_output_delay(50);  // User-adjustable delay in ms
 // Enable/disable output delay adjustment by the server. When disabled, the stored delay
 // is not applied to sync timing and is reported as 0 in client state.
 player.set_output_delay_adjustable(true);
+
+// Volume and mute are server-adjustable by default. Disable either for a fixed-level output
+// (e.g. line out to an amplifier): client state omits its value and the server's command is ignored.
+player.set_volume_adjustable(false);
+player.set_mute_adjustable(false);
 ```
 
 ## External Sources
@@ -1568,7 +1573,7 @@ format arrives as the `format` argument of `on_display_pairing_code`.
 | `MUTE` | Mute state change from the server |
 | `SET_OUTPUT_DELAY` | Output delay adjustment from the server |
 
-These represent commands the server can send to the player. The player advertises which commands it supports. Enable `SET_OUTPUT_DELAY` with `player.set_output_delay_adjustable(true)`.
+These represent commands the server can send to the player. The player advertises which commands it supports. `VOLUME` and `MUTE` are advertised unless disabled with `player.set_volume_adjustable(false)` / `player.set_mute_adjustable(false)`; enable `SET_OUTPUT_DELAY` with `player.set_output_delay_adjustable(true)`.
 
 ### SendspinGoodbyeReason
 

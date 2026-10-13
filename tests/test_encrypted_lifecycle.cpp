@@ -102,6 +102,7 @@ constexpr uint16_t RECENCY_IDLE_TEST_PORT = 19021;
 constexpr uint16_t RECENCY_PLAYBACK_TEST_PORT = 19022;
 constexpr uint16_t RECENCY_LATER_PLAYBACK_TEST_PORT = 19023;
 constexpr uint16_t LIVENESS_STAMP_TEST_PORT = 19024;
+constexpr uint16_t PLAYER_KNOBS_TEST_PORT = 19025;
 constexpr uint16_t AVAILABILITY_TEST_PORT = 19079;
 constexpr uint16_t CLOCK_GATE_SYNCED_TEST_PORT = 19080;
 constexpr uint16_t CLOCK_GATE_UNSYNCED_TEST_PORT = 19081;
@@ -1416,6 +1417,64 @@ TEST(EncryptedLifecycle, ActivateThatAddsARoleSendsItsClientState) {
     ASSERT_TRUE(parse_last_client_state(*server, after_removal));
     EXPECT_TRUE(after_removal["payload"]["artwork"].isUnbound())
         << "a removed role's object was still reported";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// roles/player/v1.md "client/state player object": a player MAY update supported_commands and
+// MUST send a state update whenever a field changes, so withdrawing or restoring volume and mute
+// republishes client/state. The two steps call the setters in opposite orders, so each setter's
+// publish is the last one in some step.
+TEST(EncryptedLifecycle, PlayerVolumeAndMuteKnobsRepublishClientState) {
+    SendspinClientConfig config;
+    config.name = "Player Knobs Test Client";
+    config.server_port = PLAYER_KNOBS_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    add_state_object_roles(client);
+    PlayerRole& player = *client.player();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;  // An active player's state waits for clock sync.
+    options.first_roles_json = R"(["player@v1"])";
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(PLAYER_KNOBS_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+    pump_until(client, [&] { return server->client_state_count() > 0; });
+
+    // True when the last client/state carries volume and mute, each with its command, exactly when
+    // `reported`.
+    auto last_state_reports = [&](bool reported) {
+        JsonDocument doc;
+        if (!parse_last_client_state(*server, doc)) {
+            return false;
+        }
+        JsonObjectConst state = doc["payload"]["player"].as<JsonObjectConst>();
+        if (state.isNull()) {
+            return false;
+        }
+        bool volume_command = false;
+        bool mute_command = false;
+        for (JsonVariantConst command : state["supported_commands"].as<JsonArrayConst>()) {
+            volume_command |= command == "volume";
+            mute_command |= command == "mute";
+        }
+        return volume_command == reported && mute_command == reported &&
+               state["volume"].is<int>() == reported && state["muted"].is<bool>() == reported;
+    };
+    ASSERT_TRUE(last_state_reports(true)) << "Control: both are reported by default";
+
+    player.set_volume_adjustable(false);
+    player.set_mute_adjustable(false);
+    pump_until(client, [&] { return last_state_reports(false); });
+
+    player.set_mute_adjustable(true);
+    player.set_volume_adjustable(true);
+    pump_until(client, [&] { return last_state_reports(true); });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

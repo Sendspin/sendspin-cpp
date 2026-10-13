@@ -184,32 +184,52 @@ TEST(PlayerRoleTimingParameters, ReportedWhileOutputDelayIsNotAdjustable) {
 // Supported commands in client/state
 // ============================================================================
 
-// roles/player/v1.md "client/state player object": supported_commands lists what the server may
-// send. The role applies a volume or mute command on any output, so both are reported whether or
-// not the output delay can be changed.
-TEST(PlayerRoleSupportedCommands, VolumeAndMuteAreAlwaysReported) {
-    SendspinClient client(make_client_config("player-commands-fixed-delay"));
-    auto& player = client.add_player(make_player_config());
+// volume and muted are reported only alongside their command. Rows leaving a knob unset check
+// its default; the toggled row checks that re-enabling reports the stored value.
+TEST(PlayerRoleSupportedCommands, EachAdjustableControlAddsItsCommandAndField) {
+    using Cmd = SendspinPlayerCommand;
+    struct Row {
+        const char* name;
+        std::optional<bool> volume;
+        std::optional<bool> mute;
+        bool delay;
+        bool toggled;
+        std::vector<Cmd> commands;
+    };
+    const Row rows[] = {
+        {"Control: defaults", std::nullopt, std::nullopt, false, false, {Cmd::VOLUME, Cmd::MUTE}},
+        {"adjustable delay", std::nullopt, std::nullopt, true, false,
+         {Cmd::VOLUME, Cmd::MUTE, Cmd::SET_OUTPUT_DELAY}},
+        {"fixed volume", false, std::nullopt, false, false, {Cmd::MUTE}},
+        {"fixed mute", std::nullopt, false, false, false, {Cmd::VOLUME}},
+        {"fixed volume and mute", false, false, true, false, {Cmd::SET_OUTPUT_DELAY}},
+        {"volume and mute re-enabled", true, true, false, true, {Cmd::VOLUME, Cmd::MUTE}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SendspinClient client(make_client_config("player-commands"));
+        auto& player = client.add_player(make_player_config());
+        player.update_volume(40);
+        player.update_muted(true);
+        if (row.toggled) {
+            player.set_volume_adjustable(false);
+            player.set_mute_adjustable(false);
+        }
+        if (row.volume.has_value()) {
+            player.set_volume_adjustable(row.volume.value());
+        }
+        if (row.mute.has_value()) {
+            player.set_mute_adjustable(row.mute.value());
+        }
+        player.set_output_delay_adjustable(row.delay);
 
-    ClientPlayerStateObject state = build_player_state(player);
-    EXPECT_EQ(state.supported_commands, (std::vector<SendspinPlayerCommand>{
-                                            SendspinPlayerCommand::VOLUME,
-                                            SendspinPlayerCommand::MUTE,
-                                        }));
-}
-
-// An adjustable output delay adds set_output_delay to the same list rather than replacing it.
-TEST(PlayerRoleSupportedCommands, AdjustableOutputDelayAddsItsCommand) {
-    SendspinClient client(make_client_config("player-commands-adjustable-delay"));
-    auto& player = client.add_player(make_player_config());
-    player.set_output_delay_adjustable(true);
-
-    ClientPlayerStateObject state = build_player_state(player);
-    EXPECT_EQ(state.supported_commands, (std::vector<SendspinPlayerCommand>{
-                                            SendspinPlayerCommand::VOLUME,
-                                            SendspinPlayerCommand::MUTE,
-                                            SendspinPlayerCommand::SET_OUTPUT_DELAY,
-                                        }));
+        const bool volume_reported = row.volume.value_or(true);
+        const bool mute_reported = row.mute.value_or(true);
+        ClientPlayerStateObject state = build_player_state(player);
+        EXPECT_EQ(state.supported_commands, row.commands);
+        EXPECT_EQ(state.volume, volume_reported ? std::optional<uint8_t>(40) : std::nullopt);
+        EXPECT_EQ(state.muted, mute_reported ? std::optional<bool>(true) : std::nullopt);
+    }
 }
 
 // ============================================================================
@@ -848,6 +868,58 @@ TEST(PlayerRoleVolume, ValueOverTheSpecMaximumIsClamped) {
         impl->build_state_fields(state);
         ASSERT_TRUE(state.player.has_value());
         EXPECT_EQ(state.player->volume, row.reported);
+    }
+}
+
+// roles/player/v1.md "server/command player object": an unadvertised volume or mute command
+// reaches neither the listener nor the stored value.
+TEST(PlayerRoleSupportedCommands, VolumeAndMuteCommandsAreIgnoredUnlessAdvertised) {
+    class LevelListener : public PlayerRoleListener {
+    public:
+        size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
+            return length;
+        }
+        void on_volume_changed(uint8_t volume) override {
+            this->volumes.push_back(volume);
+        }
+        void on_mute_changed(bool muted) override {
+            this->mutes.push_back(muted);
+        }
+        std::vector<uint8_t> volumes;
+        std::vector<bool> mutes;
+    };
+    struct Row {
+        const char* name;
+        bool volume;
+        bool mute;
+    };
+    const Row rows[] = {
+        {"Control: both advertised", true, true},
+        {"volume not advertised", false, true},
+        {"mute not advertised", true, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        LevelListener listener;  // Outlives the role that holds it
+        SendspinClient client(make_client_config("player-command-gate"));
+        auto& player = client.add_player(make_player_config());
+        player.set_listener(&listener);
+        player.set_volume_adjustable(row.volume);
+        player.set_mute_adjustable(row.mute);
+
+        ServerPlayerCommandObject player_cmd;
+        player_cmd.command = SendspinPlayerCommand::VOLUME;
+        player_cmd.volume = 70;
+        player_cmd.mute = true;
+        ServerCommandMessage cmd;
+        cmd.player = player_cmd;
+        player.impl_->handle_server_command(cmd);
+        player.impl_->drain_events();
+
+        EXPECT_EQ(listener.volumes, row.volume ? std::vector<uint8_t>{70} : std::vector<uint8_t>{});
+        EXPECT_EQ(listener.mutes, row.mute ? std::vector<bool>{true} : std::vector<bool>{});
+        EXPECT_EQ(player.get_volume(), row.volume ? 70 : 0);
+        EXPECT_EQ(player.get_muted(), row.mute);
     }
 }
 

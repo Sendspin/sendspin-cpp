@@ -216,6 +216,7 @@ struct PlayerRole::Impl : RoleTeardown {
     // to go idle; the drain then runs again when sync_idle_slot is written. Main loop only.
     bool awaiting_sync_idle{false};
     bool high_performance_requested_for_playback{false};
+    bool mute_adjustable{true};
     bool muted{false};
     // True between the drained STREAM_START and STREAM_END callbacks (main-thread only); keeps
     // on_stream_end() from firing without a matching on_stream_start()
@@ -224,6 +225,7 @@ struct PlayerRole::Impl : RoleTeardown {
     /// and the sync task.
     std::atomic<bool> output_delay_adjustable{false};
     uint8_t volume{0};
+    bool volume_adjustable{true};
 };
 
 }  // namespace sendspin

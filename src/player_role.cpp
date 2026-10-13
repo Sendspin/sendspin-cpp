@@ -177,6 +177,16 @@ void PlayerRole::set_output_delay_adjustable(bool adjustable) {
     this->impl_->client->publish_state();
 }
 
+void PlayerRole::set_volume_adjustable(bool adjustable) {
+    this->impl_->volume_adjustable = adjustable;
+    this->impl_->client->publish_state();
+}
+
+void PlayerRole::set_mute_adjustable(bool adjustable) {
+    this->impl_->mute_adjustable = adjustable;
+    this->impl_->client->publish_state();
+}
+
 const ServerPlayerStreamObject& PlayerRole::get_current_stream_params() const {
     return this->impl_->current_stream_params;
 }
@@ -293,8 +303,6 @@ size_t PlayerRole::Impl::advertised_buffer_capacity() const {
 
 void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     ClientPlayerStateObject player_state{};
-    player_state.volume = this->volume;
-    player_state.muted = this->muted;
     bool adjustable = this->output_delay_adjustable.load(std::memory_order_relaxed);
     player_state.output_delay_ms =
         adjustable ? this->output_delay_ms.load(std::memory_order_relaxed) : 0;
@@ -305,8 +313,16 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
         std::max(this->config.required_lead_time_ms.value_or(0),
                  PlayerRoleConfig::pipeline_lead_time_ms(this->config.extra_startup_silence_ms));
     player_state.min_buffer_ms = this->config.min_buffer_ms;
-    // roles/player/v1.md "client/state player object": the commands the server may send.
-    player_state.supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE};
+    // roles/player/v1.md "client/state player object": the commands the server may send. volume
+    // and muted are required only alongside their command, so a withheld command omits its value.
+    if (this->volume_adjustable) {
+        player_state.volume = this->volume;
+        player_state.supported_commands.push_back(SendspinPlayerCommand::VOLUME);
+    }
+    if (this->mute_adjustable) {
+        player_state.muted = this->muted;
+        player_state.supported_commands.push_back(SendspinPlayerCommand::MUTE);
+    }
     if (adjustable) {
         player_state.supported_commands.push_back(SendspinPlayerCommand::SET_OUTPUT_DELAY);
     }
@@ -504,26 +520,29 @@ void PlayerRole::Impl::drain_events() {
     // Check each field independently since multiple command types may have been merged into one
     // inbox slot between drain ticks. Each callback may re-enter teardown (a listener calling
     // stop()), whose own drain already reset this role, so the rest is abandoned when the
-    // generation moved on.
+    // generation moved on. roles/player/v1.md "server/command player object": a command absent
+    // from the current supported_commands is ignored.
     if (have_command && cmd_msg.player.has_value()) {
         const ServerPlayerCommandObject& player_cmd = cmd_msg.player.value();
 
-        if (player_cmd.volume.has_value()) {
+        if (player_cmd.volume.has_value() && !this->volume_adjustable) {
+            SS_LOGD(TAG, "Ignoring volume: not in supported_commands");
+        } else if (player_cmd.volume.has_value()) {
             this->update_volume(player_cmd.volume.value());
             if (this->listener) {
                 this->listener->on_volume_changed(player_cmd.volume.value());
             }
         }
 
-        if (player_cmd.mute.has_value() && this->accepts(generation)) {
+        if (player_cmd.mute.has_value() && !this->mute_adjustable) {
+            SS_LOGD(TAG, "Ignoring mute: not in supported_commands");
+        } else if (player_cmd.mute.has_value() && this->accepts(generation)) {
             this->update_muted(player_cmd.mute.value());
             if (this->listener) {
                 this->listener->on_mute_changed(player_cmd.mute.value());
             }
         }
 
-        // roles/player/v1.md "server/command player object": a command absent from the current
-        // supported_commands is ignored.
         const bool delay_advertised = this->output_delay_adjustable.load(std::memory_order_relaxed);
         if (player_cmd.output_delay_ms.has_value() && !delay_advertised) {
             SS_LOGD(TAG, "Ignoring set_output_delay: not in supported_commands");
