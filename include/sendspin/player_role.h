@@ -188,6 +188,20 @@ public:
     /// @param adjustable true if the delay can be adjusted at runtime
     void set_output_delay_adjustable(bool adjustable);
 
+    /// @brief Enables or disables the server's volume command. Main loop only.
+    ///
+    /// Enabled by default. While disabled, volume is omitted from client state and a server
+    /// volume command is ignored; the stored volume is kept.
+    /// @param adjustable true if the server may set the volume
+    void set_volume_adjustable(bool adjustable);
+
+    /// @brief Enables or disables the server's mute command. Main loop only.
+    ///
+    /// Enabled by default. While disabled, the mute state is omitted from client state and a
+    /// server mute command is ignored; the stored state is kept.
+    /// @param adjustable true if the server may set the mute state
+    void set_mute_adjustable(bool adjustable);
+
     // ========================================
     // Queries
     // ========================================

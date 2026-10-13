@@ -949,8 +949,12 @@ std::string format_client_state_message(const ClientStateMessage* msg,
 
     if (msg->player.has_value()) {
         const ClientPlayerStateObject& player_state = msg->player.value();
-        root["payload"]["player"]["volume"] = player_state.volume;
-        root["payload"]["player"]["muted"] = player_state.muted;
+        if (player_state.volume.has_value()) {
+            root["payload"]["player"]["volume"] = player_state.volume.value();
+        }
+        if (player_state.muted.has_value()) {
+            root["payload"]["player"]["muted"] = player_state.muted.value();
+        }
         root["payload"]["player"]["output_delay_ms"] = player_state.output_delay_ms;
         root["payload"]["player"]["required_lead_time_ms"] = player_state.required_lead_time_ms;
         root["payload"]["player"]["min_buffer_ms"] = player_state.min_buffer_ms;

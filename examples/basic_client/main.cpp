@@ -28,6 +28,8 @@
 ///   -p PORT   Listen on PORT (default: 8928)
 ///   -s CODE   Offer the static pairing code CODE (8 digits) instead of the dynamic one
 ///   -a        Enable unpaired access, so a server can stream without pairing first
+///   -F        The server cannot set the volume, which starts at full scale
+///   -M        The server cannot set the mute state
 ///   -l LEVEL  Set log level: none, error, warn, info (default), debug, verbose
 ///   -v        Verbose logging (same as -l verbose)
 ///   -q        Quiet logging (same as -l error)
@@ -169,6 +171,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "                SIGUSR2 cancels it\n");
     fprintf(stderr, "  -a            Enable unpaired access, so a server can stream without\n");
     fprintf(stderr, "                pairing first\n");
+    fprintf(stderr, "  -F            The server cannot set the volume, which starts at full scale\n");
+    fprintf(stderr, "  -M            The server cannot set the mute state\n");
     fprintf(stderr, "  -l LEVEL      Log level: none, error, warn, info (default), debug, verbose\n");
     fprintf(stderr, "  -v            Verbose logging (same as -l verbose)\n");
     fprintf(stderr, "  -q            Quiet logging (same as -l error)\n");
@@ -207,9 +211,11 @@ int main(int argc, char* argv[]) {
     std::string connect_url;
     std::string static_pairing_code;
     bool unpaired_access = false;
+    bool server_volume = true;
+    bool server_mute = true;
     uint16_t server_port = DEFAULT_SENDSPIN_PORT;
     int opt;
-    while ((opt = getopt(argc, argv, "u:p:s:al:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:s:aFMl:vqh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
@@ -225,6 +231,12 @@ int main(int argc, char* argv[]) {
                 break;
             case 'a':
                 unpaired_access = true;
+                break;
+            case 'F':
+                server_volume = false;
+                break;
+            case 'M':
+                server_mute = false;
                 break;
             case 'p':
                 if (!parse_port(optarg, server_port)) {
@@ -311,6 +323,11 @@ int main(int argc, char* argv[]) {
     };
     auto& player = client.add_player(std::move(player_config));
     player.set_output_delay_adjustable(true);
+    player.set_volume_adjustable(server_volume);
+    player.set_mute_adjustable(server_mute);
+    if (!server_volume) {
+        player.update_volume(100);
+    }
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     // Added for its side effect: the client offers the role and accepts server/state for it.

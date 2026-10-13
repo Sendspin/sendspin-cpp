@@ -45,6 +45,7 @@ brew install portaudio
 ./build/examples/tui_client/tui_client -u ws://192.168.1.10:8928/sendspin  # connect to a specific server
 ./build/examples/tui_client/tui_client -p 8930                # listen on a custom port
 ./build/examples/tui_client/tui_client -a                     # allow unpaired access
+./build/examples/tui_client/tui_client -F -M                  # server cannot set volume or mute
 ./build/examples/tui_client/tui_client -V                     # disable visualizer
 ```
 

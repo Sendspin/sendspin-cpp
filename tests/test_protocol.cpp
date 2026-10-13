@@ -1131,6 +1131,34 @@ TEST(Protocol, FormatClientStatePlayerEmptySupportedCommandsIsStillEmitted) {
     EXPECT_EQ(doc["payload"]["player"]["supported_commands"].as<JsonArrayConst>().size(), 0u);
 }
 
+// roles/player/v1.md "client/state player object": volume and muted are optional keys, written
+// only when set. The control row's falsy values are still written.
+TEST(Protocol, FormatClientStatePlayerOmitsUnsetVolumeAndMuted) {
+    struct Row {
+        const char* name;
+        std::optional<uint8_t> volume;
+        std::optional<bool> muted;
+    };
+    const Row rows[] = {
+        {"Control: both set to falsy values", 0, false},
+        {"volume unset", std::nullopt, false},
+        {"muted unset", 0, std::nullopt},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        ClientStateMessage msg;
+        ClientPlayerStateObject player{};
+        player.volume = row.volume;
+        player.muted = row.muted;
+        msg.player = player;
+
+        JsonDocument doc;
+        ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+        EXPECT_EQ(doc["payload"]["player"]["volume"].is<int>(), row.volume.has_value());
+        EXPECT_EQ(doc["payload"]["player"]["muted"].is<bool>(), row.muted.has_value());
+    }
+}
+
 // Control: zero is a value the server must see reported, not a reason to omit the key. A
 // serializer that skipped falsy timing fields would pass the test above and fail this one.
 TEST(Protocol, FormatClientStatePlayerReportsZeroTimingFields) {

@@ -495,8 +495,8 @@ static constexpr uint8_t VOLUME_MAX = 100;
 
 /// @brief Player state reported by the client to the server in client/state messages
 struct ClientPlayerStateObject {
-    uint8_t volume{};
-    bool muted{};
+    std::optional<uint8_t> volume;
+    std::optional<bool> muted;
     uint16_t output_delay_ms{};
     uint16_t required_lead_time_ms{};
     uint16_t min_buffer_ms{};

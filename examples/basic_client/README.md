@@ -31,6 +31,7 @@ macOS has mDNS support built in; no extra dependencies needed.
 ./build/examples/basic_client/basic_client -p 8930     # listen on a custom port
 ./build/examples/basic_client/basic_client -s 12345678 # offer a static pairing code
 ./build/examples/basic_client/basic_client -a          # allow unpaired access
+./build/examples/basic_client/basic_client -F -M       # server cannot set volume or mute
 ```
 
 The client listens on port 8928 by default. When mDNS is enabled it advertises `_sendspin._tcp` with the configured port so Sendspin servers on the local network discover and connect automatically; otherwise tell the server to connect with `ws://<this-host>:8928/sendspin`, replacing `8928` if you passed `-p`.
