@@ -93,7 +93,12 @@ the descriptions in `docs/internals.md`:
   the codec gate
   `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`,
   `src/player_role.cpp`, `src/source_role.cpp`, `src/source_task.cpp`, and
-  the source's Opus encoder list in `cmake/sources.cmake`. Examples must
+  the source's Opus encoder list in `cmake/sources.cmake`; the host-only
+  message trace gate `SENDSPIN_ENABLE_MESSAGE_TRACE` only in
+  `include/sendspin/config.h`, `src/connection.h`, `src/connection.cpp`,
+  `src/connection_manager.cpp`, `src/noise_transport.h`,
+  `src/noise_transport.cpp`, and its own source list in `cmake/sources.cmake`
+  (no Kconfig entry). Examples must
   build with roles (and Opus) disabled:
   role and opus usage in `examples/` is guarded like an external consumer
   would guard it. Verify this by grepping the example for the role's types

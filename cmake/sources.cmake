@@ -107,6 +107,13 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
+    # The plaintext message trace, appended on host when SENDSPIN_ENABLE_MESSAGE_TRACE is on
+    set(SENDSPIN_MESSAGE_TRACE_SOURCES
+        ${BASE_DIR}/src/message_trace.cpp
+
+        PARENT_SCOPE
+    )
+
     # ESP-IDF only sources: networking layer deeply coupled to ESP-IDF APIs
     set(SENDSPIN_ESP_SOURCES
         ${BASE_DIR}/src/esp/server_connection.cpp

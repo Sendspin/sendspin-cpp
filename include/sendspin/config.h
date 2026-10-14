@@ -22,6 +22,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+#include <functional>
+#endif
 #include <limits>
 #include <optional>
 #include <string>
@@ -113,6 +116,38 @@ struct SendspinPsk {
         detail::secure_zero_psk(this->bytes);
     }
 };
+
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+/// @brief Which way a traced message crossed the connection
+enum class SendspinTraceDirection : uint8_t {
+    INBOUND,   // Received from the server
+    OUTBOUND,  // Sent to the server
+};
+
+/// @brief One protocol message as the message trace sees it (SendspinClientConfig::message_trace)
+struct SendspinTracedMessage {
+    /// Unique per connection while the process runs
+    uint64_t connection_id{0};
+    SendspinTraceDirection direction{SendspinTraceDirection::INBOUND};
+    /// False for a cleartext text frame (the handshake, or a message sent before the transport is
+    /// up); true for a transport message, type byte first. Outbound fragments are traced one by
+    /// one; inbound messages once reassembled.
+    bool binary{false};
+    /// Inbound: the receive stamp; outbound: just before encryption or the cleartext send. On the
+    /// clock SendspinClient::get_client_time() converts to.
+    int64_t stamp_us{0};
+    /// Valid only during the call. The pairing secrets (`long_term_psk`, `wrapped_psk`,
+    /// `wrapped_nonce_B`) read "<redacted>".
+    const uint8_t* plaintext{nullptr};
+    size_t plaintext_len{0};
+    /// Inbound player audio chunk: its bytes of encoded audio; 0 for any other message
+    size_t audio_bytes{0};
+};
+
+/// @brief Called on the protocol task for every message on every connection; must not block.
+/// Each connection holds its own copy.
+using SendspinMessageTraceFn = std::function<void(const SendspinTracedMessage& message)>;
+#endif
 
 // The implicit copy and move members touch the deprecated pairing_window_supported; only a
 // consumer's own use of it should warn.
@@ -321,6 +356,11 @@ struct SendspinClientConfig {
     /// Set to 0 to send every document to PSRAM. On host there is no PSRAM distinction and the
     /// arena is a plain scratch buffer. Used by the protocol task only.
     size_t json_arena_size{DEFAULT_JSON_ARENA_SIZE};
+
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    /// @brief Opt-in plaintext trace of every protocol message; empty for none
+    SendspinMessageTraceFn message_trace;
+#endif
 };
 #pragma GCC diagnostic pop
 

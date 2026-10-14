@@ -67,6 +67,11 @@ add_executable(sendspin_tests
 # chunk back, and nothing on the public surface reaches it without the sync thread.
 set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
+# Built only with the trace it tests.
+if(SENDSPIN_ENABLE_MESSAGE_TRACE)
+    target_sources(sendspin_tests PRIVATE test_message_trace.cpp)
+endif()
+
 # test_client_lifecycle.cpp checks what a role's stop() left on its item list, which nothing on
 # the public surface reports, and plays the protocol task on the test thread to install a stand-in
 # connection in ConnectionManager's admitted slot, to stage an accept or a full command queue at

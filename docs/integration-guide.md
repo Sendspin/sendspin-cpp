@@ -1185,6 +1185,7 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 | `ArtworkRoleListener::on_image_decode()` | Dedicated artwork decode thread |
 | `ArtworkRoleListener::on_image_display()` | Main loop thread |
 | `VisualizerRoleListener` data callbacks (`on_loudness()`, `on_beat()`, `on_f_peak()`, `on_spectrum()`, `on_peak()`) | Dedicated visualizer drain thread |
+| `SendspinClientConfig::message_trace` (built with `SENDSPIN_ENABLE_MESSAGE_TRACE`) | Protocol task |
 | All other listener methods | Main loop thread |
 
 `PlayerRole::notify_audio_played()` is thread-safe and is designed to be called from an audio output callback thread.
@@ -1310,6 +1311,16 @@ Available options (all `ON` by default):
 
 When `SENDSPIN_ENABLE_PLAYER` is `OFF`, micro-flac is not fetched, and micro-opus is fetched only for the source role. `SENDSPIN_ENABLE_OPUS=OFF` drops micro-opus alone, for products that cannot ship Opus (see the patent note in the player and source role specs); the player then refuses `OPUS` entries in `audio_formats`, and the source refuses an `OPUS` codec in its config.
 
+### Message trace (host only)
+
+`SENDSPIN_ENABLE_MESSAGE_TRACE` (`OFF` by default) adds `SendspinClientConfig::message_trace`, a callback that receives every protocol message's plaintext (inbound after decryption, outbound before encryption, plus the cleartext text frames), for conformance tooling and interop debugging. The ESP-IDF build has no switch for it. The callback runs on the protocol task and must not block. The pairing secrets a client sends read `"<redacted>"`; `SendspinTracedMessage` in `config.h` documents the fields.
+
+```cpp
+config.message_trace = [](const SendspinTracedMessage& message) {
+    // message.plaintext is valid only during this call: copy what you keep
+};
+```
+
 ### ESP-IDF (Kconfig)
 
 Role flags are exposed via Kconfig under `Component config → sendspin-cpp`:
@@ -1375,6 +1386,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
 | `static_pairing_code_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static pairing code the device shipped with, same values as above. Advertised on the `static_pairing_code` descriptor in `client/hello`; empty omits the hint. |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer that backs every JSON document the protocol task works with: the parse of each incoming protocol message and every message it builds, instead of PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the protocol task on every message. The arena holds one document at a time: a parsed message is released before the reply it triggers (the `client/state` after a `server/activate`, a pairing reply, a re-handshake's second message) is built. The default covers one steady-state protocol message, including the FLAC stream-start header; a document larger than the budget on its own, such as a large track-metadata message, falls back to PSRAM (those arrive only once per song). That holds on a 32-bit target, where ArduinoJson allocates each variant pool as one 1,024-byte block. Every freed block is wiped, so a document that held key material leaves none behind. Set to `0` to send every document to PSRAM. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer, and since a variant pool alone is 4 KB there, the default fits no document's pool on host. |
+| `message_trace` | `SendspinMessageTraceFn` | empty | Only in a build with `SENDSPIN_ENABLE_MESSAGE_TRACE` (host only): called with every protocol message's plaintext, on the protocol task. See [Message trace (host only)](#message-trace-host-only). |
 
 ---
 
