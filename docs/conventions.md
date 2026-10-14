@@ -36,12 +36,13 @@ checklists in `.claude/skills/` apply these standards to a diff.
   provider poll, nothing else (while the client is stopped it only frees the
   outbound attempts `stop()` left parked): do not add mutex-protected endpoints
   or atomics that `loop()` polls for work. The protocol task calls no
-  listener, a role thread calls only the data-path callbacks
-  `docs/integration-guide.md` names for it (`on_audio_write()` on the sync
-  task, `on_image_decode()` on the artwork decode thread, the visualizer data
-  callbacks on its drain thread), and only the main loop calls the persistence
-  and network providers: everything else a consumer hears it hears from the
-  main loop's drain. A thread that must wait for the main loop to
+  listener (its one consumer callback is the host-only
+  `SendspinClientConfig::message_trace`), a role thread calls only the
+  data-path callbacks `docs/integration-guide.md` names for it
+  (`on_audio_write()` on the sync task, `on_image_decode()` on the artwork
+  decode thread, the visualizer data callbacks on its drain thread), and only
+  the main loop calls the persistence and network providers: everything else a
+  consumer hears it hears from the main loop's drain. A thread that must wait for the main loop to
   have called a listener waits for a grant the drain publishes (the
   high-performance grant), never for the main loop itself.
 - The Inbox event ring is for ordered lifecycle events only (stream start and
@@ -148,9 +149,14 @@ checklists in `.claude/skills/` apply these standards to a diff.
   and the codec gate
   `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`,
   `src/player_role.cpp`, `src/source_role.cpp`, `src/source_task.cpp`, and
-  the source's Opus encoder list in `cmake/sources.cmake`; consumers,
-  including the examples, guard their own role and codec usage (see Public
-  API).
+  the source's Opus encoder list in `cmake/sources.cmake`. The host-only
+  message trace gate `SENDSPIN_ENABLE_MESSAGE_TRACE` lives only in
+  `include/sendspin/config.h`, `src/connection.h`, `src/connection.cpp`,
+  `src/connection_manager.cpp`, `src/noise_transport.h`,
+  `src/noise_transport.cpp`, and its own source list in
+  `cmake/sources.cmake` (`src/message_trace.cpp`); it has no Kconfig entry.
+  Consumers, including the examples, guard their own role and codec usage
+  (see Public API).
 - Logging uses the `SS_LOG*` macros; allocation uses the `platform_malloc`
   family with an explicit `MemoryLocation` choice where it matters.
 - Code that only builds on one platform still keeps the other platform's build

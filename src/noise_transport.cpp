@@ -51,6 +51,11 @@ size_t NoiseTransport::encrypt_in_place(uint8_t* buf, size_t buf_capacity, size_
         SS_LOGE(TAG, "encrypt_in_place: buffer lacks AEAD tag room");
         return 0;
     }
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    if (this->message_tracer_ != nullptr) {
+        this->message_tracer_->trace_outbound(buf, plaintext_len);
+    }
+#endif
 
     // noise-c advances the send nonce past a failed encrypt too.
     const size_t ct_len = this->session_->encrypt(buf, plaintext_len, buf_capacity);

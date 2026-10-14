@@ -21,6 +21,9 @@
 #include "crypto/cpace.h"
 #include "crypto/keys.h"
 #include "inbound_ring.h"
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+#include "message_trace.h"
+#endif
 #include "noise_handshake.h"
 #include "noise_transport.h"
 #include "platform/crypto.h"
@@ -842,6 +845,15 @@ public:
         this->json_arena_ = &arena;
     }
 
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    /// @brief Installs the client's message trace for this connection
+    /// @note Must be called before the connection reaches the protocol task, like set_json_arena().
+    void set_message_trace(const SendspinMessageTraceFn& trace) {
+        this->message_tracer_.configure(trace, this->instance_id);
+        this->noise_transport_.set_message_tracer(&this->message_tracer_);
+    }
+#endif
+
 protected:
     // ========================================
     // Transport frames
@@ -1024,6 +1036,12 @@ protected:
     /// Encrypted transport: owns the cipher session, outbound fragmentation, and inbound
     /// reassembly. Protocol task only; see noise_transport.h.
     NoiseTransport noise_transport_;
+
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    /// Traces this connection's messages. Written once by set_message_trace(), then protocol task
+    /// only.
+    MessageTracer message_tracer_;
+#endif
 
     /// Server identity: name from server/hello, server_id from the Noise handshake result
     /// (or re-handshake; unchanged across a re-handshake since it is the same server). Protocol

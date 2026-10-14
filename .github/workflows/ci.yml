@@ -104,8 +104,9 @@ jobs:
 
       - name: Configure CMake
         # BUILD_EXAMPLES=OFF so the test job configures only sendspin + tests and skips the
-        # example-only FetchContent deps (e.g. FTXUI).
-        run: cmake -B build-tests -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .
+        # example-only FetchContent deps (e.g. FTXUI). The message trace is on here and in the TSan
+        # job; the build and no-opus jobs build it off, as consumers get it.
+        run: cmake -B build-tests -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DSENDSPIN_ENABLE_MESSAGE_TRACE=ON -DBUILD_EXAMPLES=OFF .
 
       - name: Build tests
         run: |
@@ -190,7 +191,7 @@ jobs:
       - name: Configure CMake
         # ENABLE_TSAN instead of ENABLE_SANITIZERS: TSan cannot be combined with ASan/UBSan, and
         # the concurrency tests only report a data race when built this way.
-        run: cmake -B build-tsan -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .
+        run: cmake -B build-tsan -DENABLE_WERROR=ON -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DSENDSPIN_ENABLE_MESSAGE_TRACE=ON -DBUILD_EXAMPLES=OFF .
 
       - name: Build tests
         run: |

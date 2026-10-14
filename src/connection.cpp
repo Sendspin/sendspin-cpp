@@ -110,6 +110,9 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len) {
         return this->send_encrypted_text(json, len);
     }
     // Pre-handshake cold path: the text-frame API takes a std::string.
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    this->message_tracer_.trace_outbound_text(std::string_view(json, len));
+#endif
     return this->send_text_message(std::string(json, len));
 }
 
@@ -216,6 +219,9 @@ void SendspinConnection::send_noise_client_init() {
     }
     std::string client_init = this->noise_handshake_->build_client_init();
     if (!client_init.empty()) {
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+        this->message_tracer_.trace_outbound_text(client_init);
+#endif
         this->send_text_message(client_init);
     }
 }
@@ -226,6 +232,9 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
     }
 
     auto send_fn = [this](const std::string& msg) -> bool {
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+        this->message_tracer_.trace_outbound_text(msg);
+#endif
         auto err = this->send_text_message(msg);
         return err == SsErr::OK;
     };
@@ -387,6 +396,11 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
     const bool noise_pending = !noise_active && this->noise_handshake_;
 
     if (message.kind == InboundKind::TEXT) {
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+        this->message_tracer_.trace_inbound(
+            false, widen_time_stamp_us(message.receive_time_us, platform_time_us()), message.data,
+            message.len);
+#endif
         if (noise_pending) {
             // Feed the handshake driver; it handles server/init and noise/handshake frames.
             this->handle_noise_handshake_text(
@@ -458,6 +472,11 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
         complete.receive_time_us = message.receive_time_us;
         complete.kind = InboundKind::BINARY;
     }
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    this->message_tracer_.trace_inbound(
+        true, widen_time_stamp_us(complete.receive_time_us, platform_time_us()), complete.data,
+        complete.len);
+#endif
     return classify_complete_noise_message(complete);
 }
 

@@ -7,7 +7,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="${ROOT_DIR}/build"
+# Its own build directory, so the trace option below never changes the main build
+BUILD_DIR="${ROOT_DIR}/build-tidy"
 
 # Find clang-tidy
 CLANG_TIDY=""
@@ -33,11 +34,11 @@ if [ -z "$CLANG_TIDY" ]; then
     exit 1
 fi
 
-# Ensure compile_commands.json exists
-if [ ! -f "${BUILD_DIR}/compile_commands.json" ]; then
-    echo "Generating compile_commands.json..."
-    cmake -B "$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "$ROOT_DIR"
-fi
+# Configure on every run (cheap once configured) with the message trace on, so its gated code is
+# analyzed too
+echo "Generating compile_commands.json..."
+cmake -B "$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DSENDSPIN_ENABLE_MESSAGE_TRACE=ON \
+    "$ROOT_DIR" > /dev/null
 
 # Find all source files, excluding build/ and src/esp/ directories
 SOURCES=$(find "$ROOT_DIR/src" \

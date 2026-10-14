@@ -28,6 +28,9 @@
 #include "platform/memory.h"
 #include "platform/types.h"
 #include "sendspin/types.h"
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+#include "message_trace.h"
+#endif
 
 #include <array>
 #include <cstddef>
@@ -186,6 +189,14 @@ public:
         this->buffer_location_ = location;
     }
 
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    /// @brief Sets the tracer each frame goes through before its encrypt. Call before any
+    /// transport traffic.
+    void set_message_tracer(const MessageTracer* tracer) {
+        this->message_tracer_ = tracer;
+    }
+#endif
+
 private:
     /// @brief Encrypts one frame in place under the current session. Call only with a session
     /// and the send not desynced, which every caller checks first. A failed encrypt sets
@@ -274,6 +285,12 @@ private:
     /// Noise cipher session (set at handshake COMPLETE, replaced on re-handshake swap).
     /// Protocol task only.
     std::unique_ptr<NoiseSession> session_;
+
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    /// From set_message_tracer(); nullptr for none. Written once at setup, then protocol task
+    /// only.
+    const MessageTracer* message_tracer_{nullptr};
+#endif
 
     // size_t fields
     /// Bytes used in reasm_buf_ (including the leading orig_type byte), 0 while the in-flight

@@ -161,6 +161,10 @@ else()
     # patent-encumbered; see the player and source role specs.
     option(SENDSPIN_ENABLE_OPUS "Enable Opus in the player and source roles" ON)
 
+    # Plaintext trace of every protocol message (SendspinClientConfig::message_trace), for
+    # conformance tooling. Host only: the ESP-IDF build has no switch for it.
+    option(SENDSPIN_ENABLE_MESSAGE_TRACE "Enable the plaintext protocol message trace" OFF)
+
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/host.cmake)
 
     # Get sources
@@ -193,6 +197,9 @@ else()
             list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_OPUS_SOURCES})
         endif()
     endif()
+    if(SENDSPIN_ENABLE_MESSAGE_TRACE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_MESSAGE_TRACE_SOURCES})
+    endif()
 
     # Create the library: core sources, enabled role sources, host networking (via host.cmake)
     add_library(sendspin STATIC ${SENDSPIN_ALL_SOURCES})
@@ -221,6 +228,9 @@ else()
     endif()
     if(SENDSPIN_ENABLE_SOURCE)
         target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_SOURCE)
+    endif()
+    if(SENDSPIN_ENABLE_MESSAGE_TRACE)
+        target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_MESSAGE_TRACE)
     endif()
 
     # Host build options

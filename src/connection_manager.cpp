@@ -347,6 +347,9 @@ bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
     conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
     conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
     conn->set_json_arena(this->json_arena());
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    conn->set_message_trace(this->client_->config_.message_trace);
+#endif
     conn->attach_inbound(this->client_->inbound_ring_.get(), this->client_->protocol_task_.get());
 
     ProtocolCommand command;
@@ -429,6 +432,9 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
     client_conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
     client_conn->set_json_arena(this->json_arena());
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    client_conn->set_message_trace(this->client_->config_.message_trace);
+#endif
 
     // Attached before start(): the transport may deliver, or report its upgrade, from its own
     // thread as soon as it runs.
