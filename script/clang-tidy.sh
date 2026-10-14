@@ -33,10 +33,10 @@ if [ -z "$CLANG_TIDY" ]; then
     exit 1
 fi
 
-# Ensure compile_commands.json exists
+# Ensure compile_commands.json exists. The message trace is on so its gated code is analyzed too.
 if [ ! -f "${BUILD_DIR}/compile_commands.json" ]; then
     echo "Generating compile_commands.json..."
-    cmake -B "$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "$ROOT_DIR"
+    cmake -B "$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DSENDSPIN_ENABLE_MESSAGE_TRACE=ON "$ROOT_DIR"
 fi
 
 # Find all source files, excluding build/ and src/esp/ directories
