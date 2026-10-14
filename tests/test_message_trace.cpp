@@ -217,8 +217,8 @@ TEST(MessageTrace, RedactsThePairingSecretsAndNothingElse) {
          json_body + format_client_pair_confirm_message(client_kc, wrapped, TestArena()),
          wrapped_b64},
         {"unterminated value", true, json_body + R"({"payload":{"wrapped_psk":"SECRET)", "SECRET"},
-        {"no secret", true, json_body + R"({"type":"client/state","payload":{}})", ""},
-        {"binary audio", true, std::string("\x04", 1) + R"("wrapped_psk":"BYTES")", ""},
+        {"Control: no secret", true, json_body + R"({"type":"client/state","payload":{}})", ""},
+        {"Control: binary audio", true, std::string("\x04", 1) + R"("wrapped_psk":"BYTES")", ""},
     };
 
     for (const Row& row : rows) {
@@ -242,6 +242,7 @@ TEST(MessageTrace, RedactsThePairingSecretsAndNothingElse) {
         ASSERT_EQ(traced.size(), 1U) << row.name;
         if (row.secret.empty()) {
             EXPECT_EQ(pointers[0], sent) << row.name;
+            EXPECT_EQ(traced[0], row.sent) << row.name;
         } else {
             ASSERT_NE(row.sent.find(row.secret), std::string::npos) << row.name;
             EXPECT_EQ(traced[0], with_redacted(row.sent, row.secret)) << row.name;
