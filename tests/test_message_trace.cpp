@@ -15,15 +15,20 @@
 // The plaintext message trace (SendspinClientConfig::message_trace). Built only with
 // SENDSPIN_ENABLE_MESSAGE_TRACE.
 
+#include "crypto/psk_wrap.h"
 #include "lifecycle_test_fixtures.h"
 #include "message_trace.h"
+#include "platform/base64.h"
 #include "platform/time.h"
+#include "protocol_messages.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "test_util.h"
 
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -174,33 +179,46 @@ TEST(MessageTrace, RecordsTheHandshakeTheTransportMessagesAndAnAudioChunk) {
     pump_for(client, 100);
 }
 
-// Each pairing secret reads "<redacted>" and nothing else changes; a message with no secret, and
-// a binary message, reach the trace as the very bytes sent.
+/// Copies `text` with every occurrence of `secret` replaced by "<redacted>".
+std::string with_redacted(std::string text, const std::string& secret) {
+    for (size_t at = text.find(secret); at != std::string::npos; at = text.find(secret, at)) {
+        text.replace(at, secret.size(), "<redacted>");
+    }
+    return text;
+}
+
+// Each pairing secret, as the client's own formatters spell it, reads "<redacted>" and nothing
+// else changes; a message with no secret, and a binary message, reach the trace as the very bytes
+// sent.
 TEST(MessageTrace, RedactsThePairingSecretsAndNothingElse) {
+    std::array<uint8_t, 32> psk{};
+    psk.fill(0x11);
+    std::array<uint8_t, WRAPPED_VALUE_SIZE> wrapped{};
+    wrapped.fill(0x22);
+    std::array<uint8_t, 64> client_kc{};
+    client_kc.fill(0x33);
+    const std::string psk_b64 = b64url_encode(psk.data(), psk.size());
+    const std::string wrapped_b64 = b64url_encode(wrapped.data(), wrapped.size());
+
     struct Row {
         const char* name;
         bool binary;
         std::string sent;
-        std::string traced;  // Empty: the sent bytes, unchanged and not copied.
+        std::string secret;  // Empty: the sent bytes reach the trace unchanged and not copied.
     };
     const std::string json_body(1, '\0');
-    const std::string audio("\x04", 1);
     const std::vector<Row> rows = {
-        {"cleartext long_term_psk", false,
-         R"({"type":"client/pair-finalize","payload":{"long_term_psk":"SECRETSECRET"}})",
-         R"({"type":"client/pair-finalize","payload":{"long_term_psk":"<redacted>"}})"},
-        {"transport wrapped_psk", true,
-         json_body + R"({"type":"client/pair-finalize","payload":{"wrapped_psk":"SECRET"}})",
-         json_body + R"({"type":"client/pair-finalize","payload":{"wrapped_psk":"<redacted>"}})"},
+        {"cleartext long_term_psk", false, format_client_pair_finalize_message(psk, TestArena()),
+         psk_b64},
+        {"wrapped_psk", true,
+         json_body + format_client_pair_finalize_wrapped_message(wrapped, TestArena()),
+         wrapped_b64},
         {"wrapped_nonce_B beside client_kc", true,
-         json_body +
-             R"({"type":"client/pair-confirm","payload":{"client_kc":"TAG","wrapped_nonce_B":"SECRET"}})",
-         json_body +
-             R"({"type":"client/pair-confirm","payload":{"client_kc":"TAG","wrapped_nonce_B":"<redacted>"}})"},
-        {"unterminated value", true, json_body + R"({"payload":{"wrapped_psk":"SECR)",
-         json_body + R"({"payload":{"wrapped_psk":"<redacted>)"},
+         json_body + format_client_pair_confirm_message(client_kc, wrapped, TestArena()),
+         wrapped_b64},
+        {"unterminated value", true, json_body + R"({"payload":{"wrapped_psk":"SECRET)", "SECRET"},
         {"no secret", true, json_body + R"({"type":"client/state","payload":{}})", ""},
-        {"binary audio", true, audio + R"("wrapped_psk":"BYTES")", ""},
+        {"binary audio", true, std::string("\x04", 1) + R"("wrapped_psk":"BYTES")", ""},
     };
 
     for (const Row& row : rows) {
@@ -222,11 +240,11 @@ TEST(MessageTrace, RedactsThePairingSecretsAndNothingElse) {
         }
 
         ASSERT_EQ(traced.size(), 1U) << row.name;
-        if (row.traced.empty()) {
+        if (row.secret.empty()) {
             EXPECT_EQ(pointers[0], sent) << row.name;
         } else {
-            EXPECT_EQ(traced[0], row.traced) << row.name;
-            EXPECT_EQ(traced[0].find("SECR"), std::string::npos) << row.name;
+            ASSERT_NE(row.sent.find(row.secret), std::string::npos) << row.name;
+            EXPECT_EQ(traced[0], with_redacted(row.sent, row.secret)) << row.name;
         }
     }
 }

@@ -36,12 +36,13 @@ checklists in `.claude/skills/` apply these standards to a diff.
   provider poll, nothing else (while the client is stopped it only frees the
   outbound attempts `stop()` left parked): do not add mutex-protected endpoints
   or atomics that `loop()` polls for work. The protocol task calls no
-  listener, a role thread calls only the data-path callbacks
-  `docs/integration-guide.md` names for it (`on_audio_write()` on the sync
-  task, `on_image_decode()` on the artwork decode thread, the visualizer data
-  callbacks on its drain thread), and only the main loop calls the persistence
-  and network providers: everything else a consumer hears it hears from the
-  main loop's drain. A thread that must wait for the main loop to
+  listener (its one consumer callback is the host-only
+  `SendspinClientConfig::message_trace`), a role thread calls only the
+  data-path callbacks `docs/integration-guide.md` names for it
+  (`on_audio_write()` on the sync task, `on_image_decode()` on the artwork
+  decode thread, the visualizer data callbacks on its drain thread), and only
+  the main loop calls the persistence and network providers: everything else a
+  consumer hears it hears from the main loop's drain. A thread that must wait for the main loop to
   have called a listener waits for a grant the drain publishes (the
   high-performance grant), never for the main loop itself.
 - The Inbox event ring is for ordered lifecycle events only (stream start and
