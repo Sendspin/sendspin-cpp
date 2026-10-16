@@ -318,6 +318,9 @@ public:
     /// @brief Returns the current log level (host builds only, INFO on ESP-IDF)
     static LogLevel get_log_level();
 
+    /// @brief Returns the current time on the client clock in microseconds. Any thread.
+    static int64_t now_us();
+
     // ========================================
     // Lifecycle
     // ========================================

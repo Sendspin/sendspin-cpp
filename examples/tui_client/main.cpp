@@ -90,13 +90,6 @@ using namespace sendspin;
 static constexpr uint16_t DEFAULT_SENDSPIN_PORT = SendspinClientConfig::DEFAULT_SERVER_PORT;
 static const char* SENDSPIN_PATH = "/sendspin";
 
-// Big-endian helpers for binary visualizer data parsing
-static int64_t now_us() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
 // Null audio write callback (used when PortAudio is not available)
 static size_t null_audio_write(uint8_t*, size_t length, uint32_t) {
     return length;
@@ -929,14 +922,14 @@ int main(int argc, char* argv[]) {
 
         void on_beat(int64_t /*client_timestamp*/, bool /*downbeat*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            int64_t current_us = now_us();
+            int64_t current_us = SendspinClient::now_us();
             state.vis_beat = true;
             state.vis_beat_expire_us = current_us + 100000;  // 100ms flash
         }
 
         void on_peak(int64_t /*client_timestamp*/, uint8_t /*strength*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            int64_t current_us = now_us();
+            int64_t current_us = SendspinClient::now_us();
             state.vis_peak = true;
             state.vis_peak_expire_us = current_us + 100000;  // 100ms flash
         }
@@ -1080,7 +1073,7 @@ int main(int argc, char* argv[]) {
 
             // Smooth visualizer display values every tick (10ms), only when visible
             if (vis_showing) {
-                int64_t current_us = now_us();
+                int64_t current_us = SendspinClient::now_us();
                 std::lock_guard<std::mutex> lock(state.mutex);
 
                 // Smooth decay: display values chase target values each tick.

@@ -14,6 +14,8 @@
 
 #include "portaudio_sink.h"
 
+#include "sendspin/client.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -314,9 +316,7 @@ void PortAudioSink::clear() {
 int PortAudioSink::pa_callback(const void* /*input*/, void* output, unsigned long frame_count,
                                const PaStreamCallbackTimeInfo* time_info,
                                PaStreamCallbackFlags /*status_flags*/, void* user_data) {
-    int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                         std::chrono::steady_clock::now().time_since_epoch())
-                         .count();
+    int64_t now_us = SendspinClient::now_us();
 
     auto* self = static_cast<PortAudioSink*>(user_data);
     size_t bytes_requested = frame_count * self->bytes_per_frame_;
@@ -339,7 +339,7 @@ int PortAudioSink::pa_callback(const void* /*input*/, void* output, unsigned lon
     // outputBufferDacTime is when the first sample of this buffer will hit the DAC.
     // We compute the finish time (when the last frame exits the DAC) by adding
     // the frame duration. The offset from currentTime to DAC time is converted
-    // from PA's clock domain to esp_timer's clock domain.
+    // from PA's clock domain to the client clock.
     if (bytes_read > 0 && self->on_frames_played) {
         uint32_t frames_played = static_cast<uint32_t>(bytes_read / self->bytes_per_frame_);
 
