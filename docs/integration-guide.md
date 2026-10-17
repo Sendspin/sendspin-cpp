@@ -193,7 +193,7 @@ auto& source = client.add_source(source_config);
 
 An invalid config (see [SourceRoleConfig](#sourceroleconfig)) leaves the role inert; a valid config whose buffers cannot be allocated fails `client.start()` instead. An `OPUS` role streams Opus only to a server whose `server/hello` lists it, and the same capture as PCM otherwise.
 
-Feed the capture to `write_audio()` from one capture thread, with the capture time of each buffer's first sample on the client's clock (`std::chrono::steady_clock` on host, `esp_timer_get_time()` on ESP-IDF), or 0 to have the write stamped as ending now:
+Feed the capture to `write_audio()` from one capture thread, with the capture time of each buffer's first sample on the client's clock (`SendspinClient::now_us()`), or 0 to have the write stamped as ending now:
 
 ```cpp
 source.write_audio(pcm_bytes, len, capture_time_us);
@@ -276,7 +276,7 @@ player.notify_audio_played(frames_played, current_timestamp_us);
 ```
 
 - `frames_played`: Number of audio frames (not bytes) just played
-- `timestamp`: Client timestamp in microseconds when the audio will finish playing (e.g., from `std::chrono::steady_clock`)
+- `timestamp`: Client timestamp in microseconds when the audio will finish playing (e.g., from `SendspinClient::now_us()`)
 
 This method is thread-safe and is expected to be called from an audio callback thread.
 

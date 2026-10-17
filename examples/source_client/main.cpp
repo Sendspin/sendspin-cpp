@@ -273,9 +273,7 @@ private:
         if (time_info != nullptr && time_info->currentTime > 0 &&
             time_info->inputBufferAdcTime > 0 &&
             time_info->inputBufferAdcTime <= time_info->currentTime) {
-            int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                 std::chrono::steady_clock::now().time_since_epoch())
-                                 .count();
+            int64_t now_us = SendspinClient::now_us();
             double age_us = (time_info->currentTime - time_info->inputBufferAdcTime) * 1000000.0;
             capture_us = now_us - static_cast<int64_t>(std::round(age_us));
         }

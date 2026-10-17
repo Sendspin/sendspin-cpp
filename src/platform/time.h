@@ -50,14 +50,23 @@ inline TickType_t platform_ms_to_ticks(uint32_t timeout_ms) {
 #else  // Host
 
 #include <chrono>
+#include <ctime>
 
 namespace sendspin {
 
 /// @brief Returns monotonic time in microseconds
-/// @return Microseconds elapsed since an arbitrary epoch (steady_clock).
+/// @return Microseconds elapsed since an arbitrary epoch (CLOCK_MONOTONIC_RAW on Linux,
+/// steady_clock elsewhere).
 inline int64_t platform_time_us() {
+#if defined(__linux__)
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    auto now = std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec);
+    return std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+#else
     auto now = std::chrono::steady_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+#endif
 }
 
 }  // namespace sendspin

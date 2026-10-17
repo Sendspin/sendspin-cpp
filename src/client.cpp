@@ -28,6 +28,7 @@
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/network_info.h"
+#include "platform/time.h"
 #include "record_store.h"
 #include "teardown_tracker.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -319,6 +320,10 @@ void SendspinClient::set_log_level(LogLevel level) {
 
 LogLevel SendspinClient::get_log_level() {
     return static_cast<LogLevel>(platform_get_log_level());
+}
+
+int64_t SendspinClient::now_us() {
+    return platform_time_us();
 }
 
 // ============================================================================
