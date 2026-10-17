@@ -96,9 +96,19 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeRes
 
     // TEMPORARY DEBUG: interleaved mode. `previous` reports when the last reply actually left;
     // that exchange is recomputed with it and competes as a refined sample.
-    if (this->interleaved_ && response.time_msg.has_previous && this->have_last_response_ &&
-        response.time_msg.previous_client_transmitted ==
-            this->last_response_.time_msg.client_transmitted) {
+    // A reply leaves after its stamp, and not by much: a refinement outside [0, 100 ms) is a bad
+    // stamp on the server and is dropped.
+    static constexpr int64_t MAX_SEND_SHIFT_US = 100000;
+    const int64_t shift = response.time_msg.previous_server_transmitted -
+                          this->last_response_.time_msg.server_transmitted;
+    const bool matches = this->interleaved_ && response.time_msg.has_previous &&
+                         this->have_last_response_ &&
+                         response.time_msg.previous_client_transmitted ==
+                             this->last_response_.time_msg.client_transmitted;
+    if (matches && (shift < 0 || shift >= MAX_SEND_SHIFT_US)) {
+        SS_LOGW(TAG, "Dropping an interleaved refinement that moves the send by %" PRId64 " us",
+                shift);
+    } else if (matches) {
         ServerTimeMessage refined = this->last_response_.time_msg;
         refined.server_transmitted = response.time_msg.previous_server_transmitted;
         int64_t offset = 0;
