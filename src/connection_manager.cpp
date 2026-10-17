@@ -37,6 +37,7 @@
 #include <array>
 #include <cassert>
 #include <cinttypes>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -44,6 +45,12 @@
 namespace sendspin {
 
 static const char* const TAG = "sendspin.conn_mgr";
+
+// TEMPORARY DEBUG: interleaved time replies, from the config or SENDSPIN_TIME_INTERLEAVED=1
+static bool time_interleaved(const SendspinClientConfig& config) {
+    const char* env = std::getenv("SENDSPIN_TIME_INTERLEAVED");
+    return config.time_interleaved || (env != nullptr && env[0] == '1');
+}
 
 static constexpr int64_t WS_SERVER_START_RETRY_MS = 5000LL;
 static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * US_PER_MS;
@@ -343,7 +350,8 @@ bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
     conn->init_time_filter();
     conn->time_burst().configure(this->client_->config_.time_burst_size,
                                  this->client_->config_.time_burst_interval_ms,
-                                 this->client_->config_.time_burst_response_timeout_ms);
+                                 this->client_->config_.time_burst_response_timeout_ms,
+                                 time_interleaved(this->client_->config_));
     conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
     conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
     conn->set_json_arena(this->json_arena());
@@ -444,7 +452,8 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->init_time_filter();
     client_conn->time_burst().configure(this->client_->config_.time_burst_size,
                                         this->client_->config_.time_burst_interval_ms,
-                                        this->client_->config_.time_burst_response_timeout_ms);
+                                        this->client_->config_.time_burst_response_timeout_ms,
+                                        time_interleaved(this->client_->config_));
 
     // Start the nursery clock: the nursery scan reaps the connection if it has not completed the
     // hello handshake within NURSERY_ESTABLISH_TIMEOUT_US. The stamp predates DNS/TCP resolve,

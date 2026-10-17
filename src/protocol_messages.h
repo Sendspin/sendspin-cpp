@@ -1014,6 +1014,10 @@ struct ServerTimeMessage {
     int64_t client_transmitted{0};  ///< Echo of the client/time it answers (client clock)
     int64_t server_received{0};     ///< When the server received that client/time (server clock)
     int64_t server_transmitted{0};  ///< When the server sent this reply (server clock)
+    /// TEMPORARY DEBUG: interleaved mode's report on the previous reply
+    bool has_previous{false};
+    int64_t previous_client_transmitted{0};
+    int64_t previous_server_transmitted{0};
 };
 
 /// @brief Parses a server/time JSON message into the provided struct
@@ -1095,7 +1099,7 @@ std::string format_client_goodbye_message(SendspinGoodbyeReason reason,
 
 /// Buffer size for format_client_time_message(). Fits the longest possible message:
 /// prefix (54) + '-' (1) + 19 digits + suffix (2) = 76 bytes, rounded up.
-static constexpr size_t TIME_MESSAGE_BUF_SIZE = 96;
+static constexpr size_t TIME_MESSAGE_BUF_SIZE = 128;  // TEMPORARY DEBUG: room for interleaved
 
 /// @brief Formats a client/time JSON message into a caller-supplied buffer
 ///
@@ -1104,7 +1108,8 @@ static constexpr size_t TIME_MESSAGE_BUF_SIZE = 96;
 /// @param client_transmitted The client timestamp to embed (microseconds); the server/time reply
 ///                           echoes it (see SendspinConnection::claim_time_frame()).
 /// @return Number of bytes written (excluding any null terminator), or 0 on error.
-size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted);
+size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted,
+                                  bool interleaved = false);
 
 /// @brief Formats a client/command message as a JSON string
 /// @param cmd The playback command plus any command-specific parameters. Only the parameter

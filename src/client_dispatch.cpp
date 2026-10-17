@@ -576,6 +576,8 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                                   &response.max_error);
             response.timestamp = timestamp;
             response.client_transmitted = time_msg.client_transmitted;
+            response.client_sent = client_sent.value();
+            response.time_msg = time_msg;
             conn->time_burst().on_time_response(conn, response);
             break;
         }

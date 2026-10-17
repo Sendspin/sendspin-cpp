@@ -309,6 +309,10 @@ struct SendspinClientConfig {
     static constexpr uint8_t DEFAULT_BURST_SIZE = 8;  ///< Default messages per time sync burst
 
     uint8_t time_burst_size{DEFAULT_BURST_SIZE};  ///< Number of messages per time sync burst
+    /// TEMPORARY DEBUG: ask for interleaved server/time replies, which report the previous
+    /// reply's actual send time (one extra message per burst); SENDSPIN_TIME_INTERLEAVED=1 in
+    /// the environment turns it on too, on a host
+    bool time_interleaved{false};
     int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};  ///< Milliseconds between bursts
     int64_t time_burst_response_timeout_ms{
         DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out

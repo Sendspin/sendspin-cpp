@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "protocol_messages.h"
+
 #include <cstdint>
 #include <limits>
 
@@ -33,6 +35,9 @@ struct TimeResponse {
     int64_t timestamp{0};  ///< When the reply arrived, on the client clock (microseconds).
     /// The client_transmitted the reply echoed, identifying the client/time it answers.
     int64_t client_transmitted{0};
+    /// TEMPORARY DEBUG: the exchange's raw times, for interleaved mode's recomputation
+    int64_t client_sent{0};
+    ServerTimeMessage time_msg{};
 };
 
 /// @brief Result of a single SendspinTimeBurst::loop() call
@@ -121,7 +126,13 @@ public:
     /// @param burst_size Number of time messages per burst.
     /// @param burst_interval_ms Milliseconds between bursts.
     /// @param response_timeout_ms Milliseconds before an individual message times out.
-    void configure(uint8_t burst_size, int64_t burst_interval_ms, int64_t response_timeout_ms);
+    void configure(uint8_t burst_size, int64_t burst_interval_ms, int64_t response_timeout_ms,
+                   bool interleaved = false);
+
+    /// TEMPORARY DEBUG: client/time asks for interleaved replies
+    [[nodiscard]] bool interleaved() const {
+        return this->interleaved_;
+    }
 
     /// @brief Reset state (call on connection loss/change)
     void reset();
@@ -138,6 +149,10 @@ protected:
     /// @return true if this completed the burst.
     bool retire_message(SendspinConnection* conn, int64_t now_ms);
 
+    /// TEMPORARY DEBUG: feeds the burst's best sample to the filter: the best refined one in
+    /// interleaved mode when there is one, else the best basic one
+    void feed_best(SendspinConnection* conn);
+
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;
     static constexpr int64_t DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
 
@@ -152,6 +167,17 @@ protected:
     // client_transmitted of the time message awaiting a reply, 0 when none is (see
     // on_time_response())
     int64_t pending_embedded_{0};
+
+    // TEMPORARY DEBUG: interleaved mode. The last reply's exchange, refined by the next reply's
+    // `previous`, and the burst's best refined sample.
+    TimeResponse last_response_{};
+    bool have_last_response_{false};
+    int64_t best_refined_max_error_{std::numeric_limits<int64_t>::max()};
+    int64_t best_refined_offset_{0};
+    int64_t best_refined_timestamp_{0};
+    uint32_t refined_count_{0};
+    int64_t refined_shift_sum_us_{0};  // sum of previous.server_transmitted - server_transmitted
+    bool interleaved_{false};
 
     // 8-bit fields
     uint8_t burst_size_{8};

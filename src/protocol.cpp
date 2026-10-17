@@ -444,6 +444,13 @@ bool process_server_time_message(JsonObject root, ServerTimeMessage* time_msg) {
         time_msg->client_transmitted = client_transmitted_var.as<int64_t>();
         time_msg->server_received = server_received_var.as<int64_t>();
         time_msg->server_transmitted = server_transmitted_var.as<int64_t>();
+        const JsonVariantConst prev_ct = root["payload"]["previous"]["client_transmitted"];
+        const JsonVariantConst prev_st = root["payload"]["previous"]["server_transmitted"];
+        time_msg->has_previous = prev_ct.is<int64_t>() && prev_st.is<int64_t>();
+        if (time_msg->has_previous) {
+            time_msg->previous_client_transmitted = prev_ct.as<int64_t>();
+            time_msg->previous_server_transmitted = prev_st.as<int64_t>();
+        }
     }
     return true;
 }
@@ -1136,7 +1143,8 @@ inline int decimal_digits(uint64_t v) {
 
 }  // namespace
 
-size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted) {
+size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted,
+                                  bool interleaved) {
     // Hot path on the time-sync send side. ESP-IDF newlib's snprintf("%lld", ...) costs ~50us
     // for a single int64 because it instantiates a full printf state machine and does 64-bit
     // division through generic code. We bypass it entirely: memcpy the two constant chunks
@@ -1144,8 +1152,11 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
     // two-digit-at-a-time write to halve the 64-bit division count.
     static constexpr char PREFIX[] = R"({"type":"client/time","payload":{"client_transmitted":)";
     static constexpr size_t PREFIX_LEN = sizeof(PREFIX) - 1;
-    static constexpr char SUFFIX[] = "}}";
-    static constexpr size_t SUFFIX_LEN = sizeof(SUFFIX) - 1;
+    static constexpr char PLAIN_SUFFIX[] = "}}";
+    static constexpr char INTERLEAVED_SUFFIX[] = R"(,"interleaved":true}})";
+    const char* const SUFFIX = interleaved ? INTERLEAVED_SUFFIX : PLAIN_SUFFIX;
+    const size_t SUFFIX_LEN =
+        interleaved ? sizeof(INTERLEAVED_SUFFIX) - 1 : sizeof(PLAIN_SUFFIX) - 1;
 
     // Worst case: prefix + '-' + MAX_UINT64_DIGITS digits + suffix.
     if (cap < PREFIX_LEN + 1 + MAX_UINT64_DIGITS + SUFFIX_LEN) {

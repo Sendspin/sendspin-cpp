@@ -53,6 +53,10 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
         // Start a new burst
         this->burst_index_ = 0;
         this->best_max_error_ = std::numeric_limits<int64_t>::max();
+        this->best_refined_max_error_ = std::numeric_limits<int64_t>::max();
+        this->refined_count_ = 0;
+        this->refined_shift_sum_us_ = 0;
+        this->have_last_response_ = false;
         SS_LOGV(TAG, "Starting new time burst");
         // Fall through to send first message
     }
@@ -90,6 +94,29 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeRes
         return false;
     }
 
+    // TEMPORARY DEBUG: interleaved mode. `previous` reports when the last reply actually left;
+    // that exchange is recomputed with it and competes as a refined sample.
+    if (this->interleaved_ && response.time_msg.has_previous && this->have_last_response_ &&
+        response.time_msg.previous_client_transmitted ==
+            this->last_response_.time_msg.client_transmitted) {
+        ServerTimeMessage refined = this->last_response_.time_msg;
+        refined.server_transmitted = response.time_msg.previous_server_transmitted;
+        int64_t offset = 0;
+        int64_t max_error = 0;
+        compute_time_exchange(refined, this->last_response_.client_sent,
+                              this->last_response_.timestamp, &offset, &max_error);
+        ++this->refined_count_;
+        this->refined_shift_sum_us_ +=
+            refined.server_transmitted - this->last_response_.time_msg.server_transmitted;
+        if (max_error > 0 && max_error < this->best_refined_max_error_) {
+            this->best_refined_max_error_ = max_error;
+            this->best_refined_offset_ = offset;
+            this->best_refined_timestamp_ = this->last_response_.timestamp;
+        }
+    }
+    this->last_response_ = response;
+    this->have_last_response_ = true;
+
     // Track the best (lowest RTT) measurement in this burst.
     // max_error is half the round-trip delay and must be strictly positive; zero or negative
     // values arise from clock skew or timestamp quantization in the time message and would
@@ -109,11 +136,7 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeRes
 
     // Check if burst is complete
     if (this->burst_index_ >= this->burst_size_) {
-        auto* time_filter = conn->get_time_filter();
-        if (time_filter != nullptr && this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
-            time_filter->update(this->best_offset_, this->best_max_error_, this->best_timestamp_);
-            SS_LOGV(TAG, "Burst complete, best max_error: %" PRId64 " us", this->best_max_error_);
-        }
+        this->feed_best(conn);
         this->last_burst_complete_time_ = platform_time_us() / US_PER_MS;
         this->pending_burst_completed_ = true;
         return true;
@@ -142,8 +165,10 @@ uint32_t SendspinTimeBurst::ms_until_due(int64_t now_ms) const {
 }
 
 void SendspinTimeBurst::configure(uint8_t burst_size, int64_t burst_interval_ms,
-                                  int64_t response_timeout_ms) {
-    this->burst_size_ = burst_size;
+                                  int64_t response_timeout_ms, bool interleaved) {
+    this->interleaved_ = interleaved;
+    // One more message, so that each of burst_size replies gets its refinement from the next
+    this->burst_size_ = interleaved ? static_cast<uint8_t>(burst_size + 1) : burst_size;
     this->burst_interval_ms_ = burst_interval_ms;
     this->response_timeout_ms_ = response_timeout_ms;
     this->burst_index_ = burst_size;  // "complete" state; next loop will wait for interval
@@ -158,23 +183,49 @@ void SendspinTimeBurst::reset() {
     this->best_max_error_ = std::numeric_limits<int64_t>::max();
     this->best_offset_ = 0;
     this->best_timestamp_ = 0;
+    this->best_refined_max_error_ = std::numeric_limits<int64_t>::max();
+    this->refined_count_ = 0;
+    this->refined_shift_sum_us_ = 0;
+    this->have_last_response_ = false;
 }
 
 // ============================================================================
 // Internal helpers
 // ============================================================================
 
+void SendspinTimeBurst::feed_best(SendspinConnection* conn) {
+    auto* time_filter = conn->get_time_filter();
+    const bool refined =
+        this->interleaved_ && this->best_refined_max_error_ < std::numeric_limits<int64_t>::max();
+    if (this->interleaved_) {
+        SS_LOGI(TAG,
+                "Interleaved burst: %" PRIu32 " refined, mean send shift %" PRId64
+                " us; best basic offset %" PRId64 " err %" PRId64 ", best refined offset %" PRId64
+                " err %" PRId64,
+                this->refined_count_,
+                this->refined_count_ > 0 ? this->refined_shift_sum_us_ / this->refined_count_ : 0,
+                this->best_offset_, this->best_max_error_, this->best_refined_offset_,
+                this->best_refined_max_error_);
+    }
+    if (time_filter == nullptr) {
+        return;
+    }
+    if (refined) {
+        time_filter->update(this->best_refined_offset_, this->best_refined_max_error_,
+                            this->best_refined_timestamp_);
+    } else if (this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
+        time_filter->update(this->best_offset_, this->best_max_error_, this->best_timestamp_);
+    }
+    SS_LOGV(TAG, "Burst complete, best max_error: %" PRId64 " us",
+            refined ? this->best_refined_max_error_ : this->best_max_error_);
+}
+
 bool SendspinTimeBurst::retire_message(SendspinConnection* conn, int64_t now_ms) {
     this->burst_index_++;
     if (this->burst_index_ < this->burst_size_) {
         return false;
     }
-    auto* time_filter = conn->get_time_filter();
-    if (time_filter != nullptr && this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
-        time_filter->update(this->best_offset_, this->best_max_error_, this->best_timestamp_);
-        SS_LOGV(TAG, "Burst complete (with retired messages), best max_error: %" PRId64 " us",
-                this->best_max_error_);
-    }
+    this->feed_best(conn);
     this->last_burst_complete_time_ = now_ms;
     return true;
 }

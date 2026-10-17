@@ -161,7 +161,8 @@ int64_t SendspinConnection::send_time_message() {
         ++now;
     }
     char buf[TIME_MESSAGE_BUF_SIZE];
-    const size_t len = format_client_time_message(buf, sizeof(buf), now);
+    const size_t len =
+        format_client_time_message(buf, sizeof(buf), now, this->time_burst_.interleaved());
     if (len == 0) {
         return 0;
     }
