@@ -27,11 +27,24 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     # Compiler settings
     # =========================================================================
     target_compile_features(${TARGET_LIB} PUBLIC cxx_std_20)
-    target_compile_options(${TARGET_LIB} PRIVATE
-        -Wall
-        -Wextra
-        -Wpedantic
-    )
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        # clang-cl reads -Wall as /Wall, which is -Weverything; /W4 is its -Wall -Wextra. opus_types.h
+        # uses the __int32/__int64 keywords on Windows, which -Wpedantic reports as an extension.
+        target_compile_options(${TARGET_LIB} PRIVATE /W4 -Wpedantic -Wno-language-extension-token)
+    else()
+        target_compile_options(${TARGET_LIB} PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+        )
+    endif()
+    # IXWebSocket's winsock include reaches <windows.h>, whose min/max and wingdi ERROR macros break
+    # std::min/std::max and LogLevel::ERROR. No public header includes it, so this stays private.
+    if(WIN32)
+        target_compile_definitions(${TARGET_LIB} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN NOGDI)
+        # GetAdaptersAddresses() and ntohl() in src/host/network_info.cpp
+        target_link_libraries(${TARGET_LIB} PRIVATE iphlpapi ws2_32)
+    endif()
     if(ENABLE_WERROR)
         target_compile_options(${TARGET_LIB} PRIVATE -Werror)
     endif()
@@ -82,6 +95,11 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
             GIT_TAG        v0.3.5
             GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
         )
+        # micro-opus's default thread-safe pseudostack keeps its per-thread state in pthread TLS,
+        # which Windows lacks; alloca keeps each codec thread's scratch on its own stack instead.
+        if(WIN32 AND NOT DEFINED OPUS_ALLOCATION_MODE)
+            set(OPUS_ALLOCATION_MODE "USE_ALLOCA" CACHE STRING "Memory allocation mode")
+        endif()
         FetchContent_MakeAvailable(micro_opus)
         target_link_libraries(${TARGET_LIB} PUBLIC micro_opus)
     endif()
