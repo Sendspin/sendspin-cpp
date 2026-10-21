@@ -19,6 +19,7 @@
 #include "platform/time.h"
 #include "server_connection.h"
 #include <ixwebsocket/IXConnectionState.h>
+#include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXSocketServer.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXWebSocketMessage.h>
@@ -50,6 +51,14 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
     if (this->server_ != nullptr) {
         SS_LOGW(TAG, "Server already started");
         return true;
+    }
+
+    // Winsock needs WSAStartup() before the first socket call, which IXWebSocket leaves to the
+    // application; a no-op on POSIX. Never undone: Windows releases it at process exit.
+    static const bool net_ready = ix::initNetSystem();
+    if (!net_ready) {
+        SS_LOGE(TAG, "Failed to initialize the network stack");
+        return false;
     }
 
     this->client_ = client;
