@@ -55,8 +55,8 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
 
     // Winsock needs WSAStartup() before the first socket call, which IXWebSocket leaves to the
     // application; a no-op on POSIX. Never undone: Windows releases it at process exit.
-    static const bool net_ready = ix::initNetSystem();
-    if (!net_ready) {
+    static const bool NET_READY = ix::initNetSystem();
+    if (!NET_READY) {
         SS_LOGE(TAG, "Failed to initialize the network stack");
         return false;
     }

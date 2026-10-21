@@ -57,8 +57,8 @@ void SendspinClientConnection::start() {
 
     // Winsock needs WSAStartup() before the first socket call (see SendspinWsServer::start()); a
     // failure here surfaces as the connection's error.
-    static const bool net_ready = ix::initNetSystem();
-    if (!net_ready) {
+    static const bool NET_READY = ix::initNetSystem();
+    if (!NET_READY) {
         SS_LOGE(TAG, "Failed to initialize the network stack");
     }
 
