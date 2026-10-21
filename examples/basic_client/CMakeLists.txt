@@ -24,9 +24,27 @@ else()
 endif()
 
 # PortAudio (optional; enables audio playback via PortAudioSink)
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(PORTAUDIO portaudio-2.0)
+if(WIN32)
+    # Windows has no pkg-config or system PortAudio, so build it from source as a static library.
+    include(FetchContent)
+    FetchContent_Declare(
+        portaudio
+        GIT_REPOSITORY https://github.com/PortAudio/portaudio.git
+        GIT_TAG        v19.7.0
+        GIT_SHALLOW    TRUE
+    )
+    set(PA_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    # v19.7.0 declares cmake_minimum_required(VERSION 3.1), which CMake 4 rejects
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    FetchContent_MakeAvailable(portaudio)
+    unset(CMAKE_POLICY_VERSION_MINIMUM)
+    set(PORTAUDIO_FOUND TRUE)
+    set(PORTAUDIO_LINK_LIBRARIES portaudio_static)
+else()
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(PORTAUDIO portaudio-2.0)
+    endif()
 endif()
 
 if(PORTAUDIO_FOUND)

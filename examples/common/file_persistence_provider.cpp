@@ -32,7 +32,11 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace sendspin {
 
@@ -74,6 +78,30 @@ static std::string read_file(const std::string& path) {
 /// directory is fsync'd after the rename, so a crash cannot report success for data
 /// that never reached disk, and cannot leave the rename itself unobserved after a
 /// power loss.
+#ifdef _WIN32
+/// Windows has no POSIX modes: the temp file inherits its directory's ACL, which under
+/// %USERPROFILE% grants only the user, SYSTEM and Administrators. _commit() flushes the contents
+/// before std::filesystem::rename() replaces the destination (std::rename() refuses to on Windows).
+static bool write_file(const std::string& path, const std::string& content) {
+    std::string tmp = path + ".tmp";
+
+    int fd = ::_open(tmp.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+    if (fd < 0) {
+        return false;
+    }
+    const bool written =
+        ::_write(fd, content.data(), static_cast<unsigned int>(content.size())) ==
+            static_cast<int>(content.size()) &&
+        ::_commit(fd) == 0;
+    if (::_close(fd) != 0 || !written) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    return !ec;
+}
+#else
 static bool write_file(const std::string& path, const std::string& content) {
     std::string tmp = path + ".tmp";
 
@@ -130,6 +158,7 @@ static bool write_file(const std::string& path, const std::string& content) {
     ::close(dfd);
     return dir_synced;
 }
+#endif
 
 /// Parse the file as JSON. Returns an empty object on parse error or if absent.
 static JsonDocument load_doc(const std::string& path) {
@@ -165,6 +194,11 @@ FilePersistenceProvider::FilePersistenceProvider(std::string path) : path_(std::
 
 std::string FilePersistenceProvider::default_path(const std::string& filename) {
     const char* home_dir = getenv("HOME");
+#ifdef _WIN32
+    if (home_dir == nullptr) {
+        home_dir = getenv("USERPROFILE");
+    }
+#endif
     return std::string(home_dir != nullptr ? home_dir : ".") + "/" + filename;
 }
 
