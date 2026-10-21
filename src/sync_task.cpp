@@ -769,8 +769,10 @@ bool SyncTask::wait_for_start_acknowledgement(SyncContext& sync_context) {
             }
         }
         const uint16_t header_ordinal = inbound_item_header(sync_context.encoded_item)->serial;
-        // Clear the wake before reading the ordinal (see signal_stream_start()).
-        this->event_flags_.clear(EventGroupBits::COMMAND_START);
+        // Clear the wake before reading the ordinal (see signal_stream_start()). Whether one
+        // arrived is read from the bits the clear took, not `flags`: an acknowledgement landing
+        // after `flags` was read would otherwise be cleared without the idle note it owes.
+        const uint32_t woken = this->event_flags_.clear(EventGroupBits::COMMAND_START);
         const uint16_t started = this->started_ordinal_.load(std::memory_order_acquire);
         // Reached: this stream's start, or a later one acknowledged behind it (a stream/start
         // that changed the format before playback began, whose header the active stream
@@ -778,7 +780,7 @@ bool SyncTask::wait_for_start_acknowledgement(SyncContext& sync_context) {
         if (!count_after<uint16_t>(header_ordinal, started)) {
             return true;
         }
-        if ((flags & EventGroupBits::COMMAND_START) != 0) {
+        if ((woken & EventGroupBits::COMMAND_START) != 0) {
             // The start of a stream this task already left (its stream/end overtook its
             // acknowledgement). The main loop holds that stream's STREAM_END until this task
             // reads idle, and this task never ran it, so note idle for it again.

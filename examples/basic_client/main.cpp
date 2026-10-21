@@ -51,7 +51,12 @@
 #include "portaudio_sink.h"
 #endif
 
+#ifdef _WIN32
+#include "win_getopt.h"
+#include <conio.h>  // _kbhit, _getch
+#else
 #include <getopt.h>
+#endif
 
 #ifdef SENDSPIN_HAS_MDNS
 // IWYU pragma: begin_keep
@@ -152,6 +157,7 @@ static void signal_handler(int /*sig*/) {
     running.store(false);
 }
 
+#ifndef _WIN32
 static void window_signal_handler(int sig) {
     if (sig == SIGUSR1) {
         window_gesture.store(true);
@@ -159,6 +165,7 @@ static void window_signal_handler(int sig) {
         window_cancel.store(true);
     }
 }
+#endif
 
 static void print_usage(const char* prog) {
     fprintf(stderr, "Usage: %s [options] [name]\n", prog);
@@ -203,8 +210,10 @@ int main(int argc, char* argv[]) {
     // Set up signal handler for clean shutdown
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+#ifndef _WIN32
     std::signal(SIGUSR1, window_signal_handler);
     std::signal(SIGUSR2, window_signal_handler);
+#endif
 
     // Parse command line options
     LogLevel log_level = LogLevel::INFO;
@@ -448,9 +457,15 @@ int main(int argc, char* argv[]) {
         }
 
         void on_open_pairing_window() override {
+#ifdef _WIN32
+            fprintf(stderr,
+                    "\n>>> Pairing window gesture required: press 'p' in this console to allow "
+                    "the attempt ('c' cancels it).\n\n");
+#else
             fprintf(stderr,
                     "\n>>> Pairing window gesture required: send SIGUSR1 to this process to "
                     "allow the attempt (SIGUSR2 cancels it).\n\n");
+#endif
         }
 
         void on_close_pairing_window() override {
@@ -533,6 +548,17 @@ int main(int argc, char* argv[]) {
     // Main loop
     int tick = 0;
     while (running.load()) {
+#ifdef _WIN32
+        // Windows has no SIGUSR1/SIGUSR2, so console keys stand in for them.
+        while (_kbhit() != 0) {
+            const int key = _getch();
+            if (key == 'p') {
+                window_gesture.store(true);
+            } else if (key == 'c') {
+                window_cancel.store(true);
+            }
+        }
+#endif
         if (window_gesture.exchange(false)) {
             fprintf(stderr, ">>> Pairing window gesture received\n");
             client.confirm_pairing_window();
