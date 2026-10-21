@@ -18,21 +18,32 @@
 #include "platform/network_info.h"
 
 #include "platform/logging.h"
-#include <ifaddrs.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <set>
 #include <string>
 
+#if defined(_WIN32)
+// winsock2.h must precede iphlpapi.h
+// clang-format off
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+// clang-format on
+
+#include <vector>
+#else
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #if defined(__APPLE__)
 #include <net/if_dl.h>  // sockaddr_dl, LLADDR
 #else
 #include <netpacket/packet.h>  // sockaddr_ll
+#endif
 #endif
 
 namespace sendspin {
@@ -100,6 +111,58 @@ bool is_routable_ip(const struct sockaddr* sa) {
 
 }  // namespace
 
+#if defined(_WIN32)
+
+std::optional<std::string> platform_get_interface_mac() {
+    // A first call with no buffer reports the size it needs; retry if the adapter list grows
+    // between calls.
+    const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    std::vector<uint8_t> buffer;
+    ULONG size = 0;
+    ULONG err = ERROR_BUFFER_OVERFLOW;
+    for (int attempt = 0; attempt < 3 && err == ERROR_BUFFER_OVERFLOW; attempt++) {
+        buffer.resize(size);
+        err = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr,
+                                   reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &size);
+    }
+    if (err != NO_ERROR) {
+        SS_LOGW(TAG, "GetAdaptersAddresses failed (%lu); cannot auto-detect MAC address", err);
+        return std::nullopt;
+    }
+
+    for (const auto* adapter = reinterpret_cast<const IP_ADAPTER_ADDRESSES*>(buffer.data());
+         adapter != nullptr; adapter = adapter->Next) {
+        // Skip loopback and adapters that are not up.
+        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK || adapter->OperStatus != IfOperStatusUp) {
+            continue;
+        }
+        if (adapter->PhysicalAddressLength != 6) {
+            continue;
+        }
+        // Only consider adapters that also have a routable IP address.
+        bool routable = false;
+        for (const auto* addr = adapter->FirstUnicastAddress; addr != nullptr; addr = addr->Next) {
+            if (is_routable_ip(addr->Address.lpSockaddr)) {
+                routable = true;
+                break;
+            }
+        }
+        if (!routable) {
+            continue;
+        }
+
+        auto result = format_mac(adapter->PhysicalAddress);
+        if (result.has_value()) {
+            SS_LOGD(TAG, "auto-detected MAC %s on adapter %s", result->c_str(),
+                    adapter->AdapterName);
+            return result;
+        }
+    }
+    return std::nullopt;
+}
+
+#else
+
 std::optional<std::string> platform_get_interface_mac() {
     struct ifaddrs* ifaddr = nullptr;
     if (getifaddrs(&ifaddr) != 0 || ifaddr == nullptr) {
@@ -162,5 +225,7 @@ std::optional<std::string> platform_get_interface_mac() {
     freeifaddrs(ifaddr);
     return result;
 }
+
+#endif  // _WIN32
 
 }  // namespace sendspin
