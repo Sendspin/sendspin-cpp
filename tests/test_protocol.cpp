@@ -17,6 +17,7 @@
 // malformed-input handling) where a bug is silent rather than a crash, plus a hand-rolled int64
 // formatter that we can check against snprintf as a free correctness oracle.
 
+#include "application_role.h"
 #include "platform/base64.h"
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
@@ -1048,6 +1049,108 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
     EXPECT_FALSE(doc["payload"]["device_info"]["manufacturer"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["software_version"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["mac_address"].is<const char*>());
+}
+
+// ============================================================================
+// Application-specific roles in client/hello
+// ============================================================================
+
+// messaging.md "client/hello": application-specific roles follow the library's own roles in
+// supported_roles, and a support object is keyed "<role>_support". The role without one sends no
+// key, and the defined role keeps its place and its support object.
+TEST(Protocol, FormatClientHelloApplicationRoles) {
+    ClientHelloMessage msg;
+    msg.name = "Speaker";
+    msg.supported_roles.push_back(SendspinRole::VISUALIZER);
+    VisualizerSupportObject vis{};
+    vis.buffer_capacity = 4096;
+    msg.visualizer_support = vis;
+    msg.application_roles.push_back({"_acme_pairing@v1", std::string(R"({"port":8930})")});
+    msg.application_roles.push_back({"_acme_display@v2", std::nullopt});
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    JsonArrayConst roles = doc["payload"]["supported_roles"];
+    ASSERT_EQ(roles.size(), 3U);
+    EXPECT_STREQ(roles[0], "visualizer@v1");
+    EXPECT_STREQ(roles[1], "_acme_pairing@v1");
+    EXPECT_STREQ(roles[2], "_acme_display@v2");
+
+    JsonObjectConst support = doc["payload"]["_acme_pairing@v1_support"];
+    ASSERT_FALSE(support.isNull());
+    EXPECT_EQ(support.size(), 1U);
+    EXPECT_EQ(support["port"].as<int>(), 8930);
+    EXPECT_TRUE(doc["payload"]["_acme_display@v2_support"].isUnbound());
+    EXPECT_EQ(doc["payload"]["visualizer@v1_support"]["buffer_capacity"].as<int>(), 4096);
+}
+
+// Control: a client advertising no application-specific role sends only its own roles and no
+// "_"-prefixed support key.
+TEST(Protocol, FormatClientHelloWithoutApplicationRoles) {
+    ClientHelloMessage msg;
+    msg.name = "Speaker";
+    msg.supported_roles.push_back(SendspinRole::CONTROLLER);
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    JsonArrayConst roles = doc["payload"]["supported_roles"];
+    ASSERT_EQ(roles.size(), 1U);
+    EXPECT_STREQ(roles[0], "controller@v1");
+    for (JsonPairConst kv : doc["payload"].as<JsonObjectConst>()) {
+        EXPECT_NE(kv.key().c_str()[0], '_') << kv.key().c_str();
+    }
+}
+
+// README.md "Application-Specific Roles": a leading `_` and an explicit `@version`.
+TEST(ApplicationRole, NameNeedsLeadingUnderscoreAndVersion) {
+    struct Row {
+        const char* name;
+        const char* role;
+        bool expect_ok;
+    };
+    const Row rows[] = {
+        {"defined role", "player@v1", false},
+        {"no version", "_acme_display", false},
+        {"empty version", "_acme_display@", false},
+        {"no name", "_@v1", false},
+        {"two @", "_acme@v1@v2", false},
+        {"space", "_acme display@v1", false},
+        {"non-ASCII", "_acme\xc3\xa9@v1", false},
+        {"empty", "", false},
+        // Control: well-formed names, the shortest included.
+        {"vendor-prefixed", "_acme_display@v1", true},
+        {"shortest", "_a@1", true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(is_valid_application_role_name(row.role), row.expect_ok);
+    }
+}
+
+// The support object is embedded as written, so anything but exactly one JSON object would corrupt
+// the hello or put a non-object under the support key.
+TEST(ApplicationRole, SupportJsonMustBeOneObject) {
+    struct Row {
+        const char* name;
+        const char* json;
+        bool expect_ok;
+    };
+    const Row rows[] = {
+        {"array", "[1]", false},
+        {"number", "8930", false},
+        {"truncated", R"({"port":)", false},
+        {"trailing value", R"({"port":1}{})", false},
+        {"trailing junk", R"({"port":1} x)", false},
+        {"empty", "", false},
+        // Control: objects, with surrounding whitespace and with nesting.
+        {"object", R"({"port":8930})", true},
+        {"empty object", "{}", true},
+        {"padded", " {\"a\":{\"b\":[1,2]}}\n", true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(is_valid_support_object_json(row.json), row.expect_ok);
+    }
 }
 
 // messaging.md "client/leave": the message carries no payload fields, but the envelope shape is

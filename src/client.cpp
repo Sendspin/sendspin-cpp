@@ -14,6 +14,7 @@
 
 #include "sendspin/client.h"
 
+#include "application_role.h"
 #include "connection.h"
 #include "connection_manager.h"
 #include "crypto/keys.h"
@@ -355,6 +356,29 @@ bool SendspinClient::start() {
         SS_LOGE(TAG, "Configured static pairing code is not %d decimal digits; cannot start",
                 STATIC_PAIRING_CODE_DIGITS);
         return false;
+    }
+    for (size_t i = 0; i < this->config_.application_roles.size(); ++i) {
+        const SendspinApplicationRole& app_role = this->config_.application_roles[i];
+        if (!is_valid_application_role_name(app_role.role)) {
+            SS_LOGE(TAG, "Application role \"%s\" is not _<name>@<version>; cannot start",
+                    app_role.role.c_str());
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (this->config_.application_roles[j].role == app_role.role) {
+                SS_LOGE(TAG, "Application role \"%s\" is listed twice; cannot start",
+                        app_role.role.c_str());
+                return false;
+            }
+        }
+        if (app_role.support_json.has_value() &&
+            !is_valid_support_object_json(app_role.support_json.value())) {
+            SS_LOGE(TAG,
+                    "Support object for application role \"%s\" is not a JSON object; "
+                    "cannot start",
+                    app_role.role.c_str());
+            return false;
+        }
     }
 
     // lifecycle_ stays STOPPED until every step below has succeeded. Marking the client running
@@ -1448,6 +1472,7 @@ std::string SendspinClient::build_hello_message() {
     }
 
     msg.unpaired_access_enabled = this->unpaired_access_enabled_.load(std::memory_order_acquire);
+    msg.application_roles = this->config_.application_roles;
 
     // Let each role add its fields to the hello message
 #ifdef SENDSPIN_ENABLE_PLAYER

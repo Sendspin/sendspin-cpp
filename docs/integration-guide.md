@@ -211,6 +211,17 @@ Detecting the signal is up to the application (a jack-detect pin, a link state, 
 
 `examples/source_client/` is a working reference: it captures the default PortAudio input device and feeds `write_audio()` from the capture callback with each buffer's capture time on the client's clock. With `-s` it also reports line sense from the input's level.
 
+### Application-Specific Roles
+
+An application can advertise roles of its own, outside the specification (README.md "Application-Specific Roles"), through `SendspinClientConfig::application_roles`. Each is listed in `client/hello` `supported_roles` after the library's roles, and its support object, if any, is sent as `"<role>_support"`:
+
+```cpp
+config.application_roles.push_back({"_acme_display@v1", std::string(R"({"port":8930})")});
+config.application_roles.push_back({"_acme_lights@v1", std::nullopt});  // no support object
+```
+
+A role name is a leading `_`, a name, `@` and a version, in visible ASCII; include a vendor prefix to avoid collisions. `support_json` is serialized JSON and must be exactly one object. `client.start()` logs an error and returns false on a malformed name, a name listed twice, or a support object that is not a JSON object. The library only announces these roles: the server may list one in `active_roles`, and what that means, and any messages it carries, is up to the application.
+
 ## Step 3: Implement Listener Interfaces
 
 A role you add is configured and ready, but only the server decides which roles a session actually

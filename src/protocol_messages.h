@@ -848,6 +848,8 @@ struct ClientHelloMessage {
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
     std::optional<SourceSupportObject> source_v1_support{};
+    /// Listed after supported_roles; each support_json is a validated JSON object, sent as is
+    std::vector<SendspinApplicationRole> application_roles{};
     bool unpaired_access_enabled{false};
     std::vector<PairMethodDescriptor> supported_pair_methods{};
 };
