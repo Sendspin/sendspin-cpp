@@ -19,6 +19,7 @@
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "sendspin/types.h"
+#include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocketMessage.h>
 #include <ixwebsocket/IXWebSocketMessageType.h>
 
@@ -52,6 +53,13 @@ void SendspinClientConnection::start() {
         SS_LOGW(TAG, "Client already started, stopping first");
         this->ws_->stop();
         this->ws_.reset();
+    }
+
+    // See SendspinWsServer::start(). This start() has no failure return, so the attempt goes
+    // ahead and its first socket call fails as the connection's Error.
+    static const bool NET_READY = ix::initNetSystem();
+    if (!NET_READY) {
+        SS_LOGE(TAG, "Failed to initialize the network stack");
     }
 
     this->ws_ = std::make_unique<ix::WebSocket>();
