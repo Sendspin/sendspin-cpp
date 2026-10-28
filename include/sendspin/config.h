@@ -149,10 +149,6 @@ struct SendspinTracedMessage {
 using SendspinMessageTraceFn = std::function<void(const SendspinTracedMessage& message)>;
 #endif
 
-// The implicit copy and move members touch the deprecated pairing_window_supported; only a
-// consumer's own use of it should warn.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start()
 struct SendspinClientConfig {
@@ -188,12 +184,6 @@ struct SendspinClientConfig {
     /// or speaker; QR_CODE requires a display able to render a QR code from the pairing token the
     /// listener receives. Empty leaves dynamic_pairing_code unadvertised.
     std::vector<SendspinPairingCodeFormat> pairing_code_formats{};
-
-    /// @brief Has no effect.
-    /// @deprecated Ignored: the pairing-window callbacks always fire for a gesture-gated attempt.
-    /// Removal is planned for v0.10.0.
-    [[deprecated("ignored; delete the assignment, removal is planned for v0.10.0")]]
-    bool pairing_window_supported{false};
 
     /// @brief The Pairing PSK the device shipped with, for an application that provisions one
     /// itself (for example from a factory partition). pairing.md "Pairing PSK Flow" requires it
@@ -362,7 +352,6 @@ struct SendspinClientConfig {
     SendspinMessageTraceFn message_trace;
 #endif
 };
-#pragma GCC diagnostic pop
 
 // ============================================================================
 // Player config types
