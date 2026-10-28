@@ -25,6 +25,8 @@ endif()
 
 # PortAudio (optional; enables audio playback via PortAudioSink)
 if(WIN32)
+    # getenv() and _open() in the persistence provider, which the CRT deprecates for its _s variants
+    target_compile_definitions(basic_client PRIVATE _CRT_SECURE_NO_WARNINGS)
     # Windows has no pkg-config or system PortAudio, so build it from source as a static library.
     include(FetchContent)
     FetchContent_Declare(
