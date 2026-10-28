@@ -32,7 +32,12 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>  // MoveFileExA
+#else
 #include <unistd.h>
+#endif
 
 namespace sendspin {
 
@@ -57,6 +62,33 @@ static std::string read_file(const std::string& path) {
     return ss.str();
 }
 
+#ifdef _WIN32
+/// Write content atomically via a temp file then rename.
+///
+/// Windows has no POSIX creation mode, so the temp file inherits its directory's ACL, which under
+/// %USERPROFILE% grants only the user, SYSTEM and Administrators. Its contents are flushed with
+/// _commit() before MoveFileExA() replaces the destination (std::rename() refuses to replace an
+/// existing file on Windows); MOVEFILE_WRITE_THROUGH holds the call until the move is on disk, as
+/// the directory fsync does on POSIX.
+static bool write_file(const std::string& path, const std::string& content) {
+    std::string tmp = path + ".tmp";
+
+    int fd = ::_open(tmp.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+    if (fd < 0) {
+        return false;
+    }
+    const bool written =
+        ::_write(fd, content.data(), static_cast<unsigned int>(content.size())) ==
+            static_cast<int>(content.size()) &&
+        ::_commit(fd) == 0;
+    if (::_close(fd) != 0 || !written) {
+        return false;
+    }
+
+    return ::MoveFileExA(tmp.c_str(), path.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+#else
 /// Write content atomically via a temp file then rename.
 ///
 /// This file can hold the device's static private key, long-term PSKs, and the Pairing
@@ -130,6 +162,7 @@ static bool write_file(const std::string& path, const std::string& content) {
     ::close(dfd);
     return dir_synced;
 }
+#endif
 
 /// Parse the file as JSON. Returns an empty object on parse error or if absent.
 static JsonDocument load_doc(const std::string& path) {
@@ -165,6 +198,11 @@ FilePersistenceProvider::FilePersistenceProvider(std::string path) : path_(std::
 
 std::string FilePersistenceProvider::default_path(const std::string& filename) {
     const char* home_dir = getenv("HOME");
+#ifdef _WIN32
+    if (home_dir == nullptr) {
+        home_dir = getenv("USERPROFILE");
+    }
+#endif
     return std::string(home_dir != nullptr ? home_dir : ".") + "/" + filename;
 }
 
