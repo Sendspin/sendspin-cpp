@@ -414,7 +414,8 @@ struct PlayerRoleConfig {
     /// whatever priming silence is still unsent, so those two terms overlap in part.
     /// @return Lead time in milliseconds, saturated at the field's maximum.
     static constexpr uint16_t pipeline_lead_time_ms(uint16_t extra_startup_silence_ms) {
-        constexpr uint32_t MAX = std::numeric_limits<uint16_t>::max();
+        // Parenthesized so the max() macro from a consumer's <windows.h> cannot expand it
+        constexpr uint32_t MAX = (std::numeric_limits<uint16_t>::max)();
         const uint32_t lead = static_cast<uint32_t>(INITIAL_SYNC_PRIMING_MS) +
                               extra_startup_silence_ms + PIPELINE_START_ALLOWANCE_MS;
         return static_cast<uint16_t>(lead < MAX ? lead : MAX);
