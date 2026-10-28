@@ -38,9 +38,31 @@
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #define max(a, b) (((a) > (b)) ? (a) : (b))
 
-// client.h includes config.h, types.h, persistence_keys.h and each enabled role's header.
+// Every public header. client.h brings in config.h, types.h and persistence_keys.h but only
+// forward-declares the roles, so each enabled role's header is included here as well.
 #include "sendspin/client.h"
 #include "sendspin/persistence_codec.h"
+#ifdef SENDSPIN_ENABLE_ARTWORK
+#include "sendspin/artwork_role.h"
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+#include "sendspin/color_role.h"
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+#include "sendspin/controller_role.h"
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+#include "sendspin/metadata_role.h"
+#endif
+#ifdef SENDSPIN_ENABLE_PLAYER
+#include "sendspin/player_role.h"
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+#include "sendspin/source_role.h"
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+#include "sendspin/visualizer_role.h"
+#endif
 
 // client.h set ERROR aside around LogLevel and must hand the consumer's macro back.
 static_assert(ERROR == 0, "client.h must restore the consumer's ERROR macro");
