@@ -1830,13 +1830,17 @@ TEST(SendspinClientStart, HelloAdvertisesConfiguredApplicationRoles) {
     InMemoryPersistenceProvider provider;
     SendspinClientConfig config;
     config.name = "application-role-hello";
-    config.application_roles = {{"_acme_pairing@v1", std::string(R"({"port":8930})")}};
+    // Lenient input, so the hello shows it was re-serialized rather than embedded as written
+    config.application_roles = {{"_acme_pairing@v1", std::string("{port: 8930}")}};
     SendspinClient client(std::move(config));
     client.set_persistence_provider(&provider);
     ASSERT_TRUE(client.start());
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, client.build_hello_message()));
+    const std::string hello = client.build_hello_message();
+    EXPECT_NE(hello.find(R"("_acme_pairing@v1_support":{"port":8930})"), std::string::npos)
+        << hello;
+    ASSERT_FALSE(deserializeJson(doc, hello));
     JsonArrayConst roles = doc["payload"]["supported_roles"];
     ASSERT_EQ(roles.size(), 1U);
     EXPECT_STREQ(roles[0], "_acme_pairing@v1");

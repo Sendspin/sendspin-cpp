@@ -158,7 +158,8 @@ struct SendspinApplicationRole {
     std::string role;
 
     /// @brief The role's support object as serialized JSON (e.g. `{"port":8930}`), sent as
-    /// "<role>_support"; unset sends none. It must parse as a JSON object.
+    /// "<role>_support" as the library re-serializes it; unset sends none. It must parse as a
+    /// JSON object whose strings are UTF-8 without control characters.
     std::optional<std::string> support_json{};
 };
 
@@ -227,8 +228,8 @@ struct SendspinClientConfig {
 
     /// @brief Application-specific roles listed in client/hello `supported_roles` after the
     /// library's own, in this order. A role whose name is not `_<name>@<version>`, a repeated
-    /// name, or a support object that is not a JSON object is rejected: start() logs an error and
-    /// returns false.
+    /// name, or a support object SendspinApplicationRole::support_json does not admit is rejected:
+    /// start() logs an error and returns false.
     std::vector<SendspinApplicationRole> application_roles{};
 
     /// @brief Default maximum number of long-term pairing records the store retains. Each record

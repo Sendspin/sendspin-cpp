@@ -358,7 +358,7 @@ bool SendspinClient::start() {
         return false;
     }
     for (size_t i = 0; i < this->config_.application_roles.size(); ++i) {
-        const SendspinApplicationRole& app_role = this->config_.application_roles[i];
+        SendspinApplicationRole& app_role = this->config_.application_roles[i];
         if (!is_valid_application_role_name(app_role.role)) {
             SS_LOGE(TAG, "Application role \"%s\" is not _<name>@<version>; cannot start",
                     app_role.role.c_str());
@@ -371,13 +371,18 @@ bool SendspinClient::start() {
                 return false;
             }
         }
-        if (app_role.support_json.has_value() &&
-            !is_valid_support_object_json(app_role.support_json.value())) {
-            SS_LOGE(TAG,
-                    "Support object for application role \"%s\" is not a JSON object; "
-                    "cannot start",
-                    app_role.role.c_str());
-            return false;
+        if (app_role.support_json.has_value()) {
+            // Replaced by the parser's own output, which is what client/hello embeds
+            std::optional<std::string> normalized =
+                normalize_support_object_json(app_role.support_json.value());
+            if (!normalized.has_value()) {
+                SS_LOGE(TAG,
+                        "Support object for application role \"%s\" is not a JSON object; "
+                        "cannot start",
+                        app_role.role.c_str());
+                return false;
+            }
+            app_role.support_json = std::move(normalized);
         }
     }
 

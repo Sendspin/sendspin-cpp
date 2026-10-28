@@ -937,8 +937,8 @@ std::string format_client_hello_message(const ClientHelloMessage* msg,
     }
 
     // messaging.md "client/hello": an application-specific role's support object is keyed
-    // "<role>_support". The text was checked to be one JSON object at start(), so it is embedded
-    // without a second parse.
+    // "<role>_support". start() replaced the text with ArduinoJson's own serialization of one
+    // JSON object, so it is embedded without a second parse.
     for (const auto& app_role : msg->application_roles) {
         if (app_role.support_json.has_value()) {
             root["payload"][app_role.role + "_support"] = serialized(app_role.support_json.value());

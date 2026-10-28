@@ -1127,29 +1127,38 @@ TEST(ApplicationRole, NameNeedsLeadingUnderscoreAndVersion) {
     }
 }
 
-// The support object is embedded as written, so anything but exactly one JSON object would corrupt
-// the hello or put a non-object under the support key.
-TEST(ApplicationRole, SupportJsonMustBeOneObject) {
+// The support object is embedded without a second parse, so start() sends ArduinoJson's own
+// serialization: anything but one JSON object, or strings that are not UTF-8 or hold a control
+// byte (which the serializer would emit raw), is refused, and
+// lenient input the parser accepts goes out as standard JSON.
+TEST(ApplicationRole, SupportJsonIsNormalizedToOneObject) {
     struct Row {
         const char* name;
-        const char* json;
-        bool expect_ok;
+        std::string json;
+        std::optional<std::string> expect;
     };
     const Row rows[] = {
-        {"array", "[1]", false},
-        {"number", "8930", false},
-        {"truncated", R"({"port":)", false},
-        {"trailing value", R"({"port":1}{})", false},
-        {"trailing junk", R"({"port":1} x)", false},
-        {"empty", "", false},
-        // Control: objects, with surrounding whitespace and with nesting.
-        {"object", R"({"port":8930})", true},
-        {"empty object", "{}", true},
-        {"padded", " {\"a\":{\"b\":[1,2]}}\n", true},
+        {"array", "[1]", std::nullopt},
+        {"number", "8930", std::nullopt},
+        {"truncated", R"({"port":)", std::nullopt},
+        {"trailing value", R"({"port":1}{})", std::nullopt},
+        {"trailing junk", R"({"port":1} x)", std::nullopt},
+        {"invalid UTF-8", "{\"a\":\"\xc3\x28\"}", std::nullopt},
+        {"surrogate in UTF-8", "{\"a\":\"\xed\xa0\x80\"}", std::nullopt},
+        {"empty", "", std::nullopt},
+        {"unquoted key", "{port:1}", R"({"port":1})"},
+        {"single quotes", "{'a':'b'}", R"({"a":"b"})"},
+        {"raw control byte", "{\"a\":\"x\x01\"}", std::nullopt},
+        {"escaped control byte", R"({"a":"x\u0001"})", std::nullopt},
+        // Control: objects, with surrounding whitespace, nesting and multi-byte UTF-8.
+        {"object", R"({"port":8930})", R"({"port":8930})"},
+        {"empty object", "{}", "{}"},
+        {"padded", " { \"a\" : {\"b\":[1,2]}}\n", R"({"a":{"b":[1,2]}})"},
+        {"UTF-8", "{\"a\":\"\xc3\xa9\xf0\x9f\x8e\xb5\"}", "{\"a\":\"\xc3\xa9\xf0\x9f\x8e\xb5\"}"},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        EXPECT_EQ(is_valid_support_object_json(row.json), row.expect_ok);
+        EXPECT_EQ(normalize_support_object_json(row.json), row.expect);
     }
 }
 

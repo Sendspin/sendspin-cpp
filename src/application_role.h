@@ -22,6 +22,7 @@
 #include <ArduinoJson.h>
 
 #include <cstddef>
+#include <optional>
 #include <string>
 
 namespace sendspin {
@@ -30,7 +31,8 @@ namespace sendspin {
 ///
 /// README.md "Application-Specific Roles" requires the leading `_` and an explicit version. The
 /// characters are held to visible ASCII so the name and its "<role>_support" key stay plain
-/// identifiers on the wire.
+/// identifiers on the wire. An application-specific version of a defined role (`player@_exp`) is
+/// not accepted: the library implements the defined roles itself.
 inline bool is_valid_application_role_name(const std::string& role) {
     if (role.size() < 4 || role[0] != '_') {
         return false;
@@ -52,11 +54,50 @@ inline bool is_valid_application_role_name(const std::string& role) {
     return at != std::string::npos && at > 1 && at + 1 < role.size();
 }
 
-/// @brief Whether `json` is exactly one JSON object, with nothing but whitespace after it
+/// @brief Whether `text` is well-formed UTF-8 (RFC 3629: no overlong forms, no surrogates)
+inline bool is_valid_utf8(const std::string& text) {
+    size_t i = 0;
+    while (i < text.size()) {
+        const auto lead = static_cast<unsigned char>(text[i]);
+        size_t len = 0;
+        unsigned char lo = 0x80;
+        unsigned char hi = 0xBF;  // bounds of the first continuation byte
+        if (lead < 0x80) {
+            ++i;
+            continue;
+        } else if (lead >= 0xC2 && lead <= 0xDF) {
+            len = 2;
+        } else if (lead >= 0xE0 && lead <= 0xEF) {
+            len = 3;
+            lo = lead == 0xE0 ? 0xA0 : 0x80;
+            hi = lead == 0xED ? 0x9F : 0xBF;
+        } else if (lead >= 0xF0 && lead <= 0xF4) {
+            len = 4;
+            lo = lead == 0xF0 ? 0x90 : 0x80;
+            hi = lead == 0xF4 ? 0x8F : 0xBF;
+        } else {
+            return false;
+        }
+        if (text.size() - i < len) {
+            return false;
+        }
+        for (size_t k = 1; k < len; ++k) {
+            const auto c = static_cast<unsigned char>(text[i + k]);
+            if (c < (k == 1 ? lo : 0x80) || c > (k == 1 ? hi : 0xBF)) {
+                return false;
+            }
+        }
+        i += len;
+    }
+    return true;
+}
+
+/// @brief Parses `json` as one JSON object and returns it re-serialized, or nullopt
 ///
-/// The text is embedded into client/hello as is, so trailing bytes deserializeJson() would stop
-/// before must be refused here too.
-inline bool is_valid_support_object_json(const std::string& json) {
+/// ArduinoJson's parser is lenient (unquoted keys, single quotes, leading zeros), so the text that
+/// goes into client/hello is its own output rather than the caller's input. Trailing bytes the
+/// parse stops before, and strings that are not UTF-8 or hold a raw control byte, are refused.
+inline std::optional<std::string> normalize_support_object_json(const std::string& json) {
     // ArduinoJson reader that records how far the parse consumed
     struct CountingReader {
         const std::string& text;
@@ -80,15 +121,27 @@ inline bool is_valid_support_object_json(const std::string& json) {
     JsonDocument doc = make_json_document(allocator);
     CountingReader reader{json};
     if (deserializeJson(doc, reader) || !doc.is<JsonObject>()) {
-        return false;
+        return std::nullopt;
     }
     for (size_t i = reader.pos; i < json.size(); ++i) {
         const char c = json[i];
         if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
-            return false;
+            return std::nullopt;
         }
     }
-    return true;
+    std::string out;
+    serializeJson(doc, out);
+    // The serializer passes a string's raw control bytes through unescaped, and minified output
+    // has no other byte below 0x20
+    for (const char c : out) {
+        if (static_cast<unsigned char>(c) < 0x20) {
+            return std::nullopt;
+        }
+    }
+    if (!is_valid_utf8(out)) {
+        return std::nullopt;
+    }
+    return out;
 }
 
 }  // namespace sendspin
