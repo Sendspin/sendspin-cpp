@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <io.h>
+#include <windows.h>  // MoveFileExA
 #else
 #include <unistd.h>
 #endif
@@ -66,8 +67,9 @@ static std::string read_file(const std::string& path) {
 ///
 /// Windows has no POSIX creation mode, so the temp file inherits its directory's ACL, which under
 /// %USERPROFILE% grants only the user, SYSTEM and Administrators. Its contents are flushed with
-/// _commit() before std::filesystem::rename() replaces the destination (std::rename() refuses to
-/// replace an existing file on Windows). The rename itself is not flushed.
+/// _commit() before MoveFileExA() replaces the destination (std::rename() refuses to replace an
+/// existing file on Windows); MOVEFILE_WRITE_THROUGH holds the call until the move is on disk, as
+/// the directory fsync does on POSIX.
 static bool write_file(const std::string& path, const std::string& content) {
     std::string tmp = path + ".tmp";
 
@@ -83,9 +85,8 @@ static bool write_file(const std::string& path, const std::string& content) {
         return false;
     }
 
-    std::error_code ec;
-    std::filesystem::rename(tmp, path, ec);
-    return !ec;
+    return ::MoveFileExA(tmp.c_str(), path.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 #else
 /// Write content atomically via a temp file then rename.
