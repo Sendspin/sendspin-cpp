@@ -149,6 +149,20 @@ struct SendspinTracedMessage {
 using SendspinMessageTraceFn = std::function<void(const SendspinTracedMessage& message)>;
 #endif
 
+/// @brief An application-specific role this client advertises in client/hello, beside the roles
+/// the library implements (README.md "Application-Specific Roles"). The library only announces
+/// it: the server may list it in active_roles, and the application defines what that means.
+struct SendspinApplicationRole {
+    /// @brief Versioned role name: a leading `_`, a name, `@`, and a version, in visible ASCII
+    /// (e.g. "_myapp_display@v1"). Include a vendor prefix to avoid collisions.
+    std::string role;
+
+    /// @brief The role's support object as serialized JSON (e.g. `{"port":8930}`), sent as
+    /// "<role>_support" as the library re-serializes it; unset sends none. It must parse as a
+    /// JSON object that re-serializes as valid JSON (see the integration guide).
+    std::optional<std::string> support_json{};
+};
+
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start()
 struct SendspinClientConfig {
@@ -211,6 +225,12 @@ struct SendspinClientConfig {
     /// "device", "leaflet", "operator". Advertised as the informational `locations` hint on the
     /// static_pairing_code descriptor in client/hello; empty = omit the hint.
     std::vector<std::string> static_pairing_code_locations{};
+
+    /// @brief Application-specific roles listed in client/hello `supported_roles` after the
+    /// library's own, in this order. A role whose name is not `_<name>@<version>`, a repeated
+    /// name, or a support object SendspinApplicationRole::support_json does not admit is rejected:
+    /// start() logs an error and returns false.
+    std::vector<SendspinApplicationRole> application_roles{};
 
     /// @brief Default maximum number of long-term pairing records the store retains. Each record
     /// occupies its own persistence key of `persistence_keys::RECORD_SLOT_SIZE` bytes, so the cap

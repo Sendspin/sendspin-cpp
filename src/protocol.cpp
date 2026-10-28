@@ -901,6 +901,9 @@ std::string format_client_hello_message(const ClientHelloMessage* msg,
     for (const auto& role : msg->supported_roles) {
         supported_roles_list.add(to_cstr(role));
     }
+    for (const auto& app_role : msg->application_roles) {
+        supported_roles_list.add(app_role.role);
+    }
 
     if (msg->player_v1_support.has_value()) {
         JsonArray formats_list =
@@ -930,6 +933,15 @@ std::string format_client_hello_message(const ClientHelloMessage* msg,
         JsonObject source_json = root["payload"]["source@v1_support"].to<JsonObject>();
         if (msg->source_v1_support.value().line_sense) {
             source_json["features"]["line_sense"] = true;
+        }
+    }
+
+    // messaging.md "client/hello": an application-specific role's support object is keyed
+    // "<role>_support". start() replaced the text with ArduinoJson's own serialization of one
+    // JSON object, so it is embedded without a second parse.
+    for (const auto& app_role : msg->application_roles) {
+        if (app_role.support_json.has_value()) {
+            root["payload"][app_role.role + "_support"] = serialized(app_role.support_json.value());
         }
     }
 
