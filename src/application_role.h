@@ -97,6 +97,9 @@ inline bool is_valid_utf8(const std::string& text) {
 /// ArduinoJson's parser is lenient (unquoted keys, single quotes, leading zeros), so the text that
 /// goes into client/hello is its own output rather than the caller's input. Trailing bytes the
 /// parse stops before, and strings that are not UTF-8 or hold a raw control byte, are refused.
+/// Two inputs are changed rather than refused, since detecting them would mean comparing the
+/// parse to the input: an escaped lone surrogate is dropped and an out-of-range number becomes
+/// null. Both still go out as valid JSON.
 inline std::optional<std::string> normalize_support_object_json(const std::string& json) {
     // ArduinoJson reader that records how far the parse consumed
     struct CountingReader {

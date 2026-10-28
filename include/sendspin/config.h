@@ -159,7 +159,7 @@ struct SendspinApplicationRole {
 
     /// @brief The role's support object as serialized JSON (e.g. `{"port":8930}`), sent as
     /// "<role>_support" as the library re-serializes it; unset sends none. It must parse as a
-    /// JSON object whose strings are UTF-8 without control characters.
+    /// JSON object that re-serializes as valid JSON (see the integration guide).
     std::optional<std::string> support_json{};
 };
 
