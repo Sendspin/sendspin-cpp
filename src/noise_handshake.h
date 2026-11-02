@@ -66,9 +66,9 @@ struct NoiseHandshakeResult {
     std::string server_id;
     /// The PSK record that admitted the connection.
     ResolvedPsk resolved_psk;
-    /// Serialized noise/handshake msg2 JSON to send to the peer.
-    /// Non-empty only for re-handshake results (initial handshake sends msg2 inline).
-    std::string msg2_text;
+    /// The noise/handshake msg2 envelope to send to the peer, built in the client's JSON arena.
+    /// Set only for re-handshake results (initial handshake sends msg2 inline).
+    JsonDocument msg2;
 };
 
 /// @brief Result of processing one incoming WS frame during the handshake.
@@ -119,7 +119,7 @@ std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst en
 /// @param prior_h        32-byte handshake hash from the prior session (used as prologue).
 /// @param arena          The client's JSON arena: msg1's payload is parsed and the msg2 envelope
 ///                       built in it, one after the other.
-/// @return Populated NoiseHandshakeResult (session + msg2_text to send) on success,
+/// @return Populated NoiseHandshakeResult (session + msg2 to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
     const std::vector<uint8_t>& msg1_bytes, const std::string& server_id, const Identity& identity,
@@ -160,16 +160,17 @@ public:
     // Drive the state machine
     // ========================================
 
-    /// @brief Serialize and return the client/init TEXT frame, or an empty string on error.
+    /// @brief Serialize and return the client/init TEXT frame, or an empty view on error. The view
+    /// is of the text the handshake retains for its prologue, valid while this object lives.
     /// Call this immediately after the WS connection is open, before reading frames.
-    std::string build_client_init();
+    std::string_view build_client_init();
 
     /// @brief Process one incoming WS text frame.
     /// Must be called in sequence: server/init, then noise/handshake msg1.
-    /// @param send_fn  Callable that sends a TEXT frame to the peer.
-    ///                 Signature: `bool send_fn(const std::string& text)`.
+    /// @param send_fn  Callable that sends a JSON message to the peer as a TEXT frame.
+    ///                 Signature: `bool send_fn(const JsonDocument& msg)`.
     HandshakeFrameResult on_text_frame(std::string_view text,
-                                       const std::function<bool(const std::string&)>& send_fn);
+                                       const std::function<bool(const JsonDocument&)>& send_fn);
 
     /// @brief The reason carried by a server/error received during the handshake, or empty.
     ///
@@ -210,7 +211,7 @@ private:
     /// @param send_fn    Sends the msg2 frame back to the peer.
     /// @return true when msg1 authenticated and msg2 was sent.
     bool handle_msg1(const std::vector<uint8_t>& msg1_bytes,
-                     const std::function<bool(const std::string&)>& send_fn);
+                     const std::function<bool(const JsonDocument&)>& send_fn);
 
     // Struct fields
     /// Exact bytes of the client/init frame we sent (retained for prologue).

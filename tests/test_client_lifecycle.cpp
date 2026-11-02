@@ -874,7 +874,7 @@ public:
     SsErr send_binary_message(const uint8_t*, size_t) override {
         return SsErr::OK;
     }
-    SsErr send_text_message(const std::string&) override {
+    SsErr send_text_message(const char* /*text*/, size_t /*len*/) override {
         return SsErr::OK;
     }
 };
@@ -885,8 +885,9 @@ class HelloCountingConnection : public StubConnection {
 public:
     explicit HelloCountingConnection(SsErr result) : result_(result) {}
 
-    // No Noise session, so send_app_json() routes the hello here as raw text.
-    SsErr send_text_message(const std::string& msg) override {
+    // No Noise session, so send_json() routes the hello here as raw text.
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         if (msg.find("client/hello") != std::string::npos) {
             ++this->hellos;
         }
@@ -1558,8 +1559,9 @@ public:
     void disconnect(SendspinGoodbyeReason reason) override {
         this->events.push_back("goodbye " + std::to_string(static_cast<int>(reason)));
     }
-    // No Noise session, so send_app_json() routes a message here as raw text.
-    SsErr send_text_message(const std::string& msg) override {
+    // No Noise session, so send_json() routes a message here as raw text.
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         if (msg.find("client/leave") != std::string::npos) {
             this->events.emplace_back("leave");
         } else if (msg.find("client/command") != std::string::npos) {

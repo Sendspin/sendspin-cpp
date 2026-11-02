@@ -57,7 +57,7 @@ public:
     bool is_connected() const override;
 
     /// @brief Sends a text message to the connected client
-    SsErr send_text_message(const std::string& message) override;
+    SsErr send_text_message(const char* text, size_t len) override;
 
     /// @brief Sends a binary message to the connected client
     SsErr send_binary_message(const uint8_t* data, size_t len) override;

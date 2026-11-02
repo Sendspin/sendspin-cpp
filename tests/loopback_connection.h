@@ -76,7 +76,8 @@ public:
     }
     bool is_connected() const override { return true; }
 
-    SsErr send_text_message(const std::string& msg) override {
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         sent_text_.push_back(msg);
         return SsErr::OK;
     }
@@ -255,7 +256,7 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     NoiseHandshake nh(client_id, rs, suite_name.c_str(), arena);
 
     // Step 1: client sends client/init
-    std::string client_init = nh.build_client_init();
+    std::string client_init(nh.build_client_init());
     EXPECT_FALSE(client_init.empty());
 
     // Verify client/init JSON format
@@ -284,8 +285,8 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
 
     // Our driver processes server/init
     std::string captured_msg2;
-    auto send_fn = [&captured_msg2](const std::string& text) -> bool {
-        captured_msg2 = text;
+    auto send_fn = [&captured_msg2](const JsonDocument& msg) -> bool {
+        captured_msg2 = to_text(msg);
         return true;
     };
 

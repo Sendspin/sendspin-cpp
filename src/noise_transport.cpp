@@ -85,8 +85,7 @@ SsErr NoiseTransport::encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity,
     return err;
 }
 
-SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, size_t data_len,
-                                        const FrameWriteHook& before_write) {
+SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, size_t data_len) {
     const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_FIRST_HEADER_SIZE;
     const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_CONT_HEADER_SIZE;
 
@@ -106,9 +105,8 @@ SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, 
     std::memcpy(frame_buf.data() + FRAGMENT_FIRST_HEADER_SIZE, data, first_chunk);
     size_t first_frame_len = FRAGMENT_FIRST_HEADER_SIZE + first_chunk;
 
-    const bool first_is_last = (first_chunk == data_len);
-    SsErr err = this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), first_frame_len,
-                                             first_is_last ? before_write : nullptr);
+    SsErr err =
+        this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), first_frame_len, nullptr);
     if (err != SsErr::OK) {
         return err;
     }
@@ -125,7 +123,7 @@ SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, 
         size_t cont_frame_len = FRAGMENT_CONT_HEADER_SIZE + chunk;
 
         err = this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), cont_frame_len,
-                                           is_last ? before_write : nullptr);
+                                           nullptr);
         if (err != SsErr::OK) {
             // Earlier fragments are out; encrypt_and_send_frame() has marked the send desynced.
             return err;
@@ -136,39 +134,31 @@ SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, 
     return SsErr::OK;
 }
 
-SsErr NoiseTransport::fill_and_encrypt(const uint8_t* prefix, size_t prefix_len,
-                                       const uint8_t* data, size_t data_len,
-                                       const FrameWriteHook& before_write) {
-    const size_t plaintext_len = prefix_len + data_len;
-    if (!this->ensure_send_buf(plaintext_len + AEAD_TAG_SIZE)) {
-        return SsErr::FAIL;
+char* NoiseTransport::stage_json(size_t max_len) {
+    // Plaintext = [MSG_TYPE_JSON_BODY] + utf8(json). The terminator a caller's writer may add
+    // lands in the AEAD tag room.
+    if (1 + max_len > MAX_TRANSPORT_PLAINTEXT) {
+        SS_LOGE(TAG, "stage_json: a %zu-byte JSON message does not fit one frame", max_len);
+        return nullptr;
     }
-    if (prefix_len > 0) {
-        std::memcpy(this->send_buf_.data(), prefix, prefix_len);
+    if (!this->ensure_send_buf(1 + max_len + AEAD_TAG_SIZE)) {
+        return nullptr;
     }
-    std::memcpy(this->send_buf_.data() + prefix_len, data, data_len);
-    return this->encrypt_and_send_frame(this->send_buf_.data(), this->send_buf_.size(),
-                                        plaintext_len, before_write);
+    this->send_buf_.data()[0] = MSG_TYPE_JSON_BODY;
+    return reinterpret_cast<char*>(this->send_buf_.data() + 1);
 }
 
-SsErr NoiseTransport::send_json(const char* json, size_t len, const FrameWriteHook& before_write) {
-    if (!this->is_active()) {
-        return SsErr::INVALID_STATE;
+SsErr NoiseTransport::send_staged_json(size_t len, const FrameWriteHook& before_write) {
+    const SsErr err = this->is_active() ? this->encrypt_and_send_frame(this->send_buf_.data(),
+                                                                       this->send_buf_.size(),
+                                                                       1 + len, before_write)
+                                        : SsErr::INVALID_STATE;
+    if (err != SsErr::OK) {
+        // A refusal before the encrypt, or a failed encrypt, leaves the plaintext staged; after a
+        // failed write the wipe only clears ciphertext.
+        secure_zero(this->send_buf_.data(), 1 + len);
     }
-
-    // Plaintext = [MSG_TYPE_JSON_BODY] + utf8(json)
-    const size_t plaintext_len = 1 + len;
-
-    if (plaintext_len <= MAX_TRANSPORT_PLAINTEXT) {
-        const uint8_t prefix = MSG_TYPE_JSON_BODY;
-        return this->fill_and_encrypt(&prefix, 1, reinterpret_cast<const uint8_t*>(json), len,
-                                      before_write);
-    }
-
-    // Need fragmentation. Rare (large messages only) and larger than send_buf_'s cap, so
-    // fragment_and_send() allocates its own frame buffer instead.
-    return this->fragment_and_send(MSG_TYPE_JSON_BODY, reinterpret_cast<const uint8_t*>(json), len,
-                                   before_write);
+    return err;
 }
 
 SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
@@ -186,10 +176,15 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
     }
 
     if (len <= MAX_TRANSPORT_PLAINTEXT) {
-        return this->fill_and_encrypt(nullptr, 0, data, len, nullptr);
+        if (!this->ensure_send_buf(len + AEAD_TAG_SIZE)) {
+            return SsErr::FAIL;
+        }
+        std::memcpy(this->send_buf_.data(), data, len);
+        return this->encrypt_and_send_frame(this->send_buf_.data(), this->send_buf_.size(), len,
+                                            nullptr);
     }
 
-    return this->fragment_and_send(data[0], data + 1, len - 1, nullptr);
+    return this->fragment_and_send(data[0], data + 1, len - 1);
 }
 
 SsErr NoiseTransport::send_binary_lent(OutboundRing& ring, void* item, size_t message_capacity,
@@ -227,21 +222,10 @@ SsErr NoiseTransport::send_binary_lent(OutboundRing& ring, void* item, size_t me
     return err;
 }
 
-SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
-                                         std::unique_ptr<NoiseSession> next_session) {
+SsErr NoiseTransport::send_msg2_and_swap(size_t len, std::unique_ptr<NoiseSession> next_session) {
     // msg2 goes out under the OLD session, then the session swaps. Every send runs on the
     // protocol task, as this does, so no encrypt can fall between the two.
-    const size_t plaintext_len = 1 + msg2_text.size();
-    if (plaintext_len > MAX_TRANSPORT_PLAINTEXT) {
-        // The handshake msg2 JSON is never expected to approach this size; reject rather than
-        // overflow the fixed-size send_buf_.
-        SS_LOGE(TAG, "send_msg2_and_swap: msg2 plaintext too large (%zu bytes)", plaintext_len);
-        return SsErr::FAIL;
-    }
-
-    const uint8_t prefix = MSG_TYPE_JSON_BODY;
-    SsErr err = this->fill_and_encrypt(
-        &prefix, 1, reinterpret_cast<const uint8_t*>(msg2_text.data()), msg2_text.size(), nullptr);
+    SsErr err = this->send_staged_json(len);
     if (err != SsErr::OK) {
         SS_LOGE(TAG, "send_msg2_and_swap: failed to send encrypted msg2 (err=%d)",
                 static_cast<int>(err));

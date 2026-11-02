@@ -778,7 +778,7 @@ private:
         if (std::strcmp(type, "client/goodbye") == 0) {
             // A goodbye in CLEARTEXT, before any Noise transport exists: the client rejected the
             // connection at accept (a full nursery), so it never installed a handshake driver and
-            // send_app_json() fell back to a plain text frame. The encrypted counterpart of this
+            // send_json() fell back to a plain text frame. The encrypted counterpart of this
             // branch lives in handle_binary().
             std::lock_guard<std::mutex> glock(this->goodbye_mutex_);
             this->goodbye_reason_ = doc["payload"]["reason"] | "";

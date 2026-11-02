@@ -321,10 +321,10 @@ struct SendspinClientConfig {
     MemoryLocation inbound_ring_location{MemoryLocation::PREFER_EXTERNAL};
 
     /// @brief Memory placement for the Noise transport's fragment reassembly buffer, the ~64 KB
-    /// fragmentation frame buffer, and the outbound send scratch buffer (ESP-IDF only; ignored on
-    /// host). The reassembly buffer grows with the largest fragmented message received (a player
-    /// audio chunk, bounded by the buffer capacity the player role advertises) and retains its
-    /// capacity, so PREFER_EXTERNAL keeps it out of internal RAM.
+    /// fragmentation frame buffer, and the outbound send buffer every JSON message is serialized
+    /// into (ESP-IDF only; ignored on host). The reassembly buffer grows with the largest
+    /// fragmented message received (a player audio chunk, bounded by the buffer capacity the player
+    /// role advertises) and retains its capacity, so PREFER_EXTERNAL keeps it out of internal RAM.
     MemoryLocation noise_buffer_location{MemoryLocation::PREFER_EXTERNAL};
 
     /// @brief Default arena size: one steady-state protocol message, including the FLAC

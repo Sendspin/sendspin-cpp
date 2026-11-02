@@ -225,39 +225,24 @@ public:
     ///         false on any failure (caller should close the WebSocket).
     bool handle_noise_rehandshake(const std::vector<uint8_t>& msg1_bytes);
 
-    /// @brief Encrypt and send a JSON string as a Noise transport binary frame, through
-    /// NoiseTransport::send_json() and settle_noise_send().
-    /// @return SsErr::OK on success.
-    SsErr send_encrypted_text(const char* json, size_t len) {
-        return this->settle_noise_send(this->noise_transport_.send_json(json, len));
-    }
-
-    /// @brief std::string overload of send_encrypted_text().
-    SsErr send_encrypted_text(const std::string& json) {
-        return this->send_encrypted_text(json.data(), json.size());
-    }
-
-    /// @brief Send an application-level JSON message.
+    /// @brief Sends a JSON message: serialized straight into the Noise transport's send buffer
+    /// (NoiseTransport::stage_json()), then encrypted there once the transport is active, or sent
+    /// from there as a cleartext text frame before the handshake.
     ///
-    /// This is the single choke point for all post-handshake application JSON.
-    /// - If the Noise transport is active, routes through send_encrypted_text() so the
-    ///   frame is encrypted.
-    /// - If not yet encrypted (pre-handshake), routes through send_text_message().
-    ///
-    /// All role senders use this method. client/time is the one exception: send_time_message()
-    /// calls NoiseTransport::send_json() directly to pass its write hook, and settles its result
-    /// the same way. Protocol task only, like every send on a connection. On an ESP outbound
-    /// connection the transport send blocks for up to its 10 ms send timeout
-    /// (src/esp/client_connection.cpp), once per frame.
+    /// The one way a JSON document leaves the client: every application message, the goodbye,
+    /// and the initial handshake's msg2. The others stage their text the same way: client/time
+    /// is formatted into the send buffer by send_time_message(), and the re-handshake's msg2 goes
+    /// out under the old session by handle_noise_rehandshake(). client/init alone is sent from
+    /// the text the handshake retains for its prologue. Protocol task only, like every send on a
+    /// connection. On an ESP outbound connection the transport send blocks for up to its 10 ms
+    /// send timeout (src/esp/client_connection.cpp).
     ///
     /// A failure after the encrypt closes the connection (settle_noise_send()); one before it
     /// leaves the connection open. Either way the caller only sees the error.
-    /// @return SsErr::OK if queued/sent, error code otherwise.
-    SsErr send_app_json(const std::string& json);
-
-    /// @brief Pointer/length form of send_app_json(); encrypts straight from the caller's
-    /// buffer, and the pre-handshake text fallback builds the string it needs
-    SsErr send_app_json(const char* json, size_t len);
+    /// @return SsErr::OK if queued/sent; NO_MEM when the message could not be staged (the
+    ///         document overflowed its allocator, it is longer than one frame, or the send
+    ///         buffer could not grow); another error code otherwise.
+    SsErr send_json(const JsonDocument& doc);
 
     /// @brief Send an application binary message lying in an outbound ring item, encrypted in
     /// place and lent to the transport until its frame is written (NoiseTransport::
@@ -266,7 +251,7 @@ public:
     /// Item ownership: OutboundRing, "Lending". Binary application messages exist only under the
     /// Noise transport, so there is no cleartext fallback: before the handshake, or once
     /// accepts_app_sends() is false, the item is returned unsent with INVALID_STATE. A failure
-    /// after the encrypt closes the connection (settle_noise_send()), as for send_app_json().
+    /// after the encrypt closes the connection (settle_noise_send()), as for send_json().
     /// @param message_capacity As OutboundRing::take() reported it.
     /// @param plaintext_len    Bytes of the message, type byte first, at the start of the item's
     ///                         message bytes.
@@ -302,10 +287,10 @@ public:
         return this->last_receive_time_us_.load(std::memory_order_relaxed);
     }
 
-    /// @brief Sends a text message to the peer.
-    /// @param message The message string to send.
+    /// @brief Sends a text message to the peer. The transport copies or writes the text before it
+    /// returns.
     /// @return SsErr::OK if queued/sent, error code otherwise.
-    virtual SsErr send_text_message(const std::string& message) = 0;
+    virtual SsErr send_text_message(const char* text, size_t len) = 0;
 
     /// @brief Sends a client/time message and records it as the frame in flight (see
     /// time_frame_tag_). Needs the Noise transport, which is_operational() implies. Protocol task
@@ -892,6 +877,13 @@ protected:
     /// encrypt. Protocol task only.
     /// @param err The send's result, returned unchanged.
     SsErr settle_noise_send(SsErr err);
+
+    /// @brief Serializes `doc` into the Noise transport's send buffer behind the JSON type byte
+    /// (NoiseTransport::stage_json()), sized exactly with measureJson(), so the text is never
+    /// built anywhere else. Protocol task only.
+    /// @return The staged text, or an empty view (logged) when `doc` overflowed its allocator or
+    ///         stage_json() refused it.
+    std::string_view stage_json(const JsonDocument& doc);
 
     /// @brief Classifies a complete transport message: type 0 as JSON, stripping its type byte,
     /// all others as binary role messages. Protocol task only.

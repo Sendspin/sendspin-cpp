@@ -316,8 +316,8 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
     // formats nothing.
     SendspinConnection* conn = manager.role_send_target(SendspinRole::CONTROLLER);
     if (conn != nullptr) {
-        conn->send_app_json(
-            format_client_command_message(command.controller_command, *this->json_arena_));
+        conn->send_json(
+            build_client_command_message(command.controller_command, *this->json_arena_));
     }
 }
 
@@ -325,8 +325,8 @@ void SendspinClient::process_inbound(SendspinConnection& conn, InboundMessage& m
     // One reset per inbound message of any kind, the Noise handshake frames included, reclaiming
     // what the documents of the previous one stranded (see SendspinArenaAllocator). Safe: this is
     // called only from the tick's top level, where no arena document is live; every document the
-    // task parsed or built since the last reset was destroyed before its parser or builder
-    // returned.
+    // task parsed or built since the last reset was destroyed before the handler that parsed or
+    // built it returned.
     this->json_arena_->reset();
     InboundMessage complete;
     switch (conn.process_inbound_message(message, complete)) {

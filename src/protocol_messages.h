@@ -1069,28 +1069,31 @@ bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg);
 /// @brief Parses a stream/clear JSON message into the provided struct
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg);
 
-/// @brief Formats a client/hello message as a JSON string
-std::string format_client_hello_message(const ClientHelloMessage* msg,
+// Each build_*_message() returns its message as a document allocated from `arena`, for
+// SendspinConnection::send_json() to serialize straight into the transport's send buffer.
+
+/// @brief Builds a client/hello message
+JsonDocument build_client_hello_message(const ClientHelloMessage* msg,
                                         SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/state message as a JSON string
-std::string format_client_state_message(const ClientStateMessage* msg,
+/// @brief Builds a client/state message
+JsonDocument build_client_state_message(const ClientStateMessage* msg,
                                         SendspinArenaAllocator& arena);
 
-/// @brief Formats a client-stream/start message as a JSON string
-std::string format_client_stream_start_message(const ClientStreamStartMessage* msg,
+/// @brief Builds a client-stream/start message
+JsonDocument build_client_stream_start_message(const ClientStreamStartMessage* msg,
                                                SendspinArenaAllocator& arena);
 
-/// @brief Formats a client-stream/end message as a JSON string
+/// @brief Builds a client-stream/end message
 /// roles/source/v1.md "client-stream/end": ends the input stream; no payload fields.
-std::string format_client_stream_end_message(SendspinArenaAllocator& arena);
+JsonDocument build_client_stream_end_message(SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/leave message as a JSON string
+/// @brief Builds a client/leave message
 /// messaging.md "client/leave": leaves the client's current group; no payload fields.
-std::string format_client_leave_message(SendspinArenaAllocator& arena);
+JsonDocument build_client_leave_message(SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/goodbye message as a JSON string
-std::string format_client_goodbye_message(SendspinGoodbyeReason reason,
+/// @brief Builds a client/goodbye message
+JsonDocument build_client_goodbye_message(SendspinGoodbyeReason reason,
                                           SendspinArenaAllocator& arena);
 
 /// Buffer size for format_client_time_message(). Fits the longest possible message:
@@ -1106,26 +1109,26 @@ static constexpr size_t TIME_MESSAGE_BUF_SIZE = 96;
 /// @return Number of bytes written (excluding any null terminator), or 0 on error.
 size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted);
 
-/// @brief Formats a client/command message as a JSON string
+/// @brief Builds a client/command message
 /// @param cmd The playback command plus any command-specific parameters. Only the parameter
 /// relevant to the command is serialized (e.g. position_ms for SEEK); others are ignored.
-std::string format_client_command_message(const ClientCommandControllerObject& cmd,
+JsonDocument build_client_command_message(const ClientCommandControllerObject& cmd,
                                           SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/pair-finalize message carrying long_term_psk directly (Pairing PSK
+/// @brief Builds a client/pair-finalize message carrying long_term_psk directly (Pairing PSK
 /// flow only). The PSK is 32 raw bytes, base64url-encoded (no padding, 43 chars).
-std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk,
+JsonDocument build_client_pair_finalize_message(const std::array<uint8_t, 32>& psk,
                                                 SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/pair-finalize message carrying wrapped_psk (pairing-code flows only;
+/// @brief Builds a client/pair-finalize message carrying wrapped_psk (pairing-code flows only;
 /// see pairing.md "Wrapping"). wrapped_psk is 48 raw bytes, base64url-encoded (no padding, 64
 /// chars).
-std::string format_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
+JsonDocument build_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
                                                         SendspinArenaAllocator& arena);
 
-/// @brief Formats a pair/abort message as a JSON string.
+/// @brief Builds a pair/abort message.
 /// Sent by the client when it cannot proceed with the selected pairing method.
-std::string format_pair_abort_message(PairAbortReason reason, SendspinArenaAllocator& arena);
+JsonDocument build_pair_abort_message(PairAbortReason reason, SendspinArenaAllocator& arena);
 
 /// @brief Parses a pair/abort JSON message into the provided struct; false on a missing or
 /// unrecognized reason
@@ -1150,54 +1153,54 @@ bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* pa
 /// @param payload [out] Struct to populate; nullptr for validation-only.
 bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload);
 
-/// @brief Formats a client/pair-pending message as a JSON string.
+/// @brief Builds a client/pair-pending message.
 /// Sent immediately on receiving a pairing server/activate whose attempt is gesture-gated while
 /// no pairing window is open; client/pair-init follows once a window opens. Does not start the
 /// attempt or its timeout.
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
 ///                      handshake (see SendspinConnection::get_pairing_index()).
-std::string format_client_pair_pending_message(uint32_t pairing_index,
+JsonDocument build_client_pair_pending_message(uint32_t pairing_index,
                                                SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/pair-init message as a JSON string.
+/// @brief Builds a client/pair-init message.
 /// Starts the dynamic-pairing-code attempt; carries commit_B = SHA-256(PAIRING_COMMIT_LABEL ||
 /// nonce_B) and the required pairing_index counter (pairing.md "Pairing index").
 /// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
-std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
+JsonDocument build_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
                                             uint32_t pairing_index, SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/pair-init message with only pairing_index.
+/// @brief Builds a client/pair-init message with only pairing_index.
 /// The form used by every flow that carries no commit_B: the static pairing code, sent after the
 /// operator confirms the pairing-window gesture and before starting CPace RESPONDER, and Pairing
 /// PSK, sent immediately before client/pair-finalize (pairing.md "Pairing PSK Flow").
-std::string format_client_pair_init_message(uint32_t pairing_index, SendspinArenaAllocator& arena);
+JsonDocument build_client_pair_init_message(uint32_t pairing_index, SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/pair-retry message as a JSON string.
+/// @brief Builds a client/pair-retry message.
 /// Sent in place of client/pair-confirm when server_kc fails to verify and the client admits
 /// another round (pairing.md "Client -> Server: client/pair-retry"). The payload is empty: the
 /// attempt, its pairing code and its running attempt timeout all carry over.
-std::string format_client_pair_retry_message(SendspinArenaAllocator& arena);
+JsonDocument build_client_pair_retry_message(SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/pair-auth message as a JSON string.
+/// @brief Builds a client/pair-auth message.
 /// Sent in response to server/pair-auth; carries the client's CPace public share.
 /// @param pake_msg_2 32-byte client CPace public share (base64url-encoded on the wire).
-std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2,
+JsonDocument build_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2,
                                             SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/pair-confirm message as a JSON string.
+/// @brief Builds a client/pair-confirm message.
 /// Sent in response to server/pair-confirm in the Dynamic Pairing Code Flow; carries client_kc
 /// and the sealed opening of the commitment sent earlier as commit_B.
 /// @param client_kc       64-byte client CPace confirmation tag (base64url-encoded on the wire).
 /// @param wrapped_nonce_b 48-byte wrapping of nonce_B (base64url-encoded on the wire, 64 chars);
 ///                        see pairing.md "Wrapping".
-std::string format_client_pair_confirm_message(
+JsonDocument build_client_pair_confirm_message(
     const std::array<uint8_t, 64>& client_kc,
     const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b, SendspinArenaAllocator& arena);
 
-/// @brief Formats a client/pair-confirm message with no commitment opening (the Static Pairing
+/// @brief Builds a client/pair-confirm message with no commitment opening (the Static Pairing
 /// Code Flow, which sends no commit_B and so has nothing to open).
 /// @param client_kc 64-byte client CPace confirmation tag (base64url-encoded on the wire).
-std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
+JsonDocument build_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
                                                SendspinArenaAllocator& arena);
 
 }  // namespace sendspin

@@ -1879,7 +1879,7 @@ TEST(ArtworkChannelReporting, HelloListsTheRoleWithoutChannels) {
     EXPECT_EQ(hello.supported_roles[0], SendspinRole::ARTWORK);
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&hello, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, to_text(build_client_hello_message(&hello, TestArena()))));
     EXPECT_TRUE(doc["payload"]["artwork@v1_support"].isUnbound());
 }
 

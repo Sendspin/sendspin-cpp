@@ -1895,7 +1895,7 @@ public:
     bool is_connected() const override {
         return true;
     }
-    SsErr send_text_message(const std::string& /*msg*/) override {
+    SsErr send_text_message(const char* /*text*/, size_t /*len*/) override {
         return SsErr::OK;
     }
     SsErr send_binary_message(const uint8_t* /*data*/, size_t /*len*/) override {
@@ -2470,11 +2470,12 @@ TEST(EncryptedLifecycle, RoleDispatchFollowsOwnership) {
 /// A stand-in that keeps every client/state it is asked to send.
 class StateCapturingConnection : public DispatchTestConnection {
 public:
-    SsErr send_text_message(const std::string& msg) override {
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         if (msg.find("client/state") != std::string::npos) {
             this->states.push_back(msg);
         }
-        return DispatchTestConnection::send_text_message(msg);
+        return DispatchTestConnection::send_text_message(text, len);
     }
 
     std::vector<std::string> states;
@@ -2541,7 +2542,7 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
     size_t smallest_reply_peak = 0;
     {
         SendspinArenaAllocator alone(ARENA_BYTES);
-        format_client_leave_message(alone);
+        to_text(build_client_leave_message(alone));
         smallest_reply_peak = alone.high_water();
     }
 
@@ -2577,11 +2578,12 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
 // admitted slot at that moment.
 class StateRecordingConnection : public DispatchTestConnection {
 public:
-    SsErr send_text_message(const std::string& msg) override {
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         if (msg.find("client/state") != std::string::npos) {
             this->state_sent_while_admitted.push_back(this->is_admitted());
         }
-        return DispatchTestConnection::send_text_message(msg);
+        return DispatchTestConnection::send_text_message(text, len);
     }
 
     std::vector<bool> state_sent_while_admitted;

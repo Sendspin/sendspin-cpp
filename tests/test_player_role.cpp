@@ -378,7 +378,7 @@ public:
     SsErr send_binary_message(const uint8_t*, size_t) override {
         return SsErr::OK;
     }
-    SsErr send_text_message(const std::string&) override {
+    SsErr send_text_message(const char* /*text*/, size_t /*len*/) override {
         return SsErr::OK;
     }
 };

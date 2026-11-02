@@ -22,7 +22,7 @@
 // The device under test is the CPace RESPONDER; the "server" side is simulated in-test with
 // a CPace INITIATOR (see cpace.h). A FakeConnection (adapted from TestConnection in
 // tests/test_noise_transport.cpp) stands in for the transport: it reports a canned Noise
-// handshake hash while leaving the Noise session unset, so SendspinConnection::send_app_json
+// handshake hash while leaving the Noise session unset, so SendspinConnection::send_json
 // emits raw JSON via send_text_message, which this file parses directly with ArduinoJson.
 //
 // The fixture stops the protocol task right after start() and plays its part on the test
@@ -52,6 +52,7 @@
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
+#include "test_util.h"
 #include "wrap_test_helpers.h"
 
 #include <ArduinoJson.h>
@@ -100,7 +101,8 @@ public:
     }
     bool is_connected() const override { return this->connected_; }
 
-    SsErr send_text_message(const std::string& msg) override {
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         sent_text_.push_back(msg);
         return SsErr::OK;
     }
@@ -113,7 +115,7 @@ public:
     // Test-only seam: canned handshake hash without a Noise session
 
     /// Report a fixed 32-byte handshake hash while leaving noise_session_ (and therefore
-    /// noise_active_) unset, so send_app_json() routes through send_text_message() as raw JSON.
+    /// noise_active_) unset, so send_json() routes through send_text_message() as raw JSON.
     std::optional<std::array<uint8_t, 32>> get_noise_handshake_hash() const override {
         return this->canned_hash_;
     }
@@ -416,7 +418,7 @@ protected:
     void SetUp() override {
         // The harness defaults to a device able to emit a dynamic pairing code (spec "PAKE"'s
         // pairing-method admissibility check in ConnectionManager::on_server_activate() mirrors
-        // build_hello_message()'s gating exactly). Tests that need a different capability shape
+        // build_client_hello()'s gating exactly). Tests that need a different capability shape
         // call init_client() again.
         this->init_client(/*pairing_code_emission_supported=*/true);
     }
@@ -674,11 +676,12 @@ protected:
 
     /// Return the `locations` array on the client/hello descriptor for `method`, or nullopt when
     /// the descriptor omits the hint. Fails the calling test if the method is not advertised at
-    /// all. build_hello_message() is private; this is the -fno-access-control seam for it.
+    /// all. build_client_hello() is private; this is the -fno-access-control seam for it.
     std::optional<std::vector<std::string>> hello_locations(const char* method) {
         JsonDocument doc;
         JsonObject root;
-        EXPECT_TRUE(parse_json(this->client_->build_hello_message(), doc, root));
+        const ClientHelloMessage hello = this->client_->build_client_hello();
+        EXPECT_TRUE(parse_json(to_text(build_client_hello_message(&hello, TestArena())), doc, root));
         JsonVariantConst desc = root["payload"]["supported_pair_methods"][method];
         if (!desc.isUnbound()) {
             if (desc["locations"].isUnbound()) {

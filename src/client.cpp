@@ -1402,7 +1402,7 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
 #endif
 }
 
-std::string SendspinClient::build_hello_message() {
+ClientHelloMessage SendspinClient::build_client_hello() {
     // Reached only from ConnectionManager::send_hello_message(), so only for a connection, so
     // only after a successful start(): record_store_ exists and is dereferenced unguarded below.
     ClientHelloMessage msg;
@@ -1486,7 +1486,7 @@ std::string SendspinClient::build_hello_message() {
     }
 #endif
 
-    return format_client_hello_message(&msg, *this->json_arena_);
+    return msg;
 }
 
 // ============================================================================
@@ -1527,7 +1527,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // after a server/activate carries them all.
     const ClientStateMessage state_msg =
         client_state_for_roles(snapshot, entry->owned_roles & conn->get_active_role_mask());
-    conn->send_app_json(format_client_state_message(&state_msg, *this->json_arena_));
+    conn->send_json(build_client_state_message(&state_msg, *this->json_arena_));
 }
 
 void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {
