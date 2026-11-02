@@ -119,6 +119,11 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_client_teardown.cpp`: destroying a running client joins every threaded role.
 - `test_role_deactivation.cpp`: a later `server/activate` that removes a role: output stopped,
   buffers and state dropped, the roles it keeps left alone, and a removed role added back.
+- `test_allocations.cpp`: how many times the library calls `operator new` from a connection's
+  accept to its admission, for a `client/state` and for a time burst. It replaces the global
+  allocation functions, so it builds into its own binary, `sendspin_alloc_tests`, which building
+  `sendspin_tests` also builds. Run it with `SENDSPIN_ALLOC_REPORT=1` to print each allocation
+  grouped by call site.
 - `test_crypto.cpp`, `test_cpace.cpp`, `test_pairing_code.cpp`, `test_psk_wrap.cpp`,
   `test_pairing_token.cpp`, `test_noise_transport.cpp`, `test_noise_rehandshake.cpp`,
   `test_admission.cpp`, `test_record_store.cpp`, `test_dynamic_pairing_code.cpp`,

@@ -618,6 +618,11 @@ public:
         return this->got_client_time_.load();
     }
 
+    /// Number of client/time messages received so far.
+    int client_time_count() const {
+        return this->client_time_count_.load();
+    }
+
     // Sends one role binary message over the active encrypted session: type byte, big-endian
     // server timestamp, then the payload (the same body the cleartext wire carries).
     bool send_binary(uint8_t binary_type, int64_t timestamp_us, const std::string& payload) {
@@ -855,6 +860,7 @@ private:
 
         if (std::strcmp(type, "client/time") == 0) {
             this->got_client_time_.store(true);
+            this->client_time_count_.fetch_add(1);
             if (this->options_.answer_time) {
                 const long long client_transmitted = doc["payload"]["client_transmitted"] | 0LL;
                 const int64_t now = platform_time_us() + this->options_.server_clock_offset_us;
@@ -1043,6 +1049,7 @@ private:
     std::atomic<int> client_state_count_{0};
     std::atomic<int> client_states_at_last_activate_{0};
     std::atomic<bool> got_client_time_{false};
+    std::atomic<int> client_time_count_{0};
 };
 
 // A fake Sendspin "server" that LISTENS for a real Sendspin client's OUTBOUND connection (backed
