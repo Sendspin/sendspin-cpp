@@ -54,7 +54,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 namespace sendspin {
 
@@ -71,7 +70,7 @@ struct NoiseHandshakeResult {
     /// The Noise msg2 bytes to send to the peer, in a noise/handshake envelope
     /// (build_noise_handshake_message()). Set only for re-handshake results (initial handshake
     /// sends msg2 inline).
-    std::vector<uint8_t> msg2_bytes;
+    NoiseMsg2 msg2_bytes{};
 };
 
 /// @brief Result of processing one incoming WS frame during the handshake.
@@ -120,7 +119,8 @@ std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope
 ///   4. Bind the resolved PSK onto the same session (NoiseSession::set_psk).
 ///   5. Write msg2 and split -> new session.
 ///
-/// @param msg1_bytes     The re-handshake msg1 (Noise bytes, decoded from the envelope).
+/// @param msg1_bytes     The re-handshake msg1 (Noise bytes, decoded from the envelope); cleared
+///                       on return.
 /// @param server_id      Known server peer_id (43-char base64url) from the prior handshake.
 /// @param identity       Our static X25519 identity.
 /// @param record_store   Record store for psk_id resolution (read-only on protocol task).
@@ -130,7 +130,7 @@ std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope
 /// @return Populated NoiseHandshakeResult (session + msg2_bytes to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    std::span<const uint8_t> msg1_bytes, std::string_view server_id, const Identity& identity,
+    std::span<uint8_t> msg1_bytes, std::string_view server_id, const Identity& identity,
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena);
 
@@ -223,10 +223,11 @@ private:
     bool handle_server_init(int version, const IdText& server_id, std::string_view text);
 
     /// @brief Authenticate and respond to the noise/handshake msg1.
-    /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data()).
+    /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data());
+    ///                   cleared on return.
     /// @param send_fn    Sends the msg2 frame back to the peer.
     /// @return true when msg1 authenticated and msg2 was sent.
-    bool handle_msg1(std::span<const uint8_t> msg1_bytes,
+    bool handle_msg1(std::span<uint8_t> msg1_bytes,
                      const std::function<bool(const JsonDocument&)>& send_fn);
 
     // Struct fields

@@ -542,10 +542,9 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             // is ordered with the decrypt of the next frame and with every send
             // (connection.md "Re-handshake").
             SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
-            const std::optional<PlatformBuffer> msg1_bytes =
-                parsed.extract([](JsonObjectConst root) {
-                    return read_noise_handshake_data(root, "re-handshake");
-                });
+            std::optional<PlatformBuffer> msg1_bytes = parsed.extract([](JsonObjectConst root) {
+                return read_noise_handshake_data(root, "re-handshake");
+            });
             if (!msg1_bytes.has_value() ||
                 !conn->handle_noise_rehandshake({msg1_bytes->data(), msg1_bytes->size()})) {
                 SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");

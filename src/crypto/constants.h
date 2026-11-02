@@ -72,13 +72,12 @@ static constexpr int PROTOCOL_VERSION = 1;
 /// Plaintext includes the leading type byte, so usable payload is one byte less.
 static constexpr size_t MAX_TRANSPORT_PLAINTEXT = 65535 - 16;  // = 65519
 
-/// @brief Buffer size for a single Noise handshake control message (msg1 decrypted payload,
-/// msg2 ciphertext): the spec sets no bound, but the payload it defines is small (psk_id JSON,
-/// ~60 bytes). 512 leaves room for future fields without paying for a buffer sized like
-/// transport-mode traffic. noise-c bounds-checks against this capacity and returns an error
-/// rather than overflowing it if a peer's message does not fit (verified against
-/// noise_handshakestate_read_message()'s payload->max_size check), so a legitimate handshake
-/// message exceeding this size fails the handshake rather than corrupting memory.
+/// @brief Largest Noise message 1 payload the client decrypts: the spec sets no bound, but the
+/// payload it defines is small (psk_id JSON, ~60 bytes). 512 leaves room for future fields
+/// without paying for a buffer sized like transport-mode traffic. noise-c bounds-checks against
+/// this capacity and returns an error rather than overflowing it if a peer's payload does not fit
+/// (verified against noise_handshakestate_read_message()'s payload->max_size check), so a longer
+/// payload fails the handshake rather than corrupting memory.
 static constexpr size_t MAX_HANDSHAKE_MESSAGE_BYTES = 512;
 
 /// @brief Per-connection reassembly buffer cap: 1 MiB.

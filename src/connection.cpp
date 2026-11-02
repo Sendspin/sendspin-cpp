@@ -308,7 +308,7 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
     // NEED_MORE, or COMPLETE handled above: nothing else to do until the next frame.
 }
 
-bool SendspinConnection::handle_noise_rehandshake(std::span<const uint8_t> msg1_bytes) {
+bool SendspinConnection::handle_noise_rehandshake(std::span<uint8_t> msg1_bytes) {
     // Runs on the protocol task (from SendspinClient::process_json_message() for a decrypted
     // "noise/handshake" message, itself only reachable post-COMPLETE, so this always runs on
     // the same thread as the decrypt path, sequential with it and never concurrent).

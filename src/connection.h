@@ -221,10 +221,11 @@ public:
     /// the new keys; neither hello is re-sent, and the manager's nursery is not involved (the
     /// connection stays current/established throughout, with no drop/reconnect).
     ///
-    /// @param msg1_bytes  The re-handshake msg1 Noise bytes (read_noise_handshake_data()).
+    /// @param msg1_bytes  The re-handshake msg1 Noise bytes (read_noise_handshake_data()); cleared
+    ///                    on return.
     /// @return true on success (session swapped; a post-swap server/activate is expected next).
     ///         false on any failure (caller should close the WebSocket).
-    bool handle_noise_rehandshake(std::span<const uint8_t> msg1_bytes);
+    bool handle_noise_rehandshake(std::span<uint8_t> msg1_bytes);
 
     /// @brief Sends a JSON message: serialized straight into the Noise transport's send buffer
     /// (NoiseTransport::stage_json()), then encrypted there once the transport is active, or sent

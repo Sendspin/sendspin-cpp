@@ -102,6 +102,17 @@ struct RefusingAllocator : ArduinoJson::Allocator {
     void* reallocate(void* /*ptr*/, size_t /*new_size*/) override { return nullptr; }
 };
 
+/// Pads `json` to exactly `size` bytes with an unrecognized field, which messaging.md "Forward
+/// compatibility" has the client ignore, inserted before the closing brace that sits
+/// `brace_from_end` bytes from the end.
+void pad_with_unknown_field(std::string& json, size_t size, size_t brace_from_end) {
+    const size_t field_overhead = std::string_view(R"(,"pad":"")").size();
+    ASSERT_LT(json.size() + field_overhead, size);
+    const size_t xs = size - json.size() - field_overhead;
+    json.insert(json.size() - brace_from_end, R"(,"pad":")" + std::string(xs, 'x') + "\"");
+    ASSERT_EQ(json.size(), size);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -538,13 +549,9 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
         }
         std::string frame = make_server_init(peer_id, row.version, row.type);
         if (row.padded_to != 0) {
-            // An unrecognized payload field, which messaging.md "Forward compatibility" has the
-            // client ignore, placed before the payload's closing brace.
-            const size_t field_overhead = std::string_view(R"(,"pad":"")").size();
-            ASSERT_LT(frame.size() + field_overhead, row.padded_to);
-            const size_t xs = row.padded_to - frame.size() - field_overhead;
-            frame.insert(frame.size() - 2, R"(,"pad":")" + std::string(xs, 'x') + "\"");
-            ASSERT_EQ(frame.size(), row.padded_to);
+            // Inside the payload, whose closing brace precedes the envelope's.
+            pad_with_unknown_field(frame, row.padded_to, 2);
+            ASSERT_FALSE(HasFatalFailure());
         }
         EXPECT_EQ(nh.on_text_frame(frame, [](const JsonDocument&) { return true; }), row.expected);
     }
@@ -1292,15 +1299,21 @@ TEST(NoiseTransport, EncryptInPlaceRefusesMissingTagRoomAndMarksAFailedEncrypt) 
 // ============================================================================
 
 // Noise message 1 that cannot be read as one aborts the handshake rather than being retried or
-// ignored (connection.md "Failure Handling").
+// ignored (connection.md "Failure Handling"), and so does one whose payload is longer than the
+// MAX_HANDSHAKE_MESSAGE_BYTES the client decrypts.
 TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
     struct Row {
         const char* name;
         bool well_formed;                  // build message 1 with a real initiator
         std::vector<uint8_t> noise_bytes;  // the frame's noise bytes when it is not well formed
         HandshakeFrameResult expected;
+        size_t payload_size{0};  // a well-formed payload padded to this length, 0 for unpadded
     };
     const Row rows[] = {
+        {"a payload longer than the client decrypts", true, {}, HandshakeFrameResult::ABORT,
+         MAX_HANDSHAKE_MESSAGE_BYTES + 1},
+        {"Control: a payload exactly as long as the client decrypts", true, {},
+         HandshakeFrameResult::COMPLETE, MAX_HANDSHAKE_MESSAGE_BYTES},
         {"empty noise bytes", false, {}, HandshakeFrameResult::ABORT},
         // Well-formed base64url, but fails Noise authentication as message 1.
         {"garbage of a plausible length", false, std::vector<uint8_t>(64, 0xAB),
@@ -1341,7 +1354,12 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
         ASSERT_NE(init_hs_raw, nullptr);
         HsGuard guard(init_hs_raw);
 
-        const std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id_for(psk));
+        std::string payload = R"({"psk_id":")" + psk_id_for(psk) + R"(","psk_category":"lt"})";
+        if (row.payload_size != 0) {
+            pad_with_unknown_field(payload, row.payload_size, 1);
+            ASSERT_FALSE(HasFatalFailure());
+        }
+        const std::string msg1_text = build_msg1_envelope_with_payload(init_hs_raw, payload);
         ASSERT_FALSE(msg1_text.empty());
         EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn), row.expected);
     }

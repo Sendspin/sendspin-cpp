@@ -23,9 +23,9 @@
 #include "platform/memory.h"
 #include <ArduinoJson.h>
 
+#include <algorithm>
 #include <cstring>
 #include <string>
-#include <vector>
 
 static const char* const TAG = "sendspin.noise_handshake";
 
@@ -93,7 +93,7 @@ struct Msg1CoreResult {
     /// The PSK record that admitted the connection.
     ResolvedPsk resolved_psk;
     /// Serialized noise/handshake msg2 bytes (not yet wrapped in a JSON envelope).
-    std::vector<uint8_t> msg2_bytes;
+    NoiseMsg2 msg2_bytes{};
 };
 
 /// @brief Which handshake a msg1 belongs to.
@@ -131,8 +131,7 @@ const char* to_cstr(HandshakeKind kind) {
 std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& identity,
                                             const RecordStore& record_store, const char* suite_name,
                                             const IdText& server_id, const uint8_t* prologue,
-                                            size_t prologue_len,
-                                            std::span<const uint8_t> msg1_bytes,
+                                            size_t prologue_len, std::span<uint8_t> msg1_bytes,
                                             SendspinArenaAllocator& arena) {
     const char* log_prefix = to_cstr(kind);
     auto server_pub = public_key_from_peer_id(server_id.view());
@@ -152,9 +151,16 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
         return std::nullopt;
     }
 
-    auto msg1_payload = session->read_msg1(msg1_bytes.data(), msg1_bytes.size());
-    if (msg1_payload.empty()) {
-        SS_LOGE(TAG, "%s: read_msg1 failed (auth error in msg1 static DH)", log_prefix);
+    // The payload is shorter than the message, and MAX_HANDSHAKE_MESSAGE_BYTES bounds it.
+    PlatformBuffer msg1_payload;
+    if (!msg1_payload.allocate(std::min(msg1_bytes.size(), MAX_HANDSHAKE_MESSAGE_BYTES))) {
+        SS_LOGE(TAG, "%s: no memory for the msg1 payload", log_prefix);
+        return std::nullopt;
+    }
+    const std::optional<size_t> payload_size =
+        session->read_msg1(msg1_bytes, {msg1_payload.data(), msg1_payload.size()});
+    if (!payload_size.has_value()) {
+        SS_LOGE(TAG, "%s: read_msg1 failed", log_prefix);
         return std::nullopt;
     }
 
@@ -162,7 +168,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     // payload is released as soon as its two fields are copied out, so the msg2 envelope the
     // caller builds has the arena to itself.
     ParsedJsonMessage payload(arena);
-    if (!payload.parse(reinterpret_cast<const char*>(msg1_payload.data()), msg1_payload.size())) {
+    if (!payload.parse(reinterpret_cast<const char*>(msg1_payload.data()), payload_size.value())) {
         SS_LOGE(TAG, "%s: failed to parse msg1 payload JSON", log_prefix);
         return std::nullopt;
     }
@@ -241,14 +247,13 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     }
 
     // Write msg2 (payload: `{}`) and split to transport mode
-    std::vector<uint8_t> msg2_bytes;
+    NoiseMsg2 msg2_bytes{};
     if (!session->write_msg2_and_split(msg2_bytes)) {
         SS_LOGE(TAG, "%s: write_msg2_and_split failed", log_prefix);
         return std::nullopt;
     }
 
-    return Msg1CoreResult{std::move(session.value()), std::move(resolved.value()),
-                          std::move(msg2_bytes)};
+    return Msg1CoreResult{std::move(session.value()), std::move(resolved.value()), msg2_bytes};
 }
 
 /// @brief Build a NoiseHandshakeResult from a completed Msg1CoreResult. Shared by
@@ -442,7 +447,7 @@ bool NoiseHandshake::handle_server_init(int version, const IdText& server_id,
 // Private: handle noise/handshake msg1
 // ============================================================================
 
-bool NoiseHandshake::handle_msg1(std::span<const uint8_t> msg1_bytes,
+bool NoiseHandshake::handle_msg1(std::span<uint8_t> msg1_bytes,
                                  const std::function<bool(const JsonDocument&)>& send_fn) {
     // Prologue = exact bytes of client/init || server/init
     const uint8_t* prologue = this->prologue_.data();
@@ -475,7 +480,7 @@ bool NoiseHandshake::handle_msg1(std::span<const uint8_t> msg1_bytes,
 // ============================================================================
 
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    std::span<const uint8_t> msg1_bytes, std::string_view server_id, const Identity& identity,
+    std::span<uint8_t> msg1_bytes, std::string_view server_id, const Identity& identity,
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena) {
     // The id the initial handshake recorded; run_msg1_core()'s decode check refuses an empty one.
@@ -494,9 +499,10 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
     SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%d", known_server_id.c_str(),
             static_cast<int>(core->resolved_psk.category));
 
-    NoiseHandshakeResult result = make_handshake_result(std::move(core.value()), known_server_id);
     // The caller wraps msg2 in its noise/handshake envelope and sends it encrypted.
-    result.msg2_bytes = std::move(core->msg2_bytes);
+    const NoiseMsg2 msg2_bytes = core->msg2_bytes;
+    NoiseHandshakeResult result = make_handshake_result(std::move(core.value()), known_server_id);
+    result.msg2_bytes = msg2_bytes;
     return result;
 }
 
