@@ -35,10 +35,12 @@ namespace sendspin {
 // JSON serialization helpers
 // ============================================================================
 
-/// @brief Serialize client/init to JSON.
+/// @brief Serialize client/init to JSON into `out`, allocated for it and for a server/init of up
+/// to MAX_SERVER_INIT_BYTES behind it, the rest of the prologue.
 /// Format: {"type":"client/init","payload":{"client_id":"...","version":1,"suite":"..."}}
-static std::string serialize_client_init(std::string_view client_id, const char* suite_name,
-                                         SendspinArenaAllocator& arena) {
+/// @return The bytes of client/init written, or 0 when `out` cannot be allocated.
+static size_t serialize_client_init(std::string_view client_id, const char* suite_name,
+                                    SendspinArenaAllocator& arena, PlatformBuffer& out) {
     // suite_name is the full name (e.g. NOISE_SUITE_CHACHAPOLY = "Noise_KKpsk2_25519_..."); the
     // wire value is the suffix after "Noise_KKpsk2_" (connection.md "Cipher Suites"). Strip
     // that prefix to produce the wire suite string.
@@ -55,12 +57,12 @@ static std::string serialize_client_init(std::string_view client_id, const char*
     doc["payload"]["version"] = PROTOCOL_VERSION;
     doc["payload"]["suite"] = wire_suite;
 
-    // Retained as the prologue, so serialized into a string of its own, reserved to the exact
-    // length so it is allocated once.
-    std::string out;
-    out.reserve(measureJson(doc));
-    serializeJson(doc, out);
-    return out;
+    // The NUL serializeJson() writes behind client/init lands where server/init goes.
+    const size_t size = measureJson(doc);
+    if (!out.allocate(size + MAX_SERVER_INIT_BYTES)) {
+        return 0;
+    }
+    return serializeJson(doc, out.as<char>(), size + 1);
 }
 
 bool build_noise_handshake_message(std::span<const uint8_t> noise_bytes, JsonDocument& doc) {
@@ -313,10 +315,15 @@ std::string_view NoiseHandshake::build_client_init() {
     }
 
     PeerIdText client_id{};
-    this->client_init_text_ =
-        serialize_client_init(this->identity_.peer_id(client_id), this->suite_name_, this->arena_);
+    this->client_init_size_ = serialize_client_init(
+        this->identity_.peer_id(client_id), this->suite_name_, this->arena_, this->prologue_);
+    if (this->client_init_size_ == 0) {
+        SS_LOGE(TAG, "build_client_init: no memory for the prologue");
+        this->state_ = State::ABORTED;
+        return {};
+    }
     this->state_ = State::WAIT_SERVER_INIT;
-    return this->client_init_text_;
+    return {this->prologue_.as<char>(), this->client_init_size_};
 }
 
 void NoiseHandshake::take_server_error(JsonObjectConst root, const char* log_context) {
@@ -416,8 +423,16 @@ bool NoiseHandshake::handle_server_init(int version, const IdText& server_id,
         return false;
     }
 
+    if (text.size() > MAX_SERVER_INIT_BYTES) {
+        SS_LOGE(TAG, "handle_server_init: %zu bytes, over the %zu a prologue keeps", text.size(),
+                MAX_SERVER_INIT_BYTES);
+        return false;
+    }
+
     this->server_id_ = server_id;
-    this->server_init_text_ = text;  // Retain exact bytes for prologue
+    // Exact bytes, behind client/init: the prologue
+    std::memcpy(this->prologue_.data() + this->client_init_size_, text.data(), text.size());
+    this->server_init_size_ = text.size();
 
     SS_LOGD(TAG, "server/init received: server_id=%s", this->server_id_.c_str());
     return true;
@@ -430,9 +445,8 @@ bool NoiseHandshake::handle_server_init(int version, const IdText& server_id,
 bool NoiseHandshake::handle_msg1(std::span<const uint8_t> msg1_bytes,
                                  const std::function<bool(const JsonDocument&)>& send_fn) {
     // Prologue = exact bytes of client/init || server/init
-    std::string prologue_str = this->client_init_text_ + this->server_init_text_;
-    const uint8_t* prologue = reinterpret_cast<const uint8_t*>(prologue_str.data());
-    size_t prologue_len = prologue_str.size();
+    const uint8_t* prologue = this->prologue_.data();
+    const size_t prologue_len = this->client_init_size_ + this->server_init_size_;
 
     auto core = run_msg1_core(HandshakeKind::INITIAL, this->identity_, this->record_store_,
                               this->suite_name_, this->server_id_, prologue, prologue_len,

@@ -241,12 +241,17 @@ void SendspinConnection::send_noise_client_init() {
     // Sent from the text the handshake retains for its prologue, the one JSON message that
     // does not go through send_json().
     const std::string_view client_init = this->noise_handshake_->build_client_init();
-    if (!client_init.empty()) {
-#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
-        this->message_tracer_.trace_outbound_text(client_init);
-#endif
-        this->send_text_message(client_init.data(), client_init.size());
+    if (client_init.empty()) {
+        // No memory for the prologue: without client/init the peer never proceeds, so the
+        // connection would only hold its nursery slot until the establish deadline.
+        this->noise_handshake_.reset();
+        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        return;
     }
+#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    this->message_tracer_.trace_outbound_text(client_init);
+#endif
+    this->send_text_message(client_init.data(), client_init.size());
 }
 
 void SendspinConnection::handle_noise_handshake_text(std::string_view text) {

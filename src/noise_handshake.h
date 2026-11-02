@@ -134,6 +134,13 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena);
 
+/// @brief Largest server/init the handshake keeps for its prologue: about five times the minimal
+/// frame, a version and a PEER_ID_SIZE server_id in about 104 bytes (messaging.md "server/init").
+/// It bounds the prologue buffer each handshake holds; the cost is that a later revision's
+/// optional fields, which messaging.md "Forward compatibility" has the client ignore, must keep
+/// the frame under it.
+static constexpr size_t MAX_SERVER_INIT_BYTES = 512;
+
 // ============================================================================
 // NoiseHandshake class (initial handshake state machine)
 // ============================================================================
@@ -211,7 +218,8 @@ private:
     /// @brief Validate the fields read from a server/init frame.
     /// @param version   payload.version (0 when absent).
     /// @param server_id payload.server_id (empty when absent or longer than a peer_id).
-    /// @param text      Exact received bytes, retained for the handshake prologue.
+    /// @param text      Exact received bytes, retained for the handshake prologue; refused when
+    ///                  longer than MAX_SERVER_INIT_BYTES.
     bool handle_server_init(int version, const IdText& server_id, std::string_view text);
 
     /// @brief Authenticate and respond to the noise/handshake msg1.
@@ -222,8 +230,9 @@ private:
                      const std::function<bool(const JsonDocument&)>& send_fn);
 
     // Struct fields
-    /// Exact bytes of the client/init frame we sent (retained for prologue).
-    std::string client_init_text_;
+    /// The prologue: the exact bytes of the client/init we sent, then of the server/init we
+    /// received, in one buffer sized for both when client/init is built.
+    PlatformBuffer prologue_;
 
     /// Result available after COMPLETE.
     std::optional<NoiseHandshakeResult> result_;
@@ -234,9 +243,6 @@ private:
     /// server_id decoded from server/init (43-char base64url).
     IdText server_id_;
 
-    /// Exact bytes of the server/init frame we received (retained for prologue).
-    std::string server_init_text_;
-
     const char* suite_name_;
 
     // Pointer fields
@@ -245,6 +251,11 @@ private:
     SendspinArenaAllocator& arena_;
     const Identity& identity_;
     const RecordStore& record_store_;
+
+    // size_t fields
+    /// Bytes of prologue_ holding client/init, then server/init.
+    size_t client_init_size_{0};
+    size_t server_init_size_{0};
 
     // 32-bit fields
     State state_{State::INIT};

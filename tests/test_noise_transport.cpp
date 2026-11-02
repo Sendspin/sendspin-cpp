@@ -486,9 +486,9 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
     EXPECT_EQ(nh.server_error_reason(), "malformed");
 }
 
-// A server/init is accepted only when its type, its server_id and its version are all usable:
-// the server_id names the key and goes into the prologue, so both are checked before the
-// handshake reads a Noise byte (connection.md "Handshake").
+// A server/init is accepted only when its type, its server_id, its version and its length are all
+// usable: the server_id names the key and the frame goes into the prologue, so each is checked
+// before the handshake reads a Noise byte (connection.md "Handshake").
 TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
     enum class ServerId : uint8_t { REAL, TOO_LONG, NON_CANONICAL };
     struct Row {
@@ -497,8 +497,14 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
         ServerId server_id;
         int version;
         HandshakeFrameResult expected;
+        size_t padded_to{0};  // the frame's length after an unknown top-level field, 0 for none
     };
     const Row rows[] = {
+        // The prologue keeps at most MAX_SERVER_INIT_BYTES of server/init.
+        {"longer than the prologue keeps", "server/init", ServerId::REAL, 1,
+         HandshakeFrameResult::ABORT, MAX_SERVER_INIT_BYTES + 1},
+        {"Control: exactly as long as the prologue keeps", "server/init", ServerId::REAL, 1,
+         HandshakeFrameResult::NEED_MORE, MAX_SERVER_INIT_BYTES},
         // The payload is the control's, so only the type field can produce the abort: a frame
         // whose payload would pass must still be refused for arriving under another type.
         {"another envelope type", "wrong/type", ServerId::REAL, 1, HandshakeFrameResult::ABORT},
@@ -530,9 +536,17 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
         } else if (row.server_id == ServerId::NON_CANONICAL) {
             peer_id = non_canonical_spelling(peer_id);
         }
-        EXPECT_EQ(nh.on_text_frame(make_server_init(peer_id, row.version, row.type),
-                                   [](const JsonDocument&) { return true; }),
-                  row.expected);
+        std::string frame = make_server_init(peer_id, row.version, row.type);
+        if (row.padded_to != 0) {
+            // An unrecognized payload field, which messaging.md "Forward compatibility" has the
+            // client ignore, placed before the payload's closing brace.
+            const size_t field_overhead = std::string_view(R"(,"pad":"")").size();
+            ASSERT_LT(frame.size() + field_overhead, row.padded_to);
+            const size_t xs = row.padded_to - frame.size() - field_overhead;
+            frame.insert(frame.size() - 2, R"(,"pad":")" + std::string(xs, 'x') + "\"");
+            ASSERT_EQ(frame.size(), row.padded_to);
+        }
+        EXPECT_EQ(nh.on_text_frame(frame, [](const JsonDocument&) { return true; }), row.expected);
     }
 }
 
