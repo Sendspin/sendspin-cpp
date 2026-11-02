@@ -808,9 +808,12 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
     // static flow carries no commit_B.
     SS_LOGI(TAG, "Sending client/pair-init (static_pairing_code) for server_id=%s",
             server_id.c_str());
-    JsonDocument json = make_json_document(this->json_arena());
-    build_client_pair_init_message(ps.pairing_index, json);
-    conn->send_json(json);
+    {
+        // Released before CPace starts, whose failure path builds a pair/abort.
+        JsonDocument json = make_json_document(this->json_arena());
+        build_client_pair_init_message(ps.pairing_index, json);
+        conn->send_json(json);
+    }
 
     // The static flow has no rounds: its single CPace run is round 1 (pairing.md "PAKE").
     ps.round = 1;
