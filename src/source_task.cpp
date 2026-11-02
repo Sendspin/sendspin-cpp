@@ -74,19 +74,20 @@ size_t source_capture_ring_bytes(const SourceRoleConfig& config) {
 // Lifecycle
 // ============================================================================
 
-/// @brief The largest chunk payload of a config: the PCM chunk, which a FLAC or OPUS role still
-/// streams to a server that does not list its codec, or the codec's largest output when that is
-/// larger (an Opus packet can outgrow a short chunk's PCM, and a FLAC frame of incompressible audio
-/// always outgrows it)
-static size_t largest_payload_bytes(const SourceRoleConfig& config, size_t chunk_bytes,
-                                    const FlacSourceEncoder* flac_encoder) {
+/// @brief Message bytes each outbound item of a config is acquired with: the chunk header, the
+/// largest payload and AEAD_TAG_SIZE of room for the in-place encrypt's tag. The largest payload is
+/// the PCM chunk, which a FLAC or OPUS role still streams to a server that does not list its
+/// codec, or the codec's largest output when that is larger (an Opus packet can outgrow a short
+/// chunk's PCM, and a FLAC frame of incompressible audio always outgrows it).
+static size_t chunk_message_bytes(const SourceRoleConfig& config, size_t chunk_bytes,
+                                  const FlacSourceEncoder* flac_encoder) {
+    size_t payload = chunk_bytes;
     if (config.codec == SendspinCodecFormat::OPUS) {
-        return std::max(chunk_bytes, OpusSourceEncoder::MAX_PACKET_BYTES);
+        payload = std::max(chunk_bytes, OpusSourceEncoder::MAX_PACKET_BYTES);
+    } else if (config.codec == SendspinCodecFormat::FLAC) {
+        payload = std::max(chunk_bytes, flac_encoder->max_payload_bytes());
     }
-    if (config.codec == SendspinCodecFormat::FLAC) {
-        return std::max(chunk_bytes, flac_encoder->max_payload_bytes());
-    }
-    return chunk_bytes;
+    return SOURCE_CHUNK_HEADER_SIZE + payload + AEAD_TAG_SIZE;
 }
 
 SourceTask::SourceTask(SourceRole::Impl* role)
@@ -96,11 +97,8 @@ SourceTask::SourceTask(SourceRole::Impl* role)
       role_(role),
       bytes_per_frame_(source_bytes_per_frame(role->config.channels, role->config.bit_depth)),
       chunk_bytes_(source_chunk_bytes(role->config)),
-      // AEAD_TAG_SIZE of room behind the message takes the in-place encrypt's tag.
       chunk_message_bytes_(
-          SOURCE_CHUNK_HEADER_SIZE +
-          largest_payload_bytes(role->config, this->chunk_bytes_, this->flac_encoder_.get()) +
-          AEAD_TAG_SIZE) {}
+          chunk_message_bytes(role->config, this->chunk_bytes_, this->flac_encoder_.get())) {}
 
 SourceTask::~SourceTask() {
     this->stop();
