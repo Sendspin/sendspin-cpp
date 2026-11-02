@@ -195,10 +195,6 @@
    "SendspinServerConnection::send_transport_frame(",
    "SendspinConnection::send_transport_frame("
   ],
-  "sendspin::NoiseTransport::fragment_and_send(": [
-   "SendspinServerConnection::send_transport_frame(",
-   "SendspinConnection::send_transport_frame("
-  ],
   "sendspin::NoiseTransport::send_binary_lent(": [
    "SendspinServerConnection::send_lent_frame(",
    "SendspinConnection::send_lent_frame("

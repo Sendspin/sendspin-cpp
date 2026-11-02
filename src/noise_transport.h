@@ -13,11 +13,11 @@
 // limitations under the License.
 
 /// @file noise_transport.h
-/// @brief Encrypted transport layer for a Sendspin connection: owns the Noise cipher session,
-/// outbound fragmentation, and inbound fragment reassembly.
+/// @brief Encrypted transport layer for a Sendspin connection: owns the Noise cipher session and
+/// inbound fragment reassembly. Outbound messages always fit one frame.
 ///
 /// Every use runs on the protocol task: the encrypt and send path (stage_json and
-/// send_staged_json, send_binary, send_binary_lent), the decrypt path (decrypt_in_place) and
+/// send_staged_json, send_binary_lent), the decrypt path (decrypt_in_place) and
 /// reassembly (accept_plaintext), and the session swaps (activate at handshake COMPLETE,
 /// send_msg2_and_swap at a re-handshake). One thread owns the session, so this class takes no lock:
 /// a swap is sequential with every encrypt and decrypt, and the reused send_buf_ is filled and
@@ -49,8 +49,8 @@ class OutboundRing;
 ///
 /// A SendspinConnection embeds one NoiseTransport and wires set_frame_sink() to its
 /// send_transport_frame() and set_lent_frame_sink() to its send_lent_frame(). All post-handshake
-/// application traffic flows through stage_json() + send_staged_json() / send_binary() /
-/// send_binary_lent() outbound and decrypt_in_place() + accept_plaintext() inbound.
+/// application traffic flows through stage_json() + send_staged_json() / send_binary_lent()
+/// outbound and decrypt_in_place() + accept_plaintext() inbound.
 class NoiseTransport {
 public:
     /// @brief Run by the transport immediately before it writes a frame to the socket
@@ -139,10 +139,6 @@ public:
     ///         is_send_desynced(); another error otherwise.
     SsErr send_staged_json(size_t len, const FrameWriteHook& before_write = nullptr);
 
-    /// @brief Encrypt and send pre-typed binary data as a Noise transport frame.
-    /// @param data  Pointer to type-prefixed binary bytes (first byte is the role type byte).
-    SsErr send_binary(const uint8_t* data, size_t len);
-
     /// @brief Encrypt a binary message where it lies in an outbound ring item and lend the item
     /// to the lent frame sink, which returns it to `ring` once the frame is written.
     ///
@@ -186,8 +182,8 @@ public:
     ///         consumed by reassembly, discarded, or dropped as malformed.
     CompleteMessage accept_plaintext(uint8_t* plaintext, size_t len, bool admitted);
 
-    /// @brief Sets memory placement for the fragmentation and reassembly buffers (ESP-IDF
-    /// only; ignored on host). Call during connection setup, before any transport traffic.
+    /// @brief Sets memory placement for the send and reassembly buffers (ESP-IDF only; ignored
+    /// on host). Call during connection setup, before any transport traffic.
     void set_buffer_location(MemoryLocation location) {
         this->buffer_location_ = location;
     }
@@ -215,19 +211,6 @@ private:
     SsErr encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity, size_t plaintext_len,
                                  const FrameWriteHook& before_write);
 
-    /// @brief Fragment a plaintext > MAX_TRANSPORT_PLAINTEXT into multiple frames and
-    /// encrypt+send each one. Implements messaging.md "Fragmentation": every fragment is a
-    /// type-1 message, the first also carrying orig_type.
-    ///
-    /// The plaintext is passed as its type byte plus the payload rather than as one contiguous
-    /// buffer, so no caller has to stage a copy of a message this large.
-    ///
-    /// The fragments of one logical message reach the wire consecutively, since a peer that sees
-    /// a non-fragment frame between them treats it as a messaging.md "Malformed sequences" error
-    /// (see accept_plaintext()); every send runs on the protocol task, so none can fall between
-    /// them.
-    SsErr fragment_and_send(uint8_t orig_type, const uint8_t* data, size_t data_len);
-
     /// @brief Grows a PlatformBuffer to at least `needed` bytes (geometric growth, contents
     /// preserved, capacity retained across calls), optionally capped.
     /// @param cap     Upper bound on the grown size, or 0 for uncapped.
@@ -243,8 +226,7 @@ private:
     bool reasm_reserve(size_t needed, bool admitted);
 
     /// @brief Grows send_buf_ to at least `needed` bytes, capped at MAX_TRANSPORT_PLAINTEXT +
-    /// AEAD_TAG_SIZE (the largest plaintext + AEAD tag room the non-fragmented path ever
-    /// handles). See grow_buffer().
+    /// AEAD_TAG_SIZE (one frame's largest plaintext plus its AEAD tag). See grow_buffer().
     bool ensure_send_buf(size_t needed);
 
     /// @brief Discards any in-flight reassembly state (keeps the allocation).
@@ -269,13 +251,13 @@ private:
     /// placed per buffer_location_ (PSRAM-preferring by default on ESP). Protocol task only.
     PlatformBuffer reasm_buf_;
 
-    /// Reused scratch buffer for the non-fragmented send path (stage_json, send_binary), where
-    /// each outbound JSON message is serialized in place and then encrypted over its plaintext
-    /// (or, before the handshake, sent as cleartext). Grown on demand by ensure_send_buf() to fit
-    /// each frame (geometric growth, same idiom as reasm_buf_/reasm_reserve()), capped at
-    /// MAX_TRANSPORT_PLAINTEXT + AEAD_TAG_SIZE bytes, so typical traffic settles at a working-set
-    /// size well under that ceiling instead of paying it on every connection. Protocol task only,
-    /// like every send. Placed per buffer_location_ like reasm_buf_.
+    /// Reused send buffer (stage_json()), where each outbound JSON message is serialized in place
+    /// and then encrypted over its plaintext (or, before the handshake, sent as cleartext). Grown
+    /// on demand by ensure_send_buf() to fit each frame (geometric growth, same idiom as
+    /// reasm_buf_/reasm_reserve()), capped at MAX_TRANSPORT_PLAINTEXT + AEAD_TAG_SIZE bytes, so
+    /// typical traffic settles at a working-set size well under that ceiling instead of paying it
+    /// on every connection. Protocol task only, like every send. Placed per buffer_location_ like
+    /// reasm_buf_.
     PlatformBuffer send_buf_;
 
     // Pointer fields
@@ -295,7 +277,7 @@ private:
     size_t reasm_len_{0};
 
     // 8-bit fields
-    /// Memory placement for reasm_buf_, send_buf_ and the fragmentation frame buffer.
+    /// Memory placement for reasm_buf_ and send_buf_.
     MemoryLocation buffer_location_{MemoryLocation::PREFER_EXTERNAL};
 
     /// True once a transport session exists. See is_active(). Protocol task only.

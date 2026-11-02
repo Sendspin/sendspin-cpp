@@ -102,14 +102,6 @@ struct RefusingAllocator : ArduinoJson::Allocator {
     void* reallocate(void* /*ptr*/, size_t /*new_size*/) override { return nullptr; }
 };
 
-/// A JSON-typed message of `body_len` text bytes for the binary send path, the one outbound path
-/// that still fragments: [MSG_TYPE_JSON_BODY] followed by 'A's.
-std::vector<uint8_t> json_typed_message(size_t body_len) {
-    std::vector<uint8_t> message(1 + body_len, 'A');
-    message[0] = MSG_TYPE_JSON_BODY;
-    return message;
-}
-
 }  // namespace
 
 // ============================================================================
@@ -1002,7 +994,7 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
 // cipher (advances its nonce).
 
 /// Split a type-prefixed plaintext into wire fragment frames, per messaging.md
-/// "Fragmentation" and matching NoiseTransport::fragment_and_send_locked().
+/// "Fragmentation", as a server sends a message longer than one frame.
 static std::vector<std::vector<uint8_t>> server_fragment_frames(
     const std::vector<uint8_t>& plaintext) {
     std::vector<std::vector<uint8_t>> frames;
@@ -1146,112 +1138,9 @@ TEST(NoiseTransport, CleartextFrameInTransportModeClosesSilently) {
 }
 
 // ============================================================================
-// Fragmentation threshold: exactly at and one byte over MAX_TRANSPORT_PLAINTEXT
-// ============================================================================
-
-TEST(NoiseTransport, FragmentBoundaryExactLimit) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    // Outbound JSON never fragments (send_json() refuses a message longer than one frame), so
-    // the boundary is driven through the binary send path with JSON-typed messages.
-    // plaintext = [0x00] + json, and MAX_TRANSPORT_PLAINTEXT (65519) counts the type byte.
-    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
-    constexpr size_t TAG = 16;  // AEAD tag appended to every frame's plaintext
-    auto send = [&conn](size_t json_len) {
-        const std::vector<uint8_t> message = json_typed_message(json_len);
-        return conn.test_send_binary(message.data(), message.size());
-    };
-
-    // json of (maxp - 1) bytes -> plaintext exactly maxp -> a single (unfragmented) frame.
-    EXPECT_EQ(send(maxp - 1), SsErr::OK);
-    ASSERT_EQ(conn.sent_binary_.size(), 1u);
-    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG);
-
-    conn.sent_binary_.clear();
-
-    // json of maxp bytes -> plaintext (maxp + 1) -> exactly two frames.
-    //
-    // Assert each frame's exact size, not just the frame count: the split point is wire format
-    // (messaging.md "Fragmentation"), so an off-by-one in fragment_and_send_locked's
-    // first_cap/cont_cap would still emit two frames that this transport happily reassembles,
-    // while a conforming peer would disagree about where the boundary falls.
-    //
-    // First frame is [1, flags, orig_type, data[:first_cap]], so its plaintext fills the cap
-    // exactly at 3 + (maxp - 3) == maxp. That leaves data_len - (maxp - 3) == 3 bytes for the
-    // continuation frame, whose plaintext is [1, flags, those 3 bytes] == 5 bytes.
-    EXPECT_EQ(send(maxp), SsErr::OK);
-    ASSERT_EQ(conn.sent_binary_.size(), 2u);
-    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG)
-        << "first fragment must fill MAX_TRANSPORT_PLAINTEXT exactly";
-    EXPECT_EQ(conn.sent_binary_[1].size(), 5u + TAG)
-        << "continuation must carry exactly the bytes the first frame's cap left over";
-
-    conn.sent_binary_.clear();
-
-    // One byte further: the continuation grows by exactly one, confirming the leftover tracks
-    // data_len rather than the frame count staying coincidentally right.
-    EXPECT_EQ(send(maxp + 1), SsErr::OK);
-    ASSERT_EQ(conn.sent_binary_.size(), 2u);
-    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG);
-    EXPECT_EQ(conn.sent_binary_[1].size(), 6u + TAG);
-}
-
-// The frame sizes above pin where the split falls, but not what the header bytes are. Decrypt the
-// emitted frames and assert the layout messaging.md "Fragmentation" specifies, byte by byte, so a
-// transposed flags/orig_type or a wrong flag bit fails a layout test rather than showing up as an
-// unrelated failure elsewhere.
-TEST(NoiseTransport, FragmentHeaderBytesMatchTheWireFormat) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
-    const size_t first_cap = maxp - 3;
-    const size_t cont_cap = maxp - 2;
-
-    // One byte past what two frames carry, so there is a first, a middle and a last fragment and
-    // every flags combination the send path emits appears exactly once.
-    const std::vector<uint8_t> message = json_typed_message(first_cap + cont_cap + 1);
-    ASSERT_EQ(conn.test_send_binary(message.data(), message.size()), SsErr::OK);
-    ASSERT_EQ(conn.sent_binary_.size(), 3u);
-
-    std::vector<std::vector<uint8_t>> frames;
-    for (const auto& ct : conn.sent_binary_) {
-        auto pt = raw_decrypt(r->initiator.recv_cs, ct);
-        ASSERT_FALSE(pt.empty());
-        frames.push_back(std::move(pt));
-    }
-
-    // First fragment: [1][FIRST][orig_type][data...]
-    EXPECT_EQ(frames[0][0], MSG_TYPE_FRAGMENT);
-    EXPECT_EQ(frames[0][1], FRAGMENT_FLAG_FIRST) << "the first fragment sets bit 1 and not bit 0";
-    EXPECT_EQ(frames[0][2], MSG_TYPE_JSON_BODY) << "orig_type is byte 2, after the flags";
-    EXPECT_EQ(frames[0][3], 'A') << "the data starts at byte 3";
-    EXPECT_EQ(frames[0].size(), 3 + first_cap);
-
-    // Middle fragment: [1][0][data...], no orig_type.
-    EXPECT_EQ(frames[1][0], MSG_TYPE_FRAGMENT);
-    EXPECT_EQ(frames[1][1], 0u) << "a middle fragment is neither first nor last";
-    EXPECT_EQ(frames[1][2], 'A') << "a continuation's data starts at byte 2";
-    EXPECT_EQ(frames[1].size(), 2 + cont_cap) << "a middle fragment fills cont_cap";
-
-    // Last fragment: [1][LAST][data...]
-    EXPECT_EQ(frames[2][0], MSG_TYPE_FRAGMENT);
-    EXPECT_EQ(frames[2][1], FRAGMENT_FLAG_LAST) << "the last fragment sets bit 0 and not bit 1";
-    EXPECT_EQ(frames[2][2], 'A');
-    EXPECT_EQ(frames[2].size(), 3u);
-}
-
-// ============================================================================
-// send_buf_ growth: the reused non-fragmented send buffer grows on demand instead of a fixed
-// MAX_TRANSPORT_PLAINTEXT + 16 allocation. There is no accessor for its capacity, so these
-// exercise growth indirectly: a sequence of increasing sizes (including a shrink back down,
+// send_buf_ growth: the reused send buffer grows on demand instead of a fixed
+// MAX_TRANSPORT_PLAINTEXT + 16 allocation. There is no accessor for its capacity, so this
+// exercises growth indirectly: a sequence of increasing sizes (including a shrink back down,
 // which must not lose or corrupt data) and the exact MAX_TRANSPORT_PLAINTEXT boundary, all
 // round-tripping through encrypt/decrypt correctly on one shared transport instance.
 // ============================================================================
@@ -1285,73 +1174,6 @@ TEST(NoiseTransport, SendJson_GrowingSizesRoundTrip) {
     }
 }
 
-TEST(NoiseTransport, SendBinary_GrowingSizesUpToMaxTransportPlaintextRoundTrip) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
-    // Total length including the leading type byte; maxp is the largest size the non-fragmented
-    // send_binary path ever handles (see send_binary's doc comment).
-    const size_t lens[] = {1, 32, 512, 4096, maxp};
-
-    for (size_t len : lens) {
-        std::vector<uint8_t> data(len);
-        data[0] = SENDSPIN_BINARY_PLAYER_AUDIO;  // arbitrary non-JSON role type byte
-        for (size_t i = 1; i < len; ++i) {
-            data[i] = static_cast<uint8_t>(i);
-        }
-
-        conn.sent_binary_.clear();
-        ASSERT_EQ(conn.test_send_binary(data.data(), data.size()), SsErr::OK) << "len=" << len;
-        ASSERT_EQ(conn.sent_binary_.size(), 1u) << "len=" << len;
-
-        auto pt = raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
-        ASSERT_EQ(pt.size(), len) << "len=" << len;
-        EXPECT_EQ(pt, data) << "len=" << len;
-    }
-}
-
-TEST(NoiseTransport, SendBinaryRejectsTheFragmentMessageType) {
-    // messaging.md "Fragmentation" reserves ID 1 for the transport and forbids it as an
-    // orig_type, so a role message may never claim it. Nothing reaches the wire.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    const std::vector<uint8_t> fragment_typed = {MSG_TYPE_FRAGMENT, 0xAA, 0xBB};
-    EXPECT_EQ(conn.test_send_binary(fragment_typed.data(), fragment_typed.size()), SsErr::FAIL);
-    EXPECT_TRUE(conn.sent_binary_.empty());
-
-    // Control: the same payload behind a role type byte is sent.
-    const std::vector<uint8_t> role_typed = {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA, 0xBB};
-    EXPECT_EQ(conn.test_send_binary(role_typed.data(), role_typed.size()), SsErr::OK);
-    EXPECT_EQ(conn.sent_binary_.size(), 1u);
-}
-
-TEST(NoiseTransport, SendBinaryRejectsAnEmptyPayload) {
-    // A zero-length binary message has no type byte, so there is nothing to check ID 1 against
-    // and nothing for a receiver to route. It is refused before the type read rather than sealed
-    // and put on the wire.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    const std::vector<uint8_t> payload = {SENDSPIN_BINARY_PLAYER_AUDIO};
-    EXPECT_EQ(conn.test_send_binary(payload.data(), 0), SsErr::FAIL);
-    EXPECT_TRUE(conn.sent_binary_.empty()) << "an empty binary message reached the wire";
-
-    // Control: the same buffer with its one byte counted is sent.
-    EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::OK);
-    EXPECT_EQ(conn.sent_binary_.size(), 1u);
-}
-
 TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
     // Every transport send is guarded on is_active(): with no session installed there is no
     // cipher to seal with, and the caller is told the state is wrong rather than having its
@@ -1370,7 +1192,6 @@ TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
     EXPECT_EQ(std::string(staged, json.size()), std::string(json.size(), '\0'))
         << "the refused message was left staged";
     const std::vector<uint8_t> payload = {SENDSPIN_BINARY_PLAYER_AUDIO, 0x01};
-    EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::INVALID_STATE);
     void* refused = lent.take_filled(payload);
     ASSERT_NE(refused, nullptr);
     EXPECT_EQ(conn.send_app_binary_lent(lent.ring, refused, lent.capacity, payload.size()),
@@ -1379,16 +1200,15 @@ TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
     EXPECT_TRUE(conn.sent_text_.empty()) << "a lent message went out in the clear";
     EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT) << "the refused item was not returned";
 
-    // Control: with a session installed the same three calls seal and send.
+    // Control: with a session installed the same two calls seal and send.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     conn.set_noise_session(std::move(r->responder_session));
     EXPECT_EQ(conn.send_json(json_doc(json)), SsErr::OK);
-    EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::OK);
     void* sent = lent.take_filled(payload);
     ASSERT_NE(sent, nullptr);
     EXPECT_EQ(conn.send_app_binary_lent(lent.ring, sent, lent.capacity, payload.size()), SsErr::OK);
-    EXPECT_EQ(conn.sent_binary_.size(), 3u);
+    EXPECT_EQ(conn.sent_binary_.size(), 2u);
     EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT);
 }
 
@@ -1751,7 +1571,6 @@ TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
         OVERSIZED_JSON,
         OVERFLOWED_JSON,
         NO_FRAME_SINK,
-        FRAGMENT_TYPED_BINARY,
         ENCRYPT_FAILS,
         LENT,
         FRAGMENT_TYPED_LENT,
@@ -1777,8 +1596,6 @@ TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
          -1, false, false, SsErr::NO_MEM, false, false, 0},
         {"refused before the encrypt: a JSON document that overflowed its allocator",
          Send::OVERFLOWED_JSON, -1, false, false, SsErr::NO_MEM, false, false, 0},
-        {"refused before the encrypt: a fragment-typed binary message",
-         Send::FRAGMENT_TYPED_BINARY, -1, false, false, SsErr::FAIL, false, false, 0},
         {"the write fails on a detached connection", Send::SINGLE, 0, true, false, SsErr::FAIL,
          true, true, 0},
         {"the write is refused by a closed transport", Send::SINGLE, -1, false, true,
@@ -1838,11 +1655,6 @@ TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
                 err = conn.send_json(json_doc(state_json));
                 conn.noise_transport_.frame_sink_ = std::move(sink);
                 EXPECT_TRUE(staged_is_wiped()) << "the refused message was left staged";
-                break;
-            }
-            case Send::FRAGMENT_TYPED_BINARY: {
-                const std::vector<uint8_t> fragment_typed = {MSG_TYPE_FRAGMENT, 0xAA};
-                err = conn.test_send_binary(fragment_typed.data(), fragment_typed.size());
                 break;
             }
             case Send::ENCRYPT_FAILS:

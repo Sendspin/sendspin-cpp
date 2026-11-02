@@ -341,7 +341,7 @@ A lookup miss in the initial handshake completes with the Sentinel PSK (connecti
 
 ### Transport
 
-Once active, each Noise frame carries `[type byte][payload]` in one binary WebSocket frame, and a message too large for one frame is split into `MSG_TYPE_FRAGMENT` frames (messaging.md "Fragmentation"). `MSG_TYPE_JSON_BODY` marks JSON, and every other type is a binary role message.
+Once active, each Noise frame carries `[type byte][payload]` in one binary WebSocket frame. A server message too large for one frame arrives split into `MSG_TYPE_FRAGMENT` frames (messaging.md "Fragmentation") and is reassembled; the client's own messages always fit one frame (a larger one is refused). `MSG_TYPE_JSON_BODY` marks JSON, and every other type is a binary role message.
 
 A send that fails from the encrypt on leaves the peer unable to authenticate any later frame: `NoiseTransport` refuses every later send before its encrypt (`is_send_desynced()`), and the connection closes itself without a goodbye (`SendspinConnection::settle_noise_send()`). The detached gate is the loss report: the tick drops the connection in step 6 for a send of steps 1 to 5 and in step 10 for one of steps 7 to 9. A send refused before its encrypt spends nothing and leaves the connection up. A release detaches the gate before its goodbye, so a failed goodbye closes nothing twice. The ESP server writes on its httpd worker after the send returns, so a write that fails there closes the connection from the worker, reported through `close_callback`.
 

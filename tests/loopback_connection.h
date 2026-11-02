@@ -59,7 +59,7 @@ namespace sendspin {
 // ============================================================================
 
 /// @brief Concrete SendspinConnection that captures sent binary frames.
-/// Used to verify encrypt_and_send_frame / fragment_and_send output without a real WS socket.
+/// Used to verify encrypt_and_send_frame output without a real WS socket.
 class TestConnection : public SendspinConnection {
 public:
     TestConnection() = default;
@@ -144,13 +144,6 @@ public:
     void set_noise_session(std::unique_ptr<NoiseSession> session) {
         this->noise_transport_.activate(std::move(session));
         this->noise_handshake_complete_ = true;
-    }
-
-    /// Direct access to NoiseTransport::send_binary() for tests exercising the binary send
-    /// path (there is no connection-level wrapper; production code has no client-to-server
-    /// binary message today).
-    SsErr test_send_binary(const uint8_t* data, size_t len) {
-        return this->noise_transport_.send_binary(data, len);
     }
 
     // Accumulated outgoing messages

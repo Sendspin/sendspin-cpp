@@ -103,8 +103,7 @@ void MessageTracer::emit_outbound(bool binary, const uint8_t* plaintext, size_t 
     message.stamp_us = platform_time_us();
     message.plaintext = plaintext;
     message.plaintext_len = len;
-    // Only JSON carries a secret. The messages that do are far below MAX_TRANSPORT_PLAINTEXT, so
-    // never fragmented.
+    // Only JSON carries a secret, and an outbound message is never fragmented.
     std::optional<std::string> redacted;
     if (!binary || (len > 0 && plaintext[0] == MSG_TYPE_JSON_BODY)) {
         redacted = redact_secrets(std::string_view(reinterpret_cast<const char*>(plaintext), len));

@@ -85,55 +85,6 @@ SsErr NoiseTransport::encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity,
     return err;
 }
 
-SsErr NoiseTransport::fragment_and_send(uint8_t orig_type, const uint8_t* data, size_t data_len) {
-    const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_FIRST_HEADER_SIZE;
-    const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_CONT_HEADER_SIZE;
-
-    // Buffer reused for each frame (plaintext + AEAD_TAG_SIZE of tag room). ~64 KB, so placed per
-    // buffer_location_ (PSRAM-preferring by default on ESP) rather than internal RAM.
-    PlatformBuffer frame_buf;
-    if (!frame_buf.allocate(MAX_TRANSPORT_PLAINTEXT + AEAD_TAG_SIZE, this->buffer_location_)) {
-        SS_LOGE(TAG, "fragment_and_send: frame buffer allocation failed");
-        return SsErr::FAIL;
-    }
-
-    size_t first_chunk = (data_len < first_cap) ? data_len : first_cap;
-    frame_buf.data()[0] = MSG_TYPE_FRAGMENT;
-    frame_buf.data()[1] = static_cast<uint8_t>(
-        FRAGMENT_FLAG_FIRST | ((first_chunk == data_len) ? FRAGMENT_FLAG_LAST : 0));
-    frame_buf.data()[FRAGMENT_CONT_HEADER_SIZE] = orig_type;
-    std::memcpy(frame_buf.data() + FRAGMENT_FIRST_HEADER_SIZE, data, first_chunk);
-    size_t first_frame_len = FRAGMENT_FIRST_HEADER_SIZE + first_chunk;
-
-    SsErr err =
-        this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), first_frame_len, nullptr);
-    if (err != SsErr::OK) {
-        return err;
-    }
-
-    // Continuation frames
-    size_t offset = first_chunk;
-    while (offset < data_len) {
-        size_t chunk = (data_len - offset < cont_cap) ? (data_len - offset) : cont_cap;
-        bool is_last = (offset + chunk >= data_len);
-
-        frame_buf.data()[0] = MSG_TYPE_FRAGMENT;
-        frame_buf.data()[1] = is_last ? FRAGMENT_FLAG_LAST : 0;
-        std::memcpy(frame_buf.data() + FRAGMENT_CONT_HEADER_SIZE, data + offset, chunk);
-        size_t cont_frame_len = FRAGMENT_CONT_HEADER_SIZE + chunk;
-
-        err = this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), cont_frame_len,
-                                           nullptr);
-        if (err != SsErr::OK) {
-            // Earlier fragments are out; encrypt_and_send_frame() has marked the send desynced.
-            return err;
-        }
-        offset += chunk;
-    }
-
-    return SsErr::OK;
-}
-
 char* NoiseTransport::stage_json(size_t max_len) {
     // Plaintext = [MSG_TYPE_JSON_BODY] + utf8(json). The terminator a caller's writer may add
     // lands in the AEAD tag room.
@@ -159,32 +110,6 @@ SsErr NoiseTransport::send_staged_json(size_t len, const FrameWriteHook& before_
         secure_zero(this->send_buf_.data(), 1 + len);
     }
     return err;
-}
-
-SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
-    if (!this->is_active()) {
-        return SsErr::INVALID_STATE;
-    }
-    if (len == 0) {
-        return SsErr::FAIL;
-    }
-    // messaging.md "Fragmentation": a sender MUST NOT use 1 as orig_type; the transport owns
-    // that ID.
-    if (data[0] == MSG_TYPE_FRAGMENT) {
-        SS_LOGE(TAG, "send_binary: message type 1 belongs to the fragmentation layer");
-        return SsErr::FAIL;
-    }
-
-    if (len <= MAX_TRANSPORT_PLAINTEXT) {
-        if (!this->ensure_send_buf(len + AEAD_TAG_SIZE)) {
-            return SsErr::FAIL;
-        }
-        std::memcpy(this->send_buf_.data(), data, len);
-        return this->encrypt_and_send_frame(this->send_buf_.data(), this->send_buf_.size(), len,
-                                            nullptr);
-    }
-
-    return this->fragment_and_send(data[0], data + 1, len - 1);
 }
 
 SsErr NoiseTransport::send_binary_lent(OutboundRing& ring, void* item, size_t message_capacity,
@@ -418,9 +343,8 @@ bool NoiseTransport::reasm_reserve(size_t needed, bool admitted) {
 }
 
 bool NoiseTransport::ensure_send_buf(size_t needed) {
-    // Capped at MAX_TRANSPORT_PLAINTEXT + AEAD_TAG_SIZE (the largest plaintext + AEAD tag room the
-    // non-fragmented path ever handles); callers never request more (the non-fragmented path's
-    // own size check enforces this), so the cap never actually clamps.
+    // Capped at one frame's largest plaintext plus its AEAD tag; stage_json()'s own size check
+    // keeps every request within it, so the cap never actually clamps.
     return this->grow_buffer(this->send_buf_, needed, MAX_TRANSPORT_PLAINTEXT + AEAD_TAG_SIZE,
                              "send");
 }

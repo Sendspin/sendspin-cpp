@@ -814,7 +814,7 @@ public:
     }
 
     /// @brief Sets the memory location preference for the Noise transport's buffers: fragment
-    /// reassembly, the fragmentation frame buffer, and the reused send buffer.
+    /// reassembly and the reused send buffer.
     /// @param location PREFER_EXTERNAL (SPIRAM-first) or PREFER_INTERNAL (internal-RAM-first).
     /// @note Must be called before the handshake completes; takes effect on the next allocation.
     void set_noise_buffer_location(MemoryLocation location) {
@@ -1025,8 +1025,8 @@ protected:
     /// reader threads.
     InboundGate inbound_gate_;
 
-    /// Encrypted transport: owns the cipher session, outbound fragmentation, and inbound
-    /// reassembly. Protocol task only; see noise_transport.h.
+    /// Encrypted transport: owns the cipher session and inbound reassembly. Protocol task only;
+    /// see noise_transport.h.
     NoiseTransport noise_transport_;
 
 #ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
