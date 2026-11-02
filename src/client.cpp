@@ -1527,7 +1527,9 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // after a server/activate carries them all.
     const ClientStateMessage state_msg =
         client_state_for_roles(snapshot, entry->owned_roles & conn->get_active_role_mask());
-    conn->send_json(build_client_state_message(&state_msg, *this->json_arena_));
+    JsonDocument json = make_json_document(*this->json_arena_);
+    build_client_state_message(&state_msg, json);
+    conn->send_json(json);
 }
 
 void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {

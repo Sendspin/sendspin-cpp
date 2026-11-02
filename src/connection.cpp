@@ -17,6 +17,7 @@
 #include "crypto/constants.h"
 #include "outbound_ring.h"
 #include "platform/compiler.h"
+#include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
@@ -94,7 +95,9 @@ SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason) {
     // Routed through send_json() so it is encrypted once the Noise transport is active. A
     // goodbye can precede the hello (e.g., when rejecting an excess connection before the
     // handshake finishes).
-    return this->send_json(build_client_goodbye_message(reason, *this->json_arena_));
+    JsonDocument goodbye = make_json_document(*this->json_arena_);
+    build_client_goodbye_message(reason, goodbye);
+    return this->send_json(goodbye);
 }
 
 std::string_view SendspinConnection::stage_json(const JsonDocument& doc) {
@@ -349,7 +352,9 @@ bool SendspinConnection::handle_noise_rehandshake(const std::vector<uint8_t>& ms
     }
 
     // Commit: encrypt msg2 under the OLD session and send it, then swap to the new session.
-    const std::string_view msg2_text = this->stage_json(result->msg2);
+    JsonDocument msg2 = make_json_document(*this->json_arena_);
+    build_noise_handshake_message(result->msg2_bytes, msg2);
+    const std::string_view msg2_text = this->stage_json(msg2);
     if (msg2_text.data() == nullptr) {
         SS_LOGE(TAG, "handle_noise_rehandshake: failed to stage msg2");
         return false;

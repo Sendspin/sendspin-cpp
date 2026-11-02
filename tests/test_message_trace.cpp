@@ -208,13 +208,18 @@ TEST(MessageTrace, RedactsThePairingSecretsAndNothingElse) {
     };
     const std::string json_body(1, '\0');
     const std::vector<Row> rows = {
-        {"cleartext long_term_psk", false,
-         to_text(build_client_pair_finalize_message(psk, TestArena())), psk_b64},
-        {"wrapped_psk", true,
-         json_body + to_text(build_client_pair_finalize_wrapped_message(wrapped, TestArena())),
+        {"cleartext long_term_psk", false, built_text([&](JsonDocument& message) {
+             build_client_pair_finalize_message(psk, message);
+         }),
+         psk_b64},
+        {"wrapped_psk", true, json_body + built_text([&](JsonDocument& message) {
+                                  build_client_pair_finalize_wrapped_message(wrapped, message);
+                              }),
          wrapped_b64},
         {"wrapped_nonce_B beside client_kc", true,
-         json_body + to_text(build_client_pair_confirm_message(client_kc, wrapped, TestArena())),
+         json_body + built_text([&](JsonDocument& message) {
+             build_client_pair_confirm_message(client_kc, wrapped, message);
+         }),
          wrapped_b64},
         {"unterminated value", true, json_body + R"({"payload":{"wrapped_psk":"SECRET)", "SECRET"},
         {"Control: no secret", true, json_body + R"({"type":"client/state","payload":{}})", ""},

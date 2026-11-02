@@ -66,9 +66,10 @@ struct NoiseHandshakeResult {
     std::string server_id;
     /// The PSK record that admitted the connection.
     ResolvedPsk resolved_psk;
-    /// The noise/handshake msg2 envelope to send to the peer, built in the client's JSON arena.
-    /// Set only for re-handshake results (initial handshake sends msg2 inline).
-    JsonDocument msg2;
+    /// The Noise msg2 bytes to send to the peer, in a noise/handshake envelope
+    /// (build_noise_handshake_message()). Set only for re-handshake results (initial handshake
+    /// sends msg2 inline).
+    std::vector<uint8_t> msg2_bytes;
 };
 
 /// @brief Result of processing one incoming WS frame during the handshake.
@@ -81,6 +82,10 @@ enum class HandshakeFrameResult : uint8_t {
 // ============================================================================
 // noise/handshake envelope
 // ============================================================================
+
+/// @brief Builds a noise/handshake envelope carrying `noise_bytes` base64url-encoded, into the
+/// caller-owned `doc`: {"type":"noise/handshake","payload":{"data":"..."}}
+void build_noise_handshake_message(const std::vector<uint8_t>& noise_bytes, JsonDocument& doc);
 
 /// @brief Reads the Noise message bytes a noise/handshake envelope carries: its payload.data,
 /// base64url-decoded.
@@ -117,9 +122,8 @@ std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst en
 /// @param record_store   Record store for psk_id resolution (read-only on protocol task).
 /// @param suite_name     Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
 /// @param prior_h        32-byte handshake hash from the prior session (used as prologue).
-/// @param arena          The client's JSON arena: msg1's payload is parsed and the msg2 envelope
-///                       built in it, one after the other.
-/// @return Populated NoiseHandshakeResult (session + msg2 to send) on success,
+/// @param arena          The client's JSON arena, which msg1's payload is parsed in.
+/// @return Populated NoiseHandshakeResult (session + msg2_bytes to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
     const std::vector<uint8_t>& msg1_bytes, const std::string& server_id, const Identity& identity,

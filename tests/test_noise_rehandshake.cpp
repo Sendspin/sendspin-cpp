@@ -234,29 +234,20 @@ static std::optional<RehandshakeResult> run_rehandshake(
         return std::nullopt;
     }
 
-    // Named: the result's msg2 envelope is allocated from it.
-    TestArena arena;
-    auto result = run_rehandshake_msg1(msg1_bytes_of(msg1_json), init.server_id.peer_id(),
-                                       init.client_id, rs, suite_name.c_str(), prior_h, arena);
+    auto result =
+        run_rehandshake_msg1(msg1_bytes_of(msg1_json), init.server_id.peer_id(), init.client_id, rs,
+                             suite_name.c_str(), prior_h, TestArena());
     if (!result.has_value()) {
         ADD_FAILURE() << "run_rehandshake_msg1 returned nullopt";
         return std::nullopt;
     }
 
-    // msg2 is already in the result: a noise/handshake JSON envelope wrapping msg2. The
-    // initiator reads msg2 from it as send_json() would serialize it.
-    JsonDocument msg2_doc;
-    if (deserializeJson(msg2_doc, to_text(result->msg2))) {
-        ADD_FAILURE() << "failed to parse the msg2 envelope";
+    // The result carries msg2's Noise bytes; the initiator reads them directly.
+    std::vector<uint8_t>& msg2_bytes = result->msg2_bytes;
+    if (msg2_bytes.empty()) {
+        ADD_FAILURE() << "the re-handshake produced no msg2";
         return std::nullopt;
     }
-    const char* msg2_b64 = msg2_doc["payload"]["data"] | "";
-    auto msg2_bytes_opt = b64url_decode(msg2_b64);
-    if (!msg2_bytes_opt.has_value() || msg2_bytes_opt->empty()) {
-        ADD_FAILURE() << "failed to decode msg2 bytes";
-        return std::nullopt;
-    }
-    auto& msg2_bytes = *msg2_bytes_opt;
 
     std::vector<uint8_t> msg2_payload_buf(4096);
     NoiseBuffer msg2_in;

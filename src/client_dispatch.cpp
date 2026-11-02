@@ -316,8 +316,9 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
     // formats nothing.
     SendspinConnection* conn = manager.role_send_target(SendspinRole::CONTROLLER);
     if (conn != nullptr) {
-        conn->send_json(
-            build_client_command_message(command.controller_command, *this->json_arena_));
+        JsonDocument json = make_json_document(*this->json_arena_);
+        build_client_command_message(command.controller_command, json);
+        conn->send_json(json);
     }
 }
 

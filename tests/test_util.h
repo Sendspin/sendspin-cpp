@@ -92,11 +92,10 @@ inline void put_be32(std::vector<uint8_t>& out, uint32_t val) {
 }
 
 /// A fresh arena sized like the client's default, for the message builders (the build_*()
-/// family) and the Noise handshake. Used as a temporary for one builder call
-/// (`to_text(build_client_leave_message(TestArena()))`) or as a local where the arena must outlive
-/// the call (a NoiseHandshake keeps a reference), so no two tests share one. Anything that keeps
-/// the reference must take a named TestArena: the conversion operator would bind it to a temporary
-/// destroyed at the end of the full expression.
+/// family, through built_text()) and the Noise handshake. Used as a temporary for one call or as
+/// a local where the arena must outlive the call (a NoiseHandshake keeps a reference), so no two
+/// tests share one. Anything that keeps the reference must take a named TestArena: the conversion
+/// operator would bind it to a temporary destroyed at the end of the full expression.
 struct TestArena {
     sendspin::SendspinArenaAllocator arena{sendspin::SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE};
 
@@ -106,10 +105,20 @@ struct TestArena {
     }
 };
 
-/// The text SendspinConnection::send_json() puts on the wire for a built message. Call it in the
-/// same full expression as the builder when the builder's arena is a TestArena temporary.
+/// The text SendspinConnection::send_json() puts on the wire for a document.
 inline std::string to_text(const JsonDocument& doc) {
     std::string text;
     serializeJson(doc, text);
     return text;
+}
+
+/// The wire text of the message `build` fills into a fresh TestArena document, as a builder's
+/// caller makes it; `build` is e.g.
+/// `[&](JsonDocument& message) { build_client_leave_message(message); }`.
+template <typename Build>
+std::string built_text(Build&& build) {
+    TestArena arena;
+    JsonDocument doc = sendspin::make_json_document(arena);
+    build(doc);
+    return to_text(doc);
 }

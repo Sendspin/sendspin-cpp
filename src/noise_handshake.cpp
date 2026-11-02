@@ -62,16 +62,11 @@ static std::string serialize_client_init(const std::string& client_id, const cha
     return out;
 }
 
-/// @brief Build a noise/handshake envelope containing base64url-encoded noise bytes.
-/// Format: {"type":"noise/handshake","payload":{"data":"..."}}
-static JsonDocument build_noise_handshake_message(const std::vector<uint8_t>& noise_bytes,
-                                                  SendspinArenaAllocator& arena) {
+void build_noise_handshake_message(const std::vector<uint8_t>& noise_bytes, JsonDocument& doc) {
     std::string encoded = b64url_encode(noise_bytes.data(), noise_bytes.size());
 
-    JsonDocument doc = make_json_document(arena);
     doc["type"] = "noise/handshake";
     doc["payload"]["data"] = encoded;
-    return doc;
 }
 
 // ============================================================================
@@ -418,7 +413,9 @@ bool NoiseHandshake::handle_msg1(const std::vector<uint8_t>& msg1_bytes,
     }
 
     // Send noise/handshake msg2 as a TEXT frame
-    if (!send_fn(build_noise_handshake_message(core->msg2_bytes, this->arena_))) {
+    JsonDocument msg2 = make_json_document(this->arena_);
+    build_noise_handshake_message(core->msg2_bytes, msg2);
+    if (!send_fn(msg2)) {
         SS_LOGE(TAG, "handle_msg1: failed to send noise/handshake msg2");
         return false;
     }
@@ -449,14 +446,12 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
         return std::nullopt;
     }
 
-    // Build the msg2 noise/handshake envelope (caller sends it encrypted)
-    JsonDocument msg2 = build_noise_handshake_message(core->msg2_bytes, arena);
-
     SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%d", server_id.c_str(),
             static_cast<int>(core->resolved_psk.category));
 
     NoiseHandshakeResult result = make_handshake_result(std::move(core.value()), server_id);
-    result.msg2 = std::move(msg2);
+    // The caller wraps msg2 in its noise/handshake envelope and sends it encrypted.
+    result.msg2_bytes = std::move(core->msg2_bytes);
     return result;
 }
 

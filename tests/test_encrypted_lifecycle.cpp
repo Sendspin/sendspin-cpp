@@ -2542,7 +2542,8 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
     size_t smallest_reply_peak = 0;
     {
         SendspinArenaAllocator alone(ARENA_BYTES);
-        to_text(build_client_leave_message(alone));
+        JsonDocument leave = make_json_document(alone);
+        build_client_leave_message(leave);
         smallest_reply_peak = alone.high_water();
     }
 

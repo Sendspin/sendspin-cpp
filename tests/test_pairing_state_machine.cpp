@@ -681,7 +681,9 @@ protected:
         JsonDocument doc;
         JsonObject root;
         const ClientHelloMessage hello = this->client_->build_client_hello();
-        EXPECT_TRUE(parse_json(to_text(build_client_hello_message(&hello, TestArena())), doc, root));
+        EXPECT_TRUE(parse_json(
+            built_text([&](JsonDocument& message) { build_client_hello_message(&hello, message); }),
+            doc, root));
         JsonVariantConst desc = root["payload"]["supported_pair_methods"][method];
         if (!desc.isUnbound()) {
             if (desc["locations"].isUnbound()) {
