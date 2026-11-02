@@ -194,7 +194,7 @@ TEST(PlayerRoleSupportedCommands, EachAdjustableControlAddsItsCommandAndField) {
         std::optional<bool> mute;
         bool delay;
         bool toggled;
-        std::vector<Cmd> commands;
+        EnumSet<Cmd> commands;
     };
     const Row rows[] = {
         {"Control: defaults", std::nullopt, std::nullopt, false, false, {Cmd::VOLUME, Cmd::MUTE}},

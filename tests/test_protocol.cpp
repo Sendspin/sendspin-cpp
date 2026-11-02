@@ -1125,12 +1125,13 @@ TEST(Protocol, FormatClientHelloPlayerSupportOmitsSupportedCommands) {
 }
 
 // roles/player/v1.md "client/state player object": supported_commands is a required key whose
-// value is the (possibly empty) list of commands the player accepts.
+// value is the (possibly empty) list of commands the player accepts. The set has a gap and is
+// built out of order, so every command it holds must still be listed.
 TEST(Protocol, FormatClientStatePlayerCarriesSupportedCommands) {
     ClientStateMessage msg;
     ClientPlayerStateObject player{};
-    player.supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE,
-                                 SendspinPlayerCommand::SET_OUTPUT_DELAY};
+    player.supported_commands = {SendspinPlayerCommand::SET_OUTPUT_DELAY,
+                                 SendspinPlayerCommand::VOLUME};
     msg.player = player;
 
     JsonDocument doc;
@@ -1138,10 +1139,9 @@ TEST(Protocol, FormatClientStatePlayerCarriesSupportedCommands) {
                                      build_client_state_message(&msg, message);
                                  })));
     JsonArrayConst commands = doc["payload"]["player"]["supported_commands"].as<JsonArrayConst>();
-    ASSERT_EQ(commands.size(), 3u);
+    ASSERT_EQ(commands.size(), 2u);
     EXPECT_STREQ(commands[0], "volume");
-    EXPECT_STREQ(commands[1], "mute");
-    EXPECT_STREQ(commands[2], "set_output_delay");
+    EXPECT_STREQ(commands[1], "set_output_delay");
 }
 
 // Control: a player that accepts no command reports the key as an empty array rather than

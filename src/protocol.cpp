@@ -951,9 +951,8 @@ void build_client_state_message(const ClientStateMessage* msg, JsonDocument& doc
         // roles/player/v1.md "client/state player object": supported_commands is a required key
         // that is empty when the player accepts no commands, so the array is emitted even then.
         JsonArray commands_list = root["payload"]["player"]["supported_commands"].to<JsonArray>();
-        for (const auto& cmd : player_state.supported_commands) {
-            commands_list.add(to_cstr(cmd));
-        }
+        player_state.supported_commands.for_each(
+            [&commands_list](SendspinPlayerCommand cmd) { commands_list.add(to_cstr(cmd)); });
     }
 
     if (msg->artwork.has_value()) {
