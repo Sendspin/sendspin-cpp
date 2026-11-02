@@ -1114,8 +1114,10 @@ TEST(Protocol, FormatClientHelloPlayerSupportOmitsSupportedCommands) {
     ClientHelloMessage msg;
     msg.name = "Speaker";
     msg.supported_roles.push_back(SendspinRole::PLAYER);
+    const std::vector<AudioSupportedFormatObject> formats = {
+        {SendspinCodecFormat::FLAC, 2, 44100, 16}};
     PlayerSupportObject support{};
-    support.supported_formats = {{SendspinCodecFormat::FLAC, 2, 44100, 16}};
+    support.supported_formats = formats;
     support.buffer_capacity = 4096;
     msg.player_v1_support = support;
 
@@ -1345,13 +1347,14 @@ TEST(Protocol, ClientHelloUnpairedAccessIsAlwaysEmitted) {
 TEST(Protocol, ClientHelloPairMethodsAreKeyedByMethod) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
+    const std::vector<std::string> locations = {"device"};
     PairMethodDescriptor psk_desc;
     psk_desc.method = SendspinPairMethod::PAIRING_PSK;
-    psk_desc.locations = std::vector<std::string>{"device"};
-    msg.supported_pair_methods.push_back(std::move(psk_desc));
+    psk_desc.locations = locations;
+    msg.supported_pair_methods.push_back(psk_desc);
     PairMethodDescriptor static_desc;
     static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
-    msg.supported_pair_methods.push_back(std::move(static_desc));
+    msg.supported_pair_methods.push_back(static_desc);
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
@@ -1708,7 +1711,7 @@ TEST(Protocol, Be64HelpersAreBigEndianAndRoundTrip) {
 TEST(Protocol, FormatClientHelloSourceSupport) {
     ClientHelloMessage msg;
     msg.name = "Line In";
-    msg.supported_roles = {SendspinRole::SOURCE};
+    msg.supported_roles.push_back(SendspinRole::SOURCE);
 
     msg.source_v1_support = SourceSupportObject{.line_sense = true};
     JsonDocument doc;
@@ -1728,7 +1731,7 @@ TEST(Protocol, FormatClientHelloSourceSupport) {
     EXPECT_EQ(doc_no_features["payload"]["source@v1_support"].as<JsonObject>().size(), 0U);
 
     // Control: a client without the role sends no support object.
-    msg.supported_roles = {};
+    msg.supported_roles.clear();
     msg.source_v1_support.reset();
     JsonDocument doc_unset;
     ASSERT_FALSE(deserializeJson(doc_unset, built_text([&](JsonDocument& message) {

@@ -19,6 +19,8 @@
 #pragma once
 
 #include "crypto/psk_wrap.h"
+#include "inline_vector.h"
+#include "platform/network_info.h"
 #include "sendspin/color_role.h"
 #include "sendspin/config.h"
 #include "sendspin/controller_role.h"
@@ -33,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -422,12 +425,13 @@ inline std::optional<SendspinPlaybackState> playback_state_from_string(std::stri
     return std::nullopt;
 }
 
-/// @brief Optional hardware and software identity fields sent in client/hello messages
+/// @brief Optional hardware and software identity fields sent in client/hello messages, viewing
+/// the strings they name
 struct DeviceInfoObject {
-    std::optional<std::string> product_name{};
-    std::optional<std::string> manufacturer{};
-    std::optional<std::string> software_version{};
-    std::optional<std::string> mac_address{};
+    std::optional<std::string_view> product_name{};
+    std::optional<std::string_view> manufacturer{};
+    std::optional<std::string_view> software_version{};
+    std::optional<std::string_view> mac_address{};
 };
 
 // --- player_role.h ---
@@ -484,9 +488,10 @@ inline std::optional<SendspinPlayerCommand> player_command_from_string(std::stri
     return std::nullopt;
 }
 
-/// @brief Player capabilities advertised to the server during the hello handshake
+/// @brief Player capabilities advertised to the server during the hello handshake, viewing the
+/// player config's formats
 struct PlayerSupportObject {
-    std::vector<AudioSupportedFormatObject> supported_formats{};
+    std::span<const AudioSupportedFormatObject> supported_formats{};
     size_t buffer_capacity{};
 };
 
@@ -819,37 +824,46 @@ struct ClientSourceStateObject {
 // Message envelope structs
 // ============================================================================
 
-/// @brief A pairing method descriptor for client/hello supported_pair_methods.
-/// Optional fields are omitted from the wire when not set (omit_none semantics). The methods are
-/// held as a list rather than a map because the wire object has at most two keys and the
-/// descriptor names its own: `method` is serialized as the key this descriptor sits under, not as
-/// a field of it (pairing.md "client/hello pair-method descriptor").
+/// @brief A pairing method descriptor for client/hello supported_pair_methods, viewing the lists
+/// it names.
+/// An empty list is omitted from the wire (omit_none semantics). The methods are held as a list
+/// rather than a map because the wire object has at most two keys and the descriptor names its
+/// own: `method` is serialized as the key this descriptor sits under, not as a field of it
+/// (pairing.md "client/hello pair-method descriptor").
 struct PairMethodDescriptor {
     SendspinPairMethod method{SendspinPairMethod::PAIRING_PSK};
     /// @brief Channels the dynamic pairing code is conveyed through. Required and non-empty on
-    /// the dynamic_pairing_code descriptor, absent on the others.
-    std::optional<std::vector<SendspinPairingCodeChannel>> out_channels;
+    /// the dynamic_pairing_code descriptor, empty on the others.
+    std::span<const SendspinPairingCodeChannel> out_channels;
     /// @brief Emission formats the client offers. Required and non-empty on the
-    /// dynamic_pairing_code descriptor, absent on the others.
-    std::optional<std::vector<SendspinPairingCodeFormat>> formats;
+    /// dynamic_pairing_code descriptor, empty on the others.
+    std::span<const SendspinPairingCodeFormat> formats;
     /// @brief Where the operator can find the method's configured secret:
     /// 'device' | 'leaflet' | 'operator'. Informational hint for static_pairing_code and
-    /// pairing_psk only; absent for dynamic_pairing_code, whose code has no resting place.
-    std::optional<std::vector<std::string>> locations;
+    /// pairing_psk only; empty for dynamic_pairing_code, whose code has no resting place.
+    std::span<const std::string> locations;
 };
+
+/// @brief Most pair methods a client/hello lists: pairing_psk and at most one pairing-code method
+/// (messaging.md "client/hello").
+static constexpr size_t MAX_HELLO_PAIR_METHODS = 2;
 
 /// @brief Outgoing client/hello handshake message sent at connection startup.
 /// Under encryption, client_id and version are carried in client/init (the cleartext Noise
-/// handshake frame), not repeated here.
+/// handshake frame), not repeated here. Its strings and lists view the client's config and roles,
+/// so it is built and serialized in one go and never outlives them.
 struct ClientHelloMessage {
-    std::string name{};
+    std::string_view name{};
     std::optional<DeviceInfoObject> device_info{};
-    std::vector<SendspinRole> supported_roles{};
+    /// @brief Storage for a MAC address detected at build time, which device_info views; the view
+    /// stays valid because the message can be neither copied nor moved (its InlineVectors).
+    MacAddressText detected_mac{};
+    InlineVector<SendspinRole, static_cast<size_t>(SendspinRole::COUNT)> supported_roles{};
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
     std::optional<SourceSupportObject> source_v1_support{};
     bool unpaired_access_enabled{false};
-    std::vector<PairMethodDescriptor> supported_pair_methods{};
+    InlineVector<PairMethodDescriptor, MAX_HELLO_PAIR_METHODS> supported_pair_methods{};
 };
 
 /// @brief Outgoing client/state message reporting client playback state to the server

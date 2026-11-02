@@ -1551,7 +1551,8 @@ bool ConnectionManager::send_hello_message(SendspinConnection* conn) {
         return true;
     }
 
-    const ClientHelloMessage hello = this->client_->build_client_hello();
+    ClientHelloMessage hello;
+    this->client_->build_client_hello(hello);
 
     // client/hello is encrypted like every other post-handshake message. The hello is only sent
     // once server/hello arrives, so send_json always routes to the active Noise transport here.

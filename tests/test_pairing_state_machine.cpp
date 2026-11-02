@@ -680,7 +680,8 @@ protected:
     std::optional<std::vector<std::string>> hello_locations(const char* method) {
         JsonDocument doc;
         JsonObject root;
-        const ClientHelloMessage hello = this->client_->build_client_hello();
+        ClientHelloMessage hello;
+        this->client_->build_client_hello(hello);
         EXPECT_TRUE(parse_json(
             built_text([&](JsonDocument& message) { build_client_hello_message(&hello, message); }),
             doc, root));

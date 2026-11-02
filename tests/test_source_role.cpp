@@ -503,7 +503,8 @@ TEST(SourceRoleObjects, HelloAndStateFields) {
 
     ClientHelloMessage hello;
     source.impl_->build_hello_fields(hello);
-    ASSERT_EQ(hello.supported_roles, std::vector<SendspinRole>{SendspinRole::SOURCE});
+    ASSERT_EQ(hello.supported_roles.size(), 1U);
+    EXPECT_EQ(hello.supported_roles[0], SendspinRole::SOURCE);
     ASSERT_TRUE(hello.source_v1_support.has_value());
     EXPECT_TRUE(hello.source_v1_support->line_sense);
 

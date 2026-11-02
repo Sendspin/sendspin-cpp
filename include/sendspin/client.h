@@ -854,8 +854,9 @@ private:
     /// only.
     void process_inbound(SendspinConnection& conn, InboundMessage& message);
 
-    /// @brief Builds the client/hello fields from config and every role. Protocol task.
-    ClientHelloMessage build_client_hello();
+    /// @brief Fills `msg` with the client/hello fields from config and every role, viewing them.
+    /// Protocol task.
+    void build_client_hello(ClientHelloMessage& msg);
 
     /// @brief Builds the client/state snapshot publish_state() hands the protocol task: the
     /// availability and every role's state object. Main loop only, where that state lives.
