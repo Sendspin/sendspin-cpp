@@ -65,7 +65,7 @@ struct NoiseHandshakeResult {
     /// The cipher session ready for transport-mode encrypt/decrypt.
     std::unique_ptr<NoiseSession> session;
     /// Server's public key peer_id (43-char base64url).
-    std::string server_id;
+    IdText server_id;
     /// The PSK record that admitted the connection.
     ResolvedPsk resolved_psk;
     /// The Noise msg2 bytes to send to the peer, in a noise/handshake envelope
@@ -130,7 +130,7 @@ std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope
 /// @return Populated NoiseHandshakeResult (session + msg2_bytes to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    std::span<const uint8_t> msg1_bytes, const std::string& server_id, const Identity& identity,
+    std::span<const uint8_t> msg1_bytes, std::string_view server_id, const Identity& identity,
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena);
 
@@ -210,9 +210,9 @@ private:
 
     /// @brief Validate the fields read from a server/init frame.
     /// @param version   payload.version (0 when absent).
-    /// @param server_id payload.server_id (empty when absent).
+    /// @param server_id payload.server_id (empty when absent or longer than a peer_id).
     /// @param text      Exact received bytes, retained for the handshake prologue.
-    bool handle_server_init(int version, std::string server_id, std::string_view text);
+    bool handle_server_init(int version, const IdText& server_id, std::string_view text);
 
     /// @brief Authenticate and respond to the noise/handshake msg1.
     /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data()).
@@ -232,7 +232,7 @@ private:
     std::string server_error_reason_;
 
     /// server_id decoded from server/init (43-char base64url).
-    std::string server_id_;
+    IdText server_id_;
 
     /// Exact bytes of the server/init frame we received (retained for prologue).
     std::string server_init_text_;

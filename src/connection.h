@@ -390,9 +390,10 @@ public:
     }
 
     /// @brief Returns the psk_id of the matched PSK (set at COMPLETE and rewritten at every
-    /// in-band re-handshake; empty for Sentinel or when no Noise handshake has completed).
+    /// in-band re-handshake; SENTINEL_PSK_ID for the Sentinel PSK, empty until a Noise handshake
+    /// completes).
     /// Protocol task only, the thread that writes it.
-    const std::string& get_psk_id() const {
+    const IdText& get_psk_id() const {
         return this->psk_id_;
     }
 
@@ -691,11 +692,11 @@ public:
 
     /// @brief Sets the server_id and PSK metadata from the Noise handshake result.
     /// Called at COMPLETE in connection.cpp.
-    void set_noise_handshake_result(const std::string& server_id, PskCategory psk_category,
-                                    const std::string& psk_id) {
+    void set_noise_handshake_result(std::string_view server_id, PskCategory psk_category,
+                                    std::string_view psk_id) {
         this->server_information_.server_id = server_id;
         this->psk_category_ = psk_category;
-        this->psk_id_ = psk_id;
+        this->psk_id_.assign(psk_id);
     }
 
     /// @brief Returns whether server/hello has arrived on this connection.
@@ -717,11 +718,10 @@ public:
         this->server_source_codecs_ = codecs.value_or(0);
     }
 
-    /// @brief Sets the server information (from server/hello message)
-    /// @param info The ServerInformationObject received during the hello handshake.
-    /// @note Called by hub after receiving server/hello message.
-    void set_server_information(ServerInformationObject info) {
-        this->server_information_ = std::move(info);
+    /// @brief Sets the server's display name from server/hello; the server_id the handshake
+    /// recorded stays.
+    void set_server_name(std::string name) {
+        this->server_information_.name = std::move(name);
     }
 
     // ========================================
@@ -1098,10 +1098,10 @@ protected:
     /// Retained for re-handshake: Noise suite name supplied at init_noise_handshake().
     const char* noise_suite_name_ = nullptr;
 
-    /// psk_id of the PSK matched by the Noise handshake (empty for Sentinel, or when no
-    /// Noise handshake has completed). Written at handshake COMPLETE and at every in-band
+    /// psk_id of the PSK matched by the Noise handshake (SENTINEL_PSK_ID for the Sentinel PSK,
+    /// empty until a Noise handshake completes). Written at handshake COMPLETE and at every in-band
     /// re-handshake. Protocol task only.
-    std::string psk_id_{};
+    IdText psk_id_{};
 
     // Struct fields
 

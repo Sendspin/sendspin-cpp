@@ -286,8 +286,8 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
         }
         // Record the server's identity (public key) and the PSK category/psk_id that admitted
         // the connection, resolved by the handshake.
-        this->set_noise_handshake_result(outcome->server_id, outcome->resolved_psk.category,
-                                         outcome->resolved_psk.psk_id);
+        this->set_noise_handshake_result(outcome->server_id.view(), outcome->resolved_psk.category,
+                                         outcome->resolved_psk.psk_id.view());
         // pairing.md "Pairing index": a fresh handshake starts a fresh count for the
         // pairing_index / CPace-sid counter.
         this->reset_pairing_index();
@@ -341,11 +341,9 @@ bool SendspinConnection::handle_noise_rehandshake(std::span<const uint8_t> msg1_
         SS_LOGE(TAG, "handle_noise_rehandshake: no handshake hash available");
         return false;
     }
-    const std::string current_server_id = this->server_information_.server_id;
-
-    auto result = run_rehandshake_msg1(msg1_bytes, current_server_id, *this->noise_identity_,
-                                       *this->noise_record_store_, this->noise_suite_name_,
-                                       prior_h.value(), *this->json_arena_);
+    auto result = run_rehandshake_msg1(
+        msg1_bytes, this->server_information_.server_id, *this->noise_identity_,
+        *this->noise_record_store_, this->noise_suite_name_, prior_h.value(), *this->json_arena_);
     if (!result.has_value()) {
         SS_LOGW(TAG, "handle_noise_rehandshake: re-handshake failed; closing connection");
         return false;
@@ -379,9 +377,9 @@ bool SendspinConnection::handle_noise_rehandshake(std::span<const uint8_t> msg1_
     // connection.md "Re-handshake": neither hello is re-sent, so the hello state carries over
     // untouched; the server's first message under the new keys is server/activate, which
     // first_activate_received_ (cleared above) now waits on.
-    SS_LOGI(TAG,
-            "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/activate",
-            current_server_id.c_str(), static_cast<int>(this->get_psk_category()));
+    SS_LOGI(
+        TAG, "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/activate",
+        this->server_information_.server_id.c_str(), static_cast<int>(this->get_psk_category()));
     return true;
 }
 

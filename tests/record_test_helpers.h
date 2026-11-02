@@ -33,11 +33,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace sendspin {
+
+/// Prints an IdText as its text in a failed assertion.
+inline void PrintTo(const IdText& id, std::ostream* os) {
+    *os << '"' << id.view() << '"';
+}
 
 /// Generate a random PSK of NOISE_PSK_SIZE bytes.
 inline std::array<uint8_t, NOISE_PSK_SIZE> make_random_psk() {

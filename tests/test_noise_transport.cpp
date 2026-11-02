@@ -389,6 +389,14 @@ TEST(NoiseHandshakeDriver, UnknownPskIdFallsBackToTheSentinelPsk) {
         EXPECT_EQ(outcome.category, PskCategory::SENTINEL) << "category " << category;
         EXPECT_FALSE(outcome.peer_read_msg2) << "category " << category;
     }
+
+    // An id longer than any psk_id is the same miss, though the record it extends is stored.
+    Msg1Outcome over_long = run_msg1_with_payload([](const std::string& psk_id) {
+        return R"({"psk_id":")" + psk_id + R"(x","psk_category":"lt"})";
+    });
+    EXPECT_EQ(over_long.result, HandshakeFrameResult::COMPLETE);
+    EXPECT_EQ(over_long.category, PskCategory::SENTINEL);
+    EXPECT_FALSE(over_long.peer_read_msg2);
 }
 
 // messaging.md "noise/handshake": the payload declares which category the referenced PSK is used

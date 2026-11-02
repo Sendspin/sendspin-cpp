@@ -13,7 +13,8 @@
 // limitations under the License.
 
 /// @file keys.h
-/// @brief Sendspin key helpers: PSK-ID derivation and X25519 Identity.
+/// @brief Sendspin key helpers: PSK-ID derivation, X25519 Identity, and IdText, a peer_id or psk_id
+/// held inline.
 ///
 /// Both values are fixed by connection.md "Pre-Shared Key" and "Identities":
 ///   - `psk_id_for(psk)` = base64url(SHA-256(PSK_ID_LABEL || psk))
@@ -61,6 +62,55 @@ static constexpr size_t PEER_ID_SIZE = 43;
 /// @brief Buffer one peer_id is encoded into without a heap allocation: its characters, the `=`
 /// the padded encoding carries before it is stripped, and the NUL.
 using PeerIdText = std::array<char, PEER_ID_SIZE + 2>;
+
+/// @brief A peer_id or psk_id held inline, NUL-terminated
+///
+/// Both are PEER_ID_SIZE base64url characters (psk_id_for(), Identity::peer_id()), so either fits
+/// without a heap allocation; longer text names no id this client holds and is refused.
+static_assert(PEER_ID_SIZE <= UINT8_MAX, "IdText holds its size in a uint8_t");
+
+class IdText {
+public:
+    IdText() = default;
+
+    /// @brief Holds `text`.
+    /// @return false, leaving the text empty, when `text` is longer than PEER_ID_SIZE.
+    bool assign(std::string_view text) {
+        if (text.size() > PEER_ID_SIZE) {
+            this->size_ = 0;
+            this->chars_[0] = '\0';
+            return false;
+        }
+        text.copy(this->chars_.data(), text.size());
+        this->chars_[text.size()] = '\0';
+        this->size_ = static_cast<uint8_t>(text.size());
+        return true;
+    }
+
+    std::string_view view() const {
+        return {this->chars_.data(), this->size_};
+    }
+
+    const char* c_str() const {
+        return this->chars_.data();
+    }
+
+    bool empty() const {
+        return this->size_ == 0;
+    }
+
+    bool operator==(std::string_view other) const {
+        return this->view() == other;
+    }
+
+    bool operator==(const IdText& other) const {
+        return this->view() == other.view();
+    }
+
+private:
+    std::array<char, PEER_ID_SIZE + 1> chars_{};
+    uint8_t size_{0};
+};
 
 /// @brief Decode a peer_id to the X25519 public key it names.
 ///

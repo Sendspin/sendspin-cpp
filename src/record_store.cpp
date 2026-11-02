@@ -218,7 +218,7 @@ void RecordStore::provision_pairing_psk_if_needed() {
 // PSK resolution
 // ============================================================================
 
-std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk_id,
+std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(std::string_view psk_id,
                                                           PskCategory category) const {
     // No lock: this runs on the protocol task, which makes every change to records_, and the main
     // loop's persist_records() only reads records_ (see the persistence locking note below).
@@ -230,10 +230,10 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
             const SendspinPairingRecord* rec = this->record_by_psk_id(psk_id);
             if (rec != nullptr) {
                 ResolvedPsk r;
-                r.psk_id = rec->psk_id;
+                r.psk_id.assign(rec->psk_id);
                 r.psk = rec->psk;
                 r.category = PskCategory::LONG_TERM;
-                r.counterparty_id = rec->server_id;
+                r.counterparty_id.emplace().assign(rec->server_id);
                 return r;
             }
             break;
@@ -241,7 +241,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
         case PskCategory::PAIRING: {
             if (this->pairing_psk_.has_value() && this->pairing_psk_->psk_id == psk_id) {
                 ResolvedPsk r;
-                r.psk_id = this->pairing_psk_->psk_id;
+                r.psk_id.assign(this->pairing_psk_->psk_id);
                 r.psk = this->pairing_psk_->psk;
                 r.category = PskCategory::PAIRING;
                 return r;
@@ -251,7 +251,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
         case PskCategory::SENTINEL: {
             if (psk_id == SENTINEL_PSK_ID) {
                 ResolvedPsk r;
-                r.psk_id = SENTINEL_PSK_ID;
+                r.psk_id.assign(SENTINEL_PSK_ID);
                 r.psk = SENTINEL_PSK;
                 r.category = PskCategory::SENTINEL;
                 return r;
@@ -267,7 +267,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
 // Long-term record management
 // ============================================================================
 
-size_t RecordStore::find_index(const std::string& psk_id) const {
+size_t RecordStore::find_index(std::string_view psk_id) const {
     for (size_t i = 0; i < this->records_.size(); ++i) {
         if (this->records_[i].record.psk_id == psk_id) {
             return i;
@@ -302,7 +302,7 @@ void RecordStore::mark_slot_dirty_locked(uint8_t slot) {
     }
 }
 
-const SendspinPairingRecord* RecordStore::record_by_psk_id(const std::string& psk_id) const {
+const SendspinPairingRecord* RecordStore::record_by_psk_id(std::string_view psk_id) const {
     size_t idx = this->find_index(psk_id);
     if (idx == NPOS) {
         return nullptr;
@@ -462,7 +462,7 @@ bool RecordStore::has_pending_writes() const {
     return this->order_dirty_ || !this->dirty_slots_.empty();
 }
 
-bool RecordStore::note_record_removed(const std::string& psk_id) {
+bool RecordStore::note_record_removed(std::string_view psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     const size_t idx = this->find_index(psk_id);
     if (idx == NPOS) {
@@ -474,7 +474,7 @@ bool RecordStore::note_record_removed(const std::string& psk_id) {
     return true;
 }
 
-bool RecordStore::note_record_played(const std::string& psk_id) {
+bool RecordStore::note_record_played(std::string_view psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     const size_t idx = this->find_index(psk_id);
     // A record that is already the most recent moves nothing and writes nothing, which is every

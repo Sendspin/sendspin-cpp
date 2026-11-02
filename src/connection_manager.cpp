@@ -916,12 +916,12 @@ std::vector<std::string> ConnectionManager::open_connection_psk_ids() const {
     psk_ids.reserve(MAX_OPEN_CONNECTIONS);
     for (const auto& entry : this->admitted_) {
         if (entry.conn != nullptr && !entry.conn->get_psk_id().empty()) {
-            psk_ids.push_back(entry.conn->get_psk_id());
+            psk_ids.emplace_back(entry.conn->get_psk_id().view());
         }
     }
     for (const auto& entry : this->nursery_) {
         if (!entry.conn->get_psk_id().empty()) {
-            psk_ids.push_back(entry.conn->get_psk_id());
+            psk_ids.emplace_back(entry.conn->get_psk_id().view());
         }
     }
     return psk_ids;
@@ -1579,7 +1579,7 @@ bool ConnectionManager::send_hello_message(SendspinConnection* conn) {
 // Connection lifecycle
 // ============================================================================
 
-void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
+void ConnectionManager::drop_connections_using_psk_id(const IdText& psk_id,
                                                       const SendspinConnection* except) {
     if (psk_id.empty()) {
         return;
@@ -1695,8 +1695,8 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     // least recent until a deferred move lands. RecordStore::mutex_ is a leaf (docs/conventions.md,
     // "Threading and cross-thread state"), and this holds no other lock.
     if (conn->get_psk_category() == PskCategory::LONG_TERM) {
-        const std::string& psk_id = conn->get_psk_id();
-        if (!psk_id.empty() && this->client_->record_store_->note_record_played(psk_id)) {
+        const IdText& psk_id = conn->get_psk_id();
+        if (!psk_id.empty() && this->client_->record_store_->note_record_played(psk_id.view())) {
             this->client_->request_persist();
         }
     }

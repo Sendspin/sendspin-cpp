@@ -27,6 +27,7 @@
 #pragma once
 
 #include "crypto/constants.h"
+#include "crypto/keys.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 
@@ -77,11 +78,11 @@ inline std::optional<PskCategory> psk_category_from_string(std::string_view code
 
 /// @brief A PSK selected during a handshake, with its trust metadata.
 struct ResolvedPsk {
-    std::string psk_id;
+    IdText psk_id;
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     PskCategory category{PskCategory::SENTINEL};
     /// Peer server_id; set for every long-term record, empty for the Sentinel and Pairing PSKs.
-    std::optional<std::string> counterparty_id;
+    std::optional<IdText> counterparty_id;
 
     ResolvedPsk() = default;
     ResolvedPsk(const ResolvedPsk&) = default;
@@ -153,7 +154,7 @@ public:
     /// @param category The category the server declared it is using that PSK as.
     /// Protocol task only.
     /// @return The matching PSK, or nullopt if this client holds no such PSK in that category.
-    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id(const std::string& psk_id,
+    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id(std::string_view psk_id,
                                                                PskCategory category) const;
 
     // ========================================
@@ -215,7 +216,7 @@ public:
     /// later.
     /// @param psk_id The record to erase.
     /// @return true when a record was erased, and the store therefore needs persisting.
-    [[nodiscard]] bool note_record_removed(const std::string& psk_id);
+    [[nodiscard]] bool note_record_removed(std::string_view psk_id);
 
     /// @brief Make the record at psk_id the most recently used one in RAM, leaving the durable
     /// half to a later persist_records(). No-op if absent or already the most recent.
@@ -232,7 +233,7 @@ public:
     /// written later.
     /// @param psk_id The record to move.
     /// @return true when the order moved, and the store therefore needs persisting.
-    [[nodiscard]] bool note_record_played(const std::string& psk_id);
+    [[nodiscard]] bool note_record_played(std::string_view psk_id);
 
     // ========================================
     // Pairing PSK (the one the client accepts to admit a new server)
@@ -340,7 +341,7 @@ private:
 
     /// @brief The long-term record for psk_id, or nullptr. Call with mutex_ held, or on the
     /// protocol task; the pointer does not survive a mutation of records_.
-    [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(const std::string& psk_id) const;
+    [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(std::string_view psk_id) const;
 
     /// @brief The record bound to server_id, or nullptr. Same rules.
     [[nodiscard]] const SendspinPairingRecord* record_by_server_id(
@@ -350,7 +351,7 @@ private:
     static constexpr size_t NPOS = static_cast<size_t>(-1);
 
     /// @brief Find the index of a record by psk_id, or NPOS if absent.
-    [[nodiscard]] size_t find_index(const std::string& psk_id) const;
+    [[nodiscard]] size_t find_index(std::string_view psk_id) const;
 
     /// @brief Drop the least recently used record no open connection is resolving against, to
     /// make room for a net-new one. Call with mutex_ held.
