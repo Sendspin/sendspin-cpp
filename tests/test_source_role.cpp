@@ -894,9 +894,8 @@ public:
         conn->init_time_filter();
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
-        conn->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    std::vector<std::string>{"source@v1"}, std::nullopt,
-                                    std::nullopt);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"source@v1"},
+                                    std::nullopt, std::nullopt);
         // No time burst falls due during a test, so no client/time interleaves.
         conn->time_burst().last_burst_complete_time_ = platform_time_us() / 1000;
         if (synced) {

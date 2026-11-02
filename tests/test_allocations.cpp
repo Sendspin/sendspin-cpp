@@ -430,9 +430,9 @@ constexpr int TIME_BURST_SIZE = 8;
 // libstdc++ (ESP-IDF's) keeps strings of up to 15 characters inline, libc++ up to 22: the fake
 // server's name, copied three times, allocates only under libstdc++.
 #ifdef _LIBCPP_VERSION
-constexpr size_t ADMISSION_ALLOCATIONS = 32;
+constexpr size_t ADMISSION_ALLOCATIONS = 24;
 #else
-constexpr size_t ADMISSION_ALLOCATIONS = 35;
+constexpr size_t ADMISSION_ALLOCATIONS = 27;
 #endif
 constexpr size_t CLIENT_STATE_ALLOCATIONS = 3;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;

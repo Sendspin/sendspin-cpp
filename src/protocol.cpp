@@ -384,13 +384,13 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
         return true;
     }
 
-    activate_msg->activities.clear();
+    activate_msg->activities = ActivitySet{};
     JsonArrayConst activities_array = root["payload"]["activities"].as<JsonArrayConst>();
     for (JsonVariantConst act_var : activities_array) {
         if (act_var.is<const char*>()) {
             auto act = activity_from_string(act_var.as<std::string_view>());
             if (act.has_value()) {
-                activate_msg->activities.push_back(act.value());
+                activate_msg->activities.insert(act.value());
             }
         }
     }
@@ -398,12 +398,13 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
     // active_roles is optional and sticky (omitted = keep prior set).
     JsonVariantConst roles_var = root["payload"]["active_roles"];
     if (roles_var.is<JsonArrayConst>()) {
-        activate_msg->active_roles = std::vector<std::string>{};
+        ActiveRoles roles;
         for (JsonVariantConst role_var : roles_var.as<JsonArrayConst>()) {
             if (role_var.is<const char*>()) {
-                activate_msg->active_roles->push_back(role_var.as<std::string>());
+                roles.add(role_var.as<std::string_view>());
             }
         }
+        activate_msg->active_roles = roles;
     } else {
         activate_msg->active_roles = std::nullopt;
     }

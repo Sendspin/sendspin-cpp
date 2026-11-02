@@ -427,9 +427,8 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
         }
 
         auto conn = std::make_shared<PlayerOwnerConnection>();
-        conn->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    std::vector<std::string>{"player@v1"}, std::nullopt,
-                                    std::nullopt);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"player@v1"},
+                                    std::nullopt, std::nullopt);
         client.connection_manager_->install_admitted(conn, role_mask_bit(SendspinRole::PLAYER));
 
         InboundMessage message = receive_into_ring(ring, audio_chunk(), 0);

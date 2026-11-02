@@ -31,7 +31,7 @@
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
-using Acts = std::vector<SendspinActivity>;
+using Acts = ActivitySet;
 
 static const auto PB = SendspinActivity::PLAYBACK;
 static const auto PR = SendspinActivity::PAIRING;

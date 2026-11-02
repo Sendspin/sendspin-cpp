@@ -527,8 +527,9 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::SERVER_ACTIVATE: {
             ServerActivateMessage activate_msg;
             if (parsed.extract<process_server_activate_message>(&activate_msg)) {
-                SS_LOGD(TAG, "server/activate received (activities_count=%zu)",
-                        activate_msg.activities.size());
+                SS_LOGD(TAG, "server/activate received (playback=%d, pairing=%d)",
+                        activate_msg.activities.contains(SendspinActivity::PLAYBACK),
+                        activate_msg.activities.contains(SendspinActivity::PAIRING));
                 // Applied before the next message is parsed: trust enforcement, role
                 // ownership and, for a nursery connection that is now operational, admission
                 // all land here, so the role traffic the server sends behind this activate

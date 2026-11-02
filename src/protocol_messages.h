@@ -34,6 +34,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <span>
 #include <string>
@@ -140,7 +141,7 @@ enum class SendspinRole : uint8_t {
     VISUALIZER,  // Audio visualization role
     COLOR,       // Audio-derived color palette role
     SOURCE,      // Audio capture role (streams to the server)
-    COUNT,       // Not a role; bounds the walk in active_role_mask(). Keep last.
+    COUNT,       // Not a role; bounds the walk in role_from_string(). Keep last.
 };
 
 /// @brief Protocol wire string for a role (e.g. "player@v1")
@@ -165,22 +166,6 @@ inline const char* to_cstr(SendspinRole role) {
     }
 }
 
-/// @brief Whether a versioned role name is in an active_roles set
-///
-/// The comparison is on the exact versioned name this library implements, not the family, because
-/// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
-/// version that was active: a client offered `player@v1` that is handed `player@v2` implements
-/// neither the new version's behavior nor, any longer, the old one's.
-inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole role) {
-    const char* name = to_cstr(role);
-    for (const auto& active : active_roles) {
-        if (active == name) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /// @brief Bit that represents `role` in an active-role mask
 inline uint16_t role_mask_bit(SendspinRole role) {
     return static_cast<uint16_t>(1U << static_cast<uint8_t>(role));
@@ -192,20 +177,62 @@ static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 16, "role mask is a u
 static constexpr uint16_t ALL_ROLES_MASK =
     static_cast<uint16_t>((1U << static_cast<uint8_t>(SendspinRole::COUNT)) - 1U);
 
-/// @brief Builds the mask of roles this library implements that `active_roles` names.
+/// @brief The role this library implements under a versioned role name, or nullopt
 ///
-/// The mask is what the receive path reads, so it is built with the same exact-version test role
-/// removal uses and the two can never disagree.
-inline uint16_t active_role_mask(const std::vector<std::string>& active_roles) {
-    uint16_t mask = 0;
+/// The comparison is on the exact versioned name this library implements, not the family, because
+/// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
+/// version that was active: a client offered `player@v1` that is handed `player@v2` implements
+/// neither the new version's behavior nor, any longer, the old one's.
+inline std::optional<SendspinRole> role_from_string(std::string_view name) {
     for (uint8_t i = 0; i < static_cast<uint8_t>(SendspinRole::COUNT); ++i) {
         const auto role = static_cast<SendspinRole>(i);
-        if (role_in(active_roles, role)) {
-            mask |= role_mask_bit(role);
+        if (name == to_cstr(role)) {
+            return role;
         }
     }
-    return mask;
+    return std::nullopt;
 }
+
+/// @brief A server/activate active_roles set, as the client acts on it: the roles this library
+/// implements that it names, and whether it names any role at all
+///
+/// The mask is what the receive and send gates, the client/state role objects and role removal
+/// all read, so none of them can disagree. A role this library does not implement still makes
+/// the set non-empty: messaging.md "Playback-capable connections" requires an empty set of a
+/// connection that is not playback-capable, whatever it names.
+class ActiveRoles {
+public:
+    ActiveRoles() = default;
+    ActiveRoles(std::initializer_list<std::string_view> names) {
+        for (const std::string_view name : names) {
+            this->add(name);
+        }
+    }
+
+    /// @brief Adds one versioned role name to the set.
+    void add(std::string_view name) {
+        this->names_any_ = true;
+        if (const std::optional<SendspinRole> role = role_from_string(name)) {
+            this->mask_ |= role_mask_bit(role.value());
+        }
+    }
+
+    /// @brief The named roles this library implements, as role_mask_bit() bits.
+    uint16_t mask() const {
+        return this->mask_;
+    }
+
+    /// @brief Whether no role was named, implemented here or not.
+    bool empty() const {
+        return !this->names_any_;
+    }
+
+    bool operator==(const ActiveRoles&) const = default;
+
+private:
+    uint16_t mask_{0};
+    bool names_any_{false};
+};
 
 /// @brief Activity declared in a server/activate message.
 /// A connection declares a SET of activities rather than a single reason (messaging.md
@@ -237,6 +264,34 @@ inline std::optional<SendspinActivity> activity_from_string(std::string_view str
     }
     return std::nullopt;
 }
+
+/// @brief The activities a server/activate declares: a set, its members unordered and unique
+class ActivitySet {
+public:
+    ActivitySet() = default;
+    ActivitySet(std::initializer_list<SendspinActivity> activities) {
+        for (const SendspinActivity activity : activities) {
+            this->insert(activity);
+        }
+    }
+
+    void insert(SendspinActivity activity) {
+        this->bits_ |= bit(activity);
+    }
+
+    bool contains(SendspinActivity activity) const {
+        return (this->bits_ & bit(activity)) != 0;
+    }
+
+    bool operator==(const ActivitySet&) const = default;
+
+private:
+    static uint8_t bit(SendspinActivity activity) {
+        return static_cast<uint8_t>(1U << static_cast<uint8_t>(activity));
+    }
+
+    uint8_t bits_{0};
+};
 
 /// @brief Pairing method on the wire (advertised in client/hello, selected in server/activate).
 enum class SendspinPairMethod : uint8_t {
@@ -937,8 +992,8 @@ struct ServerHelloMessage {
 /// Declares the server's current activity set and active roles for this connection
 /// (messaging.md "server/activate").
 struct ServerActivateMessage {
-    std::vector<SendspinActivity> activities{};
-    std::optional<std::vector<std::string>> active_roles;  // sticky: nullopt = keep prior set
+    ActivitySet activities{};
+    std::optional<ActiveRoles> active_roles;  // sticky: nullopt = keep prior set
     /// From payload.pairing.method: the pairing method the server picked. nullopt when the
     /// message carries no pairing object or names an unrecognized method string.
     std::optional<SendspinPairMethod> pairing_method;

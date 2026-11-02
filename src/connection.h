@@ -366,12 +366,12 @@ public:
     // ========================================
 
     /// @brief Returns the current activity set declared by server/activate. Protocol task only.
-    const std::vector<SendspinActivity>& get_activities() const {
+    ActivitySet get_activities() const {
         return this->activities_;
     }
 
     /// @brief Returns the sticky active_roles set declared by server/activate. Protocol task only.
-    const std::vector<std::string>& get_active_roles() const {
+    ActiveRoles get_active_roles() const {
         return this->active_roles_;
     }
 
@@ -571,26 +571,20 @@ public:
     /// name this library implements.
     ///
     /// The one activation test in the library: the receive gate, the send gate, the client/state
-    /// role objects and role removal all read the mask active_role_mask() builds with the same
-    /// exact-version test (role_in()) role removal applies, so none of them can disagree. The
-    /// mask is rebuilt by apply_server_activate(). Protocol task only.
+    /// role objects and role removal all read the mask ActiveRoles builds with the same
+    /// exact-version test (role_from_string()), so none of them can disagree. Protocol task only.
     bool is_role_active(SendspinRole role) const {
-        return (this->active_role_mask_ & role_mask_bit(role)) != 0;
+        return (this->active_roles_.mask() & role_mask_bit(role)) != 0;
     }
 
     /// @brief The active roles as a bitmask of role_mask_bit() values. Protocol task only.
     uint16_t get_active_role_mask() const {
-        return this->active_role_mask_;
+        return this->active_roles_.mask();
     }
 
     /// @brief Returns true if the given activity is in the current activity set.
     bool has_activity(SendspinActivity activity) const {
-        for (const auto& a : this->activities_) {
-            if (a == activity) {
-                return true;
-            }
-        }
-        return false;
+        return this->activities_.contains(activity);
     }
 
     /// @brief Applies a server/activate update: stores activities and updates active_roles
@@ -604,24 +598,14 @@ public:
     ///                       include 'pairing'").
     /// @param pairing_format Emission format from the pairing object (dynamic_pairing_code
     ///                       only); stored under the same PAIRING-activity condition.
-    void apply_server_activate(const std::vector<SendspinActivity>& activities,
-                               const std::optional<std::vector<std::string>>& active_roles,
+    void apply_server_activate(ActivitySet activities, std::optional<ActiveRoles> active_roles,
                                const std::optional<SendspinPairMethod>& pairing_method,
                                const std::optional<SendspinPairingCodeFormat>& pairing_format) {
         this->activities_ = activities;
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
         }
-        // Rebuilt on every activation, sticky set included, so the mask cannot drift from
-        // active_roles_.
-        this->active_role_mask_ = active_role_mask(this->active_roles_);
-        bool has_pairing = false;
-        for (const auto& a : activities) {
-            if (a == SendspinActivity::PAIRING) {
-                has_pairing = true;
-                break;
-            }
-        }
+        const bool has_pairing = activities.contains(SendspinActivity::PAIRING);
         this->pairing_method_ = has_pairing ? pairing_method : std::nullopt;
         this->pairing_format_ = has_pairing ? pairing_format : std::nullopt;
         this->first_activate_received_ = true;
@@ -1119,15 +1103,15 @@ protected:
     /// re-handshake. Protocol task only.
     std::string psk_id_{};
 
-    // Vector fields
-
-    /// Activities declared by server/activate (empty until the first activate is applied).
-    /// Protocol task only: see apply_server_activate().
-    std::vector<SendspinActivity> activities_{};
+    // Struct fields
 
     /// Active roles declared by server/activate (sticky: preserved across activates that omit
     /// the field). Empty until the first activate that includes active_roles. Protocol task only.
-    std::vector<std::string> active_roles_{};
+    ActiveRoles active_roles_{};
+
+    /// Activities declared by server/activate (empty until the first activate is applied).
+    /// Protocol task only: see apply_server_activate().
+    ActivitySet activities_{};
 
     /// Pairing method from the pairing object of the last pairing server/activate; nullopt
     /// outside a pairing activation. Read by the pairing flow. Protocol task only.
@@ -1161,12 +1145,6 @@ protected:
     /// performs the write (the ESP server's httpd worker); read on the protocol task
     /// (claim_time_frame()). 32 bits because a 64-bit atomic takes a lock on the ESP32 family.
     std::atomic<uint32_t> time_frame_sent_us_{0};
-
-    // 16-bit fields
-
-    /// active_roles_ as a bitmask of the roles this library implements (see is_role_active()).
-    /// Rebuilt by apply_server_activate(). Protocol task only.
-    uint16_t active_role_mask_{0};
 
     // 8-bit fields
 
