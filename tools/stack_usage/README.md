@@ -8,7 +8,8 @@ call graphs GCC writes with `-fcallgraph-info=su`. The `DEFAULT_*_STACK_SIZE` de
   sends, `std::function` callbacks, esp_http_server, esp_transport and esp_event callbacks), plus
   frames for precompiled newlib functions, read from their xtensa `entry` instruction with
   `xtensa-esp32-elf-objdump -d libc.a`.
-- `tasks.json`: each task's root, the function its FreeRTOS task starts in.
+- `tasks.json`: each task's root, the function its FreeRTOS task starts in, plus
+  `source_flac_encode`, the FLAC encode's own root (see the source, FLAC note below).
 
 ## Recipe
 
@@ -139,6 +140,7 @@ Measured on xtensa-esp32 with ESP-IDF 5.5 and GCC 14.2, at `-Os` (ESPHome's defa
 | protocol task | task entry | as bounded: an esp_websocket_client send error into the event handler, `handle_data()`, `fail_inbound()` and `httpd_sess_trigger_close` (unreachable); reachable: a pairing confirm dropping an outbound connection whose goodbye send fails (6,352 / 6,576) | 6,560 | 6,832 | 7,168 (`DEFAULT_PROTOCOL_TASK_STACK_SIZE`) | shared ESP-IDF tail |
 | source, PCM | `thread_entry()` | `begin_chunk()`'s outbound acquire | 1,104 | 1,168 | 2,048 (`DEFAULT_SOURCE_TASK_STACK_SIZE`) | FreeRTOS critical-section assert |
 | source, Opus | `thread_entry()` | the Opus encode, `quant_partition()` charged one pass | 5,152 | 5,168 | 6,656 (`DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE`) | shared ESP-IDF tail |
+| source, FLAC | `thread_entry()` | the FLAC encode through micro-flac's LPC design | 4,464 | 4,432 | 5,120 (`DEFAULT_FLAC_SOURCE_TASK_STACK_SIZE`) | libgcc `__divdi3` |
 
 Notes per task:
 
@@ -156,12 +158,20 @@ Notes per task:
 - source, Opus: `quant_partition()` nests four levels deeper than charged, 576 bytes more, so
   5,168 + 576 = 5,744, + 384 = 6,128. Rounding up to 6,144 would leave 16 bytes of slack for the
   uncounted `std::thread` entry frames, so the default takes one more 512-byte step, 6,656.
+- source, FLAC: the task's whole bound is the Opus encode, which a FLAC config never runs (GCC
+  devirtualizes the encoder calls speculatively, so `edges.json` cannot leave it out), so the
+  FLAC chain is measured from its own root, `FlacSourceEncoder::encode()` (`tasks.json`'s
+  `source_flac_encode`: 4,272 / 4,256), plus the frames above it, `thread_entry()`, `run()`,
+  `process()` and `finish_chunk()` (192 / 176). It runs through micro-flac's LPC code, compiled in
+  by default (`MICRO_FLAC_ENCODER_ENABLE_LPC`) though the source never turns LPC on. micro-flac's
+  component builds its own sources at `-O2` under either optimization level, so its frames are
+  the same in both columns. 4,464 + 384 = 4,848, rounded up.
 
 ## Margin and rounding
 
-Every chain except the PCM source task's ends in a shared ESP-IDF tail of about 2.7 KB: an
-allocation or lwIP call into an error log line through newlib's `vfprintf` (800 bytes alone), its
-lock and an assert, whose last ~500 bytes are a fatal path.
+Every chain except the PCM and FLAC source tasks' ends in a shared ESP-IDF tail of about 2.7 KB:
+an allocation or lwIP call into an error log line through newlib's `vfprintf` (800 bytes alone),
+its lock and an assert, whose last ~500 bytes are a fatal path.
 
 Each default adds 384 bytes to the larger of the two totals: the FreeRTOS exception frame and
 coprocessor save area (`XT_STK_FRMSZ` 192: `XtExcFrame` 112, the MAC16 save 48, and 32 for the

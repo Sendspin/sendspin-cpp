@@ -75,9 +75,10 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         ARDUINOJSON_USE_LONG_LONG=1
     )
 
-    # Audio codec libraries: micro-flac for the player's FLAC decoder; micro-opus, with
-    # SENDSPIN_ENABLE_OPUS, for the player's Opus decoder and the source's Opus encoder.
-    if(SENDSPIN_ENABLE_PLAYER)
+    # Audio codec libraries: micro-flac for the player's FLAC decoder and the source's FLAC
+    # encoder; micro-opus, with SENDSPIN_ENABLE_OPUS, for the player's Opus decoder and the
+    # source's Opus encoder.
+    if(SENDSPIN_ENABLE_PLAYER OR SENDSPIN_ENABLE_SOURCE)
         FetchContent_Declare(
             micro_flac
             GIT_REPOSITORY https://github.com/esphome-libs/micro-flac.git

@@ -681,6 +681,10 @@ struct SourceRoleConfig {
     /// tools/stack_usage/README.md.
     static constexpr size_t DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE = 6656U;
 
+    /// @brief Source task stack size in bytes for a FLAC config (ESP-IDF only). Derived in
+    /// tools/stack_usage/README.md.
+    static constexpr size_t DEFAULT_FLAC_SOURCE_TASK_STACK_SIZE = 5120U;
+
     /// @brief Opus bitrate bounds in bit/s: the range opus.h documents for OPUS_SET_BITRATE (the
     /// encoder clamps anything outside it). Not named OPUS_BITRATE_*, which opus.h defines as
     /// macros.
@@ -705,8 +709,9 @@ struct SourceRoleConfig {
 
     /// @brief Chunk duration in milliseconds, within [CHUNK_MIN_MS, CHUNK_MAX_MS]. One chunk, with
     /// its 9-byte header, must also fit one Noise transport message (65519 bytes), which bounds
-    /// the duration for wide or deep formats. OPUS takes only 5, 10, 20, 40, or 60: a chunk is
-    /// one Opus frame.
+    /// the duration for wide or deep formats. FLAC needs at least 16 frames a chunk (one FLAC
+    /// block), and its worst-case frame, a little over the chunk's PCM, must fit the message too.
+    /// OPUS takes only 5, 10, 20, 40, or 60: a chunk is one Opus frame.
     uint32_t chunk_duration_ms{DEFAULT_CHUNK_MS};
 
     /// @brief Capture buffer in milliseconds of audio in the configured format; must be > 0.
@@ -716,7 +721,7 @@ struct SourceRoleConfig {
     uint32_t capture_buffer_ms{DEFAULT_CAPTURE_BUFFER_MS};
 
     /// @brief Opus bitrate in bit/s, within [MIN_OPUS_BITRATE, MAX_OPUS_BITRATE]. Ignored (and
-    /// not validated) for PCM.
+    /// not validated) for PCM and FLAC.
     uint32_t opus_bitrate{DEFAULT_OPUS_BITRATE};
 
     unsigned priority{DEFAULT_SOURCE_TASK_PRIORITY};  ///< FreeRTOS priority for the source task
@@ -727,18 +732,20 @@ struct SourceRoleConfig {
     MemoryLocation buffer_location{MemoryLocation::PREFER_EXTERNAL};
 
     // 8-bit fields
-    /// @brief Codec the role streams in: PCM (the capture bytes, untouched) or OPUS (each chunk
-    /// encoded into one CELT-only packet; needs SENDSPIN_ENABLE_OPUS). An OPUS role streams PCM
-    /// to a server whose server/hello does not list opus (roles/source/v1.md "server/hello
-    /// source@v1 support object"). OPUS costs the encoder state plus the source task's own
-    /// micro-opus scratch arena (about 120 KB, PSRAM-preferring, allocated before the first opus
-    /// chunk is encoded).
+    /// @brief Codec the role streams in: PCM (the capture bytes, untouched), FLAC (each chunk
+    /// encoded losslessly into one FLAC frame), or OPUS (each chunk encoded into one CELT-only
+    /// packet; needs SENDSPIN_ENABLE_OPUS). A FLAC or OPUS role streams PCM to a server whose
+    /// server/hello does not list its codec (roles/source/v1.md "server/hello source@v1 support
+    /// object"). FLAC costs the micro-flac encoder (about 2 KB) and a chunk of scratch. OPUS costs
+    /// the encoder state plus the source task's own micro-opus scratch arena (about 120 KB,
+    /// PSRAM-preferring, allocated before the first opus chunk is encoded).
     SendspinCodecFormat codec{SendspinCodecFormat::PCM};
 
     /// @brief Opus encoder complexity, at most MAX_OPUS_COMPLEXITY. Ignored (and not validated)
-    /// for PCM.
+    /// for PCM and FLAC.
     uint8_t opus_complexity{DEFAULT_OPUS_COMPLEXITY};
-    uint8_t channels{2};      ///< Capture channel count; must be > 0 (1 or 2 for OPUS)
+    uint8_t channels{2};      ///< Capture channel count; must be > 0 (at most 8 for FLAC, 1 or 2
+                              ///< for OPUS)
     uint8_t bit_depth{16};    ///< Bits per sample: 16, 24 (3 packed bytes), or 32 (16 for OPUS)
     bool line_sense{false};   ///< Advertise signal sensing (see SourceRole::set_signal())
     bool psram_stack{false};  ///< Allocate the source task stack in PSRAM (ESP-IDF only)

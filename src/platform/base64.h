@@ -14,8 +14,9 @@
 
 /// @file base64.h
 /// @brief Platform-abstracted base64: `platform_base64_*` wrap mbedTLS on ESP and a built-in
-/// codec on host, for the standard `+`/`/` alphabet with `=` padding; `b64url_*` are portable
-/// wrappers for the URL-safe alphabet used by Noise key identifiers (PSK IDs, peer IDs).
+/// codec on host, for the standard `+`/`/` alphabet with `=` padding; base64_encode() is its
+/// portable string form, and `b64url_*` are portable wrappers for the URL-safe alphabet used by
+/// Noise key identifiers (PSK IDs, peer IDs).
 
 #pragma once
 
@@ -191,24 +192,30 @@ inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const
 
 namespace sendspin {
 
-/// @brief Encode bytes to base64url: an ASCII string of `A-Z a-z 0-9 - _`, no `=` padding.
-inline std::string b64url_encode(const uint8_t* data, size_t len) {
+/// @brief Encode bytes to standard base64 (RFC 4648 section 4): `+`/`/`, `=`-padded.
+inline std::string base64_encode(const uint8_t* data, size_t len) {
     if (len == 0) {
         return std::string();
     }
 
-    // Standard base64 (`+`/`/`, `=`-padded) output length, including room for the trailing NUL
-    // both platform_base64_encode implementations write per the mbedtls_base64_encode contract.
-    // Encoded straight into the returned string, which only ever shrinks from here, so no
-    // intermediate heap block holds the encoding: callers encoding secrets (the pairing PSK)
-    // wipe the one string they get back and leave no other copy.
+    // Output length, including room for the trailing NUL both platform_base64_encode
+    // implementations write per the mbedtls_base64_encode contract. Encoded straight into the
+    // returned string, which only ever shrinks from here, so no intermediate heap block holds the
+    // encoding: callers encoding secrets (the pairing PSK) wipe the one string they get back and
+    // leave no other copy.
     const size_t padded_len = (len / 3 + (len % 3 != 0 ? 1 : 0)) * 4;
     std::string out(padded_len + 1, '\0');
     size_t olen = 0;
     // out is sized exactly per platform_base64_encode's own contract, so this cannot fail.
     platform_base64_encode(reinterpret_cast<uint8_t*>(out.data()), out.size(), &olen, data, len);
     out.resize(olen);
+    return out;
+}
 
+/// @brief Encode bytes to base64url: an ASCII string of `A-Z a-z 0-9 - _`, no `=` padding.
+inline std::string b64url_encode(const uint8_t* data, size_t len) {
+    // Transliterated in place, so the one string base64_encode() returns stays the only copy
+    std::string out = base64_encode(data, len);
     for (char& c : out) {
         if (c == '+') {
             c = '-';

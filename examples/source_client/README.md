@@ -37,6 +37,7 @@ macOS has mDNS support built in; no extra dependencies needed.
 ```sh
 ./build/examples/source_client/source_client              # default name "Source Client"
 ./build/examples/source_client/source_client "Line In"    # custom name
+./build/examples/source_client/source_client -f           # stream FLAC instead of PCM
 ./build/examples/source_client/source_client -o           # stream Opus instead of PCM
 ./build/examples/source_client/source_client -p 8930      # listen on a custom port
 ./build/examples/source_client/source_client -s -50       # report line sense at -50 dBFS
@@ -44,7 +45,7 @@ macOS has mDNS support built in; no extra dependencies needed.
 
 The client listens on port 8928 by default. When mDNS is enabled it advertises `_sendspin._tcp` with the configured port so Sendspin servers on the local network discover and connect automatically; otherwise tell the server to connect with `ws://<this-host>:8928/sendspin`, replacing `8928` if you passed `-p`.
 
-Audio is captured at 48 kHz / 16-bit from the default input device (mono or stereo, following the device), in 20 ms chunks. Chunks are raw PCM by default; with `-o` they are Opus-encoded when the server accepts Opus, and PCM otherwise.
+Audio is captured at 48 kHz / 16-bit from the default input device (mono or stereo, following the device), in 20 ms chunks. Chunks are raw PCM by default; with `-f` they are FLAC-encoded and with `-o` Opus-encoded, each when the server accepts that codec, and PCM otherwise.
 
 Press Ctrl+C to stop.
 

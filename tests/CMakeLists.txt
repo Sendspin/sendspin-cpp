@@ -189,9 +189,12 @@ set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno
 # outbound_ring_ and protocol_task_ (rings created without the thread, so what a step produced
 # stays to be read), chunk_item_ (a chunk begun but not filled), chunk_message_bytes_ (the size
 # a completed chunk is acquired at, to write one as the task would), bytes_per_frame_ and
-# producer_drop_log_ (a run of refused writes, which shows only in the log) and opus_encoder_ (the
+# producer_drop_log_ (a run of refused writes, which shows only in the log), opus_encoder_ (the
 # encoder an OPUS config's start() creates, given to a rig without the thread, or a stand-in
-# recording the task's encoder calls, which start() keeps); SourceRole's impl_ (the hello and
+# recording the task's encoder calls, which start() keeps) and flac_encoder_ (whose scratch
+# start() allocates, allocated for a rig without the thread); FlacSourceEncoder's encoder_ and
+# micro-flac's FLACEncoder::frame_number_ (the 2^31 frames after which the numbering restarts,
+# unreachable otherwise); SourceRole's impl_ (the hello and
 # state objects without a server, the stream gate and codec a stream opening sets, the task);
 # and, for the stand-in connection it installs as the protocol task does, SendspinClient's
 # protocol_task_ (stopped), connection_manager_ (its

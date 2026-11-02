@@ -1,6 +1,7 @@
 {
  "_comment": [
-  "Each task's stack roots: the function its FreeRTOS task starts in."
+  "Each task's stack roots: the function its FreeRTOS task starts in.",
+  "source_flac_encode is the FLAC encode alone, which the source task's FLAC chain adds its own frames above (README.md, \"Current figures\")."
  ],
  "protocol_task": [
   "pthread_task_func"
@@ -22,5 +23,8 @@
  ],
  "websocket_event_handler": [
   "sym:SendspinClientConnection23websocket_event_handler"
+ ],
+ "source_flac_encode": [
+  "sym:FlacSourceEncoder6encode"
  ]
 }
