@@ -204,20 +204,13 @@ struct SendspinClient::EventState {
     uint32_t drain_generation{0};
 
     /// @brief Appends `note` to the pairing slot. Every SendspinClient::note_*() method funnels
-    /// through this so the merge shape lives once. PairingNote is anonymous-namespace-private
-    /// to this file, so this lives on EventState (itself private to SendspinClient) rather than as
-    /// a SendspinClient member declared in the public header.
+    /// through this so the append lives once. PairingNote is anonymous-namespace-private to this
+    /// file, so this lives on EventState (itself private to SendspinClient) rather than as a
+    /// SendspinClient member declared in the public header.
     /// @param note The note to append (moved).
     void push_pairing_note(PairingNote&& note) {
-        std::vector<PairingNote> delta;
-        delta.push_back(std::move(note));
-        this->pairing_slot.merge(
-            [](std::vector<PairingNote>& current, std::vector<PairingNote>&& added) {
-                for (auto& entry : added) {
-                    current.push_back(std::move(entry));
-                }
-            },
-            std::move(delta));
+        this->pairing_slot.update(
+            [&note](std::vector<PairingNote>& current) { current.push_back(std::move(note)); });
     }
 };
 
