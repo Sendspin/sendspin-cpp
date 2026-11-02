@@ -20,6 +20,7 @@
 #include "platform/base64.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
+#include "platform/memory.h"
 #include <ArduinoJson.h>
 
 #include <cstring>
@@ -36,7 +37,7 @@ namespace sendspin {
 
 /// @brief Serialize client/init to JSON.
 /// Format: {"type":"client/init","payload":{"client_id":"...","version":1,"suite":"..."}}
-static std::string serialize_client_init(const std::string& client_id, const char* suite_name,
+static std::string serialize_client_init(std::string_view client_id, const char* suite_name,
                                          SendspinArenaAllocator& arena) {
     // suite_name is the full name (e.g. NOISE_SUITE_CHACHAPOLY = "Noise_KKpsk2_25519_..."); the
     // wire value is the suffix after "Noise_KKpsk2_" (connection.md "Cipher Suites"). Strip
@@ -62,11 +63,17 @@ static std::string serialize_client_init(const std::string& client_id, const cha
     return out;
 }
 
-void build_noise_handshake_message(const std::vector<uint8_t>& noise_bytes, JsonDocument& doc) {
-    std::string encoded = b64url_encode(noise_bytes.data(), noise_bytes.size());
-
+bool build_noise_handshake_message(std::span<const uint8_t> noise_bytes, JsonDocument& doc) {
+    PlatformBuffer encoded;
+    if (!encoded.allocate(b64url_encode_buffer_size(noise_bytes.size()))) {
+        SS_LOGE(TAG, "noise/handshake: no memory to encode %zu bytes", noise_bytes.size());
+        return false;
+    }
     doc["type"] = "noise/handshake";
-    doc["payload"]["data"] = encoded;
+    // Copied into the document, which outlives the scratch buffer.
+    doc["payload"]["data"] = b64url_encode_into(encoded.as<char>(), encoded.size(),
+                                                noise_bytes.data(), noise_bytes.size());
+    return true;
 }
 
 // ============================================================================
@@ -123,7 +130,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
                                             const RecordStore& record_store, const char* suite_name,
                                             const std::string& server_id, const uint8_t* prologue,
                                             size_t prologue_len,
-                                            const std::vector<uint8_t>& msg1_bytes,
+                                            std::span<const uint8_t> msg1_bytes,
                                             SendspinArenaAllocator& arena) {
     const char* log_prefix = to_cstr(kind);
     auto server_pub = public_key_from_peer_id(server_id);
@@ -253,16 +260,25 @@ NoiseHandshakeResult make_handshake_result(Msg1CoreResult&& core, std::string se
 // noise/handshake envelope
 // ============================================================================
 
-std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst envelope,
-                                                              const char* log_context) {
-    const char* data_b64 = envelope["payload"]["data"] | "";
-    if (data_b64[0] == '\0') {
+std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope,
+                                                        const char* log_context) {
+    const std::string_view data_b64 = envelope["payload"]["data"] | "";
+    if (data_b64.empty()) {
         SS_LOGE(TAG, "%s: missing data field", log_context);
         return std::nullopt;
     }
 
-    auto bytes = b64url_decode(data_b64);
-    if (!bytes.has_value() || bytes->empty()) {
+    const std::optional<size_t> size = b64url_decoded_size(data_b64);
+    if (size.value_or(0) == 0) {
+        SS_LOGE(TAG, "%s: failed to base64url-decode noise msg1", log_context);
+        return std::nullopt;
+    }
+    PlatformBuffer bytes;
+    if (!bytes.allocate(size.value())) {
+        SS_LOGE(TAG, "%s: no memory to decode %zu bytes", log_context, size.value());
+        return std::nullopt;
+    }
+    if (b64url_decode_into(data_b64, bytes.data(), bytes.size()) != size) {
         SS_LOGE(TAG, "%s: failed to base64url-decode noise msg1", log_context);
         return std::nullopt;
     }
@@ -287,8 +303,9 @@ std::string_view NoiseHandshake::build_client_init() {
         return {};
     }
 
+    PeerIdText client_id{};
     this->client_init_text_ =
-        serialize_client_init(this->identity_.peer_id(), this->suite_name_, this->arena_);
+        serialize_client_init(this->identity_.peer_id(client_id), this->suite_name_, this->arena_);
     this->state_ = State::WAIT_SERVER_INIT;
     return this->client_init_text_;
 }
@@ -325,7 +342,7 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
 
     int version = 0;
     std::string server_id;
-    std::optional<std::vector<uint8_t>> msg1_bytes;
+    std::optional<PlatformBuffer> msg1_bytes;
     const bool expected = frame.extract([&](JsonObjectConst root) {
         const char* type = root["type"] | "";
         // messaging.md "server/error": sent in place of server/init when the server cannot
@@ -361,7 +378,8 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
         return HandshakeFrameResult::NEED_MORE;
     }
 
-    if (!msg1_bytes.has_value() || !this->handle_msg1(msg1_bytes.value(), send_fn)) {
+    if (!msg1_bytes.has_value() ||
+        !this->handle_msg1({msg1_bytes->data(), msg1_bytes->size()}, send_fn)) {
         this->state_ = State::ABORTED;
         return HandshakeFrameResult::ABORT;
     }
@@ -398,7 +416,7 @@ bool NoiseHandshake::handle_server_init(int version, std::string server_id, std:
 // Private: handle noise/handshake msg1
 // ============================================================================
 
-bool NoiseHandshake::handle_msg1(const std::vector<uint8_t>& msg1_bytes,
+bool NoiseHandshake::handle_msg1(std::span<const uint8_t> msg1_bytes,
                                  const std::function<bool(const JsonDocument&)>& send_fn) {
     // Prologue = exact bytes of client/init || server/init
     std::string prologue_str = this->client_init_text_ + this->server_init_text_;
@@ -414,8 +432,7 @@ bool NoiseHandshake::handle_msg1(const std::vector<uint8_t>& msg1_bytes,
 
     // Send noise/handshake msg2 as a TEXT frame
     JsonDocument msg2 = make_json_document(this->arena_);
-    build_noise_handshake_message(core->msg2_bytes, msg2);
-    if (!send_fn(msg2)) {
+    if (!build_noise_handshake_message(core->msg2_bytes, msg2) || !send_fn(msg2)) {
         SS_LOGE(TAG, "handle_msg1: failed to send noise/handshake msg2");
         return false;
     }
@@ -433,7 +450,7 @@ bool NoiseHandshake::handle_msg1(const std::vector<uint8_t>& msg1_bytes,
 // ============================================================================
 
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    const std::vector<uint8_t>& msg1_bytes, const std::string& server_id, const Identity& identity,
+    std::span<const uint8_t> msg1_bytes, const std::string& server_id, const Identity& identity,
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena) {
     // Prologue for re-handshake = prior handshake hash h (32 bytes)

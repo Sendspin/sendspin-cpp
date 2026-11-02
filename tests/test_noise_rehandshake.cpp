@@ -182,7 +182,7 @@ static std::vector<uint8_t> msg1_bytes_of(const std::string& envelope) {
         ADD_FAILURE() << "the msg1 envelope carries no readable payload.data";
         return {};
     }
-    return std::move(bytes.value());
+    return {bytes->data(), bytes->data() + bytes->size()};
 }
 
 // raw_encrypt() / raw_decrypt() (from noise_test_helpers.h) encrypt/decrypt one frame with a raw

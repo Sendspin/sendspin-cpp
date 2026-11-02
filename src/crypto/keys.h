@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace sendspin {
 
@@ -57,6 +58,10 @@ static constexpr size_t X25519_KEY_SIZE = 32;
 /// A 32-byte value encodes to ceil(32*8/6)=43 base64url characters.
 static constexpr size_t PEER_ID_SIZE = 43;
 
+/// @brief Buffer one peer_id is encoded into without a heap allocation: its characters, the `=`
+/// the padded encoding carries before it is stripped, and the NUL.
+using PeerIdText = std::array<char, PEER_ID_SIZE + 2>;
+
 /// @brief Decode a peer_id to the X25519 public key it names.
 ///
 /// Accepts only the exact string `Identity::peer_id()` would produce for that key: 43 base64url
@@ -66,7 +71,7 @@ static constexpr size_t PEER_ID_SIZE = 43;
 /// @param peer_id The base64url `client_id` / `server_id`.
 /// @return The public key, or nullopt when peer_id is not that canonical encoding.
 std::optional<std::array<uint8_t, X25519_KEY_SIZE>> public_key_from_peer_id(
-    const std::string& peer_id);
+    std::string_view peer_id);
 
 /// @brief Sendspin static X25519 identity: a long-term keypair.
 ///
@@ -96,6 +101,10 @@ struct Identity {
 
     /// @brief The base64url-encoded public key (Sendspin client_id / server_id).
     [[nodiscard]] std::string peer_id() const;
+
+    /// @brief The same peer_id, encoded into `text`.
+    /// @return A view into `text`.
+    [[nodiscard]] std::string_view peer_id(PeerIdText& text) const;
 
     // ========================================
     // Factory methods
