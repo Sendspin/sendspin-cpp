@@ -859,8 +859,10 @@ TEST(Protocol, FormatTimeMessageRejectsTooSmallBuffer) {
 // ============================================================================
 
 TEST(Protocol, FormatClientCommandVolume) {
-    const std::string out = format_client_command_message(
-        {.command = SendspinControllerCommand::VOLUME, .volume = 50}, TestArena());
+    const std::string out = built_text([&](JsonDocument& message) {
+        build_client_command_message({.command = SendspinControllerCommand::VOLUME, .volume = 50},
+                                     message);
+    });
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -873,8 +875,10 @@ TEST(Protocol, FormatClientCommandVolume) {
 
 // MUTE carries a boolean payload (a separate branch from VOLUME's uint8_t).
 TEST(Protocol, FormatClientCommandMute) {
-    const std::string out =
-        format_client_command_message({.command = SendspinControllerCommand::MUTE, .muted = true}, TestArena());
+    const std::string out = built_text([&](JsonDocument& message) {
+        build_client_command_message({.command = SendspinControllerCommand::MUTE, .muted = true},
+                                     message);
+    });
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -886,8 +890,10 @@ TEST(Protocol, FormatClientCommandMute) {
 
 // SEEK carries an absolute position_ms; unrelated payload fields must not leak in.
 TEST(Protocol, FormatClientCommandSeek) {
-    const std::string out = format_client_command_message(
-        {.command = SendspinControllerCommand::SEEK, .position_ms = 30000}, TestArena());
+    const std::string out = built_text([&](JsonDocument& message) {
+        build_client_command_message(
+            {.command = SendspinControllerCommand::SEEK, .position_ms = 30000}, message);
+    });
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -900,8 +906,10 @@ TEST(Protocol, FormatClientCommandSeek) {
 
 // SEEK_RELATIVE carries a signed offset_ms (negative offsets seek backward).
 TEST(Protocol, FormatClientCommandSeekRelative) {
-    const std::string out = format_client_command_message(
-        {.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = -10000}, TestArena());
+    const std::string out = built_text([&](JsonDocument& message) {
+        build_client_command_message(
+            {.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = -10000}, message);
+    });
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -913,8 +921,11 @@ TEST(Protocol, FormatClientCommandSeekRelative) {
 
 // A parameter that does not match the command is dropped at serialization (position_ms on VOLUME).
 TEST(Protocol, FormatClientCommandDropsMismatchedParam) {
-    const std::string out = format_client_command_message(
-        {.command = SendspinControllerCommand::VOLUME, .volume = 40, .position_ms = 99999}, TestArena());
+    const std::string out = built_text([&](JsonDocument& message) {
+        build_client_command_message(
+            {.command = SendspinControllerCommand::VOLUME, .volume = 40, .position_ms = 99999},
+            message);
+    });
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -925,8 +936,9 @@ TEST(Protocol, FormatClientCommandDropsMismatchedParam) {
 
 // A no-argument command (PLAY) emits just the command, with no payload fields present.
 TEST(Protocol, FormatClientCommandNoArgs) {
-    const std::string out =
-        format_client_command_message({.command = SendspinControllerCommand::PLAY}, TestArena());
+    const std::string out = built_text([&](JsonDocument& message) {
+        build_client_command_message({.command = SendspinControllerCommand::PLAY}, message);
+    });
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -947,7 +959,8 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsPresent) {
     info.mac_address = "aa:bb:cc:dd:ee:ff";
     msg.device_info = info;
 
-    const std::string out = format_client_hello_message(&msg, TestArena());
+    const std::string out =
+        built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); });
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -969,7 +982,9 @@ TEST(Protocol, FormatClientHelloVisualizerSupport) {
     msg.visualizer_support = vis;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
     EXPECT_STREQ(doc["payload"]["supported_roles"][0], "visualizer@v1");
     JsonObject support = doc["payload"]["visualizer@v1_support"];
     EXPECT_EQ(support["buffer_capacity"].as<int>(), 8192);
@@ -997,7 +1012,9 @@ TEST(Protocol, FormatClientStateVisualizerCarriesStreamConfig) {
     msg.visualizer = vis;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     JsonObject state = doc["payload"]["visualizer"];
     ASSERT_TRUE(state["types"].is<JsonArray>());
     EXPECT_EQ(state["types"].size(), 5U);
@@ -1020,7 +1037,9 @@ TEST(Protocol, FormatClientStateVisualizerWithoutTypesStillReportsRateMax) {
     msg.visualizer = vis;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     ASSERT_TRUE(doc["payload"]["visualizer"]["types"].is<JsonArrayConst>());
     EXPECT_EQ(doc["payload"]["visualizer"]["types"].as<JsonArrayConst>().size(), 0u);
     EXPECT_EQ(doc["payload"]["visualizer"]["rate_max"].as<int>(), 24);
@@ -1032,7 +1051,9 @@ TEST(Protocol, FormatClientStateOmitsVisualizerWhenUnset) {
     ClientStateMessage msg;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     EXPECT_TRUE(doc["payload"]["visualizer"].isUnbound());
 }
 
@@ -1043,7 +1064,9 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
     msg.device_info = DeviceInfoObject{};
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
     EXPECT_FALSE(doc["payload"]["device_info"]["product_name"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["manufacturer"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["software_version"].is<const char*>());
@@ -1054,7 +1077,8 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
 // the same as every other message's.
 TEST(Protocol, FormatClientLeaveHasEmptyPayload) {
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_leave_message(TestArena())));
+    ASSERT_FALSE(deserializeJson(
+        doc, built_text([&](JsonDocument& message) { build_client_leave_message(message); })));
     EXPECT_STREQ(doc["type"].as<const char*>(), "client/leave");
     ASSERT_TRUE(doc["payload"].is<JsonObject>());
     EXPECT_EQ(doc["payload"].as<JsonObject>().size(), 0U);
@@ -1076,7 +1100,9 @@ TEST(Protocol, FormatClientStatePlayerCarriesTimingFields) {
     msg.player = player;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     EXPECT_EQ(doc["payload"]["player"]["output_delay_ms"].as<uint16_t>(), 120);
     EXPECT_EQ(doc["payload"]["player"]["required_lead_time_ms"].as<uint16_t>(), 340);
     EXPECT_EQ(doc["payload"]["player"]["min_buffer_ms"].as<uint16_t>(), 560);
@@ -1094,7 +1120,9 @@ TEST(Protocol, FormatClientHelloPlayerSupportOmitsSupportedCommands) {
     msg.player_v1_support = support;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
     EXPECT_TRUE(doc["payload"]["player@v1_support"]["supported_commands"].isUnbound());
     // Control: the support object is there, with the two fields the spec defines for it.
     EXPECT_EQ(doc["payload"]["player@v1_support"]["buffer_capacity"].as<int>(), 4096);
@@ -1111,7 +1139,9 @@ TEST(Protocol, FormatClientStatePlayerCarriesSupportedCommands) {
     msg.player = player;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     JsonArrayConst commands = doc["payload"]["player"]["supported_commands"].as<JsonArrayConst>();
     ASSERT_EQ(commands.size(), 3u);
     EXPECT_STREQ(commands[0], "volume");
@@ -1126,7 +1156,9 @@ TEST(Protocol, FormatClientStatePlayerEmptySupportedCommandsIsStillEmitted) {
     msg.player = ClientPlayerStateObject{};
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     ASSERT_TRUE(doc["payload"]["player"]["supported_commands"].is<JsonArrayConst>());
     EXPECT_EQ(doc["payload"]["player"]["supported_commands"].as<JsonArrayConst>().size(), 0u);
 }
@@ -1153,7 +1185,9 @@ TEST(Protocol, FormatClientStatePlayerOmitsUnsetVolumeAndMuted) {
         msg.player = player;
 
         JsonDocument doc;
-        ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+        ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                         build_client_state_message(&msg, message);
+                                     })));
         EXPECT_EQ(doc["payload"]["player"]["volume"].is<int>(), row.volume.has_value());
         EXPECT_EQ(doc["payload"]["player"]["muted"].is<bool>(), row.muted.has_value());
     }
@@ -1166,7 +1200,9 @@ TEST(Protocol, FormatClientStatePlayerReportsZeroTimingFields) {
     msg.player = ClientPlayerStateObject{};
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     ASSERT_TRUE(doc["payload"]["player"]["required_lead_time_ms"].is<uint16_t>());
     ASSERT_TRUE(doc["payload"]["player"]["min_buffer_ms"].is<uint16_t>());
     EXPECT_EQ(doc["payload"]["player"]["required_lead_time_ms"].as<uint16_t>(), 0);
@@ -1184,7 +1220,9 @@ TEST(Protocol, FormatClientStateArtworkChannels) {
     msg.artwork = artwork;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     JsonArrayConst channels = doc["payload"]["artwork"]["channels"].as<JsonArrayConst>();
     ASSERT_EQ(channels.size(), 2u);
     EXPECT_STREQ(channels[0]["source"], "album");
@@ -1210,7 +1248,9 @@ TEST(Protocol, FormatClientStateArtworkNoneChannelOmitsFormatAndSize) {
     msg.artwork = artwork;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     JsonArrayConst channels = doc["payload"]["artwork"]["channels"].as<JsonArrayConst>();
     ASSERT_EQ(channels.size(), 1u);
     EXPECT_STREQ(channels[0]["source"], "none");
@@ -1225,7 +1265,9 @@ TEST(Protocol, FormatClientStateOmitsArtworkWhenUnset) {
     ClientStateMessage msg;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     EXPECT_TRUE(doc["payload"]["artwork"].isUnbound());
 }
 
@@ -1238,7 +1280,9 @@ TEST(Protocol, FormatClientStateReportsAvailabilityAsABoolean) {
         msg.available = available;
 
         JsonDocument doc;
-        ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg, TestArena())));
+        ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                         build_client_state_message(&msg, message);
+                                     })));
         ASSERT_TRUE(doc["payload"]["available"].is<bool>());
         EXPECT_EQ(doc["payload"]["available"].as<bool>(), available);
         EXPECT_FALSE(doc["payload"]["state"].is<const char*>())
@@ -1254,7 +1298,8 @@ TEST(Protocol, FormatClientStateReportsAvailabilityAsABoolean) {
 TEST(Protocol, ClientHelloNoClientIdOrVersion) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
-    const std::string out = format_client_hello_message(&msg, TestArena());
+    const std::string out =
+        built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); });
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -1271,7 +1316,9 @@ TEST(Protocol, ClientHelloOmitsTrustLevel) {
     msg.name = "TestDevice";
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
     EXPECT_TRUE(doc["payload"]["trust_level"].isUnbound());
     // Control: the sibling always-emitted field is still there.
     EXPECT_TRUE(doc["payload"]["unpaired_access"]["enabled"].is<bool>());
@@ -1286,7 +1333,9 @@ TEST(Protocol, ClientHelloUnpairedAccessIsAlwaysEmitted) {
         msg.unpaired_access_enabled = enabled;
 
         JsonDocument doc;
-        ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+        ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                         build_client_hello_message(&msg, message);
+                                     })));
         EXPECT_EQ(doc["payload"]["unpaired_access"]["enabled"].as<bool>(), enabled);
     }
 }
@@ -1305,7 +1354,9 @@ TEST(Protocol, ClientHelloPairMethodsAreKeyedByMethod) {
     msg.supported_pair_methods.push_back(std::move(static_desc));
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
     JsonObjectConst methods = doc["payload"]["supported_pair_methods"].as<JsonObjectConst>();
     ASSERT_EQ(methods.size(), 2u);
     ASSERT_TRUE(methods["pairing_psk"].is<JsonObjectConst>());
@@ -1326,7 +1377,9 @@ TEST(Protocol, ClientHelloNoSupportedPairMethods) {
     // supported_pair_methods is empty by default
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
     ASSERT_TRUE(doc["payload"]["supported_pair_methods"].is<JsonObjectConst>());
     EXPECT_EQ(doc["payload"]["supported_pair_methods"].as<JsonObjectConst>().size(), 0u);
 }
@@ -1515,7 +1568,7 @@ TEST(Protocol, DetermineMessageTypeHandshakeAndPairingTypes) {
     EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::UNKNOWN);
 }
 
-// format_client_pair_finalize_message: the exact wire shape (pairing.md "Client -> Server:
+// build_client_pair_finalize_message: the exact wire shape (pairing.md "Client -> Server:
 // client/pair-finalize"). long_term_psk is base64url of the 32-byte PSK with no padding, so it is
 // exactly 43 characters and decodes back to the bytes that went in.
 TEST(Protocol, FormatClientPairFinalizeWireShape) {
@@ -1527,10 +1580,11 @@ TEST(Protocol, FormatClientPairFinalizeWireShape) {
 
     for (const auto& psk : {zeros, counted}) {
         SCOPED_TRACE(psk[0] == 0 ? "all-zero psk" : "counting psk");
-        const std::string out = format_client_pair_finalize_message(psk, TestArena());
+        const std::string out = built_text(
+            [&](JsonDocument& message) { build_client_pair_finalize_message(psk, message); });
 
         JsonDocument doc;
-        ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_finalize produced invalid "
+        ASSERT_FALSE(deserializeJson(doc, out)) << "build_client_pair_finalize_message produced invalid "
                                                    "JSON";
         EXPECT_STREQ(doc["type"], "client/pair-finalize");
 
@@ -1548,12 +1602,13 @@ TEST(Protocol, FormatClientPairFinalizeWireShape) {
     }
 }
 
-// format_client_pair_retry_message: the message that asks for another round carries an empty
+// build_client_pair_retry_message: the message that asks for another round carries an empty
 // payload object and nothing else (pairing.md "Client -> Server: client/pair-retry"). The
 // binding values are unchanged across rounds, so a field naming any of them would be wrong, not
 // merely redundant.
 TEST(Protocol, FormatClientPairRetryWireShape) {
-    const std::string out = format_client_pair_retry_message(TestArena());
+    const std::string out =
+        built_text([&](JsonDocument& message) { build_client_pair_retry_message(message); });
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
     EXPECT_STREQ(doc["type"], "client/pair-retry");
@@ -1569,7 +1624,8 @@ TEST(Protocol, FormatPairAbortWireShape) {
         PairAbortReason::USER_CANCELLED,
     };
     for (const auto reason : reasons) {
-        const std::string out = format_pair_abort_message(reason, TestArena());
+        const std::string out =
+            built_text([&](JsonDocument& message) { build_pair_abort_message(reason, message); });
         JsonDocument doc;
         ASSERT_FALSE(deserializeJson(doc, out)) << "invalid JSON for reason " << to_cstr(reason);
         EXPECT_STREQ(doc["type"], "pair/abort");
@@ -1588,7 +1644,8 @@ TEST(Protocol, PairAbortMessageParseRoundTrip) {
         PairAbortReason::USER_CANCELLED,
     };
     for (const auto reason : reasons) {
-        const std::string out = format_pair_abort_message(reason, TestArena());
+        const std::string out =
+            built_text([&](JsonDocument& message) { build_pair_abort_message(reason, message); });
         JsonDocument doc;
         JsonObject root;
         ASSERT_TRUE(parse(out, doc, root)) << "invalid JSON for " << to_cstr(reason);
@@ -1655,14 +1712,18 @@ TEST(Protocol, FormatClientHelloSourceSupport) {
 
     msg.source_v1_support = SourceSupportObject{.line_sense = true};
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
     EXPECT_STREQ(doc["payload"]["supported_roles"][0], "source@v1");
     ASSERT_TRUE(doc["payload"]["source@v1_support"]["features"]["line_sense"].is<bool>());
     EXPECT_TRUE(doc["payload"]["source@v1_support"]["features"]["line_sense"].as<bool>());
 
     msg.source_v1_support = SourceSupportObject{};
     JsonDocument doc_no_features;
-    ASSERT_FALSE(deserializeJson(doc_no_features, format_client_hello_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc_no_features, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
     ASSERT_TRUE(doc_no_features["payload"]["source@v1_support"].is<JsonObject>());
     EXPECT_EQ(doc_no_features["payload"]["source@v1_support"].as<JsonObject>().size(), 0U);
 
@@ -1670,7 +1731,9 @@ TEST(Protocol, FormatClientHelloSourceSupport) {
     msg.supported_roles = {};
     msg.source_v1_support.reset();
     JsonDocument doc_unset;
-    ASSERT_FALSE(deserializeJson(doc_unset, format_client_hello_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc_unset, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
     EXPECT_TRUE(doc_unset["payload"]["source@v1_support"].isUnbound());
 }
 
@@ -1679,18 +1742,24 @@ TEST(Protocol, FormatClientHelloSourceSupport) {
 TEST(Protocol, FormatClientStateSourceObject) {
     ClientStateMessage msg;
     JsonDocument doc_unset;
-    ASSERT_FALSE(deserializeJson(doc_unset, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc_unset, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     EXPECT_TRUE(doc_unset["payload"]["source"].isUnbound());
 
     msg.source = ClientSourceStateObject{};
     JsonDocument doc_empty;
-    ASSERT_FALSE(deserializeJson(doc_empty, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc_empty, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     ASSERT_TRUE(doc_empty["payload"]["source"].is<JsonObject>());
     EXPECT_EQ(doc_empty["payload"]["source"].as<JsonObject>().size(), 0U);
 
     msg.source = ClientSourceStateObject{.signal = SourceSignal::ABSENT};
     JsonDocument doc_signal;
-    ASSERT_FALSE(deserializeJson(doc_signal, format_client_state_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc_signal, built_text([&](JsonDocument& message) {
+                                     build_client_state_message(&msg, message);
+                                 })));
     EXPECT_STREQ(doc_signal["payload"]["source"]["signal"], "absent");
 }
 
@@ -1704,7 +1773,9 @@ TEST(Protocol, FormatClientStreamStart) {
     msg.bit_depth = 16;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_stream_start_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_stream_start_message(&msg, message);
+                                 })));
     EXPECT_STREQ(doc["type"], "client-stream/start");
     JsonObject pcm = doc["payload"]["source"];
     EXPECT_STREQ(pcm["codec"], "pcm");
@@ -1718,7 +1789,9 @@ TEST(Protocol, FormatClientStreamStart) {
     msg.bit_depth = 24;
     msg.codec_header = "c2VuZHNwaW4=";
     JsonDocument doc_flac;
-    ASSERT_FALSE(deserializeJson(doc_flac, format_client_stream_start_message(&msg, TestArena())));
+    ASSERT_FALSE(deserializeJson(doc_flac, built_text([&](JsonDocument& message) {
+                                     build_client_stream_start_message(&msg, message);
+                                 })));
     JsonObject flac = doc_flac["payload"]["source"];
     EXPECT_STREQ(flac["codec"], "flac");
     EXPECT_EQ(flac["bit_depth"].as<int>(), 24);
@@ -1729,7 +1802,8 @@ TEST(Protocol, FormatClientStreamStart) {
 // object.
 TEST(Protocol, FormatClientStreamEndHasEmptyPayload) {
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_stream_end_message(TestArena())));
+    ASSERT_FALSE(deserializeJson(
+        doc, built_text([&](JsonDocument& message) { build_client_stream_end_message(message); })));
     EXPECT_STREQ(doc["type"].as<const char*>(), "client-stream/end");
     ASSERT_TRUE(doc["payload"].is<JsonObject>());
     EXPECT_EQ(doc["payload"].as<JsonObject>().size(), 0U);

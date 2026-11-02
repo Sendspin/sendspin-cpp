@@ -59,7 +59,7 @@ namespace sendspin {
 // ============================================================================
 
 /// @brief Concrete SendspinConnection that captures sent binary frames.
-/// Used to verify encrypt_and_send_frame / fragment_and_send output without a real WS socket.
+/// Used to verify encrypt_and_send_frame output without a real WS socket.
 class TestConnection : public SendspinConnection {
 public:
     TestConnection() = default;
@@ -76,7 +76,8 @@ public:
     }
     bool is_connected() const override { return true; }
 
-    SsErr send_text_message(const std::string& msg) override {
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         sent_text_.push_back(msg);
         return SsErr::OK;
     }
@@ -143,13 +144,6 @@ public:
     void set_noise_session(std::unique_ptr<NoiseSession> session) {
         this->noise_transport_.activate(std::move(session));
         this->noise_handshake_complete_ = true;
-    }
-
-    /// Direct access to NoiseTransport::send_binary() for tests exercising the binary send
-    /// path (there is no connection-level wrapper; production code has no client-to-server
-    /// binary message today).
-    SsErr test_send_binary(const uint8_t* data, size_t len) {
-        return this->noise_transport_.send_binary(data, len);
     }
 
     // Accumulated outgoing messages
@@ -255,7 +249,7 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     NoiseHandshake nh(client_id, rs, suite_name.c_str(), arena);
 
     // Step 1: client sends client/init
-    std::string client_init = nh.build_client_init();
+    std::string client_init(nh.build_client_init());
     EXPECT_FALSE(client_init.empty());
 
     // Verify client/init JSON format
@@ -284,8 +278,8 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
 
     // Our driver processes server/init
     std::string captured_msg2;
-    auto send_fn = [&captured_msg2](const std::string& text) -> bool {
-        captured_msg2 = text;
+    auto send_fn = [&captured_msg2](const JsonDocument& msg) -> bool {
+        captured_msg2 = to_text(msg);
         return true;
     };
 

@@ -17,6 +17,7 @@
 #include "crypto/constants.h"
 #include "outbound_ring.h"
 #include "platform/compiler.h"
+#include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
@@ -91,29 +92,45 @@ void SendspinConnection::wake_protocol_task() const {
 // ============================================================================
 
 SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason) {
-    // Routed through send_app_json() so it is encrypted once the Noise transport is active. A
+    // Routed through send_json() so it is encrypted once the Noise transport is active. A
     // goodbye can precede the hello (e.g., when rejecting an excess connection before the
     // handshake finishes).
-    return this->send_app_json(format_client_goodbye_message(reason, *this->json_arena_));
+    JsonDocument goodbye = make_json_document(*this->json_arena_);
+    build_client_goodbye_message(reason, goodbye);
+    return this->send_json(goodbye);
 }
 
-SsErr SendspinConnection::send_app_json(const std::string& json) {
-    // Delegate to the pointer/length overload: same routing (see that overload).
-    return this->send_app_json(json.data(), json.size());
+std::string_view SendspinConnection::stage_json(const JsonDocument& doc) {
+    // An arena block that fell back to the heap and failed leaves the document truncated.
+    if (doc.overflowed()) {
+        SS_LOGE(TAG, "JSON message overflowed its allocator; not sent");
+        return {};
+    }
+    const size_t len = measureJson(doc);
+    char* text = this->noise_transport_.stage_json(len);
+    if (text == nullptr) {
+        return {};
+    }
+    // Sized by measureJson(), so the text fits exactly; the terminator lands in the tag room.
+    serializeJson(doc, text, len + 1);
+    return {text, len};
 }
 
-SsErr SendspinConnection::send_app_json(const char* json, size_t len) {
+SsErr SendspinConnection::send_json(const JsonDocument& doc) {
+    const std::string_view text = this->stage_json(doc);
+    if (text.data() == nullptr) {
+        return SsErr::NO_MEM;
+    }
     // Protocol task only, like the re-handshake swap, so the session cannot change between this
     // check and the encrypt.
     if (this->noise_transport_.is_active()) {
-        // Post-handshake: encrypt straight from the caller's buffer.
-        return this->send_encrypted_text(json, len);
+        return this->settle_noise_send(this->noise_transport_.send_staged_json(text.size()));
     }
-    // Pre-handshake cold path: the text-frame API takes a std::string.
+    // Before the handshake: the staged text goes out as a cleartext text frame.
 #ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
-    this->message_tracer_.trace_outbound_text(std::string_view(json, len));
+    this->message_tracer_.trace_outbound_text(text);
 #endif
-    return this->send_text_message(std::string(json, len));
+    return this->send_text_message(text.data(), text.size());
 }
 
 SsErr SendspinConnection::send_app_binary_lent(OutboundRing& ring, void* item,
@@ -160,8 +177,12 @@ int64_t SendspinConnection::send_time_message() {
     if (time_frame_tag(now) == 0) {
         ++now;
     }
-    char buf[TIME_MESSAGE_BUF_SIZE];
-    const size_t len = format_client_time_message(buf, sizeof(buf), now);
+    // Formatted straight into the send buffer, like every outbound JSON message (send_json()).
+    char* text = this->noise_transport_.stage_json(TIME_MESSAGE_BUF_SIZE);
+    if (text == nullptr) {
+        return 0;
+    }
+    const size_t len = format_client_time_message(text, TIME_MESSAGE_BUF_SIZE, now);
     if (len == 0) {
         return 0;
     }
@@ -175,7 +196,7 @@ int64_t SendspinConnection::send_time_message() {
         this->time_frame_sent_us_.store(time_frame_tag(platform_time_us()),
                                         std::memory_order_release);
     };
-    if (this->settle_noise_send(this->noise_transport_.send_json(buf, len, before_write)) !=
+    if (this->settle_noise_send(this->noise_transport_.send_staged_json(len, before_write)) !=
         SsErr::OK) {
         return 0;
     }
@@ -217,12 +238,14 @@ void SendspinConnection::send_noise_client_init() {
     if (!this->noise_handshake_) {
         return;
     }
-    std::string client_init = this->noise_handshake_->build_client_init();
+    // Sent from the text the handshake retains for its prologue, the one JSON message that
+    // does not go through send_json().
+    const std::string_view client_init = this->noise_handshake_->build_client_init();
     if (!client_init.empty()) {
 #ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
         this->message_tracer_.trace_outbound_text(client_init);
 #endif
-        this->send_text_message(client_init);
+        this->send_text_message(client_init.data(), client_init.size());
     }
 }
 
@@ -231,12 +254,9 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
         return;
     }
 
-    auto send_fn = [this](const std::string& msg) -> bool {
-#ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
-        this->message_tracer_.trace_outbound_text(msg);
-#endif
-        auto err = this->send_text_message(msg);
-        return err == SsErr::OK;
+    // Before the handshake completes, send_json() sends msg2 as a cleartext text frame.
+    auto send_fn = [this](const JsonDocument& msg) -> bool {
+        return this->send_json(msg) == SsErr::OK;
     };
 
     HandshakeFrameResult result = this->noise_handshake_->on_text_frame(text, send_fn);
@@ -271,7 +291,7 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
         // pairing.md "Pairing index": a fresh handshake starts a fresh count for the
         // pairing_index / CPace-sid counter.
         this->reset_pairing_index();
-        // Install the cipher session; send_app_json() routes encrypted from here on.
+        // Install the cipher session; send_json() routes encrypted from here on.
         this->noise_transport_.activate(std::move(outcome->session));
         this->noise_handshake_.reset();
         this->noise_handshake_complete_ = true;
@@ -332,8 +352,15 @@ bool SendspinConnection::handle_noise_rehandshake(const std::vector<uint8_t>& ms
     }
 
     // Commit: encrypt msg2 under the OLD session and send it, then swap to the new session.
+    JsonDocument msg2 = make_json_document(*this->json_arena_);
+    build_noise_handshake_message(result->msg2_bytes, msg2);
+    const std::string_view msg2_text = this->stage_json(msg2);
+    if (msg2_text.data() == nullptr) {
+        SS_LOGE(TAG, "handle_noise_rehandshake: failed to stage msg2");
+        return false;
+    }
     SsErr err =
-        this->noise_transport_.send_msg2_and_swap(result->msg2_text, std::move(result->session));
+        this->noise_transport_.send_msg2_and_swap(msg2_text.size(), std::move(result->session));
     if (err != SsErr::OK) {
         SS_LOGE(TAG, "handle_noise_rehandshake: failed to send msg2 / swap session");
         return false;

@@ -189,14 +189,9 @@
    "sym:_State_impl.*ProtocolTask.*_M_runEv"
   ],
   "sendspin::HandshakeFrameResult sendspin::NoiseHandshake::on_text_frame(": [
-   "SendspinServerConnection::send_text_message(",
-   "SendspinClientConnection::send_text_message("
+   "sym:_Function_handler.*handle_noise_handshake_text.*_M_invoke"
   ],
   "sendspin::NoiseTransport::encrypt_and_send_frame(": [
-   "SendspinServerConnection::send_transport_frame(",
-   "SendspinConnection::send_transport_frame("
-  ],
-  "sendspin::NoiseTransport::fragment_and_send(": [
    "SendspinServerConnection::send_transport_frame(",
    "SendspinConnection::send_transport_frame("
   ],
@@ -204,9 +199,11 @@
    "SendspinServerConnection::send_lent_frame(",
    "SendspinConnection::send_lent_frame("
   ],
-  "sendspin::SendspinConnection::send_app_json(const char*": [
+  "sendspin::SendspinConnection::send_json(": [
    "SendspinServerConnection::send_binary_message(",
    "SendspinClientConnection::send_binary_message(",
+   "SendspinServerConnection::send_text_message(",
+   "SendspinClientConnection::send_text_message(",
    "SendspinServerConnection::send_transport_frame(",
    "SendspinConnection::send_transport_frame("
   ],

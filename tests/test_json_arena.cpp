@@ -19,6 +19,7 @@
 
 #include "platform/json_arena.h"
 #include "protocol_messages.h"
+#include "test_util.h"
 
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
@@ -207,7 +208,8 @@ TEST(JsonArena, ParsedMessageIsReleasedBeforeItsReplyIsBuilt) {
     size_t build_peak = 0;
     {
         SendspinArenaAllocator alone(ARENA_BYTES);
-        format_client_state_message(&state, alone);
+        JsonDocument doc = make_json_document(alone);
+        build_client_state_message(&state, doc);
         build_peak = alone.high_water();
     }
     ASSERT_GT(parse_peak, 0U) << "the parse must be in the arena";
@@ -225,7 +227,9 @@ TEST(JsonArena, ParsedMessageIsReleasedBeforeItsReplyIsBuilt) {
     EXPECT_LE(after_release, FIRST_KEY_BOUND)
         << "the release must leave only the first key stranded, not the variant pool";
 
-    const std::string built = format_client_state_message(&state, arena);
+    JsonDocument reply = make_json_document(arena);
+    build_client_state_message(&state, reply);
+    const std::string built = to_text(reply);
     EXPECT_NE(built.find(R"("type":"client/state")"), std::string::npos);
     EXPECT_EQ(arena.high_water(), std::max(parse_peak, after_release + build_peak))
         << "parse peak " << parse_peak << ", build peak " << build_peak;

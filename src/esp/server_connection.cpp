@@ -151,9 +151,9 @@ bool SendspinServerConnection::is_connected() const {
     return this->sockfd_ >= 0 && !this->closed_.load(std::memory_order_acquire);
 }
 
-SsErr SendspinServerConnection::send_text_message(const std::string& message) {
-    return this->queue_async_send(reinterpret_cast<const uint8_t*>(message.data()), message.size(),
-                                  HTTPD_WS_TYPE_TEXT, nullptr);
+SsErr SendspinServerConnection::send_text_message(const char* text, size_t len) {
+    return this->queue_async_send(reinterpret_cast<const uint8_t*>(text), len, HTTPD_WS_TYPE_TEXT,
+                                  nullptr);
 }
 
 SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len) {

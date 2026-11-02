@@ -303,12 +303,13 @@ set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
 # does not close it); SendspinTimeBurst::last_burst_complete_time_ (a burst due only in the row
 # that sends client/time); and the controller's impl_, whose supported_commands it seeds, stamped
 # with its cleanup_generation, so a send_command() is queued. The connection-level table removes
-# NoiseTransport::frame_sink_ for one send: the one refusal before the encrypt send_app_json()
-# can meet without a seam. The encrypt-failure rows exhaust the send nonce through the session's
+# NoiseTransport::frame_sink_ for one send: a refusal before the encrypt send_json() cannot
+# otherwise meet. The encrypt-failure rows exhaust the send nonce through the session's
 # NoiseSession::send_cipher_ (noise_cipherstate_set_nonce()), the one encrypt failure a live
 # session can meet. The lent-send and encrypt tables call NoiseTransport::encrypt_in_place() and
 # a stand-in's SendspinConnection::noise_transport_ directly, since no protocol-task step drives a
-# lent send.
+# lent send. The pre-session test and the send-failure rows that refuse or fail before the
+# encrypt stage a message through noise_transport_ and read its send_buf_, to observe the wipe.
 set_source_files_properties(test_noise_transport.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

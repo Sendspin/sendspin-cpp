@@ -130,8 +130,8 @@ struct SendspinTracedMessage {
     uint64_t connection_id{0};
     SendspinTraceDirection direction{SendspinTraceDirection::INBOUND};
     /// False for a cleartext text frame (the handshake, or a message sent before the transport is
-    /// up); true for a transport message, type byte first. Outbound fragments are traced one by
-    /// one; inbound messages once reassembled.
+    /// up); true for a transport message, type byte first. Inbound messages are traced once
+    /// reassembled; outbound ones always fit one frame.
     bool binary{false};
     /// Inbound: the receive stamp; outbound: just before encryption or the cleartext send. On the
     /// clock SendspinClient::get_client_time() converts to.
@@ -320,8 +320,8 @@ struct SendspinClientConfig {
     /// Defaults to PREFER_EXTERNAL (SPIRAM), falling back to internal RAM.
     MemoryLocation inbound_ring_location{MemoryLocation::PREFER_EXTERNAL};
 
-    /// @brief Memory placement for the Noise transport's fragment reassembly buffer, the ~64 KB
-    /// fragmentation frame buffer, and the outbound send scratch buffer (ESP-IDF only; ignored on
+    /// @brief Memory placement for the Noise transport's fragment reassembly buffer and the
+    /// outbound send buffer every JSON message is serialized into (ESP-IDF only; ignored on
     /// host). The reassembly buffer grows with the largest fragmented message received (a player
     /// audio chunk, bounded by the buffer capacity the player role advertises) and retains its
     /// capacity, so PREFER_EXTERNAL keeps it out of internal RAM.

@@ -20,6 +20,7 @@
 #include "constants.h"
 #include "crypto/constants.h"
 #include "pairing_offers.h"
+#include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "platform/types.h"
@@ -69,7 +70,9 @@ static void refuse_activate(SendspinConnection* conn, const char* why, const cha
             "server/activate %s (pairing.method=%s) for server_id=%s; replying "
             "pair/abort(method_not_supported), connection stays open",
             why, method, conn->get_server_id().c_str());
-    conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED, arena));
+    JsonDocument json = make_json_document(arena);
+    build_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED, json);
+    conn->send_json(json);
 }
 
 /// @brief Transport-establishment progress of a nursery connection, used for reap diagnostics
@@ -514,7 +517,9 @@ void ConnectionManager::leave() {
         return;
     }
     SS_LOGI(TAG, "Leaving the group (client/leave)");
-    conn->send_app_json(format_client_leave_message(this->json_arena()));
+    JsonDocument json = make_json_document(this->json_arena());
+    build_client_leave_message(json);
+    conn->send_json(json);
 }
 
 SendspinConnection* ConnectionManager::role_send_target(SendspinRole role) const {
@@ -689,7 +694,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
         const SendspinPairMethod method = msg.pairing_method.value();
         const bool category_ok = (method == SendspinPairMethod::PAIRING_PSK) ==
                                  (conn->get_psk_category() == PskCategory::PAIRING);
-        // The same predicates build_hello_message() advertises from (pairing_offers.h).
+        // The same predicates build_client_hello() advertises from (pairing_offers.h).
         const auto& cfg = this->client_->config_;
         bool offered = true;
         switch (method) {
@@ -1546,12 +1551,14 @@ bool ConnectionManager::send_hello_message(SendspinConnection* conn) {
         return true;
     }
 
-    std::string hello_message = this->client_->build_hello_message();
+    const ClientHelloMessage hello = this->client_->build_client_hello();
 
-    // send_app_json (not send_text_message): client/hello is encrypted like every other
-    // post-handshake message. The hello is only sent once server/hello arrives, so
-    // send_app_json always routes to the active Noise transport here.
-    const SsErr err = conn->send_app_json(hello_message);
+    // client/hello is encrypted like every other post-handshake message. The hello is only sent
+    // once server/hello arrives, so send_json always routes to the active Noise transport here.
+    // An error here, NO_MEM included, drops the connection below.
+    JsonDocument json = make_json_document(this->json_arena());
+    build_client_hello_message(&hello, json);
+    const SsErr err = conn->send_json(json);
     if (err == SsErr::OK) {
         // Setting the flag is all that is needed: admission is level-triggered, so the nursery
         // scan observes is_handshake_complete() even when the peer's server/hello raced ahead of
@@ -1727,8 +1734,9 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
             // displaced pairing attempt); the goodbye after it is a benign over-send, since the
             // transport layer has no close-without-goodbye path to use instead.
             if (conn->has_activity(SendspinActivity::PAIRING)) {
-                conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT,
-                                                              this->json_arena()));
+                JsonDocument json = make_json_document(this->json_arena());
+                build_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT, json);
+                conn->send_json(json);
             }
             this->release_connection(std::move(conn), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
             return next;

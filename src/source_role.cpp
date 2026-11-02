@@ -432,8 +432,9 @@ void SourceRole::Impl::try_open(SendspinConnection& conn) {
     start_msg.sample_rate = this->config.sample_rate;
     start_msg.bit_depth = this->config.bit_depth;
     start_msg.codec_header = this->task->codec_header(codec);
-    if (conn.send_app_json(format_client_stream_start_message(&start_msg, *this->json_arena)) !=
-        SsErr::OK) {
+    JsonDocument json = make_json_document(*this->json_arena);
+    build_client_stream_start_message(&start_msg, json);
+    if (conn.send_json(json) != SsErr::OK) {
         // The authorization is consumed: the server must send another start.
         SS_LOGW(TAG, "Failed to send client-stream/start; stream not opened");
         return;
@@ -478,7 +479,9 @@ void SourceRole::Impl::enqueue_stream_event(SourceStreamEventType event) const {
 
 void SourceRole::Impl::send_stream_end(SendspinConnection& conn) const {
     // A failure after the encrypt closes the connection, which ends the stream at the server too.
-    (void)conn.send_app_json(format_client_stream_end_message(*this->json_arena));
+    JsonDocument json = make_json_document(*this->json_arena);
+    build_client_stream_end_message(json);
+    (void)conn.send_json(json);
 }
 
 }  // namespace sendspin

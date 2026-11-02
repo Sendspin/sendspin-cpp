@@ -842,9 +842,7 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
 
 // Message formatting
 
-std::string format_client_hello_message(const ClientHelloMessage* msg,
-                                        SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_hello_message(const ClientHelloMessage* msg, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/hello";
@@ -932,15 +930,9 @@ std::string format_client_hello_message(const ClientHelloMessage* msg,
             source_json["features"]["line_sense"] = true;
         }
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_state_message(const ClientStateMessage* msg,
-                                        SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_state_message(const ClientStateMessage* msg, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/state";
@@ -1007,15 +999,9 @@ std::string format_client_state_message(const ClientStateMessage* msg,
             source_json["signal"] = to_cstr(msg->source.value().signal.value());
         }
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_stream_start_message(const ClientStreamStartMessage* msg,
-                                               SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_stream_start_message(const ClientStreamStartMessage* msg, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     // roles/source/v1.md "client-stream/start": bit_depth is required even for opus, which ignores
@@ -1029,51 +1015,31 @@ std::string format_client_stream_start_message(const ClientStreamStartMessage* m
     if (msg->codec_header.has_value()) {
         source_json["codec_header"] = msg->codec_header.value();
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_stream_end_message(SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_stream_end_message(JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client-stream/end";
     // roles/source/v1.md "client-stream/end": no payload fields, but the envelope carries a payload
     // object like every other message.
     root["payload"].to<JsonObject>();
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_leave_message(SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_leave_message(JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/leave";
     // messaging.md "client/leave": no payload fields, but the envelope carries a payload object
     // like every other message.
     root["payload"].to<JsonObject>();
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_goodbye_message(SendspinGoodbyeReason reason,
-                                          SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_goodbye_message(SendspinGoodbyeReason reason, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/goodbye";
     root["payload"]["reason"] = to_cstr(reason);
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
 namespace {
@@ -1192,9 +1158,7 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
     return static_cast<size_t>(p - buf);
 }
 
-std::string format_client_command_message(const ClientCommandControllerObject& cmd,
-                                          SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_command_message(const ClientCommandControllerObject& cmd, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/command";
@@ -1212,22 +1176,17 @@ std::string format_client_command_message(const ClientCommandControllerObject& c
     if (cmd.command == SendspinControllerCommand::SEEK_RELATIVE && cmd.offset_ms.has_value()) {
         controller["offset_ms"] = cmd.offset_ms.value();
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
 // ============================================================================
 // Pairing-PSK protocol messages
 // ============================================================================
 
-std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk,
-                                                SendspinArenaAllocator& arena) {
+void build_client_pair_finalize_message(const std::array<uint8_t, 32>& psk, JsonDocument& doc) {
     // The document holds the base64 long-term PSK, which admits a server permanently; the arena
-    // wipes every block it frees, and the caller wipes the returned string once it has been sent
-    // (see handle_enter_pairing_psk()). The encoded copy staged on the way is wiped here.
-    JsonDocument doc = make_json_document(arena);
+    // wipes every block it frees, and the text send_json() serializes is encrypted over in place
+    // or wiped (NoiseTransport::send_staged_json()). The encoded copy made on the way is wiped
+    // here.
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
@@ -1235,19 +1194,11 @@ std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& p
     std::string psk_b64 = b64url_encode(psk.data(), psk.size());
     root["payload"]["long_term_psk"] = psk_b64;
     secure_zero(psk_b64.data(), psk_b64.size());
-
-    // Reserved to the exact length so serializeJson() writes in place: a growing string would
-    // leave PSK-bearing copies behind in the heap blocks it outgrew, which nothing wipes.
-    std::string output;
-    output.reserve(measureJson(doc));
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
-                                                        SendspinArenaAllocator& arena) {
-    // Wiped like format_client_pair_finalize_message(); see the note there.
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
+                                                JsonDocument& doc) {
+    // Wiped like build_client_pair_finalize_message(); see the note there.
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
@@ -1256,24 +1207,13 @@ std::string format_client_pair_finalize_wrapped_message(const std::array<uint8_t
     std::string wrapped_b64 = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
     root["payload"]["wrapped_psk"] = wrapped_b64;
     secure_zero(wrapped_b64.data(), wrapped_b64.size());
-
-    // Reserved to the exact length, as in format_client_pair_finalize_message().
-    std::string output;
-    output.reserve(measureJson(doc));
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_pair_abort_message(PairAbortReason reason, SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_pair_abort_message(PairAbortReason reason, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "pair/abort";
     root["payload"]["reason"] = to_cstr(reason);
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
 bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
@@ -1371,78 +1311,50 @@ bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPaylo
     return true;
 }
 
-std::string format_client_pair_pending_message(uint32_t pairing_index,
-                                               SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_pending_message(uint32_t pairing_index, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-pending";
     root["payload"]["pairing_index"] = pairing_index;
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
-                                            uint32_t pairing_index, SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_init_message(const std::array<uint8_t, 32>& commit_b, uint32_t pairing_index,
+                                    JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
     root["payload"]["commit_B"] = b64url_encode(commit_b.data(), commit_b.size());
     root["payload"]["pairing_index"] = pairing_index;
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_init_message(uint32_t pairing_index, SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_init_message(uint32_t pairing_index, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
     // commit_B belongs to the dynamic pairing code flow only; pairing_index is required on
     // every client/pair-init (pairing.md "client/pair-init").
     root["payload"]["pairing_index"] = pairing_index;
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_retry_message(SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_retry_message(JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-retry";
     // Empty payload, emitted explicitly so the message carries the object every other pairing
     // message does (pairing.md "Client -> Server: client/pair-retry").
     root["payload"].to<JsonObject>();
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2,
-                                            SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-auth";
     root["payload"]["pake_msg_2"] = b64url_encode(pake_msg_2.data(), pake_msg_2.size());
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_confirm_message(
+void build_client_pair_confirm_message(
     const std::array<uint8_t, 64>& client_kc,
-    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b, SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";
@@ -1452,24 +1364,15 @@ std::string format_client_pair_confirm_message(
     // pairing code from the handshake it watched.
     root["payload"]["wrapped_nonce_B"] =
         b64url_encode(wrapped_nonce_b.data(), wrapped_nonce_b.size());
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
-                                               SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
+                                       JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";
     // The static flow sends no commit_B, so it has no opening to wrap.
     root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
 }  // namespace sendspin
