@@ -236,10 +236,10 @@ jobs:
             sdkconfig_defaults: sdkconfig.defaults;sdkconfig.no_opus
             flac: 'on'
             opus: 'off'
-          # Player off: micro-opus comes in for the source's encoder alone
+          # Player off: micro-flac and micro-opus come in for the source's encoders alone
           - name: source-only
             sdkconfig_defaults: sdkconfig.defaults;sdkconfig.source_only
-            flac: 'off'
+            flac: 'on'
             opus: 'on'
     defaults:
       run:

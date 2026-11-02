@@ -27,6 +27,7 @@
 /// Options:
 ///   -u URL    Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)
 ///   -p PORT   Listen on PORT (default: 8928)
+///   -f        Stream FLAC-encoded audio instead of PCM
 ///   -o        Stream Opus-encoded audio instead of PCM (needs SENDSPIN_ENABLE_OPUS)
 ///   -s DBFS   Report line sense: signal present while the input's level is at or above DBFS
 ///   -l LEVEL  Set log level: none, error, warn, info (default), debug, verbose
@@ -72,9 +73,9 @@ using namespace sendspin;
 static constexpr uint16_t DEFAULT_SENDSPIN_PORT = SendspinClientConfig::DEFAULT_SERVER_PORT;
 static const char* SENDSPIN_PATH = "/sendspin";
 
-// 48 kHz / 16-bit: what most input devices deliver natively, and legal for both PCM and -o Opus.
-// The channel count follows the default input device, clamped to stereo. Each callback carries
-// one chunk's worth of frames, well inside what one write_audio() call may hold.
+// 48 kHz / 16-bit: what most input devices deliver natively, and legal for PCM, -f FLAC and
+// -o Opus. The channel count follows the default input device, clamped to stereo. Each callback
+// carries one chunk's worth of frames, well inside what one write_audio() call may hold.
 static constexpr uint32_t CAPTURE_SAMPLE_RATE = 48000;
 static constexpr uint8_t CAPTURE_BIT_DEPTH = 16;
 static constexpr unsigned long CAPTURE_FRAMES_PER_BUFFER = CAPTURE_SAMPLE_RATE / 50;
@@ -340,6 +341,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -u URL        Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)\n");
     fprintf(stderr, "  -p PORT       Listen on PORT (default: %u)\n", DEFAULT_SENDSPIN_PORT);
+    fprintf(stderr, "  -f            Stream FLAC-encoded audio instead of PCM\n");
 #ifdef SENDSPIN_ENABLE_OPUS
     fprintf(stderr, "  -o            Stream Opus-encoded audio instead of PCM\n");
 #endif
@@ -389,10 +391,10 @@ int main(int argc, char* argv[]) {
     LogLevel log_level = LogLevel::INFO;
     std::string connect_url;
     uint16_t server_port = DEFAULT_SENDSPIN_PORT;
-    bool use_opus = false;
+    SendspinCodecFormat codec = SendspinCodecFormat::PCM;
     std::optional<double> line_sense_dbfs;
     int opt;
-    while ((opt = getopt(argc, argv, "u:p:os:l:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:fos:l:vqh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
@@ -404,9 +406,12 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
                 break;
+            case 'f':
+                codec = SendspinCodecFormat::FLAC;
+                break;
             case 'o':
 #ifdef SENDSPIN_ENABLE_OPUS
-                use_opus = true;
+                codec = SendspinCodecFormat::OPUS;
                 break;
 #else
                 fprintf(stderr, "-o needs a library built with SENDSPIN_ENABLE_OPUS\n");
@@ -483,12 +488,12 @@ int main(int argc, char* argv[]) {
     client.set_persistence_provider(&persistence_provider);
 
     // The config is the capture format of every stream the role opens. A 20 ms chunk is one
-    // legal Opus frame, so the default chunk duration serves both codecs.
+    // legal Opus frame, so the default chunk duration serves every codec.
     SourceRoleConfig source_config;
     source_config.sample_rate = CAPTURE_SAMPLE_RATE;
     source_config.channels = channels;
     source_config.bit_depth = CAPTURE_BIT_DEPTH;
-    source_config.codec = use_opus ? SendspinCodecFormat::OPUS : SendspinCodecFormat::PCM;
+    source_config.codec = codec;
     source_config.line_sense = line_sense_dbfs.has_value();
     auto& source = client.add_source(std::move(source_config));
 
@@ -590,7 +595,9 @@ int main(int argc, char* argv[]) {
 
     // Start the server
     fprintf(stderr, "Starting Sendspin source client on port %u (%s)...\n", server_port,
-            use_opus ? "opus" : "pcm");
+            codec == SendspinCodecFormat::FLAC   ? "flac"
+            : codec == SendspinCodecFormat::OPUS ? "opus"
+                                                 : "pcm");
 
     if (!client.start()) {
         fprintf(stderr, "Failed to start server\n");
