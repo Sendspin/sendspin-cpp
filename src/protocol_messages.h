@@ -993,10 +993,11 @@ struct ServerPairConfirmPayload {
 // Every process_*() below takes the parsed JSON object and fills the caller-owned output it is
 // handed, returning false on a missing or malformed required field; the output holds copies, never
 // a view into the document, so the caller can release the document before acting on it
-// (ParsedJsonMessage::extract()). Every format_*() that returns a std::string builds its document
-// in the `arena` it is handed (the client's, on the protocol task) and destroys it before it
-// returns (a document that fits one variant pool frees the arena back down to where it found it;
-// see SendspinArenaAllocator). It never resets the arena.
+// (ParsedJsonMessage::extract()). Every build_*_message() returns its message as a document
+// allocated from the `arena` it is handed (the client's, on the protocol task), for
+// SendspinConnection::send_json() to serialize straight into the transport's send buffer; the
+// caller destroys it once sent (a document that fits one variant pool frees the arena back down
+// to where it found it; see SendspinArenaAllocator). It never resets the arena.
 
 /// @brief Determines the message type of an incoming server-to-client JSON message; UNKNOWN if
 /// not recognized
@@ -1068,9 +1069,6 @@ bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg);
 
 /// @brief Parses a stream/clear JSON message into the provided struct
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg);
-
-// Each build_*_message() returns its message as a document allocated from `arena`, for
-// SendspinConnection::send_json() to serialize straight into the transport's send buffer.
 
 /// @brief Builds a client/hello message
 JsonDocument build_client_hello_message(const ClientHelloMessage* msg,
