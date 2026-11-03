@@ -48,7 +48,6 @@
 #include <array>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -62,7 +61,7 @@ class SendspinArenaAllocator;
 /// @brief Outcome of a successful Noise handshake (initial or re-handshake).
 struct NoiseHandshakeResult {
     /// The cipher session ready for transport-mode encrypt/decrypt.
-    std::unique_ptr<NoiseSession> session;
+    NoiseSession session;
     /// Server's public key peer_id (43-char base64url).
     IdText server_id;
     /// The PSK record that admitted the connection.

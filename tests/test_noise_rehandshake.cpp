@@ -54,7 +54,6 @@ extern "C" {
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -74,7 +73,7 @@ using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local c
 /// Returns: initiator cipher pair, responder NoiseSession, and server_id (public key).
 struct InitialHandshakeResult {
     CipherPair initiator;
-    std::unique_ptr<NoiseSession> responder_session;
+    std::optional<NoiseSession> responder_session;
     std::array<uint8_t, 32> responder_h{};  // handshake hash from the responder side
     std::array<uint8_t, 32> psk{};
     std::string psk_id;
@@ -161,8 +160,8 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
     }
 
     auto outcome = nh.take_result();
-    if (!outcome.has_value() || !outcome->session) { return std::nullopt; }
-    r.responder_h = outcome->session->handshake_hash();
+    if (!outcome.has_value()) { return std::nullopt; }
+    r.responder_h = outcome->session.handshake_hash();
     r.responder_session = std::move(outcome->session);
 
     return r;
@@ -205,7 +204,7 @@ static std::vector<uint8_t> msg1_bytes_of(const std::string& envelope) {
 /// @return New initiator cipher pair + new responder session on success, or nullopt.
 struct RehandshakeResult {
     CipherPair initiator;
-    std::unique_ptr<NoiseSession> responder_session;
+    std::optional<NoiseSession> responder_session;
     std::array<uint8_t, 32> new_h{};  // new handshake hash
 };
 
@@ -267,7 +266,7 @@ static std::optional<RehandshakeResult> run_rehandshake(
         return std::nullopt;
     }
 
-    rr.new_h = result->session->handshake_hash();
+    rr.new_h = result->session.handshake_hash();
     rr.responder_session = std::move(result->session);
     return rr;
 }

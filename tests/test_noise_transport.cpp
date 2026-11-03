@@ -349,7 +349,6 @@ Msg1Outcome run_msg1_with_payload(
     EXPECT_TRUE(result.has_value());
     if (result.has_value()) {
         outcome.category = result->resolved_psk.category;
-        EXPECT_NE(result->session, nullptr) << "a completed handshake must carry its session";
     }
 
     // The peer holds the PSK it referenced, so it can only read message 2 if the client bound the
@@ -1266,7 +1265,7 @@ TEST(NoiseTransport, EncryptInPlaceRefusesMissingTagRoomAndMarksAFailedEncrypt) 
         ASSERT_TRUE(r.has_value());
         NoiseCipherState* send_cs = r->responder_session->send_cipher_;
         NoiseTransport transport;
-        transport.activate(std::move(r->responder_session));
+        transport.activate(std::move(*r->responder_session));
         if (row.c == Case::NONCE_EXHAUSTED) {
             ASSERT_EQ(noise_cipherstate_set_nonce(send_cs, UINT64_MAX), NOISE_ERROR_NONE);
         }

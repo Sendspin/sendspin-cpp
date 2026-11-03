@@ -37,7 +37,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <utility>
 
@@ -95,7 +94,7 @@ public:
 
     /// @brief Installs the cipher session produced by the initial Noise handshake and marks
     /// the transport active. Called on the protocol task at handshake COMPLETE.
-    void activate(std::unique_ptr<NoiseSession> session);
+    void activate(NoiseSession session);
 
     /// @brief Returns the current session's 32-byte Noise handshake hash, or nullopt if no
     /// session is active. Protocol task only.
@@ -105,7 +104,7 @@ public:
     /// swaps). This is the check send paths use to decide encrypted-vs-cleartext. Protocol task
     /// only.
     bool is_active() const {
-        return this->active_;
+        return this->session_.has_value();
     }
 
     /// @brief Whether a send failed once its first frame was encrypted. Each encrypt spends a send
@@ -159,7 +158,7 @@ public:
     /// text) under the OLD session, then swap to the new session. Protocol task only, like every
     /// other send, so no encrypt falls between the msg2 send and the swap.
     /// @return SsErr::OK on success (session swapped); on error the old session is kept.
-    SsErr send_msg2_and_swap(size_t len, std::unique_ptr<NoiseSession> next_session);
+    SsErr send_msg2_and_swap(size_t len, NoiseSession next_session);
 
     // ========================================
     // Inbound (decrypt + reassemble); protocol task only
@@ -260,12 +259,12 @@ private:
     /// reasm_buf_.
     PlatformBuffer send_buf_;
 
-    // Pointer fields
     /// Noise cipher session (set at handshake COMPLETE, replaced on re-handshake swap).
     /// Protocol task only.
-    std::unique_ptr<NoiseSession> session_;
+    std::optional<NoiseSession> session_;
 
 #ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    // Pointer fields
     /// From set_message_tracer(); nullptr for none. Written once at setup, then protocol task
     /// only.
     const MessageTracer* message_tracer_{nullptr};
@@ -279,9 +278,6 @@ private:
     // 8-bit fields
     /// Memory placement for reasm_buf_ and send_buf_.
     MemoryLocation buffer_location_{MemoryLocation::PREFER_EXTERNAL};
-
-    /// True once a transport session exists. See is_active(). Protocol task only.
-    bool active_{false};
 
     /// See is_send_desynced(). Protocol task only.
     bool send_desynced_{false};

@@ -46,7 +46,6 @@ extern "C" {
 #include <array>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -141,8 +140,8 @@ public:
     std::function<void(InboundMessage& message)> on_binary;
 
     /// Install a noise session directly (bypasses handshake, for transport-only tests).
-    void set_noise_session(std::unique_ptr<NoiseSession> session) {
-        this->noise_transport_.activate(std::move(session));
+    void set_noise_session(std::optional<NoiseSession>&& session) {
+        this->noise_transport_.activate(std::move(session.value()));
         this->noise_handshake_complete_ = true;
     }
 
@@ -214,10 +213,10 @@ inline std::optional<std::vector<uint8_t>> extract_noise_bytes(const std::string
 /// The "server" side is noise-c as initiator.
 /// The "client" side is our NoiseHandshake/NoiseSession as responder.
 ///
-/// Returns the initiator cipher pair after split (for transport tests), or nullptr on failure.
+/// Returns the initiator cipher pair after split (for transport tests), or nullopt on failure.
 struct LoopbackResult {
     CipherPair initiator;
-    std::unique_ptr<NoiseSession> responder_session;
+    std::optional<NoiseSession> responder_session;
 
     LoopbackResult() = default;
     LoopbackResult(LoopbackResult&&) = default;
@@ -357,7 +356,6 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     if (!outcome.has_value()) {
         return std::nullopt;
     }
-    EXPECT_TRUE(outcome->session != nullptr);
     EXPECT_FALSE(outcome->server_id.empty());
     EXPECT_EQ(outcome->server_id, server_id.peer_id());
 

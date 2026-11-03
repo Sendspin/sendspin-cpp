@@ -263,11 +263,9 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
 /// @param core       Completed core result (session and resolved_psk are moved out of it).
 /// @param server_id  Server peer_id to record on the result.
 NoiseHandshakeResult make_handshake_result(Msg1CoreResult&& core, const IdText& server_id) {
-    NoiseHandshakeResult result;
-    result.session = std::make_unique<NoiseSession>(std::move(core.session));
-    result.server_id = server_id;
-    result.resolved_psk = std::move(core.resolved_psk);
-    return result;
+    return NoiseHandshakeResult{.session = std::move(core.session),
+                                .server_id = server_id,
+                                .resolved_psk = std::move(core.resolved_psk)};
 }
 
 }  // namespace
