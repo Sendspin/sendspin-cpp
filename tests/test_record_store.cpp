@@ -338,8 +338,7 @@ TEST(RecordStore, StoreRecordReplacesTheRecordHoldingTheSamePskId) {
 
     auto resolved = store.resolve_by_psk_id(psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved.has_value());
-    ASSERT_TRUE(resolved->counterparty_id.has_value());
-    EXPECT_EQ(resolved->counterparty_id.value(), test_peer_id("server-B"))
+    EXPECT_EQ(resolved->counterparty_id, test_peer_id("server-B"))
         << "the psk_id must authenticate the server that paired with it last, not the one it "
            "replaced";
 
@@ -864,8 +863,7 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
         << "the superseded PSK must stop authenticating";
     auto resolved = store.resolve_by_psk_id(outcome1.record.psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved.has_value());
-    ASSERT_TRUE(resolved->counterparty_id.has_value());
-    EXPECT_EQ(resolved->counterparty_id.value(), existing_server);
+    EXPECT_EQ(resolved->counterparty_id, existing_server);
     for (const std::string& psk_id : other_psk_ids) {
         EXPECT_TRUE(store.resolve_by_psk_id(psk_id, PskCategory::LONG_TERM).has_value())
             << "no other server's record may be evicted by a supersede";
@@ -948,15 +946,14 @@ TEST(RecordStore, ResolveByPskIdReturnsTheCategorysPskAndCounterparty) {
         std::string psk_id;
         PskCategory category;
         std::array<uint8_t, NOISE_PSK_SIZE> psk;
-        std::optional<std::string> counterparty;
+        std::string counterparty;  // Empty for a PSK bound to no server
     };
     const Row rows[] = {
         {"long-term-record", rec.psk_id, PskCategory::LONG_TERM, rec.psk, rec.server_id},
-        {"pairing-psk", pairing.psk_id, PskCategory::PAIRING, pairing.psk, std::nullopt},
+        {"pairing-psk", pairing.psk_id, PskCategory::PAIRING, pairing.psk, ""},
         // The Sentinel PSK is a constant, so it resolves on a store that has never been
         // provisioned as well as on this one.
-        {"sentinel-psk", std::string(SENTINEL_PSK_ID), PskCategory::SENTINEL, SENTINEL_PSK,
-         std::nullopt},
+        {"sentinel-psk", std::string(SENTINEL_PSK_ID), PskCategory::SENTINEL, SENTINEL_PSK, ""},
     };
 
     for (const Row& row : rows) {
@@ -993,7 +990,7 @@ TEST(RecordStore, DeclaredCategoryPicksBetweenTwoPsksWithTheSamePskId) {
     auto as_pairing = store.resolve_by_psk_id(rec.psk_id, PskCategory::PAIRING);
     ASSERT_TRUE(as_pairing.has_value());
     EXPECT_EQ(as_pairing->category, PskCategory::PAIRING);
-    EXPECT_FALSE(as_pairing->counterparty_id.has_value());
+    EXPECT_TRUE(as_pairing->counterparty_id.empty());
 }
 
 // A psk_id the client holds only under another category is a lookup miss, not a match
@@ -1220,7 +1217,7 @@ TEST(RecordStore, SupersedeIsDurableWhenTheProviderAcceptsTheFlush) {
 }
 
 // The refused delete is exactly the durability hole the bool return exists to surface: the
-// record the store kept comes back on the next start, and resolves as LONG_TERM trust again.
+// record the store kept comes back on the next start, and resolves as LONG_TERM again.
 TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
     RejectingDeleteProvider provider;
 

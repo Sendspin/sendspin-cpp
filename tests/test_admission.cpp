@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Unit tests for the admission/trust enforcement and arbitration functions:
+// Unit tests for the admissibility check and the arbitration functions:
 // the allowed-activity-set table and rejection order in messaging.md "server/activate", and the
 // priority rules in connection.md "Multiple servers (server-initiated)".
 

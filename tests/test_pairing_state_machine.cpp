@@ -526,7 +526,8 @@ protected:
         const std::string& server_id, SendspinPairMethod method,
         SendspinPairingCodeFormat format = SendspinPairingCodeFormat::DIGITS) {
         auto conn = std::make_shared<FakeConnection>();
-        conn->set_noise_handshake_result(server_id, PskCategory::SENTINEL, /*psk_id=*/"");
+        conn->set_noise_handshake_result(id_text(server_id), PskCategory::SENTINEL,
+                                         /*psk_id=*/IdText{});
         conn->apply_server_activate({SendspinActivity::PAIRING}, std::nullopt, method,
                                     method == SendspinPairMethod::DYNAMIC_PAIRING_CODE
                                         ? std::optional<SendspinPairingCodeFormat>(format)
@@ -545,7 +546,8 @@ protected:
     /// exercised end to end (not bypassed through the handle_enter_pairing() seam).
     FakeConnection* inject_provisional_current_connection(const std::string& server_id) {
         auto conn = std::make_shared<FakeConnection>();
-        conn->set_noise_handshake_result(server_id, PskCategory::SENTINEL, /*psk_id=*/"");
+        conn->set_noise_handshake_result(id_text(server_id), PskCategory::SENTINEL,
+                                         /*psk_id=*/IdText{});
         FakeConnection* raw = conn.get();
         this->injected_conn_ = conn;
         this->admit(conn);
@@ -607,8 +609,8 @@ protected:
     }
 
     /// Apply a server/activate on the injected current connection through the real activation
-    /// path, ConnectionManager::on_server_activate() (trust check, apply_server_activate, then
-    /// either the already-admitted branch's leftover-activate handling or
+    /// path, ConnectionManager::on_server_activate() (admissibility check, apply_server_activate,
+    /// then either the already-admitted branch's leftover-activate handling or
     /// on_handshake_complete()): the call process_json_message() makes on the protocol task.
     void post_activate(ActivitySet activities,
                        std::optional<ActiveRoles> active_roles,
@@ -2909,8 +2911,8 @@ TEST_F(PairingStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlayba
     // A rank-0 peer (no activities) whose server_id is the last playback server: exactly the
     // inputs admission rule 5 keys on.
     auto newcomer = std::make_shared<FakeConnection>();
-    newcomer->set_noise_handshake_result("old-playback-server", PskCategory::SENTINEL,
-                                         /*psk_id=*/"");
+    newcomer->set_noise_handshake_result(id_text("old-playback-server"), PskCategory::SENTINEL,
+                                         /*psk_id=*/IdText{});
     newcomer->apply_server_activate({}, std::nullopt, std::nullopt, std::nullopt);
 
     EXPECT_FALSE(this->would_switch_to(current, newcomer.get(), "old-playback-server"))
@@ -2919,7 +2921,8 @@ TEST_F(PairingStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlayba
 
     // The shield really is suppressed though: a rank-2 playback peer wins.
     auto playback = std::make_shared<FakeConnection>();
-    playback->set_noise_handshake_result("playback-server", PskCategory::SENTINEL, /*psk_id=*/"");
+    playback->set_noise_handshake_result(id_text("playback-server"), PskCategory::SENTINEL,
+                                         /*psk_id=*/IdText{});
     playback->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                     std::nullopt);
     EXPECT_TRUE(this->would_switch_to(current, playback.get(), "old-playback-server"))

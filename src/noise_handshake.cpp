@@ -217,8 +217,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
         if (resolved->category == PskCategory::LONG_TERM &&
             resolved->counterparty_id != server_id) {
             SS_LOGW(TAG, "%s: PSK bound to server_id='%s', but connected to '%s'", log_prefix,
-                    resolved->counterparty_id.has_value() ? resolved->counterparty_id->c_str() : "",
-                    server_id.c_str());
+                    resolved->counterparty_id.c_str(), server_id.c_str());
             return std::nullopt;
         }
     } else if (kind == HandshakeKind::INITIAL) {
@@ -372,8 +371,9 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
         }
         if (awaiting_server_init) {
             version = root["payload"]["version"] | 0;
-            // Refused when longer than a peer_id, which handle_server_init() then rejects.
-            server_id.assign(root["payload"]["server_id"] | "");
+            // Refused when longer than a peer_id, leaving it empty for handle_server_init() to
+            // reject.
+            (void)server_id.assign(root["payload"]["server_id"] | "");
         } else {
             msg1_bytes = read_noise_handshake_data(root, to_cstr(HandshakeKind::INITIAL));
         }
@@ -475,31 +475,27 @@ bool NoiseHandshake::handle_msg1(std::span<uint8_t> msg1_bytes,
 // ============================================================================
 
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    std::span<uint8_t> msg1_bytes, std::string_view server_id, const Identity& identity,
+    std::span<uint8_t> msg1_bytes, const IdText& server_id, const Identity& identity,
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena) {
-    // The id the initial handshake recorded; run_msg1_core()'s decode check refuses an empty one.
-    IdText known_server_id;
-    known_server_id.assign(server_id);
     // Prologue for re-handshake = prior handshake hash h (32 bytes)
     const uint8_t* prologue = prior_h.data();
     const size_t prologue_len = prior_h.size();
 
     auto core = run_msg1_core(HandshakeKind::REHANDSHAKE, identity, record_store, suite_name,
-                              known_server_id, prologue, prologue_len, msg1_bytes, arena);
+                              server_id, prologue, prologue_len, msg1_bytes, arena);
     if (!core.has_value()) {
         return std::nullopt;
     }
 
-    SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%d", known_server_id.c_str(),
+    SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%d", server_id.c_str(),
             static_cast<int>(core->psk_category));
 
     // The caller wraps msg2 in its noise/handshake envelope and sends it encrypted. Returned as a
     // prvalue, which is built in the caller's optional; a named optional would be moved there,
     // since this function also returns nullopt.
-    return std::optional<NoiseHandshakeResult>(std::in_place, std::move(core->session),
-                                               known_server_id, core->psk_id, core->psk_category,
-                                               core->msg2_bytes);
+    return std::optional<NoiseHandshakeResult>(std::in_place, std::move(core->session), server_id,
+                                               core->psk_id, core->psk_category, core->msg2_bytes);
 }
 
 }  // namespace sendspin

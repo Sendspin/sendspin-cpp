@@ -80,7 +80,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.
 - A message handler on the protocol task does the connection work the message
-  calls for in place (an activation's trust check, admission and role
+  calls for in place (an activation's admissibility check, admission and role
   ownership, a pairing step, a `noise/handshake` re-handshake, the RAM commit
   of a pairing record), and hands role and consumer work on through Inbox
   slots, role item lists and buffers. It never calls a listener or a

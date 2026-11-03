@@ -349,7 +349,8 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
     if (hello_msg == nullptr) {
         return true;
     }
-    hello_msg->name.assign(read_friendly_name(root["payload"]["name"], "server/hello name"));
+    // read_friendly_name() cuts it to the name's capacity.
+    (void)hello_msg->name.assign(read_friendly_name(root["payload"]["name"], "server/hello name"));
 
     // roles/source/v1.md "server/hello source@v1 support object": supported_codecs is a required
     // list of strings that must include flac and pcm, and a source ignores the codec identifiers

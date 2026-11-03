@@ -890,7 +890,8 @@ public:
         auto conn = std::make_shared<FailingWriteConnection>();
         conn->set_json_arena(*this->client->json_arena_);
         conn->set_noise_session(std::move(loopback->responder_session));
-        conn->set_noise_handshake_result("stand-in-server", PskCategory::LONG_TERM, "stand-in");
+        conn->set_noise_handshake_result(id_text("stand-in-server"), PskCategory::LONG_TERM,
+                                         id_text("stand-in"));
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
         conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"source@v1"},

@@ -14,7 +14,6 @@
 
 #include "constants.h"
 
-#include "keys.h"
 #include "platform/crypto.h"
 
 #include <cstdlib>
@@ -43,10 +42,5 @@ const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK = []() {
     }
     return digest;
 }();
-
-// SENTINEL_PSK_ID = base64url(SHA-256(PSK_ID_LABEL || SENTINEL_PSK))
-// Computed once at startup from SENTINEL_PSK.
-// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
-const std::string SENTINEL_PSK_ID = psk_id_for(SENTINEL_PSK);
 
 }  // namespace sendspin

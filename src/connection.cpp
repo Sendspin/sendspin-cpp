@@ -279,8 +279,8 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
         assert(outcome.has_value() && "a completed handshake hands out its result");
         // Record the server's identity (public key) and the PSK category/psk_id that admitted
         // the connection, resolved by the handshake.
-        this->set_noise_handshake_result(outcome->server_id.view(), outcome->psk_category,
-                                         outcome->psk_id.view());
+        this->set_noise_handshake_result(outcome->server_id, outcome->psk_category,
+                                         outcome->psk_id);
         // pairing.md "Pairing index": a fresh handshake starts a fresh count for the
         // pairing_index / CPace-sid counter.
         this->reset_pairing_index();
@@ -333,7 +333,7 @@ bool SendspinConnection::handle_noise_rehandshake(std::span<uint8_t> msg1_bytes)
         SS_LOGE(TAG, "handle_noise_rehandshake: no handshake hash available");
         return false;
     }
-    auto result = run_rehandshake_msg1(msg1_bytes, this->server_id_.view(), *this->noise_identity_,
+    auto result = run_rehandshake_msg1(msg1_bytes, this->server_id_, *this->noise_identity_,
                                        *this->noise_record_store_, this->noise_suite_name_,
                                        prior_h.value(), *this->json_arena_);
     if (!result.has_value()) {

@@ -76,13 +76,13 @@ inline std::optional<PskCategory> psk_category_from_string(std::string_view code
 // Resolved PSK (handshake currency)
 // ============================================================================
 
-/// @brief A PSK selected during a handshake, with its trust metadata.
+/// @brief A PSK selected during a handshake, with its category and the server it is bound to.
 struct ResolvedPsk {
     IdText psk_id;
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     PskCategory category{PskCategory::SENTINEL};
     /// Peer server_id; set for every long-term record, empty for the Sentinel and Pairing PSKs.
-    std::optional<IdText> counterparty_id;
+    IdText counterparty_id{};
 
     ResolvedPsk() = default;
     ResolvedPsk(const ResolvedPsk&) = default;

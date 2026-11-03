@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -274,6 +275,20 @@ inline JsonDocument make_json_document(SendspinArenaAllocator& arena) {
     return JsonDocument(&arena);
 }
 
+/// @brief Whether a T can point into a parsed document: a pointer, a std::string_view, or a
+/// JsonVariant, JsonObject, JsonArray (or their Const forms) or JsonString, alone or in a
+/// std::optional. ParsedJsonMessage::extract() refuses to return one, since the document is gone
+/// by the time the caller reads it.
+template <typename T>
+struct RefersIntoDocument
+    : std::bool_constant<std::is_pointer_v<T> || std::is_same_v<T, std::string_view> ||
+                         std::is_same_v<T, JsonVariant> || std::is_same_v<T, JsonVariantConst> ||
+                         std::is_same_v<T, JsonObject> || std::is_same_v<T, JsonObjectConst> ||
+                         std::is_same_v<T, JsonArray> || std::is_same_v<T, JsonArrayConst> ||
+                         std::is_same_v<T, JsonString>> {};
+template <typename T>
+struct RefersIntoDocument<std::optional<T>> : RefersIntoDocument<T> {};
+
 /**
  * @brief A parsed inbound JSON message, read once and released before anything acts on it
  *
@@ -316,6 +331,9 @@ public:
             extractor(this->root());
             this->release();
         } else {
+            using Extracted = std::decay_t<std::invoke_result_t<Extractor&, JsonObject>>;
+            static_assert(!RefersIntoDocument<Extracted>::value,
+                          "extract() releases the document: return an owned value, not a view");
             auto extracted = extractor(this->root());
             this->release();
             return extracted;
