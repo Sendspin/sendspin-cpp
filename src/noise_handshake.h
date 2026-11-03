@@ -48,7 +48,6 @@
 #include <array>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -62,11 +61,14 @@ class SendspinArenaAllocator;
 /// @brief Outcome of a successful Noise handshake (initial or re-handshake).
 struct NoiseHandshakeResult {
     /// The cipher session ready for transport-mode encrypt/decrypt.
-    std::unique_ptr<NoiseSession> session;
+    NoiseSession session;
     /// Server's public key peer_id (43-char base64url).
     IdText server_id;
-    /// The PSK record that admitted the connection.
-    ResolvedPsk resolved_psk;
+    /// psk_id of the PSK that admitted the connection. The handshake has already mixed the PSK
+    /// into session's keys, so the result carries none of its bytes.
+    IdText psk_id;
+    /// Category of that PSK.
+    PskCategory psk_category{PskCategory::SENTINEL};
     /// The Noise msg2 bytes to send to the peer, in a noise/handshake envelope
     /// (build_noise_handshake_message()). Set only for re-handshake results (initial handshake
     /// sends msg2 inline).
@@ -147,8 +149,8 @@ static constexpr size_t MAX_SERVER_INIT_BYTES = 512;
 
 /// @brief Noise handshake state machine for the Sendspin client (Noise responder).
 ///
-/// build_client_init() produces the first cleartext frame, on_text_frame() takes each incoming
-/// text frame, and take_result() yields the session once that returns COMPLETE.
+/// build_client_init() produces the first cleartext frame, and on_text_frame() takes each
+/// incoming text frame, handing out the session with the frame that completes the handshake.
 ///
 /// Threading: runs entirely on the protocol task, which is where RecordStore::resolve_by_psk_id()
 /// runs (see record_store.h).
@@ -182,10 +184,13 @@ public:
 
     /// @brief Process one incoming WS text frame.
     /// Must be called in sequence: server/init, then noise/handshake msg1.
-    /// @param send_fn  Callable that sends a JSON message to the peer as a TEXT frame.
-    ///                 Signature: `bool send_fn(const JsonDocument& msg)`.
+    /// @param send_fn   Callable that sends a JSON message to the peer as a TEXT frame.
+    ///                  Signature: `bool send_fn(const JsonDocument& msg)`.
+    /// @param completed Set to the handshake's result when this returns COMPLETE, untouched
+    ///                  otherwise.
     HandshakeFrameResult on_text_frame(std::string_view text,
-                                       const std::function<bool(const JsonDocument&)>& send_fn);
+                                       const std::function<bool(const JsonDocument&)>& send_fn,
+                                       std::optional<NoiseHandshakeResult>& completed);
 
     /// @brief The reason carried by a server/error received during the handshake, or empty.
     ///
@@ -194,11 +199,6 @@ public:
     /// makes the reason a hint for logging and operator display.
     const std::string& server_error_reason() const {
         return this->server_error_reason_;
-    }
-
-    /// @brief Take ownership of the handshake result (only valid after COMPLETE).
-    std::optional<NoiseHandshakeResult> take_result() {
-        return std::move(this->result_);
     }
 
 private:
@@ -226,17 +226,16 @@ private:
     /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data());
     ///                   cleared on return.
     /// @param send_fn    Sends the msg2 frame back to the peer.
+    /// @param completed  Set to the handshake's result on success.
     /// @return true when msg1 authenticated and msg2 was sent.
     bool handle_msg1(std::span<uint8_t> msg1_bytes,
-                     const std::function<bool(const JsonDocument&)>& send_fn);
+                     const std::function<bool(const JsonDocument&)>& send_fn,
+                     std::optional<NoiseHandshakeResult>& completed);
 
     // Struct fields
     /// The prologue: the exact bytes of the client/init we sent, then of the server/init we
     /// received, in one buffer sized for both when client/init is built.
     PlatformBuffer prologue_;
-
-    /// Result available after COMPLETE.
-    std::optional<NoiseHandshakeResult> result_;
 
     /// Reason from a received server/error. See server_error_reason().
     std::string server_error_reason_;

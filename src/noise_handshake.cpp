@@ -90,8 +90,11 @@ namespace {
 struct Msg1CoreResult {
     /// The session, split into transport cipher states, with the resolved PSK bound.
     NoiseSession session;
-    /// The PSK record that admitted the connection.
-    ResolvedPsk resolved_psk;
+    /// psk_id of the PSK that admitted the connection. Its bytes stay in run_msg1_core()'s
+    /// ResolvedPsk, wiped when that returns.
+    IdText psk_id;
+    /// Category of that PSK.
+    PskCategory psk_category{PskCategory::SENTINEL};
     /// Serialized noise/handshake msg2 bytes (not yet wrapped in a JSON envelope).
     NoiseMsg2 msg2_bytes{};
 };
@@ -253,21 +256,10 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
         return std::nullopt;
     }
 
-    return Msg1CoreResult{std::move(session.value()), std::move(resolved.value()), msg2_bytes};
-}
-
-/// @brief Build a NoiseHandshakeResult from a completed Msg1CoreResult. Shared by
-/// NoiseHandshake::handle_msg1 (initial handshake) and run_rehandshake_msg1: both assemble the
-/// result identically from the core's session and resolved_psk; only msg2 differs, so the
-/// caller sets it afterward.
-/// @param core       Completed core result (session and resolved_psk are moved out of it).
-/// @param server_id  Server peer_id to record on the result.
-NoiseHandshakeResult make_handshake_result(Msg1CoreResult&& core, const IdText& server_id) {
-    NoiseHandshakeResult result;
-    result.session = std::make_unique<NoiseSession>(std::move(core.session));
-    result.server_id = server_id;
-    result.resolved_psk = std::move(core.resolved_psk);
-    return result;
+    return Msg1CoreResult{.session = std::move(session.value()),
+                          .psk_id = resolved->psk_id,
+                          .psk_category = resolved->category,
+                          .msg2_bytes = msg2_bytes};
 }
 
 }  // namespace
@@ -340,7 +332,8 @@ void NoiseHandshake::take_server_error(JsonObjectConst root, const char* log_con
 }
 
 HandshakeFrameResult NoiseHandshake::on_text_frame(
-    std::string_view text, const std::function<bool(const JsonDocument&)>& send_fn) {
+    std::string_view text, const std::function<bool(const JsonDocument&)>& send_fn,
+    std::optional<NoiseHandshakeResult>& completed) {
     if (this->state_ != State::WAIT_SERVER_INIT && this->state_ != State::WAIT_MSG1) {
         SS_LOGE(TAG, "on_text_frame: no frame expected in this state");
         this->state_ = State::ABORTED;
@@ -401,7 +394,7 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
     }
 
     if (!msg1_bytes.has_value() ||
-        !this->handle_msg1({msg1_bytes->data(), msg1_bytes->size()}, send_fn)) {
+        !this->handle_msg1({msg1_bytes->data(), msg1_bytes->size()}, send_fn, completed)) {
         this->state_ = State::ABORTED;
         return HandshakeFrameResult::ABORT;
     }
@@ -448,7 +441,8 @@ bool NoiseHandshake::handle_server_init(int version, const IdText& server_id,
 // ============================================================================
 
 bool NoiseHandshake::handle_msg1(std::span<uint8_t> msg1_bytes,
-                                 const std::function<bool(const JsonDocument&)>& send_fn) {
+                                 const std::function<bool(const JsonDocument&)>& send_fn,
+                                 std::optional<NoiseHandshakeResult>& completed) {
     // Prologue = exact bytes of client/init || server/init
     const uint8_t* prologue = this->prologue_.data();
     const size_t prologue_len = this->client_init_size_ + this->server_init_size_;
@@ -468,9 +462,10 @@ bool NoiseHandshake::handle_msg1(std::span<uint8_t> msg1_bytes,
     }
 
     SS_LOGI(TAG, "Noise handshake complete: server_id=%s psk_category=%d", this->server_id_.c_str(),
-            static_cast<int>(core->resolved_psk.category));
+            static_cast<int>(core->psk_category));
 
-    this->result_ = make_handshake_result(std::move(core.value()), this->server_id_);
+    // Built in the caller's optional, so no result temporary sits on this frame.
+    completed.emplace(std::move(core->session), this->server_id_, core->psk_id, core->psk_category);
 
     return true;
 }
@@ -497,13 +492,14 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
     }
 
     SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%d", known_server_id.c_str(),
-            static_cast<int>(core->resolved_psk.category));
+            static_cast<int>(core->psk_category));
 
-    // The caller wraps msg2 in its noise/handshake envelope and sends it encrypted.
-    const NoiseMsg2 msg2_bytes = core->msg2_bytes;
-    NoiseHandshakeResult result = make_handshake_result(std::move(core.value()), known_server_id);
-    result.msg2_bytes = msg2_bytes;
-    return result;
+    // The caller wraps msg2 in its noise/handshake envelope and sends it encrypted. Returned as a
+    // prvalue, which is built in the caller's optional; a named optional would be moved there,
+    // since this function also returns nullopt.
+    return std::optional<NoiseHandshakeResult>(std::in_place, std::move(core->session),
+                                               known_server_id, core->psk_id, core->psk_category,
+                                               core->msg2_bytes);
 }
 
 }  // namespace sendspin

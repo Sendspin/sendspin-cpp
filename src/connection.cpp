@@ -26,6 +26,7 @@
 #include "time_filter.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -225,8 +226,7 @@ std::optional<int64_t> SendspinConnection::claim_time_frame(int64_t client_trans
 void SendspinConnection::init_noise_handshake(const Identity& identity,
                                               const RecordStore& record_store,
                                               const char* suite_name) {
-    this->noise_handshake_ =
-        std::make_unique<NoiseHandshake>(identity, record_store, suite_name, *this->json_arena_);
+    this->noise_handshake_.emplace(identity, record_store, suite_name, *this->json_arena_);
     // Retain for re-handshake: these pointers outlive connections (owned by the
     // SendspinClient that constructed the manager which called this).
     this->noise_identity_ = &identity;
@@ -264,7 +264,8 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
         return this->send_json(msg) == SsErr::OK;
     };
 
-    HandshakeFrameResult result = this->noise_handshake_->on_text_frame(text, send_fn);
+    std::optional<NoiseHandshakeResult> outcome;
+    HandshakeFrameResult result = this->noise_handshake_->on_text_frame(text, send_fn, outcome);
 
     if (result == HandshakeFrameResult::ABORT) {
         const std::string& server_error = this->noise_handshake_->server_error_reason();
@@ -283,16 +284,11 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
     }
 
     if (result == HandshakeFrameResult::COMPLETE) {
-        auto outcome = this->noise_handshake_->take_result();
-        if (!outcome.has_value()) {
-            SS_LOGE(TAG, "Noise handshake: COMPLETE but no result");
-            this->noise_handshake_.reset();
-            return;
-        }
+        assert(outcome.has_value() && "a completed handshake hands out its result");
         // Record the server's identity (public key) and the PSK category/psk_id that admitted
         // the connection, resolved by the handshake.
-        this->set_noise_handshake_result(outcome->server_id.view(), outcome->resolved_psk.category,
-                                         outcome->resolved_psk.psk_id.view());
+        this->set_noise_handshake_result(outcome->server_id.view(), outcome->psk_category,
+                                         outcome->psk_id.view());
         // pairing.md "Pairing index": a fresh handshake starts a fresh count for the
         // pairing_index / CPace-sid counter.
         this->reset_pairing_index();
@@ -372,8 +368,8 @@ bool SendspinConnection::handle_noise_rehandshake(std::span<uint8_t> msg1_bytes)
     }
 
     // Update PSK metadata from the re-handshake result. server_id is unchanged (same server).
-    this->psk_category_ = result->resolved_psk.category;
-    this->psk_id_ = result->resolved_psk.psk_id;
+    this->psk_category_ = result->psk_category;
+    this->psk_id_ = result->psk_id;
 
     // pairing.md "Pairing index": a re-handshake starts a fresh count for the pairing_index /
     // CPace-sid counter, same as an initial handshake.

@@ -46,7 +46,6 @@ extern "C" {
 #include <array>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -141,8 +140,8 @@ public:
     std::function<void(InboundMessage& message)> on_binary;
 
     /// Install a noise session directly (bypasses handshake, for transport-only tests).
-    void set_noise_session(std::unique_ptr<NoiseSession> session) {
-        this->noise_transport_.activate(std::move(session));
+    void set_noise_session(std::optional<NoiseSession>&& session) {
+        this->noise_transport_.activate(std::move(session.value()));
         this->noise_handshake_complete_ = true;
     }
 
@@ -214,10 +213,10 @@ inline std::optional<std::vector<uint8_t>> extract_noise_bytes(const std::string
 /// The "server" side is noise-c as initiator.
 /// The "client" side is our NoiseHandshake/NoiseSession as responder.
 ///
-/// Returns the initiator cipher pair after split (for transport tests), or nullptr on failure.
+/// Returns the initiator cipher pair after split (for transport tests), or nullopt on failure.
 struct LoopbackResult {
     CipherPair initiator;
-    std::unique_ptr<NoiseSession> responder_session;
+    std::optional<NoiseSession> responder_session;
 
     LoopbackResult() = default;
     LoopbackResult(LoopbackResult&&) = default;
@@ -247,6 +246,7 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     // -----------------------------------------------------------------
     TestArena arena;
     NoiseHandshake nh(client_id, rs, suite_name.c_str(), arena);
+    std::optional<NoiseHandshakeResult> completed;
 
     // Step 1: client sends client/init
     std::string client_init(nh.build_client_init());
@@ -283,7 +283,7 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
         return true;
     };
 
-    HandshakeFrameResult r1 = nh.on_text_frame(server_init_text, send_fn);
+    HandshakeFrameResult r1 = nh.on_text_frame(server_init_text, send_fn, completed);
     EXPECT_EQ(r1, HandshakeFrameResult::NEED_MORE);
     EXPECT_TRUE(captured_msg2.empty());  // No msg2 yet
 
@@ -311,7 +311,7 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     // Step 4: our driver processes msg1
     // on_text_frame should: decrypt msg1, resolve PSK, write msg2, return COMPLETE
     // -----------------------------------------------------------------
-    HandshakeFrameResult r2 = nh.on_text_frame(msg1_text, send_fn);
+    HandshakeFrameResult r2 = nh.on_text_frame(msg1_text, send_fn, completed);
     EXPECT_EQ(r2, HandshakeFrameResult::COMPLETE);
     EXPECT_FALSE(captured_msg2.empty()) << "Expected msg2 to be sent";
 
@@ -352,16 +352,14 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
               NOISE_ERROR_NONE);
     // noise_handshakestate_split does not free the hs; the guard destructor will free it.
 
-    auto outcome = nh.take_result();
-    EXPECT_TRUE(outcome.has_value());
-    if (!outcome.has_value()) {
+    EXPECT_TRUE(completed.has_value());
+    if (!completed.has_value()) {
         return std::nullopt;
     }
-    EXPECT_TRUE(outcome->session != nullptr);
-    EXPECT_FALSE(outcome->server_id.empty());
-    EXPECT_EQ(outcome->server_id, server_id.peer_id());
+    EXPECT_FALSE(completed->server_id.empty());
+    EXPECT_EQ(completed->server_id, server_id.peer_id());
 
-    result.responder_session = std::move(outcome->session);
+    result.responder_session = std::move(completed->session);
     return result;
 }
 

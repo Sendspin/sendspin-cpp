@@ -191,7 +191,7 @@ public:
 
     /// @brief Return true if a Noise handshake driver has been installed on this connection.
     bool has_noise_handshake() const {
-        return this->noise_handshake_ != nullptr;
+        return this->noise_handshake_.has_value();
     }
 
     /// @brief Return the full Noise suite name supplied at init_noise_handshake() (e.g.
@@ -1033,14 +1033,15 @@ protected:
     /// Sends this connection's client/time bursts and feeds its time filter. Protocol task only.
     SendspinTimeBurst time_burst_{};
 
+    /// Noise handshake driver, from init_noise_handshake() until the handshake completes or
+    /// aborts. Protocol task only.
+    std::optional<NoiseHandshake> noise_handshake_;
+
     // Pointer fields
 
     /// Time synchronization filter (Kalman-based). Shared so role threads can hold it without
     /// holding this connection (ConnectionManager::time_filter()).
     std::shared_ptr<SendspinTimeFilter> time_filter_;
-
-    /// Noise handshake driver (active from connection open until handshake complete).
-    std::unique_ptr<NoiseHandshake> noise_handshake_;
 
     /// Retained for re-handshake: pointer to the client identity supplied at
     /// init_noise_handshake(). Lifetime is owned by SendspinClient (outlives connections).

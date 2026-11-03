@@ -30,9 +30,8 @@ static const char* const TAG = "sendspin.noise_transport";
 // Session lifecycle
 // ============================================================================
 
-void NoiseTransport::activate(std::unique_ptr<NoiseSession> session) {
+void NoiseTransport::activate(NoiseSession session) {
     this->session_ = std::move(session);
-    this->active_ = true;
 }
 
 std::optional<std::array<uint8_t, 32>> NoiseTransport::handshake_hash() const {
@@ -58,6 +57,7 @@ size_t NoiseTransport::encrypt_in_place(uint8_t* buf, size_t buf_capacity, size_
 #endif
 
     // noise-c advances the send nonce past a failed encrypt too.
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access): callers check the session first
     const size_t ct_len = this->session_->encrypt(buf, plaintext_len, buf_capacity);
     if (ct_len == 0) {
         SS_LOGE(TAG, "Noise encrypt failed");
@@ -147,7 +147,7 @@ SsErr NoiseTransport::send_binary_lent(OutboundRing& ring, void* item, size_t me
     return err;
 }
 
-SsErr NoiseTransport::send_msg2_and_swap(size_t len, std::unique_ptr<NoiseSession> next_session) {
+SsErr NoiseTransport::send_msg2_and_swap(size_t len, NoiseSession next_session) {
     // msg2 goes out under the OLD session, then the session swaps. Every send runs on the
     // protocol task, as this does, so no encrypt can fall between the two.
     SsErr err = this->send_staged_json(len);
