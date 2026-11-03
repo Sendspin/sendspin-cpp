@@ -268,14 +268,14 @@ std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope
         return std::nullopt;
     }
 
-    const std::optional<size_t> size = b64url_decoded_size(data_b64);
-    if (size.value_or(0) == 0) {
+    const size_t size = b64url_decoded_size(data_b64).value_or(0);
+    if (size == 0) {
         SS_LOGE(TAG, "%s: failed to base64url-decode noise msg1", log_context);
         return std::nullopt;
     }
     PlatformBuffer bytes;
-    if (!bytes.allocate(size.value())) {
-        SS_LOGE(TAG, "%s: no memory to decode %zu bytes", log_context, size.value());
+    if (!bytes.allocate(size)) {
+        SS_LOGE(TAG, "%s: no memory to decode %zu bytes", log_context, size);
         return std::nullopt;
     }
     if (b64url_decode_into(data_b64, bytes.data(), bytes.size()) != size) {

@@ -290,8 +290,7 @@ inline std::optional<size_t> b64url_decode_into(std::string_view s, uint8_t* dst
                 c = '+';
             } else if (c == '_') {
                 c = '/';
-            } else if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                         (c >= '0' && c <= '9'))) {
+            } else if ((c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9')) {
                 return std::nullopt;
             }
             group[k] = static_cast<uint8_t>(c);
