@@ -99,6 +99,7 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
     // Run initial handshake via NoiseHandshake state machine
     TestArena arena;
     NoiseHandshake nh(r.client_id, rs, suite_name.c_str(), arena);
+    std::optional<NoiseHandshakeResult> completed;
     std::string client_init(nh.build_client_init());
     if (client_init.empty()) { return std::nullopt; }
 
@@ -116,7 +117,8 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
         captured_msg2 = to_text(msg);
         return true;
     };
-    EXPECT_EQ(nh.on_text_frame(server_init_text, send_fn), HandshakeFrameResult::NEED_MORE);
+    EXPECT_EQ(nh.on_text_frame(server_init_text, send_fn, completed),
+              HandshakeFrameResult::NEED_MORE);
 
     // Build initiator msg1
     const uint8_t* prologue = reinterpret_cast<const uint8_t*>(prologue_str.data());
@@ -133,7 +135,7 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
         return std::nullopt;
     }
 
-    EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn), HandshakeFrameResult::COMPLETE);
+    EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn, completed), HandshakeFrameResult::COMPLETE);
     if (captured_msg2.empty()) { return std::nullopt; }
 
     // Initiator reads msg2
@@ -159,10 +161,9 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
         return std::nullopt;
     }
 
-    auto outcome = nh.take_result();
-    if (!outcome.has_value()) { return std::nullopt; }
-    r.responder_h = outcome->session.handshake_hash();
-    r.responder_session = std::move(outcome->session);
+    if (!completed.has_value()) { return std::nullopt; }
+    r.responder_h = completed->session.handshake_hash();
+    r.responder_session = std::move(completed->session);
 
     return r;
 }

@@ -250,6 +250,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+    std::optional<NoiseHandshakeResult> completed;
 
     std::string client_init(nh.build_client_init());
     std::string server_init_text = make_server_init(server_id.peer_id());
@@ -258,7 +259,8 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     size_t prologue_len = prologue_str.size();
 
     // server/init: NEED_MORE
-    auto r1 = nh.on_text_frame(server_init_text, [](const JsonDocument&) { return true; });
+    auto r1 =
+        nh.on_text_frame(server_init_text, [](const JsonDocument&) { return true; }, completed);
     EXPECT_EQ(r1, HandshakeFrameResult::NEED_MORE);
 
     // The initiator uses the stored PSK, so only the counterparty binding differs.
@@ -272,7 +274,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id_val);
     ASSERT_FALSE(msg1_text.empty());
 
-    auto r2 = nh.on_text_frame(msg1_text, [](const JsonDocument&) { return true; });
+    auto r2 = nh.on_text_frame(msg1_text, [](const JsonDocument&) { return true; }, completed);
     EXPECT_EQ(r2, HandshakeFrameResult::ABORT);
 }
 
@@ -314,12 +316,14 @@ Msg1Outcome run_msg1_with_payload(
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+    std::optional<NoiseHandshakeResult> completed;
     const std::string client_init(nh.build_client_init());
     const std::string server_init_text = make_server_init(server_id.peer_id());
     const std::string prologue_str = client_init + server_init_text;
 
-    EXPECT_EQ(nh.on_text_frame(server_init_text, [](const JsonDocument&) { return true; }),
-              HandshakeFrameResult::NEED_MORE);
+    EXPECT_EQ(
+        nh.on_text_frame(server_init_text, [](const JsonDocument&) { return true; }, completed),
+        HandshakeFrameResult::NEED_MORE);
 
     NoiseHandshakeState* init_hs_raw = build_initiator(
         std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
@@ -337,18 +341,20 @@ Msg1Outcome run_msg1_with_payload(
 
     Msg1Outcome outcome;
     std::string captured_msg2;
-    outcome.result = nh.on_text_frame(msg1_text, [&captured_msg2](const JsonDocument& msg) {
-        captured_msg2 = to_text(msg);
-        return true;
-    });
+    outcome.result = nh.on_text_frame(
+        msg1_text,
+        [&captured_msg2](const JsonDocument& msg) {
+            captured_msg2 = to_text(msg);
+            return true;
+        },
+        completed);
     if (outcome.result != HandshakeFrameResult::COMPLETE) {
         return outcome;
     }
 
-    auto result = nh.take_result();
-    EXPECT_TRUE(result.has_value());
-    if (result.has_value()) {
-        outcome.category = result->resolved_psk.category;
+    EXPECT_TRUE(completed.has_value());
+    if (completed.has_value()) {
+        outcome.category = completed->psk_category;
     }
 
     // The peer holds the PSK it referenced, so it can only read message 2 if the client bound the
@@ -452,10 +458,11 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingServerInitAborts) {
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+    std::optional<NoiseHandshakeResult> completed;
     nh.build_client_init();
 
     auto r = nh.on_text_frame(R"({"type":"server/error","payload":{"reason":"unsupported_suite"}})",
-                              [](const JsonDocument&) { return true; });
+                              [](const JsonDocument&) { return true; }, completed);
     EXPECT_EQ(r, HandshakeFrameResult::ABORT);
     EXPECT_EQ(nh.server_error_reason(), "unsupported_suite");
 }
@@ -468,10 +475,11 @@ TEST(NoiseHandshakeDriver, AbortWithoutServerErrorReportsNoReason) {
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+    std::optional<NoiseHandshakeResult> completed;
     nh.build_client_init();
 
     auto r = nh.on_text_frame(R"({"type":"server/init","payload":{"version":99}})",
-                              [](const JsonDocument&) { return true; });
+                              [](const JsonDocument&) { return true; }, completed);
     EXPECT_EQ(r, HandshakeFrameResult::ABORT);
     EXPECT_TRUE(nh.server_error_reason().empty());
 }
@@ -485,13 +493,14 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+    std::optional<NoiseHandshakeResult> completed;
     nh.build_client_init();
     ASSERT_EQ(nh.on_text_frame(make_server_init(server_id.peer_id()),
-                               [](const JsonDocument&) { return true; }),
+                               [](const JsonDocument&) { return true; }, completed),
               HandshakeFrameResult::NEED_MORE);
 
     auto r = nh.on_text_frame(R"({"type":"server/error","payload":{"reason":"malformed"}})",
-                              [](const JsonDocument&) { return true; });
+                              [](const JsonDocument&) { return true; }, completed);
     EXPECT_EQ(r, HandshakeFrameResult::ABORT);
     EXPECT_EQ(nh.server_error_reason(), "malformed");
 }
@@ -538,6 +547,7 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
 
         TestArena arena;
         NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+        std::optional<NoiseHandshakeResult> completed;
         nh.build_client_init();
 
         std::string peer_id = server_id.peer_id();
@@ -552,7 +562,8 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
             pad_with_unknown_field(frame, row.padded_to, 2);
             ASSERT_FALSE(HasFatalFailure());
         }
-        EXPECT_EQ(nh.on_text_frame(frame, [](const JsonDocument&) { return true; }), row.expected);
+        EXPECT_EQ(nh.on_text_frame(frame, [](const JsonDocument&) { return true; }, completed),
+                  row.expected);
     }
 }
 
@@ -1332,13 +1343,16 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
 
         TestArena arena;
         NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+        std::optional<NoiseHandshakeResult> completed;
         const std::string client_init(nh.build_client_init());
         const std::string server_init_text = make_server_init(server_id.peer_id());
         auto send_fn = [](const JsonDocument&) { return true; };
-        ASSERT_EQ(nh.on_text_frame(server_init_text, send_fn), HandshakeFrameResult::NEED_MORE);
+        ASSERT_EQ(nh.on_text_frame(server_init_text, send_fn, completed),
+                  HandshakeFrameResult::NEED_MORE);
 
         if (!row.well_formed) {
-            EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope(row.noise_bytes), send_fn),
+            EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope(row.noise_bytes), send_fn,
+                                       completed),
                       row.expected);
             continue;
         }
@@ -1360,7 +1374,7 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
         }
         const std::string msg1_text = build_msg1_envelope_with_payload(init_hs_raw, payload);
         ASSERT_FALSE(msg1_text.empty());
-        EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn), row.expected);
+        EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn, completed), row.expected);
     }
 }
 
