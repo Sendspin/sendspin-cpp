@@ -50,7 +50,6 @@
 #include <functional>
 #include <optional>
 #include <span>
-#include <string>
 #include <string_view>
 #include <utility>
 
@@ -75,6 +74,44 @@ struct NoiseHandshakeResult {
     NoiseMsg2 msg2_bytes{};
 };
 
+/// @brief Why a server refused our client/init: the reasons messaging.md "server/error" defines,
+/// plus UNKNOWN for any other text or none
+enum class ServerErrorReason : uint8_t {
+    UNSUPPORTED_VERSION,  ///< "unsupported_version"
+    UNSUPPORTED_SUITE,    ///< "unsupported_suite"
+    MALFORMED,            ///< "malformed"
+    UNKNOWN,              ///< Any other reason, or none
+};
+
+/// @brief Parses a server/error reason; UNKNOWN for text messaging.md does not define
+inline ServerErrorReason server_error_reason_from_string(std::string_view text) {
+    if (text == "unsupported_version") {
+        return ServerErrorReason::UNSUPPORTED_VERSION;
+    }
+    if (text == "unsupported_suite") {
+        return ServerErrorReason::UNSUPPORTED_SUITE;
+    }
+    if (text == "malformed") {
+        return ServerErrorReason::MALFORMED;
+    }
+    return ServerErrorReason::UNKNOWN;
+}
+
+/// @brief Wire string for a ServerErrorReason; "unknown" for UNKNOWN.
+inline const char* to_cstr(ServerErrorReason reason) {
+    switch (reason) {
+        case ServerErrorReason::UNSUPPORTED_VERSION:
+            return "unsupported_version";
+        case ServerErrorReason::UNSUPPORTED_SUITE:
+            return "unsupported_suite";
+        case ServerErrorReason::MALFORMED:
+            return "malformed";
+        case ServerErrorReason::UNKNOWN:
+            return "unknown";
+    }
+    return "unknown";
+}
+
 /// @brief Result of processing one incoming WS frame during the handshake.
 enum class HandshakeFrameResult : uint8_t {
     NEED_MORE,  ///< Frame processed; waiting for the next frame.
@@ -98,8 +135,8 @@ bool build_noise_handshake_message(std::span<const uint8_t> noise_bytes, JsonDoc
 /// re-handshake's, so the caller can release the parsed envelope before the handshake runs.
 /// @param envelope    Parsed noise/handshake envelope; its type is the caller's to check.
 /// @param log_context Prefix for the failure log line.
-/// @return The decoded bytes, or nullopt (logged) when data is missing, empty or not base64url,
-///         or when their buffer cannot be allocated.
+/// @return The decoded bytes, or nullopt (logged) when data is missing, empty, not base64url or
+///         longer than MAX_HANDSHAKE_MSG1_BYTES, or when their buffer cannot be allocated.
 std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope,
                                                         const char* log_context);
 
@@ -185,12 +222,13 @@ public:
                                        const std::function<bool(const JsonDocument&)>& send_fn,
                                        std::optional<NoiseHandshakeResult>& completed);
 
-    /// @brief The reason carried by a server/error received during the handshake, or empty.
+    /// @brief The reason carried by a server/error received during the handshake, or nullopt
+    /// when none arrived.
     ///
     /// messaging.md "server/error": the server sends one in place of server/init when it cannot
     /// accept our client/init. The message is unauthenticated, so connection.md "Failure Handling"
     /// makes the reason a hint for logging and operator display.
-    const std::string& server_error_reason() const {
+    std::optional<ServerErrorReason> server_error_reason() const {
         return this->server_error_reason_;
     }
 
@@ -231,7 +269,7 @@ private:
     PlatformBuffer prologue_;
 
     /// Reason from a received server/error. See server_error_reason().
-    std::string server_error_reason_;
+    std::optional<ServerErrorReason> server_error_reason_;
 
     /// server_id decoded from server/init (43-char base64url).
     IdText server_id_;

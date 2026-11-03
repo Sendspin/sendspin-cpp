@@ -72,6 +72,19 @@ inline std::optional<PskCategory> psk_category_from_string(std::string_view code
     return std::nullopt;
 }
 
+/// @brief The wire code of `category`; see psk_category_from_string().
+inline const char* to_cstr(PskCategory category) {
+    switch (category) {
+        case PskCategory::LONG_TERM:
+            return "lt";
+        case PskCategory::PAIRING:
+            return "pr";
+        case PskCategory::SENTINEL:
+            return "sn";
+    }
+    return "unknown";
+}
+
 // ============================================================================
 // Resolved PSK (handshake currency)
 // ============================================================================

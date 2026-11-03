@@ -18,6 +18,7 @@
 #include "crypto/keys.h"
 #include "noise_session.h"
 #include "platform/base64.h"
+#include "platform/crypto.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
@@ -30,6 +31,14 @@
 static const char* const TAG = "sendspin.noise_handshake";
 
 namespace sendspin {
+
+/// Most bytes of unauthenticated peer text (a frame's type, a server/error reason) one log line
+/// prints. The longest such value messaging.md defines is 19 bytes.
+static constexpr size_t PEER_TEXT_LOG_BYTES = 32;
+
+static_assert(MAX_HANDSHAKE_MSG1_BYTES ==
+                  X25519_KEY_SIZE + MAX_HANDSHAKE_MESSAGE_BYTES + AEAD_TAG_SIZE,
+              "message 1 is the ephemeral key, the payload and its tag");
 
 // ============================================================================
 // JSON serialization helpers
@@ -168,7 +177,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     }
 
     // Parse psk_id from the decrypted msg1 payload: {"psk_id":"...","psk_category":"..."}. The
-    // payload is released as soon as its two fields are copied out, so the msg2 envelope the
+    // payload is released as soon as its two fields are read out, so the msg2 envelope the
     // caller builds has the arena to itself.
     ParsedJsonMessage payload(arena);
     if (!payload.parse(reinterpret_cast<const char*>(msg1_payload.data()), payload_size.value())) {
@@ -179,12 +188,12 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     IdText psk_id;
     bool psk_id_present = false;
     bool psk_id_held = false;
-    std::string psk_category_code;
+    std::optional<PskCategory> psk_category;
     payload.extract([&](JsonObjectConst root) {
-        const std::string_view text = root["psk_id"] | "";
+        const std::string_view text = root["psk_id"] | std::string_view("");
         psk_id_present = !text.empty();
         psk_id_held = psk_id.assign(text);
-        psk_category_code = root["psk_category"] | "";
+        psk_category = psk_category_from_string(root["psk_category"] | std::string_view(""));
     });
 
     if (!psk_id_present) {
@@ -195,16 +204,14 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     // messaging.md "noise/handshake": the payload declares which category the server is using the
     // referenced PSK as. A missing or unknown code is a malformed payload, which connection.md
     // "Failure Handling" makes a silent failure.
-    auto psk_category = psk_category_from_string(psk_category_code);
     if (!psk_category.has_value()) {
-        SS_LOGE(TAG, "%s: msg1 payload psk_category missing or unknown ('%s')", log_prefix,
-                psk_category_code.c_str());
+        SS_LOGE(TAG, "%s: msg1 payload psk_category missing or not 'lt', 'pr' or 'sn'", log_prefix);
         return std::nullopt;
     }
 
     const char* const psk_id_text = psk_id_held ? psk_id.c_str() : "(longer than a psk_id)";
     SS_LOGD(TAG, "%s: psk_id='%s' psk_category='%s'", log_prefix, psk_id_text,
-            psk_category_code.c_str());
+            to_cstr(*psk_category));
 
     std::optional<ResolvedPsk> resolved =
         psk_id_held ? record_store.resolve_by_psk_id(psk_id.view(), psk_category.value())
@@ -228,7 +235,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
         // "Pairing Records": an evicted record needs no wire signal of its own). Failing here
         // instead would leave a client that lost its record reconnect-looping with no way back.
         SS_LOGW(TAG, "%s: no '%s' PSK for psk_id='%s'; answering with the Sentinel PSK", log_prefix,
-                psk_category_code.c_str(), psk_id_text);
+                to_cstr(*psk_category), psk_id_text);
         resolved = record_store.resolve_by_psk_id(SENTINEL_PSK_ID, PskCategory::SENTINEL);
         if (!resolved.has_value()) {
             SS_LOGE(TAG, "%s: the Sentinel PSK did not resolve", log_prefix);
@@ -237,7 +244,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     } else {
         // connection.md "Sentinel Fallback" applies to the initial handshake alone.
         SS_LOGW(TAG, "%s: no '%s' PSK for psk_id='%s', aborting", log_prefix,
-                psk_category_code.c_str(), psk_id_text);
+                to_cstr(*psk_category), psk_id_text);
         return std::nullopt;
     }
 
@@ -269,7 +276,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
 
 std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope,
                                                         const char* log_context) {
-    const std::string_view data_b64 = envelope["payload"]["data"] | "";
+    const std::string_view data_b64 = envelope["payload"]["data"] | std::string_view("");
     if (data_b64.empty()) {
         SS_LOGE(TAG, "%s: missing data field", log_context);
         return std::nullopt;
@@ -278,6 +285,11 @@ std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope
     const size_t size = b64url_decoded_size(data_b64).value_or(0);
     if (size == 0) {
         SS_LOGE(TAG, "%s: failed to base64url-decode noise msg1", log_context);
+        return std::nullopt;
+    }
+    if (size > MAX_HANDSHAKE_MSG1_BYTES) {
+        SS_LOGE(TAG, "%s: noise msg1 of %zu bytes is longer than %zu", log_context, size,
+                MAX_HANDSHAKE_MSG1_BYTES);
         return std::nullopt;
     }
     PlatformBuffer bytes;
@@ -324,10 +336,13 @@ std::string_view NoiseHandshake::build_client_init() {
 
 void NoiseHandshake::take_server_error(JsonObjectConst root, const char* log_context) {
     // The handshake aborts either way; recognizing the message is what gives the abort the
-    // server's own account of the refusal.
-    this->server_error_reason_ = root["payload"]["reason"] | "";
-    SS_LOGE(TAG, "%s: server/error, reason='%s'; the server refused the connection", log_context,
-            this->server_error_reason_.c_str());
+    // server's own account of the refusal. The frame is unauthenticated, so its text is read in
+    // place and logged only up to PEER_TEXT_LOG_BYTES, never copied.
+    const std::string_view text = root["payload"]["reason"] | std::string_view("");
+    this->server_error_reason_ = server_error_reason_from_string(text);
+    const std::string_view logged = text.substr(0, PEER_TEXT_LOG_BYTES);
+    SS_LOGE(TAG, "%s: server/error, reason='%.*s'; the server refused the connection", log_context,
+            static_cast<int>(logged.size()), logged.data());
 }
 
 HandshakeFrameResult NoiseHandshake::on_text_frame(
@@ -357,23 +372,25 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
     IdText server_id;
     std::optional<PlatformBuffer> msg1_bytes;
     const bool expected = frame.extract([&](JsonObjectConst root) {
-        const char* type = root["type"] | "";
+        const std::string_view type = root["type"] | std::string_view("");
         // messaging.md "server/error": sent in place of server/init when the server cannot
         // accept our client/init. Recognized in either wait so an abort names the server's
         // reason.
-        if (std::strcmp(type, "server/error") == 0) {
+        if (type == "server/error") {
             this->take_server_error(root, log_context);
             return false;
         }
-        if (std::strcmp(type, expected_type) != 0) {
-            SS_LOGE(TAG, "%s: unexpected type '%s'", log_context, type);
+        if (type != expected_type) {
+            const std::string_view logged = type.substr(0, PEER_TEXT_LOG_BYTES);
+            SS_LOGE(TAG, "%s: unexpected type '%.*s'", log_context, static_cast<int>(logged.size()),
+                    logged.data());
             return false;
         }
         if (awaiting_server_init) {
             version = root["payload"]["version"] | 0;
             // Refused when longer than a peer_id, leaving it empty for handle_server_init() to
             // reject.
-            (void)server_id.assign(root["payload"]["server_id"] | "");
+            (void)server_id.assign(root["payload"]["server_id"] | std::string_view(""));
         } else {
             msg1_bytes = read_noise_handshake_data(root, to_cstr(HandshakeKind::INITIAL));
         }
@@ -461,8 +478,8 @@ bool NoiseHandshake::handle_msg1(std::span<uint8_t> msg1_bytes,
         return false;
     }
 
-    SS_LOGI(TAG, "Noise handshake complete: server_id=%s psk_category=%d", this->server_id_.c_str(),
-            static_cast<int>(core->psk_category));
+    SS_LOGI(TAG, "Noise handshake complete: server_id=%s psk_category=%s", this->server_id_.c_str(),
+            to_cstr(core->psk_category));
 
     // Built in the caller's optional, so no result temporary sits on this frame.
     completed.emplace(std::move(core->session), this->server_id_, core->psk_id, core->psk_category);
@@ -488,8 +505,8 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
         return std::nullopt;
     }
 
-    SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%d", server_id.c_str(),
-            static_cast<int>(core->psk_category));
+    SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%s", server_id.c_str(),
+            to_cstr(core->psk_category));
 
     // The caller wraps msg2 in its noise/handshake envelope and sends it encrypted. Returned as a
     // prvalue, which is built in the caller's optional; a named optional would be moved there,

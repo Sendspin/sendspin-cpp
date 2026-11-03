@@ -661,8 +661,8 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn,
     if (!activation_admissible) {
         const SendspinGoodbyeReason reject_reason = inadmissible_reject_reason(
             conn->get_psk_category(), msg.activities, has_roles, unpaired_access);
-        SS_LOGW(TAG, "server/activate inadmissible (psk_category=%d): closing with %s",
-                static_cast<int>(conn->get_psk_category()),
+        SS_LOGW(TAG, "server/activate inadmissible (psk_category=%s): closing with %s",
+                to_cstr(conn->get_psk_category()),
                 reject_reason == SendspinGoodbyeReason::PAIRING_REQUIRED ? "pairing_required"
                                                                          : "unauthorized");
         this->drop_connection(conn, reject_reason);

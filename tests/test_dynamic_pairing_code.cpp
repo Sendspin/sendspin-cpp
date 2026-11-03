@@ -110,10 +110,12 @@ TEST(DynamicPairingCode, ParseServerPairInitRejectsMalformedNonce) {
     std::array<uint8_t, 32> nonce_a{};
     for (int i = 0; i < 32; ++i) nonce_a[i] = static_cast<uint8_t>(i);
     std::array<uint8_t, 16> short_nonce{};
+    std::array<uint8_t, 33> long_nonce{};
 
     const ParseRow rows[] = {
         {"nonce_A-not-a-string", R"({"type":"server/pair-init","payload":{"nonce_A":5}})", false},
         {"nonce_A-16-bytes", make_pair_init_json(b64url(short_nonce)), false},
+        {"nonce_A-33-bytes", make_pair_init_json(b64url(long_nonce)), false},
         {"nonce_A-not-base64",
          R"({"type":"server/pair-init","payload":{"nonce_A":"!!!not_base64!!!"}})", false},
         // Control: a 32-byte base64url nonce_A.
@@ -198,10 +200,12 @@ TEST(DynamicPairingCode, ParseServerPairAuthRejectsMalformedPakeMsg1) {
     std::array<uint8_t, 32> pake_msg_1{};
     for (int i = 0; i < 32; ++i) pake_msg_1[i] = static_cast<uint8_t>(i + 10);
     std::array<uint8_t, 16> short_share{};
+    std::array<uint8_t, 33> long_share{};
 
     const ParseRow rows[] = {
         {"pake_msg_1-missing", R"({"type":"server/pair-auth","payload":{}})", false},
         {"pake_msg_1-16-bytes", make_pair_auth_json(b64url(short_share)), false},
+        {"pake_msg_1-33-bytes", make_pair_auth_json(b64url(long_share)), false},
         {"pake_msg_1-not-base64",
          R"({"type":"server/pair-auth","payload":{"pake_msg_1":"!!!not_valid!!!"}})", false},
         // Control: a 32-byte base64url pake_msg_1.
@@ -230,10 +234,12 @@ TEST(DynamicPairingCode, ParseServerPairConfirmRejectsMalformedServerKc) {
     std::array<uint8_t, 64> server_kc{};
     for (int i = 0; i < 64; ++i) server_kc[i] = static_cast<uint8_t>(i);
     std::array<uint8_t, 32> short_kc{};
+    std::array<uint8_t, 65> long_kc{};
 
     const ParseRow rows[] = {
         {"server_kc-missing", R"({"type":"server/pair-confirm","payload":{}})", false},
         {"server_kc-32-bytes", make_pair_confirm_json(b64url(short_kc)), false},
+        {"server_kc-65-bytes", make_pair_confirm_json(b64url(long_kc)), false},
         {"server_kc-not-base64",
          R"({"type":"server/pair-confirm","payload":{"server_kc":"!!!not_valid!!!"}})", false},
         // Control: a 64-byte base64url server_kc.

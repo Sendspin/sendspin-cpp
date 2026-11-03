@@ -79,7 +79,7 @@ std::optional<std::array<uint8_t, X25519_KEY_SIZE>> public_key_from_peer_id(
         return std::nullopt;
     }
     std::array<uint8_t, X25519_KEY_SIZE> key{};
-    if (b64url_decode_into(peer_id, key.data(), key.size()) != X25519_KEY_SIZE) {
+    if (!b64url_decode_exact(peer_id, key)) {
         return std::nullopt;
     }
     // The last character carries 2 unused bits; a nonzero pair decodes to the same key.

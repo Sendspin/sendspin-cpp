@@ -48,6 +48,7 @@ extern "C" {
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -167,7 +168,7 @@ public:
 /// Build and return `server/init` JSON for the given server_id and version. `type` is a
 /// parameter so a test can send the same payload under another envelope type.
 inline std::string make_server_init(const std::string& server_id, int version = 1,
-                                    const char* type = "server/init") {
+                                    std::string_view type = "server/init") {
     JsonDocument doc;
     doc["type"] = type;
     doc["payload"]["server_id"] = server_id;

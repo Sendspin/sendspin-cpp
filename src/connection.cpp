@@ -260,13 +260,13 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
     HandshakeFrameResult result = this->noise_handshake_->on_text_frame(text, send_fn, outcome);
 
     if (result == HandshakeFrameResult::ABORT) {
-        const std::string& server_error = this->noise_handshake_->server_error_reason();
-        if (server_error.empty()) {
+        const std::optional<ServerErrorReason> server_error =
+            this->noise_handshake_->server_error_reason();
+        if (!server_error.has_value()) {
             SS_LOGW(TAG, "Noise handshake aborted; closing connection");
         } else {
-            SS_LOGW(TAG,
-                    "Noise handshake aborted by server/error (reason='%s'); closing connection",
-                    server_error.c_str());
+            SS_LOGW(TAG, "Noise handshake aborted by server/error (reason=%s); closing connection",
+                    to_cstr(*server_error));
         }
         // connection.md "Failure Handling": a handshake-phase failure closes the WebSocket
         // without sending any application-level message.
@@ -288,8 +288,8 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
         this->noise_transport_.activate(std::move(outcome->session));
         this->noise_handshake_.reset();
         this->noise_handshake_complete_ = true;
-        SS_LOGI(TAG, "Noise transport active (server_id=%s, psk_category=%d)",
-                this->server_id_.c_str(), static_cast<int>(this->get_psk_category()));
+        SS_LOGI(TAG, "Noise transport active (server_id=%s, psk_category=%s)",
+                this->server_id_.c_str(), to_cstr(this->get_psk_category()));
     }
 
     // NEED_MORE, or COMPLETE handled above: nothing else to do until the next frame.
@@ -370,8 +370,8 @@ bool SendspinConnection::handle_noise_rehandshake(std::span<uint8_t> msg1_bytes)
     // untouched; the server's first message under the new keys is server/activate, which
     // first_activate_received_ (cleared above) now waits on.
     SS_LOGI(TAG,
-            "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/activate",
-            this->server_id_.c_str(), static_cast<int>(this->get_psk_category()));
+            "Noise re-handshake complete: server_id=%s psk_category=%s; awaiting server/activate",
+            this->server_id_.c_str(), to_cstr(this->get_psk_category()));
     return true;
 }
 
