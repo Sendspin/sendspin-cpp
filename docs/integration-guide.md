@@ -1139,9 +1139,9 @@ The client and roles expose query methods for polling state in your main loop or
 
 ```cpp
 // Client state
+bool paired = client.is_paired();              // Active connection is a paired session (read first)
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
-bool paired = client.is_paired();              // Active connection is a paired session
 const GroupUpdateObject& group = client.get_group_state();   // Group id, name, playback state (all optional)
 
 // Player state

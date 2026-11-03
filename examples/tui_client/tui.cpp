@@ -705,11 +705,11 @@ static Element render_server_selector(const TuiSnapshot& snap) {
     });
 }
 
-// Shown while no paired session is connected: the Pairing PSK token an operator pastes into a
-// server that only offers the mandatory pairing_psk method (dynamic_pairing_code needs nothing shown
-// here; the code itself appears in the Server panel's pairing status row instead). Wrapped across
-// the full terminal width since the token (107 chars) does not fit any of the three info panels
-// above.
+// Shown while the client has no paired session: the Pairing PSK token an operator pastes into a
+// server that only offers the mandatory pairing_psk method (dynamic_pairing_code needs nothing
+// shown here; the code itself appears in the Server panel's pairing status row instead). Wrapped
+// across the full terminal width since the token (107 chars) does not fit any of the three info
+// panels above.
 static Element render_pairing_token(const TuiSnapshot& snap) {
     return window(text(" Pairing Token ") | bold,
                   vbox({
@@ -770,7 +770,7 @@ static Element render_tui(TuiState& state) {
     if (!snap.artwork_channels.empty() || snap.color_received) {
         sections.push_back(render_artwork_and_color(snap));
     }
-    // Show the Pairing PSK token only while no paired session is connected: during one, the
+    // Show the Pairing PSK token only while the client has no paired session: during one, the
     // vertical space goes back to filler().
     if (!snap.pairing_token.empty() && !snap.paired) {
         sections.push_back(render_pairing_token(snap));
