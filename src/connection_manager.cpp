@@ -619,7 +619,8 @@ void ConnectionManager::apply_unpaired_access_change(bool enabled) {
 // Protocol task: message handlers
 // ============================================================================
 
-void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActivateMessage&& msg) {
+void ConnectionManager::on_server_activate(SendspinConnection* conn,
+                                           const ServerActivateMessage& msg) {
     NurseryEntry* nursery_entry = this->find_in_nursery(conn);
     AdmittedEntry* admitted_entry = this->find_admitted(conn);
     if (nursery_entry == this->nursery_.end() && admitted_entry == nullptr) {

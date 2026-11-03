@@ -534,7 +534,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 // ownership and, for a nursery connection that is now operational, admission
                 // all land here, so the role traffic the server sends behind this activate
                 // meets the gate this activation set.
-                this->connection_manager_->on_server_activate(conn, std::move(activate_msg));
+                this->connection_manager_->on_server_activate(conn, activate_msg);
             }
             break;
         }

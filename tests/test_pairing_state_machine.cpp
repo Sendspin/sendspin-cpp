@@ -619,8 +619,7 @@ protected:
         message.active_roles = std::move(active_roles);
         message.pairing_method = pairing_method;
         message.pairing_format = pairing_format;
-        this->client_->connection_manager_->on_server_activate(this->injected_conn_.get(),
-                                                               std::move(message));
+        this->client_->connection_manager_->on_server_activate(this->injected_conn_.get(), message);
     }
 
     /// Put the injected connection into, or out of, the state
