@@ -528,7 +528,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 SS_LOGD(TAG, "server/activate received (playback=%d, pairing=%d)",
                         activate_msg.activities.contains(SendspinActivity::PLAYBACK),
                         activate_msg.activities.contains(SendspinActivity::PAIRING));
-                // Applied before the next message is parsed: trust enforcement, role
+                // Applied before the next message is parsed: the admissibility check, role
                 // ownership and, for a nursery connection that is now operational, admission
                 // all land here, so the role traffic the server sends behind this activate
                 // meets the gate this activation set.
@@ -757,7 +757,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             break;
         }
         case SendspinServerToClientMessageType::SERVER_UNPAIR: {
-            // server/unpair. Trust gating (LONG_TERM only) happens in handle_server_unpair.
+            // server/unpair. The LONG_TERM-only check happens in handle_server_unpair.
             parsed.release();
             SS_LOGI(TAG, "server/unpair received (psk_id=%s)", conn->get_psk_id().c_str());
             this->connection_manager_->on_server_unpair(conn);

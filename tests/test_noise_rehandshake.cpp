@@ -34,6 +34,7 @@
 #include "platform/base64.h"
 #include "platform/crypto.h"
 #include "record_store.h"
+#include "record_test_helpers.h"
 #include "sendspin/config.h"
 #include "test_util.h"
 
@@ -235,8 +236,9 @@ static std::optional<RehandshakeResult> run_rehandshake(
     }
 
     std::vector<uint8_t> msg1_bytes = msg1_bytes_of(msg1_json);
-    auto result = run_rehandshake_msg1(msg1_bytes, init.server_id.peer_id(), init.client_id, rs,
-                                       suite_name.c_str(), prior_h, TestArena());
+    auto result =
+        run_rehandshake_msg1(msg1_bytes, id_text(init.server_id.peer_id()), init.client_id, rs,
+                             suite_name.c_str(), prior_h, TestArena());
     if (!result.has_value()) {
         ADD_FAILURE() << "run_rehandshake_msg1 returned nullopt";
         return std::nullopt;
@@ -388,8 +390,9 @@ TEST(NoiseRehandshake, UnknownPskIdAborts) {
 
     // run_rehandshake_msg1 must return nullopt (unknown psk_id).
     std::vector<uint8_t> msg1_bytes = msg1_bytes_of(msg1_json);
-    auto result = run_rehandshake_msg1(msg1_bytes, init.server_id.peer_id(), init.client_id,
-                                       empty_rs, suite.c_str(), prior_h, TestArena());
+    auto result =
+        run_rehandshake_msg1(msg1_bytes, id_text(init.server_id.peer_id()), init.client_id,
+                             empty_rs, suite.c_str(), prior_h, TestArena());
     EXPECT_FALSE(result.has_value())
         << "run_rehandshake_msg1 should fail with an unknown psk_id";
 }

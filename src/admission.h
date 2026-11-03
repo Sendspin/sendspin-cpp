@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// @file admission.h
-/// @brief Pure functions for server/activate trust enforcement, multi-server admission
+/// @brief Pure functions for the server/activate admissibility check, multi-server admission
 /// arbitration, and role ownership among admitted connections.
 ///
 /// Implements the allowed-activity-set table and the rejection order in messaging.md
@@ -37,7 +37,7 @@
 namespace sendspin {
 
 // ============================================================================
-// Trust enforcement (PSK category -> allowed activities)
+// Admissibility (PSK category -> allowed activities)
 // ============================================================================
 
 /// @brief Whether an activity set is allowed for the matched PSK category.

@@ -25,7 +25,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <string>
 #include <string_view>
 
 namespace sendspin {
@@ -46,10 +45,9 @@ static constexpr std::string_view PSK_ID_LABEL{"sendspin-psk-id-v1"};
 /// Expected hex: 1b5e24dbc1aed95fc2a5a338a90c05df44bd10f5ec1f4cd66cbf86272767b9d3
 extern const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK;
 
-/// @brief The psk_id for the Sentinel PSK: base64url(SHA-256(PSK_ID_LABEL || SENTINEL_PSK)).
-/// Expected value: "GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo"
-/// Computed once at startup by constants.cpp.
-extern const std::string SENTINEL_PSK_ID;
+/// @brief The psk_id for the Sentinel PSK: base64url(SHA-256(PSK_ID_LABEL || SENTINEL_PSK)), the
+/// value connection.md "Pre-Shared Key" publishes.
+static constexpr std::string_view SENTINEL_PSK_ID = "GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo";
 
 // ============================================================================
 // Cipher suite name (passed to noise_protocol_name_to_id)
@@ -77,8 +75,16 @@ static constexpr size_t MAX_TRANSPORT_PLAINTEXT = 65535 - 16;  // = 65519
 /// without paying for a buffer sized like transport-mode traffic. noise-c bounds-checks against
 /// this capacity and returns an error rather than overflowing it if a peer's payload does not fit
 /// (verified against noise_handshakestate_read_message()'s payload->max_size check), so a longer
-/// payload fails the handshake rather than corrupting memory.
+/// payload fails the handshake rather than corrupting memory. MAX_SERVER_INIT_BYTES bounds the
+/// handshake's other peer input.
 static constexpr size_t MAX_HANDSHAKE_MESSAGE_BYTES = 512;
+
+/// @brief Largest server/init the handshake keeps for its prologue: about five times the minimal
+/// frame, a version and a PEER_ID_SIZE server_id in about 104 bytes (messaging.md "server/init").
+/// It bounds the prologue buffer each handshake holds; the cost is that a later revision's
+/// optional fields, which messaging.md "Forward compatibility" has the client ignore, must keep
+/// the frame under it. MAX_HANDSHAKE_MESSAGE_BYTES bounds the handshake's other peer input.
+static constexpr size_t MAX_SERVER_INIT_BYTES = 512;
 
 /// @brief Per-connection reassembly buffer cap: 1 MiB.
 /// Artwork is never fragmented: roles/artwork/v1.md "Artwork (Binary)" caps a message at

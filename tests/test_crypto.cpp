@@ -194,8 +194,8 @@ TEST(CryptoConstants, SentinelPskMatchesSpecHex) {
 }
 
 TEST(CryptoConstants, SentinelPskIdMatchesSpecConstant) {
-    // psk_id_for(SENTINEL_PSK) must equal the spec's published identifier.
-    EXPECT_EQ(SENTINEL_PSK_ID, "GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo");
+    // The published identifier must be the one psk_id_for() derives from the Sentinel PSK.
+    EXPECT_EQ(psk_id_for(SENTINEL_PSK), SENTINEL_PSK_ID);
 }
 
 TEST(CryptoConstants, PskIdLabelIsLiteralUtf8NoNul) {

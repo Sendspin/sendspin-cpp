@@ -122,7 +122,8 @@ SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int so
 }
 
 void SendspinServerConnection::start() {
-    // Time filter is initialized by the hub when it sets up the connection.
+    // No action needed: the ws_server delivers the connection only once its WebSocket upgrade
+    // completes, so the transport is already established by then.
 }
 
 void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason) {

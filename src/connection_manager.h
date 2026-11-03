@@ -468,9 +468,9 @@ public:
     // Protocol task: message handlers
     // ========================================
 
-    /// @brief Applies a server/activate: trust enforcement, pairing-method admissibility, role
-    /// ownership and removals, and, for a nursery connection that is now operational, admission
-    /// before this returns.
+    /// @brief Applies a server/activate: the admissibility check, the pairing-method check,
+    /// role ownership and removals, and, for a nursery connection that is now operational,
+    /// admission before this returns.
     void on_server_activate(SendspinConnection* conn, const ServerActivateMessage& msg);
 
     /// @brief Handles a pair/abort from the server (an unrecognized reason arrives as
@@ -605,12 +605,12 @@ public:
     /// @param server_id The server_id of the last-played server; empty, or longer than a peer_id,
     ///                  clears it.
     void set_last_played_server_id(std::string_view server_id) {
-        this->last_played_server_id_.assign(server_id);
+        (void)this->last_played_server_id_.assign(server_id);
     }
 
     /// @brief Returns the current last-played server_id, empty if unset. Protocol task.
-    std::string_view last_played_server_id() const {
-        return this->last_played_server_id_.view();
+    const IdText& last_played_server_id() const {
+        return this->last_played_server_id_;
     }
 
 private:
@@ -723,7 +723,7 @@ private:
 
     /// @brief Decides whether an incoming connection should displace an admitted one.
     ///
-    /// Applies admission.h::should_admit_connection; trust enforcement runs earlier, on the
+    /// Applies admission.h::should_admit_connection; the admissibility check runs earlier, on the
     /// activate.
     /// @param admitted The admitted connection the incoming one conflicts with, or nullptr.
     /// @param new_conn The newly proven candidate connection. Must not be null.
@@ -769,7 +769,7 @@ private:
     /// Removing a record from the RecordStore does not by itself end a session that is already
     /// running on it: a connection caches its resolved psk_id and PSK category at Noise-handshake
     /// completion (see SendspinConnection::get_psk_category()) and never re-resolves them against
-    /// the store. Without this sweep a revoked device would keep its LONG_TERM trust (and with
+    /// the store. Without this sweep a revoked device would keep its LONG_TERM category (and with
     /// it playback) until it happened to disconnect, so revocation would not take effect until
     /// the peer's next connection.
     ///

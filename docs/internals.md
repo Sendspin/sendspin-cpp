@@ -277,7 +277,7 @@ Role-bound traffic reaches a role only from the admitted connection that owns it
 | Message | Action on the protocol task |
 |---------|------------------------------|
 | `server/hello` | Records server info and the codecs its source@v1 support object lists on the connection, and sets `server_hello_received_` |
-| `server/activate` | `ConnectionManager::on_server_activate()`: trust and pairing-method checks, what the roles owed until the activation (`SendspinClient::on_activation_applied()`), role ownership and removals, and admission of a nursery connection the activation makes operational |
+| `server/activate` | `ConnectionManager::on_server_activate()`: admissibility and pairing-method checks, what the roles owed until the activation (`SendspinClient::on_activation_applied()`), role ownership and removals, and admission of a nursery connection the activation makes operational |
 | `server/time` | Claims the connection's `client/time` frame in flight, dropping a reply that answers none, and feeds the measurement to the connection's own time burst |
 | `server/state` | Writes the controller, metadata, and color `InboxSlot`s |
 | `server/command` | Merges the player object into the player's `command_slot`; the source object starts or ends the input stream (see [Source Stream Start and End](#source-stream-start-and-end)) |
@@ -389,7 +389,7 @@ Every role this client drives has at most one owner among the admitted connectio
 
 1. An inbound connection is delivered by the platform server once its WebSocket upgrade completes, as an accept in the command queue; the protocol task takes it into the nursery and sends `client/init`. An outbound connection enters the nursery from `connect_to()` and sends `client/init` once its upgrade completes. The rest of the Noise handshake runs on the protocol task as messages arrive.
 2. Once `server/hello` arrives, the nursery scan sends `client/hello` (messaging.md "Client -> Server: client/hello").
-3. The connection is operational once both hellos are exchanged and its first `server/activate` arrives, in either order relative to the hellos. That activate is checked against the connection's trust when it is processed, and a rejected one closes the connection.
+3. The connection is operational once both hellos are exchanged and its first `server/activate` arrives, in either order relative to the hellos. That activate is checked for admissibility against the connection's PSK category when it is processed, and a rejected one closes the connection.
 4. The activation handler admits a connection the activation makes operational before it returns (the nursery scan covers a hello that completes after the activation), arbitrating against the admitted connections it conflicts with, mainly by highest activity (playback over pairing over none); `should_admit_connection()` in `src/admission.h` has the full rules.
 5. A losing newcomer is released with a goodbye; a displaced incumbent is dropped, and the roles no remaining connection owns are torn down.
 

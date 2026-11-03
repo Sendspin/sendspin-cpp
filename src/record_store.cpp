@@ -225,15 +225,17 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(std::string_view psk_i
     // Only the declared category's candidates are searched (connection.md "Pre-Shared Key"): the
     // same psk_id under another category is a lookup miss, which keeps a server from using, say, a
     // long-term PSK as though it were the Pairing PSK and inheriting that category's activities.
+    // Every id below is PEER_ID_SIZE characters (psk_id_for(), the record codec and the handshake
+    // that bound the record), so each assign() fits.
     switch (category) {
         case PskCategory::LONG_TERM: {
             const SendspinPairingRecord* rec = this->record_by_psk_id(psk_id);
             if (rec != nullptr) {
                 ResolvedPsk r;
-                r.psk_id.assign(rec->psk_id);
+                (void)r.psk_id.assign(rec->psk_id);
                 r.psk = rec->psk;
                 r.category = PskCategory::LONG_TERM;
-                r.counterparty_id.emplace().assign(rec->server_id);
+                (void)r.counterparty_id.assign(rec->server_id);
                 return r;
             }
             break;
@@ -241,7 +243,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(std::string_view psk_i
         case PskCategory::PAIRING: {
             if (this->pairing_psk_.has_value() && this->pairing_psk_->psk_id == psk_id) {
                 ResolvedPsk r;
-                r.psk_id.assign(this->pairing_psk_->psk_id);
+                (void)r.psk_id.assign(this->pairing_psk_->psk_id);
                 r.psk = this->pairing_psk_->psk;
                 r.category = PskCategory::PAIRING;
                 return r;
@@ -251,7 +253,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(std::string_view psk_i
         case PskCategory::SENTINEL: {
             if (psk_id == SENTINEL_PSK_ID) {
                 ResolvedPsk r;
-                r.psk_id.assign(SENTINEL_PSK_ID);
+                (void)r.psk_id.assign(SENTINEL_PSK_ID);
                 r.psk = SENTINEL_PSK;
                 r.category = PskCategory::SENTINEL;
                 return r;

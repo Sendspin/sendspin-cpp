@@ -60,7 +60,7 @@ public:
 
     /// @brief Holds `text`.
     /// @return false, leaving the text empty, when `text` is longer than N.
-    bool assign(std::string_view text) {
+    [[nodiscard]] bool assign(std::string_view text) {
         if (text.size() > N) {
             this->set(std::string_view{});
             return false;

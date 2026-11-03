@@ -132,16 +132,9 @@ std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope
 /// @return Populated NoiseHandshakeResult (session + msg2_bytes to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    std::span<uint8_t> msg1_bytes, std::string_view server_id, const Identity& identity,
+    std::span<uint8_t> msg1_bytes, const IdText& server_id, const Identity& identity,
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena);
-
-/// @brief Largest server/init the handshake keeps for its prologue: about five times the minimal
-/// frame, a version and a PEER_ID_SIZE server_id in about 104 bytes (messaging.md "server/init").
-/// It bounds the prologue buffer each handshake holds; the cost is that a later revision's
-/// optional fields, which messaging.md "Forward compatibility" has the client ignore, must keep
-/// the frame under it.
-static constexpr size_t MAX_SERVER_INIT_BYTES = 512;
 
 // ============================================================================
 // NoiseHandshake class (initial handshake state machine)

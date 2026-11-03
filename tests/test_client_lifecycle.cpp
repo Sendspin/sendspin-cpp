@@ -1926,7 +1926,7 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
         ConnectionManager& manager = *client.connection_manager_;
         manager.liveness_timeout_us_ = 0;
         auto conn = std::make_shared<StubConnection>();
-        conn->set_noise_handshake_result("server", PskCategory::LONG_TERM, "psk");
+        conn->set_noise_handshake_result(id_text("server"), PskCategory::LONG_TERM, id_text("psk"));
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
         conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{},

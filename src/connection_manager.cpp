@@ -652,13 +652,13 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn,
         msg.active_roles.value_or(playback_capable ? conn->get_active_roles() : ActiveRoles{});
     const bool has_roles = !effective_roles.empty();
 
-    // Trust enforcement against the PSK category the Noise handshake resolved for this
+    // The admissibility check against the PSK category the Noise handshake resolved for this
     // connection. Every connection has one: no server/activate can arrive before the
     // handshake completes.
-    const bool trust_ok =
+    const bool activation_admissible =
         admissible(conn->get_psk_category(), msg.activities, has_roles, unpaired_access);
 
-    if (!trust_ok) {
+    if (!activation_admissible) {
         const SendspinGoodbyeReason reject_reason = inadmissible_reject_reason(
             conn->get_psk_category(), msg.activities, has_roles, unpaired_access);
         SS_LOGW(TAG, "server/activate inadmissible (psk_category=%d): closing with %s",
@@ -1277,9 +1277,9 @@ uint32_t ConnectionManager::scan_nursery(int64_t now_us) {
     }
 
     // Admission: every nursery entry that has proven itself (is_operational(): hello handshake
-    // complete and first server/activate applied and admissible; trust was already checked when
-    // that activate was processed). The activate handler admits at once when the hello completed
-    // first; this level-triggered pass covers the other order.
+    // complete and first server/activate applied, its admissibility checked when it was
+    // processed). The activate handler admits at once when the hello completed first; this
+    // level-triggered pass covers the other order.
     for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
         if (!it->conn->is_operational()) {
             ++it;

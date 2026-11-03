@@ -87,7 +87,7 @@ public:
 
 // Seeds the client's RecordStore with known LONG_TERM records (server-side pairing is not under
 // test here) so a fake server that knows the same psk_id/psk resolves to PskCategory::LONG_TERM,
-// matching the trust category the admission tests need. Optionally also seeds the last-played
+// matching the PSK category the admission tests need. Optionally also seeds the last-played
 // server_id that the rank-0 arbitration tiebreak keys on.
 //
 // save_blob is left at the base class's rejecting default: nothing here is meant to

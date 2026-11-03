@@ -427,7 +427,7 @@ TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
 }
 
 // Negative path: a post-re-handshake server/activate that the new PSK category cannot admit must
-// still go through the existing inadmissible-activate drop path (trust enforcement applies
+// still go through the existing inadmissible-activate drop path (the admissibility check applies
 // identically whether the activate follows the initial handshake or a re-handshake), closing with
 // the correct client/goodbye reason.
 TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
@@ -2524,8 +2524,8 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
     auto conn = std::make_shared<StateCapturingConnection>();
     // A paired server, whose playback activations are admissible (the stand-in's default Sentinel
     // category would have the activate dropped instead).
-    conn->set_noise_handshake_result(test_peer_id("arena-release-server"), PskCategory::LONG_TERM,
-                                     "arena-release-psk-id");
+    conn->set_noise_handshake_result(id_text(test_peer_id("arena-release-server")),
+                                     PskCategory::LONG_TERM, id_text("arena-release-psk-id"));
     conn->set_client_hello_sent(true);
     conn->set_server_hello_received(true);
     conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
@@ -2601,8 +2601,8 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
         if (row.pairing_method.has_value()) {
             const auto& pairing_psk = bundle.client_ref().record_store_->pairing_psk();
             ASSERT_TRUE(pairing_psk.has_value());
-            conn->set_noise_handshake_result(test_peer_id("state-after-admission-server"),
-                                             PskCategory::PAIRING, pairing_psk->psk_id);
+            conn->set_noise_handshake_result(id_text(test_peer_id("state-after-admission-server")),
+                                             PskCategory::PAIRING, id_text(pairing_psk->psk_id));
             // The count the activate-event drain takes for every pairing server/activate.
             conn->bump_pairing_index();
         }
@@ -2844,8 +2844,8 @@ TEST(EncryptedLifecycle, SeveralRecordChangesInOneTickWriteEachTouchedKeyOnce) {
     const size_t writes_before = record_writes(persistence);
 
     DispatchTestConnection conn;
-    conn.set_noise_handshake_result(unpairing_record.server_id, PskCategory::LONG_TERM,
-                                    unpairing_record.psk_id);
+    conn.set_noise_handshake_result(id_text(unpairing_record.server_id), PskCategory::LONG_TERM,
+                                    id_text(unpairing_record.psk_id));
     {
         // What note_playback_activity() does when a long-term connection takes playback.
         EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
@@ -2898,7 +2898,8 @@ TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
     ConnectionManager& manager = *client.connection_manager_;
 
     auto conn = std::make_shared<DispatchTestConnection>();
-    conn->set_noise_handshake_result(older.server_id, PskCategory::LONG_TERM, older.psk_id);
+    conn->set_noise_handshake_result(id_text(older.server_id), PskCategory::LONG_TERM,
+                                     id_text(older.psk_id));
     conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                 std::nullopt);
 
@@ -2958,7 +2959,8 @@ TEST(EncryptedLifecycle, AnEvictionBeforeTheFlushSparesTheRecordJustPlayed) {
     ConnectionManager& manager = *client.connection_manager_;
 
     auto conn = std::make_shared<DispatchTestConnection>();
-    conn->set_noise_handshake_result(played.server_id, PskCategory::LONG_TERM, played.psk_id);
+    conn->set_noise_handshake_result(id_text(played.server_id), PskCategory::LONG_TERM,
+                                     id_text(played.psk_id));
     conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                 std::nullopt);
     {
@@ -3080,8 +3082,8 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
     ConnectionManager& manager = *client.connection_manager_;
 
     auto conn = std::make_shared<DispatchTestConnection>();
-    conn->set_noise_handshake_result(server_identity.peer_id(), PskCategory::SENTINEL,
-                                     /*psk_id=*/"");
+    conn->set_noise_handshake_result(id_text(server_identity.peer_id()), PskCategory::SENTINEL,
+                                     /*psk_id=*/IdText{});
     conn->apply_server_activate({}, std::nullopt, std::nullopt, std::nullopt);
     {
         manager.install_admitted(conn, conn->get_active_role_mask());
@@ -3160,7 +3162,8 @@ TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
         ConnectionManager& manager = *client.connection_manager_;
 
         auto conn = std::make_shared<DispatchTestConnection>();
-        conn->set_noise_handshake_result(older.server_id, PskCategory::LONG_TERM, older.psk_id);
+        conn->set_noise_handshake_result(id_text(older.server_id), PskCategory::LONG_TERM,
+                                         id_text(older.psk_id));
         conn->apply_server_activate(row.activities, std::nullopt, std::nullopt, std::nullopt);
         {
             if (row.admitted) {
@@ -3275,8 +3278,8 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     reject_record_saves(persistence);
 
     DispatchTestConnection conn;
-    conn.set_noise_handshake_result(unpairing_record.server_id, PskCategory::LONG_TERM,
-                                    unpairing_record.psk_id);
+    conn.set_noise_handshake_result(id_text(unpairing_record.server_id), PskCategory::LONG_TERM,
+                                    id_text(unpairing_record.psk_id));
     {
         // What note_playback_activity() does when a long-term connection takes playback.
         EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
@@ -3320,7 +3323,8 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     ASSERT_TRUE(client.record_store_->store_record_superseding(record, {}));
 
     DispatchTestConnection conn;
-    conn.set_noise_handshake_result(record.server_id, PskCategory::LONG_TERM, record.psk_id);
+    conn.set_noise_handshake_result(id_text(record.server_id), PskCategory::LONG_TERM,
+                                    id_text(record.psk_id));
     manager.handle_server_unpair(&conn);
     // The re-handshake's lookup, on the protocol task (this thread) right behind the handler.
     const std::optional<ResolvedPsk> resolved =

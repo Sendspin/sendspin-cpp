@@ -642,12 +642,12 @@ public:
     void wake_protocol_task() const;
 
     // ========================================
-    // Configuration setters (called by hub after receiving server/hello message)
+    // Handshake state (protocol task unless noted)
     // ========================================
 
     /// @brief Sets the client hello sent flag
     /// @param sent True if client hello message has been sent.
-    /// @note Called by hub to track handshake state.
+    /// @note Protocol task only: the nursery scan, once it sends client/hello.
     void set_client_hello_sent(bool sent) {
         this->client_hello_sent_ = sent;
     }
@@ -668,25 +668,25 @@ public:
         return this->client_hello_sent_;
     }
 
-    /// @brief Marks that the WebSocket upgrade completed
+    /// @brief Marks that the WebSocket upgrade completed. Transport thread.
     /// @note Distinct from is_connected(): on ESP the socket is accepted before any WebSocket
     ///       handshake, so this flag signals that the peer spoke WebSocket.
     void mark_ws_upgraded() {
         this->ws_upgraded_.store(true, std::memory_order_release);
     }
 
-    /// @brief Returns whether the WebSocket upgrade completed.
+    /// @brief Returns whether the WebSocket upgrade completed. Any thread.
     bool is_ws_upgraded() const {
         return this->ws_upgraded_.load(std::memory_order_acquire);
     }
 
     /// @brief Sets the server_id and PSK metadata from the Noise handshake result.
     /// Called at COMPLETE in connection.cpp.
-    void set_noise_handshake_result(std::string_view server_id, PskCategory psk_category,
-                                    std::string_view psk_id) {
-        this->server_id_.assign(server_id);
+    void set_noise_handshake_result(const IdText& server_id, PskCategory psk_category,
+                                    const IdText& psk_id) {
+        this->server_id_ = server_id;
         this->psk_category_ = psk_category;
-        this->psk_id_.assign(psk_id);
+        this->psk_id_ = psk_id;
     }
 
     /// @brief Returns whether server/hello has arrived on this connection.
@@ -696,7 +696,7 @@ public:
 
     /// @brief Sets the server hello received flag
     /// @param received True if server hello message has been received.
-    /// @note Called by hub when SERVER_HELLO is processed.
+    /// @note Protocol task only: the server/hello dispatch.
     void set_server_hello_received(bool received) {
         this->server_hello_received_ = received;
     }
@@ -777,7 +777,7 @@ public:
     void notify_transport_closed();
 
     // ========================================
-    // Initialization setters (called by hub before start)
+    // Initialization setters (ConnectionManager, before the protocol task can reach the connection)
     // ========================================
 
     /// @brief Sets the memory location preference for the fallback buffer the transport
@@ -1010,12 +1010,6 @@ protected:
     MessageTracer message_tracer_;
 #endif
 
-    /// Server identity: server_id from the Noise handshake result (or re-handshake; unchanged
-    /// across a re-handshake since it is the same server), name from server/hello. Protocol task
-    /// only; ConnectionManager publishes a copy to other threads at admission.
-    IdText server_id_{};
-    ServerName server_name_{};
-
     /// The pairing record staged by the attempt in flight, committed by the
     /// server/pair-finalize handler (nullopt = nothing to store). Protocol task only.
     std::optional<SendspinPairingRecord> pending_pairing_record_{};
@@ -1094,6 +1088,12 @@ protected:
     /// empty until a Noise handshake completes). Written at handshake COMPLETE and at every in-band
     /// re-handshake. Protocol task only.
     IdText psk_id_{};
+
+    /// Server identity: server_id from the Noise handshake result (or re-handshake; unchanged
+    /// across a re-handshake since it is the same server), name from server/hello. Protocol task
+    /// only; ConnectionManager publishes a copy to other threads at admission.
+    IdText server_id_{};
+    ServerName server_name_{};
 
     // Struct fields
 
@@ -1187,7 +1187,8 @@ protected:
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
     /// Written from the transport connected callback (transport thread), read by the manager on
-    /// the protocol task, hence atomic. See mark_ws_upgraded().
+    /// the protocol task and by the host client's close_transport_now() on the transport thread,
+    /// hence atomic. See mark_ws_upgraded().
     std::atomic<bool> ws_upgraded_{false};
 
     /// The kind of the message in fallback_buf_ (TEXT or BINARY: a continuation frame does not
