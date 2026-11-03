@@ -1867,9 +1867,8 @@ TEST(NoiseTransport, ASendFailureAfterTheEncryptDropsTheConnectionInItsTick) {
         conn->init_time_filter();
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
-        conn->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    std::vector<std::string>{"controller@v1"}, std::nullopt,
-                                    std::nullopt);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"controller@v1"},
+                                    std::nullopt, std::nullopt);
         // Not due until the row opens it, so only the row's own site sends.
         conn->time_burst().last_burst_complete_time_ = platform_time_us() / 1000;
         manager.install_admitted(conn, role_mask_bit(SendspinRole::CONTROLLER));

@@ -503,7 +503,8 @@ TEST(SourceRoleObjects, HelloAndStateFields) {
 
     ClientHelloMessage hello;
     source.impl_->build_hello_fields(hello);
-    ASSERT_EQ(hello.supported_roles, std::vector<SendspinRole>{SendspinRole::SOURCE});
+    ASSERT_EQ(hello.supported_roles.size(), 1U);
+    EXPECT_EQ(hello.supported_roles[0], SendspinRole::SOURCE);
     ASSERT_TRUE(hello.source_v1_support.has_value());
     EXPECT_TRUE(hello.source_v1_support->line_sense);
 
@@ -893,9 +894,8 @@ public:
         conn->init_time_filter();
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
-        conn->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    std::vector<std::string>{"source@v1"}, std::nullopt,
-                                    std::nullopt);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"source@v1"},
+                                    std::nullopt, std::nullopt);
         // No time burst falls due during a test, so no client/time interleaves.
         conn->time_burst().last_burst_complete_time_ = platform_time_us() / 1000;
         if (synced) {

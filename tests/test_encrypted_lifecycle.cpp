@@ -1883,9 +1883,8 @@ public:
     /// every role this fixture drives.
     DispatchTestConnection() {
         this->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    std::vector<std::string>{"player@v1", "controller@v1",
-                                                             "metadata@v1", "color@v1",
-                                                             "artwork@v1", "visualizer@v1"},
+                                    ActiveRoles{"player@v1", "controller@v1", "metadata@v1",
+                                                "color@v1", "artwork@v1", "visualizer@v1"},
                                     std::nullopt, std::nullopt);
     }
 
@@ -2607,7 +2606,7 @@ public:
 TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitted) {
     struct Row {
         const char* label;
-        std::vector<SendspinActivity> activities;
+        ActivitySet activities;
         std::optional<SendspinPairMethod> pairing_method;
     };
     const Row rows[] = {
@@ -2635,7 +2634,7 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
         }
         // No player in the active set: an active player's state also waits for clock sync, which
         // lands after admission by itself and would hide the gate under test.
-        conn->apply_server_activate(row.activities, std::vector<std::string>{"metadata@v1"},
+        conn->apply_server_activate(row.activities, ActiveRoles{"metadata@v1"},
                                     row.pairing_method, std::nullopt);
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
@@ -3153,7 +3152,7 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
 TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
     struct Row {
         const char* name;
-        std::vector<SendspinActivity> activities;
+        ActivitySet activities;
         bool admitted;
         std::vector<uint8_t> expected_order;
     };

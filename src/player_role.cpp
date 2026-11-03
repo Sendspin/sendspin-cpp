@@ -284,7 +284,7 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
         .supported_formats = this->config.audio_formats,
         .buffer_capacity = this->advertised_buffer_capacity(),
     };
-    msg.player_v1_support = std::move(player_support);
+    msg.player_v1_support = player_support;
 }
 
 size_t PlayerRole::Impl::buffer_capacity_share() const {

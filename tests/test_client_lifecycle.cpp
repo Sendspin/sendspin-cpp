@@ -1738,7 +1738,7 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
         ConnectionManager& manager = *client.connection_manager_;
         manager.liveness_timeout_us_ = 0;
         auto conn = std::make_shared<RecordingConnection>();
-        conn->apply_server_activate({}, std::vector<std::string>{"player@v1", "controller@v1"},
+        conn->apply_server_activate({}, ActiveRoles{"player@v1", "controller@v1"},
                                     std::nullopt, std::nullopt);
         conn->set_client_hello_sent(row.operational);
         conn->set_server_hello_received(row.operational);
@@ -1918,7 +1918,7 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
         conn->set_noise_handshake_result("server", PskCategory::LONG_TERM, "psk");
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
-        conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::vector<std::string>{},
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{},
                                     std::nullopt, std::nullopt);
 
         manager.install_admitted(conn, 0);

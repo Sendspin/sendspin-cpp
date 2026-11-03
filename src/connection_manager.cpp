@@ -49,9 +49,6 @@ static const char* const TAG = "sendspin.conn_mgr";
 static constexpr int64_t WS_SERVER_START_RETRY_MS = 5000LL;
 static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * US_PER_MS;
 
-/// @brief Stands in for an active_roles set the server left out or the client refuses to keep.
-static const std::vector<std::string> EMPTY_ROLES{};
-
 /// @brief Refuses an activation the client cannot act on
 ///
 /// pairing.md "Client <-> Server: pair/abort" answers a method or format the client does not offer
@@ -140,9 +137,8 @@ static const char* to_cstr(SetupStage stage) {
 /// the connection then also takes the operational path (SendspinClient::on_handshake_complete()).
 /// @return The selected method, or nullopt when the activate does not select pairing.
 static std::optional<SendspinPairMethod> selected_pairing_method(
-    const std::vector<SendspinActivity>& activities,
-    const std::optional<SendspinPairMethod>& pairing_method) {
-    if (!contains_activity(activities, SendspinActivity::PAIRING) || !pairing_method.has_value()) {
+    ActivitySet activities, const std::optional<SendspinPairMethod>& pairing_method) {
+    if (!activities.contains(SendspinActivity::PAIRING) || !pairing_method.has_value()) {
         return std::nullopt;
     }
     const SendspinPairMethod method = pairing_method.value();
@@ -623,7 +619,8 @@ void ConnectionManager::apply_unpaired_access_change(bool enabled) {
 // Protocol task: message handlers
 // ============================================================================
 
-void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActivateMessage&& msg) {
+void ConnectionManager::on_server_activate(SendspinConnection* conn,
+                                           const ServerActivateMessage& msg) {
     NurseryEntry* nursery_entry = this->find_in_nursery(conn);
     AdmittedEntry* admitted_entry = this->find_admitted(conn);
     if (nursery_entry == this->nursery_.end() && admitted_entry == nullptr) {
@@ -642,9 +639,8 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
     // activate can legally narrow activities without re-sending an empty active_roles).
     const bool playback_capable =
         is_playback_capable(conn->get_psk_category(), msg.activities, unpaired_access);
-    const std::vector<std::string>& effective_roles =
-        msg.active_roles.has_value() ? msg.active_roles.value()
-                                     : (playback_capable ? conn->get_active_roles() : EMPTY_ROLES);
+    const ActiveRoles effective_roles =
+        msg.active_roles.value_or(playback_capable ? conn->get_active_roles() : ActiveRoles{});
     const bool has_roles = !effective_roles.empty();
 
     // Trust enforcement against the PSK category the Noise handshake resolved for this
@@ -670,7 +666,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
     // single point every pairing server/activate is received, so a rejected activate does not
     // leave the client permanently behind the server's count. handle_enter_pairing() reads this
     // value; it must not bump again.
-    const bool is_pairing_activate = contains_activity(msg.activities, SendspinActivity::PAIRING);
+    const bool is_pairing_activate = msg.activities.contains(SendspinActivity::PAIRING);
     if (is_pairing_activate) {
         conn->bump_pairing_index();
     }
@@ -728,13 +724,13 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
 
     const bool is_first = !conn->first_activate_received();
     // Pass the same active_roles the admissibility check above used: when the message
-    // omitted active_roles but the connection is no longer playback-capable, that is
-    // effective_roles == EMPTY_ROLES, and it must be applied (not left sticky) so the
-    // persisted active_roles_ is actually cleared (messaging.md "Playback-capable connections").
-    const std::optional<std::vector<std::string>> active_roles_to_apply =
+    // omitted active_roles but the connection is no longer playback-capable, that is an empty
+    // effective_roles, and it must be applied (not left sticky) so the persisted active_roles_
+    // is actually cleared (messaging.md "Playback-capable connections").
+    const std::optional<ActiveRoles> active_roles_to_apply =
         msg.active_roles.has_value()
             ? msg.active_roles
-            : (!playback_capable ? std::make_optional(EMPTY_ROLES) : std::nullopt);
+            : (!playback_capable ? std::make_optional(ActiveRoles{}) : std::nullopt);
     // Copied before the activate is applied: messaging.md "client/state" ties the next state
     // update to the active-role set changing, so the comparison needs the set this activation
     // replaces.
@@ -768,7 +764,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
         // an is_first activate also require is_handshake_complete().
         this->note_playback_activity(conn);
 
-        const auto& activities = conn->get_activities();
+        const ActivitySet activities = conn->get_activities();
         const std::optional<SendspinPairMethod> pairing_method =
             selected_pairing_method(activities, conn->get_pairing_method());
         const bool selects_pairing = pairing_method.has_value();
@@ -808,7 +804,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
                 // declares both purposes therefore runs the operational path as well as the
                 // pairing one, and first: going operational clears stale pairing state the
                 // new attempt must not inherit.
-                if (is_first && contains_activity(activities, SendspinActivity::PLAYBACK)) {
+                if (is_first && activities.contains(SendspinActivity::PLAYBACK)) {
                     this->client_->on_handshake_complete(conn);
                 }
                 SS_LOGI(TAG,
@@ -819,8 +815,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
                 // connection.md "Re-handshake" makes a post-re-handshake activation a subsequent
                 // one, so messaging.md "client/state" owes an update for a role it activates.
                 const bool adds_role = (conn->get_active_role_mask() & ~roles_before) != 0;
-                if (is_first && adds_role &&
-                    !contains_activity(activities, SendspinActivity::PLAYBACK)) {
+                if (is_first && adds_role && !activities.contains(SendspinActivity::PLAYBACK)) {
                     this->client_->publish_client_state(conn);
                 }
             }
@@ -1551,7 +1546,8 @@ bool ConnectionManager::send_hello_message(SendspinConnection* conn) {
         return true;
     }
 
-    const ClientHelloMessage hello = this->client_->build_client_hello();
+    ClientHelloMessage hello;
+    this->client_->build_client_hello(hello);
 
     // client/hello is encrypted like every other post-handshake message. The hello is only sent
     // once server/hello arrives, so send_json always routes to the active Noise transport here.
@@ -1670,7 +1666,7 @@ bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* ad
         /*incoming_activities=*/new_conn->get_activities(),
         /*incoming_server_id=*/new_conn->get_server_id(),
         /*admitted_activities=*/
-        has_admitted ? admitted->get_activities() : std::vector<SendspinActivity>{},
+        has_admitted ? admitted->get_activities() : ActivitySet{},
         /*admitted_server_id=*/has_admitted ? admitted->get_server_id() : std::string{},
         /*has_admitted=*/has_admitted,
         /*last_playback_server_id=*/this->last_played_server_id_,
@@ -1764,12 +1760,12 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
     // state before the new attempt. A playback-capable connection may carry active roles with
     // pairing alone (messaging.md "server/activate"), and those still owe the initial
     // client/state (messaging.md "client/state"), published without going operational.
-    const auto& activities = admitted->get_activities();
+    const ActivitySet activities = admitted->get_activities();
     const std::optional<SendspinPairMethod> pairing_method =
         selected_pairing_method(activities, admitted->get_pairing_method());
     const bool selects_pairing = pairing_method.has_value();
 
-    if (!selects_pairing || contains_activity(activities, SendspinActivity::PLAYBACK)) {
+    if (!selects_pairing || activities.contains(SendspinActivity::PLAYBACK)) {
         this->client_->on_handshake_complete(admitted);
     }
     if (selects_pairing) {
@@ -1778,7 +1774,7 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
         this->handle_enter_pairing(admitted);
         // handle_enter_pairing() may have dropped the connection: checked first.
         if (this->find_admitted(admitted) != nullptr &&
-            !contains_activity(activities, SendspinActivity::PLAYBACK) &&
+            !activities.contains(SendspinActivity::PLAYBACK) &&
             !admitted->get_active_roles().empty()) {
             this->client_->publish_client_state(admitted);
         }

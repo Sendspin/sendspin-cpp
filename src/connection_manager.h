@@ -460,7 +460,7 @@ public:
     /// @brief Applies a server/activate: trust enforcement, pairing-method admissibility, role
     /// ownership and removals, and, for a nursery connection that is now operational, admission
     /// before this returns.
-    void on_server_activate(SendspinConnection* conn, ServerActivateMessage&& msg);
+    void on_server_activate(SendspinConnection* conn, const ServerActivateMessage& msg);
 
     /// @brief Handles a pair/abort from the server (an unrecognized reason arrives as
     /// METHOD_NOT_SUPPORTED). Only an admitted connection hosts a pairing attempt.

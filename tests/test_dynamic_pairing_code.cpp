@@ -440,13 +440,15 @@ TEST(DynamicPairingCodeCPace, MismatchedAssociatedDataFailsVerify) {
 TEST(DynamicPairingCode, ClientHelloDescriptorCarriesChannelsAndFormats) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
+    const std::vector<SendspinPairingCodeChannel> configured_channels = {
+        SendspinPairingCodeChannel::DISPLAY, SendspinPairingCodeChannel::SPEAKER};
+    const std::vector<SendspinPairingCodeFormat> configured_formats = {
+        SendspinPairingCodeFormat::DIGITS, SendspinPairingCodeFormat::QR_CODE};
     PairMethodDescriptor dynamic_desc;
     dynamic_desc.method = SendspinPairMethod::DYNAMIC_PAIRING_CODE;
-    dynamic_desc.out_channels = std::vector<SendspinPairingCodeChannel>{
-        SendspinPairingCodeChannel::DISPLAY, SendspinPairingCodeChannel::SPEAKER};
-    dynamic_desc.formats = std::vector<SendspinPairingCodeFormat>{
-        SendspinPairingCodeFormat::DIGITS, SendspinPairingCodeFormat::QR_CODE};
-    msg.supported_pair_methods.push_back(std::move(dynamic_desc));
+    dynamic_desc.out_channels = configured_channels;
+    dynamic_desc.formats = configured_formats;
+    msg.supported_pair_methods.push_back(dynamic_desc);
 
     const std::string out =
         built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); });
@@ -484,7 +486,7 @@ TEST(StaticPairingCode, ClientHelloDescriptorShape) {
     msg.name = "TestDevice";
     PairMethodDescriptor static_desc;
     static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
-    msg.supported_pair_methods.push_back(std::move(static_desc));
+    msg.supported_pair_methods.push_back(static_desc);
 
     const std::string out =
         built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); });
@@ -506,10 +508,11 @@ TEST(StaticPairingCode, ClientHelloDescriptorShape) {
 TEST(StaticPairingCode, ClientHelloLocationsHint) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
+    const std::vector<std::string> configured_locations = {"device", "leaflet"};
     PairMethodDescriptor static_desc;
     static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
-    static_desc.locations = std::vector<std::string>{"device", "leaflet"};
-    msg.supported_pair_methods.push_back(std::move(static_desc));
+    static_desc.locations = configured_locations;
+    msg.supported_pair_methods.push_back(static_desc);
 
     const std::string out =
         built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); });

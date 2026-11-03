@@ -19,6 +19,8 @@
 #pragma once
 
 #include "crypto/psk_wrap.h"
+#include "inline_vector.h"
+#include "platform/network_info.h"
 #include "sendspin/color_role.h"
 #include "sendspin/config.h"
 #include "sendspin/controller_role.h"
@@ -32,7 +34,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -137,7 +141,7 @@ enum class SendspinRole : uint8_t {
     VISUALIZER,  // Audio visualization role
     COLOR,       // Audio-derived color palette role
     SOURCE,      // Audio capture role (streams to the server)
-    COUNT,       // Not a role; bounds the walk in active_role_mask(). Keep last.
+    COUNT,       // Not a role; bounds the walk in role_from_string(). Keep last.
 };
 
 /// @brief Protocol wire string for a role (e.g. "player@v1")
@@ -162,22 +166,6 @@ inline const char* to_cstr(SendspinRole role) {
     }
 }
 
-/// @brief Whether a versioned role name is in an active_roles set
-///
-/// The comparison is on the exact versioned name this library implements, not the family, because
-/// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
-/// version that was active: a client offered `player@v1` that is handed `player@v2` implements
-/// neither the new version's behavior nor, any longer, the old one's.
-inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole role) {
-    const char* name = to_cstr(role);
-    for (const auto& active : active_roles) {
-        if (active == name) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /// @brief Bit that represents `role` in an active-role mask
 inline uint16_t role_mask_bit(SendspinRole role) {
     return static_cast<uint16_t>(1U << static_cast<uint8_t>(role));
@@ -189,20 +177,62 @@ static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 16, "role mask is a u
 static constexpr uint16_t ALL_ROLES_MASK =
     static_cast<uint16_t>((1U << static_cast<uint8_t>(SendspinRole::COUNT)) - 1U);
 
-/// @brief Builds the mask of roles this library implements that `active_roles` names.
+/// @brief The role this library implements under a versioned role name, or nullopt
 ///
-/// The mask is what the receive path reads, so it is built with the same exact-version test role
-/// removal uses and the two can never disagree.
-inline uint16_t active_role_mask(const std::vector<std::string>& active_roles) {
-    uint16_t mask = 0;
+/// The comparison is on the exact versioned name this library implements, not the family, because
+/// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
+/// version that was active: a client offered `player@v1` that is handed `player@v2` implements
+/// neither the new version's behavior nor, any longer, the old one's.
+inline std::optional<SendspinRole> role_from_string(std::string_view name) {
     for (uint8_t i = 0; i < static_cast<uint8_t>(SendspinRole::COUNT); ++i) {
         const auto role = static_cast<SendspinRole>(i);
-        if (role_in(active_roles, role)) {
-            mask |= role_mask_bit(role);
+        if (name == to_cstr(role)) {
+            return role;
         }
     }
-    return mask;
+    return std::nullopt;
 }
+
+/// @brief A server/activate active_roles set, as the client acts on it: the roles this library
+/// implements that it names, and whether it names any role at all
+///
+/// The mask is what the receive and send gates, the client/state role objects and role removal
+/// all read, so none of them can disagree. A role this library does not implement still makes
+/// the set non-empty: messaging.md "Playback-capable connections" requires an empty set of a
+/// connection that is not playback-capable, whatever it names.
+class ActiveRoles {
+public:
+    ActiveRoles() = default;
+    ActiveRoles(std::initializer_list<std::string_view> names) {
+        for (const std::string_view name : names) {
+            this->add(name);
+        }
+    }
+
+    /// @brief Adds one versioned role name to the set.
+    void add(std::string_view name) {
+        this->names_any_ = true;
+        if (const std::optional<SendspinRole> role = role_from_string(name)) {
+            this->mask_ |= role_mask_bit(role.value());
+        }
+    }
+
+    /// @brief The named roles this library implements, as role_mask_bit() bits.
+    uint16_t mask() const {
+        return this->mask_;
+    }
+
+    /// @brief Whether no role was named, implemented here or not.
+    bool empty() const {
+        return !this->names_any_;
+    }
+
+    bool operator==(const ActiveRoles&) const = default;
+
+private:
+    uint16_t mask_{0};
+    bool names_any_{false};
+};
 
 /// @brief Activity declared in a server/activate message.
 /// A connection declares a SET of activities rather than a single reason (messaging.md
@@ -234,6 +264,34 @@ inline std::optional<SendspinActivity> activity_from_string(std::string_view str
     }
     return std::nullopt;
 }
+
+/// @brief The activities a server/activate declares: a set, its members unordered and unique
+class ActivitySet {
+public:
+    ActivitySet() = default;
+    ActivitySet(std::initializer_list<SendspinActivity> activities) {
+        for (const SendspinActivity activity : activities) {
+            this->insert(activity);
+        }
+    }
+
+    void insert(SendspinActivity activity) {
+        this->bits_ |= bit(activity);
+    }
+
+    bool contains(SendspinActivity activity) const {
+        return (this->bits_ & bit(activity)) != 0;
+    }
+
+    bool operator==(const ActivitySet&) const = default;
+
+private:
+    static uint8_t bit(SendspinActivity activity) {
+        return static_cast<uint8_t>(1U << static_cast<uint8_t>(activity));
+    }
+
+    uint8_t bits_{0};
+};
 
 /// @brief Pairing method on the wire (advertised in client/hello, selected in server/activate).
 enum class SendspinPairMethod : uint8_t {
@@ -422,12 +480,13 @@ inline std::optional<SendspinPlaybackState> playback_state_from_string(std::stri
     return std::nullopt;
 }
 
-/// @brief Optional hardware and software identity fields sent in client/hello messages
+/// @brief Optional hardware and software identity fields sent in client/hello messages, viewing
+/// the strings they name
 struct DeviceInfoObject {
-    std::optional<std::string> product_name{};
-    std::optional<std::string> manufacturer{};
-    std::optional<std::string> software_version{};
-    std::optional<std::string> mac_address{};
+    std::optional<std::string_view> product_name{};
+    std::optional<std::string_view> manufacturer{};
+    std::optional<std::string_view> software_version{};
+    std::optional<std::string_view> mac_address{};
 };
 
 // --- player_role.h ---
@@ -484,9 +543,10 @@ inline std::optional<SendspinPlayerCommand> player_command_from_string(std::stri
     return std::nullopt;
 }
 
-/// @brief Player capabilities advertised to the server during the hello handshake
+/// @brief Player capabilities advertised to the server during the hello handshake, viewing the
+/// player config's formats
 struct PlayerSupportObject {
-    std::vector<AudioSupportedFormatObject> supported_formats{};
+    std::span<const AudioSupportedFormatObject> supported_formats{};
     size_t buffer_capacity{};
 };
 
@@ -819,37 +879,46 @@ struct ClientSourceStateObject {
 // Message envelope structs
 // ============================================================================
 
-/// @brief A pairing method descriptor for client/hello supported_pair_methods.
-/// Optional fields are omitted from the wire when not set (omit_none semantics). The methods are
-/// held as a list rather than a map because the wire object has at most two keys and the
-/// descriptor names its own: `method` is serialized as the key this descriptor sits under, not as
-/// a field of it (pairing.md "client/hello pair-method descriptor").
+/// @brief A pairing method descriptor for client/hello supported_pair_methods, viewing the lists
+/// it names.
+/// An empty list is omitted from the wire (omit_none semantics). The methods are held as a list
+/// rather than a map because the wire object has at most two keys and the descriptor names its
+/// own: `method` is serialized as the key this descriptor sits under, not as a field of it
+/// (pairing.md "client/hello pair-method descriptor").
 struct PairMethodDescriptor {
     SendspinPairMethod method{SendspinPairMethod::PAIRING_PSK};
     /// @brief Channels the dynamic pairing code is conveyed through. Required and non-empty on
-    /// the dynamic_pairing_code descriptor, absent on the others.
-    std::optional<std::vector<SendspinPairingCodeChannel>> out_channels;
+    /// the dynamic_pairing_code descriptor, empty on the others.
+    std::span<const SendspinPairingCodeChannel> out_channels;
     /// @brief Emission formats the client offers. Required and non-empty on the
-    /// dynamic_pairing_code descriptor, absent on the others.
-    std::optional<std::vector<SendspinPairingCodeFormat>> formats;
+    /// dynamic_pairing_code descriptor, empty on the others.
+    std::span<const SendspinPairingCodeFormat> formats;
     /// @brief Where the operator can find the method's configured secret:
     /// 'device' | 'leaflet' | 'operator'. Informational hint for static_pairing_code and
-    /// pairing_psk only; absent for dynamic_pairing_code, whose code has no resting place.
-    std::optional<std::vector<std::string>> locations;
+    /// pairing_psk only; empty for dynamic_pairing_code, whose code has no resting place.
+    std::span<const std::string> locations;
 };
+
+/// @brief Most pair methods a client/hello lists: pairing_psk and at most one pairing-code method
+/// (messaging.md "client/hello").
+static constexpr size_t MAX_HELLO_PAIR_METHODS = 2;
 
 /// @brief Outgoing client/hello handshake message sent at connection startup.
 /// Under encryption, client_id and version are carried in client/init (the cleartext Noise
-/// handshake frame), not repeated here.
+/// handshake frame), not repeated here. Its strings and lists view the client's config and roles,
+/// so it is built and serialized in one go and never outlives them.
 struct ClientHelloMessage {
-    std::string name{};
+    std::string_view name{};
     std::optional<DeviceInfoObject> device_info{};
-    std::vector<SendspinRole> supported_roles{};
+    /// @brief Storage for a MAC address detected at build time, which device_info views; the view
+    /// stays valid because the message can be neither copied nor moved (its InlineVectors).
+    MacAddressText detected_mac{};
+    InlineVector<SendspinRole, static_cast<size_t>(SendspinRole::COUNT)> supported_roles{};
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
     std::optional<SourceSupportObject> source_v1_support{};
     bool unpaired_access_enabled{false};
-    std::vector<PairMethodDescriptor> supported_pair_methods{};
+    InlineVector<PairMethodDescriptor, MAX_HELLO_PAIR_METHODS> supported_pair_methods{};
 };
 
 /// @brief Outgoing client/state message reporting client playback state to the server
@@ -923,8 +992,8 @@ struct ServerHelloMessage {
 /// Declares the server's current activity set and active roles for this connection
 /// (messaging.md "server/activate").
 struct ServerActivateMessage {
-    std::vector<SendspinActivity> activities{};
-    std::optional<std::vector<std::string>> active_roles;  // sticky: nullopt = keep prior set
+    ActivitySet activities{};
+    std::optional<ActiveRoles> active_roles;  // sticky: nullopt = keep prior set
     /// From payload.pairing.method: the pairing method the server picked. nullopt when the
     /// message carries no pairing object or names an unrecognized method string.
     std::optional<SendspinPairMethod> pairing_method;

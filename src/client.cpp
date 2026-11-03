@@ -168,19 +168,6 @@ struct HighPerformanceRequests {
     uint32_t releases{0};
 };
 
-/// @brief Resolve the `locations` hint for a pair-method descriptor in client/hello.
-/// @return The hint to advertise, or nullopt to omit the field.
-///
-/// The hint is informational (pairing.md "client/hello pair-method descriptor"): only the
-/// application knows where its secret was published, so an unset value means the client has
-/// nothing to say rather than a default worth sending.
-std::optional<std::vector<std::string>> locations_hint(const std::vector<std::string>& configured) {
-    if (configured.empty()) {
-        return std::nullopt;
-    }
-    return configured;
-}
-
 /// @brief Whether `role` is in `mask`, logging the teardown once per role rather than once per
 /// call site.
 [[maybe_unused]] bool role_removed(uint16_t mask, SendspinRole role) {
@@ -1402,32 +1389,38 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
 #endif
 }
 
-ClientHelloMessage SendspinClient::build_client_hello() {
+void SendspinClient::build_client_hello(ClientHelloMessage& msg) {
     // Reached only from ConnectionManager::send_hello_message(), so only for a connection, so
     // only after a successful start(): record_store_ exists and is dereferenced unguarded below.
-    ClientHelloMessage msg;
     msg.name = this->config_.name;
 
+    const auto view = [](const std::optional<std::string>& value) {
+        return value.has_value() ? std::optional<std::string_view>(value.value()) : std::nullopt;
+    };
+    DeviceInfoObject& device_info = msg.device_info.emplace();
+    device_info.product_name = view(this->config_.product_name);
+    device_info.manufacturer = view(this->config_.manufacturer);
+    device_info.software_version = view(this->config_.software_version);
     // Use the explicitly configured MAC when provided; otherwise fall back to platform detection
     // (reliable on ESP, best-effort on host). Leaves the field absent if neither is available.
-    const std::optional<std::string> interface_mac =
-        this->config_.mac_address ? this->config_.mac_address : platform_get_interface_mac();
-
-    DeviceInfoObject device_info{};
-    device_info.product_name = this->config_.product_name;
-    device_info.manufacturer = this->config_.manufacturer;
-    device_info.software_version = this->config_.software_version;
-    device_info.mac_address = interface_mac;
-    msg.device_info = device_info;
+    device_info.mac_address = view(this->config_.mac_address);
+    if (!device_info.mac_address.has_value()) {
+        if (const std::optional<MacAddressText> detected = platform_get_interface_mac()) {
+            msg.detected_mac = detected.value();
+            device_info.mac_address = msg.detected_mac.data();
+        }
+    }
 
     // pairing.md "client/hello pair-method descriptor". offers_*() is the single source both this
     // and the server/activate admissibility check read, so a method advertised here is one an
-    // activation can select. pairing_psk is always advertised (see pairing_offers.h).
+    // activation can select. pairing_psk is always advertised (see pairing_offers.h). The
+    // `locations` hint is informational: only the application knows where its secret was
+    // published, so an empty list is omitted rather than replaced by a default.
     {
         PairMethodDescriptor psk_desc;
         psk_desc.method = SendspinPairMethod::PAIRING_PSK;
-        psk_desc.locations = locations_hint(this->config_.pairing_psk_locations);
-        msg.supported_pair_methods.push_back(std::move(psk_desc));
+        psk_desc.locations = this->config_.pairing_psk_locations;
+        msg.supported_pair_methods.push_back(psk_desc);
     }
     // out_channels and formats are both required and non-empty. No `locations`: a per-session code
     // has no resting place for the operator to look it up in.
@@ -1436,15 +1429,15 @@ ClientHelloMessage SendspinClient::build_client_hello() {
         dynamic_desc.method = SendspinPairMethod::DYNAMIC_PAIRING_CODE;
         dynamic_desc.out_channels = this->config_.pairing_code_out_channels;
         dynamic_desc.formats = this->config_.pairing_code_formats;
-        msg.supported_pair_methods.push_back(std::move(dynamic_desc));
+        msg.supported_pair_methods.push_back(dynamic_desc);
     }
     // Offered only when the dynamic code is not: messaging.md "client/hello" permits at most one
     // pairing-code method.
     if (offers_static_pairing_code(this->config_)) {
         PairMethodDescriptor static_desc;
         static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
-        static_desc.locations = locations_hint(this->config_.static_pairing_code_locations);
-        msg.supported_pair_methods.push_back(std::move(static_desc));
+        static_desc.locations = this->config_.static_pairing_code_locations;
+        msg.supported_pair_methods.push_back(static_desc);
     }
 
     msg.unpaired_access_enabled = this->unpaired_access_enabled_.load(std::memory_order_acquire);
@@ -1485,8 +1478,6 @@ ClientHelloMessage SendspinClient::build_client_hello() {
         this->source_->impl_->build_hello_fields(msg);
     }
 #endif
-
-    return msg;
 }
 
 // ============================================================================

@@ -17,10 +17,17 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <optional>
-#include <string>
 
 namespace sendspin {
+
+/// @brief Size of a MAC address as text, "aa:bb:cc:dd:ee:ff", with its NUL.
+static constexpr size_t MAC_ADDRESS_TEXT_SIZE = 18;
+
+/// @brief A MAC address as NUL-terminated text.
+using MacAddressText = std::array<char, MAC_ADDRESS_TEXT_SIZE>;
 
 /// @brief Best-effort lookup of the local MAC address used for Sendspin connections.
 ///
@@ -36,6 +43,6 @@ namespace sendspin {
 ///   (non-link-local) IP address. This is a heuristic (the "primary" interface), not necessarily
 ///   the interface a given connection is bound to; on multi-homed hosts it may differ. Prefer
 ///   setting SendspinClientConfig::mac_address explicitly when the exact interface matters.
-std::optional<std::string> platform_get_interface_mac();
+std::optional<MacAddressText> platform_get_interface_mac();
 
 }  // namespace sendspin

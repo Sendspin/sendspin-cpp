@@ -140,10 +140,9 @@ TEST(Protocol, EnumWireStringsRoundTrip) {
                },
                pair_abort_reason_from_string, "not_a_reason");
 
-    // Roles are read back from server/activate's active_roles through active_role_mask().
-    {
-        SCOPED_TRACE("SendspinRole");
-        const std::array roles{
+    round_trip(
+        "SendspinRole",
+        std::array{
             std::pair{SendspinRole::PLAYER, "player@v1"},
             std::pair{SendspinRole::CONTROLLER, "controller@v1"},
             std::pair{SendspinRole::METADATA, "metadata@v1"},
@@ -151,14 +150,8 @@ TEST(Protocol, EnumWireStringsRoundTrip) {
             std::pair{SendspinRole::VISUALIZER, "visualizer@v1"},
             std::pair{SendspinRole::COLOR, "color@v1"},
             std::pair{SendspinRole::SOURCE, "source@v1"},
-        };
-        for (const auto& [role, wire] : roles) {
-            SCOPED_TRACE(wire);
-            EXPECT_STREQ(to_cstr(role), wire);
-            EXPECT_EQ(active_role_mask({wire}), role_mask_bit(role));
-        }
-        EXPECT_EQ(active_role_mask({"source@v2"}), 0U);
-    }
+        },
+        role_from_string, "source@v2");
 
     emitted_as("SourceSignal", std::array{
                                    std::pair{SourceSignal::PRESENT, "present"},
@@ -1114,8 +1107,10 @@ TEST(Protocol, FormatClientHelloPlayerSupportOmitsSupportedCommands) {
     ClientHelloMessage msg;
     msg.name = "Speaker";
     msg.supported_roles.push_back(SendspinRole::PLAYER);
+    const std::vector<AudioSupportedFormatObject> formats = {
+        {SendspinCodecFormat::FLAC, 2, 44100, 16}};
     PlayerSupportObject support{};
-    support.supported_formats = {{SendspinCodecFormat::FLAC, 2, 44100, 16}};
+    support.supported_formats = formats;
     support.buffer_capacity = 4096;
     msg.player_v1_support = support;
 
@@ -1345,13 +1340,14 @@ TEST(Protocol, ClientHelloUnpairedAccessIsAlwaysEmitted) {
 TEST(Protocol, ClientHelloPairMethodsAreKeyedByMethod) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
+    const std::vector<std::string> locations = {"device"};
     PairMethodDescriptor psk_desc;
     psk_desc.method = SendspinPairMethod::PAIRING_PSK;
-    psk_desc.locations = std::vector<std::string>{"device"};
-    msg.supported_pair_methods.push_back(std::move(psk_desc));
+    psk_desc.locations = locations;
+    msg.supported_pair_methods.push_back(psk_desc);
     PairMethodDescriptor static_desc;
     static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
-    msg.supported_pair_methods.push_back(std::move(static_desc));
+    msg.supported_pair_methods.push_back(static_desc);
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
@@ -1394,7 +1390,7 @@ TEST(Protocol, ServerActivateParsesTheActivitiesList) {
     struct Row {
         const char* name;
         const char* activities_json;
-        std::vector<SendspinActivity> expected;
+        ActivitySet expected;
     };
     const Row rows[] = {
         {"Control: one activity", R"(["playback"])", {SendspinActivity::PLAYBACK}},
@@ -1421,19 +1417,39 @@ TEST(Protocol, ServerActivateParsesTheActivitiesList) {
     }
 }
 
-TEST(Protocol, ServerActivateWithActiveRoles) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(
-        R"({"type":"server/activate","payload":{"activities":["playback"],"active_roles":["player@v1","metadata@v1"]}})",
-        doc, root));
-
-    ServerActivateMessage msg;
-    ASSERT_TRUE(process_server_activate_message(root, &msg));
-    ASSERT_TRUE(msg.active_roles.has_value());
-    ASSERT_EQ(msg.active_roles->size(), 2u);
-    EXPECT_EQ((*msg.active_roles)[0], "player@v1");
-    EXPECT_EQ((*msg.active_roles)[1], "metadata@v1");
+// messaging.md "server/activate": a present active_roles is the new set, read as the roles this
+// library implements plus whether it names any role at all. A version this library does not
+// implement sets no bit but still makes the set non-empty, which admission reads.
+TEST(Protocol, ServerActivateReadsActiveRoles) {
+    struct Row {
+        const char* name;
+        const char* roles_json;
+        uint16_t mask;
+        bool empty;
+    };
+    const Row rows[] = {
+        {"Control: implemented roles", R"(["player@v1","metadata@v1"])",
+         static_cast<uint16_t>(role_mask_bit(SendspinRole::PLAYER) |
+                               role_mask_bit(SendspinRole::METADATA)),
+         false},
+        {"a version this library does not implement", R"(["player@v2"])", 0, false},
+        {"an explicit empty set", "[]", 0, true},
+        {"no string element", "[7]", 0, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"server/activate","payload":{"activities":)"
+                                      R"(["playback"],"active_roles":)") +
+                              row.roles_json + "}}",
+                          doc, root));
+        ServerActivateMessage msg;
+        ASSERT_TRUE(process_server_activate_message(root, &msg));
+        ASSERT_TRUE(msg.active_roles.has_value());
+        EXPECT_EQ(msg.active_roles->mask(), row.mask);
+        EXPECT_EQ(msg.active_roles->empty(), row.empty);
+    }
 }
 
 // messaging.md "server/activate" nests the pairing parameters: payload.pairing =
@@ -1708,7 +1724,7 @@ TEST(Protocol, Be64HelpersAreBigEndianAndRoundTrip) {
 TEST(Protocol, FormatClientHelloSourceSupport) {
     ClientHelloMessage msg;
     msg.name = "Line In";
-    msg.supported_roles = {SendspinRole::SOURCE};
+    msg.supported_roles.push_back(SendspinRole::SOURCE);
 
     msg.source_v1_support = SourceSupportObject{.line_sense = true};
     JsonDocument doc;
@@ -1728,7 +1744,7 @@ TEST(Protocol, FormatClientHelloSourceSupport) {
     EXPECT_EQ(doc_no_features["payload"]["source@v1_support"].as<JsonObject>().size(), 0U);
 
     // Control: a client without the role sends no support object.
-    msg.supported_roles = {};
+    msg.supported_roles.clear();
     msg.source_v1_support.reset();
     JsonDocument doc_unset;
     ASSERT_FALSE(deserializeJson(doc_unset, built_text([&](JsonDocument& message) {

@@ -384,13 +384,13 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
         return true;
     }
 
-    activate_msg->activities.clear();
+    activate_msg->activities = ActivitySet{};
     JsonArrayConst activities_array = root["payload"]["activities"].as<JsonArrayConst>();
     for (JsonVariantConst act_var : activities_array) {
         if (act_var.is<const char*>()) {
             auto act = activity_from_string(act_var.as<std::string_view>());
             if (act.has_value()) {
-                activate_msg->activities.push_back(act.value());
+                activate_msg->activities.insert(act.value());
             }
         }
     }
@@ -398,12 +398,13 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
     // active_roles is optional and sticky (omitted = keep prior set).
     JsonVariantConst roles_var = root["payload"]["active_roles"];
     if (roles_var.is<JsonArrayConst>()) {
-        activate_msg->active_roles = std::vector<std::string>{};
+        ActiveRoles roles;
         for (JsonVariantConst role_var : roles_var.as<JsonArrayConst>()) {
             if (role_var.is<const char*>()) {
-                activate_msg->active_roles->push_back(role_var.as<std::string>());
+                roles.add(role_var.as<std::string_view>());
             }
         }
+        activate_msg->active_roles = roles;
     } else {
         activate_msg->active_roles = std::nullopt;
     }
@@ -871,25 +872,22 @@ void build_client_hello_message(const ClientHelloMessage* msg, JsonDocument& doc
         JsonObject methods_obj = root["payload"]["supported_pair_methods"].to<JsonObject>();
         for (const auto& desc : msg->supported_pair_methods) {
             JsonObject method_obj = methods_obj[to_cstr(desc.method)].to<JsonObject>();
-            const auto& out_channels = desc.out_channels;
-            if (out_channels.has_value() && !out_channels->empty()) {
+            if (!desc.out_channels.empty()) {
                 JsonArray ch_arr = method_obj["out_channels"].to<JsonArray>();
-                for (const auto& ch : out_channels.value()) {
+                for (const auto& ch : desc.out_channels) {
                     ch_arr.add(to_cstr(ch));
                 }
             }
-            const auto& formats = desc.formats;
-            if (formats.has_value() && !formats->empty()) {
+            if (!desc.formats.empty()) {
                 JsonArray fmt_arr = method_obj["formats"].to<JsonArray>();
-                for (const auto& fmt : formats.value()) {
+                for (const auto& fmt : desc.formats) {
                     fmt_arr.add(to_cstr(fmt));
                 }
             }
-            const auto& locations = desc.locations;
-            if (locations.has_value() && !locations->empty()) {
+            if (!desc.locations.empty()) {
                 JsonArray loc_arr = method_obj["locations"].to<JsonArray>();
-                for (const auto& loc : locations.value()) {
-                    loc_arr.add(loc.c_str());
+                for (const auto& loc : desc.locations) {
+                    loc_arr.add(loc);
                 }
             }
         }
