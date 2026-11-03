@@ -3489,8 +3489,9 @@ std::shared_ptr<ObservedConnection> make_synced_connection(ConnectionObservation
 
 // The time filter slot follows the primary admitted connection's filter: a synced connection
 // converts with its offset, a vacated slot reads as unsynced, the slot never keeps a connection
-// alive, an unsynced newcomer installed over a synced one reads its own filter, and that
-// newcomer's first measurement reaches the slot at the protocol task's next publish.
+// alive, an unsynced newcomer installed over a synced one reads its own filter, and each of that
+// newcomer's measurements, its first and a later correction, reaches the slot at the protocol
+// task's next publish.
 TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheAdmittedConnection) {
     ConnectionObservation dropped_obs;  // All outlive the client
     ConnectionObservation replaced_obs;
@@ -3516,10 +3517,20 @@ TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheAdmittedConnection) {
     (void) replace_admitted(manager, newcomer);
     EXPECT_FALSE(client.is_time_synced()) << "the newcomer read the replaced connection's filter";
 
-    newcomer->time_filter().update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000, platform_time_us());
+    // Each measurement is stamped after the last: the filter skips one that is not.
+    const int64_t first_measured_at = platform_time_us();
+    newcomer->time_filter().update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000, first_measured_at);
     manager.refresh_published_state();
     EXPECT_TRUE(client.is_time_synced()) << "a measurement after admission never reached the slot";
     EXPECT_EQ(client.get_client_time(SERVER_TS_US), SERVER_TS_US - SEEDED_SERVER_OFFSET_US);
+
+    // A second measurement takes its offset as is, with no drift applied yet.
+    constexpr int64_t CORRECTED_OFFSET_US = SEEDED_SERVER_OFFSET_US + 5000;
+    newcomer->time_filter().update(CORRECTED_OFFSET_US, /*max_error=*/1000,
+                                   first_measured_at + 1000);
+    manager.refresh_published_state();
+    EXPECT_EQ(client.get_client_time(SERVER_TS_US), SERVER_TS_US - CORRECTED_OFFSET_US)
+        << "a correction after the first measurement never reached the slot";
 }
 
 // The sync task converts chunks with the current connection's offset. The fed
