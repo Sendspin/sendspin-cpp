@@ -768,11 +768,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        void on_trust_changed(ConnectionTrust trust) override {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            state.trust = trust;
-        }
-
         void on_pairing_started(const std::string& /*server_id*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.pairing_status = "Pairing...";
@@ -1133,7 +1128,7 @@ int main(int argc, char* argv[]) {
             if (++tick % 25 == 0) {  // every 250ms
                 // Snapshot previous state to detect changes
                 uint32_t prev_progress, prev_duration;
-                bool prev_connected;
+                bool prev_connected, prev_paired;
                 uint8_t prev_group_vol, prev_player_vol;
                 bool prev_group_muted, prev_player_muted;
                 std::string prev_group_name;
@@ -1142,6 +1137,7 @@ int main(int argc, char* argv[]) {
                     prev_progress = state.track_progress_ms;
                     prev_duration = state.track_duration_ms;
                     prev_connected = state.connected;
+                    prev_paired = state.paired;
                     prev_group_vol = state.group_volume;
                     prev_player_vol = state.player_volume;
                     prev_group_muted = state.group_muted;
@@ -1179,6 +1175,7 @@ int main(int argc, char* argv[]) {
                         changed = (state.track_progress_ms != prev_progress ||
                                    state.track_duration_ms != prev_duration ||
                                    state.connected != prev_connected ||
+                                   state.paired != prev_paired ||
                                    state.group_volume != prev_group_vol ||
                                    state.player_volume != prev_player_vol ||
                                    state.group_muted != prev_group_muted ||

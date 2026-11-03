@@ -70,6 +70,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -403,14 +404,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        void on_trust_changed(ConnectionTrust trust) override {
-            if (trust == ConnectionTrust::USER) {
-                fprintf(stderr, ">>> Trust: user (paired server)\n");
-            } else {
-                fprintf(stderr, ">>> Trust: none (unpaired)\n");
-            }
-        }
-
         void on_pairing_started(const std::string& server_id) override {
             fprintf(stderr, ">>> Pairing started with server: %s\n", server_id.c_str());
         }
@@ -418,7 +411,7 @@ int main(int argc, char* argv[]) {
         void on_pairing_succeeded(const std::string& server_id) override {
             fprintf(stderr, ">>> Pairing succeeded with server: %s\n", server_id.c_str());
             fprintf(stderr, "    Long-term record stored. Future connections from this server\n");
-            fprintf(stderr, "    will be trusted (ConnectionTrust::USER).\n");
+            fprintf(stderr, "    will be paired sessions.\n");
         }
 
         void on_pairing_failed(const std::string& server_id,
@@ -532,6 +525,7 @@ int main(int argc, char* argv[]) {
 
     // Main loop
     int tick = 0;
+    std::optional<bool> reported_paired;
     while (running.load()) {
         if (window_gesture.exchange(false)) {
             fprintf(stderr, ">>> Pairing window gesture received\n");
@@ -542,6 +536,16 @@ int main(int argc, char* argv[]) {
             client.cancel_pairing_window();
         }
         client.loop();
+        // Read before is_connected() (see SendspinClient::is_paired()).
+        const bool paired = client.is_paired();
+        if (client.is_connected()) {
+            if (reported_paired != paired) {
+                reported_paired = paired;
+                fprintf(stderr, ">>> Session: %s\n", paired ? "paired" : "unpaired");
+            }
+        } else {
+            reported_paired.reset();
+        }
 #ifdef BASIC_CLIENT_HAS_AUDIO_SINK
         // Sync audio sink volume periodically (catches all volume change sources)
         if (++tick % 25 == 0) {

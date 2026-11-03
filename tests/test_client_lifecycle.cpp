@@ -1899,14 +1899,25 @@ TEST(ClientLifecycle, AnAcceptBehindADisconnectFindsTheNurserySlotsItFreed) {
 // is_connected() is raised only at the end of a tick, after every handler of that tick has run,
 // so a thread that sees it true also sees the tick's whole effect (the published slots and the
 // events it queued for the drain): a connection admitted (install_admitted(), which refreshes
-// the published slots mid-handler) and made operational (on_handshake_complete(), which queues
-// the trust event) reads as not yet connected until the tick ends. A loss lowers the flag at
-// once, without a tick: the
-// drop row refreshes and reads false. The test thread plays the protocol task. The stand-in is a
-// LONG_TERM connection with its hellos and its activation done; the liveness check is off.
+// the published slots mid-handler) and made operational (on_handshake_complete()) reads as not
+// yet connected until the tick ends. A loss lowers the flag at once, without a tick: the drop row
+// refreshes and reads false. is_paired() follows the same connection: true for this LONG_TERM
+// session, false once it is dropped, and still true while a re-handshake awaits its
+// server/activate, when is_connected() already reads false. The test thread plays the protocol
+// task. The stand-in has its hellos and its activation done; the liveness check is off.
 TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
-    for (const bool drop : {false, true}) {
-        SCOPED_TRACE(drop ? "a drop lowers the flag without a tick" : "an admission raises it");
+    enum class Then : uint8_t { NOTHING, DROP, REHANDSHAKE };
+    struct Case {
+        const char* what;
+        Then then;
+    };
+    const Case cases[] = {
+        {"Control: an admission raises it", Then::NOTHING},
+        {"a drop lowers the flag without a tick", Then::DROP},
+        {"a re-handshake lowers it until its server/activate", Then::REHANDSHAKE},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.what);
         TestNetworkProvider network;
         SendspinClient client(make_config(0));
         client.set_network_provider(&network);
@@ -1927,10 +1938,26 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
         EXPECT_FALSE(client.is_connected()) << "raised before the tick ended";
         (void) client.protocol_tick();
         ASSERT_TRUE(client.is_connected()) << "the end of the tick did not raise it";
+        EXPECT_TRUE(client.is_paired()) << "the LONG_TERM session read as unpaired";
 
-        if (drop) {
+        if (c.then == Then::DROP) {
             manager.drop_connection(conn.get(), std::nullopt);
             EXPECT_FALSE(client.is_connected()) << "a loss waited for the end of a tick";
+            EXPECT_FALSE(client.is_paired()) << "the dropped session still read as paired";
+        } else if (c.then == Then::REHANDSHAKE) {
+            // What handle_noise_rehandshake() leaves: the same LONG_TERM session, not yet
+            // re-activated.
+            conn->first_activate_received_ = false;
+            manager.refresh_published_state();
+            EXPECT_FALSE(client.is_connected()) << "connected before the re-activation";
+            (void) client.protocol_tick();
+            EXPECT_FALSE(client.is_connected()) << "a tick raised it before the re-activation";
+            EXPECT_TRUE(client.is_paired())
+                << "the session awaiting re-activation read as unpaired";
+            conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{}, std::nullopt,
+                                        std::nullopt);
+            (void) client.protocol_tick();
+            EXPECT_TRUE(client.is_connected()) << "the re-activation did not raise it";
         }
         client.stop();
     }

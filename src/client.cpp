@@ -72,7 +72,6 @@ namespace {
 enum class PairingNoteType : uint8_t {
     PAIRING_STARTED,
     PAIRING_SUCCEEDED,
-    TRUST_CHANGED,
     PAIRING_FAILED,
     DISPLAY_PAIRING_CODE,
     CLEAR_PAIRING_CODE,
@@ -87,15 +86,14 @@ enum class PairingPrompt : uint8_t {
     WINDOW,
 };
 
-/// @brief One deferred pairing/trust listener notification, queued by the note_*() methods on
-/// the protocol task and dispatched from the main loop's drain
+/// @brief One deferred pairing listener notification, queued by the note_*() methods on the
+/// protocol task and dispatched from the main loop's drain
 struct PairingNote {
     PairingNoteType type{};
     /// server_id for PAIRING_STARTED/SUCCEEDED/FAILED; the emitted code for
     /// DISPLAY_PAIRING_CODE; empty otherwise.
     std::string text{};
     SendspinPairAbortReason reason{};  ///< Valid only for PAIRING_FAILED.
-    ConnectionTrust trust{};           ///< Valid only for TRUST_CHANGED.
     /// Emission format of `text`; valid only for DISPLAY_PAIRING_CODE.
     SendspinPairingCodeFormat format{};
 };
@@ -195,8 +193,8 @@ struct SendspinClient::EventState {
     /// High-performance edges from the protocol task (time bursts), applied by the drain, which
     /// grants each acquire (SendspinClient::high_performance_granted_).
     InboxSlot<HighPerformanceRequests> high_performance_slot{inbox, INBOX_TOPIC_HIGH_PERFORMANCE};
-    /// Pairing/trust listener notifications, appended on the protocol task in the order they
-    /// happen and dispatched by the drain.
+    /// Pairing listener notifications, appended on the protocol task in the order they happen and
+    /// dispatched by the drain.
     InboxSlot<std::vector<PairingNote>> pairing_slot{inbox, INBOX_TOPIC_PAIRING};
     /// Bumped by stop() before its teardown so a drain frame already on the stack (a listener
     /// callback that called stop()) abandons what it has not delivered yet: the events it copied
@@ -960,9 +958,9 @@ void SendspinClient::drain_inbox() {
     // comment above for the staleness argument, which applies identically here.
     const uint32_t slot_bits = es.inbox.poll();
 
-    // --- Pairing/trust notifications, and the deferred provider writes ---
+    // --- Pairing notifications, and the deferred provider writes ---
     // After the event ring, so a role's clear can precede a pairing note queued before it. The
-    // two never describe the same listener state (role state against the pairing UI and trust).
+    // two never describe the same listener state (role state against the pairing UI).
     // The one ordering that matters is a record's provider write ahead of on_pairing_succeeded:
     // the protocol task requests the write before it queues the PAIRING_SUCCEEDED note, so the
     // flush (which polls for itself) runs after the notes are taken and before they are
@@ -994,9 +992,6 @@ void SendspinClient::drain_inbox() {
                         break;
                     case PairingNoteType::PAIRING_SUCCEEDED:
                         this->listener_->on_pairing_succeeded(note.text);
-                        break;
-                    case PairingNoteType::TRUST_CHANGED:
-                        this->listener_->on_trust_changed(note.trust);
                         break;
                     case PairingNoteType::PAIRING_FAILED:
                         this->listener_->on_pairing_failed(note.text, note.reason);
@@ -1191,6 +1186,10 @@ std::optional<std::string> SendspinClient::pairing_token() const {
 
 bool SendspinClient::is_connected() const {
     return this->connection_manager_->is_connected();
+}
+
+bool SendspinClient::is_paired() const {
+    return this->connection_manager_->is_paired();
 }
 
 bool SendspinClient::is_time_synced() const {
@@ -1667,13 +1666,6 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     this->note_pairing_ui_dismissals(pairing_ui);
 
     this->publish_client_state(conn);
-
-    // Report the trust level of the newly operational connection; the listener hears it from
-    // the main loop's drain.
-    ConnectionTrust trust = (conn->get_psk_category() == PskCategory::LONG_TERM)
-                                ? ConnectionTrust::USER
-                                : ConnectionTrust::NONE;
-    this->note_trust_changed(trust);
 }
 
 void SendspinClient::apply_role_removals([[maybe_unused]] SendspinConnection* conn,
@@ -1782,10 +1774,6 @@ void SendspinClient::note_pairing_ui_dismissals(const PairingUiSnapshot& ui) {
     if (ui.window_was_shown) {
         this->note_close_pairing_window();
     }
-}
-
-void SendspinClient::note_trust_changed(ConnectionTrust trust) {
-    this->event_state_->push_pairing_note({.type = PairingNoteType::TRUST_CHANGED, .trust = trust});
 }
 
 void SendspinClient::confirm_pairing_window() {

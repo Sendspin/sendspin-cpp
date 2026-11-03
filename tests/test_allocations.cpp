@@ -427,8 +427,7 @@ void expect_library_allocations(const Window& window, const char* title, size_t 
 constexpr uint16_t ALLOCATION_TEST_PORT = 19300;
 constexpr int TIME_BURST_SIZE = 8;
 
-// The pairing slot's vector growing for the trust note on_handshake_complete() queues.
-constexpr size_t ADMISSION_ALLOCATIONS = 1;
+constexpr size_t ADMISSION_ALLOCATIONS = 0;
 constexpr size_t CLIENT_STATE_ALLOCATIONS = 0;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;
 

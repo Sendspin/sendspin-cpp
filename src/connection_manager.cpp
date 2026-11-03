@@ -1081,6 +1081,13 @@ void ConnectionManager::refresh_published_state() {
     if (!this->has_operational_connection()) {
         this->connected_.store(false, std::memory_order_release);
     }
+    // Read each tick: a re-handshake changes the PSK category on the same connection, onto the
+    // long-term PSK after a pairing. It clears the connection's activate flag first, and paired_ is
+    // stored after connected_ is lowered, so a reader that sees a re-handshake's value and then
+    // is_connected() true has seen the session's re-activation too.
+    this->paired_.store(
+        primary_conn != nullptr && primary_conn->get_psk_category() == PskCategory::LONG_TERM,
+        std::memory_order_release);
 }
 
 void ConnectionManager::publish_connected() {
