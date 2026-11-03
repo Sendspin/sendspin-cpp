@@ -450,38 +450,67 @@ TEST(NoiseHandshakeDriver, Msg1PayloadPskCategoryIsValidated) {
 }
 
 // messaging.md "server/error": the server sends it in place of server/init when it cannot accept
-// our client/init, then closes. The handshake aborts, and the reason it carries is logged rather
-// than the frame being treated as an unparseable server/init.
+// our client/init, then closes. The handshake aborts, and the reason it carries is kept as one of
+// the reasons the spec defines, any other text (or none) as UNKNOWN, rather than the frame being
+// treated as an unparseable server/init.
 TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingServerInitAborts) {
-    Identity client_id = Identity::generate().value();
-    RecordStore rs(nullptr);
+    struct Row {
+        const char* frame;
+        std::optional<ServerErrorReason> expected;
+    };
+    const Row rows[] = {
+        {R"({"type":"server/error","payload":{"reason":"unsupported_version"}})",
+         ServerErrorReason::UNSUPPORTED_VERSION},
+        {R"({"type":"server/error","payload":{"reason":"unsupported_suite"}})",
+         ServerErrorReason::UNSUPPORTED_SUITE},
+        {R"({"type":"server/error","payload":{"reason":"malformed"}})",
+         ServerErrorReason::MALFORMED},
+        {R"({"type":"server/error","payload":{"reason":"Malformed"}})", ServerErrorReason::UNKNOWN},
+        {R"({"type":"server/error","payload":{"reason":7}})", ServerErrorReason::UNKNOWN},
+        {R"({"type":"server/error","payload":{}})", ServerErrorReason::UNKNOWN},
+        // Control: an abort on a frame that is not a server/error leaves no reason to report, so
+        // the connection does not attribute a generic failure to the server.
+        {R"({"type":"server/init","payload":{"version":99}})", std::nullopt},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.frame);
+        Identity client_id = Identity::generate().value();
+        RecordStore rs(nullptr);
 
-    TestArena arena;
-    NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
-    std::optional<NoiseHandshakeResult> completed;
-    nh.build_client_init();
+        TestArena arena;
+        NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+        std::optional<NoiseHandshakeResult> completed;
+        nh.build_client_init();
 
-    auto r = nh.on_text_frame(R"({"type":"server/error","payload":{"reason":"unsupported_suite"}})",
-                              [](const JsonDocument&) { return true; }, completed);
-    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
-    EXPECT_EQ(nh.server_error_reason(), "unsupported_suite");
+        auto r = nh.on_text_frame(row.frame, [](const JsonDocument&) { return true; }, completed);
+        EXPECT_EQ(r, HandshakeFrameResult::ABORT);
+        EXPECT_EQ(nh.server_error_reason(), row.expected);
+    }
 }
 
-// Control: the same abort from a frame that is not a server/error leaves no reason to report, so
-// the connection does not attribute a generic failure to the server.
-TEST(NoiseHandshakeDriver, AbortWithoutServerErrorReportsNoReason) {
-    Identity client_id = Identity::generate().value();
-    RecordStore rs(nullptr);
-
-    TestArena arena;
-    NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
-    std::optional<NoiseHandshakeResult> completed;
-    nh.build_client_init();
-
-    auto r = nh.on_text_frame(R"({"type":"server/init","payload":{"version":99}})",
-                              [](const JsonDocument&) { return true; }, completed);
-    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
-    EXPECT_TRUE(nh.server_error_reason().empty());
+// A noise/handshake data field longer than any message 1 the client could read is refused before
+// its buffer is allocated, so a pre-admission frame cannot make the client hold a peer-sized decode
+// buffer.
+TEST(NoiseHandshakeDriver, HandshakeDataLongerThanAMsg1IsRefused) {
+    struct Row {
+        const char* name;
+        size_t bytes;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"longest-msg1", MAX_HANDSHAKE_MSG1_BYTES, true},
+        {"one-byte-over", MAX_HANDSHAKE_MSG1_BYTES + 1, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        const std::vector<uint8_t> bytes(row.bytes, 0x5A);
+        const std::string frame = R"({"type":"noise/handshake","payload":{"data":")" +
+                                  b64url_encode(bytes.data(), bytes.size()) + R"("}})";
+        JsonDocument doc;
+        ASSERT_EQ(deserializeJson(doc, frame), DeserializationError::Ok);
+        EXPECT_EQ(read_noise_handshake_data(doc.as<JsonObjectConst>(), "test").has_value(),
+                  row.accepted);
+    }
 }
 
 // The same frame after server/init, while the client is waiting for Noise message 1, is refused
@@ -502,7 +531,7 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
     auto r = nh.on_text_frame(R"({"type":"server/error","payload":{"reason":"malformed"}})",
                               [](const JsonDocument&) { return true; }, completed);
     EXPECT_EQ(r, HandshakeFrameResult::ABORT);
-    EXPECT_EQ(nh.server_error_reason(), "malformed");
+    EXPECT_EQ(nh.server_error_reason(), ServerErrorReason::MALFORMED);
 }
 
 // A server/init is accepted only when its type, its server_id, its version and its length are all

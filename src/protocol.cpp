@@ -1268,17 +1268,14 @@ bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* pa
         SS_LOGE(TAG, "server/pair-init: nonce_A is not a string");
         return false;
     }
-    auto decoded = b64url_decode(nonce_var.as<std::string>());
-    if (!decoded.has_value() || decoded->size() != 32) {
+    std::array<uint8_t, 32> nonce_a{};
+    if (!b64url_decode_exact(nonce_var.as<std::string_view>(), nonce_a)) {
         SS_LOGE(TAG, "server/pair-init: nonce_A is not 32 base64url-encoded bytes");
         return false;
     }
-    if (payload == nullptr) {
-        return true;
+    if (payload != nullptr) {
+        payload->nonce_a = nonce_a;
     }
-    std::array<uint8_t, 32> nonce_a{};
-    std::memcpy(nonce_a.data(), decoded->data(), nonce_a.size());
-    payload->nonce_a = nonce_a;
     return true;
 }
 
@@ -1288,17 +1285,14 @@ bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* pa
         return false;
     }
 
-    if (payload == nullptr) {
-        return true;
-    }
-
-    const std::string msg1_b64 = root["payload"]["pake_msg_1"].as<std::string>();
-    auto msg1_bytes = b64url_decode(msg1_b64);
-    if (!msg1_bytes.has_value() || msg1_bytes->size() != 32) {
+    std::array<uint8_t, 32> pake_msg_1{};
+    if (!b64url_decode_exact(root["payload"]["pake_msg_1"].as<std::string_view>(), pake_msg_1)) {
         SS_LOGE(TAG, "server/pair-auth: pake_msg_1 is not 32 bytes");
         return false;
     }
-    std::memcpy(payload->pake_msg_1.data(), msg1_bytes->data(), 32);
+    if (payload != nullptr) {
+        payload->pake_msg_1 = pake_msg_1;
+    }
     return true;
 }
 
@@ -1308,17 +1302,14 @@ bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPaylo
         return false;
     }
 
-    if (payload == nullptr) {
-        return true;
-    }
-
-    const std::string kc_b64 = root["payload"]["server_kc"].as<std::string>();
-    auto kc_bytes = b64url_decode(kc_b64);
-    if (!kc_bytes.has_value() || kc_bytes->size() != 64) {
+    std::array<uint8_t, 64> server_kc{};
+    if (!b64url_decode_exact(root["payload"]["server_kc"].as<std::string_view>(), server_kc)) {
         SS_LOGE(TAG, "server/pair-confirm: server_kc is not 64 bytes");
         return false;
     }
-    std::memcpy(payload->server_kc.data(), kc_bytes->data(), 64);
+    if (payload != nullptr) {
+        payload->server_kc = server_kc;
+    }
     return true;
 }
 

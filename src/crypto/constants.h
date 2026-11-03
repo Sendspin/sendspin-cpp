@@ -72,18 +72,23 @@ static constexpr size_t MAX_TRANSPORT_PLAINTEXT = 65535 - 16;  // = 65519
 
 /// @brief Largest Noise message 1 payload the client decrypts: the spec sets no bound, but the
 /// payload it defines is small (psk_id JSON, ~60 bytes). 512 leaves room for future fields
-/// without paying for a buffer sized like transport-mode traffic. noise-c bounds-checks against
-/// this capacity and returns an error rather than overflowing it if a peer's payload does not fit
-/// (verified against noise_handshakestate_read_message()'s payload->max_size check), so a longer
-/// payload fails the handshake rather than corrupting memory. MAX_SERVER_INIT_BYTES bounds the
+/// without paying for a buffer sized like transport-mode traffic. MAX_HANDSHAKE_MSG1_BYTES refuses
+/// a message 1 that could carry a longer payload, and noise-c also bounds-checks against this
+/// capacity (noise_handshakestate_read_message()'s payload->max_size check), so a longer payload
+/// fails the handshake rather than corrupting memory. MAX_SERVER_INIT_BYTES bounds the
 /// handshake's other peer input.
 static constexpr size_t MAX_HANDSHAKE_MESSAGE_BYTES = 512;
+
+/// @brief Largest Noise message 1 the client decodes: KKpsk2's "e, es, ss" sends the 32-byte
+/// ephemeral key, then a payload of up to MAX_HANDSHAKE_MESSAGE_BYTES and its 16-byte AEAD tag.
+/// A longer one could not be read, so it is refused before its buffer is allocated.
+static constexpr size_t MAX_HANDSHAKE_MSG1_BYTES = 32 + MAX_HANDSHAKE_MESSAGE_BYTES + 16;
 
 /// @brief Largest server/init the handshake keeps for its prologue: about five times the minimal
 /// frame, a version and a PEER_ID_SIZE server_id in about 104 bytes (messaging.md "server/init").
 /// It bounds the prologue buffer each handshake holds; the cost is that a later revision's
 /// optional fields, which messaging.md "Forward compatibility" has the client ignore, must keep
-/// the frame under it. MAX_HANDSHAKE_MESSAGE_BYTES bounds the handshake's other peer input.
+/// the frame under it. MAX_HANDSHAKE_MSG1_BYTES bounds the handshake's other peer input.
 static constexpr size_t MAX_SERVER_INIT_BYTES = 512;
 
 /// @brief Per-connection reassembly buffer cap: 1 MiB.

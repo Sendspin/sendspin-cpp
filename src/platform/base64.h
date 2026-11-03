@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -303,6 +304,14 @@ inline std::optional<size_t> b64url_decode_into(std::string_view s, uint8_t* dst
         written += olen;
     }
     return written;
+}
+
+/// @brief Decode base64url that must carry exactly N bytes straight into `out`, tolerating
+/// missing `=` padding.
+/// @return false on invalid input or any other length, with `out` unspecified.
+template <size_t N>
+inline bool b64url_decode_exact(std::string_view s, std::array<uint8_t, N>& out) {
+    return b64url_decode_into(s, out.data(), out.size()) == N;
 }
 
 /// @brief Decode base64url, tolerating missing `=` padding; nullopt on invalid input.
