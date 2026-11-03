@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -223,7 +224,7 @@ public:
     /// @param msg1_bytes  The re-handshake msg1 Noise bytes (read_noise_handshake_data()).
     /// @return true on success (session swapped; a post-swap server/activate is expected next).
     ///         false on any failure (caller should close the WebSocket).
-    bool handle_noise_rehandshake(const std::vector<uint8_t>& msg1_bytes);
+    bool handle_noise_rehandshake(std::span<const uint8_t> msg1_bytes);
 
     /// @brief Sends a JSON message: serialized straight into the Noise transport's send buffer
     /// (NoiseTransport::stage_json()), then encrypted there once the transport is active, or sent

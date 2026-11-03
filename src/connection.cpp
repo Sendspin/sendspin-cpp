@@ -303,7 +303,7 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
     // NEED_MORE, or COMPLETE handled above: nothing else to do until the next frame.
 }
 
-bool SendspinConnection::handle_noise_rehandshake(const std::vector<uint8_t>& msg1_bytes) {
+bool SendspinConnection::handle_noise_rehandshake(std::span<const uint8_t> msg1_bytes) {
     // Runs on the protocol task (from SendspinClient::process_json_message() for a decrypted
     // "noise/handshake" message, itself only reachable post-COMPLETE, so this always runs on
     // the same thread as the decrypt path, sequential with it and never concurrent).
@@ -353,7 +353,9 @@ bool SendspinConnection::handle_noise_rehandshake(const std::vector<uint8_t>& ms
 
     // Commit: encrypt msg2 under the OLD session and send it, then swap to the new session.
     JsonDocument msg2 = make_json_document(*this->json_arena_);
-    build_noise_handshake_message(result->msg2_bytes, msg2);
+    if (!build_noise_handshake_message(result->msg2_bytes, msg2)) {
+        return false;
+    }
     const std::string_view msg2_text = this->stage_json(msg2);
     if (msg2_text.data() == nullptr) {
         SS_LOGE(TAG, "handle_noise_rehandshake: failed to stage msg2");

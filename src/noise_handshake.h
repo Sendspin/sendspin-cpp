@@ -41,6 +41,7 @@
 
 #include "crypto/keys.h"
 #include "noise_session.h"
+#include "platform/memory.h"
 #include "record_store.h"
 #include <ArduinoJson.h>
 
@@ -49,6 +50,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -85,7 +87,8 @@ enum class HandshakeFrameResult : uint8_t {
 
 /// @brief Builds a noise/handshake envelope carrying `noise_bytes` base64url-encoded, into the
 /// caller-owned `doc`: {"type":"noise/handshake","payload":{"data":"..."}}
-void build_noise_handshake_message(const std::vector<uint8_t>& noise_bytes, JsonDocument& doc);
+/// @return false (logged) when the encoding's scratch buffer cannot be allocated.
+bool build_noise_handshake_message(std::span<const uint8_t> noise_bytes, JsonDocument& doc);
 
 /// @brief Reads the Noise message bytes a noise/handshake envelope carries: its payload.data,
 /// base64url-decoded.
@@ -94,9 +97,10 @@ void build_noise_handshake_message(const std::vector<uint8_t>& noise_bytes, Json
 /// re-handshake's, so the caller can release the parsed envelope before the handshake runs.
 /// @param envelope    Parsed noise/handshake envelope; its type is the caller's to check.
 /// @param log_context Prefix for the failure log line.
-/// @return The decoded bytes, or nullopt (logged) when data is missing, empty or not base64url.
-std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst envelope,
-                                                              const char* log_context);
+/// @return The decoded bytes, or nullopt (logged) when data is missing, empty or not base64url,
+///         or when their buffer cannot be allocated.
+std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope,
+                                                        const char* log_context);
 
 // ============================================================================
 // Re-handshake helper
@@ -126,7 +130,7 @@ std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst en
 /// @return Populated NoiseHandshakeResult (session + msg2_bytes to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    const std::vector<uint8_t>& msg1_bytes, const std::string& server_id, const Identity& identity,
+    std::span<const uint8_t> msg1_bytes, const std::string& server_id, const Identity& identity,
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena);
 
@@ -214,7 +218,7 @@ private:
     /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data()).
     /// @param send_fn    Sends the msg2 frame back to the peer.
     /// @return true when msg1 authenticated and msg2 was sent.
-    bool handle_msg1(const std::vector<uint8_t>& msg1_bytes,
+    bool handle_msg1(std::span<const uint8_t> msg1_bytes,
                      const std::function<bool(const JsonDocument&)>& send_fn);
 
     // Struct fields
