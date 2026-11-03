@@ -190,10 +190,10 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     bool psk_id_held = false;
     std::optional<PskCategory> psk_category;
     payload.extract([&](JsonObjectConst root) {
-        const std::string_view text = root["psk_id"] | "";
+        const std::string_view text = root["psk_id"] | std::string_view("");
         psk_id_present = !text.empty();
         psk_id_held = psk_id.assign(text);
-        psk_category = psk_category_from_string(root["psk_category"] | "");
+        psk_category = psk_category_from_string(root["psk_category"] | std::string_view(""));
     });
 
     if (!psk_id_present) {
@@ -276,7 +276,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
 
 std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope,
                                                         const char* log_context) {
-    const std::string_view data_b64 = envelope["payload"]["data"] | "";
+    const std::string_view data_b64 = envelope["payload"]["data"] | std::string_view("");
     if (data_b64.empty()) {
         SS_LOGE(TAG, "%s: missing data field", log_context);
         return std::nullopt;
@@ -338,7 +338,7 @@ void NoiseHandshake::take_server_error(JsonObjectConst root, const char* log_con
     // The handshake aborts either way; recognizing the message is what gives the abort the
     // server's own account of the refusal. The frame is unauthenticated, so its text is read in
     // place and logged only up to PEER_TEXT_LOG_BYTES, never copied.
-    const std::string_view text = root["payload"]["reason"] | "";
+    const std::string_view text = root["payload"]["reason"] | std::string_view("");
     this->server_error_reason_ = server_error_reason_from_string(text);
     const std::string_view logged = text.substr(0, PEER_TEXT_LOG_BYTES);
     SS_LOGE(TAG, "%s: server/error, reason='%.*s'; the server refused the connection", log_context,
@@ -372,7 +372,7 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
     IdText server_id;
     std::optional<PlatformBuffer> msg1_bytes;
     const bool expected = frame.extract([&](JsonObjectConst root) {
-        const std::string_view type = root["type"] | "";
+        const std::string_view type = root["type"] | std::string_view("");
         // messaging.md "server/error": sent in place of server/init when the server cannot
         // accept our client/init. Recognized in either wait so an abort names the server's
         // reason.
@@ -390,7 +390,7 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
             version = root["payload"]["version"] | 0;
             // Refused when longer than a peer_id, leaving it empty for handle_server_init() to
             // reject.
-            (void)server_id.assign(root["payload"]["server_id"] | "");
+            (void)server_id.assign(root["payload"]["server_id"] | std::string_view(""));
         } else {
             msg1_bytes = read_noise_handshake_data(root, to_cstr(HandshakeKind::INITIAL));
         }
