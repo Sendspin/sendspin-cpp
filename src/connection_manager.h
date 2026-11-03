@@ -382,9 +382,10 @@ public:
     /// connection or its filter.
     std::optional<TimeTransform> clock() const;
 
-    /// @brief Returns a copy of the primary admitted connection's server information, or nullopt
-    /// when none is admitted. Any thread: reads a slot written at admission and cleared on the
-    /// drop, behind the leaf published_mutex_.
+    /// @brief Returns the primary admitted connection's server information, or nullopt when none
+    /// is admitted. Any thread: copies the inline id and name out of a slot written at admission
+    /// and cleared on the drop, behind the leaf published_mutex_, and builds the strings on the
+    /// caller's thread.
     std::optional<ServerInformationObject> server_information() const;
 
     // ========================================
@@ -789,8 +790,7 @@ private:
     /// @param server_id conn->get_server_id(), captured by handle_enter_pairing().
     /// @param selected_method The selected method; DYNAMIC_PAIRING_CODE or STATIC_PAIRING_CODE.
     void handle_enter_pairing_code(SendspinConnection* conn, uint32_t pairing_index,
-                                   const std::string& server_id,
-                                   SendspinPairMethod selected_method);
+                                   const IdText& server_id, SendspinPairMethod selected_method);
 
     /// @brief Runs the Pairing-PSK branch of handle_enter_pairing(): resolves the pairing
     /// outcome and sends client/pair-init followed by client/pair-finalize with the long-term
@@ -799,7 +799,7 @@ private:
     /// @param pairing_index Current pairing_index counter, captured by handle_enter_pairing().
     /// @param server_id conn->get_server_id(), captured by handle_enter_pairing().
     void handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
-                                  const std::string& server_id);
+                                  const IdText& server_id);
 
     /// @brief Handles a pair/abort on an admitted connection.
     /// Cleans up pairing state. Per pairing.md "pair/abort", only closes the connection for reason
@@ -995,15 +995,22 @@ private:
     /// @brief Each admitted slot's clock (admitted_[slot]), nullopt for a free slot
     using ClockSlots = std::array<std::optional<TimeTransform>, MAX_ADMITTED>;
 
+    /// @brief The primary connection's server identity, held inline so the publish copies it
+    /// without a heap allocation
+    struct PublishedServer {
+        IdText server_id{};
+        ServerName name{};
+    };
+
     /// @brief What other threads read of the admitted connections
     struct PublishedState {
         ClockSlots clocks{};
         /// The slot in clocks of the primary connection (primary()), MAX_ADMITTED for none.
         size_t primary_slot{MAX_ADMITTED};
-        /// The primary connection's server information.
-        std::optional<ServerInformationObject> server_information;
+        /// The primary connection's server identity.
+        std::optional<PublishedServer> server;
     };
-    /// Guards published_. A leaf (docs/conventions.md): held only to copy or swap a member, so it
+    /// Guards published_. A leaf (docs/conventions.md): held only to copy a member, so it
     /// also serialises the role threads' clock() reads behind server_information() copies.
     mutable std::mutex published_mutex_;
     /// Written by the protocol task (refresh_published_state()), which, as its only writer, also

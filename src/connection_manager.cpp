@@ -326,8 +326,16 @@ std::optional<TimeTransform> ConnectionManager::clock() const {
 }
 
 std::optional<ServerInformationObject> ConnectionManager::server_information() const {
-    std::lock_guard<std::mutex> lock(this->published_mutex_);
-    return this->published_.server_information;
+    std::optional<PublishedServer> server;
+    {
+        std::lock_guard<std::mutex> lock(this->published_mutex_);
+        server = this->published_.server;
+    }
+    if (!server.has_value()) {
+        return std::nullopt;
+    }
+    return ServerInformationObject{.server_id = std::string(server->server_id.view()),
+                                   .name = std::string(server->name.view())};
 }
 
 // ============================================================================
@@ -892,7 +900,7 @@ void ConnectionManager::on_pairing_succeeded(SendspinConnection* conn) {
     if (this->pairing_window_conn_ != nullptr && this->pairing_window_conn_ == conn) {
         this->close_pairing_window();
     }
-    this->client_->note_pairing_succeeded(conn->get_server_id());
+    this->client_->note_pairing_succeeded(conn->get_server_id().view());
 }
 
 void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
@@ -1041,13 +1049,7 @@ void ConnectionManager::refresh_published_state() {
     // The server information changes only with the primary connection: it is complete before
     // admission (server/hello precedes it).
     const bool primary_changed = primary_id != this->published_primary_id_;
-    std::optional<ServerInformationObject> info;
-    if (primary_changed) {
-        this->published_primary_id_ = primary_id;
-        if (primary_conn != nullptr) {
-            info = primary_conn->get_server_information();
-        }
-    }
+    this->published_primary_id_ = primary_id;
     // Each admitted slot's clock, which a measurement, the slot's connection or the primary moves.
     // The protocol task is published_'s only writer, so it compares without the lock, and a tick
     // that changed nothing takes none.
@@ -1061,10 +1063,14 @@ void ConnectionManager::refresh_published_state() {
         primary != nullptr ? static_cast<size_t>(primary - this->admitted_.data()) : MAX_ADMITTED;
     if (primary_changed || clocks != this->published_.clocks ||
         primary_slot != this->published_.primary_slot) {
-        // Swapped under the leaf lock; the server information it replaces is destroyed outside it.
         std::lock_guard<std::mutex> lock(this->published_mutex_);
-        if (primary_changed) {
-            this->published_.server_information.swap(info);
+        if (primary_changed && primary_conn == nullptr) {
+            this->published_.server.reset();
+        } else if (primary_changed) {
+            // Written in place: the slot is the only copy.
+            PublishedServer& server = this->published_.server.emplace();
+            server.server_id = primary_conn->get_server_id();
+            server.name = primary_conn->get_server_name();
         }
         this->published_.clocks = clocks;
         this->published_.primary_slot = primary_slot;
@@ -1668,10 +1674,10 @@ bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* ad
     const bool pairing_in_flight = !has_admitted || !admitted->is_pairing_finalized();
     return should_admit_connection(
         /*incoming_activities=*/new_conn->get_activities(),
-        /*incoming_server_id=*/new_conn->get_server_id(),
+        /*incoming_server_id=*/new_conn->get_server_id().view(),
         /*admitted_activities=*/
         has_admitted ? admitted->get_activities() : ActivitySet{},
-        /*admitted_server_id=*/has_admitted ? admitted->get_server_id() : std::string{},
+        /*admitted_server_id=*/has_admitted ? admitted->get_server_id().view() : std::string_view{},
         /*has_admitted=*/has_admitted,
         /*last_playback_server_id=*/this->last_played_server_id_.view(),
         /*admitted_pairing_in_flight=*/pairing_in_flight);
@@ -1686,14 +1692,14 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     if (!conn->has_activity(SendspinActivity::PLAYBACK)) {
         return;
     }
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
     if (server_id.empty()) {
         return;
     }
     // The RAM half updates here, because a later arbitration reads last_played_server_id_; the
     // provider writes for this and for the recency move below wait for
     // SendspinClient::flush_pending_persistence() on the main loop.
-    this->client_->note_last_played_server(server_id);
+    this->client_->note_last_played_server(server_id.view());
     // A pair-finalize at capacity evicts against the recency order and spares only the records
     // of open connections, so a connection that closes later must not leave its record looking
     // least recent until a deferred move lands. RecordStore::mutex_ is a leaf (docs/conventions.md,

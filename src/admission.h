@@ -178,9 +178,9 @@ inline int activity_rank(ActivitySet activities) {
 ///        shielding a pairing that has finished.
 /// @return true if the incoming connection should become the admitted one.
 inline bool should_admit_connection(ActivitySet incoming_activities,
-                                    const std::string& incoming_server_id,
+                                    std::string_view incoming_server_id,
                                     ActivitySet admitted_activities,
-                                    const std::string& admitted_server_id, bool has_admitted,
+                                    std::string_view admitted_server_id, bool has_admitted,
                                     std::string_view last_playback_server_id,
                                     bool admitted_pairing_in_flight) {
     if (!has_admitted) {

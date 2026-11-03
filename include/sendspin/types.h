@@ -42,6 +42,7 @@ enum class SendspinGoodbyeReason : uint8_t {
 /// @brief Server identity fields received in server/hello messages
 struct ServerInformationObject {
     std::string server_id{};
+    /// At most 64 bytes in UTF-8, cut at a character boundary
     std::string name{};
 };
 
@@ -55,6 +56,7 @@ enum class SendspinPlaybackState : uint8_t {
 struct GroupUpdateObject {
     std::optional<SendspinPlaybackState> playback_state{};
     std::optional<std::string> group_id{};
+    /// At most 64 bytes in UTF-8, cut at a character boundary
     std::optional<std::string> group_name{};
 };
 

@@ -289,8 +289,7 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
         this->noise_handshake_.reset();
         this->noise_handshake_complete_ = true;
         SS_LOGI(TAG, "Noise transport active (server_id=%s, psk_category=%d)",
-                this->server_information_.server_id.c_str(),
-                static_cast<int>(this->get_psk_category()));
+                this->server_id_.c_str(), static_cast<int>(this->get_psk_category()));
     }
 
     // NEED_MORE, or COMPLETE handled above: nothing else to do until the next frame.
@@ -334,9 +333,9 @@ bool SendspinConnection::handle_noise_rehandshake(std::span<uint8_t> msg1_bytes)
         SS_LOGE(TAG, "handle_noise_rehandshake: no handshake hash available");
         return false;
     }
-    auto result = run_rehandshake_msg1(
-        msg1_bytes, this->server_information_.server_id, *this->noise_identity_,
-        *this->noise_record_store_, this->noise_suite_name_, prior_h.value(), *this->json_arena_);
+    auto result = run_rehandshake_msg1(msg1_bytes, this->server_id_.view(), *this->noise_identity_,
+                                       *this->noise_record_store_, this->noise_suite_name_,
+                                       prior_h.value(), *this->json_arena_);
     if (!result.has_value()) {
         SS_LOGW(TAG, "handle_noise_rehandshake: re-handshake failed; closing connection");
         return false;
@@ -370,9 +369,9 @@ bool SendspinConnection::handle_noise_rehandshake(std::span<uint8_t> msg1_bytes)
     // connection.md "Re-handshake": neither hello is re-sent, so the hello state carries over
     // untouched; the server's first message under the new keys is server/activate, which
     // first_activate_received_ (cleared above) now waits on.
-    SS_LOGI(
-        TAG, "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/activate",
-        this->server_information_.server_id.c_str(), static_cast<int>(this->get_psk_category()));
+    SS_LOGI(TAG,
+            "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/activate",
+            this->server_id_.c_str(), static_cast<int>(this->get_psk_category()));
     return true;
 }
 

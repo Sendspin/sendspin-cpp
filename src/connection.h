@@ -345,13 +345,14 @@ public:
 
     /// @brief Gets the server ID from the Noise handshake result (set at COMPLETE; empty until
     /// then when a Noise handshake is installed on this connection).
-    const std::string& get_server_id() const {
-        return this->server_information_.server_id;
+    const IdText& get_server_id() const {
+        return this->server_id_;
     }
 
-    /// @brief Gets the server information from the server/hello message (empty until received).
-    const ServerInformationObject& get_server_information() const {
-        return this->server_information_;
+    /// @brief Gets the server's friendly name from the server/hello message (empty until
+    /// received).
+    const ServerName& get_server_name() const {
+        return this->server_name_;
     }
 
     /// @brief Whether server/hello's source@v1 support object lists `codec` among the codecs the
@@ -683,7 +684,7 @@ public:
     /// Called at COMPLETE in connection.cpp.
     void set_noise_handshake_result(std::string_view server_id, PskCategory psk_category,
                                     std::string_view psk_id) {
-        this->server_information_.server_id = server_id;
+        this->server_id_.assign(server_id);
         this->psk_category_ = psk_category;
         this->psk_id_.assign(psk_id);
     }
@@ -707,10 +708,10 @@ public:
         this->server_source_codecs_ = codecs.value_or(0);
     }
 
-    /// @brief Sets the server's display name from server/hello; the server_id the handshake
+    /// @brief Sets the server's friendly name from server/hello; the server_id the handshake
     /// recorded stays.
-    void set_server_name(std::string name) {
-        this->server_information_.name = std::move(name);
+    void set_server_name(const ServerName& name) {
+        this->server_name_ = name;
     }
 
     // ========================================
@@ -1009,10 +1010,11 @@ protected:
     MessageTracer message_tracer_;
 #endif
 
-    /// Server identity: name from server/hello, server_id from the Noise handshake result
-    /// (or re-handshake; unchanged across a re-handshake since it is the same server). Protocol
-    /// task only; ConnectionManager publishes a copy to other threads at admission.
-    ServerInformationObject server_information_{};
+    /// Server identity: server_id from the Noise handshake result (or re-handshake; unchanged
+    /// across a re-handshake since it is the same server), name from server/hello. Protocol task
+    /// only; ConnectionManager publishes a copy to other threads at admission.
+    IdText server_id_{};
+    ServerName server_name_{};
 
     /// The pairing record staged by the attempt in flight, committed by the
     /// server/pair-finalize handler (nullopt = nothing to store). Protocol task only.

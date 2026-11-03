@@ -23,6 +23,7 @@
 #pragma once
 
 #include "constants.h"
+#include "inline_text.h"
 
 #include <array>
 #include <cstddef>
@@ -66,51 +67,8 @@ using PeerIdText = std::array<char, PEER_ID_SIZE + 2>;
 /// @brief A peer_id or psk_id held inline, NUL-terminated
 ///
 /// Both are PEER_ID_SIZE base64url characters (psk_id_for(), Identity::peer_id()), so either fits
-/// without a heap allocation; longer text names no id this client holds and is refused.
-static_assert(PEER_ID_SIZE <= UINT8_MAX, "IdText holds its size in a uint8_t");
-
-class IdText {
-public:
-    IdText() = default;
-
-    /// @brief Holds `text`.
-    /// @return false, leaving the text empty, when `text` is longer than PEER_ID_SIZE.
-    bool assign(std::string_view text) {
-        if (text.size() > PEER_ID_SIZE) {
-            this->size_ = 0;
-            this->chars_[0] = '\0';
-            return false;
-        }
-        text.copy(this->chars_.data(), text.size());
-        this->chars_[text.size()] = '\0';
-        this->size_ = static_cast<uint8_t>(text.size());
-        return true;
-    }
-
-    std::string_view view() const {
-        return {this->chars_.data(), this->size_};
-    }
-
-    const char* c_str() const {
-        return this->chars_.data();
-    }
-
-    bool empty() const {
-        return this->size_ == 0;
-    }
-
-    bool operator==(std::string_view other) const {
-        return this->view() == other;
-    }
-
-    bool operator==(const IdText& other) const {
-        return this->view() == other.view();
-    }
-
-private:
-    std::array<char, PEER_ID_SIZE + 1> chars_{};
-    uint8_t size_{0};
-};
+/// without a heap allocation; longer text names no id this client holds and is refused (assign()).
+using IdText = InlineText<PEER_ID_SIZE>;
 
 /// @brief Decode a peer_id to the X25519 public key it names.
 ///

@@ -510,15 +510,15 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             ServerHelloMessage hello_msg;
             if (parsed.extract<process_server_hello_message>(&hello_msg)) {
                 // server_id comes from the Noise handshake result (already set on the
-                // connection); server/hello supplies the display name.
-                conn->set_server_name(std::move(hello_msg.name));
+                // connection); server/hello supplies the friendly name.
+                conn->set_server_name(hello_msg.name);
                 conn->set_server_source_codecs(hello_msg.source_codecs);
                 // The nursery scan later in this tick sends client/hello in reply; nothing
                 // needs to be scheduled here.
                 conn->set_server_hello_received(true);
 
                 SS_LOGD(TAG, "Connected to server '%s' (server_id=%s)",
-                        conn->get_server_information().name.c_str(), conn->get_server_id().c_str());
+                        conn->get_server_name().c_str(), conn->get_server_id().c_str());
             }
             break;
         }
