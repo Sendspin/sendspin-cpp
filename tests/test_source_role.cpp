@@ -891,7 +891,6 @@ public:
         conn->set_json_arena(*this->client->json_arena_);
         conn->set_noise_session(std::move(loopback->responder_session));
         conn->set_noise_handshake_result("stand-in-server", PskCategory::LONG_TERM, "stand-in");
-        conn->init_time_filter();
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
         conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"source@v1"},
@@ -912,7 +911,7 @@ public:
 
     /// One measurement: the server clock runs SERVER_CLOCK_OFFSET_US ahead.
     static void sync(SendspinConnection& conn) {
-        conn.get_time_filter()->update(SERVER_CLOCK_OFFSET_US, 1000, platform_time_us());
+        conn.time_filter().update(SERVER_CLOCK_OFFSET_US, 1000, platform_time_us());
     }
 
     /// A server message on the current stand-in, as the protocol task dispatches it.
@@ -1205,7 +1204,7 @@ TEST(SourceStream, CaptureGoesOutStampedOnTheServerClock) {
     ASSERT_EQ(chunk.size(), SOURCE_CHUNK_HEADER_SIZE + CHUNK_BYTES);
     EXPECT_EQ(chunk[0], SENDSPIN_BINARY_SOURCE_AUDIO);
     EXPECT_EQ(be64_to_host(chunk.data() + 1),
-              rig.conn().get_time_filter()->compute_server_time(capture_us));
+              rig.conn().time_filter().compute_server_time(capture_us));
     EXPECT_GT(be64_to_host(chunk.data() + 1), capture_us + SERVER_CLOCK_OFFSET_US / 2)
         << "the stamp was left on the client clock";
     EXPECT_TRUE(std::equal(chunk.begin() + SOURCE_CHUNK_HEADER_SIZE, chunk.end(), pcm.begin()));
@@ -2012,8 +2011,7 @@ TEST(SourceOpusStream, OpusIsAnnouncedOnlyWhenTheServerListsIt) {
             EXPECT_EQ(payload, std::vector<uint8_t>(pcm.begin(), pcm.begin() + CHUNK_BYTES));
         }
         EXPECT_EQ(be64_to_host(chunk.data() + 1),
-                  rig.conn().get_time_filter()->compute_server_time(capture_us -
-                                                                    (opus ? 2500 : 0)));
+                  rig.conn().time_filter().compute_server_time(capture_us - (opus ? 2500 : 0)));
     }
 }
 

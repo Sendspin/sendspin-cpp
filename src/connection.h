@@ -615,32 +615,20 @@ public:
         this->pairing_finalized_ = false;
     }
 
-    /// @brief Gets the time filter for this connection
-    /// @return Pointer to the time filter, or nullptr if not initialized.
-    SendspinTimeFilter* get_time_filter() {
-        return this->time_filter_.get();
+    /// @brief This connection's time filter. Protocol task only; other threads read its transform
+    /// through ConnectionManager::clock().
+    SendspinTimeFilter& time_filter() {
+        return this->time_filter_;
     }
-
-    /// @brief Returns a shared reference to this connection's time filter, for ConnectionManager's
-    /// time filter slot (see ConnectionManager::time_filter())
-    /// @return The time filter, or nullptr if not initialized.
-    std::shared_ptr<SendspinTimeFilter> get_shared_time_filter() const {
+    const SendspinTimeFilter& time_filter() const {
         return this->time_filter_;
     }
 
     /// @brief Returns true if the time filter has received at least one measurement
     /// @return True if time synchronization has started, false otherwise.
     bool is_time_synced() const {
-        if (this->time_filter_ == nullptr) {
-            return false;
-        }
-        return this->time_filter_->has_update();
+        return this->time_filter_.has_update();
     }
-
-    /// @brief Initializes the time filter with Kalman parameters. Call once, before the connection
-    /// can enter a manager slot: ConnectionManager's time filter slot copies this filter at install
-    /// and never refreshes it.
-    void init_time_filter();
 
     /// @brief This connection's time burst, which feeds its time filter. Protocol task only: the
     /// burst sends its client/time frames there and is fed the server/time replies there.
@@ -1033,15 +1021,15 @@ protected:
     /// Sends this connection's client/time bursts and feeds its time filter. Protocol task only.
     SendspinTimeBurst time_burst_{};
 
+    /// Time synchronization filter (Kalman-based), fed by time_burst_. Protocol task only; other
+    /// threads read its transform through ConnectionManager::clock().
+    SendspinTimeFilter time_filter_{};
+
     /// Noise handshake driver, from init_noise_handshake() until the handshake completes or
     /// aborts. Protocol task only.
     std::optional<NoiseHandshake> noise_handshake_;
 
     // Pointer fields
-
-    /// Time synchronization filter (Kalman-based). Shared so role threads can hold it without
-    /// holding this connection (ConnectionManager::time_filter()).
-    std::shared_ptr<SendspinTimeFilter> time_filter_;
 
     /// Retained for re-handshake: pointer to the client identity supplied at
     /// init_noise_handshake(). Lifetime is owned by SendspinClient (outlives connections).

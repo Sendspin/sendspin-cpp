@@ -1534,7 +1534,6 @@ TEST(TimeBurst, CountsOnlyTheReplyToItsPendingMessage) {
     ASSERT_TRUE(r.has_value());
     DeferredWriteConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
-    conn.init_time_filter();
     conn.set_client_hello_sent(true);
     conn.set_server_hello_received(true);
     auto reply = [](int64_t echo) {
@@ -1577,7 +1576,6 @@ TEST(TimeBurst, TimedOutMessageIsRetired) {
     ASSERT_TRUE(r.has_value());
     DeferredWriteConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
-    conn.init_time_filter();
     conn.set_client_hello_sent(true);
     conn.set_server_hello_received(true);
 
@@ -1917,7 +1915,6 @@ TEST(NoiseTransport, ASendFailureAfterTheEncryptDropsTheConnectionInItsTick) {
         auto conn = std::make_shared<FailingWriteConnection>();
         conn->set_json_arena(*client.json_arena_);
         conn->set_noise_session(std::move(r->responder_session));
-        conn->init_time_filter();
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
         conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"controller@v1"},
@@ -1997,7 +1994,6 @@ TEST(TimeBurst, AnUnsentTimeMessageCountsAsTimedOut) {
             ASSERT_TRUE(r.has_value());
             conn.set_noise_session(std::move(r->responder_session));
         }
-        conn.init_time_filter();
         conn.set_client_hello_sent(true);
         conn.set_server_hello_received(true);
 

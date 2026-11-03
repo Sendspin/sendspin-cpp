@@ -74,14 +74,6 @@ SsErr SendspinConnection::send_lent_frame(OutboundRing& ring, void* item, size_t
     return err;
 }
 
-// ============================================================================
-// Time filter
-// ============================================================================
-
-void SendspinConnection::init_time_filter() {
-    this->time_filter_ = std::make_shared<SendspinTimeFilter>(SendspinTimeFilter::Config{});
-}
-
 void SendspinConnection::wake_protocol_task() const {
     if (this->inbound_task_ != nullptr) {
         this->inbound_task_->wake();

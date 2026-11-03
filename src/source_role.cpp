@@ -344,8 +344,7 @@ void SourceRole::Impl::send_chunks(SendspinConnection* owner) {
         // as possible, on the thread that feeds it.
         uint8_t* message = outbound_item_message(item);
         message[0] = SENDSPIN_BINARY_SOURCE_AUDIO;
-        host_to_be64(owner->get_time_filter()->compute_server_time(header.capture_time_us),
-                     message + 1);
+        host_to_be64(owner->time_filter().compute_server_time(header.capture_time_us), message + 1);
         // The send chain owns the item from here on (OutboundRing "Lending"). A failure after
         // the encrypt closes the connection, which the loss pass that follows drops.
         (void)owner->send_app_binary_lent(*ring, item, capacity, header.data_len);
