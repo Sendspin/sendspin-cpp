@@ -1188,18 +1188,6 @@ uint16_t ConnectionManager::roles_owned_by_others(const AdmittedEntry* except) c
 }
 
 // ============================================================================
-// Handoff support
-// ============================================================================
-
-void ConnectionManager::set_last_played_server_id(const std::string& server_id) {
-    if (server_id.empty()) {
-        this->last_played_server_id_.reset();
-    } else {
-        this->last_played_server_id_ = server_id;
-    }
-}
-
-// ============================================================================
 // Tick steps
 // ============================================================================
 
@@ -1669,7 +1657,7 @@ bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* ad
         has_admitted ? admitted->get_activities() : ActivitySet{},
         /*admitted_server_id=*/has_admitted ? admitted->get_server_id() : std::string{},
         /*has_admitted=*/has_admitted,
-        /*last_playback_server_id=*/this->last_played_server_id_,
+        /*last_playback_server_id=*/this->last_played_server_id_.view(),
         /*admitted_pairing_in_flight=*/pairing_in_flight);
 }
 

@@ -19,6 +19,7 @@
 #pragma once
 
 #include "constants.h"
+#include "crypto/keys.h"
 #include "inline_vector.h"
 #include "protocol_messages.h"
 #include "record_store.h"
@@ -33,6 +34,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -590,12 +592,15 @@ public:
 
     /// @brief Sets the last-played server_id for handoff preference decisions. Main loop before the
     /// protocol task starts (SendspinClient::load_last_played_server()), protocol task after.
-    /// @param server_id The server_id of the last-played server; empty clears it.
-    void set_last_played_server_id(const std::string& server_id);
+    /// @param server_id The server_id of the last-played server; empty, or longer than a peer_id,
+    ///                  clears it.
+    void set_last_played_server_id(std::string_view server_id) {
+        this->last_played_server_id_.assign(server_id);
+    }
 
-    /// @brief Returns the current last-played server_id, or nullopt if unset. Protocol task.
-    const std::optional<std::string>& last_played_server_id() const {
-        return this->last_played_server_id_;
+    /// @brief Returns the current last-played server_id, empty if unset. Protocol task.
+    std::string_view last_played_server_id() const {
+        return this->last_played_server_id_.view();
     }
 
 private:
@@ -942,9 +947,9 @@ private:
     std::unique_ptr<SendspinWsServer> ws_server_;
 
     // String fields
-    /// server_id of the last-played server; nullopt if unset. Written on the main loop by
+    /// server_id of the last-played server; empty if unset. Written on the main loop by
     /// start()'s load, before the protocol task runs, then protocol task only.
-    std::optional<std::string> last_played_server_id_;
+    IdText last_played_server_id_;
 
     // 64-bit fields
     /// From resolve_liveness_timeout_ms(), in microseconds; 0 or negative disables the check.

@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -929,10 +930,10 @@ private:
     /// @brief Makes server_id the last-played server in RAM and queues its provider write for
     /// flush_pending_persistence() on the main loop. Protocol task, where arbitration reads the
     /// value. An empty or unchanged server_id is a no-op: one flash write per handoff.
-    void note_last_played_server(const std::string& server_id);
+    void note_last_played_server(std::string_view server_id);
 
     /// @brief Writes the last-played server_id through the persistence provider.
-    void write_last_played_server(const std::string& server_id);
+    void write_last_played_server(std::string_view server_id);
 
     // ========================================
     // Connection event handlers (called by ConnectionManager via friend access)

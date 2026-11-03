@@ -30,9 +30,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 namespace sendspin {
 
@@ -170,6 +170,7 @@ inline int activity_rank(ActivitySet activities) {
 ///   4. Equal non-zero rank -> admit.
 ///   5. Both rank-0 (empty activities): admit only if
 ///      incoming.server_id == last_playback_server_id && admitted.server_id != last_playback.
+///      An empty last_playback_server_id means none, so rule 5 never admits.
 ///
 /// @param admitted_pairing_in_flight  Whether the admitted connection's pairing exchange is still
 ///        in flight. True is the plain reading of rule 2. Pass false only when the admitted side
@@ -180,7 +181,7 @@ inline bool should_admit_connection(ActivitySet incoming_activities,
                                     const std::string& incoming_server_id,
                                     ActivitySet admitted_activities,
                                     const std::string& admitted_server_id, bool has_admitted,
-                                    const std::optional<std::string>& last_playback_server_id,
+                                    std::string_view last_playback_server_id,
                                     bool admitted_pairing_in_flight) {
     if (!has_admitted) {
         return true;
@@ -204,11 +205,11 @@ inline bool should_admit_connection(ActivitySet incoming_activities,
 
     if (incoming_rank == 0) {
         // Both-empty: resolve by last_playback server_id.
-        if (!last_playback_server_id.has_value()) {
+        if (last_playback_server_id.empty()) {
             return false;
         }
-        return (incoming_server_id == *last_playback_server_id &&
-                admitted_server_id != *last_playback_server_id);
+        return (incoming_server_id == last_playback_server_id &&
+                admitted_server_id != last_playback_server_id);
     }
 
     return true;

@@ -537,6 +537,10 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
         this->order_dirty_ = false;
         return writes;
     }
+    // A flush staged only for the last-played server owes no record write: skip the reserve.
+    if (this->dirty_slots_.empty() && !this->order_dirty_) {
+        return writes;
+    }
     writes.reserve(this->dirty_slots_.size() + 1);
     for (uint8_t slot : this->dirty_slots_) {
         SlotWrite write;

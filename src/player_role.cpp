@@ -317,16 +317,16 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     // and muted are required only alongside their command, so a withheld command omits its value.
     if (this->volume_adjustable) {
         player_state.volume = this->volume;
-        player_state.supported_commands.push_back(SendspinPlayerCommand::VOLUME);
+        player_state.supported_commands.insert(SendspinPlayerCommand::VOLUME);
     }
     if (this->mute_adjustable) {
         player_state.muted = this->muted;
-        player_state.supported_commands.push_back(SendspinPlayerCommand::MUTE);
+        player_state.supported_commands.insert(SendspinPlayerCommand::MUTE);
     }
     if (adjustable) {
-        player_state.supported_commands.push_back(SendspinPlayerCommand::SET_OUTPUT_DELAY);
+        player_state.supported_commands.insert(SendspinPlayerCommand::SET_OUTPUT_DELAY);
     }
-    msg.player = std::move(player_state);
+    msg.player = player_state;
 }
 
 std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* data, size_t len) {

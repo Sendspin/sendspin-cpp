@@ -146,15 +146,15 @@ void retain_delivered_dismissals(std::vector<PairingNote>& notes) {
 /// @brief The provider writes the main loop owes, accumulated by request_persist() and
 /// note_last_played_server() and performed by flush_pending_persistence()
 struct PersistRequest {
-    /// The last-played server_id to write, when it changed since the last flush.
-    std::optional<std::string> last_played{};
+    /// The last-played server_id to write, when it changed since the last flush; empty when not.
+    IdText last_played{};
 };
 
 /// @brief Folds a later persist request into the one the drain has not taken yet: a newer
 /// last-played server replaces an older one.
 void merge_persist_request(PersistRequest& current, PersistRequest&& delta) {
-    if (delta.last_played.has_value()) {
-        current.last_played = std::move(delta.last_played);
+    if (!delta.last_played.empty()) {
+        current.last_played = delta.last_played;
     }
 }
 
@@ -204,20 +204,13 @@ struct SendspinClient::EventState {
     uint32_t drain_generation{0};
 
     /// @brief Appends `note` to the pairing slot. Every SendspinClient::note_*() method funnels
-    /// through this so the merge shape lives once. PairingNote is anonymous-namespace-private
-    /// to this file, so this lives on EventState (itself private to SendspinClient) rather than as
-    /// a SendspinClient member declared in the public header.
+    /// through this so the append lives once. PairingNote is anonymous-namespace-private to this
+    /// file, so this lives on EventState (itself private to SendspinClient) rather than as a
+    /// SendspinClient member declared in the public header.
     /// @param note The note to append (moved).
     void push_pairing_note(PairingNote&& note) {
-        std::vector<PairingNote> delta;
-        delta.push_back(std::move(note));
-        this->pairing_slot.merge(
-            [](std::vector<PairingNote>& current, std::vector<PairingNote>&& added) {
-                for (auto& entry : added) {
-                    current.push_back(std::move(entry));
-                }
-            },
-            std::move(delta));
+        this->pairing_slot.update(
+            [&note](std::vector<PairingNote>& current) { current.push_back(std::move(note)); });
     }
 };
 
@@ -699,8 +692,8 @@ void SendspinClient::flush_pending_persistence() {
     if (this->record_store_ != nullptr) {
         this->record_store_->persist_records();
     }
-    if (owed.last_played.has_value()) {
-        this->write_last_played_server(owed.last_played.value());
+    if (!owed.last_played.empty()) {
+        this->write_last_played_server(owed.last_played.view());
     }
 }
 
@@ -1625,29 +1618,34 @@ void SendspinClient::load_last_played_server() {
         SS_LOGI(TAG, "Loaded last played server: %s", server_id.c_str());
     }
 }
-void SendspinClient::note_last_played_server(const std::string& server_id) {
+
+void SendspinClient::note_last_played_server(std::string_view server_id) {
     if (server_id.empty() || server_id == this->connection_manager_->last_played_server_id()) {
         return;
     }
-    SS_LOGD(TAG, "Last played server is now %s", server_id.c_str());
-    this->connection_manager_->set_last_played_server_id(server_id);
     PersistRequest request;
-    request.last_played = server_id;
-    this->event_state_->persist_slot.merge(merge_persist_request, std::move(request));
+    // A server_id is a peer_id, which IdText always holds.
+    if (!request.last_played.assign(server_id)) {
+        return;
+    }
+    SS_LOGD(TAG, "Last played server is now %s", request.last_played.c_str());
+    this->connection_manager_->set_last_played_server_id(server_id);
+    this->event_state_->persist_slot.merge(merge_persist_request, request);
 }
 
-void SendspinClient::write_last_played_server(const std::string& server_id) {
+void SendspinClient::write_last_played_server(std::string_view server_id) {
     if (this->persistence_provider_) {
         // The handshake admits only a server_id that is a canonical public key.
         auto key = public_key_from_peer_id(server_id);
         if (!key.has_value()) {
-            SS_LOGW(TAG, "Not persisting last played server %s: not a public key",
-                    server_id.c_str());
+            SS_LOGW(TAG, "Not persisting last played server %.*s: not a public key",
+                    static_cast<int>(server_id.size()), server_id.data());
             return;
         }
         if (this->persistence_provider_->save_blob(persistence_keys::LAST_PLAYED, key->data(),
                                                    key->size())) {
-            SS_LOGD(TAG, "Persisted last played server: %s", server_id.c_str());
+            SS_LOGD(TAG, "Persisted last played server: %.*s", static_cast<int>(server_id.size()),
+                    server_id.data());
         } else {
             SS_LOGW(TAG, "Failed to persist last played server");
         }
