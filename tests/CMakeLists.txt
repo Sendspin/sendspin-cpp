@@ -248,7 +248,8 @@ target_include_directories(sendspin_alloc_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/crypto
 )
-target_link_libraries(sendspin_alloc_tests PRIVATE sendspin GTest::gtest)
+# dladdr() lives in libdl before glibc 2.34; CMAKE_DL_LIBS names it on Linux and is empty on macOS.
+target_link_libraries(sendspin_alloc_tests PRIVATE sendspin GTest::gtest ${CMAKE_DL_LIBS})
 add_dependencies(sendspin_tests sendspin_alloc_tests)
 
 foreach(test_target sendspin_tests sendspin_alloc_tests)

@@ -401,6 +401,18 @@ void pump_while_not(SendspinClient& client, Pred pred) {
     client.loop();
 }
 
+/// Counts the completed time bursts the main loop reports. on_time_sync_updated() comes only after
+/// a burst's last reply and its completion have run on the protocol task, so the count bounds a
+/// burst on the client's side. Main loop (the test thread) only.
+class BurstCountingListener : public SendspinClientListener {
+public:
+    void on_time_sync_updated(float /*error*/) override {
+        ++this->bursts;
+    }
+
+    int bursts{0};
+};
+
 void expect_library_allocations(const Window& window, const char* title, size_t expected) {
     EXPECT_FALSE(window.overflowed) << title;
     EXPECT_EQ(window.count(Owner::LIBRARY), expected) << title;
@@ -441,8 +453,10 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     config.time_burst_size = static_cast<uint8_t>(TIME_BURST_SIZE);
     config.time_burst_interval_ms = 100;
 
+    BurstCountingListener burst_listener;  // Outlives the client
     PairedClientBundle bundle(config);
     SendspinClient& client = bundle.client();
+    client.set_listener(&burst_listener);
     CountingPlayerListener player_listener;
     client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_controller();
@@ -471,13 +485,13 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     pump_while_not(client, [&] { return server->client_state_count() > states_before; });
     expect_library_allocations(close_window(), "client/state", CLIENT_STATE_ALLOCATIONS);
 
-    // Opens once the server has a burst's last client/time and closes once it has the next one's:
-    // one burst of sends and the replies to them.
-    pump_while_not(client, [&] { return server->client_time_count() % TIME_BURST_SIZE == 0; });
-    const int times_before = server->client_time_count();
+    // Opens just after the main loop reports a completed burst and closes once it reports the
+    // next: one burst's sends, its replies and its completion. The next burst starts
+    // time_burst_interval_ms after a completion, so none of it is in flight at the open.
+    const int bursts_seen = burst_listener.bursts;
+    pump_while_not(client, [&] { return burst_listener.bursts > bursts_seen; });
     open_window();
-    pump_while_not(client,
-                   [&] { return server->client_time_count() >= times_before + TIME_BURST_SIZE; });
+    pump_while_not(client, [&] { return burst_listener.bursts > bursts_seen + 1; });
     expect_library_allocations(close_window(), "client/time and server/time burst",
                                TIME_BURST_ALLOCATIONS);
 
