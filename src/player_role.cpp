@@ -326,7 +326,7 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     if (adjustable) {
         player_state.supported_commands.insert(SendspinPlayerCommand::SET_OUTPUT_DELAY);
     }
-    msg.player = std::move(player_state);
+    msg.player = player_state;
 }
 
 std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* data, size_t len) {
