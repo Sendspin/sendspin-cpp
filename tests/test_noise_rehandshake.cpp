@@ -241,6 +241,8 @@ static std::optional<RehandshakeResult> run_rehandshake(
         ADD_FAILURE() << "run_rehandshake_msg1 returned nullopt";
         return std::nullopt;
     }
+    // The PSK the re-handshake resolved, which becomes the connection's psk_id.
+    EXPECT_EQ(result->psk_id.view(), rehs_psk_id);
 
     // The result carries msg2's Noise bytes; the initiator reads them directly.
     NoiseMsg2& msg2_bytes = result->msg2_bytes;

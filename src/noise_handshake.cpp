@@ -262,19 +262,6 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
                           .msg2_bytes = msg2_bytes};
 }
 
-/// @brief Build a NoiseHandshakeResult from a completed Msg1CoreResult. Shared by
-/// NoiseHandshake::handle_msg1 (initial handshake) and run_rehandshake_msg1: both assemble the
-/// result identically from the core's session and PSK; only msg2 differs, so the caller sets it
-/// afterward.
-/// @param core       Completed core result (its session is moved out of it).
-/// @param server_id  Server peer_id to record on the result.
-NoiseHandshakeResult make_handshake_result(Msg1CoreResult&& core, const IdText& server_id) {
-    return NoiseHandshakeResult{.session = std::move(core.session),
-                                .server_id = server_id,
-                                .psk_id = core.psk_id,
-                                .psk_category = core.psk_category};
-}
-
 }  // namespace
 
 // ============================================================================
@@ -477,7 +464,8 @@ bool NoiseHandshake::handle_msg1(std::span<uint8_t> msg1_bytes,
     SS_LOGI(TAG, "Noise handshake complete: server_id=%s psk_category=%d", this->server_id_.c_str(),
             static_cast<int>(core->psk_category));
 
-    completed = make_handshake_result(std::move(core.value()), this->server_id_);
+    // Built in the caller's optional, so no result temporary sits on this frame.
+    completed.emplace(std::move(core->session), this->server_id_, core->psk_id, core->psk_category);
 
     return true;
 }
@@ -506,11 +494,12 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
     SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%d", known_server_id.c_str(),
             static_cast<int>(core->psk_category));
 
-    // The caller wraps msg2 in its noise/handshake envelope and sends it encrypted.
-    const NoiseMsg2 msg2_bytes = core->msg2_bytes;
-    NoiseHandshakeResult result = make_handshake_result(std::move(core.value()), known_server_id);
-    result.msg2_bytes = msg2_bytes;
-    return result;
+    // The caller wraps msg2 in its noise/handshake envelope and sends it encrypted. Returned as a
+    // prvalue, which is built in the caller's optional; a named optional would be moved there,
+    // since this function also returns nullopt.
+    return std::optional<NoiseHandshakeResult>(std::in_place, std::move(core->session),
+                                               known_server_id, core->psk_id, core->psk_category,
+                                               core->msg2_bytes);
 }
 
 }  // namespace sendspin
