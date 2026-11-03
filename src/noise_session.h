@@ -36,8 +36,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <string>
-#include <vector>
+#include <span>
 
 // noise-c forward declarations: the implementation includes the actual headers.
 struct NoiseHandshakeState_s;
@@ -46,6 +45,13 @@ struct NoiseCipherState_s;
 typedef struct NoiseCipherState_s NoiseCipherState;
 
 namespace sendspin {
+
+/// @brief Bytes of Noise message 2: the responder's ephemeral key, then the `{}` payload
+/// write_msg2_and_split() sends and its authentication tag.
+static constexpr size_t NOISE_MSG2_BYTES = 32 + 2 + 16;
+
+/// @brief Noise message 2, which is always NOISE_MSG2_BYTES long.
+using NoiseMsg2 = std::array<uint8_t, NOISE_MSG2_BYTES>;
 
 /// @brief Noise KKpsk2 session: handshake and transport state.
 ///
@@ -91,9 +97,11 @@ public:
     // Handshake
     // ========================================
 
-    /// @brief Decrypt Noise message 1 and return its plaintext payload.
-    /// @return Decrypted payload, or empty vector on auth failure.
-    std::vector<uint8_t> read_msg1(const uint8_t* msg1_bytes, size_t msg1_len);
+    /// @brief Decrypt Noise message 1 into `payload`.
+    /// @param msg1    The message; noise-c decrypts its parts in place and clears it.
+    /// @param payload Output for the plaintext payload; must not overlap `msg1`.
+    /// @return The payload's size, or nullopt on auth failure or a payload larger than `payload`.
+    std::optional<size_t> read_msg1(std::span<uint8_t> msg1, std::span<uint8_t> payload);
 
     /// @brief Bind (or rebind) the pre-shared key on this handshake state.
     ///
@@ -109,7 +117,7 @@ public:
     /// @brief Encrypt Noise message 2 (payload = `{}` UTF-8) and split into
     /// transport cipher states.
     /// @return true on success; transport mode is now active.
-    bool write_msg2_and_split(std::vector<uint8_t>& msg2_out);
+    bool write_msg2_and_split(NoiseMsg2& msg2_out);
 
     /// @brief The 32-byte Noise handshake hash `h` (available after split).
     const std::array<uint8_t, 32>& handshake_hash() const {

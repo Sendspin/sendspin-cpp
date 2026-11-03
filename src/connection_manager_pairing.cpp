@@ -931,8 +931,8 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn) {
         return;
     }
 
-    // Copied: the drops below release the connection that owns the string.
-    const std::string psk_id = conn->get_psk_id();
+    // Copied: the drops below release the connection that owns the id.
+    const IdText psk_id = conn->get_psk_id();
     SS_LOGI(TAG, "server/unpair: dropping record and disconnecting (server_id=%s, psk_id=%s)",
             conn->get_server_id().c_str(), psk_id.c_str());
 
@@ -940,7 +940,7 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn) {
     // because a re-handshake on the revoked psk_id resolves against the store and must miss it
     // from this instant: deferring it would leave the credential usable until the flush. The slot
     // write is left to SendspinClient::flush_pending_persistence() on the main loop.
-    if (this->client_->record_store_->note_record_removed(psk_id)) {
+    if (this->client_->record_store_->note_record_removed(psk_id.view())) {
         this->client_->request_persist();
     }
 

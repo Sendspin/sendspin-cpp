@@ -234,20 +234,16 @@ static std::optional<RehandshakeResult> run_rehandshake(
         return std::nullopt;
     }
 
-    auto result =
-        run_rehandshake_msg1(msg1_bytes_of(msg1_json), init.server_id.peer_id(), init.client_id, rs,
-                             suite_name.c_str(), prior_h, TestArena());
+    std::vector<uint8_t> msg1_bytes = msg1_bytes_of(msg1_json);
+    auto result = run_rehandshake_msg1(msg1_bytes, init.server_id.peer_id(), init.client_id, rs,
+                                       suite_name.c_str(), prior_h, TestArena());
     if (!result.has_value()) {
         ADD_FAILURE() << "run_rehandshake_msg1 returned nullopt";
         return std::nullopt;
     }
 
     // The result carries msg2's Noise bytes; the initiator reads them directly.
-    std::vector<uint8_t>& msg2_bytes = result->msg2_bytes;
-    if (msg2_bytes.empty()) {
-        ADD_FAILURE() << "the re-handshake produced no msg2";
-        return std::nullopt;
-    }
+    NoiseMsg2& msg2_bytes = result->msg2_bytes;
 
     std::vector<uint8_t> msg2_payload_buf(4096);
     NoiseBuffer msg2_in;
@@ -389,8 +385,9 @@ TEST(NoiseRehandshake, UnknownPskIdAborts) {
     ASSERT_FALSE(msg1_json.empty());
 
     // run_rehandshake_msg1 must return nullopt (unknown psk_id).
-    auto result = run_rehandshake_msg1(msg1_bytes_of(msg1_json), init.server_id.peer_id(),
-                                       init.client_id, empty_rs, suite.c_str(), prior_h, TestArena());
+    std::vector<uint8_t> msg1_bytes = msg1_bytes_of(msg1_json);
+    auto result = run_rehandshake_msg1(msg1_bytes, init.server_id.peer_id(), init.client_id,
+                                       empty_rs, suite.c_str(), prior_h, TestArena());
     EXPECT_FALSE(result.has_value())
         << "run_rehandshake_msg1 should fail with an unknown psk_id";
 }

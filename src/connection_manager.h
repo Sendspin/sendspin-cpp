@@ -762,7 +762,7 @@ private:
     ///
     /// @param psk_id psk_id whose sessions are no longer trusted.
     /// @param except Connection to leave alone (its caller is already dropping it), or nullptr.
-    void drop_connections_using_psk_id(const std::string& psk_id, const SendspinConnection* except);
+    void drop_connections_using_psk_id(const IdText& psk_id, const SendspinConnection* except);
 
     // ========================================
     // Pairing handlers

@@ -54,7 +54,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 namespace sendspin {
 
@@ -65,13 +64,13 @@ struct NoiseHandshakeResult {
     /// The cipher session ready for transport-mode encrypt/decrypt.
     std::unique_ptr<NoiseSession> session;
     /// Server's public key peer_id (43-char base64url).
-    std::string server_id;
+    IdText server_id;
     /// The PSK record that admitted the connection.
     ResolvedPsk resolved_psk;
     /// The Noise msg2 bytes to send to the peer, in a noise/handshake envelope
     /// (build_noise_handshake_message()). Set only for re-handshake results (initial handshake
     /// sends msg2 inline).
-    std::vector<uint8_t> msg2_bytes;
+    NoiseMsg2 msg2_bytes{};
 };
 
 /// @brief Result of processing one incoming WS frame during the handshake.
@@ -120,7 +119,8 @@ std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope
 ///   4. Bind the resolved PSK onto the same session (NoiseSession::set_psk).
 ///   5. Write msg2 and split -> new session.
 ///
-/// @param msg1_bytes     The re-handshake msg1 (Noise bytes, decoded from the envelope).
+/// @param msg1_bytes     The re-handshake msg1 (Noise bytes, decoded from the envelope); cleared
+///                       on return.
 /// @param server_id      Known server peer_id (43-char base64url) from the prior handshake.
 /// @param identity       Our static X25519 identity.
 /// @param record_store   Record store for psk_id resolution (read-only on protocol task).
@@ -130,9 +130,16 @@ std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope
 /// @return Populated NoiseHandshakeResult (session + msg2_bytes to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    std::span<const uint8_t> msg1_bytes, const std::string& server_id, const Identity& identity,
+    std::span<uint8_t> msg1_bytes, std::string_view server_id, const Identity& identity,
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena);
+
+/// @brief Largest server/init the handshake keeps for its prologue: about five times the minimal
+/// frame, a version and a PEER_ID_SIZE server_id in about 104 bytes (messaging.md "server/init").
+/// It bounds the prologue buffer each handshake holds; the cost is that a later revision's
+/// optional fields, which messaging.md "Forward compatibility" has the client ignore, must keep
+/// the frame under it.
+static constexpr size_t MAX_SERVER_INIT_BYTES = 512;
 
 // ============================================================================
 // NoiseHandshake class (initial handshake state machine)
@@ -210,20 +217,23 @@ private:
 
     /// @brief Validate the fields read from a server/init frame.
     /// @param version   payload.version (0 when absent).
-    /// @param server_id payload.server_id (empty when absent).
-    /// @param text      Exact received bytes, retained for the handshake prologue.
-    bool handle_server_init(int version, std::string server_id, std::string_view text);
+    /// @param server_id payload.server_id (empty when absent or longer than a peer_id).
+    /// @param text      Exact received bytes, retained for the handshake prologue; refused when
+    ///                  longer than MAX_SERVER_INIT_BYTES.
+    bool handle_server_init(int version, const IdText& server_id, std::string_view text);
 
     /// @brief Authenticate and respond to the noise/handshake msg1.
-    /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data()).
+    /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data());
+    ///                   cleared on return.
     /// @param send_fn    Sends the msg2 frame back to the peer.
     /// @return true when msg1 authenticated and msg2 was sent.
-    bool handle_msg1(std::span<const uint8_t> msg1_bytes,
+    bool handle_msg1(std::span<uint8_t> msg1_bytes,
                      const std::function<bool(const JsonDocument&)>& send_fn);
 
     // Struct fields
-    /// Exact bytes of the client/init frame we sent (retained for prologue).
-    std::string client_init_text_;
+    /// The prologue: the exact bytes of the client/init we sent, then of the server/init we
+    /// received, in one buffer sized for both when client/init is built.
+    PlatformBuffer prologue_;
 
     /// Result available after COMPLETE.
     std::optional<NoiseHandshakeResult> result_;
@@ -232,10 +242,7 @@ private:
     std::string server_error_reason_;
 
     /// server_id decoded from server/init (43-char base64url).
-    std::string server_id_;
-
-    /// Exact bytes of the server/init frame we received (retained for prologue).
-    std::string server_init_text_;
+    IdText server_id_;
 
     const char* suite_name_;
 
@@ -245,6 +252,11 @@ private:
     SendspinArenaAllocator& arena_;
     const Identity& identity_;
     const RecordStore& record_store_;
+
+    // size_t fields
+    /// Bytes of prologue_ holding client/init, then server/init.
+    size_t client_init_size_{0};
+    size_t server_init_size_{0};
 
     // 32-bit fields
     State state_{State::INIT};

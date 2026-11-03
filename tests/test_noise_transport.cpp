@@ -102,6 +102,17 @@ struct RefusingAllocator : ArduinoJson::Allocator {
     void* reallocate(void* /*ptr*/, size_t /*new_size*/) override { return nullptr; }
 };
 
+/// Pads `json` to exactly `size` bytes with an unrecognized field, which messaging.md "Forward
+/// compatibility" has the client ignore, inserted before the closing brace that sits
+/// `brace_from_end` bytes from the end.
+void pad_with_unknown_field(std::string& json, size_t size, size_t brace_from_end) {
+    const size_t field_overhead = std::string_view(R"(,"pad":"")").size();
+    ASSERT_LT(json.size() + field_overhead, size);
+    const size_t xs = size - json.size() - field_overhead;
+    json.insert(json.size() - brace_from_end, R"(,"pad":")" + std::string(xs, 'x') + "\"");
+    ASSERT_EQ(json.size(), size);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -389,6 +400,14 @@ TEST(NoiseHandshakeDriver, UnknownPskIdFallsBackToTheSentinelPsk) {
         EXPECT_EQ(outcome.category, PskCategory::SENTINEL) << "category " << category;
         EXPECT_FALSE(outcome.peer_read_msg2) << "category " << category;
     }
+
+    // An id longer than any psk_id is the same miss, though the record it extends is stored.
+    Msg1Outcome over_long = run_msg1_with_payload([](const std::string& psk_id) {
+        return R"({"psk_id":")" + psk_id + R"(x","psk_category":"lt"})";
+    });
+    EXPECT_EQ(over_long.result, HandshakeFrameResult::COMPLETE);
+    EXPECT_EQ(over_long.category, PskCategory::SENTINEL);
+    EXPECT_FALSE(over_long.peer_read_msg2);
 }
 
 // messaging.md "noise/handshake": the payload declares which category the referenced PSK is used
@@ -478,9 +497,9 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
     EXPECT_EQ(nh.server_error_reason(), "malformed");
 }
 
-// A server/init is accepted only when its type, its server_id and its version are all usable:
-// the server_id names the key and goes into the prologue, so both are checked before the
-// handshake reads a Noise byte (connection.md "Handshake").
+// A server/init is accepted only when its type, its server_id, its version and its length are all
+// usable: the server_id names the key and the frame goes into the prologue, so each is checked
+// before the handshake reads a Noise byte (connection.md "Handshake").
 TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
     enum class ServerId : uint8_t { REAL, TOO_LONG, NON_CANONICAL };
     struct Row {
@@ -489,8 +508,14 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
         ServerId server_id;
         int version;
         HandshakeFrameResult expected;
+        size_t padded_to{0};  // the frame's length after an unknown top-level field, 0 for none
     };
     const Row rows[] = {
+        // The prologue keeps at most MAX_SERVER_INIT_BYTES of server/init.
+        {"longer than the prologue keeps", "server/init", ServerId::REAL, 1,
+         HandshakeFrameResult::ABORT, MAX_SERVER_INIT_BYTES + 1},
+        {"Control: exactly as long as the prologue keeps", "server/init", ServerId::REAL, 1,
+         HandshakeFrameResult::NEED_MORE, MAX_SERVER_INIT_BYTES},
         // The payload is the control's, so only the type field can produce the abort: a frame
         // whose payload would pass must still be refused for arriving under another type.
         {"another envelope type", "wrong/type", ServerId::REAL, 1, HandshakeFrameResult::ABORT},
@@ -522,9 +547,13 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
         } else if (row.server_id == ServerId::NON_CANONICAL) {
             peer_id = non_canonical_spelling(peer_id);
         }
-        EXPECT_EQ(nh.on_text_frame(make_server_init(peer_id, row.version, row.type),
-                                   [](const JsonDocument&) { return true; }),
-                  row.expected);
+        std::string frame = make_server_init(peer_id, row.version, row.type);
+        if (row.padded_to != 0) {
+            // Inside the payload, whose closing brace precedes the envelope's.
+            pad_with_unknown_field(frame, row.padded_to, 2);
+            ASSERT_FALSE(HasFatalFailure());
+        }
+        EXPECT_EQ(nh.on_text_frame(frame, [](const JsonDocument&) { return true; }), row.expected);
     }
 }
 
@@ -1270,15 +1299,21 @@ TEST(NoiseTransport, EncryptInPlaceRefusesMissingTagRoomAndMarksAFailedEncrypt) 
 // ============================================================================
 
 // Noise message 1 that cannot be read as one aborts the handshake rather than being retried or
-// ignored (connection.md "Failure Handling").
+// ignored (connection.md "Failure Handling"), and so does one whose payload is longer than the
+// MAX_HANDSHAKE_MESSAGE_BYTES the client decrypts.
 TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
     struct Row {
         const char* name;
         bool well_formed;                  // build message 1 with a real initiator
         std::vector<uint8_t> noise_bytes;  // the frame's noise bytes when it is not well formed
         HandshakeFrameResult expected;
+        size_t payload_size{0};  // a well-formed payload padded to this length, 0 for unpadded
     };
     const Row rows[] = {
+        {"a payload longer than the client decrypts", true, {}, HandshakeFrameResult::ABORT,
+         MAX_HANDSHAKE_MESSAGE_BYTES + 1},
+        {"Control: a payload exactly as long as the client decrypts", true, {},
+         HandshakeFrameResult::COMPLETE, MAX_HANDSHAKE_MESSAGE_BYTES},
         {"empty noise bytes", false, {}, HandshakeFrameResult::ABORT},
         // Well-formed base64url, but fails Noise authentication as message 1.
         {"garbage of a plausible length", false, std::vector<uint8_t>(64, 0xAB),
@@ -1319,7 +1354,12 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
         ASSERT_NE(init_hs_raw, nullptr);
         HsGuard guard(init_hs_raw);
 
-        const std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id_for(psk));
+        std::string payload = R"({"psk_id":")" + psk_id_for(psk) + R"(","psk_category":"lt"})";
+        if (row.payload_size != 0) {
+            pad_with_unknown_field(payload, row.payload_size, 1);
+            ASSERT_FALSE(HasFatalFailure());
+        }
+        const std::string msg1_text = build_msg1_envelope_with_payload(init_hs_raw, payload);
         ASSERT_FALSE(msg1_text.empty());
         EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn), row.expected);
     }

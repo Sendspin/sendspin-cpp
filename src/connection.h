@@ -221,10 +221,11 @@ public:
     /// the new keys; neither hello is re-sent, and the manager's nursery is not involved (the
     /// connection stays current/established throughout, with no drop/reconnect).
     ///
-    /// @param msg1_bytes  The re-handshake msg1 Noise bytes (read_noise_handshake_data()).
+    /// @param msg1_bytes  The re-handshake msg1 Noise bytes (read_noise_handshake_data()); cleared
+    ///                    on return.
     /// @return true on success (session swapped; a post-swap server/activate is expected next).
     ///         false on any failure (caller should close the WebSocket).
-    bool handle_noise_rehandshake(std::span<const uint8_t> msg1_bytes);
+    bool handle_noise_rehandshake(std::span<uint8_t> msg1_bytes);
 
     /// @brief Sends a JSON message: serialized straight into the Noise transport's send buffer
     /// (NoiseTransport::stage_json()), then encrypted there once the transport is active, or sent
@@ -328,11 +329,11 @@ public:
     /// connection.md "Failure Handling": handshake-phase failures, an AEAD failure once in
     /// transport mode, and malformed fragment sequences all close the WebSocket without sending a
     /// client/goodbye (or any other application-level message). Called on the protocol task, from
-    /// the receive path and settle_noise_send(), so this routes to close_transport_now()
-    /// (non-blocking on every platform) instead of disconnect() (which can block on a transport
-    /// join; see close_transport_now()).
-    /// The inbound gate is detached first, so nothing the peer sent after the failure is processed,
-    /// and the protocol task reports the loss.
+    /// the receive path, settle_noise_send() and send_noise_client_init(), so this routes to
+    /// close_transport_now() (non-blocking on every platform) instead of disconnect() (which can
+    /// block on a transport join; see close_transport_now()). The inbound gate is detached first,
+    /// so nothing the peer sent after the failure is processed, and the protocol task reports the
+    /// loss.
     void close_silently(SendspinGoodbyeReason /*reason*/) {
         this->detach_inbound();
         this->close_transport_now();
@@ -390,9 +391,10 @@ public:
     }
 
     /// @brief Returns the psk_id of the matched PSK (set at COMPLETE and rewritten at every
-    /// in-band re-handshake; empty for Sentinel or when no Noise handshake has completed).
+    /// in-band re-handshake; SENTINEL_PSK_ID for the Sentinel PSK, empty until a Noise handshake
+    /// completes).
     /// Protocol task only, the thread that writes it.
-    const std::string& get_psk_id() const {
+    const IdText& get_psk_id() const {
         return this->psk_id_;
     }
 
@@ -691,11 +693,11 @@ public:
 
     /// @brief Sets the server_id and PSK metadata from the Noise handshake result.
     /// Called at COMPLETE in connection.cpp.
-    void set_noise_handshake_result(const std::string& server_id, PskCategory psk_category,
-                                    const std::string& psk_id) {
+    void set_noise_handshake_result(std::string_view server_id, PskCategory psk_category,
+                                    std::string_view psk_id) {
         this->server_information_.server_id = server_id;
         this->psk_category_ = psk_category;
-        this->psk_id_ = psk_id;
+        this->psk_id_.assign(psk_id);
     }
 
     /// @brief Returns whether server/hello has arrived on this connection.
@@ -717,11 +719,10 @@ public:
         this->server_source_codecs_ = codecs.value_or(0);
     }
 
-    /// @brief Sets the server information (from server/hello message)
-    /// @param info The ServerInformationObject received during the hello handshake.
-    /// @note Called by hub after receiving server/hello message.
-    void set_server_information(ServerInformationObject info) {
-        this->server_information_ = std::move(info);
+    /// @brief Sets the server's display name from server/hello; the server_id the handshake
+    /// recorded stays.
+    void set_server_name(std::string name) {
+        this->server_information_.name = std::move(name);
     }
 
     // ========================================
@@ -1098,10 +1099,10 @@ protected:
     /// Retained for re-handshake: Noise suite name supplied at init_noise_handshake().
     const char* noise_suite_name_ = nullptr;
 
-    /// psk_id of the PSK matched by the Noise handshake (empty for Sentinel, or when no
-    /// Noise handshake has completed). Written at handshake COMPLETE and at every in-band
+    /// psk_id of the PSK matched by the Noise handshake (SENTINEL_PSK_ID for the Sentinel PSK,
+    /// empty until a Noise handshake completes). Written at handshake COMPLETE and at every in-band
     /// re-handshake. Protocol task only.
-    std::string psk_id_{};
+    IdText psk_id_{};
 
     // Struct fields
 

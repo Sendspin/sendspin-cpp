@@ -172,37 +172,28 @@ std::optional<NoiseSession> NoiseSession::as_responder(const char* suite_name,
 // Handshake
 // ============================================================================
 
-std::vector<uint8_t> NoiseSession::read_msg1(const uint8_t* msg1_bytes, size_t msg1_len) {
+std::optional<size_t> NoiseSession::read_msg1(std::span<uint8_t> msg1, std::span<uint8_t> payload) {
     if (!this->hs_) {
         SS_LOGE(TAG, "read_msg1: handshake state is null");
-        return {};
+        return std::nullopt;
     }
 
     if (noise_handshakestate_get_action(this->hs_) != NOISE_ACTION_READ_MESSAGE) {
         SS_LOGE(TAG, "read_msg1: unexpected handshake action (not READ_MESSAGE)");
-        return {};
+        return std::nullopt;
     }
-
-    // Payload buffer large enough for any handshake payload; see
-    // MAX_HANDSHAKE_MESSAGE_BYTES in crypto/constants.h.
-    std::vector<uint8_t> payload_buf(MAX_HANDSHAKE_MESSAGE_BYTES);
-
-    // Input buffer: noise-c needs a mutable copy
-    std::vector<uint8_t> in_buf(msg1_bytes, msg1_bytes + msg1_len);
 
     NoiseBuffer msg_in;
     NoiseBuffer payload_out;
-    noise_buffer_set_input(msg_in, in_buf.data(), in_buf.size());
-    noise_buffer_set_output(payload_out, payload_buf.data(), payload_buf.size());
+    noise_buffer_set_input(msg_in, msg1.data(), msg1.size());
+    noise_buffer_set_output(payload_out, payload.data(), payload.size());
 
     int err = noise_handshakestate_read_message(this->hs_, &msg_in, &payload_out);
     if (err != NOISE_ERROR_NONE) {
         SS_LOGW(TAG, "read_msg1: noise_handshakestate_read_message failed (err=%d)", err);
-        return {};
+        return std::nullopt;
     }
-
-    payload_buf.resize(payload_out.size);
-    return payload_buf;
+    return payload_out.size;
 }
 
 bool NoiseSession::set_psk(const uint8_t* psk) {
@@ -220,7 +211,7 @@ bool NoiseSession::set_psk(const uint8_t* psk) {
     return true;
 }
 
-bool NoiseSession::write_msg2_and_split(std::vector<uint8_t>& msg2_out) {
+bool NoiseSession::write_msg2_and_split(NoiseMsg2& msg2_out) {
     if (!this->hs_) {
         SS_LOGE(TAG, "write_msg2_and_split: handshake state is null");
         return false;
@@ -233,12 +224,9 @@ bool NoiseSession::write_msg2_and_split(std::vector<uint8_t>& msg2_out) {
 
     // msg2 plaintext payload: `{}` (2 bytes UTF-8)
     const uint8_t msg2_payload[] = {'{', '}'};
+    static_assert(NOISE_MSG2_BYTES == X25519_KEY_SIZE + sizeof(msg2_payload) + AEAD_TAG_SIZE);
     NoiseBuffer payload_in;
     noise_buffer_set_input(payload_in, const_cast<uint8_t*>(msg2_payload), sizeof(msg2_payload));
-
-    // Output buffer: handshake message 2 is small; see MAX_HANDSHAKE_MESSAGE_BYTES in
-    // crypto/constants.h.
-    msg2_out.resize(MAX_HANDSHAKE_MESSAGE_BYTES);
 
     NoiseBuffer msg_out;
     noise_buffer_set_output(msg_out, msg2_out.data(), msg2_out.size());
@@ -249,7 +237,6 @@ bool NoiseSession::write_msg2_and_split(std::vector<uint8_t>& msg2_out) {
                 err);
         return false;
     }
-    msg2_out.resize(msg_out.size);
 
     if (noise_handshakestate_get_action(this->hs_) != NOISE_ACTION_SPLIT) {
         SS_LOGE(TAG, "write_msg2_and_split: expected SPLIT action after write, got %d",
