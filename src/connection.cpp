@@ -225,8 +225,7 @@ std::optional<int64_t> SendspinConnection::claim_time_frame(int64_t client_trans
 void SendspinConnection::init_noise_handshake(const Identity& identity,
                                               const RecordStore& record_store,
                                               const char* suite_name) {
-    this->noise_handshake_ =
-        std::make_unique<NoiseHandshake>(identity, record_store, suite_name, *this->json_arena_);
+    this->noise_handshake_.emplace(identity, record_store, suite_name, *this->json_arena_);
     // Retain for re-handshake: these pointers outlive connections (owned by the
     // SendspinClient that constructed the manager which called this).
     this->noise_identity_ = &identity;
