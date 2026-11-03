@@ -53,7 +53,7 @@ The primitives other than the Inbox and the inbound and outbound rings live in `
 | `ConnectionManager` published state (each admitted slot's clock, the primary's server information) | Protocol task (`refresh_published_state()`) | Any thread (`clock()`, `server_information()`) |
 | `RecordStore` | Protocol task (resolves and changes records) | Main loop (writes them to the provider) |
 
-Plain atomics carry the rest: the `connected_` flag on `ConnectionManager`; the admission flag `accepting_` on `ProtocolTask`, written on the main loop under the queue lock; the unpaired-access setting, the lifecycle state, the network provider's last answer (`network_ready_`, written by the main loop's poll and read by the protocol task before it starts the WebSocket server) and the high-performance grant count (`high_performance_granted_`, see [One Main Loop Drain](#one-main-loop-drain)) on `SendspinClient`; and each role's teardown generation (`cleanup_generation`), written by the protocol task and read by the main loop and the role's thread. The role- and connection-local atomics (a connection's last-arrival stamp, upgrade flag and time-frame write time; artwork's `stream_active` and slot epochs, the visualizer's `spectrum_bin_count`, `tracks_downbeats` and `boundary_sequence`, the player's output delay, the controller's supported commands, the source's stream gate and codec, the source task's overflow generation) each state their writer and reader at their declaration.
+Plain atomics carry the rest: the `connected_` and `paired_` flags on `ConnectionManager`; the admission flag `accepting_` on `ProtocolTask`, written on the main loop under the queue lock; the unpaired-access setting, the lifecycle state, the network provider's last answer (`network_ready_`, written by the main loop's poll and read by the protocol task before it starts the WebSocket server) and the high-performance grant count (`high_performance_granted_`, see [One Main Loop Drain](#one-main-loop-drain)) on `SendspinClient`; and each role's teardown generation (`cleanup_generation`), written by the protocol task and read by the main loop and the role's thread. The role- and connection-local atomics (a connection's last-arrival stamp, upgrade flag and time-frame write time; artwork's `stream_active` and slot epochs, the visualizer's `spectrum_bin_count`, `tracks_downbeats` and `boundary_sequence`, the player's output delay, the controller's supported commands, the source's stream gate and codec, the source task's overflow generation) each state their writer and reader at their declaration.
 
 ### Locks
 
@@ -79,7 +79,7 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
 | `SendspinClient::EventState::time_sync_slot` | `INBOX_TOPIC_TIME` | Protocol task (the primary connection's completed time burst) |
 | `SendspinClient::EventState::group_slot` | `INBOX_TOPIC_GROUP` | Protocol task (`group/update` from the primary connection) |
 | `SendspinClient::EventState::persist_slot` | `INBOX_TOPIC_PERSIST` | Protocol task (`server/pair-finalize`, an unpair, a playback activate, a last-played change); main loop (`start()`) |
-| `SendspinClient::EventState::pairing_slot` | `INBOX_TOPIC_PAIRING` | Protocol task (pairing and trust notes); main loop (`stop()`'s dismissals) |
+| `SendspinClient::EventState::pairing_slot` | `INBOX_TOPIC_PAIRING` | Protocol task (pairing notes); main loop (`stop()`'s dismissals) |
 | `SendspinClient::EventState::high_performance_slot` | `INBOX_TOPIC_HIGH_PERFORMANCE` | Protocol task (time-burst acquires and releases, counted separately) |
 | `ControllerRole::Impl::EventState::slot` (generation-stamped) | `INBOX_TOPIC_CONTROLLER` | Protocol task |
 | `MetadataRole::Impl::EventState::slot` (generation-stamped) | `INBOX_TOPIC_METADATA` | Protocol task |
@@ -130,8 +130,8 @@ Every role state slot is a `GenerationSlot<T>`: each payload carries the stamp i
 10. Losses from the sends of steps 7 to 9: a connection a failed send detached is dropped, as in
     step 6, before anything is published
 11. ConnectionManager::refresh_published_state(): the published state (each admitted slot's
-    clock, the primary's server information); then publish_connected(), the connected flag
-    other threads read, raised only here, after every handler of the tick, so is_connected() never reads true
+    clock, the primary's server information) and the paired flag; then publish_connected(), the
+    connected flag other threads read, raised only here, after every handler of the tick, so is_connected() never reads true
     before the tick's whole effect (the published slots and the events it queued for the
     drain); a loss lowers it at once
 ```
@@ -151,7 +151,7 @@ While the client is stopped, `SendspinClient::loop()` only frees the outbound at
    stamped with (catch_up_teardown())
    ├─ *_CLEARED → the catch-up alone: the role's main-loop half delivers its clear
    └─ PLAYER/ARTWORK/VISUALIZER/SOURCE_STREAM → a current event's handler, after the catch-up
-5. Take the pairing and trust notes, then perform the provider writes owed since the last
+5. Take the pairing notes, then perform the provider writes owed since the last
    drain (flush_pending_persistence(), which polls for itself)
 6. Dispatch the notes taken in step 5 in queue order, skipping a code or window dismissal, or a
    window prompt, that repeats the last note delivered for its prompt
@@ -336,7 +336,7 @@ Server -> Client: server/activate (encrypted, activities, active_roles)
 - `pr`: the Pairing PSK, from the config, persistence, or generated at first start
 - `sn`: the published Sentinel PSK, which authenticates nothing
 
-A lookup miss in the initial handshake completes with the Sentinel PSK (connection.md "Sentinel Fallback"); a miss during a re-handshake fails it. The resolved category is stored on the connection. It decides which activations the connection may be admitted with (`src/admission.h`, messaging.md "server/activate") and, once admitted, the client's `ConnectionTrust`.
+A lookup miss in the initial handshake completes with the Sentinel PSK (connection.md "Sentinel Fallback"); a miss during a re-handshake fails it. The resolved category is stored on the connection. It decides which activations the connection may be admitted with (`src/admission.h`, messaging.md "server/activate") and, while the connection is the primary admitted one, what `SendspinClient::is_paired()` reports (a flag `refresh_published_state()` writes each tick).
 
 ### Transport
 

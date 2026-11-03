@@ -226,16 +226,11 @@ private:
     std::optional<SendspinPairingRecord> seeded_long_term_record_;
 };
 
-// Records on_trust_changed / on_pairing_succeeded notifications so the pairing-flow test can
-// assert both that pairing was reported successful and that trust was later upgraded to USER
-// once the post-pairing re-handshake completes. Callbacks fire from SendspinClient::loop() on
-// the test thread (see EventState's dispatch block), so no locking is needed here.
+// Records the pairing notifications so the pairing-flow test can assert that pairing was reported
+// successful, and in which order. Callbacks fire from SendspinClient::loop() on the test thread
+// (see EventState's dispatch block), so no locking is needed here.
 class RecordingClientListener : public SendspinClientListener {
 public:
-    void on_trust_changed(ConnectionTrust trust) override {
-        this->trust_history_.push_back(trust);
-    }
-
     void on_pairing_started(const std::string& server_id) override {
         this->pairing_started_server_id_ = server_id;
         this->pairing_started_seq_ = this->next_seq_++;
@@ -255,20 +250,6 @@ public:
     void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
         this->pairing_failed_server_id_ = server_id;
         this->pairing_failed_reason_ = reason;
-    }
-
-    /// The trust reported last, or NONE before any report.
-    ConnectionTrust last_trust() const {
-        return this->trust_history_.empty() ? ConnectionTrust::NONE : this->trust_history_.back();
-    }
-
-    bool trust_ever_reached(ConnectionTrust trust) const {
-        for (const auto& t : this->trust_history_) {
-            if (t == trust) {
-                return true;
-            }
-        }
-        return false;
     }
 
     const std::optional<std::string>& pairing_started_server_id() const {
@@ -298,7 +279,6 @@ public:
     }
 
 private:
-    std::vector<ConnectionTrust> trust_history_;
     size_t next_seq_{0};
     std::optional<size_t> pairing_started_seq_;
     std::optional<size_t> pairing_succeeded_seq_;
@@ -360,7 +340,7 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     EXPECT_EQ(server.client_hello_count(), 1);
 
     // Trigger the in-band re-handshake on the ADMITTED connection (same PSK: this test isolates
-    // resumption from trust change, which is covered separately below).
+    // resumption from a change of PSK, which is covered separately below).
     ASSERT_TRUE(server.trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
 
     // The post-swap server/activate alone brings it back. The evidence is monotonic: the client
@@ -539,8 +519,8 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
 // client/pair-finalize, the server acks, the client persists the record, and then, exactly like a
 // real server immediately rekeying onto the new PSK, the fake server triggers an in-band
 // re-handshake with the learned psk_id/psk. The connection must resume operational under the new
-// session with trust upgraded from PAIRING to USER (LONG_TERM).
-TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
+// session, now paired: keyed by the long-term PSK instead of the Pairing PSK it started on.
+TEST(EncryptedLifecycle, PairingPskFlowPersistsAndPairsTheSession) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
     // The Pairing PSK the operator "typed in" (e.g. via a pairing token): known to both the
@@ -637,18 +617,14 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     auto learned_psk = server.learned_psk();
     auto learned_psk_id = server.learned_psk_id();
     ASSERT_TRUE(learned_psk.has_value() && learned_psk_id.has_value());
+    EXPECT_FALSE(client.is_paired()) << "the session on the Pairing PSK read as paired";
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
-    // The connection must resume operational under the new session, now with LONG_TERM/USER trust
-    // instead of the PAIRING/none trust it started with. Waited for with no timeout: is_connected()
-    // still reads true from before the re-handshake until a tick refreshes it, so only the trust
-    // the re-activation reports tells the new session apart, and a trust that is never upgraded
+    // The connection must resume operational under the new, paired session. Waited for with no
+    // timeout: is_connected() still reads true from before the re-handshake until a tick refreshes
+    // it, so only is_paired() tells the new session apart, and a session that never becomes paired
     // hangs here for the suite watchdog to name.
-    pump_until(client, [&] {
-        return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
-    });
-    EXPECT_EQ(listener.last_trust(), ConnectionTrust::USER)
-        << "the rekeyed connection's trust must be the one reported last";
+    pump_until(client, [&] { return client.is_paired() && client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
@@ -659,7 +635,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 }
 
 // Regression test for the "re-pair an already-connected client" bug: Music Assistant can
-// token-pair a client that is already admitted and operational (LONG_TERM trust). The server
+// token-pair a client that is already admitted and operational (a paired session). The server
 // does this by in-band re-handshaking the LIVE connection onto the Pairing PSK, which resets
 // first_activate_received_ exactly like any other re-handshake, then sends a fresh
 // server/activate declaring ["pairing"] with pairing.method=pairing_psk. That activate looks
@@ -718,9 +694,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                long_term_peer.record.psk_id, long_term_peer.psk, options);
 
-    pump_until(client, [&] {
-        return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
-    });
+    pump_until(client, [&] { return client.is_paired() && client.is_connected(); });
 
     // Becoming operational the first time legitimately sends one client/state; only traffic
     // AFTER this point is what the regression check below cares about. Pump a little longer to
@@ -734,6 +708,9 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     // is already streaming).
     ASSERT_TRUE(server.trigger_rehandshake(stored_pairing_psk.psk_id, pairing_psk_bytes, "pr"))
         << "Failed to start the in-band re-handshake onto the pairing PSK";
+    // The session on the Pairing PSK is no longer paired. Waited for with no timeout: a flag that
+    // stays true hangs here for the suite watchdog to name.
+    pump_until(client, [&] { return !client.is_paired(); });
 
     // The fixed client must reply with client/pair-finalize instead of hard-stalling; the
     // pre-fix client never sends it (it sends client/state instead, which a real server treats
@@ -776,7 +753,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
 // Fail-open persistence: when the persistence provider rejects the pair-finalize record write
 // (e.g. storage full, write error), the pairing still completes for this boot. The RAM commit on
 // the protocol task is what the server's follow-up re-handshake resolves, so the connection
-// rekeys and upgrades trust exactly like the happy path; the rejected write happens later, at
+// rekeys onto the long-term PSK exactly like the happy path; the rejected write happens later, at
 // the deferred flush from loop() (where the provider is main-loop-only), and costs only a logged
 // durability warning: the record is lost at the next reboot. This is deliberate: a provider that
 // cannot write will not be fixed by aborting the pairing, so the device stays usable until
@@ -786,7 +763,7 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
     persistence.set_reject_pairing_records(true);
-    // As in PairingPskFlowPersistsAndUpgradesTrust: the fake server must connect using an
+    // As in PairingPskFlowPersistsAndPairsTheSession: the fake server must connect using an
     // accepted Pairing PSK directly (PskCategory::PAIRING), not Sentinel, now that the client
     // enforces pairing.method=pairing_psk iff the matched PSK IS the Pairing PSK.
     std::array<uint8_t, 32> pairing_psk_bytes{};
@@ -836,7 +813,7 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
 
     // Rekey onto the new PSK, exactly like the real server does immediately after acking
     // pair-finalize. Unlike the retired fail-closed contract, the client CAN resolve the psk_id
-    // (the record is in RAM), so the re-handshake succeeds and trust upgrades to USER; only a
+    // (the record is in RAM), so the re-handshake succeeds and the session becomes paired; only a
     // reboot loses the pairing.
     auto learned_psk = server.learned_psk();
     auto learned_psk_id = server.learned_psk_id();
@@ -844,13 +821,10 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
     // Waited for with no timeout: is_connected() still reads true from before the re-handshake
-    // until a tick refreshes it, so only the trust the re-activation reports tells the new session
-    // apart, and a trust that is never upgraded hangs here for the suite watchdog to name.
-    pump_until(client, [&] {
-        return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
-    });
-    EXPECT_EQ(listener.last_trust(), ConnectionTrust::USER)
-        << "Trust must upgrade to USER on the RAM-committed record";
+    // until a tick refreshes it, so only is_paired() tells the new session apart, and a session
+    // that never becomes paired on the RAM-committed record hangs here for the suite watchdog to
+    // name.
+    pump_until(client, [&] { return client.is_paired() && client.is_connected(); });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -3378,11 +3352,12 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
 
-    // The Sentinel PSK admits an unpaired server (ConnectionTrust::NONE).
+    // The Sentinel PSK admits an unpaired server, whose session is not paired.
     FakeEncryptedServer server(server_url(UNPAIR_SENTINEL_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), sentinel_identity,
                                std::string(SENTINEL_PSK_ID), SENTINEL_PSK);
     pump_until(client, [&] { return client.is_connected(); });
+    EXPECT_FALSE(client.is_paired()) << "the Sentinel session read as paired";
 
     ASSERT_TRUE(server.send_app_json(R"({"type":"server/unpair","payload":{}})"));
     // Must-not-happen window: the drop an acted-on unpair would perform runs on the main loop a
@@ -3409,7 +3384,7 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
 //
 // A connection resolves its psk_id and PSK category once, at Noise-handshake completion, and never
 // re-checks them against the RecordStore, so deleting the record alone does not stop a second
-// session holding the same credential: it would keep its LONG_TERM trust, and with it playback,
+// session holding the same credential: it would stay a paired session, and with it keep playback,
 // until it happened to disconnect on its own.
 TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
     // One paired record, two sessions on it: the admitted one (A) and a nursery entry (B).

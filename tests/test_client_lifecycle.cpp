@@ -1899,8 +1899,8 @@ TEST(ClientLifecycle, AnAcceptBehindADisconnectFindsTheNurserySlotsItFreed) {
 // is_connected() is raised only at the end of a tick, after every handler of that tick has run,
 // so a thread that sees it true also sees the tick's whole effect (the published slots and the
 // events it queued for the drain): a connection admitted (install_admitted(), which refreshes
-// the published slots mid-handler) and made operational (on_handshake_complete(), which queues
-// the trust event) reads as not yet connected until the tick ends. A loss lowers the flag at
+// the published slots mid-handler) and made operational (on_handshake_complete()) reads as not
+// yet connected until the tick ends. A loss lowers the flag at
 // once, without a tick: the
 // drop row refreshes and reads false. The test thread plays the protocol task. The stand-in is a
 // LONG_TERM connection with its hellos and its activation done; the liveness check is off.

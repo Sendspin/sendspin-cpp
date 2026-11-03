@@ -101,9 +101,8 @@ public:
 
     /// @brief Called when a pairing exchange completes and a long-term record is stored
     ///
-    /// server_id is the base64url public key of the newly paired server. After this
-    /// callback the server re-handshakes on the new long-term PSK. Subsequent connections from
-    /// this server will report ConnectionTrust::USER.
+    /// server_id is the base64url public key of the newly paired server. The server then
+    /// re-handshakes on the new long-term PSK, after which is_paired() reads true.
     virtual void on_pairing_succeeded(const std::string& /*server_id*/) {}
 
     /// @brief Called when a pairing exchange is aborted (by the server or by the protocol)
@@ -114,16 +113,6 @@ public:
     /// pairing protocol error (a malformed or out-of-sequence pairing message).
     virtual void on_pairing_failed(const std::string& /*server_id*/,
                                    SendspinPairAbortReason /*reason*/) {}
-
-    /// @brief Called when the active connection's trust level is known after handshake
-    ///
-    /// Fires on the initial handshake and after each successful re-handshake (for example, after
-    /// pairing). trust reflects the PSK category matched during the Noise handshake:
-    ///   ConnectionTrust::USER:  long-term record (paired server)
-    ///   ConnectionTrust::NONE:  Sentinel or Pairing PSK (unpaired access)
-    /// The last reported trust describes the connection only while is_connected() is true: a
-    /// disconnect fires no on_trust_changed.
-    virtual void on_trust_changed(ConnectionTrust /*trust*/) {}
 
     /// @brief Called when a dynamic pairing code should be emitted to the operator.
     ///
@@ -574,6 +563,13 @@ public:
     /// nullopt when no connection is active. Any thread.
     std::optional<ServerInformationObject> get_server_information() const;
 
+    /// @brief Returns true if the active connection is a paired session: one keyed by the
+    /// long-term PSK of a pairing record, not the Pairing or Sentinel PSK. Any thread; reflects
+    /// the protocol task's last tick. Read it before is_connected(): between a re-handshake and the
+    /// server/activate that follows it, it already describes the new session while is_connected()
+    /// reads false, and a true is_connected() read after it means that session is activated.
+    bool is_paired() const;
+
     /// @brief Returns true if the time filter has received at least one measurement. Any thread.
     bool is_time_synced() const;
 
@@ -940,8 +936,8 @@ private:
     // ========================================
 
     /// @brief Publishes the initial client state once an admitted connection goes operational,
-    /// clears its pairing state, dismissing any prompt the attempt left showing, and reports its
-    /// trust level. Protocol task only.
+    /// clears its pairing state, dismissing any prompt the attempt left showing. Protocol task
+    /// only.
     /// @param conn The connection that completed the handshake
     void on_handshake_complete(SendspinConnection* conn);
 
@@ -963,8 +959,8 @@ private:
     /// of its role removals and of anything else it sends. Protocol task only.
     void on_activation_applied(SendspinConnection* conn);
 
-    // Pairing and trust notifications. Each is called on the protocol task and queues the
-    // listener callback for delivery from the main loop's drain_inbox().
+    // Pairing notifications. Each is called on the protocol task and queues the listener callback
+    // for delivery from the main loop's drain_inbox().
 
     /// @brief Queue an on_pairing_started notification
     void note_pairing_started(std::string_view server_id);
@@ -990,9 +986,6 @@ private:
     /// @brief Queue on_clear_pairing_code and/or on_close_pairing_window for each prompt `ui`
     /// records as showing
     void note_pairing_ui_dismissals(const PairingUiSnapshot& ui);
-
-    /// @brief Queue an on_trust_changed notification
-    void note_trust_changed(ConnectionTrust trust);
 
     struct EventState;
     struct TaskState;

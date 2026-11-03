@@ -545,14 +545,6 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, ">>> High-performance networking released\n");
         }
 
-        void on_trust_changed(ConnectionTrust trust) override {
-            if (trust == ConnectionTrust::USER) {
-                fprintf(stderr, ">>> Trust: user (paired server)\n");
-            } else {
-                fprintf(stderr, ">>> Trust: none (unpaired)\n");
-            }
-        }
-
         void on_pairing_started(const std::string& server_id) override {
             fprintf(stderr, ">>> Pairing started with server: %s\n", server_id.c_str());
         }
@@ -644,8 +636,19 @@ int main(int argc, char* argv[]) {
     constexpr auto DROP_REPORT_INTERVAL = std::chrono::seconds(5);
     auto next_drop_report = std::chrono::steady_clock::now() + DROP_REPORT_INTERVAL;
     std::optional<bool> reported_signal;
+    std::optional<bool> reported_paired;
     while (running.load()) {
         client.loop();
+        // Read before is_connected() (see SendspinClient::is_paired()).
+        const bool paired = client.is_paired();
+        if (client.is_connected()) {
+            if (reported_paired != paired) {
+                reported_paired = paired;
+                fprintf(stderr, ">>> Session: %s\n", paired ? "paired" : "unpaired");
+            }
+        } else {
+            reported_paired.reset();
+        }
         if (line_sense_dbfs.has_value()) {
             bool present = capture.signal_present();
             if (reported_signal != present) {

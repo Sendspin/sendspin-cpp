@@ -768,11 +768,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        void on_trust_changed(ConnectionTrust trust) override {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            state.trust = trust;
-        }
-
         void on_pairing_started(const std::string& /*server_id*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.pairing_status = "Pairing...";

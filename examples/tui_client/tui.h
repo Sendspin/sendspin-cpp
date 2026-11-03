@@ -93,9 +93,9 @@ struct TuiState {
     std::string connected_host;
     uint16_t connected_port{0};
 
-    // Identity and trust
+    // Identity and pairing
     std::string client_id;
-    ConnectionTrust trust{ConnectionTrust::NONE};
+    bool paired{false};
     std::string pairing_status;  // brief human-readable pairing event description
     std::string pairing_token;   // formatted Pairing PSK token (SP:...); empty if unavailable
 

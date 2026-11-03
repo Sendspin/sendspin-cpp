@@ -699,7 +699,7 @@ struct MyClientListener : SendspinClientListener {
     }
 
     // Called when pairing completes successfully and the long-term record is stored.
-    // Subsequent connections from this server will report ConnectionTrust::USER.
+    // Subsequent connections from this server are paired sessions (is_paired()).
     void on_pairing_succeeded(const std::string& server_id) override {
         printf("Pairing succeeded with server %s\n", server_id.c_str());
     }
@@ -709,16 +709,6 @@ struct MyClientListener : SendspinClientListener {
     // and protocol errors (reported as UNKNOWN) close it.
     void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
         printf("Pairing failed with server %s\n", server_id.c_str());
-    }
-
-    // Called after the Noise handshake completes, and again after each successful
-    // re-handshake (notably the post-pairing rekey).
-    // trust reflects the PSK category used:
-    //   ConnectionTrust::USER  -- long-term record: a paired server
-    //   ConnectionTrust::NONE  -- Sentinel or Pairing PSK (unpaired access)
-    void on_trust_changed(ConnectionTrust trust) override {
-        bool paired = (trust == ConnectionTrust::USER);
-        update_trust_indicator(paired);
     }
 
     // Dynamic pairing code: emit/withdraw the code the device derived. Only invoked when
@@ -840,8 +830,8 @@ printf("client_id: %s\n", client.client_id().c_str());
 
 ### Pairing
 
-Pairing creates a long-term trust record for a specific server. After pairing, connections
-from that server resolve via the long-term PSK and report `ConnectionTrust::USER`.
+Pairing creates a long-term record for a specific server. After pairing, connections from that
+server resolve via the long-term PSK and are paired sessions (`is_paired()`).
 
 Pairing is server-initiated. The server includes `pairing` in the `activities` of its
 `server/activate` message; the library handles the exchange automatically. The application
@@ -968,23 +958,22 @@ The secrets themselves are `pairing_psk` (or the generated Pairing PSK) and
 `static_pairing_code` in the same config, so an application that sets one sets its hint beside
 it.
 
-### Trust Levels
+### Paired Sessions
 
-`ConnectionTrust` reflects which PSK resolved during the Noise handshake:
+`is_paired()` reports whether the active connection is a paired session, which the PSK that
+resolved during the Noise handshake decides:
 
-| Value | PSK used | Meaning |
-|-------|---------|---------|
-| `ConnectionTrust::USER` | Long-term record | Server holds a record minted for it during pairing |
-| `ConnectionTrust::NONE` | Sentinel or Pairing PSK | Unpaired access |
+| PSK used | `is_paired()` | Meaning |
+|---------|---------------|---------|
+| Long-term record | `true` | Server holds a record minted for it during pairing |
+| Sentinel or Pairing PSK | `false` | Unpaired access |
 
-`on_trust_changed` fires after `server/activate` is processed and the connection is promoted
-to current, and again after each successful in-band re-handshake on that same connection.
-Pairing an already-connected server therefore delivers the callback twice: once with
-`ConnectionTrust::NONE` at admission, then again with `ConnectionTrust::USER` once the
-post-pairing rekey completes. Connections that are rejected (e.g., an unpaired server
-declaring playback or active roles while unpaired access is disabled) do not fire this
-callback. The last reported trust describes the connection only while `is_connected()` is
-true: a disconnect fires no `on_trust_changed`.
+Like `is_connected()`, it can be called from any thread and reflects the protocol task's last
+tick, and it reads `false` while no connection is admitted. An in-band re-handshake can change
+it on the same connection: pairing an already-connected server turns it `true` once the
+post-pairing rekey completes. Read it before `is_connected()`: between a re-handshake and the
+`server/activate` that follows it, it already describes the new session while `is_connected()`
+reads `false`, and a `true` `is_connected()` read after it means that session is activated.
 
 ### Unpaired Access
 
@@ -1023,8 +1012,8 @@ A call on a running client applies the new value to the live connections as `pai
   would cost that pairing attempt. If it activates idle instead, it keeps the `client/hello` it
   already read until it reconnects.
 
-Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
-unpaired access after the device is paired is the typical production configuration.
+Connections admitted with the Sentinel PSK are unpaired sessions (`is_paired()` reads `false`).
+Disabling unpaired access after the device is paired is the typical production configuration.
 
 ## Sending Commands
 
@@ -1152,6 +1141,7 @@ The client and roles expose query methods for polling state in your main loop or
 // Client state
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
+bool paired = client.is_paired();              // Active connection is a paired session
 const GroupUpdateObject& group = client.get_group_state();   // Group id, name, playback state (all optional)
 
 // Player state
@@ -1204,7 +1194,7 @@ non-blocking.
 Callable from any thread: `connect_to()`, `disconnect()`, `leave()`,
 `confirm_pairing_window()`, `cancel_pairing_window()`, `set_unpaired_access_enabled()` and the
 getters `is_started()`, `is_connected()`, `is_time_synced()`, `get_client_time()`,
-`get_server_information()` and `is_unpaired_access_enabled()`. The
+`get_server_information()`, `is_paired()` and `is_unpaired_access_enabled()`. The
 requests take effect on the protocol task's next tick; the getters read what that task last
 published. Controller commands are queued, so a burst of them can fill the
 queue (see [Sending Commands](#sending-commands)); `connect_to()`, `disconnect()`, `leave()`,
@@ -1501,16 +1491,6 @@ The capture buffer and an encoder's chunk scratch are allocated by the first `st
 
 ## Enums Reference
 
-### ConnectionTrust
-
-| Value | Description |
-|---|---|
-| `NONE` | Sentinel or Pairing PSK was used; this server has not been paired |
-| `USER` | Long-term record matched; the server is paired |
-
-Reported via `SendspinClientListener::on_trust_changed` on admission and again after each
-successful in-band re-handshake. See [Trust Levels](#trust-levels).
-
 ### SendspinPairAbortReason
 
 | Value | Description |
@@ -1594,7 +1574,7 @@ These represent commands the server can send to the player. The player advertise
 | `SHUTDOWN` | Device is shutting down |
 | `RESTART` | Device is restarting |
 | `USER_REQUEST` | User requested disconnect |
-| `UNAUTHORIZED` | Server requested an activity its trust level does not permit |
+| `UNAUTHORIZED` | Server declared activities or roles the session does not permit, or its pairing record was revoked |
 | `PAIRING_REQUIRED` | Server requested playback but the client requires pairing first |
 | `CONCURRENT_ATTEMPT` | Incoming connection rejected because another is already admitted. Distinct from the same-named `SendspinPairAbortReason`, which is specific to pairing |
 | `UNPAIRED` | Server unpaired this device via `server/unpair` |

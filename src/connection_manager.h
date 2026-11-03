@@ -268,7 +268,8 @@ public:
     ///   which is keyed on no remaining connection owning one.
     /// - clock() and the server information follow primary() (the player's owner, else the first
     ///   admitted), so a role owned by another connection converts with the wrong clock.
-    /// - group/update, leave() and get_server_information() are singular: they follow primary().
+    /// - group/update, leave(), get_server_information() and is_paired() are singular: they follow
+    ///   primary().
     /// - The artwork binary gate (SendspinClient::process_binary_message()) passes any admitted
     ///   connection while none owns the role.
     /// - A role released by a dropped connection is not reassigned to another admitted connection
@@ -370,6 +371,13 @@ public:
     /// and the events it queued for the drain); refresh_published_state() lowers it at once.
     bool is_connected() const {
         return this->connected_.load(std::memory_order_acquire);
+    }
+
+    /// @brief Returns whether the primary admitted connection is a paired session, keyed by the
+    /// long-term PSK of a pairing record (README.md "Definitions"); false when none is admitted.
+    /// Any thread: reads a flag refresh_published_state() writes each tick.
+    bool is_paired() const {
+        return this->paired_.load(std::memory_order_acquire);
     }
 
     /// @brief Returns the clock of the primary admitted connection (see primary()), as of the
@@ -525,9 +533,9 @@ public:
     uint32_t run_time_sync();
 
     /// @brief Refreshes what other threads read without a protocol-task lock: each admitted slot's
-    /// clock, the primary() slot and its server information, and lowers the connected flag when no
-    /// admitted connection is operational. Called at the end of every tick and after every change
-    /// to the admitted array.
+    /// clock, the primary() slot, its server information and whether its session is paired, and
+    /// lowers the connected flag when no admitted connection is operational. Called at the end of
+    /// every tick and after every change to the admitted array.
     void refresh_published_state();
 
     /// @brief Publishes the connected flag (is_connected()) as it stands, raising it as well as
@@ -564,9 +572,10 @@ public:
     /// @brief The admitted connection that owns `role`, or nullptr when none does.
     SendspinConnection* role_owner(SendspinRole role) const;
 
-    /// @brief The admitted connection whose clock and server information the client reports: the
-    /// owner of the player role, or the first admitted connection when no connection owns it.
-    /// With MAX_ADMITTED 1 that is the admitted connection. nullptr when none is admitted.
+    /// @brief The admitted connection whose clock, server information and paired flag the client
+    /// reports: the owner of the player role, or the first admitted connection when no connection
+    /// owns it. With MAX_ADMITTED 1 that is the admitted connection. nullptr when none is
+    /// admitted.
     AdmittedEntry* primary();
 
     /// @brief Whether an admitted connection is connected and operational: what is_connected()
@@ -991,6 +1000,9 @@ private:
     /// What is_connected() reports. Written by the protocol task (raised by publish_connected(),
     /// lowered by refresh_published_state() too), read from any thread.
     std::atomic<bool> connected_{false};
+    /// What is_paired() reports. Written by the protocol task (refresh_published_state()), read
+    /// from any thread.
+    std::atomic<bool> paired_{false};
 
     /// @brief Each admitted slot's clock (admitted_[slot]), nullopt for a free slot
     using ClockSlots = std::array<std::optional<TimeTransform>, MAX_ADMITTED>;
