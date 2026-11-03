@@ -57,6 +57,7 @@ size_t NoiseTransport::encrypt_in_place(uint8_t* buf, size_t buf_capacity, size_
 #endif
 
     // noise-c advances the send nonce past a failed encrypt too.
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access): callers check the session first
     const size_t ct_len = this->session_->encrypt(buf, plaintext_len, buf_capacity);
     if (ct_len == 0) {
         SS_LOGE(TAG, "Noise encrypt failed");
