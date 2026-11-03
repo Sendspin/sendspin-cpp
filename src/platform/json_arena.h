@@ -287,7 +287,7 @@ struct RefersIntoDocument
                          std::is_same_v<T, JsonArray> || std::is_same_v<T, JsonArrayConst> ||
                          std::is_same_v<T, JsonString>> {};
 template <typename T>
-struct RefersIntoDocument<std::optional<T>> : RefersIntoDocument<T> {};
+struct RefersIntoDocument<std::optional<T>> : RefersIntoDocument<std::remove_cv_t<T>> {};
 
 /**
  * @brief A parsed inbound JSON message, read once and released before anything acts on it

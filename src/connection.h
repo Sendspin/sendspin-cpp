@@ -675,7 +675,7 @@ public:
         this->ws_upgraded_.store(true, std::memory_order_release);
     }
 
-    /// @brief Returns whether the WebSocket upgrade completed.
+    /// @brief Returns whether the WebSocket upgrade completed. Any thread.
     bool is_ws_upgraded() const {
         return this->ws_upgraded_.load(std::memory_order_acquire);
     }
@@ -1187,7 +1187,8 @@ protected:
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
     /// Written from the transport connected callback (transport thread), read by the manager on
-    /// the protocol task, hence atomic. See mark_ws_upgraded().
+    /// the protocol task and by the host client's close_transport_now() on the transport thread,
+    /// hence atomic. See mark_ws_upgraded().
     std::atomic<bool> ws_upgraded_{false};
 
     /// The kind of the message in fallback_buf_ (TEXT or BINARY: a continuation frame does not
