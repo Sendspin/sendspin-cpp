@@ -270,7 +270,7 @@ public:
     ///
     /// Minting cannot fail on a full store: store_record_superseding() supersedes a re-pair's
     /// existing record and evicts for a net-new one (pairing.md "Pairing Records").
-    [[nodiscard]] PairingOutcome resolve_pairing_outcome(const std::string& server_id);
+    [[nodiscard]] PairingOutcome resolve_pairing_outcome(std::string_view server_id);
 
 private:
     // ========================================
@@ -345,7 +345,7 @@ private:
 
     /// @brief The record bound to server_id, or nullptr. Same rules.
     [[nodiscard]] const SendspinPairingRecord* record_by_server_id(
-        const std::string& server_id) const;
+        std::string_view server_id) const;
 
     /// @brief Sentinel find_index() returns for a psk_id the store does not hold.
     static constexpr size_t NPOS = static_cast<size_t>(-1);

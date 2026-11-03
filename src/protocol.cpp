@@ -86,6 +86,18 @@ static std::optional<bool> read_bool_field(JsonVariantConst var, const char* nam
     return var.as<bool>();
 }
 
+/// @brief Reads a friendly name: messaging.md "server/hello" and "group/update" cap one at
+/// MAX_FRIENDLY_NAME_BYTES, and a longer one is truncated at a UTF-8 character boundary (logged),
+/// never rejected. `var` must hold a string.
+static std::string_view read_friendly_name(JsonVariantConst var, const char* field) {
+    const auto text = var.as<std::string_view>();
+    const std::string_view kept = utf8_truncate(text, MAX_FRIENDLY_NAME_BYTES);
+    if (kept.size() != text.size()) {
+        SS_LOGW(TAG, "Truncating %s: longer than %zu bytes", field, MAX_FRIENDLY_NAME_BYTES);
+    }
+    return kept;
+}
+
 /// @brief Reads an enum field parsed from a wire string via `from_string`. Absent or null returns
 /// nullopt silently; a present non-string, or a string that `from_string` does not recognize, is
 /// logged and returns nullopt. The caller picks the policy: an optional field leaves its current
@@ -337,7 +349,7 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
     if (hello_msg == nullptr) {
         return true;
     }
-    hello_msg->name = root["payload"]["name"].as<std::string>();
+    hello_msg->name.assign(read_friendly_name(root["payload"]["name"], "server/hello name"));
 
     // roles/source/v1.md "server/hello source@v1 support object": supported_codecs is a required
     // list of strings that must include flac and pcm, and a source ignores the codec identifiers
@@ -491,7 +503,8 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
     // Parse optional group_name; use empty string to signal clearing
     JsonVariantConst group_name_var = root["payload"]["group_name"];
     if (group_name_var.is<const char*>()) {
-        group_msg->group.group_name = group_name_var.as<std::string>();
+        group_msg->group.group_name =
+            std::string(read_friendly_name(group_name_var, "group/update group_name"));
     } else if (!group_name_var.isUnbound() && group_name_var.isNull()) {
         // Field set to null: use empty string to clear
         group_msg->group.group_name = "";

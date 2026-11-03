@@ -310,7 +310,7 @@ const SendspinPairingRecord* RecordStore::record_by_psk_id(std::string_view psk_
     return &this->records_[idx].record;
 }
 
-const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string& server_id) const {
+const SendspinPairingRecord* RecordStore::record_by_server_id(std::string_view server_id) const {
     for (const auto& stored : this->records_) {
         if (stored.record.server_id == server_id) {
             return &stored.record;
@@ -495,7 +495,7 @@ bool RecordStore::note_record_played(std::string_view psk_id) {
 // Pairing outcome
 // ============================================================================
 
-RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(const std::string& server_id) {
+RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(std::string_view server_id) {
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     platform_random_bytes(psk.data(), psk.size());
 

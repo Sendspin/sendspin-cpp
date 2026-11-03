@@ -1740,20 +1740,21 @@ void SendspinClient::on_activation_applied([[maybe_unused]] SendspinConnection* 
 #endif
 }
 
-void SendspinClient::note_pairing_started(const std::string& server_id) {
+void SendspinClient::note_pairing_started(std::string_view server_id) {
     this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::PAIRING_STARTED, .text = server_id});
+        {.type = PairingNoteType::PAIRING_STARTED, .text = std::string(server_id)});
 }
 
-void SendspinClient::note_pairing_succeeded(const std::string& server_id) {
+void SendspinClient::note_pairing_succeeded(std::string_view server_id) {
     this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::PAIRING_SUCCEEDED, .text = server_id});
+        {.type = PairingNoteType::PAIRING_SUCCEEDED, .text = std::string(server_id)});
 }
 
-void SendspinClient::note_pairing_failed(const std::string& server_id,
+void SendspinClient::note_pairing_failed(std::string_view server_id,
                                          SendspinPairAbortReason reason) {
-    this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::PAIRING_FAILED, .text = server_id, .reason = reason});
+    this->event_state_->push_pairing_note({.type = PairingNoteType::PAIRING_FAILED,
+                                           .text = std::string(server_id),
+                                           .reason = reason});
 }
 
 void SendspinClient::note_display_pairing_code(const std::string& code,

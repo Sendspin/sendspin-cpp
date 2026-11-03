@@ -19,6 +19,7 @@
 #pragma once
 
 #include "crypto/psk_wrap.h"
+#include "inline_text.h"
 #include "inline_vector.h"
 #include "platform/network_info.h"
 #include "sendspin/color_role.h"
@@ -998,11 +999,19 @@ constexpr uint8_t source_codec_bit(SendspinCodecFormat codec) {
 static_assert(static_cast<uint8_t>(SendspinCodecFormat::UNSUPPORTED) < 8,
               "codec mask is a uint8_t");
 
+/// @brief Longest friendly name the server sends, in UTF-8 bytes: messaging.md "server/hello"
+/// caps `name` and "group/update" caps `group_name` at 64 bytes, and a client truncates a longer
+/// one at a UTF-8 character boundary.
+constexpr size_t MAX_FRIENDLY_NAME_BYTES = 64;
+
+/// @brief The server's friendly name from server/hello, cut to MAX_FRIENDLY_NAME_BYTES
+using ServerName = InlineText<MAX_FRIENDLY_NAME_BYTES>;
+
 /// @brief Parsed server/hello handshake message received at connection startup.
 /// server_id comes from the Noise handshake result (set on the connection at COMPLETE), and
 /// activities/active_roles come from the server/activate message that follows.
 struct ServerHelloMessage {
-    std::string name{};
+    ServerName name{};
     /// Codecs the server accepts in client-stream/start, as source_codec_bit() bits; a set value
     /// always carries the PCM and FLAC bits, nullopt when server/hello carried no valid
     /// source@v1_support object (roles/source/v1.md "server/hello source@v1 support object").

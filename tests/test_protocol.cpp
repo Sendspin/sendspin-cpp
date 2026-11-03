@@ -615,7 +615,42 @@ TEST(Protocol, ServerHelloRequiresName) {
     ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"srv"}})", doc_ok, root_ok));
     ServerHelloMessage ok;
     ASSERT_TRUE(process_server_hello_message(root_ok, &ok));
-    EXPECT_EQ(ok.name, "srv");
+    EXPECT_EQ(ok.name.view(), "srv");
+}
+
+// messaging.md "server/hello" and "group/update": a friendly name over 64 bytes is truncated at a
+// character boundary rather than rejected, and one of exactly 64 bytes is kept whole.
+TEST(Protocol, FriendlyNamesAreTruncatedToTheirCap) {
+    struct Case {
+        const char* what;
+        std::string name;
+        std::string kept;
+    };
+    const std::string below_cap(63, 'a');
+    const Case cases[] = {
+        {"Control: at the cap", below_cap + "a", below_cap + "a"},
+        // U+00E9 straddles the cap, so the cut lands before it.
+        {"a character straddling the cap", below_cap + "\xC3\xA9", below_cap},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.what);
+
+        JsonDocument hello_doc;
+        JsonObject hello_root;
+        ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":")" + c.name + R"("}})",
+                          hello_doc, hello_root));
+        ServerHelloMessage hello;
+        ASSERT_TRUE(process_server_hello_message(hello_root, &hello));
+        EXPECT_EQ(hello.name.view(), c.kept);
+
+        JsonDocument group_doc;
+        JsonObject group_root;
+        ASSERT_TRUE(parse(R"({"type":"group/update","payload":{"group_name":")" + c.name + R"("}})",
+                          group_doc, group_root));
+        GroupUpdateMessage group;
+        ASSERT_TRUE(process_group_update_message(group_root, &group));
+        EXPECT_EQ(group.group.group_name, c.kept);
+    }
 }
 
 // roles/source/v1.md "server/hello source@v1 support object": the codecs the server accepts in

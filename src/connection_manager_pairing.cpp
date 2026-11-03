@@ -192,7 +192,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     conn->set_pairing_in_progress(true);
     // Queued before any other note of the attempt, so the queue-order drain delivers it ahead of
     // the attempt's prompt or failure.
-    this->client_->note_pairing_started(conn->get_server_id());
+    this->client_->note_pairing_started(conn->get_server_id().view());
 
     // The pairing server/activate counter (pairing.md "Pairing index") was already bumped at the
     // point this activate was received (on_server_activate()). Do not bump again here: this
@@ -203,7 +203,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     // (sent as pairing_index and reused for the CPace sid).
     const uint32_t pairing_index = conn->get_pairing_index();
 
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
     const auto& selected_method = conn->get_pairing_method();
 
     if (selected_method.has_value() &&
@@ -217,7 +217,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
 }
 
 void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint32_t pairing_index,
-                                                  const std::string& server_id,
+                                                  const IdText& server_id,
                                                   SendspinPairMethod selected_method) {
     const bool is_dynamic = selected_method == SendspinPairMethod::DYNAMIC_PAIRING_CODE;
     const auto& static_code = this->client_->config_.static_pairing_code;
@@ -296,11 +296,11 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
 }
 
 void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
-                                                 const std::string& server_id) {
+                                                 const IdText& server_id) {
     // resolve_pairing_outcome mints the long-term PSK and the record that holds it. It cannot
     // fail: a pairing never fails for lack of record storage (pairing.md "Pairing Records"),
     // and room for the record is made where it is stored.
-    auto outcome = this->client_->record_store_->resolve_pairing_outcome(server_id);
+    auto outcome = this->client_->record_store_->resolve_pairing_outcome(server_id.view());
 
     // pairing.md "Pairing PSK Flow": after the pairing server/activate the client sends
     // client/pair-init followed immediately by client/pair-finalize, without waiting for a
@@ -363,7 +363,7 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
                                               SendspinPairAbortReason public_reason,
                                               SendspinGoodbyeReason goodbye_reason) {
     // server_id is copied so it survives any tear-down below.
-    const std::string server_id = conn->get_server_id();
+    const IdText server_id = conn->get_server_id();
     // Snapshot before clear_pairing_state()/drop_connection() clear it (see PairingUiSnapshot).
     const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
 
@@ -385,7 +385,7 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
     }
 
     // Queued after any drop_connection() so they survive to be dispatched on the main loop.
-    this->client_->note_pairing_failed(server_id, public_reason);
+    this->client_->note_pairing_failed(server_id.view(), public_reason);
     this->client_->note_pairing_ui_dismissals(ui);
 }
 
@@ -426,7 +426,7 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
 
         case PairingMessageKind::MALFORMED: {
             auto& ps = conn->pairing_session();
-            const std::string& server_id = conn->get_server_id();
+            const IdText& server_id = conn->get_server_id();
 
             // A server pairing message (server/pair-init, server/pair-auth, or
             // server/pair-confirm) failed to parse. If no pairing-code session is active on this
@@ -468,7 +468,7 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
 void ConnectionManager::handle_pair_init(SendspinConnection* conn,
                                          const ServerPairingMessage& message) {
     auto& ps = conn->pairing_session();
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
 
     // Step 1: server/pair-init received. This step belongs to the dynamic pairing code alone;
     // the static flow goes straight from client/pair-init to server/pair-auth (pairing.md
@@ -550,7 +550,7 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
 void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
                                          const ServerPairingMessage& message) {
     auto& ps = conn->pairing_session();
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
 
     // Step 2: server/pair-auth received. Expect step AWAIT_SERVER_PAIR_AUTH.
     if (ps.step != SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_AUTH) {
@@ -594,7 +594,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
                                             const ServerPairingMessage& message) {
     auto& ps = conn->pairing_session();
     RecordStore& store = *this->client_->record_store_;
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
 
     // Step 3: server/pair-confirm received. Expect step AWAIT_SERVER_PAIR_CONFIRM.
     if (ps.step != SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_CONFIRM) {
@@ -690,7 +690,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
 
     // Now run the same resolve_pairing_outcome path as pairing_psk, then send
     // client/pair-finalize. The server will respond with server/pair-finalize.
-    auto outcome = store.resolve_pairing_outcome(server_id);
+    auto outcome = store.resolve_pairing_outcome(server_id.view());
 
     // The code-based flows carry the new PSK wrapped under the CPace output, not in the clear
     // (pairing.md "Wrapping"). K_wrap = SHA-256(PSK_WRAP_LABEL || sid || ISK); the PSK is
@@ -768,7 +768,7 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
     }
 
     auto& ps = conn->pairing_session();
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
 
     if (ps.method == SendspinPairMethod::DYNAMIC_PAIRING_CODE) {
         // Generate nonce_B and its commitment, then send client/pair-init with commit_B and

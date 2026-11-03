@@ -297,6 +297,7 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
+    EXPECT_EQ(info->name, FAKE_SERVER_HELLO_NAME);
 
     // The probes never complete a WebSocket handshake, so the transport layer closes them without
     // them ever reaching the manager (host: IXWebSocket's 3 s server-side handshake timeout; on

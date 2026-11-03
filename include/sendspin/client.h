@@ -967,13 +967,13 @@ private:
     // listener callback for delivery from the main loop's drain_inbox().
 
     /// @brief Queue an on_pairing_started notification
-    void note_pairing_started(const std::string& server_id);
+    void note_pairing_started(std::string_view server_id);
 
     /// @brief Queue an on_pairing_succeeded notification
-    void note_pairing_succeeded(const std::string& server_id);
+    void note_pairing_succeeded(std::string_view server_id);
 
     /// @brief Queue an on_pairing_failed notification
-    void note_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason);
+    void note_pairing_failed(std::string_view server_id, SendspinPairAbortReason reason);
 
     /// @brief Queue an on_display_pairing_code notification
     void note_display_pairing_code(const std::string& code, SendspinPairingCodeFormat format);
