@@ -17,7 +17,8 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)  # only gtest_main is used; skip building gmock
 FetchContent_MakeAvailable(googletest)
 
-# One executable aggregating every test_*.cpp file behind the main.cpp watchdog entry point.
+# One executable aggregating every test_*.cpp file but test_allocations.cpp behind the main.cpp
+# watchdog entry point.
 # gtest_discover_tests still registers the individual TEST() cases with CTest so failures are
 # reported per case.
 add_executable(sendspin_tests
@@ -237,14 +238,29 @@ target_include_directories(sendspin_tests PRIVATE
 )
 
 target_link_libraries(sendspin_tests PRIVATE sendspin GTest::gtest)
-# The watchdog in main.cpp prints a backtrace on a hang; glibc needs exported symbols to name
-# the frames.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_options(sendspin_tests PRIVATE -rdynamic)
-endif()
 
-target_compile_features(sendspin_tests PRIVATE cxx_std_20)
-target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
+# test_allocations.cpp replaces the global operator new to count the library's allocations, so it
+# gets a binary of its own: in sendspin_tests the replacement would take the place of the
+# sanitizers' operator new and its mismatch checks. Building sendspin_tests builds it too, so the
+# documented build and CTest commands cover it.
+add_executable(sendspin_alloc_tests main.cpp test_allocations.cpp)
+target_include_directories(sendspin_alloc_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/crypto
+)
+# dladdr() lives in libdl before glibc 2.34; CMAKE_DL_LIBS names it on Linux and is empty on macOS.
+target_link_libraries(sendspin_alloc_tests PRIVATE sendspin GTest::gtest ${CMAKE_DL_LIBS})
+add_dependencies(sendspin_tests sendspin_alloc_tests)
+
+foreach(test_target sendspin_tests sendspin_alloc_tests)
+    # The watchdog in main.cpp prints a backtrace on a hang, and test_allocations.cpp names each
+    # allocation's frames; glibc needs exported symbols for both.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(${test_target} PRIVATE -rdynamic)
+    endif()
+    target_compile_features(${test_target} PRIVATE cxx_std_20)
+    target_compile_options(${test_target} PRIVATE -Wall -Wextra)
+endforeach()
 
 # test_pairing_state_machine.cpp is a white-box integration harness: its fixture injects fake
 # connections into ConnectionManager's private state and drives private lifecycle methods
@@ -320,21 +336,23 @@ set_source_files_properties(test_noise_transport.cpp PROPERTIES
 set_source_files_properties(test_cpace.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
-# Match the library's sanitizer configuration so the test binary is instrumented too.
-if(ENABLE_SANITIZERS)
-    target_compile_options(sendspin_tests PRIVATE
-        -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options(sendspin_tests PRIVATE -fsanitize=address,undefined)
-endif()
-
-# ThreadSanitizer, configured separately from ASan/UBSan (the two cannot be combined). The
-# concurrency tests only report a data race when the binary is built this way.
-if(ENABLE_TSAN)
-    target_compile_options(sendspin_tests PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
-    target_link_options(sendspin_tests PRIVATE -fsanitize=thread)
-endif()
-
 include(GoogleTest)
-# Backstop above the 55 s watchdog in main.cpp, which fires first and prints the hung test's
-# stack.
-gtest_discover_tests(sendspin_tests PROPERTIES TIMEOUT 60)
+foreach(test_target sendspin_tests sendspin_alloc_tests)
+    # Match the library's sanitizer configuration so the test binaries are instrumented too.
+    if(ENABLE_SANITIZERS)
+        target_compile_options(${test_target} PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${test_target} PRIVATE -fsanitize=address,undefined)
+    endif()
+
+    # ThreadSanitizer, configured separately from ASan/UBSan (the two cannot be combined). The
+    # concurrency tests only report a data race when the binary is built this way.
+    if(ENABLE_TSAN)
+        target_compile_options(${test_target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(${test_target} PRIVATE -fsanitize=thread)
+    endif()
+
+    # Backstop above the 55 s watchdog in main.cpp, which fires first and prints the hung test's
+    # stack.
+    gtest_discover_tests(${test_target} PROPERTIES TIMEOUT 60)
+endforeach()
