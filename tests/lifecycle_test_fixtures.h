@@ -504,13 +504,17 @@ struct FakeEncryptedServerOptions {
     int64_t server_clock_offset_us{0};
 };
 
+/// The name every FakeEncryptedServer sends in server/hello. Longer than the 22 characters libc++
+/// keeps inline, so a heap copy of it shows in the allocation test under either standard library.
+inline constexpr const char* FAKE_SERVER_HELLO_NAME = "Fake Encrypted Server Under Test";
+
 class FakeEncryptedServer : public NoiseInitiatorFixtureBase {
 public:
     FakeEncryptedServer(const std::string& url, std::string suite_name, Identity server_identity,
                         std::string psk_id, std::array<uint8_t, NOISE_PSK_SIZE> psk,
                         FakeEncryptedServerOptions options = {})
         : NoiseInitiatorFixtureBase(std::move(suite_name), server_identity, std::move(psk_id), psk,
-                                    "Fake Encrypted Server",
+                                    FAKE_SERVER_HELLO_NAME,
                                     options.psk_category.value_or("")),
           options_(std::move(options)) {
         this->ws_.setUrl(url);

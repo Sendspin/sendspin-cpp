@@ -618,15 +618,15 @@ TEST(Protocol, ServerHelloRequiresName) {
     EXPECT_EQ(ok.name.view(), "srv");
 }
 
-// messaging.md "server/hello" and "group/update": a friendly name over MAX_FRIENDLY_NAME_BYTES is
-// truncated at a character boundary rather than rejected, and one at the cap is kept whole.
+// messaging.md "server/hello" and "group/update": a friendly name over 64 bytes is truncated at a
+// character boundary rather than rejected, and one of exactly 64 bytes is kept whole.
 TEST(Protocol, FriendlyNamesAreTruncatedToTheirCap) {
     struct Case {
         const char* what;
         std::string name;
         std::string kept;
     };
-    const std::string below_cap(MAX_FRIENDLY_NAME_BYTES - 1, 'a');
+    const std::string below_cap(63, 'a');
     const Case cases[] = {
         {"Control: at the cap", below_cap + "a", below_cap + "a"},
         // U+00E9 straddles the cap, so the cut lands before it.
