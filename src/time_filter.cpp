@@ -17,7 +17,6 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
-#include <mutex>
 
 namespace sendspin {
 
@@ -42,8 +41,6 @@ SendspinTimeFilter::SendspinTimeFilter(const Config& config)
 // ============================================================================
 
 void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t time_added) {
-    std::lock_guard<std::mutex> lock(this->state_mutex_);
-
     if (time_added <= this->last_update_) {
         // Skip non-monotonic timestamps (duplicates or out-of-order packets)
         // This protects against division by zero and backwards time progression
@@ -144,34 +141,14 @@ void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t 
 }
 
 int64_t SendspinTimeFilter::compute_server_time(int64_t client_time) const {
-    // Transform: T_server = T_client + offset + drift * (T_client - T_last_update)
-    // Compute instantaneous offset accounting for linear drift:
-    // offset(t) = offset_base + drift * (t - t_last_update)
-
-    std::lock_guard<std::mutex> lock(this->state_mutex_);
-    const double dt = client_time - this->last_update_;
-    const double effective_drift = this->use_drift_ ? this->drift_ : 0.0;
-
-    const int64_t offset = std::round(this->offset_ + effective_drift * dt);
-    return client_time + offset;
+    return this->transform().compute_server_time(client_time);
 }
 
 int64_t SendspinTimeFilter::compute_client_time(int64_t server_time) const {
-    // Inverse transform solving for T_client:
-    // T_server = T_client + offset + drift * (T_client - T_last_update)
-    // T_server = (1 + drift) * T_client + offset - drift * T_last_update
-    // T_client = (T_server - offset + drift * T_last_update) / (1 + drift)
-
-    std::lock_guard<std::mutex> lock(this->state_mutex_);
-    const double effective_drift = this->use_drift_ ? this->drift_ : 0.0;
-
-    return std::round(
-        (static_cast<double>(server_time) - this->offset_ + effective_drift * this->last_update_) /
-        (1.0 + effective_drift));
+    return this->transform().compute_client_time(server_time);
 }
 
 void SendspinTimeFilter::reset() {
-    std::lock_guard<std::mutex> lock(this->state_mutex_);
     this->count_ = 0;
     this->offset_ = 0.0;
     this->drift_ = 0.0;
@@ -187,18 +164,45 @@ void SendspinTimeFilter::reset() {
 // ============================================================================
 
 int64_t SendspinTimeFilter::get_covariance() const {
-    std::lock_guard<std::mutex> lock(this->state_mutex_);
     return std::round(this->offset_covariance_);
 }
 
 int64_t SendspinTimeFilter::get_error() const {
-    std::lock_guard<std::mutex> lock(this->state_mutex_);
     return std::round(sqrt(this->offset_covariance_));
 }
 
 bool SendspinTimeFilter::has_update() const {
-    std::lock_guard<std::mutex> lock(this->state_mutex_);
     return this->count_ >= 1;
+}
+
+TimeTransform SendspinTimeFilter::transform() const {
+    return TimeTransform{.offset = this->offset_,
+                         .drift = this->use_drift_ ? this->drift_ : 0.0,
+                         .last_update = this->last_update_,
+                         .synced = this->has_update()};
+}
+
+// ============================================================================
+// TimeTransform
+// ============================================================================
+
+int64_t TimeTransform::compute_server_time(int64_t client_time) const {
+    // Transform: T_server = T_client + offset + drift * (T_client - T_last_update)
+    // Compute instantaneous offset accounting for linear drift:
+    // offset(t) = offset_base + drift * (t - t_last_update)
+    const double dt = client_time - this->last_update;
+    const int64_t instantaneous_offset = std::round(this->offset + this->drift * dt);
+    return client_time + instantaneous_offset;
+}
+
+int64_t TimeTransform::compute_client_time(int64_t server_time) const {
+    // Inverse transform solving for T_client:
+    // T_server = T_client + offset + drift * (T_client - T_last_update)
+    // T_server = (1 + drift) * T_client + offset - drift * T_last_update
+    // T_client = (T_server - offset + drift * T_last_update) / (1 + drift)
+    return std::round(
+        (static_cast<double>(server_time) - this->offset + this->drift * this->last_update) /
+        (1.0 + this->drift));
 }
 
 }  // namespace sendspin

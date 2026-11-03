@@ -1194,15 +1194,15 @@ bool SendspinClient::is_connected() const {
 }
 
 bool SendspinClient::is_time_synced() const {
-    // See ConnectionManager::time_filter().
-    auto filter = this->connection_manager_->time_filter();
-    return filter != nullptr && filter->has_update();
+    // See ConnectionManager::clock().
+    const std::optional<TimeTransform> clock = this->connection_manager_->clock();
+    return clock.has_value() && clock->synced;
 }
 
 int64_t SendspinClient::get_client_time(int64_t server_time) const {
-    // See ConnectionManager::time_filter().
-    auto filter = this->connection_manager_->time_filter();
-    return filter != nullptr ? filter->compute_client_time(server_time) : 0;
+    // See ConnectionManager::clock().
+    const std::optional<TimeTransform> clock = this->connection_manager_->clock();
+    return clock.has_value() ? clock->compute_client_time(server_time) : 0;
 }
 
 std::optional<ServerInformationObject> SendspinClient::get_server_information() const {

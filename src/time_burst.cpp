@@ -109,9 +109,9 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeRes
 
     // Check if burst is complete
     if (this->burst_index_ >= this->burst_size_) {
-        auto* time_filter = conn->get_time_filter();
-        if (time_filter != nullptr && this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
-            time_filter->update(this->best_offset_, this->best_max_error_, this->best_timestamp_);
+        if (this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
+            conn->time_filter().update(this->best_offset_, this->best_max_error_,
+                                       this->best_timestamp_);
             SS_LOGV(TAG, "Burst complete, best max_error: %" PRId64 " us", this->best_max_error_);
         }
         this->last_burst_complete_time_ = platform_time_us() / US_PER_MS;
@@ -169,9 +169,9 @@ bool SendspinTimeBurst::retire_message(SendspinConnection* conn, int64_t now_ms)
     if (this->burst_index_ < this->burst_size_) {
         return false;
     }
-    auto* time_filter = conn->get_time_filter();
-    if (time_filter != nullptr && this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
-        time_filter->update(this->best_offset_, this->best_max_error_, this->best_timestamp_);
+    if (this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
+        conn->time_filter().update(this->best_offset_, this->best_max_error_,
+                                   this->best_timestamp_);
         SS_LOGV(TAG, "Burst complete (with retired messages), best max_error: %" PRId64 " us",
                 this->best_max_error_);
     }

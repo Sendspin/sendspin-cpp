@@ -317,9 +317,12 @@ void ConnectionManager::reap_finished(bool drop_one_opened) {
 // Any thread
 // ============================================================================
 
-std::shared_ptr<SendspinTimeFilter> ConnectionManager::time_filter() const {
+std::optional<TimeTransform> ConnectionManager::clock() const {
     std::lock_guard<std::mutex> lock(this->published_mutex_);
-    return this->published_.time_filter;
+    if (this->published_.primary_slot >= MAX_ADMITTED) {
+        return std::nullopt;
+    }
+    return this->published_.clocks[this->published_.primary_slot];
 }
 
 std::optional<ServerInformationObject> ConnectionManager::server_information() const {
@@ -339,7 +342,6 @@ bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
     }
     // On the transport's delivery thread, ahead of the connection's first frame and before the
     // protocol task can reach the connection: the push below publishes these writes to the task.
-    conn->init_time_filter();
     conn->time_burst().configure(this->client_->config_.time_burst_size,
                                  this->client_->config_.time_burst_interval_ms,
                                  this->client_->config_.time_burst_response_timeout_ms);
@@ -440,7 +442,6 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->attach_inbound(this->client_->inbound_ring_.get(),
                                 this->client_->protocol_task_.get());
 
-    client_conn->init_time_filter();
     client_conn->time_burst().configure(this->client_->config_.time_burst_size,
                                         this->client_->config_.time_burst_interval_ms,
                                         this->client_->config_.time_burst_response_timeout_ms);
@@ -1019,8 +1020,8 @@ uint32_t ConnectionManager::run_time_sync() {
                     this->client_->request_high_performance(false);
                     entry.high_performance_held = false;
                 }
-                if (&entry == primary && conn->get_time_filter() != nullptr) {
-                    this->client_->post_time_sync_error(conn->get_time_filter()->get_error());
+                if (&entry == primary) {
+                    this->client_->post_time_sync_error(conn->time_filter().get_error());
                 }
             }
             next = std::min(next, burst.ms_until_due(now_ms));
@@ -1037,21 +1038,36 @@ void ConnectionManager::refresh_published_state() {
     AdmittedEntry* primary = this->primary();
     SendspinConnection* primary_conn = primary != nullptr ? primary->conn.get() : nullptr;
     const uint64_t primary_id = primary_conn != nullptr ? primary_conn->get_instance_id() : 0;
-    if (primary_id != this->published_primary_id_) {
-        // The slot changes only with the primary connection: its filter is fixed at creation and
-        // its server information is complete before admission (server/hello precedes it).
+    // The server information changes only with the primary connection: it is complete before
+    // admission (server/hello precedes it).
+    const bool primary_changed = primary_id != this->published_primary_id_;
+    std::optional<ServerInformationObject> info;
+    if (primary_changed) {
         this->published_primary_id_ = primary_id;
-        std::shared_ptr<SendspinTimeFilter> filter =
-            primary_conn != nullptr ? primary_conn->get_shared_time_filter() : nullptr;
-        std::optional<ServerInformationObject> info =
-            primary_conn != nullptr ? std::make_optional(primary_conn->get_server_information())
-                                    : std::nullopt;
-        {
-            // Swapped under the leaf lock; what they replace is destroyed outside it.
-            std::lock_guard<std::mutex> lock(this->published_mutex_);
-            this->published_.time_filter.swap(filter);
+        if (primary_conn != nullptr) {
+            info = primary_conn->get_server_information();
+        }
+    }
+    // Each admitted slot's clock, which a measurement, the slot's connection or the primary moves.
+    // The protocol task is published_'s only writer, so it compares without the lock, and a tick
+    // that changed nothing takes none.
+    ClockSlots clocks{};
+    for (size_t slot = 0; slot < MAX_ADMITTED; ++slot) {
+        if (this->admitted_[slot].conn != nullptr) {
+            clocks[slot] = this->admitted_[slot].conn->time_filter().transform();
+        }
+    }
+    const size_t primary_slot =
+        primary != nullptr ? static_cast<size_t>(primary - this->admitted_.data()) : MAX_ADMITTED;
+    if (primary_changed || clocks != this->published_.clocks ||
+        primary_slot != this->published_.primary_slot) {
+        // Swapped under the leaf lock; the server information it replaces is destroyed outside it.
+        std::lock_guard<std::mutex> lock(this->published_mutex_);
+        if (primary_changed) {
             this->published_.server_information.swap(info);
         }
+        this->published_.clocks = clocks;
+        this->published_.primary_slot = primary_slot;
     }
 
     // Only ever lowered here: a loss is reported as soon as the slots stop naming the connection,
@@ -1109,7 +1125,7 @@ void ConnectionManager::shutdown() {
     this->nursery_.clear();
     // A standing pairing window belongs to this run; a restart begins with it closed.
     this->close_pairing_window();
-    // Empties the time filter slot before stop() stops the role threads: a role thread that reads
+    // Empties the published clocks before stop() stops the role threads: a role thread that reads
     // it from here converts to 0, which reads as late.
     this->refresh_published_state();
     this->shutdown_ui_.code_was_emitted |= ui.code_was_emitted;
@@ -1618,8 +1634,8 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         std::shared_ptr<SendspinConnection> dropped = this->vacate_admitted(*entry);
         // Ahead of the slot refresh below: the teardown commands the stream to end before the
-        // time filter slot stops naming this connection's filter (see docs/internals.md "Time
-        // Filter Slot").
+        // published clock stops being this connection's (see docs/internals.md "Time Filter
+        // Slot").
         this->client_->cleanup_connection_state(
             static_cast<uint16_t>(ALL_ROLES_MASK & ~this->roles_owned_by_others(nullptr)));
         this->refresh_published_state();

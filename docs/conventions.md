@@ -52,9 +52,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - State published from one writer thread to one reader thread uses a
   `ShadowSlot` (`src/platform/shadow_slot.h`), whichever side (if either) the
   main loop is on. State the main loop *reads* goes through the Inbox instead.
-  The values read by several threads without being consumed, the primary
-  admitted connection's time filter and server information, sit in
-  `ConnectionManager`'s own slot behind a leaf mutex (`time_filter()`,
+  The values read by several threads without being consumed, the admitted
+  connections' clocks and the primary's server information, sit in
+  `ConnectionManager`'s own slot behind a leaf mutex (`clock()`,
   `server_information()`), written by the protocol task; a flag read the same
   way is a plain atomic.
 - Event producers push through `push_event_or_log()` rather than hand-rolling
@@ -118,8 +118,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   state, never across a call that takes another library lock, a send, a
   listener or the persistence provider, so the library has no lock order to
   cite. The leaves are `ConnectionManager::published_mutex_`,
-  `RecordStore::mutex_`, the Inbox mutex, each
-  `SendspinTimeFilter`'s `state_mutex_`, the inbound ring's, each outbound
+  `RecordStore::mutex_`, the Inbox mutex, the inbound ring's, each outbound
   ring's, item lists' and protocol task command queue's own locks, the artwork
   role's slot mutex, `ShadowSlot`'s and the ESP server's pending-upgrade mutex. A
   change that would take a second library lock under one of them is a design

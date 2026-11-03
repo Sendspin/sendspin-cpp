@@ -25,6 +25,7 @@
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/types.h"
+#include "time_filter.h"
 
 #include <array>
 #include <atomic>
@@ -44,7 +45,6 @@ class SendspinArenaAllocator;
 class SendspinClient;
 class SendspinConnection;
 class SendspinServerConnection;
-class SendspinTimeFilter;
 class SendspinWsServer;
 
 /// @brief Converts a duration in seconds to microseconds at compile time.
@@ -266,8 +266,8 @@ public:
     /// - SendspinClient::cleanup_connection_state() resets the client-wide state (event ring,
     ///   group, time-sync report, pairing notes) only when the teardown covers every role,
     ///   which is keyed on no remaining connection owning one.
-    /// - The time filter and server information slots follow primary() (the player's owner, else
-    ///   the first admitted), so a role owned by another connection converts with the wrong clock.
+    /// - clock() and the server information follow primary() (the player's owner, else the first
+    ///   admitted), so a role owned by another connection converts with the wrong clock.
     /// - group/update, leave() and get_server_information() are singular: they follow primary().
     /// - The artwork binary gate (SendspinClient::process_binary_message()) passes any admitted
     ///   connection while none owns the role.
@@ -372,15 +372,15 @@ public:
         return this->connected_.load(std::memory_order_acquire);
     }
 
-    /// @brief Returns the time filter of the primary admitted connection (see primary()), or
-    /// nullptr when none is admitted. Any thread.
+    /// @brief Returns the clock of the primary admitted connection (see primary()), as of the
+    /// protocol task's last refresh_published_state(), or nullopt when none is admitted. Any
+    /// thread.
     ///
     /// Reads published_ behind the leaf published_mutex_, so a role thread converting
     /// timestamps (the sync task per chunk, the visualizer drain per frame) never waits on the
-    /// protocol task. Hands out the filter, never the connection: a connection's destructor can
-    /// join its transport thread, which must not happen on a role thread, while the filter's last
-    /// drop only frees memory.
-    std::shared_ptr<SendspinTimeFilter> time_filter() const;
+    /// protocol task. A copy of the filter's transform, so a reader shares nothing with the
+    /// connection or its filter.
+    std::optional<TimeTransform> clock() const;
 
     /// @brief Returns a copy of the primary admitted connection's server information, or nullopt
     /// when none is admitted. Any thread: reads a slot written at admission and cleared on the
@@ -523,10 +523,10 @@ public:
     ///         burst waiting for its grant adds no deadline, since the grant wakes the task.
     uint32_t run_time_sync();
 
-    /// @brief Refreshes what other threads read without a protocol-task lock: the time filter and
-    /// server-information slots (from primary()), and lowers the connected flag when no admitted
-    /// connection is operational. Called at the end of every tick and after every change to the
-    /// admitted array.
+    /// @brief Refreshes what other threads read without a protocol-task lock: each admitted slot's
+    /// clock, the primary() slot and its server information, and lowers the connected flag when no
+    /// admitted connection is operational. Called at the end of every tick and after every change
+    /// to the admitted array.
     void refresh_published_state();
 
     /// @brief Publishes the connected flag (is_connected()) as it stands, raising it as well as
@@ -992,17 +992,24 @@ private:
     /// lowered by refresh_published_state() too), read from any thread.
     std::atomic<bool> connected_{false};
 
-    /// @brief What other threads read of the primary admitted connection, written together
-    struct PublishedPrimary {
-        std::shared_ptr<SendspinTimeFilter> time_filter;
+    /// @brief Each admitted slot's clock (admitted_[slot]), nullopt for a free slot
+    using ClockSlots = std::array<std::optional<TimeTransform>, MAX_ADMITTED>;
+
+    /// @brief What other threads read of the admitted connections
+    struct PublishedState {
+        ClockSlots clocks{};
+        /// The slot in clocks of the primary connection (primary()), MAX_ADMITTED for none.
+        size_t primary_slot{MAX_ADMITTED};
+        /// The primary connection's server information.
         std::optional<ServerInformationObject> server_information;
     };
     /// Guards published_. A leaf (docs/conventions.md): held only to copy or swap a member, so it
-    /// also serialises the role threads' time_filter() reads behind server_information() copies.
+    /// also serialises the role threads' clock() reads behind server_information() copies.
     mutable std::mutex published_mutex_;
-    /// Written by the protocol task (refresh_published_state()); read from any thread
-    /// (time_filter(), server_information()): role threads, the main loop, the consumer.
-    PublishedPrimary published_;
+    /// Written by the protocol task (refresh_published_state()), which, as its only writer, also
+    /// reads it without the lock; read from any thread (clock(), server_information()): role
+    /// threads, the main loop, the consumer.
+    PublishedState published_;
 };
 
 }  // namespace sendspin

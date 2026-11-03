@@ -3407,13 +3407,10 @@ struct ConnectionObservation {
 
 /// Connection stand-in that records where it was destroyed and how many goodbyes it was asked
 /// for. The tests drive the stream through the player's own handlers, so no message traffic
-/// reaches it: it exists to carry the stream's time filter, and to be goodbyed and freed. Its
-/// filter is created with it, as production does before a connection can enter a slot.
+/// reaches it: it exists to carry the stream's time filter, and to be goodbyed and freed.
 class ObservedConnection : public StubConnection {
 public:
-    explicit ObservedConnection(ConnectionObservation* obs) : obs_(obs) {
-        this->init_time_filter();
-    }
+    explicit ObservedConnection(ConnectionObservation* obs) : obs_(obs) {}
     ~ObservedConnection() override {
         this->obs_->destroyed_on = std::this_thread::get_id();
         this->obs_->destroyed.store(true);
@@ -3486,14 +3483,15 @@ constexpr int64_t SEEDED_SERVER_OFFSET_US = -10LL * 60 * 1000 * 1000;
 /// A stand-in connection whose time filter has taken one measurement of SEEDED_SERVER_OFFSET_US.
 std::shared_ptr<ObservedConnection> make_synced_connection(ConnectionObservation* obs) {
     auto conn = std::make_shared<ObservedConnection>(obs);
-    conn->get_time_filter()->update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000,
-                                    platform_time_us());
+    conn->time_filter().update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000, platform_time_us());
     return conn;
 }
 
 // The time filter slot follows the primary admitted connection's filter: a synced connection
 // converts with its offset, a vacated slot reads as unsynced, the slot never keeps a connection
-// alive, and an unsynced newcomer installed over a synced one reads its own filter.
+// alive, an unsynced newcomer installed over a synced one reads its own filter, and each of that
+// newcomer's measurements, its first and a later correction, reaches the slot at the protocol
+// task's next publish.
 TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheAdmittedConnection) {
     ConnectionObservation dropped_obs;  // All outlive the client
     ConnectionObservation replaced_obs;
@@ -3515,8 +3513,24 @@ TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheAdmittedConnection) {
 
     (void) replace_admitted(manager, make_synced_connection(&replaced_obs));
     ASSERT_TRUE(client.is_time_synced());
-    (void) replace_admitted(manager, std::make_shared<ObservedConnection>(&newcomer_obs));
+    auto newcomer = std::make_shared<ObservedConnection>(&newcomer_obs);
+    (void) replace_admitted(manager, newcomer);
     EXPECT_FALSE(client.is_time_synced()) << "the newcomer read the replaced connection's filter";
+
+    // Each measurement is stamped after the last: the filter skips one that is not.
+    const int64_t first_measured_at = platform_time_us();
+    newcomer->time_filter().update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000, first_measured_at);
+    manager.refresh_published_state();
+    EXPECT_TRUE(client.is_time_synced()) << "a measurement after admission never reached the slot";
+    EXPECT_EQ(client.get_client_time(SERVER_TS_US), SERVER_TS_US - SEEDED_SERVER_OFFSET_US);
+
+    // A second measurement takes its offset as is, with no drift applied yet.
+    constexpr int64_t CORRECTED_OFFSET_US = SEEDED_SERVER_OFFSET_US + 5000;
+    newcomer->time_filter().update(CORRECTED_OFFSET_US, /*max_error=*/1000,
+                                   first_measured_at + 1000);
+    manager.refresh_published_state();
+    EXPECT_EQ(client.get_client_time(SERVER_TS_US), SERVER_TS_US - CORRECTED_OFFSET_US)
+        << "a correction after the first measurement never reached the slot";
 }
 
 // The sync task converts chunks with the current connection's offset. The fed
