@@ -445,13 +445,16 @@ constexpr int TIME_BURST_SIZE = 8;
 constexpr size_t ADMISSION_ALLOCATIONS = 0;
 constexpr size_t CLIENT_STATE_ALLOCATIONS = 0;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;
-constexpr size_t STREAM_ROLES_ALLOCATIONS = 0;
+// The visualizer types list stream/start's parse builds, moved from there into the role's slot.
+constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 1;
+constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 
 // One paired connection with a player, a controller, metadata, two artwork channels and a
 // visualizer, so the player, artwork and visualizer objects of client/state are built: from the
 // fake server's connect through admission and the first client/state, then one client/state
-// publish, then one full burst of client/time and server/time exchanges, then a stream/end and a
-// stream/clear that name their roles.
+// publish, then one full burst of client/time and server/time exchanges, then an artwork and
+// visualizer stream/start and a stream/end and a stream/clear that name their roles, then a
+// stream/start whose player section the connection, no longer owning the player, does not take.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -517,11 +520,16 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
                                TIME_BURST_ALLOCATIONS);
 
     // Closes on the client/state the trailing volume command publishes, which the protocol task
-    // sends only after handling the two stream messages ahead of it.
+    // sends only after handling the three stream messages ahead of it.
     const int states_before_streams = server->client_state_count();
     open_window();
     {
         TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"stream/start","payload":{"artwork":{"channels":[)"
+            R"({"source":"album","format":"jpeg","width":320,"height":320},)"
+            R"({"source":"artist","format":"png","width":64,"height":64}]},)"
+            R"("visualizer":{"types":["loudness"],"rate_max":30}}})"));
         ASSERT_TRUE(server->send_app_json(
             R"({"type":"stream/end","payload":{"roles":["artwork","visualizer"]}})"));
         ASSERT_TRUE(server->send_app_json(
@@ -530,8 +538,40 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
             R"({"type":"server/command","payload":{"player":{"command":"volume","volume":17}}})"));
     }
     pump_while_not(client, [&] { return server->client_state_count() > states_before_streams; });
-    expect_library_allocations(close_window(), "stream/end and stream/clear with roles",
-                               STREAM_ROLES_ALLOCATIONS);
+    expect_library_allocations(close_window(),
+                               "stream/start, stream/end and stream/clear with roles",
+                               STREAM_MESSAGES_ALLOCATIONS);
+
+    // An activation that leaves the player out takes the role from the connection, outside any
+    // window. The window holds a stream/start whose player section carries a FLAC codec_header
+    // longer than either standard library's inline capacity, which a parse would copy, and closes
+    // on the client/state of the activation behind it that hands the player back.
+    const int states_before_removal = server->client_state_count();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"server/activate","payload":{"activities":["playback"],"active_roles":)"
+            R"(["controller@v1","metadata@v1","color@v1","artwork@v1","visualizer@v1"]}})"));
+    }
+    pump_while_not(client, [&] { return server->client_state_count() > states_before_removal; });
+    const int states_before_untaken = server->client_state_count();
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"stream/start","payload":{"player":{"codec":"flac","sample_rate":48000,)"
+            R"("channels":2,"bit_depth":16,)"
+            R"("codec_header":"ZkxhQwAAACIQABAAAAANAAANC7gB8AAAAAAAAAAAAAAAAAAAAAAAAAAA"}}})"));
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"server/activate","payload":{"activities":["playback"],"active_roles":)"
+            R"(["player@v1","controller@v1","metadata@v1","color@v1","artwork@v1",)"
+            R"("visualizer@v1"]}})"));
+    }
+    pump_while_not(client, [&] { return server->client_state_count() > states_before_untaken; });
+    expect_library_allocations(close_window(), "stream/start for a role the connection lacks",
+                               UNTAKEN_STREAM_START_ALLOCATIONS);
+    EXPECT_EQ(player_listener.stream_starts, 0)
+        << "the player started a stream from a connection that did not own it";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

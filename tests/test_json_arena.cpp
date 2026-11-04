@@ -219,7 +219,10 @@ TEST(JsonArena, ParsedMessageIsReleasedBeforeItsReplyIsBuilt) {
     ParsedJsonMessage parsed(arena);
     ASSERT_TRUE(parsed.parse(stream_start.data(), stream_start.size()));
     StreamStartMessage stream_msg;
-    ASSERT_TRUE(parsed.extract<process_stream_start_message>(&stream_msg));
+    ASSERT_TRUE(parsed.extract([&stream_msg](JsonObject root) {
+        return process_stream_start_message(root, EnumSet<SendspinRole>{SendspinRole::PLAYER},
+                                            &stream_msg);
+    }));
     ASSERT_TRUE(stream_msg.player.has_value());
     EXPECT_EQ(stream_msg.player->sample_rate.value_or(0), 48000U) << "the fields outlive the release";
 

@@ -71,10 +71,10 @@ namespace {
 ///
 /// messaging.md "Communication" keeps a message the client implements *recognized* while its role
 /// is inactive ("An ID the receiver implements is still recognized when its role is inactive"), so
-/// this is not the unknown-message rule: the message is parsed and validated as usual, the
-/// connection is never closed for it, and only the role's own handling is skipped. messaging.md
-/// "server/activate" requires the mirror of this of servers, so a role removal the peer has not
-/// yet seen never costs the connection.
+/// this is not the unknown-message rule: the message stays recognized and the connection is never
+/// closed for it, while what it carries for a role the connection does not take is skipped
+/// unparsed. messaging.md "server/activate" requires the mirror of this of servers, so a role
+/// removal the peer has not yet seen never costs the connection.
 ///
 /// The handler a true verdict admits loads the role's teardown generation itself and stamps what
 /// it queues with it for the drains to check (RoleTeardown). Protocol task only.
@@ -394,30 +394,53 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::STREAM_START: {
             SS_LOGD(TAG, "Stream Started");
 
+            // As with server/state, each section's role gate is decided before the parse (see
+            // process_stream_start_message()).
+            EnumSet<SendspinRole> take;
+#ifdef SENDSPIN_ENABLE_PLAYER
+            if (this->player_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
+                take.insert(SendspinRole::PLAYER);
+            }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+            if (this->artwork_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
+                take.insert(SendspinRole::ARTWORK);
+            }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+            if (this->visualizer_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
+                take.insert(SendspinRole::VISUALIZER);
+            }
+#endif
+
             StreamStartMessage stream_msg;
-            if (!parsed.extract<process_stream_start_message>(&stream_msg)) {
+            if (!parsed.extract([take, &stream_msg](JsonObject root) {
+                    return process_stream_start_message(root, take, &stream_msg);
+                })) {
                 SS_LOGE(TAG, "Failed to parse stream/start message");
                 break;
             }
 
+            // The parser fills only the sections in `take`.
 #ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_ && stream_msg.player.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                this->player_->impl_->handle_stream_start(stream_msg.player.value());
+            if (stream_msg.player.has_value()) {
+                this->player_->impl_->handle_stream_start(std::move(stream_msg.player.value()));
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
-            if (this->artwork_ && stream_msg.artwork.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
+            if (stream_msg.artwork.has_value()) {
                 this->artwork_->impl_->handle_stream_start(stream_msg.artwork.value());
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-            if (this->visualizer_ && stream_msg.visualizer.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
-                this->visualizer_->impl_->handle_stream_start(stream_msg.visualizer.value());
+            if (stream_msg.visualizer.has_value()) {
+                this->visualizer_->impl_->handle_stream_start(
+                    std::move(stream_msg.visualizer.value()));
             }
 #endif
             break;

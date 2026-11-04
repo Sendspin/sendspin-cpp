@@ -784,7 +784,7 @@ TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
         params.codec = row.codec;
         params.sample_rate = 48000;
         params.bit_depth = 24;
-        impl->handle_stream_start(params);
+        impl->handle_stream_start(std::move(params));
 
         void* header_item = impl->sync_task->take_item(0);
         ASSERT_NE(header_item, nullptr);

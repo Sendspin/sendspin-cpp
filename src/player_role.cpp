@@ -367,7 +367,7 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
                                generation);
 }
 
-void PlayerRole::Impl::handle_stream_start(ServerPlayerStreamObject player_obj) {
+void PlayerRole::Impl::handle_stream_start(ServerPlayerStreamObject&& player_obj) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
     // Numbers the codec header and the STREAM_START, so the sync task starts the stream only on

@@ -2795,7 +2795,7 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
             params.sample_rate = 48000;
             params.channels = 2;
             params.bit_depth = 16;
-            impl.handle_stream_start(params);
+            impl.handle_stream_start(std::move(params));
             pump_until(client, [&] { return impl.sync_task->is_running(); });
             impl.handle_stream_end();
             pump_until(client, [&] { return !client.is_started(); });
@@ -3192,7 +3192,7 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params);
+            player.handle_stream_start(ServerPlayerStreamObject{params});
         };
         const auto end = [&] { player.handle_stream_end(); };
 
@@ -3282,7 +3282,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params);
+            player.handle_stream_start(ServerPlayerStreamObject{params});
         };
 
         start();

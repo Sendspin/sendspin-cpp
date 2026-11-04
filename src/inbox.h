@@ -499,9 +499,9 @@ public:
     }
 
     /// @brief Overwrites the pending payload (latest-wins) unless it belongs to a later generation
-    /// @param value The payload.
+    /// @param value The payload, taken by reference for the reason merge() states.
     /// @param generation The producing role's teardown generation the payload was admitted under.
-    void write(T value, uint32_t generation) {
+    void write(T&& value, uint32_t generation) {
         this->merge([](T& current, T&& delta) { current = std::move(delta); }, std::move(value),
                     generation);
     }
