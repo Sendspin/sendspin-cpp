@@ -425,21 +425,12 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::STREAM_END: {
             StreamEndMessage end_msg;
             if (parsed.extract<process_stream_end_message>(&end_msg)) {
-                bool end_player = !end_msg.roles.has_value();
-                bool end_artwork = !end_msg.roles.has_value();
-                bool end_visualizer = !end_msg.roles.has_value();
-
-                if (end_msg.roles.has_value()) {
-                    for (const auto& role : end_msg.roles.value()) {
-                        if (role == "player") {
-                            end_player = true;
-                        } else if (role == "artwork") {
-                            end_artwork = true;
-                        } else if (role == "visualizer") {
-                            end_visualizer = true;
-                        }
-                    }
-                }
+                const auto ends = [&end_msg](SendspinRole role) {
+                    return !end_msg.roles.has_value() || end_msg.roles->contains(role);
+                };
+                const bool end_player = ends(SendspinRole::PLAYER);
+                const bool end_artwork = ends(SendspinRole::ARTWORK);
+                const bool end_visualizer = ends(SendspinRole::VISUALIZER);
 
                 SS_LOGD(TAG, "Stream ended - player:%d artwork:%d visualizer:%d", end_player,
                         end_artwork, end_visualizer);
@@ -473,18 +464,11 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             if (parsed.extract<process_stream_clear_message>(&clear_msg)) {
                 // messaging.md "stream/clear": only player and visualizer streams clear, and an
                 // omitted roles list clears both.
-                bool clear_player = !clear_msg.roles.has_value();
-                bool clear_visualizer = !clear_msg.roles.has_value();
-
-                if (clear_msg.roles.has_value()) {
-                    for (const auto& role : clear_msg.roles.value()) {
-                        if (role == "player") {
-                            clear_player = true;
-                        } else if (role == "visualizer") {
-                            clear_visualizer = true;
-                        }
-                    }
-                }
+                const auto clears = [&clear_msg](SendspinRole role) {
+                    return !clear_msg.roles.has_value() || clear_msg.roles->contains(role);
+                };
+                const bool clear_player = clears(SendspinRole::PLAYER);
+                const bool clear_visualizer = clears(SendspinRole::VISUALIZER);
 
                 SS_LOGD(TAG, "Stream clear - player:%d visualizer:%d", clear_player,
                         clear_visualizer);

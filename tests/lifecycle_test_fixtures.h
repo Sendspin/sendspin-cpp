@@ -1287,10 +1287,14 @@ public:
     void on_visualizer_stream_end() override {
         ++this->stream_ends;
     }
+    void on_visualizer_stream_clear() override {
+        ++this->stream_clears;
+    }
 
     std::atomic<size_t> loudness{0};
     int stream_starts{0};
     int stream_ends{0};
+    int stream_clears{0};
 };
 
 // ============================================================================

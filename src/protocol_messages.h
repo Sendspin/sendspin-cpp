@@ -756,6 +756,9 @@ struct ArtworkChannelFormatObject {
     uint16_t height{};
 };
 
+/// @brief Maximum number of artwork slots (2-bit slot field in protocol binary type byte)
+static constexpr size_t ARTWORK_MAX_SLOTS = 4;
+
 /// @brief Server-side description of one artwork channel's format and dimensions
 struct ServerArtworkChannelObject {
     std::optional<SendspinImageSource> source;
@@ -777,7 +780,7 @@ struct ServerArtworkChannelObject {
 
 /// @brief Artwork stream parameters sent by the server in stream/start messages
 struct ServerArtworkStreamObject {
-    std::optional<std::vector<ServerArtworkChannelObject>> channels;
+    std::optional<InlineVector<ServerArtworkChannelObject, ARTWORK_MAX_SLOTS>> channels;
 };
 
 /// @brief Visualizer stream configuration reported by the client in client/state messages
@@ -996,7 +999,8 @@ struct ClientStreamStartMessage {
     uint8_t channels{};
     uint32_t sample_rate{};
     uint8_t bit_depth{};
-    std::optional<std::string> codec_header{};
+    /// Views the source encoder's header; the message is built and serialized in one go.
+    std::optional<std::string_view> codec_header{};
 };
 
 /// @brief Bit that represents `codec` in a codec mask
@@ -1054,14 +1058,20 @@ struct StreamStartMessage {
     std::optional<ServerVisualizerStreamObject> visualizer;
 };
 
+static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 8, "EnumSet<SendspinRole> needs 8 bits");
+
+/// @brief The roles a stream/end or stream/clear names; nullopt when it omits the list, which
+/// applies it to every role it covers (messaging.md "stream/end", "stream/clear")
+using StreamRoles = std::optional<EnumSet<SendspinRole>>;
+
 /// @brief Parsed stream/end message listing which roles the stream end applies to
 struct StreamEndMessage {
-    std::optional<std::vector<std::string>> roles{};
+    StreamRoles roles{};
 };
 
 /// @brief Parsed stream/clear message listing which roles the buffer flush applies to
 struct StreamClearMessage {
-    std::optional<std::vector<std::string>> roles{};
+    StreamRoles roles{};
 };
 
 /// @brief Parsed pair/abort message (received or sent during a pairing exchange)

@@ -99,6 +99,7 @@ constexpr uint16_t VISUALIZER_OFFSET_TEST_PORT = 19088;
 constexpr uint16_t VISUALIZER_HELD_END_TEST_PORT = 19099;
 constexpr uint16_t VISUALIZER_HELD_CLEAR_TEST_PORT = 19100;
 constexpr uint16_t VISUALIZER_HELD_TEARDOWN_TEST_PORT = 19104;
+constexpr uint16_t STREAM_ROLES_TEST_PORT = 19105;
 constexpr uint16_t HELLO_TEST_PORT = 19090;
 constexpr uint16_t OUTBOUND_GOODBYE_TEST_PORT = 19069;
 constexpr uint16_t NETWORK_PROVIDER_TEST_PORT = 19086;
@@ -554,6 +555,56 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
     send_loudness_until(client, *server, VISUALIZER_LEAD_US,
                         [&] { return listener.loudness.load() >= 1; });
+    client.stop();
+}
+
+// messaging.md "stream/end" and "stream/clear": a roles list confines each message to the roles
+// it names. Each row's first message names only the player. The second names the visualizer and
+// is the Control: its callback is queued behind anything the first fired on the same ordered event
+// ring, so once it arrives the first has shown whether it reached the visualizer.
+TEST(ClientLifecycle, StreamEndAndClearReachOnlyTheNamedRoles) {
+    struct Row {
+        const char* name;
+        const char* first;
+        const char* barrier;
+        bool barrier_is_clear;
+    };
+    const Row rows[] = {
+        {"stream/end naming only the player",
+         R"({"type":"stream/end","payload":{"roles":["player"]}})",
+         R"({"type":"stream/clear","payload":{"roles":["visualizer"]}})", true},
+        {"stream/clear naming only the player",
+         R"({"type":"stream/clear","payload":{"roles":["player"]}})",
+         R"({"type":"stream/end","payload":{"roles":["visualizer"]}})", false},
+    };
+
+    CountingVisualizerListener listener;
+    auto config = make_config(STREAM_ROLES_TEST_PORT);
+    config.time_burst_interval_ms = 100;
+    PairedClientBundle bundle(std::move(config));
+    SendspinClient& client = bundle.client();
+    client.add_visualizer(make_visualizer_config()).set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    auto server = connect_paired_server(bundle.peer, STREAM_ROLES_TEST_PORT, options);
+    pump_until_synced(client);
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
+        const int ends = listener.stream_ends;
+        const int clears = listener.stream_clears;
+        ASSERT_TRUE(server->send_app_json(row.first));
+        ASSERT_TRUE(server->send_app_json(row.barrier));
+        if (row.barrier_is_clear) {
+            pump_until(client, [&] { return listener.stream_clears > clears; });
+            EXPECT_EQ(listener.stream_ends, ends) << "the end reached a role it did not name";
+        } else {
+            pump_until(client, [&] { return listener.stream_ends > ends; });
+            EXPECT_EQ(listener.stream_clears, clears) << "the clear reached a role it did not name";
+        }
+    }
     client.stop();
 }
 

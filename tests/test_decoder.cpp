@@ -120,6 +120,23 @@ TEST(Decoder, FlacChunkWithSeveralFramesDecodesEveryFrame) {
     EXPECT_EQ(calls, 3);
 }
 
+// The sync task keeps one decoder for its run and resets it between streams, so a FLAC stream that
+// follows another decodes from its own header on the same FLAC decoder.
+TEST(Decoder, FlacStreamAfterAResetDecodesOnTheSameDecoder) {
+    SendspinDecoder decoder;
+    start_flac(decoder);
+    int calls = 0;
+    ASSERT_EQ(decode_resuming(decoder, FLAC_FRAMES, 3 * FLAC_FRAME_PCM_BYTES, &calls),
+              flac_source_pcm());
+    const micro_flac::FLACDecoder* const first = decoder.flac_decoder_.get();
+
+    decoder.reset_decoders();
+    start_flac(decoder);
+    EXPECT_EQ(decoder.flac_decoder_.get(), first) << "a new FLAC decoder was built for the stream";
+    EXPECT_EQ(decode_resuming(decoder, FLAC_FRAMES, 3 * FLAC_FRAME_PCM_BYTES, &calls),
+              flac_source_pcm());
+}
+
 // Out of room, the decoder stops at a frame boundary and reports how far it got.
 TEST(Decoder, FlacStopsAtAFrameBoundaryWhenOutOfRoom) {
     SendspinDecoder decoder;

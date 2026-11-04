@@ -32,8 +32,9 @@ namespace sendspin {
 /// (by the shift or a reset to T{}), so its resources (e.g. a shared_ptr reference) are released
 /// at the removal.
 ///
-/// Requires T to be default-constructible, move-constructible, and move-assignable. Not copyable
-/// or movable; use swap().
+/// Requires T to be default-constructible, move-constructible, and move-assignable. Copyable only
+/// when T is trivially copyable, so a copy duplicates plain values and never a resource; otherwise
+/// neither copyable nor movable, and swap() moves the contents.
 template <typename T, size_t N>
 class InlineVector {
 public:
@@ -41,8 +42,12 @@ public:
     using const_iterator = const T*;
 
     InlineVector() = default;
-    InlineVector(const InlineVector&) = delete;
-    InlineVector& operator=(const InlineVector&) = delete;
+    InlineVector(const InlineVector&)
+        requires std::is_trivially_copyable_v<T>
+    = default;
+    InlineVector& operator=(const InlineVector&)
+        requires std::is_trivially_copyable_v<T>
+    = default;
 
     /// @brief Appends `value`. Precondition: size() < N.
     /// @param value The element to append (moved in).

@@ -405,7 +405,7 @@ void SourceTask::flush_to_live() {
     }
 }
 
-std::optional<std::string> SourceTask::codec_header(SendspinCodecFormat codec) const {
+std::optional<std::string_view> SourceTask::codec_header(SendspinCodecFormat codec) const {
     if (codec == SendspinCodecFormat::FLAC && this->flac_encoder_ != nullptr) {
         return this->flac_encoder_->codec_header();
     }

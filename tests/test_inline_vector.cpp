@@ -13,18 +13,27 @@
 // limitations under the License.
 
 /// @file test_inline_vector.cpp
-/// @brief Tests for InlineVector: order-preserving erase, element release at removal, and swap
+/// @brief Tests for InlineVector: order-preserving erase, element release at removal, swap, and
+/// copying only plain values
 
 #include "inline_vector.h"
 
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <type_traits>
 
 namespace sendspin {
 namespace {
 
 using SharedVector = InlineVector<std::shared_ptr<int>, 3>;
+
+// A vector of a resource is neither copied nor moved, so a reference count never changes behind
+// a copy; a vector of plain values is copied like one.
+static_assert(!std::is_copy_constructible_v<SharedVector>);
+static_assert(!std::is_copy_assignable_v<SharedVector>);
+static_assert(!std::is_move_constructible_v<SharedVector>);
+static_assert(std::is_trivially_copyable_v<InlineVector<int, 3>>);
 
 // A removed shared_ptr must drop its reference at the removal, not linger in the vacated slot:
 // ConnectionManager relies on that to release connections at a known point.

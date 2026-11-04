@@ -75,7 +75,8 @@ public:
         this->reset_decoders();
     }
 
-    /// @brief Resets the state of the FLAC and Opus decoders
+    /// @brief Resets the state of the FLAC and Opus decoders; the FLAC decoder object is kept for
+    /// the next FLAC stream, so call it before each stream's process_header()
     void reset_decoders();
 
     /// @brief Sets up the appropriate decoder and processes the codec header (which may be a dummy

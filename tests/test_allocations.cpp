@@ -445,11 +445,13 @@ constexpr int TIME_BURST_SIZE = 8;
 constexpr size_t ADMISSION_ALLOCATIONS = 0;
 constexpr size_t CLIENT_STATE_ALLOCATIONS = 0;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;
+constexpr size_t STREAM_ROLES_ALLOCATIONS = 0;
 
 // One paired connection with a player, a controller, metadata, two artwork channels and a
 // visualizer, so the player, artwork and visualizer objects of client/state are built: from the
 // fake server's connect through admission and the first client/state, then one client/state
-// publish, then one full burst of client/time and server/time exchanges.
+// publish, then one full burst of client/time and server/time exchanges, then a stream/end and a
+// stream/clear that name their roles.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -513,6 +515,23 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     pump_while_not(client, [&] { return burst_listener.bursts > bursts_seen + 1; });
     expect_library_allocations(close_window(), "client/time and server/time burst",
                                TIME_BURST_ALLOCATIONS);
+
+    // Closes on the client/state the trailing volume command publishes, which the protocol task
+    // sends only after handling the two stream messages ahead of it.
+    const int states_before_streams = server->client_state_count();
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"stream/end","payload":{"roles":["artwork","visualizer"]}})"));
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"stream/clear","payload":{"roles":["player","visualizer"]}})"));
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"server/command","payload":{"player":{"command":"volume","volume":17}}})"));
+    }
+    pump_while_not(client, [&] { return server->client_state_count() > states_before_streams; });
+    expect_library_allocations(close_window(), "stream/end and stream/clear with roles",
+                               STREAM_ROLES_ALLOCATIONS);
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

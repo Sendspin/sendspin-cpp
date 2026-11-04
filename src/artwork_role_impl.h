@@ -45,9 +45,6 @@ enum class ArtworkEventType : uint8_t {
     STREAM_END,
 };
 
-/// @brief Maximum number of artwork slots (2-bit slot field in protocol binary type byte)
-static constexpr size_t ARTWORK_MAX_SLOTS = 4;
-
 /// @brief Ack-gate state for a slot with require_frame_done enabled
 enum class SlotAckState : uint8_t {
     IDLE,              // no un-acked delivery; next frame or clear may be processed
@@ -389,7 +386,7 @@ struct ArtworkRole::Impl : RoleTeardown {
     // against it: only the channels whose configuration changes lose their pending image.
     // Protocol task only, like `transfer`: written by handle_stream_start() and cleared by
     // discard_all_pending().
-    std::optional<std::vector<ServerArtworkChannelObject>> streamed_channels;
+    std::optional<InlineVector<ServerArtworkChannelObject, ARTWORK_MAX_SLOTS>> streamed_channels;
 
     // Pointer fields
     SendspinClient* client;
