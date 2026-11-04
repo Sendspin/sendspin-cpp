@@ -938,7 +938,7 @@ struct ClientHelloMessage {
     std::string_view name{};
     std::optional<DeviceInfoObject> device_info{};
     /// @brief Storage for a MAC address detected at build time, which device_info views; the view
-    /// stays valid because the message can be neither copied nor moved (its InlineVectors).
+    /// stays valid because the message can be neither copied nor moved (deleted below).
     MacAddressText detected_mac{};
     InlineVector<SendspinRole, static_cast<size_t>(SendspinRole::COUNT)> supported_roles{};
     std::optional<PlayerSupportObject> player_v1_support{};
@@ -946,7 +946,13 @@ struct ClientHelloMessage {
     std::optional<SourceSupportObject> source_v1_support{};
     bool unpaired_access_enabled{false};
     InlineVector<PairMethodDescriptor, MAX_HELLO_PAIR_METHODS> supported_pair_methods{};
+
+    ClientHelloMessage() = default;
+    ClientHelloMessage(const ClientHelloMessage&) = delete;
+    ClientHelloMessage& operator=(const ClientHelloMessage&) = delete;
 };
+static_assert(!std::is_copy_constructible_v<ClientHelloMessage> &&
+              !std::is_move_constructible_v<ClientHelloMessage>);
 
 /// @brief Outgoing client/state message reporting client playback state to the server
 struct ClientStateMessage {
@@ -1183,9 +1189,11 @@ bool process_server_state_controller(JsonObject root,
 bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg);
 
 /// @brief Parses a stream/end JSON message into the provided struct
+/// @return false (logged) when `roles` is present but not an array, which rejects the message.
 bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg);
 
 /// @brief Parses a stream/clear JSON message into the provided struct
+/// @return false (logged) when `roles` is present but not an array, which rejects the message.
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg);
 
 /// @brief Builds a client/hello message

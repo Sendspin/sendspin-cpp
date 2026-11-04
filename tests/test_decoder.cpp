@@ -131,6 +131,7 @@ TEST(Decoder, FlacStreamAfterAResetDecodesOnTheSameDecoder) {
     const micro_flac::FLACDecoder* const first = decoder.flac_decoder_.get();
 
     decoder.reset_decoders();
+    EXPECT_EQ(decoder.flac_decoder_.get(), first) << "the reset released the FLAC decoder";
     start_flac(decoder);
     EXPECT_EQ(decoder.flac_decoder_.get(), first) << "a new FLAC decoder was built for the stream";
     EXPECT_EQ(decode_resuming(decoder, FLAC_FRAMES, 3 * FLAC_FRAME_PCM_BYTES, &calls),

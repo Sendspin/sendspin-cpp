@@ -86,11 +86,18 @@ static std::optional<bool> read_bool_field(JsonVariantConst var, const char* nam
     return var.as<bool>();
 }
 
-/// @brief Reads a stream/end or stream/clear `roles` list: nullopt when absent, otherwise the
-/// stream roles it names ('player', 'artwork', 'visualizer'), any other entry ignored.
-static StreamRoles read_stream_roles(JsonVariantConst var) {
+/// @brief Reads a stream/end or stream/clear `roles` list into `out`: nullopt when absent or null,
+/// otherwise the stream roles it names ('player', 'artwork', 'visualizer'), any other entry
+/// ignored.
+/// @return false (logged) when `roles` is present but not an array.
+static bool read_stream_roles(JsonVariantConst var, const char* type, StreamRoles* out) {
+    if (var.isNull()) {
+        *out = std::nullopt;
+        return true;
+    }
     if (!var.is<JsonArrayConst>()) {
-        return std::nullopt;
+        SS_LOGE(TAG, "Invalid %s message: roles is not an array", type);
+        return false;
     }
     EnumSet<SendspinRole> roles;
     for (JsonVariantConst role : var.as<JsonArrayConst>()) {
@@ -103,7 +110,8 @@ static StreamRoles read_stream_roles(JsonVariantConst var) {
             roles.insert(SendspinRole::VISUALIZER);
         }
     }
-    return roles;
+    *out = roles;
+    return true;
 }
 
 /// @brief Writes `bytes` base64url-encoded (no padding) into `field`, which copies it, through a
@@ -853,16 +861,14 @@ bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg) {
     if (end_msg == nullptr) {
         return true;
     }
-    end_msg->roles = read_stream_roles(root["payload"]["roles"]);
-    return true;
+    return read_stream_roles(root["payload"]["roles"], "stream/end", &end_msg->roles);
 }
 
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg) {
     if (clear_msg == nullptr) {
         return true;
     }
-    clear_msg->roles = read_stream_roles(root["payload"]["roles"]);
-    return true;
+    return read_stream_roles(root["payload"]["roles"], "stream/clear", &clear_msg->roles);
 }
 
 // Message formatting
