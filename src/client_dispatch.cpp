@@ -129,7 +129,7 @@ uint32_t SendspinClient::protocol_tick() {
     {
         ClientStateMessage snapshot;
         if (this->protocol_task_->take_state(snapshot)) {
-            this->adopt_client_state(std::move(snapshot));
+            this->adopt_client_state(snapshot);
         }
     }
 

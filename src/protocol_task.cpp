@@ -73,11 +73,8 @@ void ProtocolTask::stop() {
     // pushed and requests posted after the final tick stay for the joining thread
     // (take_command(), take_requests(), drop_commands()), which releases what a command holds
     // off this queue's lock.
-    std::optional<ClientStateMessage> dropped;
-    {
-        std::lock_guard<std::mutex> lock(this->command_mutex_);
-        dropped.swap(this->latest_state_);
-    }
+    std::lock_guard<std::mutex> lock(this->command_mutex_);
+    this->latest_state_.reset();
 }
 
 void ProtocolTask::drop_commands() {
@@ -194,26 +191,21 @@ void ProtocolTask::clear_command(ProtocolCommand& command) {
 // State slot
 // ============================================================================
 
-void ProtocolTask::publish_state(ClientStateMessage state) {
-    std::optional<ClientStateMessage> replaced(std::move(state));
+void ProtocolTask::publish_state(const ClientStateMessage& state) {
     {
         std::lock_guard<std::mutex> lock(this->command_mutex_);
-        replaced.swap(this->latest_state_);
+        this->latest_state_ = state;
     }
-    // `replaced` now holds the superseded snapshot, destroyed here outside the lock.
     this->wake();
 }
 
 bool ProtocolTask::take_state(ClientStateMessage& out) {
-    std::optional<ClientStateMessage> taken;
-    {
-        std::lock_guard<std::mutex> lock(this->command_mutex_);
-        taken.swap(this->latest_state_);
-    }
-    if (!taken.has_value()) {
+    std::lock_guard<std::mutex> lock(this->command_mutex_);
+    if (!this->latest_state_.has_value()) {
         return false;
     }
-    out = std::move(*taken);
+    out = *this->latest_state_;
+    this->latest_state_.reset();
     return true;
 }
 

@@ -176,7 +176,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
   connection's handshake and admission and the messages that follow allocate
   only through the `platform_malloc` family, whose failure refuses or closes
   the connection or drops the message. A value with a bound is held inline
-  (`InlineText`, `InlineVector`, `EnumSet`, `std::array`), and text from a peer
+  (`InlineText`, `InlineVector`, `EnumSet`, `std::array`), or viewed
+  (`std::span`, `std::string_view`) when it is configuration fixed from
+  `add_*()`, and text from a peer
   is bounded where it is parsed: read in place, refused past its cap, or cut to
   its field's size. A public type keeps `std::string` and `std::vector`; where
   its value has a bound, the library holds it inline and builds the public

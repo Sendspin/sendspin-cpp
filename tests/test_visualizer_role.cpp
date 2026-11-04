@@ -653,10 +653,10 @@ TEST(VisualizerConfigReporting, HelloAdvertisesCapacityAndStateCarriesTheStreamC
     ClientStateMessage state;
     impl->build_state_fields(state);
     ASSERT_TRUE(state.visualizer.has_value());
-    EXPECT_EQ(state.visualizer->types, (std::vector<VisualizerDataType>{
-                                           VisualizerDataType::SPECTRUM,
-                                           VisualizerDataType::BEAT,
-                                       }));
+    EXPECT_EQ(std::vector<VisualizerDataType>(state.visualizer->types.begin(),
+                                              state.visualizer->types.end()),
+              (std::vector<VisualizerDataType>{VisualizerDataType::SPECTRUM,
+                                               VisualizerDataType::BEAT}));
     EXPECT_EQ(state.visualizer->rate_max, 25);
     ASSERT_TRUE(state.visualizer->spectrum.has_value());
     EXPECT_EQ(state.visualizer->spectrum->n_disp_bins, 16);

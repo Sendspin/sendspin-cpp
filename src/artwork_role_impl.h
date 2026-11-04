@@ -381,6 +381,7 @@ struct ArtworkRole::Impl : RoleTeardown {
 
     // Struct fields
     ArtworkRoleConfig config;
+    /// Fixed at construction: client/state snapshots view it (ClientArtworkStateObject::channels).
     std::vector<ArtworkChannelFormatObject> artwork_channels;
     // Protocol task only (or the main loop in stop() once it is joined); see ArtworkTransfer.
     ArtworkTransfer transfer;

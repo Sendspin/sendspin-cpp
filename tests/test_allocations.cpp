@@ -35,6 +35,7 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <gtest/gtest.h>
+#include <ArduinoJson.h>
 
 #include <algorithm>
 #include <array>
@@ -424,6 +425,20 @@ void expect_library_allocations(const Window& window, const char* title, size_t 
     }
 }
 
+/// Checks that the `index`th client/state `server` received carries both configured artwork
+/// channels and the visualizer's loudness type, so the window just closed measured their build.
+/// Parsed after the window closes, outside the count.
+void expect_role_objects(const FakeEncryptedServer& server, size_t index) {
+    const std::vector<std::string> states = server.client_states();
+    ASSERT_GT(states.size(), index);
+    JsonDocument doc;
+    ASSERT_EQ(deserializeJson(doc, states[index]), DeserializationError::Ok);
+    EXPECT_EQ(doc["payload"]["artwork"]["channels"].size(), 2U);
+    EXPECT_STREQ(doc["payload"]["artwork"]["channels"][1]["source"], "artist");
+    EXPECT_EQ(doc["payload"]["visualizer"]["types"].size(), 1U);
+    EXPECT_STREQ(doc["payload"]["visualizer"]["types"][0], "loudness");
+}
+
 constexpr uint16_t ALLOCATION_TEST_PORT = 19300;
 constexpr int TIME_BURST_SIZE = 8;
 
@@ -431,9 +446,10 @@ constexpr size_t ADMISSION_ALLOCATIONS = 0;
 constexpr size_t CLIENT_STATE_ALLOCATIONS = 0;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;
 
-// One paired connection with a player, a controller and metadata: from the fake server's connect
-// through admission and the first client/state, then one client/state publish, then one full
-// burst of client/time and server/time exchanges.
+// One paired connection with a player, a controller, metadata, two artwork channels and a
+// visualizer, so the player, artwork and visualizer objects of client/state are built: from the
+// fake server's connect through admission and the first client/state, then one client/state
+// publish, then one full burst of client/time and server/time exchanges.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -455,6 +471,13 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_controller();
     client.add_metadata();
+    ArtworkRoleConfig artwork_config;
+    artwork_config.preferred_formats = {
+        {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 320},
+        {SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 64},
+    };
+    client.add_artwork(std::move(artwork_config));
+    client.add_visualizer(make_visualizer_config());
     ASSERT_TRUE(bundle.start());
 
     FakeEncryptedServerOptions options;
@@ -470,6 +493,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
                    [&] { return client.is_connected() && server->client_state_count() > 0; });
     expect_library_allocations(close_window(), "accept to admission and the first client/state",
                                ADMISSION_ALLOCATIONS);
+    expect_role_objects(*server, 0);
 
     pump_while_not(client, [&] { return client.is_time_synced(); });
 
@@ -478,6 +502,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     client.set_available(false);
     pump_while_not(client, [&] { return server->client_state_count() > states_before; });
     expect_library_allocations(close_window(), "client/state", CLIENT_STATE_ALLOCATIONS);
+    expect_role_objects(*server, static_cast<size_t>(states_before));
 
     // Opens just after the main loop reports a completed burst and closes once it reports the
     // next: one burst's sends, its replies and its completion. The next burst starts
