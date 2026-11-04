@@ -117,24 +117,23 @@ void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::CONTROLLER);
 }
 
-void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& state) const {
+void ControllerRole::Impl::handle_server_state(const ControllerStatePayload& state) const {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
-    this->event_state->slot.write(std::move(state), generation);
+    this->event_state->slot.write(ControllerStatePayload{state}, generation);
 }
 
 void ControllerRole::Impl::drain_events() {
-    ServerStateControllerObject state;
+    ControllerStatePayload state;
     bool have_state = false;
     const uint32_t generation = take_current_payload(*this, this->event_state->slot, state,
                                                      have_state, TAG, "controller state");
     if (!have_state || !this->accepts(generation)) {
         return;
     }
-    this->controller_state = std::move(state);
+    this->apply_state(state);
     uint32_t mask = 0;
-    for (const auto command : this->controller_state.supported_commands) {
-        mask |= command_bit(command);
-    }
+    state.supported_commands.for_each(
+        [&mask](SendspinControllerCommand command) { mask |= command_bit(command); });
     this->supported_commands.store(pack_supported_commands(generation, mask),
                                    std::memory_order_release);
     if (this->listener) {
@@ -154,11 +153,23 @@ void ControllerRole::Impl::cleanup() {
 }
 
 void ControllerRole::Impl::complete_teardown() {
-    this->controller_state = {};
+    this->apply_state(ControllerStatePayload{});
     this->supported_commands.store(0, std::memory_order_release);
     if (this->listener) {
         this->listener->on_controller_state_clear();
     }
+}
+
+void ControllerRole::Impl::apply_state(const ControllerStatePayload& state) {
+    ServerStateControllerObject& out = this->controller_state;
+    out.supported_commands.clear();
+    state.supported_commands.for_each(
+        [&out](SendspinControllerCommand command) { out.supported_commands.push_back(command); });
+    out.volume = state.volume;
+    out.muted = state.muted;
+    out.repeat = state.repeat;
+    out.shuffle = state.shuffle;
+    out.seek_max_ms = state.seek_max_ms;
 }
 
 }  // namespace sendspin

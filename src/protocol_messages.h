@@ -657,6 +657,26 @@ inline std::optional<SendspinRepeatMode> repeat_mode_from_string(std::string_vie
     return std::nullopt;
 }
 
+// Every controller command, SEEK_RELATIVE (the last) included, is a ControllerCommandSet member
+static_assert(static_cast<uint8_t>(SendspinControllerCommand::SEEK_RELATIVE) < 16,
+              "ControllerCommandSet needs 16 bits");
+
+using ControllerCommandSet = EnumSet<SendspinControllerCommand, 16>;
+
+/// @brief A parsed server/state controller object: ServerStateControllerObject with its
+/// supported_commands held as a set, which the main loop lists into the public object
+struct ControllerStatePayload {
+    ControllerCommandSet supported_commands{};
+    uint8_t volume{};
+    bool muted{};
+    SendspinRepeatMode repeat{SendspinRepeatMode::OFF};
+    bool shuffle{};
+    std::optional<uint32_t> seek_max_ms{};
+};
+
+static_assert(std::is_trivially_copyable_v<ControllerStatePayload>,
+              "parsed on the protocol task and carried to the main loop with nothing on the heap");
+
 // --- artwork_role.h ---
 
 inline const char* to_cstr(SendspinImageFormat format) {
@@ -818,6 +838,22 @@ inline std::optional<VisualizerSpectrumScale> visualizer_spectrum_scale_from_str
     }
     return std::nullopt;
 }
+
+// Every visualizer type, PEAK (the last) included, is an EnumSet<VisualizerDataType> member
+static_assert(static_cast<uint8_t>(VisualizerDataType::PEAK) < 8,
+              "EnumSet<VisualizerDataType> needs 8 bits");
+
+/// @brief A parsed stream/start visualizer object: ServerVisualizerStreamObject with its types
+/// held as a set, which the main loop lists into the public object
+struct VisualizerStreamPayload {
+    EnumSet<VisualizerDataType> types{};
+    uint16_t rate_max{};
+    bool tracks_downbeats{false};
+    std::optional<VisualizerSpectrumConfig> spectrum;
+};
+
+static_assert(std::is_trivially_copyable_v<VisualizerStreamPayload>,
+              "parsed on the protocol task and carried to the main loop with nothing on the heap");
 
 // --- source_role.h ---
 
@@ -1013,7 +1049,7 @@ struct GroupUpdateMessage {
 struct StreamStartMessage {
     std::optional<ServerPlayerStreamObject> player;
     std::optional<ServerArtworkStreamObject> artwork;
-    std::optional<ServerVisualizerStreamObject> visualizer;
+    std::optional<VisualizerStreamPayload> visualizer;
 };
 
 static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 8, "EnumSet<SendspinRole> needs 8 bits");
@@ -1134,8 +1170,7 @@ bool process_server_state_color(JsonObject root, ServerColorStateObject* color);
 
 /// @brief Parses the controller section of a server/state JSON message; true if the section was
 /// present and parsed
-bool process_server_state_controller(JsonObject root,
-                                     ServerStateControllerObject* controller_state);
+bool process_server_state_controller(JsonObject root, ControllerStatePayload* controller_state);
 
 /// @brief Parses the sections of a stream/start JSON message that `roles` names into the provided
 /// struct

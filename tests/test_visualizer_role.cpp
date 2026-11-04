@@ -370,13 +370,15 @@ TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
     EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
 }
 
-/// Counts on_visualizer_stream_start() calls.
+/// Counts on_visualizer_stream_start() calls and keeps a copy of the latest stream reported.
 class StreamStartCounter : public VisualizerRoleListener {
 public:
-    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*config*/) override {
+    void on_visualizer_stream_start(const ServerVisualizerStreamObject& stream) override {
         ++this->starts;
+        this->last = stream;
     }
     int starts{0};
+    ServerVisualizerStreamObject last;
 };
 
 // A STREAM_START applies only the config written with its own stamp: a config left in the slot by
@@ -398,15 +400,56 @@ TEST(VisualizerStreamEvents, AStreamStartAppliesOnlyTheConfigOfItsOwnGeneration)
         impl->listener = &listener;
         const uint32_t before = impl->cleanup_generation.load();
         impl->cleanup();
-        ServerVisualizerStreamObject config;
+        VisualizerStreamPayload config;
         config.types = {VisualizerDataType::BEAT};
         const uint32_t current = impl->cleanup_generation.load();
-        impl->event_state->config_slot.write(std::move(config), row.stale ? before : current);
+        impl->event_state->config_slot.write(VisualizerStreamPayload{config},
+                                             row.stale ? before : current);
 
         impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, current);
 
         EXPECT_EQ(listener.starts, row.expected_starts);
     }
+}
+
+// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object" makes the types a
+// subset of the requested ones, so the stream the listener hears lists each once, in enumerator
+// order, beside every other field the parsed stream carries; a later stream's list replaces the
+// one before it.
+TEST(VisualizerStreamEvents, AStartedStreamReportsEveryFieldOfItsConfig) {
+    auto impl = make_impl();
+    StreamStartCounter listener;
+    impl->listener = &listener;
+    const uint32_t generation = impl->cleanup_generation.load();
+    const auto start = [&impl, generation](const VisualizerStreamPayload& stream) {
+        impl->event_state->config_slot.write(VisualizerStreamPayload{stream}, generation);
+        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, generation);
+    };
+    const ServerVisualizerStreamObject& heard = listener.last;
+
+    const VisualizerSpectrumConfig spectrum{
+        .n_disp_bins = 16, .scale = VisualizerSpectrumScale::LOG, .f_min = 30, .f_max = 12000};
+    start({.types = {VisualizerDataType::PEAK, VisualizerDataType::SPECTRUM,
+                     VisualizerDataType::BEAT},
+           .rate_max = 24,
+           .tracks_downbeats = true,
+           .spectrum = spectrum});
+    EXPECT_EQ(heard.types, (std::vector{VisualizerDataType::BEAT, VisualizerDataType::SPECTRUM,
+                                        VisualizerDataType::PEAK}));
+    EXPECT_EQ(heard.rate_max, 24);
+    EXPECT_TRUE(heard.tracks_downbeats);
+    ASSERT_TRUE(heard.spectrum.has_value());
+    EXPECT_EQ(heard.spectrum->n_disp_bins, 16);
+    EXPECT_EQ(heard.spectrum->scale, VisualizerSpectrumScale::LOG);
+    EXPECT_EQ(heard.spectrum->f_min, 30);
+    EXPECT_EQ(heard.spectrum->f_max, 12000);
+
+    // A later stream replaces every field, the ones it leaves at their defaults included.
+    start({.types = {VisualizerDataType::LOUDNESS}});
+    EXPECT_EQ(heard.types, std::vector{VisualizerDataType::LOUDNESS});
+    EXPECT_EQ(heard.rate_max, 0);
+    EXPECT_FALSE(heard.tracks_downbeats);
+    EXPECT_FALSE(heard.spectrum.has_value());
 }
 
 // roles/visualizer/v1.md "Server -> Client: stream/start": a stream that names the spectrum type
@@ -438,12 +481,12 @@ TEST(VisualizerSpectrumWiring, TheSpectrumTypeWithNoSpectrumObjectDeliversNothin
         impl->config.stream.spectrum = VisualizerSpectrumConfig{
             .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
 
-        ServerVisualizerStreamObject stream;
+        VisualizerStreamPayload stream;
         stream.types = {VisualizerDataType::SPECTRUM};
         if (row.has_object) {
             stream.spectrum = impl->config.stream.spectrum;
         }
-        impl->handle_stream_start(std::move(stream));
+        impl->handle_stream_start(stream);
         take_in_ring_order(*impl->drain_task->inbound.ring());
 
         std::vector<uint16_t> bins;
@@ -459,9 +502,9 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
     auto impl = make_impl();
     impl->negotiated_types_mask = 0;
 
-    ServerVisualizerStreamObject stream;
+    VisualizerStreamPayload stream;
     stream.types = {VisualizerDataType::BEAT};
-    impl->handle_stream_start(std::move(stream));
+    impl->handle_stream_start(stream);
     take_in_ring_order(*impl->drain_task->inbound.ring());
 
     Entry entry;
@@ -514,7 +557,7 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
          {0x02}},
     };
 
-    ServerVisualizerStreamObject stream;
+    VisualizerStreamPayload stream;
     stream.types = {VisualizerDataType::LOUDNESS};
     auto loudness = [](uint8_t value) {
         std::vector<uint8_t> data;
@@ -536,7 +579,7 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
                     impl->handle_stream_end();
                     break;
                 case Step::START:
-                    impl->handle_stream_start(ServerVisualizerStreamObject{stream});
+                    impl->handle_stream_start(stream);
                     break;
                 case Step::CLEAR:
                     impl->handle_stream_clear();

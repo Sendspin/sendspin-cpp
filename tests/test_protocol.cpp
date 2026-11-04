@@ -850,7 +850,8 @@ TEST(Protocol, ServerHelloSourceSupportListsAcceptedCodecs) {
 // advertises SPECTRUM carries a valid spectrum config with a non-zero bin count, without which the
 // expected size of binary spectrum messages is indeterminate. Like any malformed section, a
 // visualizer object missing one rejects the whole message, so the valid player section beside it
-// does not start a stream.
+// does not start a stream. An unrecognized type string is skipped, and the types are a subset, so
+// a repeat is held once.
 TEST(Protocol, StreamStartRejectsAnIncompleteVisualizerSection) {
     struct Row {
         const char* name;
@@ -858,14 +859,19 @@ TEST(Protocol, StreamStartRejectsAnIncompleteVisualizerSection) {
         bool accepted;
         bool tracks_downbeats;
         uint8_t spectrum_bins;  // 0: no spectrum config
+        EnumSet<VisualizerDataType> types{};
     };
     const Row rows[] = {
         {"Control: SPECTRUM with a valid config",
          R"({"types":["spectrum"],"rate_max":30,)"
          R"("spectrum":{"n_disp_bins":32,"scale":"log","f_min":20,"f_max":20000}})",
-         true, false, 32},
+         true, false, 32, {VisualizerDataType::SPECTRUM}},
         {"Control: beat with tracks_downbeats",
-         R"({"types":["beat"],"rate_max":30,"tracks_downbeats":true})", true, true, 0},
+         R"({"types":["beat"],"rate_max":30,"tracks_downbeats":true})", true, true, 0,
+         {VisualizerDataType::BEAT}},
+        {"Control: an unrecognized type is skipped and a repeated one counted once",
+         R"({"types":["peak","bogus","loudness","peak"],"rate_max":30})", true, false, 0,
+         {VisualizerDataType::LOUDNESS, VisualizerDataType::PEAK}},
         {"no types", R"({"rate_max":30})", false, false, 0},
         {"types that is not an array", R"({"types":"loudness","rate_max":30})", false, false, 0},
         {"a types entry that is not a string", R"({"types":["loudness",42],"rate_max":30})", false,
@@ -903,6 +909,7 @@ TEST(Protocol, StreamStartRejectsAnIncompleteVisualizerSection) {
         ASSERT_EQ(msg.visualizer.has_value(), row.accepted);
         if (row.accepted) {
             EXPECT_EQ(msg.visualizer->rate_max, 30);
+            EXPECT_EQ(msg.visualizer->types, row.types);
             EXPECT_EQ(msg.visualizer->tracks_downbeats, row.tracks_downbeats);
             ASSERT_EQ(msg.visualizer->spectrum.has_value(), row.spectrum_bins != 0);
             if (row.spectrum_bins != 0) {
@@ -916,26 +923,27 @@ TEST(Protocol, StreamStartRejectsAnIncompleteVisualizerSection) {
 // fails the type check and the whole color is left without a value.
 // supported_commands is validated element-by-element. The controller role is frozen at v1, so an
 // unrecognized command is a non-compliant value that is dropped (and logged), while the valid
-// commands around it are kept in order.
+// commands around it are kept. roles/controller/v1.md "server/state controller object" makes them
+// a subset, so a repeated command is held once.
 TEST(Protocol, ControllerSupportedCommandsValidation) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
-                      R"({"supported_commands":["play","bogus","mute"]}}})",
+                      R"({"supported_commands":["mute","bogus","play","mute"]}}})",
                       doc, root));
-    ServerStateControllerObject controller;
+    ControllerStatePayload controller;
     ASSERT_TRUE(process_server_state_controller(root, &controller));
 
-    const auto& commands = controller.supported_commands;
-    ASSERT_EQ(commands.size(), 2u);  // "bogus" dropped
-    EXPECT_EQ(commands[0], SendspinControllerCommand::PLAY);
-    EXPECT_EQ(commands[1], SendspinControllerCommand::MUTE);
+    EXPECT_EQ(controller.supported_commands,
+              (ControllerCommandSet{SendspinControllerCommand::PLAY, SendspinControllerCommand::MUTE}))
+        << "\"bogus\" kept or a valid command dropped";
 }
 
 // A field the object omits goes back to its default, whatever the target struct held before, the
 // same way the metadata and color objects replace what they omit.
 TEST(Protocol, ControllerObjectReplacesEveryFieldItOmits) {
-    ServerStateControllerObject controller;
+    ControllerStatePayload controller;
+    controller.supported_commands = {SendspinControllerCommand::PAUSE};
     controller.volume = 50;
     controller.muted = true;
     controller.repeat = SendspinRepeatMode::ALL;
@@ -949,8 +957,7 @@ TEST(Protocol, ControllerObjectReplacesEveryFieldItOmits) {
                       doc, root));
     ASSERT_TRUE(process_server_state_controller(root, &controller));
 
-    ASSERT_EQ(controller.supported_commands.size(), 1u);
-    EXPECT_EQ(controller.supported_commands[0], SendspinControllerCommand::PLAY);
+    EXPECT_EQ(controller.supported_commands, ControllerCommandSet{SendspinControllerCommand::PLAY});
     EXPECT_EQ(controller.volume, 0);
     EXPECT_FALSE(controller.muted);
     EXPECT_EQ(controller.repeat, SendspinRepeatMode::OFF);
@@ -978,7 +985,7 @@ TEST(Protocol, ControllerSeekMaxIsParsedOnlyWhenServed) {
         ASSERT_TRUE(parse(std::string(R"({"type":"server/state","payload":{"controller":)") +
                               row.controller_json + "}}",
                           doc, root));
-        ServerStateControllerObject controller;
+        ControllerStatePayload controller;
         ASSERT_TRUE(process_server_state_controller(root, &controller));
         EXPECT_EQ(controller.seek_max_ms, row.expected);
     }

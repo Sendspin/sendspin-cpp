@@ -312,18 +312,15 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
 // Stream lifecycle (protocol task)
 // ============================================================================
 
-void VisualizerRole::Impl::handle_stream_start(ServerVisualizerStreamObject&& stream) {
+void VisualizerRole::Impl::handle_stream_start(const VisualizerStreamPayload& stream) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // Cache stream config for handle_binary (same thread) and the drain thread
     uint8_t bin_count = 0;
     uint8_t types_mask = 0;
-    bool has_spectrum = false;
-    for (auto type : stream.types) {
-        if (type == VisualizerDataType::SPECTRUM) {
-            has_spectrum = true;
-        }
+    const bool has_spectrum = stream.types.contains(VisualizerDataType::SPECTRUM);
+    stream.types.for_each([&types_mask](VisualizerDataType type) {
         types_mask |= 1U << (wire_type_for(type) - SENDSPIN_BINARY_VISUALIZER_FIRST);
-    }
+    });
     if (has_spectrum) {
         // roles/visualizer/v1.md "Server -> Client: stream/start": the spectrum object is sent
         // "only if `types` includes 'spectrum'" and MUST match the requested configuration. The
@@ -365,7 +362,7 @@ void VisualizerRole::Impl::handle_stream_start(ServerVisualizerStreamObject&& st
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
     // guaranteed to observe this config (see config_slot.take() in handle_stream_ring_event()).
     // Both carry `generation`, so a config left over from a torn-down stream is never applied.
-    this->event_state->config_slot.write(std::move(stream), generation);
+    this->event_state->config_slot.write(VisualizerStreamPayload{stream}, generation);
     this->enqueue_stream_event(VisualizerEventType::STREAM_START, generation);
 }
 
@@ -406,10 +403,10 @@ void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event,
 // ============================================================================
 
 void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event,
-                                                    uint32_t generation) const {
+                                                    uint32_t generation) {
     switch (event) {
         case VisualizerEventType::STREAM_START: {
-            ServerVisualizerStreamObject config{};
+            VisualizerStreamPayload config{};
             uint32_t stamp = 0;
             if (!this->event_state->config_slot.take(config, stamp)) {
                 break;
@@ -418,8 +415,14 @@ void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event,
                 SS_LOGD(TAG, "Dropping a visualizer config queued before the role was torn down");
                 break;
             }
+            ServerVisualizerStreamObject& out = this->stream_object;
+            out.types.clear();
+            config.types.for_each([&out](VisualizerDataType type) { out.types.push_back(type); });
+            out.rate_max = config.rate_max;
+            out.tracks_downbeats = config.tracks_downbeats;
+            out.spectrum = config.spectrum;
             if (this->listener) {
-                this->listener->on_visualizer_stream_start(config);
+                this->listener->on_visualizer_stream_start(out);
             }
             break;
         }
