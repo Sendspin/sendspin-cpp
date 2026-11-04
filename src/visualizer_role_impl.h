@@ -19,6 +19,7 @@
 
 #include "inbound_ring.h"
 #include "inbox.h"
+#include "protocol_messages.h"
 #include "sendspin/visualizer_role.h"
 #include "teardown_tracker.h"
 
@@ -106,7 +107,7 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// @brief Deferred event state for the visualizer stream config, delivered to the main thread
     /// via the shared Inbox
     struct EventState {
-        GenerationSlot<ServerVisualizerStreamObject> config_slot;
+        GenerationSlot<VisualizerStreamPayload> config_slot;
     };
 
     // ========================================
@@ -133,16 +134,16 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted frame; `data` points at its message type byte.
     void handle_binary(uint8_t binary_type, InboundMessage& message);
-    void handle_stream_start(ServerVisualizerStreamObject&& stream);
+    void handle_stream_start(const VisualizerStreamPayload& stream);
     void handle_stream_end();
     void handle_stream_clear();
     /// @brief Fires the listener callback for a current stream event. Main loop.
     /// @param generation The event's stamp: a STREAM_START applies only the config written with
-    ///        the same stamp.
-    void handle_stream_ring_event(VisualizerEventType event, uint32_t generation) const;
+    ///        the same stamp, filled into stream_object before the listener hears it.
+    void handle_stream_ring_event(VisualizerEventType event, uint32_t generation);
     /// @brief The main-loop teardown half: delivers the stream end the teardown owes the
-    /// listener (on_visualizer_stream_end()). The visualizer keeps no other main-loop state: its
-    /// stream events carry everything the listener hears. Main loop only, through
+    /// listener (on_visualizer_stream_end()). Its only other main-loop state, stream_object, is
+    /// refilled by each STREAM_START, so teardown leaves it. Main loop only, through
     /// catch_up_teardown().
     void complete_teardown() const;
 
@@ -185,6 +186,10 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// (ClientVisualizerStateObject::types).
     VisualizerRoleConfig config;
     VisualizerSupportObject visualizer_support;
+    /// The stream on_visualizer_stream_start() reports, filled in place from each applied config
+    /// into the types capacity the constructor reserves for every type, so a fill never
+    /// allocates. Main loop.
+    ServerVisualizerStreamObject stream_object{};
 
     // Pointer fields
     SendspinClient* client;

@@ -18,6 +18,7 @@
 #pragma once
 
 #include "inbox.h"
+#include "protocol_messages.h"
 #include "sendspin/controller_role.h"
 #include "teardown_tracker.h"
 
@@ -40,9 +41,9 @@ struct ControllerRole::Impl : RoleTeardown {
 
     struct EventState {
         // Latest-wins only, unlike metadata and color: messaging.md "server/state" scopes a
-        // deferred timestamp to those two objects, so ServerStateControllerObject carries none and
-        // this role needs neither their PendingXStates pair nor their held_state deadline poll.
-        GenerationSlot<ServerStateControllerObject> slot;
+        // deferred timestamp to those two objects, so ControllerStatePayload carries none and this
+        // role needs neither their PendingXStates pair nor their held_state deadline poll.
+        GenerationSlot<ControllerStatePayload> slot;
     };
 
     // ========================================
@@ -51,7 +52,7 @@ struct ControllerRole::Impl : RoleTeardown {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerStateControllerObject&& state) const;
+    void handle_server_state(const ControllerStatePayload& state) const;
     // True if a controller-state delta is waiting in the inbox slot.
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & INBOX_TOPIC_CONTROLLER) != 0;
@@ -74,6 +75,10 @@ struct ControllerRole::Impl : RoleTeardown {
     /// on_controller_state_clear(). Main loop only, through catch_up_teardown().
     void complete_teardown();
 
+    /// @brief Fills controller_state from `state` in place, its supported_commands listed in
+    /// enumerator order into the list's kept capacity. Main loop.
+    void apply_state(const ControllerStatePayload& state);
+
     // ========================================
     // Consumer-facing method implementations
     // ========================================
@@ -85,6 +90,8 @@ struct ControllerRole::Impl : RoleTeardown {
     // ========================================
 
     // Struct fields
+    /// Filled in place (apply_state()) into the supported_commands capacity the constructor
+    /// reserves for every command, so a fill never allocates.
     ServerStateControllerObject controller_state{};
 
     // Pointer fields
@@ -94,7 +101,7 @@ struct ControllerRole::Impl : RoleTeardown {
     ControllerRoleListener* listener{nullptr};
 
     // 32-bit fields
-    /// @brief The commands of the applied controller_state.supported_commands, one bit each (see
+    /// @brief The commands of the applied state's supported_commands, one bit each (see
     /// command_bit()) in the low half, stamped in the high half with the low 16 bits of the
     /// teardown generation the state was admitted under (see pack_supported_commands()).
     /// send_command() treats a stamp other than the current generation's as no commands, so a
