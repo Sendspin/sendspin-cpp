@@ -1076,8 +1076,7 @@ void SendspinClient::drain_inbox() {
                 this->listener_->on_group_update(group_delta);
             }
 
-            // group_name is cut to MAX_FRIENDLY_NAME_BYTES at parse; group_id is not, so its log is
-            // cut.
+            // group_name is cut to MAX_FRIENDLY_NAME_BYTES at parse, group_id only here.
             const std::string_view id =
                 peer_text_for_log(this->group_state_.group_id.has_value()
                                       ? std::string_view(*this->group_state_.group_id)
