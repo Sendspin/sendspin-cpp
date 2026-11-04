@@ -91,12 +91,24 @@ enum class PairingPrompt : uint8_t {
 struct PairingNote {
     PairingNoteType type{};
     /// server_id for PAIRING_STARTED/SUCCEEDED/FAILED; the emitted code for
-    /// DISPLAY_PAIRING_CODE; empty otherwise.
-    std::string text{};
+    /// DISPLAY_PAIRING_CODE; empty otherwise. The drain builds the listener's std::string.
+    IdText text{};
     SendspinPairAbortReason reason{};  ///< Valid only for PAIRING_FAILED.
     /// Emission format of `text`; valid only for DISPLAY_PAIRING_CODE.
     SendspinPairingCodeFormat format{};
 };
+
+static_assert(PAIRING_CODE_TOKEN_LENGTH <= PEER_ID_SIZE &&
+                  static_cast<size_t>(DYNAMIC_PAIRING_CODE_DIGITS) <= PEER_ID_SIZE,
+              "every emitted pairing code fits PairingNote::text");
+
+/// @brief Builds a note carrying `text`, a server_id or an emitted pairing code
+PairingNote make_text_note(PairingNoteType type, std::string_view text) {
+    PairingNote note{.type = type};
+    // A server_id is PEER_ID_SIZE characters, and every emitted code fits (static_assert above).
+    (void)note.text.assign(text);
+    return note;
+}
 
 /// @brief Returns the prompt `type` shows or dismisses, or PairingPrompt::NONE
 constexpr PairingPrompt prompt_of(PairingNoteType type) {
@@ -205,10 +217,10 @@ struct SendspinClient::EventState {
     /// through this so the append lives once. PairingNote is anonymous-namespace-private to this
     /// file, so this lives on EventState (itself private to SendspinClient) rather than as a
     /// SendspinClient member declared in the public header.
-    /// @param note The note to append (moved).
-    void push_pairing_note(PairingNote&& note) {
+    /// @param note The note to append.
+    void push_pairing_note(const PairingNote& note) {
         this->pairing_slot.update(
-            [&note](std::vector<PairingNote>& current) { current.push_back(std::move(note)); });
+            [&note](std::vector<PairingNote>& current) { current.push_back(note); });
     }
 };
 
@@ -988,16 +1000,18 @@ void SendspinClient::drain_inbox() {
                 }
                 switch (note.type) {
                     case PairingNoteType::PAIRING_STARTED:
-                        this->listener_->on_pairing_started(note.text);
+                        this->listener_->on_pairing_started(std::string(note.text.view()));
                         break;
                     case PairingNoteType::PAIRING_SUCCEEDED:
-                        this->listener_->on_pairing_succeeded(note.text);
+                        this->listener_->on_pairing_succeeded(std::string(note.text.view()));
                         break;
                     case PairingNoteType::PAIRING_FAILED:
-                        this->listener_->on_pairing_failed(note.text, note.reason);
+                        this->listener_->on_pairing_failed(std::string(note.text.view()),
+                                                           note.reason);
                         break;
                     case PairingNoteType::DISPLAY_PAIRING_CODE:
-                        this->listener_->on_display_pairing_code(note.text, note.format);
+                        this->listener_->on_display_pairing_code(std::string(note.text.view()),
+                                                                 note.format);
                         break;
                     case PairingNoteType::CLEAR_PAIRING_CODE:
                         this->listener_->on_clear_pairing_code();
@@ -1734,25 +1748,26 @@ void SendspinClient::on_activation_applied([[maybe_unused]] SendspinConnection* 
 
 void SendspinClient::note_pairing_started(std::string_view server_id) {
     this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::PAIRING_STARTED, .text = std::string(server_id)});
+        make_text_note(PairingNoteType::PAIRING_STARTED, server_id));
 }
 
 void SendspinClient::note_pairing_succeeded(std::string_view server_id) {
     this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::PAIRING_SUCCEEDED, .text = std::string(server_id)});
+        make_text_note(PairingNoteType::PAIRING_SUCCEEDED, server_id));
 }
 
 void SendspinClient::note_pairing_failed(std::string_view server_id,
                                          SendspinPairAbortReason reason) {
-    this->event_state_->push_pairing_note({.type = PairingNoteType::PAIRING_FAILED,
-                                           .text = std::string(server_id),
-                                           .reason = reason});
+    PairingNote note = make_text_note(PairingNoteType::PAIRING_FAILED, server_id);
+    note.reason = reason;
+    this->event_state_->push_pairing_note(note);
 }
 
-void SendspinClient::note_display_pairing_code(const std::string& code,
+void SendspinClient::note_display_pairing_code(std::string_view code,
                                                SendspinPairingCodeFormat format) {
-    this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::DISPLAY_PAIRING_CODE, .text = code, .format = format});
+    PairingNote note = make_text_note(PairingNoteType::DISPLAY_PAIRING_CODE, code);
+    note.format = format;
+    this->event_state_->push_pairing_note(note);
 }
 
 void SendspinClient::note_clear_pairing_code() {

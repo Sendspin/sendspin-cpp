@@ -1106,6 +1106,10 @@ TEST_F(PairingStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyWithdrawnC
         << "on_clear_pairing_code must not fire twice for one pairing attempt";
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
+    // The failure names the server whose attempt it was.
+    const std::string server_id(this->injected_conn_->get_server_id().view());
+    ASSERT_FALSE(server_id.empty());
+    EXPECT_EQ(this->listener_.last_failed_server_id(), server_id);
 }
 
 // ============================================================================

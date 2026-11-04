@@ -497,18 +497,21 @@ bool RecordStore::note_record_played(std::string_view psk_id) {
 // Pairing outcome
 // ============================================================================
 
-RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(std::string_view server_id) {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-
-    SendspinPairingRecord record;
-    record.psk_id = psk_id_for(psk);
-    record.psk = psk;
-    record.server_id = server_id;
-
+std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
+    std::string_view server_id) {
+    // Minted straight into the outcome, which wipes its PSK however this returns.
     PairingOutcome outcome;
-    outcome.psk = psk;
-    outcome.record = std::move(record);
+    platform_random_bytes(outcome.psk.data(), outcome.psk.size());
+
+    // The fallible overload: a pairing that cannot hash its PSK fails, where the std::array one
+    // would abort.
+    std::optional<std::string> psk_id = psk_id_for(outcome.psk.data(), outcome.psk.size());
+    if (!psk_id.has_value()) {
+        return std::nullopt;
+    }
+    outcome.record.psk_id = std::move(*psk_id);
+    outcome.record.psk = outcome.psk;
+    outcome.record.server_id = server_id;
     return outcome;
 }
 

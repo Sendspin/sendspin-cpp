@@ -86,6 +86,15 @@ static std::optional<bool> read_bool_field(JsonVariantConst var, const char* nam
     return var.as<bool>();
 }
 
+/// @brief Writes `bytes` base64url-encoded (no padding) into `field`, which copies it, through a
+/// stack buffer wiped afterwards, so a pairing secret leaves no copy outside the document.
+template <typename Field, size_t N>
+static void write_b64url(Field field, const std::array<uint8_t, N>& bytes) {
+    std::array<char, b64url_encode_buffer_size(N)> text{};
+    field = b64url_encode_into(text.data(), text.size(), bytes.data(), bytes.size());
+    secure_zero(text.data(), text.size());
+}
+
 /// @brief Reads a friendly name: messaging.md "server/hello" and "group/update" cap one at
 /// MAX_FRIENDLY_NAME_BYTES, and a longer one is truncated at a UTF-8 character boundary (logged),
 /// never rejected. `var` must hold a string.
@@ -1196,15 +1205,11 @@ void build_client_command_message(const ClientCommandControllerObject& cmd, Json
 void build_client_pair_finalize_message(const std::array<uint8_t, 32>& psk, JsonDocument& doc) {
     // The document holds the base64 long-term PSK, which admits a server permanently; the arena
     // wipes every block it frees, and the text send_json() serializes is encrypted over in place
-    // or wiped (NoiseTransport::send_staged_json()). The encoded copy made on the way is wiped
-    // here.
+    // or wiped (NoiseTransport::send_staged_json()).
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
-    // Encode the 32-byte PSK as 43-char base64url (no padding).
-    std::string psk_b64 = b64url_encode(psk.data(), psk.size());
-    root["payload"]["long_term_psk"] = psk_b64;
-    secure_zero(psk_b64.data(), psk_b64.size());
+    write_b64url(root["payload"]["long_term_psk"], psk);
 }
 
 void build_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
@@ -1215,9 +1220,7 @@ void build_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& w
     root["type"] = "client/pair-finalize";
     // Pairing-code flows only (pairing.md "Wrapping"); exactly one of long_term_psk/wrapped_psk
     // is present per message.
-    std::string wrapped_b64 = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
-    root["payload"]["wrapped_psk"] = wrapped_b64;
-    secure_zero(wrapped_b64.data(), wrapped_b64.size());
+    write_b64url(root["payload"]["wrapped_psk"], wrapped_psk);
 }
 
 void build_pair_abort_message(PairAbortReason reason, JsonDocument& doc) {
@@ -1325,7 +1328,7 @@ void build_client_pair_init_message(const std::array<uint8_t, 32>& commit_b, uin
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
-    root["payload"]["commit_B"] = b64url_encode(commit_b.data(), commit_b.size());
+    write_b64url(root["payload"]["commit_B"], commit_b);
     root["payload"]["pairing_index"] = pairing_index;
 }
 
@@ -1351,7 +1354,7 @@ void build_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2, J
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-auth";
-    root["payload"]["pake_msg_2"] = b64url_encode(pake_msg_2.data(), pake_msg_2.size());
+    write_b64url(root["payload"]["pake_msg_2"], pake_msg_2);
 }
 
 void build_client_pair_confirm_message(
@@ -1360,12 +1363,11 @@ void build_client_pair_confirm_message(
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";
-    root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
+    write_b64url(root["payload"]["client_kc"], client_kc);
     // The commitment opening crosses the wire sealed under the CPace output, never in the clear
     // (pairing.md "Wrapping"): an observer that cannot complete the PAKE cannot reconstruct the
     // pairing code from the handshake it watched.
-    root["payload"]["wrapped_nonce_B"] =
-        b64url_encode(wrapped_nonce_b.data(), wrapped_nonce_b.size());
+    write_b64url(root["payload"]["wrapped_nonce_B"], wrapped_nonce_b);
 }
 
 void build_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
@@ -1374,7 +1376,7 @@ void build_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
 
     root["type"] = "client/pair-confirm";
     // The static flow sends no commit_B, so it has no opening to wrap.
-    root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
+    write_b64url(root["payload"]["client_kc"], client_kc);
 }
 
 }  // namespace sendspin

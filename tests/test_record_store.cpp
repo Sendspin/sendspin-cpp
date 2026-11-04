@@ -240,11 +240,11 @@ TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
     RecordStore store(nullptr);
     const std::string server_id = test_peer_id("server-repair");
 
-    auto outcome1 = store.resolve_pairing_outcome(server_id);
+    auto outcome1 = store.resolve_pairing_outcome(server_id).value();
     ASSERT_TRUE(store.store_record_superseding(outcome1.record, {}));
     const std::string first_psk_id = outcome1.record.psk_id;
 
-    auto outcome2 = store.resolve_pairing_outcome(server_id);
+    auto outcome2 = store.resolve_pairing_outcome(server_id).value();
     ASSERT_TRUE(store.store_record_superseding(outcome2.record, {}));
     const std::string second_psk_id = outcome2.record.psk_id;
 
@@ -355,12 +355,13 @@ TEST(RecordStore, StoreRecordReplacesTheRecordHoldingTheSamePskId) {
 TEST(RecordStore, CapacityEvictsRatherThanRefusingANewPairing) {
     RecordStore store(nullptr);
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
+        auto outcome =
+            store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i))).value();
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
     ASSERT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS);
 
-    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
+    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow")).value();
     EXPECT_TRUE(store.store_record_superseding(overflow.record, {}))
         << "a pairing never fails for lack of record storage";
     EXPECT_NE(store.record_by_server_id(test_peer_id("server-overflow")), nullptr);
@@ -413,7 +414,7 @@ TEST(RecordStore, RecencyReorderWritesOnlyTheOrderKey) {
     // Control: the reorder still happened. A and B were the two oldest records when the
     // alternation began, so without the rotate A would be the victim here; with it, the oldest
     // filler is.
-    auto outcome = store.resolve_pairing_outcome(test_peer_id("server-new"));
+    auto outcome = store.resolve_pairing_outcome(test_peer_id("server-new")).value();
     ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     EXPECT_FALSE(store.resolve_by_psk_id(filler_psk_ids.front(), PskCategory::LONG_TERM).has_value())
         << "the RAM-only order must still drive eviction";
@@ -455,7 +456,7 @@ TEST(RecordStore, BootRestoresTheRecencyOrderFromTheOrderKey) {
         provider.seed_blob(persistence_keys::RECORD_ORDER, row.order);
 
         RecordStore store(&provider, {.max_pairing_records = RecordStore::MIN_MAX_RECORDS});
-        auto overflow = store.resolve_pairing_outcome(test_peer_id("server-new"));
+        auto overflow = store.resolve_pairing_outcome(test_peer_id("server-new")).value();
         ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
 
         for (size_t i = 0; i < seeded.size(); ++i) {
@@ -489,7 +490,7 @@ TEST(RecordStore, EvictionAfterARebootFollowsThePersistedUseOrder) {
     }
 
     RecordStore rebooted(&provider, {.max_pairing_records = RecordStore::MIN_MAX_RECORDS});
-    auto overflow = rebooted.resolve_pairing_outcome(test_peer_id("server-new"));
+    auto overflow = rebooted.resolve_pairing_outcome(test_peer_id("server-new")).value();
     ASSERT_TRUE(rebooted.store_record_superseding(overflow.record, {}));
 
     EXPECT_FALSE(rebooted.resolve_by_psk_id(psk_ids.back(), PskCategory::LONG_TERM).has_value())
@@ -559,7 +560,7 @@ TEST(RecordStore, EveryRecordWriteHasItsKeysFixedSize) {
     RecordStore store(&provider);
     const size_t order_size = RecordStore::DEFAULT_MAX_RECORDS;
 
-    auto outcome = store.resolve_pairing_outcome(test_peer_id("server-sized"));
+    auto outcome = store.resolve_pairing_outcome(test_peer_id("server-sized")).value();
     ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     ASSERT_TRUE(store.persist_records());
 
@@ -588,7 +589,7 @@ TEST(RecordStore, ASupersedeReusesTheSlotItsRetireFreed) {
     RecordStore store(&provider);
 
     auto pair_with = [&store](const std::string& server_id) {
-        auto outcome = store.resolve_pairing_outcome(test_peer_id(server_id));
+        auto outcome = store.resolve_pairing_outcome(test_peer_id(server_id)).value();
         EXPECT_TRUE(store.store_record_superseding(outcome.record, {}));
         EXPECT_TRUE(store.persist_records());
         return outcome.record.psk_id;
@@ -670,7 +671,7 @@ TEST(RecordStore, ARejectedWriteWarnsOnlyWhenTheNextBootCannotRebuildIt) {
         // Control: a write the next boot cannot reconstruct says so.
         {"pairing",
          [](RecordStore& store, const std::vector<SendspinPairingRecord>&) {
-             auto outcome = store.resolve_pairing_outcome(test_peer_id("server-paired"));
+             auto outcome = store.resolve_pairing_outcome(test_peer_id("server-paired")).value();
              ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
              EXPECT_FALSE(store.persist_records());
          },
@@ -754,7 +755,7 @@ TEST(RecordStore, EvictionFollowsPlaybackRecency) {
         std::vector<std::string> psk_ids;
         for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
             auto outcome =
-                store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
+                store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i))).value();
             psk_ids.push_back(outcome.record.psk_id);
             ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
         }
@@ -764,7 +765,7 @@ TEST(RecordStore, EvictionFollowsPlaybackRecency) {
             (void) store.note_record_played(psk_ids.front());
         }
 
-        auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
+        auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow")).value();
         ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
 
         EXPECT_EQ(store.record_by_server_id(test_peer_id("server-0")) != nullptr,
@@ -780,12 +781,13 @@ TEST(RecordStore, EvictionFollowsPlaybackRecency) {
 TEST(RecordStore, ANewRecordIsNotTheNextVictim) {
     RecordStore store(nullptr, {.max_pairing_records = RecordStore::MIN_MAX_RECORDS});
     for (size_t i = 0; i < RecordStore::MIN_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
+        auto outcome =
+            store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i))).value();
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
-    auto first_new = store.resolve_pairing_outcome(test_peer_id("server-new-1"));
+    auto first_new = store.resolve_pairing_outcome(test_peer_id("server-new-1")).value();
     ASSERT_TRUE(store.store_record_superseding(first_new.record, {}));
-    auto second_new = store.resolve_pairing_outcome(test_peer_id("server-new-2"));
+    auto second_new = store.resolve_pairing_outcome(test_peer_id("server-new-2")).value();
     ASSERT_TRUE(store.store_record_superseding(second_new.record, {}));
 
     EXPECT_NE(store.record_by_server_id(test_peer_id("server-new-1")), nullptr)
@@ -801,12 +803,13 @@ TEST(RecordStore, EvictionSkipsRecordsBackingOpenConnections) {
     RecordStore store(nullptr);
     std::vector<std::string> psk_ids;
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
+        auto outcome =
+            store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i))).value();
         psk_ids.push_back(outcome.record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
 
-    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
+    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow")).value();
     ASSERT_TRUE(store.store_record_superseding(overflow.record, {psk_ids.front()}));
 
     EXPECT_NE(store.record_by_server_id(test_peer_id("server-0")), nullptr)
@@ -822,12 +825,13 @@ TEST(RecordStore, NothingEvictableRejectsTheRecord) {
     RecordStore store(nullptr);
     std::vector<std::string> psk_ids;
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
+        auto outcome =
+            store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i))).value();
         psk_ids.push_back(outcome.record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
 
-    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
+    auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow")).value();
     EXPECT_FALSE(store.store_record_superseding(overflow.record, psk_ids));
     EXPECT_EQ(store.record_by_server_id(test_peer_id("server-overflow")), nullptr);
     EXPECT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS);
@@ -839,14 +843,15 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
     RecordStore store(nullptr);
     const std::string existing_server = test_peer_id("server-existing");
 
-    auto outcome0 = store.resolve_pairing_outcome(existing_server);
+    auto outcome0 = store.resolve_pairing_outcome(existing_server).value();
     ASSERT_TRUE(store.store_record_superseding(outcome0.record, {}));
     const std::string first_psk_id = outcome0.record.psk_id;
 
     // Fill every remaining slot with other servers' records.
     std::vector<std::string> other_psk_ids;
     for (size_t i = 1; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
+        auto outcome =
+            store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i))).value();
         other_psk_ids.push_back(outcome.record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
@@ -855,7 +860,7 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
     // record is the eviction victim and an eviction is indistinguishable from the supersede.
     (void) store.note_record_played(first_psk_id);
 
-    auto outcome1 = store.resolve_pairing_outcome(existing_server);
+    auto outcome1 = store.resolve_pairing_outcome(existing_server).value();
     EXPECT_TRUE(store.store_record_superseding(outcome1.record, {}));
 
     // Every claim below is what a handshake sees: which psk_ids still authenticate, and as whom.
@@ -899,7 +904,8 @@ TEST(RecordStore, ConfiguredCapacityIsHonouredAboveTheProtocolFloor) {
 
         std::vector<std::string> psk_ids;
         for (size_t i = 0; i < row.effective; ++i) {
-            auto outcome = store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i)));
+            auto outcome =
+                store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i))).value();
             psk_ids.push_back(outcome.record.psk_id);
             ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
         }
@@ -913,7 +919,7 @@ TEST(RecordStore, ConfiguredCapacityIsHonouredAboveTheProtocolFloor) {
         EXPECT_EQ(stored_record_in_slot(provider, row.effective - 1)->psk_id, psk_ids.back())
             << "the last record stored must be the one in the highest slot";
 
-        auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow"));
+        auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow")).value();
         ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
         ASSERT_TRUE(store.persist_records());
         EXPECT_FALSE(store.resolve_by_psk_id(psk_ids.front(), PskCategory::LONG_TERM).has_value())
@@ -1601,7 +1607,7 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
     RecordStore store(nullptr);
 
     const std::string server_id = test_peer_id("server-pair-test");
-    auto outcome = store.resolve_pairing_outcome(server_id);
+    auto outcome = store.resolve_pairing_outcome(server_id).value();
 
     // PSK must be non-zero (randomly generated).
     bool all_zero = true;
@@ -1630,7 +1636,7 @@ TEST(RecordStore, ResolvePairingOutcomeMintsOnAFullStore) {
             store.store_record_superseding(make_client_record("server-" + std::to_string(i)), {}));
     }
 
-    auto outcome = store.resolve_pairing_outcome(test_peer_id("server-new"));
+    auto outcome = store.resolve_pairing_outcome(test_peer_id("server-new")).value();
 
     EXPECT_EQ(outcome.record.server_id, test_peer_id("server-new"));
     EXPECT_EQ(outcome.record.psk_id, psk_id_for(outcome.psk));
@@ -1644,7 +1650,7 @@ TEST(RecordStore, ResolvePairingOutcomeThenStore) {
     RecordStore store(nullptr);
 
     const std::string server_id = test_peer_id("server-store-after");
-    auto outcome = store.resolve_pairing_outcome(server_id);
+    auto outcome = store.resolve_pairing_outcome(server_id).value();
 
     // Simulate the ack path: store the pending record.
     store.store_record_superseding(outcome.record, {});
