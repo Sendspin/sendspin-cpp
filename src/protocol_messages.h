@@ -1185,8 +1185,13 @@ bool process_server_state_color(JsonObject root, ServerColorStateObject* color);
 bool process_server_state_controller(JsonObject root,
                                      ServerStateControllerObject* controller_state);
 
-/// @brief Parses a stream/start JSON message into the provided struct
-bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg);
+/// @brief Parses the sections of a stream/start JSON message that `roles` names into the provided
+/// struct
+/// @param roles The roles whose sections are parsed; any other section is skipped unvalidated.
+/// @return false (logged, every section reset) when a parsed section is malformed, which rejects
+/// the message.
+bool process_stream_start_message(JsonObject root, EnumSet<SendspinRole> roles,
+                                  StreamStartMessage* stream_msg);
 
 /// @brief Parses a stream/end JSON message into the provided struct
 /// @return false (logged) when `roles` is present but not an array, which rejects the message.

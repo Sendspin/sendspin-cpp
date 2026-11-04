@@ -54,6 +54,10 @@ bool parse(const std::string& json, JsonDocument& doc, JsonObject& root) {
     return true;
 }
 
+// Every stream/start section, as a connection that owns all three stream roles takes them.
+const EnumSet<SendspinRole> STREAM_START_ROLES{SendspinRole::PLAYER, SendspinRole::ARTWORK,
+                                               SendspinRole::VISUALIZER};
+
 }  // namespace
 
 // ============================================================================
@@ -494,7 +498,7 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
                       R"("sample_rate":44100,"channels":300,"bit_depth":16}}}})",
                       doc, root));
     StreamStartMessage msg;
-    EXPECT_FALSE(process_stream_start_message(root, &msg));
+    EXPECT_FALSE(process_stream_start_message(root, STREAM_START_ROLES, &msg));
     // The rejected section is reset, so the codec, sample rate and bit depth that did parse do
     // not survive into the caller's message beside the dropped channel count.
     EXPECT_FALSE(msg.player.has_value());
@@ -506,7 +510,7 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
                       R"("sample_rate":44100,"channels":2,"bit_depth":16}}}})",
                       doc_ok, root_ok));
     StreamStartMessage ok;
-    EXPECT_TRUE(process_stream_start_message(root_ok, &ok));
+    EXPECT_TRUE(process_stream_start_message(root_ok, STREAM_START_ROLES, &ok));
     ASSERT_TRUE(ok.player.has_value());
     ASSERT_TRUE(ok.player->channels.has_value());
     EXPECT_EQ(ok.player->channels.value(), 2);
@@ -524,7 +528,7 @@ TEST(Protocol, StreamStartWithAMalformedPlayerDropsAValidArtworkSection) {
                       R"("width":100,"height":100}]}}})",
                       doc, root));
     StreamStartMessage msg;
-    EXPECT_FALSE(process_stream_start_message(root, &msg));
+    EXPECT_FALSE(process_stream_start_message(root, STREAM_START_ROLES, &msg));
     EXPECT_FALSE(msg.player.has_value());
     EXPECT_FALSE(msg.artwork.has_value())
         << "the artwork section survived a message the parser rejected";
@@ -536,10 +540,43 @@ TEST(Protocol, StreamStartWithAMalformedPlayerDropsAValidArtworkSection) {
                       R"([{"source":"album","format":"jpeg","width":100,"height":100}]}}})",
                       doc_ok, root_ok));
     StreamStartMessage ok;
-    EXPECT_TRUE(process_stream_start_message(root_ok, &ok));
+    EXPECT_TRUE(process_stream_start_message(root_ok, STREAM_START_ROLES, &ok));
     ASSERT_TRUE(ok.artwork.has_value());
     ASSERT_TRUE(ok.artwork->channels.has_value());
     EXPECT_EQ(ok.artwork->channels->size(), 1u);
+}
+
+// As with server/state, only the sections of the roles the parser is given are parsed, so a section
+// no role takes is not validated either: the malformed player section that rejects the message for
+// a connection owning the player is skipped for one owning only artwork.
+TEST(Protocol, StreamStartParsesOnlyTheTakenSections) {
+    struct Row {
+        const char* name;
+        EnumSet<SendspinRole> roles;
+        bool accepted;
+        bool has_artwork;
+    };
+    const Row rows[] = {
+        {"Control: the player section is taken, so its malformed channels reject the message",
+         STREAM_START_ROLES, false, false},
+        {"the player section is skipped and the artwork section taken",
+         EnumSet<SendspinRole>{SendspinRole::ARTWORK}, true, true},
+        {"no section is taken", EnumSet<SendspinRole>{}, true, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":{"codec":"pcm",)"
+                          R"("sample_rate":44100,"channels":300,"bit_depth":16},)"
+                          R"("artwork":{"channels":[{"source":"album","format":"jpeg",)"
+                          R"("width":100,"height":100}]}}})",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_EQ(process_stream_start_message(root, row.roles, &msg), row.accepted);
+        EXPECT_FALSE(msg.player.has_value());
+        EXPECT_EQ(msg.artwork.has_value(), row.has_artwork);
+    }
 }
 
 // Spec "stream/start artwork object": format, width and height are required unless source is
@@ -565,7 +602,8 @@ TEST(Protocol, StreamStartArtworkFieldsRequiredUnlessSourceNone) {
                            c.channels + "}}}";
         ASSERT_TRUE(parse(json.c_str(), doc, root));
         StreamStartMessage msg;
-        EXPECT_EQ(process_stream_start_message(root, &msg), c.accepted) << c.channels;
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), c.accepted)
+            << c.channels;
         EXPECT_EQ(msg.artwork.has_value(), c.accepted) << c.channels;
         if (c.accepted) {
             ASSERT_EQ(msg.artwork->channels->size(), 2u);
@@ -594,11 +632,42 @@ TEST(Protocol, StreamStartArtworkChannelsAtMostFour) {
         StreamStartMessage msg;
         // Control: four channels, every slot, are accepted.
         const bool accepted = count <= 4;
-        EXPECT_EQ(process_stream_start_message(root, &msg), accepted);
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), accepted);
         if (accepted) {
             ASSERT_TRUE(msg.artwork.has_value());
             EXPECT_EQ(msg.artwork->channels->size(), count);
         }
+    }
+}
+
+// roles/artwork/v1.md "stream/start artwork object": the channels array is required, so an artwork
+// object without one rejects the whole message and the valid player section beside it does not
+// start a stream.
+TEST(Protocol, StreamStartRejectsAnArtworkSectionWithoutChannels) {
+    struct Row {
+        const char* name;
+        const char* artwork;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: a channels array", R"({"channels":[{"source":"none"}]})", true},
+        {"no channels", R"({})", false},
+        {"channels that is not an array", R"({"channels":5})", false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"stream/start","payload":{)"
+                                      R"("player":{"codec":"pcm","sample_rate":48000,)"
+                                      R"("channels":2,"bit_depth":16},"artwork":)") +
+                              row.artwork + "}}",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), row.accepted);
+        EXPECT_EQ(msg.player.has_value(), row.accepted)
+            << "the player section survived a message the parser rejected";
+        EXPECT_EQ(msg.artwork.has_value(), row.accepted);
     }
 }
 
@@ -771,74 +840,71 @@ TEST(Protocol, ServerHelloSourceSupportListsAcceptedCodecs) {
     }
 }
 
-// If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a
-// non-zero bin count must be present. Otherwise the expected size of binary spectrum messages
-// would be indeterminate, so the visualizer object is dropped, but only that object: the message
-// itself still parses so a well-formed player/artwork start alongside it is not lost.
-TEST(Protocol, StreamStartDropsSpectrumWithoutValidConfig) {
-    // (a) SPECTRUM advertised but no spectrum object at all.
-    {
+// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": types (a string[]) and
+// rate_max are required, tracks_downbeats is required if types includes 'beat', and a stream that
+// advertises SPECTRUM carries a valid spectrum config with a non-zero bin count, without which the
+// expected size of binary spectrum messages is indeterminate. Like any malformed section, a
+// visualizer object missing one rejects the whole message, so the valid player section beside it
+// does not start a stream.
+TEST(Protocol, StreamStartRejectsAnIncompleteVisualizerSection) {
+    struct Row {
+        const char* name;
+        const char* visualizer;
+        bool accepted;
+        bool tracks_downbeats;
+        uint8_t spectrum_bins;  // 0: no spectrum config
+    };
+    const Row rows[] = {
+        {"Control: SPECTRUM with a valid config",
+         R"({"types":["spectrum"],"rate_max":30,)"
+         R"("spectrum":{"n_disp_bins":32,"scale":"log","f_min":20,"f_max":20000}})",
+         true, false, 32},
+        {"Control: beat with tracks_downbeats",
+         R"({"types":["beat"],"rate_max":30,"tracks_downbeats":true})", true, true, 0},
+        {"no types", R"({"rate_max":30})", false, false, 0},
+        {"types that is not an array", R"({"types":"loudness","rate_max":30})", false, false, 0},
+        {"a types entry that is not a string", R"({"types":["loudness",42],"rate_max":30})", false,
+         false, 0},
+        {"no rate_max", R"({"types":["loudness"]})", false, false, 0},
+        {"a rate_max that is not an integer", R"({"types":["loudness"],"rate_max":"30"})", false,
+         false, 0},
+        {"beat without tracks_downbeats", R"({"types":["beat"],"rate_max":30})", false, false, 0},
+        {"a tracks_downbeats that is not a boolean",
+         R"({"types":["beat"],"rate_max":30,"tracks_downbeats":1})", false, false, 0},
+        {"SPECTRUM with no spectrum object", R"({"types":["spectrum"],"rate_max":30})", false,
+         false, 0},
+        {"a zero bin count",
+         R"({"types":["spectrum"],"rate_max":30,"spectrum":{"n_disp_bins":0,"scale":"log",)"
+         R"("f_min":20,"f_max":20000}})",
+         false, false, 0},
+        {"a bin count that is not an integer",
+         R"({"types":["spectrum"],"rate_max":30,"spectrum":{"n_disp_bins":"32","scale":"log",)"
+         R"("f_min":20,"f_max":20000}})",
+         false, false, 0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
         JsonDocument doc;
         JsonObject root;
-        ASSERT_TRUE(parse(
-            R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"]}}})", doc,
-            root));
-        StreamStartMessage msg;
-        EXPECT_TRUE(process_stream_start_message(root, &msg));
-        EXPECT_FALSE(msg.visualizer.has_value());
-    }
-    // (b) spectrum object present but n_disp_bins is zero.
-    {
-        JsonDocument doc;
-        JsonObject root;
-        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
-                          R"("spectrum":{"n_disp_bins":0}}}})",
+        ASSERT_TRUE(parse(std::string(R"({"type":"stream/start","payload":{)"
+                                      R"("player":{"codec":"pcm","sample_rate":48000,)"
+                                      R"("channels":2,"bit_depth":16},"visualizer":)") +
+                              row.visualizer + "}}",
                           doc, root));
         StreamStartMessage msg;
-        EXPECT_TRUE(process_stream_start_message(root, &msg));
-        EXPECT_FALSE(msg.visualizer.has_value());
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), row.accepted);
+        EXPECT_EQ(msg.player.has_value(), row.accepted)
+            << "the player section survived a message the parser rejected";
+        ASSERT_EQ(msg.visualizer.has_value(), row.accepted);
+        if (row.accepted) {
+            EXPECT_EQ(msg.visualizer->rate_max, 30);
+            EXPECT_EQ(msg.visualizer->tracks_downbeats, row.tracks_downbeats);
+            ASSERT_EQ(msg.visualizer->spectrum.has_value(), row.spectrum_bins != 0);
+            if (row.spectrum_bins != 0) {
+                EXPECT_EQ(msg.visualizer->spectrum->n_disp_bins, row.spectrum_bins);
+            }
+        }
     }
-    // (c) n_disp_bins present but not an integer.
-    {
-        JsonDocument doc;
-        JsonObject root;
-        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
-                          R"("spectrum":{"n_disp_bins":"32"}}}})",
-                          doc, root));
-        StreamStartMessage msg;
-        EXPECT_TRUE(process_stream_start_message(root, &msg));
-        EXPECT_FALSE(msg.visualizer.has_value());
-    }
-    // (d) a valid player start in the same message survives the malformed visualizer object.
-    {
-        JsonDocument doc;
-        JsonObject root;
-        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{)"
-                          R"("player":{"codec":"pcm","sample_rate":48000,"channels":2,)"
-                          R"("bit_depth":16},)"
-                          R"("visualizer":{"types":["spectrum"]}}})",
-                          doc, root));
-        StreamStartMessage msg;
-        EXPECT_TRUE(process_stream_start_message(root, &msg));
-        EXPECT_FALSE(msg.visualizer.has_value());
-        ASSERT_TRUE(msg.player.has_value());
-        EXPECT_EQ(msg.player->sample_rate, 48000U);
-    }
-
-    // Control: SPECTRUM advertised with a valid config is accepted.
-    JsonDocument doc_ok;
-    JsonObject root_ok;
-    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
-                      R"("rate_max":30,)"
-                      R"("spectrum":{"n_disp_bins":32,"scale":"log","f_min":20,"f_max":20000}}}})",
-                      doc_ok, root_ok));
-    StreamStartMessage ok;
-    ASSERT_TRUE(process_stream_start_message(root_ok, &ok));
-    ASSERT_TRUE(ok.visualizer.has_value());
-    EXPECT_EQ(ok.visualizer->rate_max, 30);
-    EXPECT_FALSE(ok.visualizer->tracks_downbeats);
-    ASSERT_TRUE(ok.visualizer->spectrum.has_value());
-    EXPECT_EQ(ok.visualizer->spectrum->n_disp_bins, 32);
 }
 
 // The color parser reads each component as a uint8, so a non-integer (or out-of-range) component

@@ -750,111 +750,146 @@ bool process_server_state_controller(JsonObject root,
     return true;
 }
 
-bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg) {
+// stream/start's sections, each parsed straight into the caller's optional rather than into a
+// local that is then moved in: both copies would otherwise be live at once in the protocol task's
+// frame. Each returns true when its section is absent or valid, and false when it is malformed.
+
+static bool process_stream_start_player(JsonObject payload,
+                                        std::optional<ServerPlayerStreamObject>* player) {
+    if (!payload["player"].is<JsonObject>()) {
+        return true;
+    }
+    ServerPlayerStreamObject& player_obj = player->emplace();
+    if (!process_player_stream_object(payload["player"], &player_obj, true)) {
+        return false;
+    }
+    if (!player_obj.is_complete()) {
+        SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
+        return false;
+    }
+    return true;
+}
+
+static bool process_stream_start_artwork(JsonObject payload,
+                                         std::optional<ServerArtworkStreamObject>* artwork) {
+    if (!payload["artwork"].is<JsonObject>()) {
+        return true;
+    }
+    // roles/artwork/v1.md "stream/start artwork object": the channels array is required, and never
+    // longer than 4, the slots a binary message's type byte can address.
+    if (!payload["artwork"]["channels"].is<JsonArray>()) {
+        SS_LOGE(TAG, "Invalid stream/start message: artwork object without a channels array");
+        return false;
+    }
+    JsonArray channels_array = payload["artwork"]["channels"].as<JsonArray>();
+    if (channels_array.size() > ARTWORK_MAX_SLOTS) {
+        SS_LOGE(TAG, "Invalid stream/start message: %zu artwork channels, at most %zu",
+                channels_array.size(), ARTWORK_MAX_SLOTS);
+        return false;
+    }
+    auto& channels = artwork->emplace().channels.emplace();
+    for (JsonObject channel_json : channels_array) {
+        ServerArtworkChannelObject channel{};
+        if (!process_artwork_channel_object(channel_json, &channel)) {
+            return false;
+        }
+        if (!channel.is_complete()) {
+            SS_LOGE(TAG, "Invalid stream/start message: incomplete artwork channel");
+            return false;
+        }
+        channels.push_back(channel);
+    }
+    return true;
+}
+
+static bool process_stream_start_visualizer(
+    JsonObject payload, std::optional<ServerVisualizerStreamObject>* visualizer) {
+    if (!payload["visualizer"].is<JsonObject>()) {
+        return true;
+    }
+    ServerVisualizerStreamObject& vis_obj = visualizer->emplace();
+    JsonObject vis_json = payload["visualizer"];
+
+    // roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": types (a string[])
+    // and rate_max are required, and tracks_downbeats is required if types includes 'beat'. An
+    // unrecognized type string is skipped like any unrecognized enum value.
+    const auto rate_max = read_uint_field<uint16_t>(vis_json["rate_max"], "rate_max");
+    if (!vis_json["types"].is<JsonArray>() || !rate_max.has_value()) {
+        SS_LOGE(TAG, "Invalid stream/start message: incomplete visualizer object");
+        return false;
+    }
+    vis_obj.rate_max = *rate_max;
+    bool lists_beat = false;
+    bool lists_spectrum = false;
+    JsonArray types_array = vis_json["types"].as<JsonArray>();
+    for (JsonVariant type_var : types_array) {
+        if (!type_var.is<const char*>()) {
+            SS_LOGE(TAG, "Invalid stream/start message: a visualizer type that is not a string");
+            return false;
+        }
+        if (auto type = read_enum_field(type_var, "types", visualizer_data_type_from_string)) {
+            vis_obj.types.push_back(*type);
+            lists_beat = lists_beat || *type == VisualizerDataType::BEAT;
+            lists_spectrum = lists_spectrum || *type == VisualizerDataType::SPECTRUM;
+        }
+    }
+
+    if (lists_beat) {
+        const auto tracks_downbeats =
+            read_bool_field(vis_json["tracks_downbeats"], "tracks_downbeats");
+        if (!tracks_downbeats.has_value()) {
+            SS_LOGE(TAG, "Invalid stream/start message: beat listed without tracks_downbeats");
+            return false;
+        }
+        vis_obj.tracks_downbeats = *tracks_downbeats;
+    }
+
+    // The same section sends the spectrum object "only if `types` includes 'spectrum'". Without a
+    // valid one the size of a binary spectrum message is indeterminate, so none could be
+    // validated: an absent or malformed field leaves the config unset, which rejects the stream
+    // rather than acting on a fabricated default.
+    if (vis_json["spectrum"].is<JsonObject>()) {
+        JsonObject spec_json = vis_json["spectrum"];
+        auto n_disp_bins = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1);
+        auto scale =
+            read_enum_field(spec_json["scale"], "scale", visualizer_spectrum_scale_from_string);
+        auto f_min = read_uint_field<uint16_t>(spec_json["f_min"], "f_min");
+        auto f_max = read_uint_field<uint16_t>(spec_json["f_max"], "f_max");
+        if (n_disp_bins && scale && f_min && f_max) {
+            vis_obj.spectrum = VisualizerSpectrumConfig{*n_disp_bins, *scale, *f_min, *f_max};
+        }
+    }
+    if (lists_spectrum && !vis_obj.spectrum.has_value()) {
+        SS_LOGE(TAG, "Invalid stream/start message: SPECTRUM advertised without a valid "
+                     "spectrum config");
+        return false;
+    }
+    return true;
+}
+
+bool process_stream_start_message(JsonObject root, EnumSet<SendspinRole> roles,
+                                  StreamStartMessage* stream_msg) {
     if (stream_msg == nullptr) {
         return true;
     }
 
-    // Each section is parsed straight into the caller's struct rather than into a local that is
-    // then moved in. Both copies would otherwise be live at once in this frame, which matters on
-    // the ESP httpd task (4 KB stack); on a parse failure the section is reset instead.
-
-    if (root["payload"]["player"].is<JsonObject>()) {
-        ServerPlayerStreamObject& player_obj = stream_msg->player.emplace();
-        if (!process_player_stream_object(root["payload"]["player"], &player_obj, true)) {
-            stream_msg->player.reset();
-            return false;
-        }
-        if (!player_obj.is_complete()) {
-            SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
-            stream_msg->player.reset();
-            return false;
-        }
+    // Only the sections of `roles` are parsed, so a section no role takes is neither copied nor
+    // validated, as with server/state. A malformed section that is parsed rejects the whole
+    // message and resets every section, so a well-formed section beside it never starts half the
+    // stream the server asked for.
+    JsonObject payload = root["payload"];
+    const bool valid = (!roles.contains(SendspinRole::PLAYER) ||
+                        process_stream_start_player(payload, &stream_msg->player)) &&
+                       (!roles.contains(SendspinRole::ARTWORK) ||
+                        process_stream_start_artwork(payload, &stream_msg->artwork)) &&
+                       (!roles.contains(SendspinRole::VISUALIZER) ||
+                        process_stream_start_visualizer(payload, &stream_msg->visualizer));
+    if (!valid) {
+        stream_msg->player.reset();
+        stream_msg->artwork.reset();
+        stream_msg->visualizer.reset();
     }
-
-    if (root["payload"]["artwork"]["channels"].is<JsonArray>()) {
-        JsonArray channels_array = root["payload"]["artwork"]["channels"].as<JsonArray>();
-        // roles/artwork/v1.md "stream/start artwork object": the channels array is never longer
-        // than 4, the slots a binary message's type byte can address.
-        if (channels_array.size() > ARTWORK_MAX_SLOTS) {
-            SS_LOGE(TAG, "Invalid stream/start message: %zu artwork channels, at most %zu",
-                    channels_array.size(), ARTWORK_MAX_SLOTS);
-            return false;
-        }
-        auto& channels = stream_msg->artwork.emplace().channels.emplace();
-        for (JsonObject channel_json : channels_array) {
-            ServerArtworkChannelObject channel{};
-            if (process_artwork_channel_object(channel_json, &channel)) {
-                if (!channel.is_complete()) {
-                    SS_LOGE(TAG, "Invalid stream/start message: incomplete artwork channel");
-                    stream_msg->artwork.reset();
-                    return false;
-                }
-                channels.push_back(channel);
-            } else {
-                stream_msg->artwork.reset();
-                return false;
-            }
-        }
-    }
-
-    if (root["payload"]["visualizer"].is<JsonObject>()) {
-        ServerVisualizerStreamObject& vis_obj = stream_msg->visualizer.emplace();
-        JsonObject vis_json = root["payload"]["visualizer"];
-
-        // Parse types array
-        if (vis_json["types"].is<JsonArray>()) {
-            JsonArray types_array = vis_json["types"].as<JsonArray>();
-            for (JsonVariant type_var : types_array) {
-                if (auto type =
-                        read_enum_field(type_var, "types", visualizer_data_type_from_string)) {
-                    vis_obj.types.push_back(*type);
-                }
-            }
-        }
-
-        if (auto v = read_uint_field<uint16_t>(vis_json["rate_max"], "rate_max")) {
-            vis_obj.rate_max = *v;
-        }
-
-        if (auto v = read_bool_field(vis_json["tracks_downbeats"], "tracks_downbeats")) {
-            vis_obj.tracks_downbeats = *v;
-        }
-
-        // Parse spectrum config if present. Every field is required by the spec; if any is
-        // absent or malformed, leave the config unset so the SPECTRUM validation below rejects
-        // the stream rather than acting on a fabricated default.
-        if (vis_json["spectrum"].is<JsonObject>()) {
-            JsonObject spec_json = vis_json["spectrum"];
-            auto n_disp_bins = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1);
-            auto scale =
-                read_enum_field(spec_json["scale"], "scale", visualizer_spectrum_scale_from_string);
-            auto f_min = read_uint_field<uint16_t>(spec_json["f_min"], "f_min");
-            auto f_max = read_uint_field<uint16_t>(spec_json["f_max"], "f_max");
-            if (n_disp_bins && scale && f_min && f_max) {
-                vis_obj.spectrum = VisualizerSpectrumConfig{*n_disp_bins, *scale, *f_min, *f_max};
-            }
-        }
-
-        // If SPECTRUM is advertised, a fully valid spectrum config must be present; otherwise the
-        // expected size of binary spectrum messages is indeterminate and they could not be
-        // validated. The defect is local to the visualizer object, so drop only that object and
-        // let a well-formed player/artwork start in the same message go through.
-        bool advertises_spectrum = false;
-        for (auto type : vis_obj.types) {
-            if (type == VisualizerDataType::SPECTRUM) {
-                advertises_spectrum = true;
-                break;
-            }
-        }
-        if (advertises_spectrum && !vis_obj.spectrum.has_value()) {
-            SS_LOGE(TAG, "Ignoring visualizer stream config: SPECTRUM advertised without valid "
-                         "spectrum config");
-            stream_msg->visualizer.reset();
-        }
-    }
-
-    return true;
+    return valid;
 }
 
 bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg) {

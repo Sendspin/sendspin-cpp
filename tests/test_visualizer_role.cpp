@@ -401,7 +401,7 @@ TEST(VisualizerStreamEvents, AStreamStartAppliesOnlyTheConfigOfItsOwnGeneration)
         ServerVisualizerStreamObject config;
         config.types = {VisualizerDataType::BEAT};
         const uint32_t current = impl->cleanup_generation.load();
-        impl->event_state->config_slot.write(config, row.stale ? before : current);
+        impl->event_state->config_slot.write(std::move(config), row.stale ? before : current);
 
         impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, current);
 
@@ -411,10 +411,11 @@ TEST(VisualizerStreamEvents, AStreamStartAppliesOnlyTheConfigOfItsOwnGeneration)
 
 // roles/visualizer/v1.md "Server -> Client: stream/start": a stream that names the spectrum type
 // without a spectrum object has no bin count, so its frames are not deliverable. No wire input
-// reaches this: parse_server_message() drops a visualizer object that advertises spectrum with no
-// valid spectrum config, so the cached count is read out of the Impl and run through the decode
-// the drain thread runs. That the served object governs the count is asserted where a consumer
-// sees it, in ClientLifecycle.TheServedSpectrumBinCountGovernsTheDeliveredFrame.
+// reaches this: process_stream_start_message() rejects a stream/start whose visualizer object
+// advertises spectrum with no valid spectrum config, so the cached count is read out of the Impl
+// and run through the decode the drain thread runs. That the served object governs the count is
+// asserted where a consumer sees it, in
+// ClientLifecycle.TheServedSpectrumBinCountGovernsTheDeliveredFrame.
 TEST(VisualizerSpectrumWiring, TheSpectrumTypeWithNoSpectrumObjectDeliversNothing) {
     struct Row {
         const char* name;
@@ -442,7 +443,7 @@ TEST(VisualizerSpectrumWiring, TheSpectrumTypeWithNoSpectrumObjectDeliversNothin
         if (row.has_object) {
             stream.spectrum = impl->config.stream.spectrum;
         }
-        impl->handle_stream_start(stream);
+        impl->handle_stream_start(std::move(stream));
         take_in_ring_order(*impl->drain_task->inbound.ring());
 
         std::vector<uint16_t> bins;
@@ -460,7 +461,7 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 
     ServerVisualizerStreamObject stream;
     stream.types = {VisualizerDataType::BEAT};
-    impl->handle_stream_start(stream);
+    impl->handle_stream_start(std::move(stream));
     take_in_ring_order(*impl->drain_task->inbound.ring());
 
     Entry entry;
@@ -535,7 +536,7 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
                     impl->handle_stream_end();
                     break;
                 case Step::START:
-                    impl->handle_stream_start(stream);
+                    impl->handle_stream_start(ServerVisualizerStreamObject{stream});
                     break;
                 case Step::CLEAR:
                     impl->handle_stream_clear();

@@ -120,7 +120,8 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_role_deactivation.cpp`: a later `server/activate` that removes a role: output stopped,
   buffers and state dropped, the roles it keeps left alone, and a removed role added back.
 - `test_allocations.cpp`: how many times the library calls `operator new` from a connection's
-  accept to its admission, for a `client/state` and for a time burst. It replaces the global
+  accept to its admission, for a `client/state`, for a time burst, for the `stream/*` messages and
+  for a `stream/start` section the connection's roles do not take. It replaces the global
   allocation functions, so it builds into its own binary, `sendspin_alloc_tests`, which building
   `sendspin_tests` also builds. Run it with `SENDSPIN_ALLOC_REPORT=1` to print each allocation
   grouped by call site.
