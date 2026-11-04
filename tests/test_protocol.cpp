@@ -640,6 +640,37 @@ TEST(Protocol, StreamStartArtworkChannelsAtMostFour) {
     }
 }
 
+// roles/artwork/v1.md "stream/start artwork object": the channels array is required, so an artwork
+// object without one rejects the whole message and the valid player section beside it does not
+// start a stream.
+TEST(Protocol, StreamStartRejectsAnArtworkSectionWithoutChannels) {
+    struct Row {
+        const char* name;
+        const char* artwork;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: a channels array", R"({"channels":[{"source":"none"}]})", true},
+        {"no channels", R"({})", false},
+        {"channels that is not an array", R"({"channels":5})", false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"stream/start","payload":{)"
+                                      R"("player":{"codec":"pcm","sample_rate":48000,)"
+                                      R"("channels":2,"bit_depth":16},"artwork":)") +
+                              row.artwork + "}}",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), row.accepted);
+        EXPECT_EQ(msg.player.has_value(), row.accepted)
+            << "the player section survived a message the parser rejected";
+        EXPECT_EQ(msg.artwork.has_value(), row.accepted);
+    }
+}
+
 // messaging.md "stream/end" and "stream/clear": `roles` names the unversioned stream roles; an
 // omitted list applies to every role, and an entry that names none of them is ignored. A `roles`
 // that is present but not an array is malformed and rejects the message.
@@ -809,8 +840,8 @@ TEST(Protocol, ServerHelloSourceSupportListsAcceptedCodecs) {
     }
 }
 
-// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": types and rate_max
-// are required, tracks_downbeats is required if types includes 'beat', and a stream that
+// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": types (a string[]) and
+// rate_max are required, tracks_downbeats is required if types includes 'beat', and a stream that
 // advertises SPECTRUM carries a valid spectrum config with a non-zero bin count, without which the
 // expected size of binary spectrum messages is indeterminate. Like any malformed section, a
 // visualizer object missing one rejects the whole message, so the valid player section beside it
@@ -832,6 +863,8 @@ TEST(Protocol, StreamStartRejectsAnIncompleteVisualizerSection) {
          R"({"types":["beat"],"rate_max":30,"tracks_downbeats":true})", true, true, 0},
         {"no types", R"({"rate_max":30})", false, false, 0},
         {"types that is not an array", R"({"types":"loudness","rate_max":30})", false, false, 0},
+        {"a types entry that is not a string", R"({"types":["loudness",42],"rate_max":30})", false,
+         false, 0},
         {"no rate_max", R"({"types":["loudness"]})", false, false, 0},
         {"a rate_max that is not an integer", R"({"types":["loudness"],"rate_max":"30"})", false,
          false, 0},

@@ -772,12 +772,16 @@ static bool process_stream_start_player(JsonObject payload,
 
 static bool process_stream_start_artwork(JsonObject payload,
                                          std::optional<ServerArtworkStreamObject>* artwork) {
-    if (!payload["artwork"]["channels"].is<JsonArray>()) {
+    if (!payload["artwork"].is<JsonObject>()) {
         return true;
     }
+    // roles/artwork/v1.md "stream/start artwork object": the channels array is required, and never
+    // longer than 4, the slots a binary message's type byte can address.
+    if (!payload["artwork"]["channels"].is<JsonArray>()) {
+        SS_LOGE(TAG, "Invalid stream/start message: artwork object without a channels array");
+        return false;
+    }
     JsonArray channels_array = payload["artwork"]["channels"].as<JsonArray>();
-    // roles/artwork/v1.md "stream/start artwork object": the channels array is never longer than
-    // 4, the slots a binary message's type byte can address.
     if (channels_array.size() > ARTWORK_MAX_SLOTS) {
         SS_LOGE(TAG, "Invalid stream/start message: %zu artwork channels, at most %zu",
                 channels_array.size(), ARTWORK_MAX_SLOTS);
@@ -806,8 +810,9 @@ static bool process_stream_start_visualizer(
     ServerVisualizerStreamObject& vis_obj = visualizer->emplace();
     JsonObject vis_json = payload["visualizer"];
 
-    // roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": types and
-    // rate_max are required, and tracks_downbeats is required if types includes 'beat'.
+    // roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": types (a string[])
+    // and rate_max are required, and tracks_downbeats is required if types includes 'beat'. An
+    // unrecognized type string is skipped like any unrecognized enum value.
     const auto rate_max = read_uint_field<uint16_t>(vis_json["rate_max"], "rate_max");
     if (!vis_json["types"].is<JsonArray>() || !rate_max.has_value()) {
         SS_LOGE(TAG, "Invalid stream/start message: incomplete visualizer object");
@@ -818,6 +823,10 @@ static bool process_stream_start_visualizer(
     bool lists_spectrum = false;
     JsonArray types_array = vis_json["types"].as<JsonArray>();
     for (JsonVariant type_var : types_array) {
+        if (!type_var.is<const char*>()) {
+            SS_LOGE(TAG, "Invalid stream/start message: a visualizer type that is not a string");
+            return false;
+        }
         if (auto type = read_enum_field(type_var, "types", visualizer_data_type_from_string)) {
             vis_obj.types.push_back(*type);
             lists_beat = lists_beat || *type == VisualizerDataType::BEAT;
