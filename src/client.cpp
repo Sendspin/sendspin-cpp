@@ -1076,11 +1076,16 @@ void SendspinClient::drain_inbox() {
                 this->listener_->on_group_update(group_delta);
             }
 
-            SS_LOGD(TAG, "Group update - state: %s, id: %s, name: %s",
+            // group_name is cut to MAX_FRIENDLY_NAME_BYTES at parse, group_id only here.
+            const std::string_view id =
+                peer_text_for_log(this->group_state_.group_id.has_value()
+                                      ? std::string_view(*this->group_state_.group_id)
+                                      : std::string_view(""));
+            SS_LOGD(TAG, "Group update - state: %s, id: %.*s, name: %s",
                     this->group_state_.playback_state.has_value()
                         ? to_cstr(this->group_state_.playback_state.value())
                         : "unchanged",
-                    this->group_state_.group_id.value_or("").c_str(),
+                    static_cast<int>(id.size()), id.data(),
                     this->group_state_.group_name.value_or("").c_str());
         }
     }

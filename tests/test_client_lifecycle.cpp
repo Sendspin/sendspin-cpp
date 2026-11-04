@@ -103,7 +103,7 @@ constexpr uint16_t STREAM_ROLES_TEST_PORT = 19105;
 constexpr uint16_t HELLO_TEST_PORT = 19090;
 constexpr uint16_t OUTBOUND_GOODBYE_TEST_PORT = 19069;
 constexpr uint16_t NETWORK_PROVIDER_TEST_PORT = 19086;
-constexpr uint16_t INBOUND_OFF_TEST_PORT = 19105;
+constexpr uint16_t INBOUND_OFF_TEST_PORT = 19106;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif

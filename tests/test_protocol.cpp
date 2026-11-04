@@ -17,6 +17,7 @@
 // malformed-input handling) where a bug is silent rather than a crash, plus a hand-rolled int64
 // formatter that we can check against snprintf as a free correctness oracle.
 
+#include "log_capture.h"
 #include "platform/base64.h"
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
@@ -193,6 +194,10 @@ TEST(Protocol, DetermineMessageType) {
     EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::UNKNOWN);
 
     ASSERT_TRUE(parse(R"({})", doc, root));  // missing type field
+    EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::UNKNOWN);
+
+    // The whole type is compared, so an escaped NUL does not cut it short to a known one.
+    ASSERT_TRUE(parse(R"({"type":"server/hello\u0000x"})", doc, root));
     EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::UNKNOWN);
 }
 
@@ -1600,22 +1605,28 @@ TEST(Protocol, ServerActivateParsesTheActivitiesList) {
 
 // messaging.md "server/activate": a present active_roles is the new set, read as the roles this
 // library implements plus whether it names any role at all. A version this library does not
-// implement sets no bit but still makes the set non-empty, which admission reads.
+// implement sets no bit but still makes the set non-empty, which admission reads. A null one keeps
+// the prior set, and one that is not an array rejects the activate.
 TEST(Protocol, ServerActivateReadsActiveRoles) {
     struct Row {
         const char* name;
         const char* roles_json;
+        bool accepted;
+        bool has_roles;
         uint16_t mask;
         bool empty;
     };
     const Row rows[] = {
-        {"Control: implemented roles", R"(["player@v1","metadata@v1"])",
+        {"Control: implemented roles", R"(["player@v1","metadata@v1"])", true, true,
          static_cast<uint16_t>(role_mask_bit(SendspinRole::PLAYER) |
                                role_mask_bit(SendspinRole::METADATA)),
          false},
-        {"a version this library does not implement", R"(["player@v2"])", 0, false},
-        {"an explicit empty set", "[]", 0, true},
-        {"no string element", "[7]", 0, true},
+        {"a version this library does not implement", R"(["player@v2"])", true, true, 0, false},
+        {"an explicit empty set", "[]", true, true, 0, true},
+        {"no string element", "[7]", true, true, 0, true},
+        {"null keeps the prior set", "null", true, false, 0, false},
+        {"a string", R"("player@v1")", false, false, 0, false},
+        {"an object", R"({"player@v1":true})", false, false, 0, false},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -1626,10 +1637,16 @@ TEST(Protocol, ServerActivateReadsActiveRoles) {
                               row.roles_json + "}}",
                           doc, root));
         ServerActivateMessage msg;
-        ASSERT_TRUE(process_server_activate_message(root, &msg));
-        ASSERT_TRUE(msg.active_roles.has_value());
-        EXPECT_EQ(msg.active_roles->mask(), row.mask);
-        EXPECT_EQ(msg.active_roles->empty(), row.empty);
+        const bool accepted = process_server_activate_message(root, &msg);
+        EXPECT_EQ(accepted, row.accepted);
+        if (!accepted || !row.accepted) {
+            continue;
+        }
+        EXPECT_EQ(msg.active_roles.has_value(), row.has_roles);
+        if (row.has_roles && msg.active_roles.has_value()) {
+            EXPECT_EQ(msg.active_roles->mask(), row.mask);
+            EXPECT_EQ(msg.active_roles->empty(), row.empty);
+        }
     }
 }
 
@@ -1812,6 +1829,44 @@ TEST(Protocol, FormatClientPairRetryWireShape) {
     ASSERT_TRUE(doc["payload"].is<JsonObject>());
     EXPECT_EQ(doc["payload"].as<JsonObjectConst>().size(), 0u);
     EXPECT_EQ(doc.as<JsonObjectConst>().size(), 2u);
+}
+
+// docs/conventions.md "Embedded resource discipline": a log line prints at most
+// PEER_TEXT_LOG_BYTES of a peer's unrecognized value, however long the value is.
+TEST(Protocol, UnrecognizedPeerTextIsLoggedOnlyUpToTheBound) {
+    const std::string value(4 * PEER_TEXT_LOG_BYTES, 'x');
+    struct Row {
+        const char* name;
+        std::string json;
+        bool (*process)(JsonObject);
+    };
+    const Row rows[] = {
+        {"server/activate pairing.method",
+         R"({"type":"server/activate","payload":{"activities":["pairing"],)"
+         R"("pairing":{"method":")" +
+             value + R"("}}})",
+         [](JsonObject root) {
+             ServerActivateMessage msg;
+             return process_server_activate_message(root, &msg);
+         }},
+        {"pair/abort reason", R"({"type":"pair/abort","payload":{"reason":")" + value + R"("}})",
+         [](JsonObject root) {
+             PairAbortMessage msg;
+             return process_pair_abort_message(root, &msg);
+         }},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(row.json, doc, root));
+        StderrCapture capture;
+        (void)row.process(root);
+        const std::string log = capture.release();
+        EXPECT_NE(log.find(value.substr(0, PEER_TEXT_LOG_BYTES)), std::string::npos)
+            << "Control: the value is logged at all: " << log;
+        EXPECT_EQ(log.find(value.substr(0, PEER_TEXT_LOG_BYTES + 1)), std::string::npos) << log;
+    }
 }
 
 TEST(Protocol, FormatPairAbortWireShape) {

@@ -673,8 +673,10 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn,
     // not of accepted attempts, so the server counts every pairing activate it sends, including
     // ones the client goes on to reject (e.g. method_not_supported below). Bump here, at the
     // single point every pairing server/activate is received, so a rejected activate does not
-    // leave the client permanently behind the server's count. handle_enter_pairing() reads this
-    // value; it must not bump again.
+    // leave the client permanently behind the server's count. A server/activate the parser
+    // rejects never arrives here and is not counted, so a server that counted it stays one ahead
+    // until the next Noise handshake. handle_enter_pairing() reads this value; it must not bump
+    // again.
     const bool is_pairing_activate = msg.activities.contains(SendspinActivity::PAIRING);
     if (is_pairing_activate) {
         conn->bump_pairing_index();
@@ -688,7 +690,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn,
     // (unlike the reasons above, this does not close the connection).
     // A pairing activate that names no usable method (pairing object absent, or a
     // method string this client does not recognize; process_server_activate_message
-    // logs the raw value) cannot start any flow.
+    // logs the unrecognized value) cannot start any flow.
     if (is_pairing_activate && !msg.pairing_method.has_value()) {
         refuse_activate(conn, "declares pairing with no usable pairing.method",
                         "absent or unrecognized", this->json_arena());

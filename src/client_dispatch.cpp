@@ -812,10 +812,11 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         }
         default: {
             // Nothing acts on an unhandled message, so its type is read in place.
-            const char* type = parsed.read([](JsonObject root) {
-                return root["type"].is<const char*>() ? root["type"].as<const char*>() : "unknown";
+            const std::string_view type = parsed.read([](JsonObject root) {
+                return peer_text_for_log(root["type"] | std::string_view("unknown"));
             });
-            SS_LOGW(TAG, "Unhandled server message type: %s", type);
+            SS_LOGW(TAG, "Unhandled server message type: %.*s", static_cast<int>(type.size()),
+                    type.data());
         }
     }
 }
