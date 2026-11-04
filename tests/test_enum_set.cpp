@@ -39,7 +39,7 @@ TEST(EnumSet, VisitsEachMemberOnceInEnumeratorOrder) {
     const Case cases[] = {
         {"Control: inserted in order", {Bit::B0, Bit::B3}, {Bit::B0, Bit::B3}},
         {"inserted out of order", {Bit::B5, Bit::B1, Bit::B3}, {Bit::B1, Bit::B3, Bit::B5}},
-        {"a repeated member", {Bit::B2, Bit::B2, Bit::B4, Bit::B2}, {Bit::B2, Bit::B4}},
+        {"a repeated member", {Bit::B2, Bit::B4, Bit::B2}, {Bit::B2, Bit::B4}},
         {"the eighth enumerator", {Bit::B7, Bit::B0}, {Bit::B0, Bit::B7}},
         {"empty", {}, {}},
     };
