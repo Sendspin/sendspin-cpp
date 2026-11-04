@@ -65,7 +65,7 @@ struct TimeBurstResult {
  * const int64_t now_ms = platform_time_us() / US_PER_MS;
  * TimeBurstResult result = burst.loop(conn, now_ms, burst.starts_burst(now_ms));
  * if (result.burst_completed) {
- *     int64_t server_now = conn->get_time_filter()->compute_server_time(platform_time_us());
+ *     int64_t server_now = conn->time_filter().compute_server_time(platform_time_us());
  * }
  *
  * // When a SERVER_TIME response arrives:

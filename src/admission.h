@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// @file admission.h
-/// @brief Pure functions for server/activate trust enforcement, multi-server admission
+/// @brief Pure functions for the server/activate admissibility check, multi-server admission
 /// arbitration, and role ownership among admitted connections.
 ///
 /// Implements the allowed-activity-set table and the rejection order in messaging.md
@@ -30,28 +30,15 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <string>
-#include <vector>
+#include <string_view>
 
 namespace sendspin {
 
 // ============================================================================
-// Trust enforcement (PSK category -> allowed activities)
+// Admissibility (PSK category -> allowed activities)
 // ============================================================================
-
-/// @brief Whether `activities` contains `target`. Activity lists are always tiny, so a linear
-/// scan is used everywhere in this file instead of a set.
-inline bool contains_activity(const std::vector<SendspinActivity>& activities,
-                              SendspinActivity target) {
-    for (const auto& a : activities) {
-        if (a == target) {
-            return true;
-        }
-    }
-    return false;
-}
 
 /// @brief Whether an activity set is allowed for the matched PSK category.
 ///
@@ -83,13 +70,10 @@ inline bool activity_set_allowed(PskCategory category, bool has_playback, bool h
     return !has_playback || unpaired_access;
 }
 
-/// @brief activity_set_allowed() for a declared activity list.
-inline bool activities_allowed(PskCategory category,
-                               const std::vector<SendspinActivity>& activities,
-                               bool unpaired_access) {
-    return activity_set_allowed(category, contains_activity(activities, SendspinActivity::PLAYBACK),
-                                contains_activity(activities, SendspinActivity::PAIRING),
-                                unpaired_access);
+/// @brief activity_set_allowed() for a declared activity set.
+inline bool activities_allowed(PskCategory category, ActivitySet activities, bool unpaired_access) {
+    return activity_set_allowed(category, activities.contains(SendspinActivity::PLAYBACK),
+                                activities.contains(SendspinActivity::PAIRING), unpaired_access);
 }
 
 /// @brief Whether a connection declaring `activities` is "playback-capable": `activities`
@@ -100,12 +84,10 @@ inline bool activities_allowed(PskCategory category,
 /// @param activities  Activities declared in the server/activate message.
 /// @param unpaired_access Whether unpaired (Sentinel) access is enabled.
 /// @return true if the connection is playback-capable under these activities.
-inline bool is_playback_capable(PskCategory category,
-                                const std::vector<SendspinActivity>& activities,
+inline bool is_playback_capable(PskCategory category, ActivitySet activities,
                                 bool unpaired_access) {
     return activity_set_allowed(category, /*has_playback=*/true,
-                                contains_activity(activities, SendspinActivity::PAIRING),
-                                unpaired_access);
+                                activities.contains(SendspinActivity::PAIRING), unpaired_access);
 }
 
 /// @brief Whether `activities`/`active_roles` satisfy the matched PSK's structural constraints.
@@ -119,8 +101,8 @@ inline bool is_playback_capable(PskCategory category,
 /// @param has_roles       Whether the effective active_roles set is non-empty.
 /// @param unpaired_access Whether unpaired (Sentinel) access is enabled.
 /// @return true if the activate is structurally admissible.
-inline bool admissible(PskCategory category, const std::vector<SendspinActivity>& activities,
-                       bool has_roles, bool unpaired_access) {
+inline bool admissible(PskCategory category, ActivitySet activities, bool has_roles,
+                       bool unpaired_access) {
     if (!activities_allowed(category, activities, unpaired_access)) {
         return false;
     }
@@ -133,8 +115,7 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
 /// stops admitting unpaired access.
 ///
 /// @param category, activities, has_roles  Same as admissible().
-inline bool relies_on_unpaired_access(PskCategory category,
-                                      const std::vector<SendspinActivity>& activities,
+inline bool relies_on_unpaired_access(PskCategory category, ActivitySet activities,
                                       bool has_roles) {
     return admissible(category, activities, has_roles, /*unpaired_access=*/true) &&
            !admissible(category, activities, has_roles, /*unpaired_access=*/false);
@@ -152,9 +133,9 @@ inline bool relies_on_unpaired_access(PskCategory category,
 ///
 /// @param category, activities, has_roles, unpaired_access  Same as admissible().
 /// @return PAIRING_REQUIRED if enabling unpaired access would have admitted it, else UNAUTHORIZED.
-inline SendspinGoodbyeReason inadmissible_reject_reason(
-    PskCategory category, const std::vector<SendspinActivity>& activities, bool has_roles,
-    bool unpaired_access) {
+inline SendspinGoodbyeReason inadmissible_reject_reason(PskCategory category,
+                                                        ActivitySet activities, bool has_roles,
+                                                        bool unpaired_access) {
     if (!unpaired_access && relies_on_unpaired_access(category, activities, has_roles)) {
         return SendspinGoodbyeReason::PAIRING_REQUIRED;
     }
@@ -169,20 +150,11 @@ inline SendspinGoodbyeReason inadmissible_reject_reason(
 ///
 /// connection.md "Multiple servers (server-initiated)" ranks playback above pairing and an empty
 /// set lowest, so playback=2 > pairing=1 > none=0.
-inline int activity_rank(const std::vector<SendspinActivity>& activities) {
-    bool has_playback = false;
-    bool has_pairing = false;
-    for (const auto& a : activities) {
-        if (a == SendspinActivity::PLAYBACK) {
-            has_playback = true;
-        } else if (a == SendspinActivity::PAIRING) {
-            has_pairing = true;
-        }
-    }
-    if (has_playback) {
+inline int activity_rank(ActivitySet activities) {
+    if (activities.contains(SendspinActivity::PLAYBACK)) {
         return 2;
     }
-    if (has_pairing) {
+    if (activities.contains(SendspinActivity::PAIRING)) {
         return 1;
     }
     return 0;
@@ -198,17 +170,18 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 ///   4. Equal non-zero rank -> admit.
 ///   5. Both rank-0 (empty activities): admit only if
 ///      incoming.server_id == last_playback_server_id && admitted.server_id != last_playback.
+///      An empty last_playback_server_id means none, so rule 5 never admits.
 ///
 /// @param admitted_pairing_in_flight  Whether the admitted connection's pairing exchange is still
 ///        in flight. True is the plain reading of rule 2. Pass false only when the admitted side
 ///        declares PAIRING but has already been acked with server/pair-finalize, so rule 2 stops
 ///        shielding a pairing that has finished.
 /// @return true if the incoming connection should become the admitted one.
-inline bool should_admit_connection(const std::vector<SendspinActivity>& incoming_activities,
-                                    const std::string& incoming_server_id,
-                                    const std::vector<SendspinActivity>& admitted_activities,
-                                    const std::string& admitted_server_id, bool has_admitted,
-                                    const std::optional<std::string>& last_playback_server_id,
+inline bool should_admit_connection(ActivitySet incoming_activities,
+                                    std::string_view incoming_server_id,
+                                    ActivitySet admitted_activities,
+                                    std::string_view admitted_server_id, bool has_admitted,
+                                    std::string_view last_playback_server_id,
                                     bool admitted_pairing_in_flight) {
     if (!has_admitted) {
         return true;
@@ -221,8 +194,8 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
     // admitted_pairing_in_flight=false once server/pair-finalize is acked. Substituting an empty
     // activity set instead would drop the admitted side to rank 0 and hand a rank-0 newcomer the
     // last_playback tiebreak below, which it could never have won before.
-    if (admitted_pairing_in_flight &&
-        contains_activity(admitted_activities, SendspinActivity::PAIRING) && incoming_rank != 0) {
+    if (admitted_pairing_in_flight && admitted_activities.contains(SendspinActivity::PAIRING) &&
+        incoming_rank != 0) {
         return false;
     }
 
@@ -232,11 +205,11 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
 
     if (incoming_rank == 0) {
         // Both-empty: resolve by last_playback server_id.
-        if (!last_playback_server_id.has_value()) {
+        if (last_playback_server_id.empty()) {
             return false;
         }
-        return (incoming_server_id == *last_playback_server_id &&
-                admitted_server_id != *last_playback_server_id);
+        return (incoming_server_id == last_playback_server_id &&
+                admitted_server_id != last_playback_server_id);
     }
 
     return true;

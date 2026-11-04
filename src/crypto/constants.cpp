@@ -14,7 +14,6 @@
 
 #include "constants.h"
 
-#include "keys.h"
 #include "platform/crypto.h"
 
 #include <cstdlib>
@@ -32,8 +31,7 @@ const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK = []() {
         // SHA-256 is unavailable at process startup (noise-c allocation failure). There is no
         // safe fallback value for this security-critical constant: an all-zero SENTINEL_PSK
         // would be a fixed, publicly known PSK that every client and server would both derive
-        // and silently authenticate under. Fail loudly at startup instead (same rationale as
-        // the CSPRNG-failure abort() in platform_random_bytes()).
+        // and silently authenticate under. Fail loudly at startup instead.
         abort();
     }
     h.update(reinterpret_cast<const uint8_t*>(LABEL.data()), LABEL.size());
@@ -43,10 +41,5 @@ const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK = []() {
     }
     return digest;
 }();
-
-// SENTINEL_PSK_ID = base64url(SHA-256(PSK_ID_LABEL || SENTINEL_PSK))
-// Computed once at startup from SENTINEL_PSK.
-// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
-const std::string SENTINEL_PSK_ID = psk_id_for(SENTINEL_PSK);
 
 }  // namespace sendspin

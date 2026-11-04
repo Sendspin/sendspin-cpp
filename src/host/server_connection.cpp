@@ -61,9 +61,8 @@ bool SendspinServerConnection::is_connected() const {
     return this->ws_ && this->ws_->getReadyState() == ix::ReadyState::Open;
 }
 
-SsErr SendspinServerConnection::send_text_message(const std::string& message) {
-    return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
-                               message.size());
+SsErr SendspinServerConnection::send_text_message(const char* text, size_t len) {
+    return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(text), len);
 }
 
 SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len) {

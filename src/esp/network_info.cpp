@@ -30,11 +30,8 @@ static const char* const TAG = "sendspin.network_info";
 
 namespace {
 
-/// @brief Size of a formatted MAC string buffer: "aa:bb:cc:dd:ee:ff" plus null terminator.
-constexpr size_t MAC_STR_BUF_SIZE = 18;
-
 /// @brief Formats six MAC octets as lowercase colon-separated text, or nullopt if all zero.
-std::optional<std::string> format_mac(const uint8_t* mac) {
+std::optional<MacAddressText> format_mac(const uint8_t* mac) {
     bool all_zero = true;
     for (int i = 0; i < 6; i++) {
         if (mac[i] != 0) {
@@ -46,22 +43,22 @@ std::optional<std::string> format_mac(const uint8_t* mac) {
         return std::nullopt;  // emulators/unprovisioned efuse can report a zeroed MAC
     }
 
-    char buf[MAC_STR_BUF_SIZE];
-    std::snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3],
-                  mac[4], mac[5]);
-    return std::string(buf);
+    MacAddressText text{};
+    std::snprintf(text.data(), text.size(), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2],
+                  mac[3], mac[4], mac[5]);
+    return text;
 }
 
 }  // namespace
 
-std::optional<std::string> platform_get_interface_mac() {
+std::optional<MacAddressText> platform_get_interface_mac() {
     uint8_t mac[6] = {0};
 
     // Prefer the MAC of the default network interface - the one outbound connections route over.
     // This resolves to the correct address whether the device is on Wi-Fi or Ethernet.
     esp_netif_t* netif = esp_netif_get_default_netif();
     if (netif != nullptr && esp_netif_get_mac(netif, mac) == ESP_OK) {
-        if (std::optional<std::string> detected = format_mac(mac); detected.has_value()) {
+        if (std::optional<MacAddressText> detected = format_mac(mac); detected.has_value()) {
             return detected;
         }
     }

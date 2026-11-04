@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -100,9 +101,8 @@ public:
 
     /// @brief Called when a pairing exchange completes and a long-term record is stored
     ///
-    /// server_id is the base64url public key of the newly paired server. After this
-    /// callback the server re-handshakes on the new long-term PSK. Subsequent connections from
-    /// this server will report ConnectionTrust::USER.
+    /// server_id is the base64url public key of the newly paired server. The server then
+    /// re-handshakes on the new long-term PSK, after which is_paired() reads true.
     virtual void on_pairing_succeeded(const std::string& /*server_id*/) {}
 
     /// @brief Called when a pairing exchange is aborted (by the server or by the protocol)
@@ -113,16 +113,6 @@ public:
     /// pairing protocol error (a malformed or out-of-sequence pairing message).
     virtual void on_pairing_failed(const std::string& /*server_id*/,
                                    SendspinPairAbortReason /*reason*/) {}
-
-    /// @brief Called when the active connection's trust level is known after handshake
-    ///
-    /// Fires on the initial handshake and after each successful re-handshake (for example, after
-    /// pairing). trust reflects the PSK category matched during the Noise handshake:
-    ///   ConnectionTrust::USER:  long-term record (paired server)
-    ///   ConnectionTrust::NONE:  Sentinel or Pairing PSK (unpaired access)
-    /// The last reported trust describes the connection only while is_connected() is true: a
-    /// disconnect fires no on_trust_changed.
-    virtual void on_trust_changed(ConnectionTrust /*trust*/) {}
 
     /// @brief Called when a dynamic pairing code should be emitted to the operator.
     ///
@@ -235,6 +225,12 @@ public:
     }
 };
 
+// <windows.h> (wingdi.h) defines ERROR as a macro unless NOGDI is set; set it aside so the
+// enumerator below compiles when a consumer includes <windows.h> first. Code that names
+// LogLevel::ERROR after <windows.h> still needs NOGDI or its own #undef ERROR.
+#pragma push_macro("ERROR")
+#undef ERROR
+
 /// @brief Log severity levels for host builds
 /// Has no effect on ESP-IDF builds
 enum class LogLevel : uint8_t {
@@ -245,6 +241,8 @@ enum class LogLevel : uint8_t {
     DEBUG = 4,
     VERBOSE = 5,
 };
+
+#pragma pop_macro("ERROR")
 
 // Forward declarations
 class ConnectionManager;
@@ -257,6 +255,7 @@ class ProtocolTask;
 class RecordStore;
 class SendspinArenaAllocator;
 class SendspinConnection;
+struct ClientHelloMessage;
 struct ClientStateMessage;
 struct Identity;
 
@@ -328,7 +327,8 @@ public:
     /// @brief Starts the role threads and the protocol task, and arms the WebSocket server
     ///
     /// The server starts listening before this returns when the network provider already reports
-    /// ready, and otherwise on the protocol task once a loop() finds it ready. If a role fails to
+    /// ready, and otherwise on the protocol task once a loop() finds it ready. With
+    /// SendspinClientConfig::accept_inbound_connections off, no server starts. If a role fails to
     /// start, the roles that did start are stopped again so a corrected retry begins from the
     /// stopped state. A rejected configured pairing secret (SendspinClientConfig::pairing_psk or
     /// static_pairing_code) fails every start() of this instance, since the config is fixed at
@@ -571,6 +571,13 @@ public:
     /// @brief Returns the server information from the active connection's hello handshake, or
     /// nullopt when no connection is active. Any thread.
     std::optional<ServerInformationObject> get_server_information() const;
+
+    /// @brief Returns true if the active connection is a paired session: one keyed by the
+    /// long-term PSK of a pairing record, not the Pairing or Sentinel PSK. Any thread; reflects
+    /// the protocol task's last tick. Read it before is_connected(): between a re-handshake and the
+    /// server/activate that follows it, it already describes the new session while is_connected()
+    /// reads false, and a true is_connected() read after it means that session is activated.
+    bool is_paired() const;
 
     /// @brief Returns true if the time filter has received at least one measurement. Any thread.
     bool is_time_synced() const;
@@ -853,8 +860,9 @@ private:
     /// only.
     void process_inbound(SendspinConnection& conn, InboundMessage& message);
 
-    /// @brief Builds the formatted client hello message from config. Protocol task.
-    std::string build_hello_message();
+    /// @brief Fills `msg` with the client/hello fields from config and every role, viewing them.
+    /// Protocol task.
+    void build_client_hello(ClientHelloMessage& msg);
 
     /// @brief Builds the client/state snapshot publish_state() hands the protocol task: the
     /// availability and every role's state object. Main loop only, where that state lives.
@@ -898,7 +906,7 @@ private:
     /// @brief Makes `snapshot` the client/state every admitted connection's is built from, and
     /// sends each admitted connection its copy (publish_client_state()). An unavailable snapshot
     /// first ends the source's input stream. Protocol task only.
-    void adopt_client_state(ClientStateMessage&& snapshot);
+    void adopt_client_state(const ClientStateMessage& snapshot);
 
     /// @brief Whether the adopted client/state snapshot reports the client available; false before
     /// the first is adopted (adopt_client_state()). Protocol task only.
@@ -927,18 +935,18 @@ private:
     /// @brief Makes server_id the last-played server in RAM and queues its provider write for
     /// flush_pending_persistence() on the main loop. Protocol task, where arbitration reads the
     /// value. An empty or unchanged server_id is a no-op: one flash write per handoff.
-    void note_last_played_server(const std::string& server_id);
+    void note_last_played_server(std::string_view server_id);
 
     /// @brief Writes the last-played server_id through the persistence provider.
-    void write_last_played_server(const std::string& server_id);
+    void write_last_played_server(std::string_view server_id);
 
     // ========================================
     // Connection event handlers (called by ConnectionManager via friend access)
     // ========================================
 
     /// @brief Publishes the initial client state once an admitted connection goes operational,
-    /// clears its pairing state, dismissing any prompt the attempt left showing, and reports its
-    /// trust level. Protocol task only.
+    /// clears its pairing state, dismissing any prompt the attempt left showing. Protocol task
+    /// only.
     /// @param conn The connection that completed the handshake
     void on_handshake_complete(SendspinConnection* conn);
 
@@ -960,20 +968,20 @@ private:
     /// of its role removals and of anything else it sends. Protocol task only.
     void on_activation_applied(SendspinConnection* conn);
 
-    // Pairing and trust notifications. Each is called on the protocol task and queues the
-    // listener callback for delivery from the main loop's drain_inbox().
+    // Pairing notifications. Each is called on the protocol task and queues the listener callback
+    // for delivery from the main loop's drain_inbox().
 
     /// @brief Queue an on_pairing_started notification
-    void note_pairing_started(const std::string& server_id);
+    void note_pairing_started(std::string_view server_id);
 
     /// @brief Queue an on_pairing_succeeded notification
-    void note_pairing_succeeded(const std::string& server_id);
+    void note_pairing_succeeded(std::string_view server_id);
 
     /// @brief Queue an on_pairing_failed notification
-    void note_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason);
+    void note_pairing_failed(std::string_view server_id, SendspinPairAbortReason reason);
 
     /// @brief Queue an on_display_pairing_code notification
-    void note_display_pairing_code(const std::string& code, SendspinPairingCodeFormat format);
+    void note_display_pairing_code(std::string_view code, SendspinPairingCodeFormat format);
 
     /// @brief Queue an on_clear_pairing_code notification
     void note_clear_pairing_code();
@@ -987,9 +995,6 @@ private:
     /// @brief Queue on_clear_pairing_code and/or on_close_pairing_window for each prompt `ui`
     /// records as showing
     void note_pairing_ui_dismissals(const PairingUiSnapshot& ui);
-
-    /// @brief Queue an on_trust_changed notification
-    void note_trust_changed(ConnectionTrust trust);
 
     struct EventState;
     struct TaskState;

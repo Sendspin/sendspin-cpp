@@ -27,6 +27,7 @@
 #pragma once
 
 #include "crypto/constants.h"
+#include "crypto/keys.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 
@@ -35,6 +36,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -71,17 +73,30 @@ inline std::optional<PskCategory> psk_category_from_string(std::string_view code
     return std::nullopt;
 }
 
+/// @brief The wire code of `category`; see psk_category_from_string().
+inline const char* to_cstr(PskCategory category) {
+    switch (category) {
+        case PskCategory::LONG_TERM:
+            return "lt";
+        case PskCategory::PAIRING:
+            return "pr";
+        case PskCategory::SENTINEL:
+            return "sn";
+    }
+    return "unknown";
+}
+
 // ============================================================================
 // Resolved PSK (handshake currency)
 // ============================================================================
 
-/// @brief A PSK selected during a handshake, with its trust metadata.
+/// @brief A PSK selected during a handshake, with its category and the server it is bound to.
 struct ResolvedPsk {
-    std::string psk_id;
+    IdText psk_id;
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     PskCategory category{PskCategory::SENTINEL};
     /// Peer server_id; set for every long-term record, empty for the Sentinel and Pairing PSKs.
-    std::optional<std::string> counterparty_id;
+    IdText counterparty_id{};
 
     ResolvedPsk() = default;
     ResolvedPsk(const ResolvedPsk&) = default;
@@ -153,7 +168,7 @@ public:
     /// @param category The category the server declared it is using that PSK as.
     /// Protocol task only.
     /// @return The matching PSK, or nullopt if this client holds no such PSK in that category.
-    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id(const std::string& psk_id,
+    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id(std::string_view psk_id,
                                                                PskCategory category) const;
 
     // ========================================
@@ -180,7 +195,7 @@ public:
     ///        exists.
     /// @return true when stored; false only when every record at capacity is in use.
     bool store_record_superseding(SendspinPairingRecord record,
-                                  const std::vector<std::string>& psk_ids_in_use = {});
+                                  std::span<const IdText* const> psk_ids_in_use = {});
 
     /// @brief Save the record slots that changed since the last call, plus the record-order
     /// blob when the eviction order moved. Main loop only: it calls the provider. The deferred
@@ -215,7 +230,7 @@ public:
     /// later.
     /// @param psk_id The record to erase.
     /// @return true when a record was erased, and the store therefore needs persisting.
-    [[nodiscard]] bool note_record_removed(const std::string& psk_id);
+    [[nodiscard]] bool note_record_removed(std::string_view psk_id);
 
     /// @brief Make the record at psk_id the most recently used one in RAM, leaving the durable
     /// half to a later persist_records(). No-op if absent or already the most recent.
@@ -232,7 +247,7 @@ public:
     /// written later.
     /// @param psk_id The record to move.
     /// @return true when the order moved, and the store therefore needs persisting.
-    [[nodiscard]] bool note_record_played(const std::string& psk_id);
+    [[nodiscard]] bool note_record_played(std::string_view psk_id);
 
     // ========================================
     // Pairing PSK (the one the client accepts to admit a new server)
@@ -267,9 +282,11 @@ public:
 
     /// @brief Mint a pairing outcome: a fresh PSK bound to server_id and the record holding it.
     ///
-    /// Minting cannot fail on a full store: store_record_superseding() supersedes a re-pair's
+    /// Minting never fails on a full store: store_record_superseding() supersedes a re-pair's
     /// existing record and evicts for a net-new one (pairing.md "Pairing Records").
-    [[nodiscard]] PairingOutcome resolve_pairing_outcome(const std::string& server_id);
+    /// @return nullopt when the PSK's psk_id cannot be derived (noise-c could not allocate the
+    ///         hash state).
+    [[nodiscard]] std::optional<PairingOutcome> resolve_pairing_outcome(std::string_view server_id);
 
 private:
     // ========================================
@@ -340,23 +357,23 @@ private:
 
     /// @brief The long-term record for psk_id, or nullptr. Call with mutex_ held, or on the
     /// protocol task; the pointer does not survive a mutation of records_.
-    [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(const std::string& psk_id) const;
+    [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(std::string_view psk_id) const;
 
     /// @brief The record bound to server_id, or nullptr. Same rules.
     [[nodiscard]] const SendspinPairingRecord* record_by_server_id(
-        const std::string& server_id) const;
+        std::string_view server_id) const;
 
     /// @brief Sentinel find_index() returns for a psk_id the store does not hold.
     static constexpr size_t NPOS = static_cast<size_t>(-1);
 
     /// @brief Find the index of a record by psk_id, or NPOS if absent.
-    [[nodiscard]] size_t find_index(const std::string& psk_id) const;
+    [[nodiscard]] size_t find_index(std::string_view psk_id) const;
 
     /// @brief Drop the least recently used record no open connection is resolving against, to
     /// make room for a net-new one. Call with mutex_ held.
     /// @param psk_ids_in_use psk_ids that must not be evicted (see store_record_superseding).
     /// @return true when a record was evicted.
-    bool evict_one_locked(const std::vector<std::string>& psk_ids_in_use);
+    bool evict_one_locked(std::span<const IdText* const> psk_ids_in_use);
 
     /// @brief Encode every owed write and clear the dirty bookkeeping. Call with mutex_ held, so
     /// each blob is exactly what is in memory at that moment.

@@ -17,7 +17,8 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)  # only gtest_main is used; skip building gmock
 FetchContent_MakeAvailable(googletest)
 
-# One executable aggregating every test_*.cpp file behind the main.cpp watchdog entry point.
+# One executable aggregating every test_*.cpp file but test_allocations.cpp behind the main.cpp
+# watchdog entry point.
 # gtest_discover_tests still registers the individual TEST() cases with CTest so failures are
 # reported per case.
 add_executable(sendspin_tests
@@ -36,6 +37,8 @@ add_executable(sendspin_tests
     test_protocol_task.cpp
     test_inbox.cpp
     test_player_role.cpp
+    test_enum_set.cpp
+    test_inline_text.cpp
     test_inline_vector.cpp
     test_fixed_block_pool.cpp
     test_visualizer_role.cpp
@@ -56,6 +59,7 @@ add_executable(sendspin_tests
     test_client_teardown.cpp
     test_client_lifecycle.cpp
     test_role_deactivation.cpp
+    test_windows_header_macros.cpp
 
     # FilePersistenceProvider is a host example helper (examples/common/), not part of the
     # library; compile it into the test target so the record-store tests can exercise it.
@@ -64,7 +68,8 @@ add_executable(sendspin_tests
 
 # test_decoder.cpp calls SyncTask::decode_whole_chunk(), the sync task's chunk-resume loop, which
 # is a protected static member: it grows the decode buffer, resumes the decoder and rolls a failed
-# chunk back, and nothing on the public surface reaches it without the sync thread.
+# chunk back, and nothing on the public surface reaches it without the sync thread. It also reads
+# SendspinDecoder::flac_decoder_, since a decoder object kept across streams shows nowhere else.
 set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Built only with the trace it tests.
@@ -80,8 +85,10 @@ endif()
 # player_ and each role's impl_ (the sync task, which a feeder thread hands chunks to directly, and
 # the visualizer's drain list, whose links it reads under the list's lock); ProtocolTask's
 # command_mutex_ and command_count_ (how many commands wait); ConnectionManager's admitted_,
-# nursery_, install_admitted(), refresh_published_state(), scan_nursery(), close_admission() and
-# drop_connection() (to install, swap out, and drop a stand-in connection, and to run one scan);
+# nursery_, closing_ (an accept refused at stop() is released at once rather than held until
+# finish_stop(), which the peer cannot tell apart), install_admitted(), refresh_published_state(),
+# scan_nursery(), close_admission() and drop_connection() (to install, swap out, and drop a
+# stand-in connection, and to run one scan);
 # and SendspinConnection's noise_handshake_complete_ (a stand-in's finished handshake) and its
 # transport side, begin_inbound_message() and end_inbound_message() (a stand-in's transport writing
 # a ring item and a fallback message). The ring-size tables read SendspinClient::inbound_ring_ and
@@ -189,9 +196,12 @@ set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno
 # outbound_ring_ and protocol_task_ (rings created without the thread, so what a step produced
 # stays to be read), chunk_item_ (a chunk begun but not filled), chunk_message_bytes_ (the size
 # a completed chunk is acquired at, to write one as the task would), bytes_per_frame_ and
-# producer_drop_log_ (a run of refused writes, which shows only in the log) and opus_encoder_ (the
+# producer_drop_log_ (a run of refused writes, which shows only in the log), opus_encoder_ (the
 # encoder an OPUS config's start() creates, given to a rig without the thread, or a stand-in
-# recording the task's encoder calls, which start() keeps); SourceRole's impl_ (the hello and
+# recording the task's encoder calls, which start() keeps) and flac_encoder_ (whose scratch
+# start() allocates, allocated for a rig without the thread); FlacSourceEncoder's encoder_ and
+# micro-flac's FLACEncoder::frame_number_ (the 2^31 frames after which the numbering restarts,
+# unreachable otherwise); SourceRole's impl_ (the hello and
 # state objects without a server, the stream gate and codec a stream opening sets, the task);
 # and, for the stand-in connection it installs as the protocol task does, SendspinClient's
 # protocol_task_ (stopped), connection_manager_ (its
@@ -220,7 +230,7 @@ set_source_files_properties(test_inbound_ring.cpp PROPERTIES COMPILE_OPTIONS -fn
 # test_record_store.cpp reads records_ directly and calls the store's private locked-context
 # lookups (record_by_psk_id, record_by_server_id); the store deliberately exposes no copying
 # accessor for them, since nothing in the library needs one. It also calls the client's private
-# build_hello_message() to read the hello a configured client would send, which no connection-free
+# build_client_hello() to read the hello a configured client would send, which no connection-free
 # public call returns.
 set_source_files_properties(test_record_store.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
@@ -236,14 +246,29 @@ target_include_directories(sendspin_tests PRIVATE
 )
 
 target_link_libraries(sendspin_tests PRIVATE sendspin GTest::gtest)
-# The watchdog in main.cpp prints a backtrace on a hang; glibc needs exported symbols to name
-# the frames.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_options(sendspin_tests PRIVATE -rdynamic)
-endif()
 
-target_compile_features(sendspin_tests PRIVATE cxx_std_20)
-target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
+# test_allocations.cpp replaces the global operator new to count the library's allocations, so it
+# gets a binary of its own: in sendspin_tests the replacement would take the place of the
+# sanitizers' operator new and its mismatch checks. Building sendspin_tests builds it too, so the
+# documented build and CTest commands cover it.
+add_executable(sendspin_alloc_tests main.cpp test_allocations.cpp)
+target_include_directories(sendspin_alloc_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/crypto
+)
+# dladdr() lives in libdl before glibc 2.34; CMAKE_DL_LIBS names it on Linux and is empty on macOS.
+target_link_libraries(sendspin_alloc_tests PRIVATE sendspin GTest::gtest ${CMAKE_DL_LIBS})
+add_dependencies(sendspin_tests sendspin_alloc_tests)
+
+foreach(test_target sendspin_tests sendspin_alloc_tests)
+    # The watchdog in main.cpp prints a backtrace on a hang, and test_allocations.cpp names each
+    # allocation's frames; glibc needs exported symbols for both.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(${test_target} PRIVATE -rdynamic)
+    endif()
+    target_compile_features(${test_target} PRIVATE cxx_std_20)
+    target_compile_options(${test_target} PRIVATE -Wall -Wextra)
+endforeach()
 
 # test_pairing_state_machine.cpp is a white-box integration harness: its fixture injects fake
 # connections into ConnectionManager's private state and drives private lifecycle methods
@@ -302,12 +327,13 @@ set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
 # does not close it); SendspinTimeBurst::last_burst_complete_time_ (a burst due only in the row
 # that sends client/time); and the controller's impl_, whose supported_commands it seeds, stamped
 # with its cleanup_generation, so a send_command() is queued. The connection-level table removes
-# NoiseTransport::frame_sink_ for one send: the one refusal before the encrypt send_app_json()
-# can meet without a seam. The encrypt-failure rows exhaust the send nonce through the session's
+# NoiseTransport::frame_sink_ for one send: a refusal before the encrypt send_json() cannot
+# otherwise meet. The encrypt-failure rows exhaust the send nonce through the session's
 # NoiseSession::send_cipher_ (noise_cipherstate_set_nonce()), the one encrypt failure a live
 # session can meet. The lent-send and encrypt tables call NoiseTransport::encrypt_in_place() and
 # a stand-in's SendspinConnection::noise_transport_ directly, since no protocol-task step drives a
-# lent send.
+# lent send. The pre-session test and the send-failure rows that refuse or fail before the
+# encrypt stage a message through noise_transport_ and read its send_buf_, to observe the wipe.
 set_source_files_properties(test_noise_transport.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
@@ -318,21 +344,23 @@ set_source_files_properties(test_noise_transport.cpp PROPERTIES
 set_source_files_properties(test_cpace.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
-# Match the library's sanitizer configuration so the test binary is instrumented too.
-if(ENABLE_SANITIZERS)
-    target_compile_options(sendspin_tests PRIVATE
-        -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options(sendspin_tests PRIVATE -fsanitize=address,undefined)
-endif()
-
-# ThreadSanitizer, configured separately from ASan/UBSan (the two cannot be combined). The
-# concurrency tests only report a data race when the binary is built this way.
-if(ENABLE_TSAN)
-    target_compile_options(sendspin_tests PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
-    target_link_options(sendspin_tests PRIVATE -fsanitize=thread)
-endif()
-
 include(GoogleTest)
-# Backstop above the 55 s watchdog in main.cpp, which fires first and prints the hung test's
-# stack.
-gtest_discover_tests(sendspin_tests PROPERTIES TIMEOUT 60)
+foreach(test_target sendspin_tests sendspin_alloc_tests)
+    # Match the library's sanitizer configuration so the test binaries are instrumented too.
+    if(ENABLE_SANITIZERS)
+        target_compile_options(${test_target} PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${test_target} PRIVATE -fsanitize=address,undefined)
+    endif()
+
+    # ThreadSanitizer, configured separately from ASan/UBSan (the two cannot be combined). The
+    # concurrency tests only report a data race when the binary is built this way.
+    if(ENABLE_TSAN)
+        target_compile_options(${test_target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(${test_target} PRIVATE -fsanitize=thread)
+    endif()
+
+    # Backstop above the 55 s watchdog in main.cpp, which fires first and prints the hung test's
+    # stack.
+    gtest_discover_tests(${test_target} PROPERTIES TIMEOUT 60)
+endforeach()

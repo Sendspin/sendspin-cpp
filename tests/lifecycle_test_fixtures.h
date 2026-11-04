@@ -87,7 +87,7 @@ public:
 
 // Seeds the client's RecordStore with known LONG_TERM records (server-side pairing is not under
 // test here) so a fake server that knows the same psk_id/psk resolves to PskCategory::LONG_TERM,
-// matching the trust category the admission tests need. Optionally also seeds the last-played
+// matching the PSK category the admission tests need. Optionally also seeds the last-played
 // server_id that the rank-0 arbitration tiebreak keys on.
 //
 // save_blob is left at the base class's rejecting default: nothing here is meant to
@@ -504,13 +504,17 @@ struct FakeEncryptedServerOptions {
     int64_t server_clock_offset_us{0};
 };
 
+/// The name every FakeEncryptedServer sends in server/hello. Longer than the 22 characters libc++
+/// keeps inline, so a heap copy of it shows in the allocation test under either standard library.
+inline constexpr const char* FAKE_SERVER_HELLO_NAME = "Fake Encrypted Server Under Test";
+
 class FakeEncryptedServer : public NoiseInitiatorFixtureBase {
 public:
     FakeEncryptedServer(const std::string& url, std::string suite_name, Identity server_identity,
                         std::string psk_id, std::array<uint8_t, NOISE_PSK_SIZE> psk,
                         FakeEncryptedServerOptions options = {})
         : NoiseInitiatorFixtureBase(std::move(suite_name), server_identity, std::move(psk_id), psk,
-                                    "Fake Encrypted Server",
+                                    FAKE_SERVER_HELLO_NAME,
                                     options.psk_category.value_or("")),
           options_(std::move(options)) {
         this->ws_.setUrl(url);
@@ -778,7 +782,7 @@ private:
         if (std::strcmp(type, "client/goodbye") == 0) {
             // A goodbye in CLEARTEXT, before any Noise transport exists: the client rejected the
             // connection at accept (a full nursery), so it never installed a handshake driver and
-            // send_app_json() fell back to a plain text frame. The encrypted counterpart of this
+            // send_json() fell back to a plain text frame. The encrypted counterpart of this
             // branch lives in handle_binary().
             std::lock_guard<std::mutex> glock(this->goodbye_mutex_);
             this->goodbye_reason_ = doc["payload"]["reason"] | "";
@@ -1283,10 +1287,14 @@ public:
     void on_visualizer_stream_end() override {
         ++this->stream_ends;
     }
+    void on_visualizer_stream_clear() override {
+        ++this->stream_clears;
+    }
 
     std::atomic<size_t> loudness{0};
     int stream_starts{0};
     int stream_ends{0};
+    int stream_clears{0};
 };
 
 // ============================================================================

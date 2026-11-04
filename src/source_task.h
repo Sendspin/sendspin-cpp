@@ -19,6 +19,7 @@
 #pragma once
 
 #include "constants.h"
+#include "crypto/constants.h"
 #include "inbound_ring.h"
 #include "outbound_ring.h"
 #include "platform/event_flags.h"
@@ -30,10 +31,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
 
 namespace sendspin {
 
+class FlacSourceEncoder;
 class ProtocolTask;
 
 /// @brief Event flag bits for the source task (distinct names from the sync task's
@@ -90,6 +95,11 @@ constexpr int64_t source_entry_anchor_us(int64_t entry_capture_us, size_t consum
 /// (roles/source/v1.md "Source Audio Chunks (Binary)")
 inline constexpr size_t SOURCE_CHUNK_HEADER_SIZE = 1U + 8U;
 
+/// @brief Largest chunk payload: the send path encrypts a chunk in place as one transport message,
+/// never fragmented
+inline constexpr size_t SOURCE_MAX_PAYLOAD_BYTES =
+    MAX_TRANSPORT_PLAINTEXT - SOURCE_CHUNK_HEADER_SIZE;
+
 /// @brief Bytes of audio in one full chunk of the config, or 0 when the chunk holds no whole
 /// frame or would not fit one Noise transport message with its header (the send path encrypts
 /// a chunk in place and never fragments it)
@@ -118,8 +128,9 @@ public:
     SourceTask(const SourceTask&) = delete;
     SourceTask& operator=(const SourceTask&) = delete;
 
-    /// @brief Creates the rings, the event flags and an OPUS config's encoder, then starts the
-    /// thread, which waits for captured audio. Main loop, from SourceRole::Impl::start().
+    /// @brief Creates the rings, the event flags, and an OPUS config's encoder or a FLAC config's
+    /// encoder scratch, then starts the thread, which waits for captured audio. Main loop, from
+    /// SourceRole::Impl::start().
     /// @param protocol_task Woken whenever a chunk is completed.
     /// @return false on an allocation failure or when the thread is already running.
     bool start(ProtocolTask* protocol_task);
@@ -137,6 +148,11 @@ public:
     OutboundRing* outbound_ring() const {
         return this->outbound_ring_.get();
     }
+
+    /// @brief The client-stream/start `codec_header` of a stream of `codec`: the FLAC header for
+    /// flac, absent otherwise. Protocol task, from SourceRole::Impl::try_open(); fixed since
+    /// construction, so the view is valid for the task's life.
+    std::optional<std::string_view> codec_header(SendspinCodecFormat codec) const;
 
 protected:
     /// @brief Entry point for the thread
@@ -174,8 +190,8 @@ protected:
     /// from live capture (roles/source/v1.md "Source Audio Chunks (Binary)")
     void flush_to_live();
 
-    /// @brief The encoder for a stream of `codec`: the Opus encoder for opus, the passthrough
-    /// otherwise
+    /// @brief The encoder for a stream of `codec`: the Opus or FLAC encoder for its codec, the
+    /// passthrough otherwise
     SourceEncoder* encoder_for(SendspinCodecFormat codec);
 
     // Struct fields
@@ -187,6 +203,10 @@ protected:
     /// The Opus encoder of an OPUS config, created by the first start() and kept, like the
     /// capture ring; null otherwise.
     std::unique_ptr<SourceEncoder> opus_encoder_;
+    /// The FLAC encoder of a FLAC config; null otherwise. Created with the task, unlike the Opus
+    /// encoder, because chunk_message_bytes_ is sized from its worst-case frame and codec_header()
+    /// reads its header; its scratch is allocated by the first start(), and all of it kept.
+    std::unique_ptr<FlacSourceEncoder> flac_encoder_;
     std::unique_ptr<OutboundRing> capture_ring_;
     std::unique_ptr<OutboundRing> outbound_ring_;
     std::thread task_thread_;

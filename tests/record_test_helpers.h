@@ -33,11 +33,25 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ostream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace sendspin {
+
+/// Prints an IdText as its text in a failed assertion.
+inline void PrintTo(const IdText& id, std::ostream* os) {
+    *os << '"' << id.view() << '"';
+}
+
+/// An IdText holding `text`, which a test id must fit (at most PEER_ID_SIZE characters).
+inline IdText id_text(std::string_view text) {
+    IdText id;
+    EXPECT_TRUE(id.assign(text)) << "a test id is longer than a peer_id: " << text;
+    return id;
+}
 
 /// Generate a random PSK of NOISE_PSK_SIZE bytes.
 inline std::array<uint8_t, NOISE_PSK_SIZE> make_random_psk() {

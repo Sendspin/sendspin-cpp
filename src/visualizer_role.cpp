@@ -271,7 +271,7 @@ void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     visualizer_state.types = this->config.stream.types;
     visualizer_state.rate_max = this->config.stream.rate_max;
     visualizer_state.spectrum = this->config.stream.spectrum;
-    msg.visualizer = std::move(visualizer_state);
+    msg.visualizer = visualizer_state;
 }
 
 // ============================================================================
@@ -312,7 +312,7 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
 // Stream lifecycle (protocol task)
 // ============================================================================
 
-void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObject& stream) {
+void VisualizerRole::Impl::handle_stream_start(ServerVisualizerStreamObject&& stream) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // Cache stream config for handle_binary (same thread) and the drain thread
     uint8_t bin_count = 0;
@@ -325,9 +325,10 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
         types_mask |= 1U << (wire_type_for(type) - SENDSPIN_BINARY_VISUALIZER_FIRST);
     }
     if (has_spectrum) {
-        // roles/visualizer/v1.md "Server -> Client: stream/start": the spectrum object is present
-        // when types includes 'spectrum' and MUST match the requested configuration. The object is
-        // reported to the listener as the server sent it, so a mismatch is logged, not rejected.
+        // roles/visualizer/v1.md "Server -> Client: stream/start": the spectrum object is sent
+        // "only if `types` includes 'spectrum'" and MUST match the requested configuration. The
+        // object is reported to the listener as the server sent it, so a mismatch is logged, not
+        // rejected.
         const std::optional<VisualizerSpectrumConfig>& requested = this->config.stream.spectrum;
         if (!stream.spectrum.has_value()) {
             SS_LOGW(TAG, "Visualizer stream/start requests the spectrum type with no spectrum "
@@ -364,7 +365,7 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
     // guaranteed to observe this config (see config_slot.take() in handle_stream_ring_event()).
     // Both carry `generation`, so a config left over from a torn-down stream is never applied.
-    this->event_state->config_slot.write(stream, generation);
+    this->event_state->config_slot.write(std::move(stream), generation);
     this->enqueue_stream_event(VisualizerEventType::STREAM_START, generation);
 }
 

@@ -73,7 +73,6 @@ namespace {
 enum class PairingNoteType : uint8_t {
     PAIRING_STARTED,
     PAIRING_SUCCEEDED,
-    TRUST_CHANGED,
     PAIRING_FAILED,
     DISPLAY_PAIRING_CODE,
     CLEAR_PAIRING_CODE,
@@ -88,18 +87,29 @@ enum class PairingPrompt : uint8_t {
     WINDOW,
 };
 
-/// @brief One deferred pairing/trust listener notification, queued by the note_*() methods on
-/// the protocol task and dispatched from the main loop's drain
+/// @brief One deferred pairing listener notification, queued by the note_*() methods on the
+/// protocol task and dispatched from the main loop's drain
 struct PairingNote {
     PairingNoteType type{};
     /// server_id for PAIRING_STARTED/SUCCEEDED/FAILED; the emitted code for
-    /// DISPLAY_PAIRING_CODE; empty otherwise.
-    std::string text{};
+    /// DISPLAY_PAIRING_CODE; empty otherwise. The drain builds the listener's std::string.
+    IdText text{};
     SendspinPairAbortReason reason{};  ///< Valid only for PAIRING_FAILED.
-    ConnectionTrust trust{};           ///< Valid only for TRUST_CHANGED.
     /// Emission format of `text`; valid only for DISPLAY_PAIRING_CODE.
     SendspinPairingCodeFormat format{};
 };
+
+static_assert(PAIRING_CODE_TOKEN_LENGTH <= PEER_ID_SIZE &&
+                  static_cast<size_t>(DYNAMIC_PAIRING_CODE_DIGITS) <= PEER_ID_SIZE,
+              "every emitted pairing code fits PairingNote::text");
+
+/// @brief Builds a note carrying `text`, a server_id or an emitted pairing code
+PairingNote make_text_note(PairingNoteType type, std::string_view text) {
+    PairingNote note{.type = type};
+    // A server_id is PEER_ID_SIZE characters, and every emitted code fits (static_assert above).
+    (void)note.text.assign(text);
+    return note;
+}
 
 /// @brief Returns the prompt `type` shows or dismisses, or PairingPrompt::NONE
 constexpr PairingPrompt prompt_of(PairingNoteType type) {
@@ -147,15 +157,15 @@ void retain_delivered_dismissals(std::vector<PairingNote>& notes) {
 /// @brief The provider writes the main loop owes, accumulated by request_persist() and
 /// note_last_played_server() and performed by flush_pending_persistence()
 struct PersistRequest {
-    /// The last-played server_id to write, when it changed since the last flush.
-    std::optional<std::string> last_played{};
+    /// The last-played server_id to write, when it changed since the last flush; empty when not.
+    IdText last_played{};
 };
 
 /// @brief Folds a later persist request into the one the drain has not taken yet: a newer
 /// last-played server replaces an older one.
 void merge_persist_request(PersistRequest& current, PersistRequest&& delta) {
-    if (delta.last_played.has_value()) {
-        current.last_played = std::move(delta.last_played);
+    if (!delta.last_played.empty()) {
+        current.last_played = delta.last_played;
     }
 }
 
@@ -168,19 +178,6 @@ struct HighPerformanceRequests {
     uint32_t acquires{0};
     uint32_t releases{0};
 };
-
-/// @brief Resolve the `locations` hint for a pair-method descriptor in client/hello.
-/// @return The hint to advertise, or nullopt to omit the field.
-///
-/// The hint is informational (pairing.md "client/hello pair-method descriptor"): only the
-/// application knows where its secret was published, so an unset value means the client has
-/// nothing to say rather than a default worth sending.
-std::optional<std::vector<std::string>> locations_hint(const std::vector<std::string>& configured) {
-    if (configured.empty()) {
-        return std::nullopt;
-    }
-    return configured;
-}
 
 /// @brief Whether `role` is in `mask`, logging the teardown once per role rather than once per
 /// call site.
@@ -209,8 +206,8 @@ struct SendspinClient::EventState {
     /// High-performance edges from the protocol task (time bursts), applied by the drain, which
     /// grants each acquire (SendspinClient::high_performance_granted_).
     InboxSlot<HighPerformanceRequests> high_performance_slot{inbox, INBOX_TOPIC_HIGH_PERFORMANCE};
-    /// Pairing/trust listener notifications, appended on the protocol task in the order they
-    /// happen and dispatched by the drain.
+    /// Pairing listener notifications, appended on the protocol task in the order they happen and
+    /// dispatched by the drain.
     InboxSlot<std::vector<PairingNote>> pairing_slot{inbox, INBOX_TOPIC_PAIRING};
     /// Bumped by stop() before its teardown so a drain frame already on the stack (a listener
     /// callback that called stop()) abandons what it has not delivered yet: the events it copied
@@ -218,20 +215,13 @@ struct SendspinClient::EventState {
     uint32_t drain_generation{0};
 
     /// @brief Appends `note` to the pairing slot. Every SendspinClient::note_*() method funnels
-    /// through this so the merge shape lives once. PairingNote is anonymous-namespace-private
-    /// to this file, so this lives on EventState (itself private to SendspinClient) rather than as
-    /// a SendspinClient member declared in the public header.
-    /// @param note The note to append (moved).
-    void push_pairing_note(PairingNote&& note) {
-        std::vector<PairingNote> delta;
-        delta.push_back(std::move(note));
-        this->pairing_slot.merge(
-            [](std::vector<PairingNote>& current, std::vector<PairingNote>&& added) {
-                for (auto& entry : added) {
-                    current.push_back(std::move(entry));
-                }
-            },
-            std::move(delta));
+    /// through this so the append lives once. PairingNote is anonymous-namespace-private to this
+    /// file, so this lives on EventState (itself private to SendspinClient) rather than as a
+    /// SendspinClient member declared in the public header.
+    /// @param note The note to append.
+    void push_pairing_note(const PairingNote& note) {
+        this->pairing_slot.update(
+            [&note](std::vector<PairingNote>& current) { current.push_back(note); });
     }
 };
 
@@ -741,8 +731,8 @@ void SendspinClient::flush_pending_persistence() {
     if (this->record_store_ != nullptr) {
         this->record_store_->persist_records();
     }
-    if (owed.last_played.has_value()) {
-        this->write_last_played_server(owed.last_played.value());
+    if (!owed.last_played.empty()) {
+        this->write_last_played_server(owed.last_played.view());
     }
 }
 
@@ -1009,9 +999,9 @@ void SendspinClient::drain_inbox() {
     // comment above for the staleness argument, which applies identically here.
     const uint32_t slot_bits = es.inbox.poll();
 
-    // --- Pairing/trust notifications, and the deferred provider writes ---
+    // --- Pairing notifications, and the deferred provider writes ---
     // After the event ring, so a role's clear can precede a pairing note queued before it. The
-    // two never describe the same listener state (role state against the pairing UI and trust).
+    // two never describe the same listener state (role state against the pairing UI).
     // The one ordering that matters is a record's provider write ahead of on_pairing_succeeded:
     // the protocol task requests the write before it queues the PAIRING_SUCCEEDED note, so the
     // flush (which polls for itself) runs after the notes are taken and before they are
@@ -1039,19 +1029,18 @@ void SendspinClient::drain_inbox() {
                 }
                 switch (note.type) {
                     case PairingNoteType::PAIRING_STARTED:
-                        this->listener_->on_pairing_started(note.text);
+                        this->listener_->on_pairing_started(std::string(note.text.view()));
                         break;
                     case PairingNoteType::PAIRING_SUCCEEDED:
-                        this->listener_->on_pairing_succeeded(note.text);
-                        break;
-                    case PairingNoteType::TRUST_CHANGED:
-                        this->listener_->on_trust_changed(note.trust);
+                        this->listener_->on_pairing_succeeded(std::string(note.text.view()));
                         break;
                     case PairingNoteType::PAIRING_FAILED:
-                        this->listener_->on_pairing_failed(note.text, note.reason);
+                        this->listener_->on_pairing_failed(std::string(note.text.view()),
+                                                           note.reason);
                         break;
                     case PairingNoteType::DISPLAY_PAIRING_CODE:
-                        this->listener_->on_display_pairing_code(note.text, note.format);
+                        this->listener_->on_display_pairing_code(std::string(note.text.view()),
+                                                                 note.format);
                         break;
                     case PairingNoteType::CLEAR_PAIRING_CODE:
                         this->listener_->on_clear_pairing_code();
@@ -1116,11 +1105,16 @@ void SendspinClient::drain_inbox() {
                 this->listener_->on_group_update(group_delta);
             }
 
-            SS_LOGD(TAG, "Group update - state: %s, id: %s, name: %s",
+            // group_name is cut to MAX_FRIENDLY_NAME_BYTES at parse, group_id only here.
+            const std::string_view id =
+                peer_text_for_log(this->group_state_.group_id.has_value()
+                                      ? std::string_view(*this->group_state_.group_id)
+                                      : std::string_view(""));
+            SS_LOGD(TAG, "Group update - state: %s, id: %.*s, name: %s",
                     this->group_state_.playback_state.has_value()
                         ? to_cstr(this->group_state_.playback_state.value())
                         : "unchanged",
-                    this->group_state_.group_id.value_or("").c_str(),
+                    static_cast<int>(id.size()), id.data(),
                     this->group_state_.group_name.value_or("").c_str());
         }
     }
@@ -1242,16 +1236,20 @@ bool SendspinClient::is_connected() const {
     return this->connection_manager_->is_connected();
 }
 
+bool SendspinClient::is_paired() const {
+    return this->connection_manager_->is_paired();
+}
+
 bool SendspinClient::is_time_synced() const {
-    // See ConnectionManager::time_filter().
-    auto filter = this->connection_manager_->time_filter();
-    return filter != nullptr && filter->has_update();
+    // See ConnectionManager::clock().
+    const std::optional<TimeTransform> clock = this->connection_manager_->clock();
+    return clock.has_value() && clock->synced;
 }
 
 int64_t SendspinClient::get_client_time(int64_t server_time) const {
-    // See ConnectionManager::time_filter().
-    auto filter = this->connection_manager_->time_filter();
-    return filter != nullptr ? filter->compute_client_time(server_time) : 0;
+    // See ConnectionManager::clock().
+    const std::optional<TimeTransform> clock = this->connection_manager_->clock();
+    return clock.has_value() ? clock->compute_client_time(server_time) : 0;
 }
 
 std::optional<ServerInformationObject> SendspinClient::get_server_information() const {
@@ -1431,32 +1429,38 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
 #endif
 }
 
-std::string SendspinClient::build_hello_message() {
+void SendspinClient::build_client_hello(ClientHelloMessage& msg) {
     // Reached only from ConnectionManager::send_hello_message(), so only for a connection, so
     // only after a successful start(): record_store_ exists and is dereferenced unguarded below.
-    ClientHelloMessage msg;
     msg.name = this->config_.name;
 
+    const auto view = [](const std::optional<std::string>& value) {
+        return value.has_value() ? std::optional<std::string_view>(value.value()) : std::nullopt;
+    };
+    DeviceInfoObject& device_info = msg.device_info.emplace();
+    device_info.product_name = view(this->config_.product_name);
+    device_info.manufacturer = view(this->config_.manufacturer);
+    device_info.software_version = view(this->config_.software_version);
     // Use the explicitly configured MAC when provided; otherwise fall back to platform detection
     // (reliable on ESP, best-effort on host). Leaves the field absent if neither is available.
-    const std::optional<std::string> interface_mac =
-        this->config_.mac_address ? this->config_.mac_address : platform_get_interface_mac();
-
-    DeviceInfoObject device_info{};
-    device_info.product_name = this->config_.product_name;
-    device_info.manufacturer = this->config_.manufacturer;
-    device_info.software_version = this->config_.software_version;
-    device_info.mac_address = interface_mac;
-    msg.device_info = device_info;
+    device_info.mac_address = view(this->config_.mac_address);
+    if (!device_info.mac_address.has_value()) {
+        if (const std::optional<MacAddressText> detected = platform_get_interface_mac()) {
+            msg.detected_mac = detected.value();
+            device_info.mac_address = msg.detected_mac.data();
+        }
+    }
 
     // pairing.md "client/hello pair-method descriptor". offers_*() is the single source both this
     // and the server/activate admissibility check read, so a method advertised here is one an
-    // activation can select. pairing_psk is always advertised (see pairing_offers.h).
+    // activation can select. pairing_psk is always advertised (see pairing_offers.h). The
+    // `locations` hint is informational: only the application knows where its secret was
+    // published, so an empty list is omitted rather than replaced by a default.
     {
         PairMethodDescriptor psk_desc;
         psk_desc.method = SendspinPairMethod::PAIRING_PSK;
-        psk_desc.locations = locations_hint(this->config_.pairing_psk_locations);
-        msg.supported_pair_methods.push_back(std::move(psk_desc));
+        psk_desc.locations = this->config_.pairing_psk_locations;
+        msg.supported_pair_methods.push_back(psk_desc);
     }
     // out_channels and formats are both required and non-empty. No `locations`: a per-session code
     // has no resting place for the operator to look it up in.
@@ -1465,15 +1469,15 @@ std::string SendspinClient::build_hello_message() {
         dynamic_desc.method = SendspinPairMethod::DYNAMIC_PAIRING_CODE;
         dynamic_desc.out_channels = this->config_.pairing_code_out_channels;
         dynamic_desc.formats = this->config_.pairing_code_formats;
-        msg.supported_pair_methods.push_back(std::move(dynamic_desc));
+        msg.supported_pair_methods.push_back(dynamic_desc);
     }
     // Offered only when the dynamic code is not: messaging.md "client/hello" permits at most one
     // pairing-code method.
     if (offers_static_pairing_code(this->config_)) {
         PairMethodDescriptor static_desc;
         static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
-        static_desc.locations = locations_hint(this->config_.static_pairing_code_locations);
-        msg.supported_pair_methods.push_back(std::move(static_desc));
+        static_desc.locations = this->config_.static_pairing_code_locations;
+        msg.supported_pair_methods.push_back(static_desc);
     }
 
     msg.unpaired_access_enabled = this->unpaired_access_enabled_.load(std::memory_order_acquire);
@@ -1515,8 +1519,6 @@ std::string SendspinClient::build_hello_message() {
         this->source_->impl_->build_hello_fields(msg);
     }
 #endif
-
-    return format_client_hello_message(&msg, *this->json_arena_);
 }
 
 // ============================================================================
@@ -1557,10 +1559,12 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // after a server/activate carries them all.
     const ClientStateMessage state_msg =
         client_state_for_roles(snapshot, entry->owned_roles & conn->get_active_role_mask());
-    conn->send_app_json(format_client_state_message(&state_msg, *this->json_arena_));
+    JsonDocument json = make_json_document(*this->json_arena_);
+    build_client_state_message(&state_msg, json);
+    conn->send_json(json);
 }
 
-void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {
+void SendspinClient::adopt_client_state(const ClientStateMessage& snapshot) {
 #ifdef SENDSPIN_ENABLE_SOURCE
     // roles/source/v1.md "Source command semantics": a source that becomes unavailable clears its
     // authorization and ends its input stream before it reports available: false.
@@ -1569,7 +1573,7 @@ void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {
             this->connection_manager_->role_owner(SendspinRole::SOURCE));
     }
 #endif
-    this->task_state_->client_state = std::move(snapshot);
+    this->task_state_->client_state = snapshot;
     this->connection_manager_->for_each_admitted(
         [this](AdmittedEntry& entry) { this->publish_client_state(entry.conn.get()); });
 }
@@ -1662,29 +1666,34 @@ void SendspinClient::load_last_played_server() {
         SS_LOGI(TAG, "Loaded last played server: %s", server_id.c_str());
     }
 }
-void SendspinClient::note_last_played_server(const std::string& server_id) {
+
+void SendspinClient::note_last_played_server(std::string_view server_id) {
     if (server_id.empty() || server_id == this->connection_manager_->last_played_server_id()) {
         return;
     }
-    SS_LOGD(TAG, "Last played server is now %s", server_id.c_str());
-    this->connection_manager_->set_last_played_server_id(server_id);
     PersistRequest request;
-    request.last_played = server_id;
-    this->event_state_->persist_slot.merge(merge_persist_request, std::move(request));
+    // A server_id is a peer_id, which IdText always holds.
+    if (!request.last_played.assign(server_id)) {
+        return;
+    }
+    SS_LOGD(TAG, "Last played server is now %s", request.last_played.c_str());
+    this->connection_manager_->set_last_played_server_id(server_id);
+    this->event_state_->persist_slot.merge(merge_persist_request, request);
 }
 
-void SendspinClient::write_last_played_server(const std::string& server_id) {
+void SendspinClient::write_last_played_server(std::string_view server_id) {
     if (this->persistence_provider_) {
         // The handshake admits only a server_id that is a canonical public key.
         auto key = public_key_from_peer_id(server_id);
         if (!key.has_value()) {
-            SS_LOGW(TAG, "Not persisting last played server %s: not a public key",
-                    server_id.c_str());
+            SS_LOGW(TAG, "Not persisting last played server %.*s: not a public key",
+                    static_cast<int>(server_id.size()), server_id.data());
             return;
         }
         if (this->persistence_provider_->save_blob(persistence_keys::LAST_PLAYED, key->data(),
                                                    key->size())) {
-            SS_LOGD(TAG, "Persisted last played server: %s", server_id.c_str());
+            SS_LOGD(TAG, "Persisted last played server: %.*s", static_cast<int>(server_id.size()),
+                    server_id.data());
         } else {
             SS_LOGW(TAG, "Failed to persist last played server");
         }
@@ -1706,13 +1715,6 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     this->note_pairing_ui_dismissals(pairing_ui);
 
     this->publish_client_state(conn);
-
-    // Report the trust level of the newly operational connection; the listener hears it from
-    // the main loop's drain.
-    ConnectionTrust trust = (conn->get_psk_category() == PskCategory::LONG_TERM)
-                                ? ConnectionTrust::USER
-                                : ConnectionTrust::NONE;
-    this->note_trust_changed(trust);
 }
 
 void SendspinClient::apply_role_removals([[maybe_unused]] SendspinConnection* conn,
@@ -1779,26 +1781,28 @@ void SendspinClient::on_activation_applied([[maybe_unused]] SendspinConnection* 
 #endif
 }
 
-void SendspinClient::note_pairing_started(const std::string& server_id) {
+void SendspinClient::note_pairing_started(std::string_view server_id) {
     this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::PAIRING_STARTED, .text = server_id});
+        make_text_note(PairingNoteType::PAIRING_STARTED, server_id));
 }
 
-void SendspinClient::note_pairing_succeeded(const std::string& server_id) {
+void SendspinClient::note_pairing_succeeded(std::string_view server_id) {
     this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::PAIRING_SUCCEEDED, .text = server_id});
+        make_text_note(PairingNoteType::PAIRING_SUCCEEDED, server_id));
 }
 
-void SendspinClient::note_pairing_failed(const std::string& server_id,
+void SendspinClient::note_pairing_failed(std::string_view server_id,
                                          SendspinPairAbortReason reason) {
-    this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::PAIRING_FAILED, .text = server_id, .reason = reason});
+    PairingNote note = make_text_note(PairingNoteType::PAIRING_FAILED, server_id);
+    note.reason = reason;
+    this->event_state_->push_pairing_note(note);
 }
 
-void SendspinClient::note_display_pairing_code(const std::string& code,
+void SendspinClient::note_display_pairing_code(std::string_view code,
                                                SendspinPairingCodeFormat format) {
-    this->event_state_->push_pairing_note(
-        {.type = PairingNoteType::DISPLAY_PAIRING_CODE, .text = code, .format = format});
+    PairingNote note = make_text_note(PairingNoteType::DISPLAY_PAIRING_CODE, code);
+    note.format = format;
+    this->event_state_->push_pairing_note(note);
 }
 
 void SendspinClient::note_clear_pairing_code() {
@@ -1820,10 +1824,6 @@ void SendspinClient::note_pairing_ui_dismissals(const PairingUiSnapshot& ui) {
     if (ui.window_was_shown) {
         this->note_close_pairing_window();
     }
-}
-
-void SendspinClient::note_trust_changed(ConnectionTrust trust) {
-    this->event_state_->push_pairing_note({.type = PairingNoteType::TRUST_CHANGED, .trust = trust});
 }
 
 void SendspinClient::confirm_pairing_window() {

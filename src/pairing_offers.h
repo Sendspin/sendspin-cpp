@@ -15,7 +15,7 @@
 /// @file pairing_offers.h
 /// @brief Which pairing methods and emission formats the client currently offers.
 ///
-/// One answer serves two callers that must never disagree: `build_hello_message()` fills
+/// One answer serves two callers that must never disagree: `build_client_hello()` fills
 /// `supported_pair_methods` from these predicates (pairing.md "client/hello pair-method
 /// descriptor"), and the `server/activate` admissibility check answers
 /// `pair/abort(method_not_supported)` for anything they leave out (messaging.md

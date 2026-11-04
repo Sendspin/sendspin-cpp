@@ -133,7 +133,7 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted frame; `data` points at its message type byte.
     void handle_binary(uint8_t binary_type, InboundMessage& message);
-    void handle_stream_start(const ServerVisualizerStreamObject& stream);
+    void handle_stream_start(ServerVisualizerStreamObject&& stream);
     void handle_stream_end();
     void handle_stream_clear();
     /// @brief Fires the listener callback for a current stream event. Main loop.
@@ -181,6 +181,8 @@ struct VisualizerRole::Impl : RoleTeardown {
     // ========================================
 
     // Struct fields
+    /// Fixed at construction: client/state snapshots view its stream types
+    /// (ClientVisualizerStateObject::types).
     VisualizerRoleConfig config;
     VisualizerSupportObject visualizer_support;
 

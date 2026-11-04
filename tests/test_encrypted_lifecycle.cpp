@@ -33,6 +33,7 @@
 #include "inbound_ring.h"
 #include "inbox.h"
 #include "lifecycle_test_fixtures.h"
+#include "log_capture.h"
 #include "platform/crypto.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
@@ -226,16 +227,11 @@ private:
     std::optional<SendspinPairingRecord> seeded_long_term_record_;
 };
 
-// Records on_trust_changed / on_pairing_succeeded notifications so the pairing-flow test can
-// assert both that pairing was reported successful and that trust was later upgraded to USER
-// once the post-pairing re-handshake completes. Callbacks fire from SendspinClient::loop() on
-// the test thread (see EventState's dispatch block), so no locking is needed here.
+// Records the pairing notifications so the pairing-flow test can assert that pairing was reported
+// successful, and in which order. Callbacks fire from SendspinClient::loop() on the test thread
+// (see EventState's dispatch block), so no locking is needed here.
 class RecordingClientListener : public SendspinClientListener {
 public:
-    void on_trust_changed(ConnectionTrust trust) override {
-        this->trust_history_.push_back(trust);
-    }
-
     void on_pairing_started(const std::string& server_id) override {
         this->pairing_started_server_id_ = server_id;
         this->pairing_started_seq_ = this->next_seq_++;
@@ -255,20 +251,6 @@ public:
     void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
         this->pairing_failed_server_id_ = server_id;
         this->pairing_failed_reason_ = reason;
-    }
-
-    /// The trust reported last, or NONE before any report.
-    ConnectionTrust last_trust() const {
-        return this->trust_history_.empty() ? ConnectionTrust::NONE : this->trust_history_.back();
-    }
-
-    bool trust_ever_reached(ConnectionTrust trust) const {
-        for (const auto& t : this->trust_history_) {
-            if (t == trust) {
-                return true;
-            }
-        }
-        return false;
     }
 
     const std::optional<std::string>& pairing_started_server_id() const {
@@ -298,7 +280,6 @@ public:
     }
 
 private:
-    std::vector<ConnectionTrust> trust_history_;
     size_t next_seq_{0};
     std::optional<size_t> pairing_started_seq_;
     std::optional<size_t> pairing_succeeded_seq_;
@@ -360,7 +341,7 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     EXPECT_EQ(server.client_hello_count(), 1);
 
     // Trigger the in-band re-handshake on the ADMITTED connection (same PSK: this test isolates
-    // resumption from trust change, which is covered separately below).
+    // resumption from a change of PSK, which is covered separately below).
     ASSERT_TRUE(server.trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
 
     // The post-swap server/activate alone brings it back. The evidence is monotonic: the client
@@ -447,7 +428,7 @@ TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
 }
 
 // Negative path: a post-re-handshake server/activate that the new PSK category cannot admit must
-// still go through the existing inadmissible-activate drop path (trust enforcement applies
+// still go through the existing inadmissible-activate drop path (the admissibility check applies
 // identically whether the activate follows the initial handshake or a re-handshake), closing with
 // the correct client/goodbye reason.
 TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
@@ -539,8 +520,8 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
 // client/pair-finalize, the server acks, the client persists the record, and then, exactly like a
 // real server immediately rekeying onto the new PSK, the fake server triggers an in-band
 // re-handshake with the learned psk_id/psk. The connection must resume operational under the new
-// session with trust upgraded from PAIRING to USER (LONG_TERM).
-TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
+// session, now paired: keyed by the long-term PSK instead of the Pairing PSK it started on.
+TEST(EncryptedLifecycle, PairingPskFlowPersistsAndPairsTheSession) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
     // The Pairing PSK the operator "typed in" (e.g. via a pairing token): known to both the
@@ -637,18 +618,14 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     auto learned_psk = server.learned_psk();
     auto learned_psk_id = server.learned_psk_id();
     ASSERT_TRUE(learned_psk.has_value() && learned_psk_id.has_value());
+    EXPECT_FALSE(client.is_paired()) << "the session on the Pairing PSK read as paired";
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
-    // The connection must resume operational under the new session, now with LONG_TERM/USER trust
-    // instead of the PAIRING/none trust it started with. Waited for with no timeout: is_connected()
-    // still reads true from before the re-handshake until a tick refreshes it, so only the trust
-    // the re-activation reports tells the new session apart, and a trust that is never upgraded
+    // The connection must resume operational under the new, paired session. Waited for with no
+    // timeout: is_connected() still reads true from before the re-handshake until a tick refreshes
+    // it, so only is_paired() tells the new session apart, and a session that never becomes paired
     // hangs here for the suite watchdog to name.
-    pump_until(client, [&] {
-        return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
-    });
-    EXPECT_EQ(listener.last_trust(), ConnectionTrust::USER)
-        << "the rekeyed connection's trust must be the one reported last";
+    pump_until(client, [&] { return client.is_paired() && client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
@@ -659,7 +636,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 }
 
 // Regression test for the "re-pair an already-connected client" bug: Music Assistant can
-// token-pair a client that is already admitted and operational (LONG_TERM trust). The server
+// token-pair a client that is already admitted and operational (a paired session). The server
 // does this by in-band re-handshaking the LIVE connection onto the Pairing PSK, which resets
 // first_activate_received_ exactly like any other re-handshake, then sends a fresh
 // server/activate declaring ["pairing"] with pairing.method=pairing_psk. That activate looks
@@ -718,9 +695,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                long_term_peer.record.psk_id, long_term_peer.psk, options);
 
-    pump_until(client, [&] {
-        return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
-    });
+    pump_until(client, [&] { return client.is_paired() && client.is_connected(); });
 
     // Becoming operational the first time legitimately sends one client/state; only traffic
     // AFTER this point is what the regression check below cares about. Pump a little longer to
@@ -734,6 +709,9 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     // is already streaming).
     ASSERT_TRUE(server.trigger_rehandshake(stored_pairing_psk.psk_id, pairing_psk_bytes, "pr"))
         << "Failed to start the in-band re-handshake onto the pairing PSK";
+    // The session on the Pairing PSK is no longer paired. Waited for with no timeout: a flag that
+    // stays true hangs here for the suite watchdog to name.
+    pump_until(client, [&] { return !client.is_paired(); });
 
     // The fixed client must reply with client/pair-finalize instead of hard-stalling; the
     // pre-fix client never sends it (it sends client/state instead, which a real server treats
@@ -776,7 +754,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
 // Fail-open persistence: when the persistence provider rejects the pair-finalize record write
 // (e.g. storage full, write error), the pairing still completes for this boot. The RAM commit on
 // the protocol task is what the server's follow-up re-handshake resolves, so the connection
-// rekeys and upgrades trust exactly like the happy path; the rejected write happens later, at
+// rekeys onto the long-term PSK exactly like the happy path; the rejected write happens later, at
 // the deferred flush from loop() (where the provider is main-loop-only), and costs only a logged
 // durability warning: the record is lost at the next reboot. This is deliberate: a provider that
 // cannot write will not be fixed by aborting the pairing, so the device stays usable until
@@ -786,7 +764,7 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
     persistence.set_reject_pairing_records(true);
-    // As in PairingPskFlowPersistsAndUpgradesTrust: the fake server must connect using an
+    // As in PairingPskFlowPersistsAndPairsTheSession: the fake server must connect using an
     // accepted Pairing PSK directly (PskCategory::PAIRING), not Sentinel, now that the client
     // enforces pairing.method=pairing_psk iff the matched PSK IS the Pairing PSK.
     std::array<uint8_t, 32> pairing_psk_bytes{};
@@ -836,7 +814,7 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
 
     // Rekey onto the new PSK, exactly like the real server does immediately after acking
     // pair-finalize. Unlike the retired fail-closed contract, the client CAN resolve the psk_id
-    // (the record is in RAM), so the re-handshake succeeds and trust upgrades to USER; only a
+    // (the record is in RAM), so the re-handshake succeeds and the session becomes paired; only a
     // reboot loses the pairing.
     auto learned_psk = server.learned_psk();
     auto learned_psk_id = server.learned_psk_id();
@@ -844,13 +822,10 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
     // Waited for with no timeout: is_connected() still reads true from before the re-handshake
-    // until a tick refreshes it, so only the trust the re-activation reports tells the new session
-    // apart, and a trust that is never upgraded hangs here for the suite watchdog to name.
-    pump_until(client, [&] {
-        return listener.trust_ever_reached(ConnectionTrust::USER) && client.is_connected();
-    });
-    EXPECT_EQ(listener.last_trust(), ConnectionTrust::USER)
-        << "Trust must upgrade to USER on the RAM-committed record";
+    // until a tick refreshes it, so only is_paired() tells the new session apart, and a session
+    // that never becomes paired on the RAM-committed record hangs here for the suite watchdog to
+    // name.
+    pump_until(client, [&] { return client.is_paired() && client.is_connected(); });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1883,9 +1858,8 @@ public:
     /// every role this fixture drives.
     DispatchTestConnection() {
         this->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    std::vector<std::string>{"player@v1", "controller@v1",
-                                                             "metadata@v1", "color@v1",
-                                                             "artwork@v1", "visualizer@v1"},
+                                    ActiveRoles{"player@v1", "controller@v1", "metadata@v1",
+                                                "color@v1", "artwork@v1", "visualizer@v1"},
                                     std::nullopt, std::nullopt);
     }
 
@@ -1895,7 +1869,7 @@ public:
     bool is_connected() const override {
         return true;
     }
-    SsErr send_text_message(const std::string& /*msg*/) override {
+    SsErr send_text_message(const char* /*text*/, size_t /*len*/) override {
         return SsErr::OK;
     }
     SsErr send_binary_message(const uint8_t* /*data*/, size_t /*len*/) override {
@@ -2115,6 +2089,21 @@ TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
     EXPECT_EQ(admitted.time_frame_tag_, 0U) << "the reply to the frame in flight takes it";
 
     client.stop();
+}
+
+// Any connection keyed with the published Sentinel PSK can send a message of a type no handler
+// takes; its warning prints at most PEER_TEXT_LOG_BYTES of that type.
+TEST(EncryptedLifecycle, AnUnhandledTypeIsLoggedOnlyUpToTheBound) {
+    DispatchTestClient bundle("Unhandled Type Log Test Client");
+    DispatchTestConnection& conn = bundle.connection();
+
+    const std::string type(4 * PEER_TEXT_LOG_BYTES, 'x');
+    StderrCapture capture;
+    bundle.deliver(conn, R"({"type":")" + type + R"("})");
+    const std::string log = capture.release();
+    EXPECT_NE(log.find(type.substr(0, PEER_TEXT_LOG_BYTES)), std::string::npos)
+        << "Control: the type is logged at all: " << log;
+    EXPECT_EQ(log.find(type.substr(0, PEER_TEXT_LOG_BYTES + 1)), std::string::npos) << log;
 }
 
 // messaging.md "server/state": each metadata object carries the role's full state, so what a
@@ -2470,11 +2459,12 @@ TEST(EncryptedLifecycle, RoleDispatchFollowsOwnership) {
 /// A stand-in that keeps every client/state it is asked to send.
 class StateCapturingConnection : public DispatchTestConnection {
 public:
-    SsErr send_text_message(const std::string& msg) override {
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         if (msg.find("client/state") != std::string::npos) {
             this->states.push_back(msg);
         }
-        return DispatchTestConnection::send_text_message(msg);
+        return DispatchTestConnection::send_text_message(text, len);
     }
 
     std::vector<std::string> states;
@@ -2541,7 +2531,8 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
     size_t smallest_reply_peak = 0;
     {
         SendspinArenaAllocator alone(ARENA_BYTES);
-        format_client_leave_message(alone);
+        JsonDocument leave = make_json_document(alone);
+        build_client_leave_message(leave);
         smallest_reply_peak = alone.high_water();
     }
 
@@ -2549,8 +2540,8 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
     auto conn = std::make_shared<StateCapturingConnection>();
     // A paired server, whose playback activations are admissible (the stand-in's default Sentinel
     // category would have the activate dropped instead).
-    conn->set_noise_handshake_result(test_peer_id("arena-release-server"), PskCategory::LONG_TERM,
-                                     "arena-release-psk-id");
+    conn->set_noise_handshake_result(id_text(test_peer_id("arena-release-server")),
+                                     PskCategory::LONG_TERM, id_text("arena-release-psk-id"));
     conn->set_client_hello_sent(true);
     conn->set_server_hello_received(true);
     conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
@@ -2577,11 +2568,12 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
 // admitted slot at that moment.
 class StateRecordingConnection : public DispatchTestConnection {
 public:
-    SsErr send_text_message(const std::string& msg) override {
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         if (msg.find("client/state") != std::string::npos) {
             this->state_sent_while_admitted.push_back(this->is_admitted());
         }
-        return DispatchTestConnection::send_text_message(msg);
+        return DispatchTestConnection::send_text_message(text, len);
     }
 
     std::vector<bool> state_sent_while_admitted;
@@ -2604,7 +2596,7 @@ public:
 TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitted) {
     struct Row {
         const char* label;
-        std::vector<SendspinActivity> activities;
+        ActivitySet activities;
         std::optional<SendspinPairMethod> pairing_method;
     };
     const Row rows[] = {
@@ -2625,14 +2617,14 @@ TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitte
         if (row.pairing_method.has_value()) {
             const auto& pairing_psk = bundle.client_ref().record_store_->pairing_psk();
             ASSERT_TRUE(pairing_psk.has_value());
-            conn->set_noise_handshake_result(test_peer_id("state-after-admission-server"),
-                                             PskCategory::PAIRING, pairing_psk->psk_id);
+            conn->set_noise_handshake_result(id_text(test_peer_id("state-after-admission-server")),
+                                             PskCategory::PAIRING, id_text(pairing_psk->psk_id));
             // The count the activate-event drain takes for every pairing server/activate.
             conn->bump_pairing_index();
         }
         // No player in the active set: an active player's state also waits for clock sync, which
         // lands after admission by itself and would hide the gate under test.
-        conn->apply_server_activate(row.activities, std::vector<std::string>{"metadata@v1"},
+        conn->apply_server_activate(row.activities, ActiveRoles{"metadata@v1"},
                                     row.pairing_method, std::nullopt);
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
@@ -2868,8 +2860,8 @@ TEST(EncryptedLifecycle, SeveralRecordChangesInOneTickWriteEachTouchedKeyOnce) {
     const size_t writes_before = record_writes(persistence);
 
     DispatchTestConnection conn;
-    conn.set_noise_handshake_result(unpairing_record.server_id, PskCategory::LONG_TERM,
-                                    unpairing_record.psk_id);
+    conn.set_noise_handshake_result(id_text(unpairing_record.server_id), PskCategory::LONG_TERM,
+                                    id_text(unpairing_record.psk_id));
     {
         // What note_playback_activity() does when a long-term connection takes playback.
         EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
@@ -2922,7 +2914,8 @@ TEST(EncryptedLifecycle, APlaybackThatMovesNothingWritesNothing) {
     ConnectionManager& manager = *client.connection_manager_;
 
     auto conn = std::make_shared<DispatchTestConnection>();
-    conn->set_noise_handshake_result(older.server_id, PskCategory::LONG_TERM, older.psk_id);
+    conn->set_noise_handshake_result(id_text(older.server_id), PskCategory::LONG_TERM,
+                                     id_text(older.psk_id));
     conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                 std::nullopt);
 
@@ -2982,7 +2975,8 @@ TEST(EncryptedLifecycle, AnEvictionBeforeTheFlushSparesTheRecordJustPlayed) {
     ConnectionManager& manager = *client.connection_manager_;
 
     auto conn = std::make_shared<DispatchTestConnection>();
-    conn->set_noise_handshake_result(played.server_id, PskCategory::LONG_TERM, played.psk_id);
+    conn->set_noise_handshake_result(id_text(played.server_id), PskCategory::LONG_TERM,
+                                     id_text(played.psk_id));
     conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                 std::nullopt);
     {
@@ -3104,8 +3098,8 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
     ConnectionManager& manager = *client.connection_manager_;
 
     auto conn = std::make_shared<DispatchTestConnection>();
-    conn->set_noise_handshake_result(server_identity.peer_id(), PskCategory::SENTINEL,
-                                     /*psk_id=*/"");
+    conn->set_noise_handshake_result(id_text(server_identity.peer_id()), PskCategory::SENTINEL,
+                                     /*psk_id=*/IdText{});
     conn->apply_server_activate({}, std::nullopt, std::nullopt, std::nullopt);
     {
         manager.install_admitted(conn, conn->get_active_role_mask());
@@ -3150,7 +3144,7 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
 TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
     struct Row {
         const char* name;
-        std::vector<SendspinActivity> activities;
+        ActivitySet activities;
         bool admitted;
         std::vector<uint8_t> expected_order;
     };
@@ -3184,7 +3178,8 @@ TEST(EncryptedLifecycle, OnlyPlaybackOnTheAdmittedConnectionMovesRecency) {
         ConnectionManager& manager = *client.connection_manager_;
 
         auto conn = std::make_shared<DispatchTestConnection>();
-        conn->set_noise_handshake_result(older.server_id, PskCategory::LONG_TERM, older.psk_id);
+        conn->set_noise_handshake_result(id_text(older.server_id), PskCategory::LONG_TERM,
+                                         id_text(older.psk_id));
         conn->apply_server_activate(row.activities, std::nullopt, std::nullopt, std::nullopt);
         {
             if (row.admitted) {
@@ -3299,8 +3294,8 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     reject_record_saves(persistence);
 
     DispatchTestConnection conn;
-    conn.set_noise_handshake_result(unpairing_record.server_id, PskCategory::LONG_TERM,
-                                    unpairing_record.psk_id);
+    conn.set_noise_handshake_result(id_text(unpairing_record.server_id), PskCategory::LONG_TERM,
+                                    id_text(unpairing_record.psk_id));
     {
         // What note_playback_activity() does when a long-term connection takes playback.
         EXPECT_TRUE(client.record_store_->note_record_played(played_record.psk_id));
@@ -3344,7 +3339,8 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     ASSERT_TRUE(client.record_store_->store_record_superseding(record, {}));
 
     DispatchTestConnection conn;
-    conn.set_noise_handshake_result(record.server_id, PskCategory::LONG_TERM, record.psk_id);
+    conn.set_noise_handshake_result(id_text(record.server_id), PskCategory::LONG_TERM,
+                                    id_text(record.psk_id));
     manager.handle_server_unpair(&conn);
     // The re-handshake's lookup, on the protocol task (this thread) right behind the handler.
     const std::optional<ResolvedPsk> resolved =
@@ -3376,11 +3372,12 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
 
-    // The Sentinel PSK admits an unpaired server (ConnectionTrust::NONE).
+    // The Sentinel PSK admits an unpaired server, whose session is not paired.
     FakeEncryptedServer server(server_url(UNPAIR_SENTINEL_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), sentinel_identity,
                                std::string(SENTINEL_PSK_ID), SENTINEL_PSK);
     pump_until(client, [&] { return client.is_connected(); });
+    EXPECT_FALSE(client.is_paired()) << "the Sentinel session read as paired";
 
     ASSERT_TRUE(server.send_app_json(R"({"type":"server/unpair","payload":{}})"));
     // Must-not-happen window: the drop an acted-on unpair would perform runs on the main loop a
@@ -3407,7 +3404,7 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
 //
 // A connection resolves its psk_id and PSK category once, at Noise-handshake completion, and never
 // re-checks them against the RecordStore, so deleting the record alone does not stop a second
-// session holding the same credential: it would keep its LONG_TERM trust, and with it playback,
+// session holding the same credential: it would stay a paired session, and with it keep playback,
 // until it happened to disconnect on its own.
 TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
     // One paired record, two sessions on it: the admitted one (A) and a nursery entry (B).

@@ -149,13 +149,13 @@ bool SendspinClientConnection::is_connected() const {
     return this->connected_;
 }
 
-SsErr SendspinClientConnection::send_text_message(const std::string& message) {
+SsErr SendspinClientConnection::send_text_message(const char* text, size_t len) {
     if (!this->is_connected()) {
         return SsErr::INVALID_STATE;
     }
 
     // esp_websocket_client_send_text is synchronous in the current task
-    int sent = esp_websocket_client_send_text(this->client_, message.c_str(), message.length(),
+    int sent = esp_websocket_client_send_text(this->client_, text, static_cast<int>(len),
                                               pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
     if (sent < 0) {
         SS_LOGE(TAG, "Failed to send text message (timeout or error): %d", sent);

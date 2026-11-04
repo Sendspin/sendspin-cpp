@@ -46,9 +46,9 @@ extern "C" {
 #include <array>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -59,7 +59,7 @@ namespace sendspin {
 // ============================================================================
 
 /// @brief Concrete SendspinConnection that captures sent binary frames.
-/// Used to verify encrypt_and_send_frame / fragment_and_send output without a real WS socket.
+/// Used to verify encrypt_and_send_frame output without a real WS socket.
 class TestConnection : public SendspinConnection {
 public:
     TestConnection() = default;
@@ -76,7 +76,8 @@ public:
     }
     bool is_connected() const override { return true; }
 
-    SsErr send_text_message(const std::string& msg) override {
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         sent_text_.push_back(msg);
         return SsErr::OK;
     }
@@ -140,16 +141,9 @@ public:
     std::function<void(InboundMessage& message)> on_binary;
 
     /// Install a noise session directly (bypasses handshake, for transport-only tests).
-    void set_noise_session(std::unique_ptr<NoiseSession> session) {
-        this->noise_transport_.activate(std::move(session));
+    void set_noise_session(std::optional<NoiseSession>&& session) {
+        this->noise_transport_.activate(std::move(session.value()));
         this->noise_handshake_complete_ = true;
-    }
-
-    /// Direct access to NoiseTransport::send_binary() for tests exercising the binary send
-    /// path (there is no connection-level wrapper; production code has no client-to-server
-    /// binary message today).
-    SsErr test_send_binary(const uint8_t* data, size_t len) {
-        return this->noise_transport_.send_binary(data, len);
     }
 
     // Accumulated outgoing messages
@@ -174,7 +168,7 @@ public:
 /// Build and return `server/init` JSON for the given server_id and version. `type` is a
 /// parameter so a test can send the same payload under another envelope type.
 inline std::string make_server_init(const std::string& server_id, int version = 1,
-                                    const char* type = "server/init") {
+                                    std::string_view type = "server/init") {
     JsonDocument doc;
     doc["type"] = type;
     doc["payload"]["server_id"] = server_id;
@@ -220,10 +214,10 @@ inline std::optional<std::vector<uint8_t>> extract_noise_bytes(const std::string
 /// The "server" side is noise-c as initiator.
 /// The "client" side is our NoiseHandshake/NoiseSession as responder.
 ///
-/// Returns the initiator cipher pair after split (for transport tests), or nullptr on failure.
+/// Returns the initiator cipher pair after split (for transport tests), or nullopt on failure.
 struct LoopbackResult {
     CipherPair initiator;
-    std::unique_ptr<NoiseSession> responder_session;
+    std::optional<NoiseSession> responder_session;
 
     LoopbackResult() = default;
     LoopbackResult(LoopbackResult&&) = default;
@@ -253,9 +247,10 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     // -----------------------------------------------------------------
     TestArena arena;
     NoiseHandshake nh(client_id, rs, suite_name.c_str(), arena);
+    std::optional<NoiseHandshakeResult> completed;
 
     // Step 1: client sends client/init
-    std::string client_init = nh.build_client_init();
+    std::string client_init(nh.build_client_init());
     EXPECT_FALSE(client_init.empty());
 
     // Verify client/init JSON format
@@ -284,12 +279,12 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
 
     // Our driver processes server/init
     std::string captured_msg2;
-    auto send_fn = [&captured_msg2](const std::string& text) -> bool {
-        captured_msg2 = text;
+    auto send_fn = [&captured_msg2](const JsonDocument& msg) -> bool {
+        captured_msg2 = to_text(msg);
         return true;
     };
 
-    HandshakeFrameResult r1 = nh.on_text_frame(server_init_text, send_fn);
+    HandshakeFrameResult r1 = nh.on_text_frame(server_init_text, send_fn, completed);
     EXPECT_EQ(r1, HandshakeFrameResult::NEED_MORE);
     EXPECT_TRUE(captured_msg2.empty());  // No msg2 yet
 
@@ -317,7 +312,7 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     // Step 4: our driver processes msg1
     // on_text_frame should: decrypt msg1, resolve PSK, write msg2, return COMPLETE
     // -----------------------------------------------------------------
-    HandshakeFrameResult r2 = nh.on_text_frame(msg1_text, send_fn);
+    HandshakeFrameResult r2 = nh.on_text_frame(msg1_text, send_fn, completed);
     EXPECT_EQ(r2, HandshakeFrameResult::COMPLETE);
     EXPECT_FALSE(captured_msg2.empty()) << "Expected msg2 to be sent";
 
@@ -358,16 +353,14 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
               NOISE_ERROR_NONE);
     // noise_handshakestate_split does not free the hs; the guard destructor will free it.
 
-    auto outcome = nh.take_result();
-    EXPECT_TRUE(outcome.has_value());
-    if (!outcome.has_value()) {
+    EXPECT_TRUE(completed.has_value());
+    if (!completed.has_value()) {
         return std::nullopt;
     }
-    EXPECT_TRUE(outcome->session != nullptr);
-    EXPECT_FALSE(outcome->server_id.empty());
-    EXPECT_EQ(outcome->server_id, server_id.peer_id());
+    EXPECT_FALSE(completed->server_id.empty());
+    EXPECT_EQ(completed->server_id, server_id.peer_id());
 
-    result.responder_session = std::move(outcome->session);
+    result.responder_session = std::move(completed->session);
     return result;
 }
 

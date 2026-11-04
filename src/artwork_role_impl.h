@@ -32,7 +32,6 @@
 #include <optional>
 #include <thread>
 #include <type_traits>
-#include <vector>
 
 namespace sendspin {
 
@@ -44,9 +43,6 @@ struct ClientStateMessage;
 enum class ArtworkEventType : uint8_t {
     STREAM_END,
 };
-
-/// @brief Maximum number of artwork slots (2-bit slot field in protocol binary type byte)
-static constexpr size_t ARTWORK_MAX_SLOTS = 4;
 
 /// @brief Ack-gate state for a slot with require_frame_done enabled
 enum class SlotAckState : uint8_t {
@@ -381,14 +377,15 @@ struct ArtworkRole::Impl : RoleTeardown {
 
     // Struct fields
     ArtworkRoleConfig config;
-    std::vector<ArtworkChannelFormatObject> artwork_channels;
+    /// Fixed at construction: client/state snapshots view it (ClientArtworkStateObject::channels).
+    InlineVector<ArtworkChannelFormatObject, ARTWORK_MAX_SLOTS> artwork_channels;
     // Protocol task only (or the main loop in stop() once it is joined); see ArtworkTransfer.
     ArtworkTransfer transfer;
     // The channel array of the stream/start in force, kept so the next one can be compared
     // against it: only the channels whose configuration changes lose their pending image.
     // Protocol task only, like `transfer`: written by handle_stream_start() and cleared by
     // discard_all_pending().
-    std::optional<std::vector<ServerArtworkChannelObject>> streamed_channels;
+    std::optional<InlineVector<ServerArtworkChannelObject, ARTWORK_MAX_SLOTS>> streamed_channels;
 
     // Pointer fields
     SendspinClient* client;

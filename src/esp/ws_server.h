@@ -17,19 +17,20 @@
 
 #pragma once
 
+#include "inline_vector.h"
 #include "platform/memory.h"
 #include "sendspin/config.h"
 #include "server_connection.h"
 #include <esp_err.h>
 #include <esp_http_server.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <utility>
-#include <vector>
 
 namespace sendspin {
 
@@ -39,8 +40,8 @@ class SendspinConnection;
 
 /// @brief An accepted httpd session whose WebSocket upgrade has not yet been observed.
 ///
-/// The session slot (httpd_sess_set_ctx) remains the authoritative owner of the connection;
-/// this entry's shared_ptr is dropped when the session is delivered, closed, or reaped.
+/// The session slot (SendspinWsServer::sessions_) remains the authoritative owner of the
+/// connection; this entry's shared_ptr is dropped when the session is delivered, closed, or reaped.
 struct PendingUpgrade {
     std::shared_ptr<SendspinServerConnection> conn;  ///< Parallel refcount to the session slot
     int64_t accept_time_us{0};                       ///< Accept stamp for the upgrade deadline
@@ -52,8 +53,9 @@ struct PendingUpgrade {
  *
  * Manages the ESP-IDF httpd that listens for incoming WebSocket connections. The authoritative
  * owner of each accepted SendspinServerConnection is the httpd session: open_callback() pins a
- * shared_ptr via httpd_sess_set_ctx with a free_fn deleter, and the handlers look it back up
- * with httpd_sess_get_ctx. The protocol task holds the same shared_ptr as a secondary observer.
+ * shared_ptr in a session slot (sessions_) set via httpd_sess_set_ctx, whose free_fn resets it,
+ * and the handlers look it back up with httpd_sess_get_ctx. The protocol task holds the same
+ * shared_ptr as a secondary observer.
  *
  * Delivery contract: a connection reaches the NewConnectionCallback only once its WebSocket
  * upgrade has been observed in the HTTP_GET branch of websocket_handler, so the rest of the
@@ -69,6 +71,11 @@ class SendspinWsServer {
 public:
     SendspinWsServer() = default;
     ~SendspinWsServer();
+
+    /// @brief Most httpd sessions open at once: the cap start() puts on max_open_sockets, and the
+    /// size of the session slots and the pending table. httpd's default max_open_sockets, the
+    /// most its default CONFIG_LWIP_MAX_SOCKETS of 10 allows beside its 3 internal sockets.
+    static constexpr uint8_t MAX_SESSIONS = 7;
 
     /// @brief Callback type for notifying the client of new connections, on the httpd task
     ///
@@ -108,7 +115,8 @@ public:
     /// The default supports handoff plus graceful rejection: one established connection, the
     /// manager's nursery, and one spare socket so a surplus peer can receive a goodbye (see
     /// ConnectionManager::NURSERY_CAPACITY's socket-budget invariant).
-    /// @param max_connections Maximum number of open sockets (1-7).
+    /// @param max_connections Maximum number of open sockets, 1 to MAX_SESSIONS; start() clamps a
+    ///        larger one.
     void set_max_connections(uint8_t max_connections) {
         this->max_connections_ = max_connections;
     }
@@ -170,8 +178,13 @@ public:
 
 protected:
     /// @brief Callback invoked when a new client opens a connection; creates a
-    /// SendspinServerConnection and adds it to the pending table.
+    /// SendspinServerConnection in a free session slot and adds it to the pending table.
+    /// @return ESP_FAIL, which makes httpd close the session, when no callback is set, no slot is
+    ///         free or the connection cannot be allocated.
     static esp_err_t open_callback(httpd_handle_t handle, int sockfd);
+
+    /// @brief httpd's free_fn for a session context: resets the session slot, freeing it
+    static void release_session_slot(void* slot);
 
     /// @brief Callback invoked when a client closes a connection: marks the connection closed and
     /// tells it its transport closed (SendspinConnection::notify_transport_closed())
@@ -198,8 +211,23 @@ protected:
     /// only for table mutation/scan; delivery and closing happen outside it.
     std::mutex pending_mutex_;
 
-    /// @brief Accepted sessions whose WebSocket upgrade has not yet been observed
-    std::vector<PendingUpgrade> pending_;
+    /// @brief Accepted sessions whose WebSocket upgrade has not yet been observed. Never full at
+    /// a push: an entry is pushed after its session's slot is claimed and popped before that slot
+    /// is freed (close_callback() runs before the free_fn), so it holds fewer entries than
+    /// sessions_ has in use when open_callback() pushes.
+    InlineVector<PendingUpgrade, MAX_SESSIONS> pending_;
+
+    /// @brief Session slots, each the session context (httpd_sess_set_ctx) and authoritative
+    /// reference of one open session's connection; a null entry is free.
+    ///
+    /// httpd task only: open_callback() fills a free entry, close_callback() and
+    /// websocket_handler() reach their own through httpd_sess_get_ctx(), and httpd runs the
+    /// free_fn (release_session_slot()) as it deletes the session, after its close_fn and outside
+    /// any handler for it, then clears the session's context. So an entry is free only once
+    /// nothing can reach it; queued send workers hold a weak_ptr, never the slot. httpd frees the
+    /// entry before it marks its session free, so with max_open_sockets <= MAX_SESSIONS a new
+    /// session always finds one.
+    std::array<std::shared_ptr<SendspinServerConnection>, MAX_SESSIONS> sessions_{};
 
     NewConnectionCallback new_connection_callback_;
 

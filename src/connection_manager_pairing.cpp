@@ -24,6 +24,7 @@
 #include "crypto/pairing_token.h"
 #include "crypto/psk_wrap.h"
 #include "platform/crypto.h"
+#include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
@@ -191,7 +192,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     conn->set_pairing_in_progress(true);
     // Queued before any other note of the attempt, so the queue-order drain delivers it ahead of
     // the attempt's prompt or failure.
-    this->client_->note_pairing_started(conn->get_server_id());
+    this->client_->note_pairing_started(conn->get_server_id().view());
 
     // The pairing server/activate counter (pairing.md "Pairing index") was already bumped at the
     // point this activate was received (on_server_activate()). Do not bump again here: this
@@ -202,7 +203,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     // (sent as pairing_index and reused for the CPace sid).
     const uint32_t pairing_index = conn->get_pairing_index();
 
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
     const auto& selected_method = conn->get_pairing_method();
 
     if (selected_method.has_value() &&
@@ -216,7 +217,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
 }
 
 void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint32_t pairing_index,
-                                                  const std::string& server_id,
+                                                  const IdText& server_id,
                                                   SendspinPairMethod selected_method) {
     const bool is_dynamic = selected_method == SendspinPairMethod::DYNAMIC_PAIRING_CODE;
     const auto& static_code = this->client_->config_.static_pairing_code;
@@ -280,8 +281,9 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
                 "Sending client/pair-pending (%s, gesture-gated, no window open) for "
                 "server_id=%s",
                 to_cstr(ps.method), server_id.c_str());
-        conn->send_app_json(
-            format_client_pair_pending_message(ps.pairing_index, this->json_arena()));
+        JsonDocument json = make_json_document(this->json_arena());
+        build_client_pair_pending_message(ps.pairing_index, json);
+        conn->send_json(json);
 
         this->client_->note_open_pairing_window();
         ps.window_shown = true;
@@ -294,31 +296,41 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
 }
 
 void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
-                                                 const std::string& server_id) {
-    // resolve_pairing_outcome mints the long-term PSK and the record that holds it. It cannot
-    // fail: a pairing never fails for lack of record storage (pairing.md "Pairing Records"),
-    // and room for the record is made where it is stored.
-    auto outcome = this->client_->record_store_->resolve_pairing_outcome(server_id);
+                                                 const IdText& server_id) {
+    // resolve_pairing_outcome mints the long-term PSK and the record that holds it. A pairing
+    // never fails for lack of record storage (pairing.md "Pairing Records"): room for the record
+    // is made where it is stored.
+    auto outcome = this->client_->record_store_->resolve_pairing_outcome(server_id.view());
+    if (!outcome.has_value()) {
+        SS_LOGE(TAG, "handle_enter_pairing_psk: minting the long-term PSK failed for server_id=%s",
+                server_id.c_str());
+        this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+        return;
+    }
 
     // pairing.md "Pairing PSK Flow": after the pairing server/activate the client sends
     // client/pair-init followed immediately by client/pair-finalize, without waiting for a
     // server response. pair-init starts the attempt and carries the pairing index alone; the
     // PSK flow has no PAKE round and so no commit_B.
     SS_LOGI(TAG, "Sending client/pair-init (pairing_psk) for server_id=%s", server_id.c_str());
-    conn->send_app_json(format_client_pair_init_message(pairing_index, this->json_arena()));
+    {
+        JsonDocument json = make_json_document(this->json_arena());
+        build_client_pair_init_message(pairing_index, json);
+        conn->send_json(json);
+    }
     conn->pairing_session().attempt_deadline_us = platform_time_us() + PAIRING_ATTEMPT_TIMEOUT_US;
 
     // Send client/pair-finalize with the long-term PSK (base64url-encoded, 43 chars).
     SS_LOGI(TAG, "Sending client/pair-finalize for server_id=%s", server_id.c_str());
-    // Named local rather than a temporary so the serialized message, which carries the raw
-    // base64 long-term PSK, can be wiped once it has been handed to the transport.
-    std::string finalize_msg = format_client_pair_finalize_message(outcome.psk, this->json_arena());
-    conn->send_app_json(finalize_msg);
-    secure_zero(finalize_msg.data(), finalize_msg.size());
+    // The message carries the raw base64 long-term PSK: the arena wipes the document, and its
+    // serialized text is encrypted over in place or wiped (NoiseTransport::send_staged_json()).
+    JsonDocument json = make_json_document(this->json_arena());
+    build_client_pair_finalize_message(outcome->psk, json);
+    conn->send_json(json);
 
     // Hold the pending record: committed to the RecordStore by the server/pair-finalize handler
     // on ack.
-    conn->set_pending_pairing_record(std::move(outcome.record));
+    conn->set_pending_pairing_record(std::move(outcome->record));
 }
 
 void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortReason reason) {
@@ -357,13 +369,14 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
                                               SendspinPairAbortReason public_reason,
                                               SendspinGoodbyeReason goodbye_reason) {
     // server_id is copied so it survives any tear-down below.
-    const std::string server_id = conn->get_server_id();
+    const IdText server_id = conn->get_server_id();
     // Snapshot before clear_pairing_state()/drop_connection() clear it (see PairingUiSnapshot).
     const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
 
     if (wire_abort_reason.has_value()) {
-        conn->send_app_json(
-            format_pair_abort_message(wire_abort_reason.value(), this->json_arena()));
+        JsonDocument json = make_json_document(this->json_arena());
+        build_pair_abort_message(wire_abort_reason.value(), json);
+        conn->send_json(json);
     }
 
     // On the admitted path drop_connection() -> cleanup_connection_state() clears the queued
@@ -378,7 +391,7 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
     }
 
     // Queued after any drop_connection() so they survive to be dispatched on the main loop.
-    this->client_->note_pairing_failed(server_id, public_reason);
+    this->client_->note_pairing_failed(server_id.view(), public_reason);
     this->client_->note_pairing_ui_dismissals(ui);
 }
 
@@ -419,7 +432,7 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
 
         case PairingMessageKind::MALFORMED: {
             auto& ps = conn->pairing_session();
-            const std::string& server_id = conn->get_server_id();
+            const IdText& server_id = conn->get_server_id();
 
             // A server pairing message (server/pair-init, server/pair-auth, or
             // server/pair-confirm) failed to parse. If no pairing-code session is active on this
@@ -461,7 +474,7 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
 void ConnectionManager::handle_pair_init(SendspinConnection* conn,
                                          const ServerPairingMessage& message) {
     auto& ps = conn->pairing_session();
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
 
     // Step 1: server/pair-init received. This step belongs to the dynamic pairing code alone;
     // the static flow goes straight from client/pair-init to server/pair-auth (pairing.md
@@ -543,7 +556,7 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
 void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
                                          const ServerPairingMessage& message) {
     auto& ps = conn->pairing_session();
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
 
     // Step 2: server/pair-auth received. Expect step AWAIT_SERVER_PAIR_AUTH.
     if (ps.step != SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_AUTH) {
@@ -553,7 +566,9 @@ void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
 
     // Send client/pair-auth (pake_msg_2 = client CPace share) before deriving.
     const auto& client_share = ps.cpace.public_share();
-    conn->send_app_json(format_client_pair_auth_message(client_share, this->json_arena()));
+    JsonDocument json = make_json_document(this->json_arena());
+    build_client_pair_auth_message(client_share, json);
+    conn->send_json(json);
 
     // Derive the MAC key from the server's share (pake_msg_1).
     // A derive failure means the peer share has the wrong length or encodes a
@@ -585,7 +600,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
                                             const ServerPairingMessage& message) {
     auto& ps = conn->pairing_session();
     RecordStore& store = *this->client_->record_store_;
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
 
     // Step 3: server/pair-confirm received. Expect step AWAIT_SERVER_PAIR_CONFIRM.
     if (ps.step != SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_CONFIRM) {
@@ -621,7 +636,9 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
                 "handle_pairing_message: server_kc verification failed (pairing-code mismatch) "
                 "for server_id=%s after round %u; sending client/pair-retry",
                 server_id.c_str(), static_cast<unsigned>(ps.round));
-        conn->send_app_json(format_client_pair_retry_message(this->json_arena()));
+        JsonDocument json = make_json_document(this->json_arena());
+        build_client_pair_retry_message(json);
+        conn->send_json(json);
         ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT;
         return;
     }
@@ -654,8 +671,9 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     // commit_B, the static flow client_kc alone (pairing.md "Client -> Server:
     // client/pair-confirm").
     if (ps.method == SendspinPairMethod::STATIC_PAIRING_CODE) {
-        conn->send_app_json(
-            format_client_pair_confirm_message(client_kc_opt.value(), this->json_arena()));
+        JsonDocument json = make_json_document(this->json_arena());
+        build_client_pair_confirm_message(client_kc_opt.value(), json);
+        conn->send_json(json);
     } else {
         auto wrapped_nonce =
             wrap_value(NONCE_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), ps.nonce_b);
@@ -665,8 +683,9 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
             this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
             return;
         }
-        conn->send_app_json(format_client_pair_confirm_message(
-            client_kc_opt.value(), wrapped_nonce.value(), this->json_arena()));
+        JsonDocument json = make_json_document(this->json_arena());
+        build_client_pair_confirm_message(client_kc_opt.value(), wrapped_nonce.value(), json);
+        conn->send_json(json);
     }
 
     // Reset both flags immediately after dismissing: clear_pairing_state() does not run on this
@@ -677,14 +696,20 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
 
     // Now run the same resolve_pairing_outcome path as pairing_psk, then send
     // client/pair-finalize. The server will respond with server/pair-finalize.
-    auto outcome = store.resolve_pairing_outcome(server_id);
+    auto outcome = store.resolve_pairing_outcome(server_id.view());
+    if (!outcome.has_value()) {
+        SS_LOGE(TAG, "handle_pairing_message: minting the long-term PSK failed for server_id=%s",
+                server_id.c_str());
+        this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+        return;
+    }
 
     // The code-based flows carry the new PSK wrapped under the CPace output, not in the clear
     // (pairing.md "Wrapping"). K_wrap = SHA-256(PSK_WRAP_LABEL || sid || ISK); the PSK is
     // sealed with the connection's negotiated AEAD, a 12-byte all-zero nonce, and empty AD. The
     // label differs from the one nonce_B was sealed under, so the two fields never share a key.
     auto wrapped =
-        wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), outcome.psk);
+        wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), outcome->psk);
     if (!wrapped.has_value()) {
         SS_LOGE(TAG, "handle_pairing_message: wrapping the long-term PSK failed for server_id=%s",
                 server_id.c_str());
@@ -694,14 +719,12 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
 
     SS_LOGI(TAG, "Sending client/pair-finalize (%s) for server_id=%s", to_cstr(ps.method),
             server_id.c_str());
-    // Wiped after the send for the same reason as the unwrapped form above. The payload here is
-    // the AEAD-wrapped PSK rather than raw key bytes, so this is the weaker of the two cases,
-    // but the two finalize paths are kept identical so neither drifts.
-    std::string finalize_msg =
-        format_client_pair_finalize_wrapped_message(wrapped.value(), this->json_arena());
-    conn->send_app_json(finalize_msg);
-    secure_zero(finalize_msg.data(), finalize_msg.size());
-    conn->set_pending_pairing_record(std::move(outcome.record));
+    // Wiped like the unwrapped form above, though the payload here is the AEAD-wrapped PSK
+    // rather than raw key bytes.
+    JsonDocument json = make_json_document(this->json_arena());
+    build_client_pair_finalize_wrapped_message(wrapped.value(), json);
+    conn->send_json(json);
+    conn->set_pending_pairing_record(std::move(outcome->record));
 
     ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_FINALIZE;
 }
@@ -757,7 +780,7 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
     }
 
     auto& ps = conn->pairing_session();
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
 
     if (ps.method == SendspinPairMethod::DYNAMIC_PAIRING_CODE) {
         // Generate nonce_B and its commitment, then send client/pair-init with commit_B and
@@ -775,8 +798,9 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
 
         SS_LOGI(TAG, "Sending client/pair-init (dynamic_pairing_code) for server_id=%s",
                 server_id.c_str());
-        conn->send_app_json(format_client_pair_init_message(commit_b.value(), ps.pairing_index,
-                                                            this->json_arena()));
+        JsonDocument json = make_json_document(this->json_arena());
+        build_client_pair_init_message(commit_b.value(), ps.pairing_index, json);
+        conn->send_json(json);
 
         ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT;
         ps.attempt_deadline_us = platform_time_us() + PAIRING_ATTEMPT_TIMEOUT_US;
@@ -796,7 +820,12 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
     // static flow carries no commit_B.
     SS_LOGI(TAG, "Sending client/pair-init (static_pairing_code) for server_id=%s",
             server_id.c_str());
-    conn->send_app_json(format_client_pair_init_message(ps.pairing_index, this->json_arena()));
+    {
+        // Released before CPace starts, whose failure path builds a pair/abort.
+        JsonDocument json = make_json_document(this->json_arena());
+        build_client_pair_init_message(ps.pairing_index, json);
+        conn->send_json(json);
+    }
 
     // The static flow has no rounds: its single CPace run is round 1 (pairing.md "PAKE").
     ps.round = 1;
@@ -914,8 +943,8 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn) {
         return;
     }
 
-    // Copied: the drops below release the connection that owns the string.
-    const std::string psk_id = conn->get_psk_id();
+    // Copied: the drops below release the connection that owns the id.
+    const IdText psk_id = conn->get_psk_id();
     SS_LOGI(TAG, "server/unpair: dropping record and disconnecting (server_id=%s, psk_id=%s)",
             conn->get_server_id().c_str(), psk_id.c_str());
 
@@ -923,7 +952,7 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn) {
     // because a re-handshake on the revoked psk_id resolves against the store and must miss it
     // from this instant: deferring it would leave the credential usable until the flush. The slot
     // write is left to SendspinClient::flush_pending_persistence() on the main loop.
-    if (this->client_->record_store_->note_record_removed(psk_id)) {
+    if (this->client_->record_store_->note_record_removed(psk_id.view())) {
         this->client_->request_persist();
     }
 

@@ -50,7 +50,7 @@ static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1U << 7;     // Visual
 static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1U << 8;       // Artwork display slot
 static constexpr uint32_t INBOX_TOPIC_PERSIST = 1U << 9;               // Owed provider writes slot
 static constexpr uint32_t INBOX_TOPIC_TIME = 1U << 10;                 // Time-sync report slot
-static constexpr uint32_t INBOX_TOPIC_PAIRING = 1U << 11;              // Pairing/trust notes slot
+static constexpr uint32_t INBOX_TOPIC_PAIRING = 1U << 11;              // Pairing notes slot
 static constexpr uint32_t INBOX_TOPIC_HIGH_PERFORMANCE = 1U << 12;     // High-performance requests
 static constexpr uint32_t INBOX_TOPIC_PLAYER_SYNC_IDLE = 1U << 13;     // Sync task left a stream
 
@@ -499,9 +499,9 @@ public:
     }
 
     /// @brief Overwrites the pending payload (latest-wins) unless it belongs to a later generation
-    /// @param value The payload.
+    /// @param value The payload, taken by reference for the reason merge() states.
     /// @param generation The producing role's teardown generation the payload was admitted under.
-    void write(T value, uint32_t generation) {
+    void write(T&& value, uint32_t generation) {
         this->merge([](T& current, T&& delta) { current = std::move(delta); }, std::move(value),
                     generation);
     }

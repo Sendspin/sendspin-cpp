@@ -14,9 +14,9 @@
 
 /// Tests for the source role (roles/source/v1.md): chunk bookkeeping and config validation, the
 /// capture path and chunk assembly played on the test thread, the stream lifecycle on the
-/// protocol task against an in-process stand-in connection over a live Noise session, the Opus
-/// encode path (built with SENDSPIN_ENABLE_OPUS), and a few wire scenarios end to end against
-/// FakeEncryptedServer on loopback.
+/// protocol task against an in-process stand-in connection over a live Noise session, the FLAC
+/// encode path and the Opus one (built with SENDSPIN_ENABLE_OPUS), and a few wire scenarios end to
+/// end against FakeEncryptedServer on loopback.
 
 #include "connection_manager.h"
 #include "crypto/constants.h"
@@ -24,6 +24,7 @@
 #include "log_capture.h"
 #include "loopback_connection.h"
 #include "outbound_ring.h"
+#include "platform/base64.h"
 #include "platform/crypto.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
@@ -31,6 +32,7 @@
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/source_role.h"
+#include "source_encoder_flac.h"
 #include "source_role_impl.h"
 #include "source_task.h"
 #include "time_filter.h"
@@ -40,14 +42,17 @@
 #endif
 
 #include <gtest/gtest.h>
+#include <micro_flac/flac_decoder.h>
 
 #include <ArduinoJson.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <thread>
@@ -109,6 +114,17 @@ std::vector<uint8_t> counting_bytes(size_t len, size_t first) {
     std::vector<uint8_t> bytes(len);
     for (size_t i = 0; i < len; ++i) {
         bytes[i] = static_cast<uint8_t>(first + i);
+    }
+    return bytes;
+}
+
+/// `len` bytes of reproducible white noise, which spends the most bits; `seed` picks the stretch.
+std::vector<uint8_t> noise_bytes(size_t len, uint32_t seed) {
+    std::vector<uint8_t> bytes(len);
+    uint32_t lcg = seed;
+    for (uint8_t& byte : bytes) {
+        lcg = lcg * 1664525U + 1013904223U;
+        byte = static_cast<uint8_t>(lcg >> 24);
     }
     return bytes;
 }
@@ -321,7 +337,62 @@ TEST(SourceConfigValidation, RejectsUnusableFormats) {
         {"zero capture buffer", [](SourceRoleConfig& c) { c.capture_buffer_ms = 0; }, false},
         {"capture buffer too large to size",
          [](SourceRoleConfig& c) { c.capture_buffer_ms = UINT32_MAX; }, false},
-        {"flac is not offered", [](SourceRoleConfig& c) { c.codec = SendspinCodecFormat::FLAC; },
+        {"an unsupported codec",
+         [](SourceRoleConfig& c) { c.codec = SendspinCodecFormat::UNSUPPORTED; }, false},
+        // FLAC rules: micro-flac's channel counts, at least 16 frames a chunk, and a worst-case
+        // frame within one transport message
+        {"Control: flac at the defaults",
+         [](SourceRoleConfig& c) { c.codec = SendspinCodecFormat::FLAC; }, true},
+        {"Control: flac ignores the opus settings",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::FLAC;
+             c.opus_bitrate = 0;
+             c.opus_complexity = SourceRoleConfig::MAX_OPUS_COMPLEXITY + 1;
+         },
+         true},
+        {"Control: flac from 32-bit, 8-channel capture",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::FLAC;
+             c.channels = 8;
+             c.bit_depth = 32;
+         },
+         true},
+        {"Control: flac at a 16-frame chunk",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::FLAC;
+             c.sample_rate = 3200;
+             c.chunk_duration_ms = 5;
+         },
+         true},
+        {"flac at a 15-frame chunk",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::FLAC;
+             c.sample_rate = 3000;
+             c.chunk_duration_ms = 5;
+         },
+         false},
+        {"flac with nine channels",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::FLAC;
+             c.channels = 9;
+         },
+         false},
+        // 150 ms of 16-bit stereo: the PCM fits one transport message at both rates (up to
+        // 109186 Hz), micro-flac's worst-case frame (which charges each stereo channel one bit
+        // wider) only at the first
+        {"Control: flac whose worst-case frame just fits one transport message",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::FLAC;
+             c.sample_rate = 102726;
+             c.chunk_duration_ms = 150;
+         },
+         true},
+        {"flac whose worst-case frame outgrows one transport message by a frame",
+         [](SourceRoleConfig& c) {
+             c.codec = SendspinCodecFormat::FLAC;
+             c.sample_rate = 102727;
+             c.chunk_duration_ms = 150;
+         },
          false},
         // Opus rules: libopus's rates and channel counts, 16-bit, one legal frame per chunk; none
         // is valid in a build without the encoder
@@ -432,7 +503,8 @@ TEST(SourceRoleObjects, HelloAndStateFields) {
 
     ClientHelloMessage hello;
     source.impl_->build_hello_fields(hello);
-    ASSERT_EQ(hello.supported_roles, std::vector<SendspinRole>{SendspinRole::SOURCE});
+    ASSERT_EQ(hello.supported_roles.size(), 1U);
+    EXPECT_EQ(hello.supported_roles[0], SendspinRole::SOURCE);
     ASSERT_TRUE(hello.source_v1_support.has_value());
     EXPECT_TRUE(hello.source_v1_support->line_sense);
 
@@ -818,13 +890,12 @@ public:
         auto conn = std::make_shared<FailingWriteConnection>();
         conn->set_json_arena(*this->client->json_arena_);
         conn->set_noise_session(std::move(loopback->responder_session));
-        conn->set_noise_handshake_result("stand-in-server", PskCategory::LONG_TERM, "stand-in");
-        conn->init_time_filter();
+        conn->set_noise_handshake_result(id_text("stand-in-server"), PskCategory::LONG_TERM,
+                                         id_text("stand-in"));
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
-        conn->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    std::vector<std::string>{"source@v1"}, std::nullopt,
-                                    std::nullopt);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"source@v1"},
+                                    std::nullopt, std::nullopt);
         // No time burst falls due during a test, so no client/time interleaves.
         conn->time_burst().last_burst_complete_time_ = platform_time_us() / 1000;
         if (synced) {
@@ -841,7 +912,7 @@ public:
 
     /// One measurement: the server clock runs SERVER_CLOCK_OFFSET_US ahead.
     static void sync(SendspinConnection& conn) {
-        conn.get_time_filter()->update(SERVER_CLOCK_OFFSET_US, 1000, platform_time_us());
+        conn.time_filter().update(SERVER_CLOCK_OFFSET_US, 1000, platform_time_us());
     }
 
     /// A server message on the current stand-in, as the protocol task dispatches it.
@@ -1134,7 +1205,7 @@ TEST(SourceStream, CaptureGoesOutStampedOnTheServerClock) {
     ASSERT_EQ(chunk.size(), SOURCE_CHUNK_HEADER_SIZE + CHUNK_BYTES);
     EXPECT_EQ(chunk[0], SENDSPIN_BINARY_SOURCE_AUDIO);
     EXPECT_EQ(be64_to_host(chunk.data() + 1),
-              rig.conn().get_time_filter()->compute_server_time(capture_us));
+              rig.conn().time_filter().compute_server_time(capture_us));
     EXPECT_GT(be64_to_host(chunk.data() + 1), capture_us + SERVER_CLOCK_OFFSET_US / 2)
         << "the stamp was left on the client clock";
     EXPECT_TRUE(std::equal(chunk.begin() + SOURCE_CHUNK_HEADER_SIZE, chunk.end(), pcm.begin()));
@@ -1233,6 +1304,294 @@ TEST(SourceStream, StopFromTheStoppedCallbackFindsTheHoldReleased) {
 }
 
 // ============================================================================
+// FLAC
+// ============================================================================
+
+namespace {
+
+SourceRoleConfig make_flac_config() {
+    SourceRoleConfig config;
+    config.codec = SendspinCodecFormat::FLAC;
+    return config;
+}
+
+/// `frames` frames of packed little-endian PCM in the config's format: a 440 Hz sine at half
+/// scale plus a little noise, a different phase in each channel, which FLAC's predictors compress
+std::vector<uint8_t> music_bytes(size_t frames, const SourceRoleConfig& config, uint32_t seed) {
+    const size_t bytes_per_sample = config.bit_depth / 8U;
+    std::vector<uint8_t> pcm(frames * config.channels * bytes_per_sample);
+    const double amplitude = std::ldexp(0.5, config.bit_depth - 1);
+    uint32_t lcg = seed;
+    size_t pos = 0;
+    for (size_t i = 0; i < frames; ++i) {
+        for (uint8_t ch = 0; ch < config.channels; ++ch) {
+            lcg = lcg * 1664525U + 1013904223U;
+            const double phase =
+                2.0 * std::numbers::pi * 440.0 * static_cast<double>(i) / config.sample_rate + ch;
+            const auto sample = static_cast<int32_t>(amplitude * std::sin(phase)) +
+                                static_cast<int32_t>(lcg >> 28);
+            for (size_t b = 0; b < bytes_per_sample; ++b) {
+                pcm[pos++] = static_cast<uint8_t>(static_cast<uint32_t>(sample) >> (8 * b));
+            }
+        }
+    }
+    return pcm;
+}
+
+/// Decodes a stream back to packed PCM as a server does, from client-stream/start's Base64
+/// codec_header and the chunk payloads, each of which must be exactly one frame.
+std::vector<uint8_t> decode_flac(std::string_view codec_header,
+                                 const std::vector<std::vector<uint8_t>>& frames) {
+    std::vector<uint8_t> header(codec_header.size());
+    size_t header_len = 0;
+    EXPECT_EQ(platform_base64_decode(header.data(), header.size(), &header_len,
+                                     reinterpret_cast<const uint8_t*>(codec_header.data()),
+                                     codec_header.size()),
+              0);
+    micro_flac::FLACDecoder decoder;
+    size_t consumed = 0;
+    size_t samples = 0;
+    EXPECT_EQ(decoder.decode(header.data(), header_len, static_cast<uint8_t*>(nullptr), 0,
+                             consumed, samples),
+              micro_flac::FLAC_DECODER_HEADER_READY);
+    EXPECT_EQ(consumed, header_len) << "the codec header is the marker and STREAMINFO alone";
+
+    const size_t bytes_per_sample = decoder.get_stream_info().bytes_per_sample();
+    std::vector<uint8_t> block(decoder.get_output_buffer_size_samples() * bytes_per_sample);
+    std::vector<uint8_t> pcm;
+    for (const auto& frame : frames) {
+        EXPECT_EQ(decoder.decode(frame.data(), frame.size(), block.data(), block.size(), consumed,
+                                 samples),
+                  micro_flac::FLAC_DECODER_SUCCESS);
+        EXPECT_EQ(consumed, frame.size()) << "a payload is not exactly one frame";
+        pcm.insert(pcm.end(), block.begin(),
+                   block.begin() + static_cast<std::ptrdiff_t>(samples * bytes_per_sample));
+    }
+    return pcm;
+}
+
+}  // namespace
+
+// roles/source/v1.md "client-stream/start", codec framing: each chunk encodes to one FLAC frame,
+// and the codec header plus the frames decode back to exactly the capture at every sample width,
+// whether the chunk was assembled in input_buffer() or sits 9 bytes into an outbound item (in ==
+// out, unaligned). Incompressible audio is stored verbatim, larger than its PCM but within
+// max_payload_bytes(). A chunk longer than one block is refused.
+TEST(SourceFlacEncoder, RoundTripsLosslesslyFromEitherPlacement) {
+    struct Row {
+        const char* name;
+        uint32_t sample_rate;
+        uint8_t channels;
+        uint8_t bit_depth;
+        uint32_t chunk_ms;
+    };
+    const Row rows[] = {
+        {"16-bit stereo, 20 ms at 48 kHz", 48000, 2, 16, 20},
+        {"24-bit mono, 5 ms at 44.1 kHz", 44100, 1, 24, 5},
+        {"32-bit stereo, 10 ms at 16 kHz", 16000, 2, 32, 10},
+        {"16-bit, three channels, 10 ms at 16 kHz", 16000, 3, 16, 10},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SourceRoleConfig config = make_flac_config();
+        config.sample_rate = row.sample_rate;
+        config.channels = row.channels;
+        config.bit_depth = row.bit_depth;
+        config.chunk_duration_ms = row.chunk_ms;
+        ASSERT_TRUE(SourceRole::Impl::validate_config(config));
+        FlacSourceEncoder encoder(config);
+        ASSERT_TRUE(encoder.init(config));
+
+        const size_t chunk_bytes = source_chunk_bytes(config);
+        const size_t frame_bytes = source_bytes_per_frame(row.channels, row.bit_depth);
+        const size_t max_payload = encoder.max_payload_bytes();
+        std::vector<uint8_t> item(SOURCE_CHUNK_HEADER_SIZE + max_payload);
+        uint8_t* payload = item.data() + SOURCE_CHUNK_HEADER_SIZE;
+        std::vector<uint8_t> capture;
+        std::vector<std::vector<uint8_t>> frames;
+        constexpr uint32_t CHUNKS = 6;
+        for (uint32_t n = 0; n < CHUNKS; ++n) {
+            SCOPED_TRACE(n);
+            const bool noise = n == CHUNKS - 1;
+            const std::vector<uint8_t> pcm = noise ? noise_bytes(chunk_bytes, n + 1)
+                                                   : music_bytes(chunk_bytes / frame_bytes, config,
+                                                                 n + 1);
+            // Alternating placements, so both carry the stream; the verbatim noise frame is
+            // encoded in place
+            uint8_t* const in = n % 2 == 0 ? encoder.input_buffer() : payload;
+            std::memcpy(in, pcm.data(), chunk_bytes);
+            const size_t written = encoder.encode(in, chunk_bytes, payload, max_payload);
+            ASSERT_GT(written, 0U);
+            EXPECT_EQ(written > chunk_bytes, noise) << written << " bytes from " << chunk_bytes;
+            capture.insert(capture.end(), pcm.begin(), pcm.end());
+            frames.emplace_back(payload, payload + written);
+        }
+        EXPECT_EQ(decode_flac(encoder.codec_header(), frames), capture);
+
+        EXPECT_EQ(encoder.encode(payload, chunk_bytes + frame_bytes, payload, max_payload), 0U)
+            << "a chunk one frame long was encoded";
+    }
+}
+
+// reset() restarts the frame numbering for a new stream, and so does running out of frame
+// numbers (2^31), rather than failing every chunk after: each encodes the same audio exactly as
+// the stream's first frame did.
+TEST(SourceFlacEncoder, ResetAndFrameNumberExhaustionRestartTheNumbering) {
+    const SourceRoleConfig config = make_flac_config();
+    FlacSourceEncoder encoder(config);
+    ASSERT_TRUE(encoder.init(config));
+    const std::vector<uint8_t> pcm = music_bytes(source_chunk_bytes(config) / 4, config, 1);
+    std::vector<uint8_t> out(encoder.max_payload_bytes());
+    const auto encode = [&] {
+        const size_t written = encoder.encode(pcm.data(), pcm.size(), out.data(), out.size());
+        return std::vector<uint8_t>(out.begin(),
+                                    out.begin() + static_cast<std::ptrdiff_t>(written));
+    };
+
+    const std::vector<uint8_t> first = encode();
+    ASSERT_FALSE(first.empty());
+    EXPECT_NE(encode(), first) << "Control: the same audio as frame 1 encoded as frame 0";
+    encoder.reset();
+    EXPECT_EQ(encode(), first);
+
+    // Past micro-flac's last frame number; reaching it for real takes over a year of 20 ms chunks
+    encoder.encoder_.frame_number_ = 1U << 31;
+    EXPECT_EQ(encode(), first);
+}
+
+// The source task reserves each outbound item at the worst-case frame, which a FLAC config always
+// needs over its PCM chunk, and each chunk carries one whole frame stamped with its first captured
+// sample (FLAC has no encoder delay); white noise stores verbatim, past the PCM, and still decodes
+// back to the capture.
+TEST(SourceFlacChunks, EachChunkIsOneFrameReservedAtTheWorstCase) {
+    const SourceRoleConfig config = make_flac_config();
+    CaptureRig rig(config);
+    ASSERT_TRUE(rig.task.flac_encoder_->init(config));
+    const size_t max_payload = rig.task.flac_encoder_->max_payload_bytes();
+    EXPECT_GT(max_payload, CHUNK_BYTES);
+    EXPECT_EQ(rig.task.chunk_message_bytes_,
+              SOURCE_CHUNK_HEADER_SIZE + max_payload + AEAD_TAG_SIZE);
+
+    constexpr int64_t FIRST_CAPTURE_US = 5000000;
+    constexpr int CHUNKS = static_cast<int>(OUTBOUND_RING_ITEM_COUNT);
+    std::vector<uint8_t> capture;
+    rig.open(1, SendspinCodecFormat::FLAC);
+    for (int n = 0; n < CHUNKS; ++n) {
+        const std::vector<uint8_t> piece = noise_bytes(CHUNK_BYTES, n + 1);
+        ASSERT_TRUE(rig.source.write_audio(piece.data(), piece.size(),
+                                           FIRST_CAPTURE_US + n * CHUNK_MS * 1000));
+        rig.drain();
+        capture.insert(capture.end(), piece.begin(), piece.end());
+    }
+
+    const auto chunks = rig.take_chunks();
+    ASSERT_EQ(chunks.size(), static_cast<size_t>(CHUNKS));
+    std::vector<std::vector<uint8_t>> frames;
+    for (size_t n = 0; n < chunks.size(); ++n) {
+        SCOPED_TRACE(n);
+        const auto& [header, payload] = chunks[n];
+        EXPECT_GT(payload.size(), CHUNK_BYTES) << "a verbatim frame was cut to the PCM's size";
+        EXPECT_EQ(header.data_len, SOURCE_CHUNK_HEADER_SIZE + payload.size());
+        EXPECT_EQ(header.capture_time_us,
+                  FIRST_CAPTURE_US + static_cast<int64_t>(n) * CHUNK_MS * 1000);
+        frames.push_back(payload);
+    }
+    const std::optional<std::string_view> codec_header =
+        rig.task.codec_header(SendspinCodecFormat::FLAC);
+    ASSERT_TRUE(codec_header.has_value());
+    EXPECT_EQ(decode_flac(*codec_header, frames), capture);
+}
+
+// Each stream starts the encoder afresh: a second stream fed the same capture opens with the same
+// frame as the first, which FLAC produces only from frame number 0. The control shows the
+// numbering matters: within one stream the same capture encodes differently later on.
+TEST(SourceFlacChunks, EachStreamResetsTheEncoder) {
+    const SourceRoleConfig config = make_flac_config();
+    CaptureRig rig(config);
+    ASSERT_TRUE(rig.task.flac_encoder_->init(config));
+    const std::vector<uint8_t> piece = music_bytes(CHUNK_BYTES / 4, config, 1);
+
+    rig.open(1, SendspinCodecFormat::FLAC);
+    for (int n = 0; n < 2; ++n) {
+        ASSERT_TRUE(rig.source.write_audio(piece.data(), piece.size(), 1000000));
+        rig.drain();
+    }
+    auto chunks = rig.take_chunks();
+    rig.open(2, SendspinCodecFormat::FLAC);
+    ASSERT_TRUE(rig.source.write_audio(piece.data(), piece.size(), 2000000));
+    rig.drain();
+    for (auto& chunk : rig.take_chunks()) {
+        chunks.push_back(std::move(chunk));
+    }
+    ASSERT_EQ(chunks.size(), 3U);
+    EXPECT_NE(chunks[1].second, chunks[0].second)
+        << "Control: the same capture later in a stream encoded the same";
+    EXPECT_EQ(chunks[2].second, chunks[0].second)
+        << "the second stream's first frame carries the first stream's frame number";
+}
+
+// roles/source/v1.md "client-stream/start": a FLAC role announces flac with the codec header (the
+// `fLaC` marker and STREAMINFO, in Base64) to a server whose server/hello lists it, and its chunks
+// decode with that header back to the capture; to a server that does not, it streams the same
+// capture as pcm, with no codec_header. The protocol task and the server are played on the test
+// thread; the source task is the real one.
+TEST(SourceFlacStream, FlacIsAnnouncedWithItsHeaderOnlyWhenTheServerListsIt) {
+    struct Row {
+        const char* name;
+        SendspinCodecFormat role_codec;
+        std::optional<std::string> server_codecs;  // supported_codecs, or no support object
+        bool flac;
+    };
+    const Row rows[] = {
+        {"Control: the server lists flac", SendspinCodecFormat::FLAC, R"(["pcm","flac"])", true},
+        {"the server sends no source@v1 support object", SendspinCodecFormat::FLAC, std::nullopt,
+         false},
+        {"a pcm role to a server listing flac", SendspinCodecFormat::PCM, R"(["pcm","flac"])",
+         false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SourceRoleConfig config;
+        config.codec = row.role_codec;
+        SourceStandIn rig(true, config);
+        std::string hello = R"({"type":"server/hello","payload":{"name":"Stand-in")";
+        if (row.server_codecs.has_value()) {
+            hello += R"(,"source@v1_support":{"supported_codecs":)" + *row.server_codecs + "}";
+        }
+        rig.deliver(hello + "}}");
+        rig.deliver(source_command_json("start"));
+        rig.tick();
+        rig.collect(0);
+        ASSERT_EQ(rig.stream_starts.size(), 1U);
+        JsonDocument start;
+        ASSERT_FALSE(deserializeJson(start, rig.stream_starts[0]));
+        EXPECT_EQ(start["codec"].as<std::string>(), row.flac ? "flac" : "pcm");
+        EXPECT_EQ(start["codec_header"].is<std::string>(), row.flac);
+
+        const int64_t capture_us = platform_time_us();
+        const std::vector<uint8_t> pcm = noise_bytes(2 * WRITE_BYTES, 1);
+        ASSERT_TRUE(rig.source->write_audio(pcm.data(), WRITE_BYTES, capture_us));
+        ASSERT_TRUE(rig.source->write_audio(pcm.data() + WRITE_BYTES, WRITE_BYTES,
+                                            capture_us + WRITE_MS * 1000));
+        // No timeout: a chunk that never arrives hangs here and the suite watchdog names it.
+        while (rig.chunks.empty()) {
+            rig.tick();
+            rig.collect(1);
+            std::this_thread::yield();
+        }
+
+        const std::vector<uint8_t>& chunk = rig.chunks.front();
+        const std::vector<uint8_t> payload(chunk.begin() + SOURCE_CHUNK_HEADER_SIZE, chunk.end());
+        const std::vector<uint8_t> captured(pcm.begin(), pcm.begin() + CHUNK_BYTES);
+        if (row.flac) {
+            EXPECT_EQ(decode_flac(start["codec_header"].as<std::string>(), {payload}), captured);
+        } else {
+            EXPECT_EQ(payload, captured);
+        }
+    }
+}
+
+// ============================================================================
 // Opus
 // ============================================================================
 
@@ -1244,17 +1603,6 @@ SourceRoleConfig make_opus_config() {
     SourceRoleConfig config;
     config.codec = SendspinCodecFormat::OPUS;
     return config;
-}
-
-/// `len` bytes of reproducible white noise, which spends the most bits; `seed` picks the stretch.
-std::vector<uint8_t> noise_bytes(size_t len, uint32_t seed) {
-    std::vector<uint8_t> bytes(len);
-    uint32_t lcg = seed;
-    for (uint8_t& byte : bytes) {
-        lcg = lcg * 1664525U + 1013904223U;
-        byte = static_cast<uint8_t>(lcg >> 24);
-    }
-    return bytes;
 }
 
 /// Frames one Opus packet decodes to through micro-opus's decoder, configured from the rate and
@@ -1664,8 +2012,7 @@ TEST(SourceOpusStream, OpusIsAnnouncedOnlyWhenTheServerListsIt) {
             EXPECT_EQ(payload, std::vector<uint8_t>(pcm.begin(), pcm.begin() + CHUNK_BYTES));
         }
         EXPECT_EQ(be64_to_host(chunk.data() + 1),
-                  rig.conn().get_time_filter()->compute_server_time(capture_us -
-                                                                    (opus ? 2500 : 0)));
+                  rig.conn().time_filter().compute_server_time(capture_us - (opus ? 2500 : 0)));
     }
 }
 

@@ -20,6 +20,7 @@
 #include "constants.h"
 #include "crypto/constants.h"
 #include "pairing_offers.h"
+#include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "platform/types.h"
@@ -48,9 +49,6 @@ static const char* const TAG = "sendspin.conn_mgr";
 static constexpr int64_t WS_SERVER_START_RETRY_MS = 5000LL;
 static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * US_PER_MS;
 
-/// @brief Stands in for an active_roles set the server left out or the client refuses to keep.
-static const std::vector<std::string> EMPTY_ROLES{};
-
 /// @brief Refuses an activation the client cannot act on
 ///
 /// pairing.md "Client <-> Server: pair/abort" answers a method or format the client does not offer
@@ -69,7 +67,9 @@ static void refuse_activate(SendspinConnection* conn, const char* why, const cha
             "server/activate %s (pairing.method=%s) for server_id=%s; replying "
             "pair/abort(method_not_supported), connection stays open",
             why, method, conn->get_server_id().c_str());
-    conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED, arena));
+    JsonDocument json = make_json_document(arena);
+    build_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED, json);
+    conn->send_json(json);
 }
 
 /// @brief Transport-establishment progress of a nursery connection, used for reap diagnostics
@@ -137,9 +137,8 @@ static const char* to_cstr(SetupStage stage) {
 /// the connection then also takes the operational path (SendspinClient::on_handshake_complete()).
 /// @return The selected method, or nullopt when the activate does not select pairing.
 static std::optional<SendspinPairMethod> selected_pairing_method(
-    const std::vector<SendspinActivity>& activities,
-    const std::optional<SendspinPairMethod>& pairing_method) {
-    if (!contains_activity(activities, SendspinActivity::PAIRING) || !pairing_method.has_value()) {
+    ActivitySet activities, const std::optional<SendspinPairMethod>& pairing_method) {
+    if (!activities.contains(SendspinActivity::PAIRING) || !pairing_method.has_value()) {
         return std::nullopt;
     }
     const SendspinPairMethod method = pairing_method.value();
@@ -225,7 +224,7 @@ void ConnectionManager::start() {
     this->shutdown_ui_ = {false, false};
     this->ws_server_start_retry_time_us_ = 0;
 
-    if (this->ws_server_ == nullptr) {
+    if (this->ws_server_ == nullptr && this->client_->config_.accept_inbound_connections) {
         // First start: create the server object and configure it once. The config is immutable
         // for the client's lifetime, so a restart reuses these values along with the object.
         this->ws_server_ = std::make_unique<SendspinWsServer>();
@@ -289,7 +288,7 @@ PairingUiSnapshot ConnectionManager::finish_stop() {
     }
     // Released here, after the server stop: an outbound connection's destructor stops its
     // transport synchronously, and every outbound one of these had opened.
-    std::vector<std::shared_ptr<SendspinConnection>> releasing;
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> releasing;
     releasing.swap(this->closing_);
     releasing.clear();
     this->reap_finished(false);
@@ -318,14 +317,25 @@ void ConnectionManager::reap_finished(bool drop_one_opened) {
 // Any thread
 // ============================================================================
 
-std::shared_ptr<SendspinTimeFilter> ConnectionManager::time_filter() const {
+std::optional<TimeTransform> ConnectionManager::clock() const {
     std::lock_guard<std::mutex> lock(this->published_mutex_);
-    return this->published_.time_filter;
+    if (this->published_.primary_slot >= MAX_ADMITTED) {
+        return std::nullopt;
+    }
+    return this->published_.clocks[this->published_.primary_slot];
 }
 
 std::optional<ServerInformationObject> ConnectionManager::server_information() const {
-    std::lock_guard<std::mutex> lock(this->published_mutex_);
-    return this->published_.server_information;
+    std::optional<PublishedServer> server;
+    {
+        std::lock_guard<std::mutex> lock(this->published_mutex_);
+        server = this->published_.server;
+    }
+    if (!server.has_value()) {
+        return std::nullopt;
+    }
+    return ServerInformationObject{.server_id = std::string(server->server_id.view()),
+                                   .name = std::string(server->name.view())};
 }
 
 // ============================================================================
@@ -340,7 +350,6 @@ bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
     }
     // On the transport's delivery thread, ahead of the connection's first frame and before the
     // protocol task can reach the connection: the push below publishes these writes to the task.
-    conn->init_time_filter();
     conn->time_burst().configure(this->client_->config_.time_burst_size,
                                  this->client_->config_.time_burst_interval_ms,
                                  this->client_->config_.time_burst_response_timeout_ms);
@@ -407,11 +416,10 @@ void ConnectionManager::accept(std::shared_ptr<SendspinConnection> conn) {
 
 void ConnectionManager::refuse_accept(std::shared_ptr<SendspinConnection> conn) {
     // Queued before admission closed and taken after (a stop() under way): the slots are being
-    // emptied, so the newcomer gets a goodbye and a close instead of one, and is kept for
-    // finish_stop().
+    // emptied, so the newcomer gets a goodbye and a close instead of one. It is inbound, so its
+    // destructor joins nothing and it is released here, leaving closing_ to the shutdown pass.
     SS_LOGD(TAG, "Not accepting connections, rejecting new connection");
-    conn->detach_inbound();
-    this->goodbye_for_shutdown(std::move(conn));
+    this->release_connection(std::move(conn), SendspinGoodbyeReason::SHUTDOWN);
 }
 
 void ConnectionManager::goodbye_for_shutdown(std::shared_ptr<SendspinConnection> conn) {
@@ -441,7 +449,6 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->attach_inbound(this->client_->inbound_ring_.get(),
                                 this->client_->protocol_task_.get());
 
-    client_conn->init_time_filter();
     client_conn->time_burst().configure(this->client_->config_.time_burst_size,
                                         this->client_->config_.time_burst_interval_ms,
                                         this->client_->config_.time_burst_response_timeout_ms);
@@ -514,7 +521,9 @@ void ConnectionManager::leave() {
         return;
     }
     SS_LOGI(TAG, "Leaving the group (client/leave)");
-    conn->send_app_json(format_client_leave_message(this->json_arena()));
+    JsonDocument json = make_json_document(this->json_arena());
+    build_client_leave_message(json);
+    conn->send_json(json);
 }
 
 SendspinConnection* ConnectionManager::role_send_target(SendspinRole role) const {
@@ -618,7 +627,8 @@ void ConnectionManager::apply_unpaired_access_change(bool enabled) {
 // Protocol task: message handlers
 // ============================================================================
 
-void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActivateMessage&& msg) {
+void ConnectionManager::on_server_activate(SendspinConnection* conn,
+                                           const ServerActivateMessage& msg) {
     NurseryEntry* nursery_entry = this->find_in_nursery(conn);
     AdmittedEntry* admitted_entry = this->find_admitted(conn);
     if (nursery_entry == this->nursery_.end() && admitted_entry == nullptr) {
@@ -637,22 +647,21 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
     // activate can legally narrow activities without re-sending an empty active_roles).
     const bool playback_capable =
         is_playback_capable(conn->get_psk_category(), msg.activities, unpaired_access);
-    const std::vector<std::string>& effective_roles =
-        msg.active_roles.has_value() ? msg.active_roles.value()
-                                     : (playback_capable ? conn->get_active_roles() : EMPTY_ROLES);
+    const ActiveRoles effective_roles =
+        msg.active_roles.value_or(playback_capable ? conn->get_active_roles() : ActiveRoles{});
     const bool has_roles = !effective_roles.empty();
 
-    // Trust enforcement against the PSK category the Noise handshake resolved for this
+    // The admissibility check against the PSK category the Noise handshake resolved for this
     // connection. Every connection has one: no server/activate can arrive before the
     // handshake completes.
-    const bool trust_ok =
+    const bool activation_admissible =
         admissible(conn->get_psk_category(), msg.activities, has_roles, unpaired_access);
 
-    if (!trust_ok) {
+    if (!activation_admissible) {
         const SendspinGoodbyeReason reject_reason = inadmissible_reject_reason(
             conn->get_psk_category(), msg.activities, has_roles, unpaired_access);
-        SS_LOGW(TAG, "server/activate inadmissible (psk_category=%d): closing with %s",
-                static_cast<int>(conn->get_psk_category()),
+        SS_LOGW(TAG, "server/activate inadmissible (psk_category=%s): closing with %s",
+                to_cstr(conn->get_psk_category()),
                 reject_reason == SendspinGoodbyeReason::PAIRING_REQUIRED ? "pairing_required"
                                                                          : "unauthorized");
         this->drop_connection(conn, reject_reason);
@@ -663,9 +672,11 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
     // not of accepted attempts, so the server counts every pairing activate it sends, including
     // ones the client goes on to reject (e.g. method_not_supported below). Bump here, at the
     // single point every pairing server/activate is received, so a rejected activate does not
-    // leave the client permanently behind the server's count. handle_enter_pairing() reads this
-    // value; it must not bump again.
-    const bool is_pairing_activate = contains_activity(msg.activities, SendspinActivity::PAIRING);
+    // leave the client permanently behind the server's count. A server/activate the parser
+    // rejects never arrives here and is not counted, so a server that counted it stays one ahead
+    // until the next Noise handshake. handle_enter_pairing() reads this value; it must not bump
+    // again.
+    const bool is_pairing_activate = msg.activities.contains(SendspinActivity::PAIRING);
     if (is_pairing_activate) {
         conn->bump_pairing_index();
     }
@@ -678,7 +689,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
     // (unlike the reasons above, this does not close the connection).
     // A pairing activate that names no usable method (pairing object absent, or a
     // method string this client does not recognize; process_server_activate_message
-    // logs the raw value) cannot start any flow.
+    // logs the unrecognized value) cannot start any flow.
     if (is_pairing_activate && !msg.pairing_method.has_value()) {
         refuse_activate(conn, "declares pairing with no usable pairing.method",
                         "absent or unrecognized", this->json_arena());
@@ -689,7 +700,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
         const SendspinPairMethod method = msg.pairing_method.value();
         const bool category_ok = (method == SendspinPairMethod::PAIRING_PSK) ==
                                  (conn->get_psk_category() == PskCategory::PAIRING);
-        // The same predicates build_hello_message() advertises from (pairing_offers.h).
+        // The same predicates build_client_hello() advertises from (pairing_offers.h).
         const auto& cfg = this->client_->config_;
         bool offered = true;
         switch (method) {
@@ -723,13 +734,13 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
 
     const bool is_first = !conn->first_activate_received();
     // Pass the same active_roles the admissibility check above used: when the message
-    // omitted active_roles but the connection is no longer playback-capable, that is
-    // effective_roles == EMPTY_ROLES, and it must be applied (not left sticky) so the
-    // persisted active_roles_ is actually cleared (messaging.md "Playback-capable connections").
-    const std::optional<std::vector<std::string>> active_roles_to_apply =
+    // omitted active_roles but the connection is no longer playback-capable, that is an empty
+    // effective_roles, and it must be applied (not left sticky) so the persisted active_roles_
+    // is actually cleared (messaging.md "Playback-capable connections").
+    const std::optional<ActiveRoles> active_roles_to_apply =
         msg.active_roles.has_value()
             ? msg.active_roles
-            : (!playback_capable ? std::make_optional(EMPTY_ROLES) : std::nullopt);
+            : (!playback_capable ? std::make_optional(ActiveRoles{}) : std::nullopt);
     // Copied before the activate is applied: messaging.md "client/state" ties the next state
     // update to the active-role set changing, so the comparison needs the set this activation
     // replaces.
@@ -763,7 +774,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
         // an is_first activate also require is_handshake_complete().
         this->note_playback_activity(conn);
 
-        const auto& activities = conn->get_activities();
+        const ActivitySet activities = conn->get_activities();
         const std::optional<SendspinPairMethod> pairing_method =
             selected_pairing_method(activities, conn->get_pairing_method());
         const bool selects_pairing = pairing_method.has_value();
@@ -803,7 +814,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
                 // declares both purposes therefore runs the operational path as well as the
                 // pairing one, and first: going operational clears stale pairing state the
                 // new attempt must not inherit.
-                if (is_first && contains_activity(activities, SendspinActivity::PLAYBACK)) {
+                if (is_first && activities.contains(SendspinActivity::PLAYBACK)) {
                     this->client_->on_handshake_complete(conn);
                 }
                 SS_LOGI(TAG,
@@ -814,8 +825,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn, ServerActiv
                 // connection.md "Re-handshake" makes a post-re-handshake activation a subsequent
                 // one, so messaging.md "client/state" owes an update for a role it activates.
                 const bool adds_role = (conn->get_active_role_mask() & ~roles_before) != 0;
-                if (is_first && adds_role &&
-                    !contains_activity(activities, SendspinActivity::PLAYBACK)) {
+                if (is_first && adds_role && !activities.contains(SendspinActivity::PLAYBACK)) {
                     this->client_->publish_client_state(conn);
                 }
             }
@@ -891,7 +901,7 @@ void ConnectionManager::on_pairing_succeeded(SendspinConnection* conn) {
     if (this->pairing_window_conn_ != nullptr && this->pairing_window_conn_ == conn) {
         this->close_pairing_window();
     }
-    this->client_->note_pairing_succeeded(conn->get_server_id());
+    this->client_->note_pairing_succeeded(conn->get_server_id().view());
 }
 
 void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
@@ -911,17 +921,17 @@ void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
     this->drop_connection(conn, std::nullopt);
 }
 
-std::vector<std::string> ConnectionManager::open_connection_psk_ids() const {
-    std::vector<std::string> psk_ids;
-    psk_ids.reserve(MAX_OPEN_CONNECTIONS);
+InlineVector<const IdText*, ConnectionManager::MAX_OPEN_CONNECTIONS>
+ConnectionManager::open_connection_psk_ids() const {
+    InlineVector<const IdText*, MAX_OPEN_CONNECTIONS> psk_ids;
     for (const auto& entry : this->admitted_) {
         if (entry.conn != nullptr && !entry.conn->get_psk_id().empty()) {
-            psk_ids.push_back(entry.conn->get_psk_id());
+            psk_ids.push_back(&entry.conn->get_psk_id());
         }
     }
     for (const auto& entry : this->nursery_) {
         if (!entry.conn->get_psk_id().empty()) {
-            psk_ids.push_back(entry.conn->get_psk_id());
+            psk_ids.push_back(&entry.conn->get_psk_id());
         }
     }
     return psk_ids;
@@ -1019,8 +1029,8 @@ uint32_t ConnectionManager::run_time_sync() {
                     this->client_->request_high_performance(false);
                     entry.high_performance_held = false;
                 }
-                if (&entry == primary && conn->get_time_filter() != nullptr) {
-                    this->client_->post_time_sync_error(conn->get_time_filter()->get_error());
+                if (&entry == primary) {
+                    this->client_->post_time_sync_error(conn->time_filter().get_error());
                 }
             }
             next = std::min(next, burst.ms_until_due(now_ms));
@@ -1037,21 +1047,34 @@ void ConnectionManager::refresh_published_state() {
     AdmittedEntry* primary = this->primary();
     SendspinConnection* primary_conn = primary != nullptr ? primary->conn.get() : nullptr;
     const uint64_t primary_id = primary_conn != nullptr ? primary_conn->get_instance_id() : 0;
-    if (primary_id != this->published_primary_id_) {
-        // The slot changes only with the primary connection: its filter is fixed at creation and
-        // its server information is complete before admission (server/hello precedes it).
-        this->published_primary_id_ = primary_id;
-        std::shared_ptr<SendspinTimeFilter> filter =
-            primary_conn != nullptr ? primary_conn->get_shared_time_filter() : nullptr;
-        std::optional<ServerInformationObject> info =
-            primary_conn != nullptr ? std::make_optional(primary_conn->get_server_information())
-                                    : std::nullopt;
-        {
-            // Swapped under the leaf lock; what they replace is destroyed outside it.
-            std::lock_guard<std::mutex> lock(this->published_mutex_);
-            this->published_.time_filter.swap(filter);
-            this->published_.server_information.swap(info);
+    // The server information changes only with the primary connection: it is complete before
+    // admission (server/hello precedes it).
+    const bool primary_changed = primary_id != this->published_primary_id_;
+    this->published_primary_id_ = primary_id;
+    // Each admitted slot's clock, which a measurement, the slot's connection or the primary moves.
+    // The protocol task is published_'s only writer, so it compares without the lock, and a tick
+    // that changed nothing takes none.
+    ClockSlots clocks{};
+    for (size_t slot = 0; slot < MAX_ADMITTED; ++slot) {
+        if (this->admitted_[slot].conn != nullptr) {
+            clocks[slot] = this->admitted_[slot].conn->time_filter().transform();
         }
+    }
+    const size_t primary_slot =
+        primary != nullptr ? static_cast<size_t>(primary - this->admitted_.data()) : MAX_ADMITTED;
+    if (primary_changed || clocks != this->published_.clocks ||
+        primary_slot != this->published_.primary_slot) {
+        std::lock_guard<std::mutex> lock(this->published_mutex_);
+        if (primary_changed && primary_conn == nullptr) {
+            this->published_.server.reset();
+        } else if (primary_changed) {
+            // Written in place: the slot is the only copy.
+            PublishedServer& server = this->published_.server.emplace();
+            server.server_id = primary_conn->get_server_id();
+            server.name = primary_conn->get_server_name();
+        }
+        this->published_.clocks = clocks;
+        this->published_.primary_slot = primary_slot;
     }
 
     // Only ever lowered here: a loss is reported as soon as the slots stop naming the connection,
@@ -1059,6 +1082,13 @@ void ConnectionManager::refresh_published_state() {
     if (!this->has_operational_connection()) {
         this->connected_.store(false, std::memory_order_release);
     }
+    // Read each tick: a re-handshake changes the PSK category on the same connection, onto the
+    // long-term PSK after a pairing. It clears the connection's activate flag first, and paired_ is
+    // stored after connected_ is lowered, so a reader that sees a re-handshake's value and then
+    // is_connected() true has seen the session's re-activation too.
+    this->paired_.store(
+        primary_conn != nullptr && primary_conn->get_psk_category() == PskCategory::LONG_TERM,
+        std::memory_order_release);
 }
 
 void ConnectionManager::publish_connected() {
@@ -1109,7 +1139,7 @@ void ConnectionManager::shutdown() {
     this->nursery_.clear();
     // A standing pairing window belongs to this run; a restart begins with it closed.
     this->close_pairing_window();
-    // Empties the time filter slot before stop() stops the role threads: a role thread that reads
+    // Empties the published clocks before stop() stops the role threads: a role thread that reads
     // it from here converts to 0, which reads as late.
     this->refresh_published_state();
     this->shutdown_ui_.code_was_emitted |= ui.code_was_emitted;
@@ -1188,18 +1218,6 @@ uint16_t ConnectionManager::roles_owned_by_others(const AdmittedEntry* except) c
 }
 
 // ============================================================================
-// Handoff support
-// ============================================================================
-
-void ConnectionManager::set_last_played_server_id(const std::string& server_id) {
-    if (server_id.empty()) {
-        this->last_played_server_id_.reset();
-    } else {
-        this->last_played_server_id_ = server_id;
-    }
-}
-
-// ============================================================================
 // Tick steps
 // ============================================================================
 
@@ -1260,9 +1278,9 @@ uint32_t ConnectionManager::scan_nursery(int64_t now_us) {
     }
 
     // Admission: every nursery entry that has proven itself (is_operational(): hello handshake
-    // complete and first server/activate applied and admissible; trust was already checked when
-    // that activate was processed). The activate handler admits at once when the hello completed
-    // first; this level-triggered pass covers the other order.
+    // complete and first server/activate applied, its admissibility checked when it was
+    // processed). The activate handler admits at once when the hello completed first; this
+    // level-triggered pass covers the other order.
     for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
         if (!it->conn->is_operational()) {
             ++it;
@@ -1546,12 +1564,15 @@ bool ConnectionManager::send_hello_message(SendspinConnection* conn) {
         return true;
     }
 
-    std::string hello_message = this->client_->build_hello_message();
+    ClientHelloMessage hello;
+    this->client_->build_client_hello(hello);
 
-    // send_app_json (not send_text_message): client/hello is encrypted like every other
-    // post-handshake message. The hello is only sent once server/hello arrives, so
-    // send_app_json always routes to the active Noise transport here.
-    const SsErr err = conn->send_app_json(hello_message);
+    // client/hello is encrypted like every other post-handshake message. The hello is only sent
+    // once server/hello arrives, so send_json always routes to the active Noise transport here.
+    // An error here, NO_MEM included, drops the connection below.
+    JsonDocument json = make_json_document(this->json_arena());
+    build_client_hello_message(&hello, json);
+    const SsErr err = conn->send_json(json);
     if (err == SsErr::OK) {
         // Setting the flag is all that is needed: admission is level-triggered, so the nursery
         // scan observes is_handshake_complete() even when the peer's server/hello raced ahead of
@@ -1576,7 +1597,7 @@ bool ConnectionManager::send_hello_message(SendspinConnection* conn) {
 // Connection lifecycle
 // ============================================================================
 
-void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
+void ConnectionManager::drop_connections_using_psk_id(const IdText& psk_id,
                                                       const SendspinConnection* except) {
     if (psk_id.empty()) {
         return;
@@ -1627,8 +1648,8 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         std::shared_ptr<SendspinConnection> dropped = this->vacate_admitted(*entry);
         // Ahead of the slot refresh below: the teardown commands the stream to end before the
-        // time filter slot stops naming this connection's filter (see docs/internals.md "Time
-        // Filter Slot").
+        // published clock stops being this connection's (see docs/internals.md "Time Filter
+        // Slot").
         this->client_->cleanup_connection_state(
             static_cast<uint16_t>(ALL_ROLES_MASK & ~this->roles_owned_by_others(nullptr)));
         this->refresh_published_state();
@@ -1661,12 +1682,12 @@ bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* ad
     const bool pairing_in_flight = !has_admitted || !admitted->is_pairing_finalized();
     return should_admit_connection(
         /*incoming_activities=*/new_conn->get_activities(),
-        /*incoming_server_id=*/new_conn->get_server_id(),
+        /*incoming_server_id=*/new_conn->get_server_id().view(),
         /*admitted_activities=*/
-        has_admitted ? admitted->get_activities() : std::vector<SendspinActivity>{},
-        /*admitted_server_id=*/has_admitted ? admitted->get_server_id() : std::string{},
+        has_admitted ? admitted->get_activities() : ActivitySet{},
+        /*admitted_server_id=*/has_admitted ? admitted->get_server_id().view() : std::string_view{},
         /*has_admitted=*/has_admitted,
-        /*last_playback_server_id=*/this->last_played_server_id_,
+        /*last_playback_server_id=*/this->last_played_server_id_.view(),
         /*admitted_pairing_in_flight=*/pairing_in_flight);
 }
 
@@ -1679,21 +1700,21 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     if (!conn->has_activity(SendspinActivity::PLAYBACK)) {
         return;
     }
-    const std::string& server_id = conn->get_server_id();
+    const IdText& server_id = conn->get_server_id();
     if (server_id.empty()) {
         return;
     }
     // The RAM half updates here, because a later arbitration reads last_played_server_id_; the
     // provider writes for this and for the recency move below wait for
     // SendspinClient::flush_pending_persistence() on the main loop.
-    this->client_->note_last_played_server(server_id);
+    this->client_->note_last_played_server(server_id.view());
     // A pair-finalize at capacity evicts against the recency order and spares only the records
     // of open connections, so a connection that closes later must not leave its record looking
     // least recent until a deferred move lands. RecordStore::mutex_ is a leaf (docs/conventions.md,
     // "Threading and cross-thread state"), and this holds no other lock.
     if (conn->get_psk_category() == PskCategory::LONG_TERM) {
-        const std::string& psk_id = conn->get_psk_id();
-        if (!psk_id.empty() && this->client_->record_store_->note_record_played(psk_id)) {
+        const IdText& psk_id = conn->get_psk_id();
+        if (!psk_id.empty() && this->client_->record_store_->note_record_played(psk_id.view())) {
             this->client_->request_persist();
         }
     }
@@ -1727,8 +1748,9 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
             // displaced pairing attempt); the goodbye after it is a benign over-send, since the
             // transport layer has no close-without-goodbye path to use instead.
             if (conn->has_activity(SendspinActivity::PAIRING)) {
-                conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT,
-                                                              this->json_arena()));
+                JsonDocument json = make_json_document(this->json_arena());
+                build_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT, json);
+                conn->send_json(json);
             }
             this->release_connection(std::move(conn), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
             return next;
@@ -1756,12 +1778,12 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
     // state before the new attempt. A playback-capable connection may carry active roles with
     // pairing alone (messaging.md "server/activate"), and those still owe the initial
     // client/state (messaging.md "client/state"), published without going operational.
-    const auto& activities = admitted->get_activities();
+    const ActivitySet activities = admitted->get_activities();
     const std::optional<SendspinPairMethod> pairing_method =
         selected_pairing_method(activities, admitted->get_pairing_method());
     const bool selects_pairing = pairing_method.has_value();
 
-    if (!selects_pairing || contains_activity(activities, SendspinActivity::PLAYBACK)) {
+    if (!selects_pairing || activities.contains(SendspinActivity::PLAYBACK)) {
         this->client_->on_handshake_complete(admitted);
     }
     if (selects_pairing) {
@@ -1770,7 +1792,7 @@ NurseryEntry* ConnectionManager::promote_or_arbitrate_nursery_entry(NurseryEntry
         this->handle_enter_pairing(admitted);
         // handle_enter_pairing() may have dropped the connection: checked first.
         if (this->find_admitted(admitted) != nullptr &&
-            !contains_activity(activities, SendspinActivity::PLAYBACK) &&
+            !activities.contains(SendspinActivity::PLAYBACK) &&
             !admitted->get_active_roles().empty()) {
             this->client_->publish_client_state(admitted);
         }

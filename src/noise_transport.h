@@ -13,14 +13,15 @@
 // limitations under the License.
 
 /// @file noise_transport.h
-/// @brief Encrypted transport layer for a Sendspin connection: owns the Noise cipher session,
-/// outbound fragmentation, and inbound fragment reassembly.
+/// @brief Encrypted transport layer for a Sendspin connection: owns the Noise cipher session and
+/// inbound fragment reassembly. Outbound messages always fit one frame.
 ///
-/// Every use runs on the protocol task: the encrypt and send path (send_json, send_binary,
-/// send_binary_lent), the decrypt path (decrypt_in_place) and reassembly (accept_plaintext), and
-/// the session swaps (activate at handshake COMPLETE, send_msg2_and_swap at a re-handshake). One
-/// thread owns the session, so this class takes no lock: a swap is sequential with every encrypt
-/// and decrypt, and the reused send_buf_ is filled and encrypted by one caller at a time.
+/// Every use runs on the protocol task: the encrypt and send path (stage_json and
+/// send_staged_json, send_binary_lent), the decrypt path (decrypt_in_place) and
+/// reassembly (accept_plaintext), and the session swaps (activate at handshake COMPLETE,
+/// send_msg2_and_swap at a re-handshake). One thread owns the session, so this class takes no lock:
+/// a swap is sequential with every encrypt and decrypt, and the reused send_buf_ is filled and
+/// encrypted by one caller at a time.
 
 #pragma once
 
@@ -36,9 +37,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
-#include <string>
 #include <utility>
 
 namespace sendspin {
@@ -49,8 +48,8 @@ class OutboundRing;
 ///
 /// A SendspinConnection embeds one NoiseTransport and wires set_frame_sink() to its
 /// send_transport_frame() and set_lent_frame_sink() to its send_lent_frame(). All post-handshake
-/// application traffic flows through send_json() / send_binary() / send_binary_lent() outbound and
-/// decrypt_in_place() + accept_plaintext() inbound.
+/// application traffic flows through stage_json() + send_staged_json() / send_binary_lent()
+/// outbound and decrypt_in_place() + accept_plaintext() inbound.
 class NoiseTransport {
 public:
     /// @brief Run by the transport immediately before it writes a frame to the socket
@@ -95,7 +94,7 @@ public:
 
     /// @brief Installs the cipher session produced by the initial Noise handshake and marks
     /// the transport active. Called on the protocol task at handshake COMPLETE.
-    void activate(std::unique_ptr<NoiseSession> session);
+    void activate(NoiseSession session);
 
     /// @brief Returns the current session's 32-byte Noise handshake hash, or nullopt if no
     /// session is active. Protocol task only.
@@ -105,7 +104,7 @@ public:
     /// swaps). This is the check send paths use to decide encrypted-vs-cleartext. Protocol task
     /// only.
     bool is_active() const {
-        return this->active_;
+        return this->session_.has_value();
     }
 
     /// @brief Whether a send failed once its first frame was encrypted. Each encrypt spends a send
@@ -121,23 +120,23 @@ public:
     // Outbound (encrypt + send); protocol task only
     // ========================================
 
-    /// @brief Encrypt and send a JSON string as a Noise transport frame.
-    /// Encodes as [MSG_TYPE_JSON_BODY | utf8(json)] -> encrypt -> frame sink.
-    /// Fragments automatically when the plaintext exceeds MAX_TRANSPORT_PLAINTEXT.
-    /// @param before_write Goes to the frame sink with the message's last frame. A synchronous
-    ///                     transport runs it inside this call, so it must not block or send.
+    /// @brief Stages a JSON message in send_buf_: writes its type byte and returns where its text
+    /// goes, with room for `max_len` bytes and a terminator. Works with or without a session; the
+    /// staged message is sent once, by send_staged_json(), send_msg2_and_swap(), or, before the
+    /// handshake, by the caller as a cleartext text frame read from the returned pointer.
+    /// @return nullptr (logged) when the message would not fit one frame or send_buf_ cannot grow.
+    char* stage_json(size_t max_len);
+
+    /// @brief Encrypts the staged JSON message, the type byte plus `len` bytes of text, in place
+    /// and sends it as one frame. Outbound JSON is never fragmented: stage_json() refuses a
+    /// message longer than one frame. A refusal before the encrypt, or a failed encrypt, wipes
+    /// the staged text, which may carry key material (client/pair-finalize); a successful encrypt
+    /// overwrites it.
+    /// @param before_write Goes to the frame sink with the frame. A synchronous transport runs it
+    ///                     inside this call, so it must not block or send.
     /// @return SsErr::OK on success; INVALID_STATE if the transport is not active or
     ///         is_send_desynced(); another error otherwise.
-    SsErr send_json(const char* json, size_t len, const FrameWriteHook& before_write = nullptr);
-
-    /// @brief Convenience overload of send_json(const char*, size_t) for std::string callers.
-    SsErr send_json(const std::string& json) {
-        return this->send_json(json.data(), json.size());
-    }
-
-    /// @brief Encrypt and send pre-typed binary data as a Noise transport frame.
-    /// @param data  Pointer to type-prefixed binary bytes (first byte is the role type byte).
-    SsErr send_binary(const uint8_t* data, size_t len);
+    SsErr send_staged_json(size_t len, const FrameWriteHook& before_write = nullptr);
 
     /// @brief Encrypt a binary message where it lies in an outbound ring item and lend the item
     /// to the lent frame sink, which returns it to `ring` once the frame is written.
@@ -155,12 +154,11 @@ public:
     SsErr send_binary_lent(OutboundRing& ring, void* item, size_t message_capacity,
                            size_t plaintext_len);
 
-    /// @brief Re-handshake commit: encrypt and send msg2 under the OLD session, then swap to
-    /// the new session. Protocol task only, like every other send, so no encrypt falls between
-    /// the msg2 send and the swap.
+    /// @brief Re-handshake commit: encrypt and send the staged msg2 (stage_json(), `len` bytes of
+    /// text) under the OLD session, then swap to the new session. Protocol task only, like every
+    /// other send, so no encrypt falls between the msg2 send and the swap.
     /// @return SsErr::OK on success (session swapped); on error the old session is kept.
-    SsErr send_msg2_and_swap(const std::string& msg2_text,
-                             std::unique_ptr<NoiseSession> next_session);
+    SsErr send_msg2_and_swap(size_t len, NoiseSession next_session);
 
     // ========================================
     // Inbound (decrypt + reassemble); protocol task only
@@ -183,8 +181,8 @@ public:
     ///         consumed by reassembly, discarded, or dropped as malformed.
     CompleteMessage accept_plaintext(uint8_t* plaintext, size_t len, bool admitted);
 
-    /// @brief Sets memory placement for the fragmentation and reassembly buffers (ESP-IDF
-    /// only; ignored on host). Call during connection setup, before any transport traffic.
+    /// @brief Sets memory placement for the send and reassembly buffers (ESP-IDF only; ignored
+    /// on host). Call during connection setup, before any transport traffic.
     void set_buffer_location(MemoryLocation location) {
         this->buffer_location_ = location;
     }
@@ -212,26 +210,6 @@ private:
     SsErr encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity, size_t plaintext_len,
                                  const FrameWriteHook& before_write);
 
-    /// @brief Fragment a plaintext > MAX_TRANSPORT_PLAINTEXT into multiple frames and
-    /// encrypt+send each one. Implements messaging.md "Fragmentation": every fragment is a
-    /// type-1 message, the first also carrying orig_type.
-    ///
-    /// The plaintext is passed as its type byte plus the payload rather than as one contiguous
-    /// buffer, so no caller has to stage a copy of a message this large.
-    ///
-    /// The fragments of one logical message reach the wire consecutively, since a peer that sees
-    /// a non-fragment frame between them treats it as a messaging.md "Malformed sequences" error
-    /// (see accept_plaintext()); every send runs on the protocol task, so none can fall between
-    /// them.
-    /// @param before_write Passed to the frame sink with the last fragment.
-    SsErr fragment_and_send(uint8_t orig_type, const uint8_t* data, size_t data_len,
-                            const FrameWriteHook& before_write);
-
-    /// @brief Fills send_buf_ with an optional prefix followed by data, then encrypts and
-    /// sends it.
-    SsErr fill_and_encrypt(const uint8_t* prefix, size_t prefix_len, const uint8_t* data,
-                           size_t data_len, const FrameWriteHook& before_write);
-
     /// @brief Grows a PlatformBuffer to at least `needed` bytes (geometric growth, contents
     /// preserved, capacity retained across calls), optionally capped.
     /// @param cap     Upper bound on the grown size, or 0 for uncapped.
@@ -247,8 +225,7 @@ private:
     bool reasm_reserve(size_t needed, bool admitted);
 
     /// @brief Grows send_buf_ to at least `needed` bytes, capped at MAX_TRANSPORT_PLAINTEXT +
-    /// AEAD_TAG_SIZE (the largest plaintext + AEAD tag room the non-fragmented path ever
-    /// handles). See grow_buffer().
+    /// AEAD_TAG_SIZE (one frame's largest plaintext plus its AEAD tag). See grow_buffer().
     bool ensure_send_buf(size_t needed);
 
     /// @brief Discards any in-flight reassembly state (keeps the allocation).
@@ -273,20 +250,21 @@ private:
     /// placed per buffer_location_ (PSRAM-preferring by default on ESP). Protocol task only.
     PlatformBuffer reasm_buf_;
 
-    /// Reused scratch buffer for the non-fragmented send path (send_json, send_binary,
-    /// send_msg2_and_swap). Grown on demand by ensure_send_buf() to fit each frame (geometric
-    /// growth, same idiom as reasm_buf_/reasm_reserve()), capped at MAX_TRANSPORT_PLAINTEXT +
-    /// AEAD_TAG_SIZE bytes, so typical traffic settles at a working-set size well under that
-    /// ceiling instead of paying it on every connection. Protocol task only, like every send.
-    /// Placed per buffer_location_ like reasm_buf_.
+    /// Reused send buffer (stage_json()), where each outbound JSON message is serialized in place
+    /// and then encrypted over its plaintext (or, before the handshake, sent as cleartext). Grown
+    /// on demand by ensure_send_buf() to fit each frame (geometric growth, same idiom as
+    /// reasm_buf_/reasm_reserve()), capped at MAX_TRANSPORT_PLAINTEXT + AEAD_TAG_SIZE bytes, so
+    /// typical traffic settles at a working-set size well under that ceiling instead of paying it
+    /// on every connection. Protocol task only, like every send. Placed per buffer_location_ like
+    /// reasm_buf_.
     PlatformBuffer send_buf_;
 
-    // Pointer fields
     /// Noise cipher session (set at handshake COMPLETE, replaced on re-handshake swap).
     /// Protocol task only.
-    std::unique_ptr<NoiseSession> session_;
+    std::optional<NoiseSession> session_;
 
 #ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
+    // Pointer fields
     /// From set_message_tracer(); nullptr for none. Written once at setup, then protocol task
     /// only.
     const MessageTracer* message_tracer_{nullptr};
@@ -298,11 +276,8 @@ private:
     size_t reasm_len_{0};
 
     // 8-bit fields
-    /// Memory placement for reasm_buf_, send_buf_ and the fragmentation frame buffer.
+    /// Memory placement for reasm_buf_ and send_buf_.
     MemoryLocation buffer_location_{MemoryLocation::PREFER_EXTERNAL};
-
-    /// True once a transport session exists. See is_active(). Protocol task only.
-    bool active_{false};
 
     /// See is_send_desynced(). Protocol task only.
     bool send_desynced_{false};

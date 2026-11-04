@@ -8,10 +8,11 @@ dependencies:
   espressif/esp_websocket_client: ">=1.6.1"
   bblanchon/arduinojson: ">=7.4.2"
   esphome/noise-c: ">=0.1.13"
+  # 0.3.0: the encoder the source role's FLAC codec runs on
   esphome/micro-flac:
-    version: ">=0.1.1"
+    version: ">=0.3.0"
     rules:
-      - if: "$CONFIG{SENDSPIN_ENABLE_PLAYER} == True"
+      - if: "$CONFIG{SENDSPIN_ENABLE_PLAYER} == True || $CONFIG{SENDSPIN_ENABLE_SOURCE} == True"
   esphome/micro-opus:
     version: ">=0.3.5"
     rules:

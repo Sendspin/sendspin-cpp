@@ -107,9 +107,8 @@ void SendspinClientConnection::close_transport_now() {
     }
 }
 
-SsErr SendspinClientConnection::send_text_message(const std::string& message) {
-    return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
-                               message.size());
+SsErr SendspinClientConnection::send_text_message(const char* text, size_t len) {
+    return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(text), len);
 }
 
 SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len) {

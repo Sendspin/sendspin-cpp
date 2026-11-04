@@ -52,9 +52,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - State published from one writer thread to one reader thread uses a
   `ShadowSlot` (`src/platform/shadow_slot.h`), whichever side (if either) the
   main loop is on. State the main loop *reads* goes through the Inbox instead.
-  The values read by several threads without being consumed, the primary
-  admitted connection's time filter and server information, sit in
-  `ConnectionManager`'s own slot behind a leaf mutex (`time_filter()`,
+  The values read by several threads without being consumed, the admitted
+  connections' clocks and the primary's server information, sit in
+  `ConnectionManager`'s own slot behind a leaf mutex (`clock()`,
   `server_information()`), written by the protocol task; a flag read the same
   way is a plain atomic.
 - Event producers push through `push_event_or_log()` rather than hand-rolling
@@ -80,7 +80,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.
 - A message handler on the protocol task does the connection work the message
-  calls for in place (an activation's trust check, admission and role
+  calls for in place (an activation's admissibility check, admission and role
   ownership, a pairing step, a `noise/handshake` re-handshake, the RAM commit
   of a pairing record), and hands role and consumer work on through Inbox
   slots, role item lists and buffers. It never calls a listener or a
@@ -118,8 +118,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   state, never across a call that takes another library lock, a send, a
   listener or the persistence provider, so the library has no lock order to
   cite. The leaves are `ConnectionManager::published_mutex_`,
-  `RecordStore::mutex_`, the Inbox mutex, each
-  `SendspinTimeFilter`'s `state_mutex_`, the inbound ring's, each outbound
+  `RecordStore::mutex_`, the Inbox mutex, the inbound ring's, each outbound
   ring's, item lists' and protocol task command queue's own locks, the artwork
   role's slot mutex, `ShadowSlot`'s and the ESP server's pending-upgrade mutex. A
   change that would take a second library lock under one of them is a design
@@ -172,6 +171,22 @@ checklists in `.claude/skills/` apply these standards to a diff.
   Watch for aggressive inlining aggregating several frames into one.
 - Hot paths (per audio chunk, per binary message, per visualizer frame) do not
   allocate. Reuse persistent buffers; size them once with a stated derivation.
+- `operator new` is for construction, `add_*()` and `start()`: on ESPHome it
+  draws only on internal RAM and aborts when it fails. After `start()`, a
+  connection's handshake and admission and the messages that follow allocate
+  only through the `platform_malloc` family, whose failure refuses or closes
+  the connection or drops the message. A value with a bound is held inline
+  (`InlineText`, `InlineVector`, `EnumSet`, `std::array`), or viewed
+  (`std::span`, `std::string_view`) when it is configuration fixed from
+  `add_*()`, and text from a peer
+  is bounded where it is parsed: read in place, refused past its cap, or cut to
+  its field's size. Peer text a log line prints that no field bounds (a type, a
+  reason, an unrecognized value) is cut to `PEER_TEXT_LOG_BYTES`
+  (`peer_text_for_log()`). A public type keeps `std::string` and `std::vector`; where
+  its value has a bound, the library holds it inline and builds the public
+  type on the thread that hands it to the consumer. `docs/internals.md`
+  "Memory" lists the `operator new` allocations that remain after `start()`,
+  and `sendspin_alloc_tests` counts them on the paths it walks.
 - Buffer and queue capacities are justified numbers. Derive related constants
   from each other (`constexpr size_t X = Y / 4;`) so they cannot drift apart,
   and do not grow a budget without recording why.
@@ -286,7 +301,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
 
 - `docs/internals.md` holds only facts that span files: the thread model,
   cross-thread channels, the protocol task's tick and the `loop()` drain order,
-  and invariants that hold
+  the allocation model, and invariants that hold
   across classes. Why a single function or member behaves as it does belongs
   in a comment at that function or member, and protocol behavior is cited
   from the spec rather than restated. Do not add test names or numeric

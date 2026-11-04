@@ -20,9 +20,30 @@
 
 #include <cstdint>
 #include <limits>
-#include <mutex>
 
 namespace sendspin {
+
+/// @brief A time filter's conversion between the client and server clocks, as of its latest
+/// measurement: what threads other than the protocol task read of a connection's filter
+/// (ConnectionManager::clock()).
+struct TimeTransform {
+    /// Server minus client time at last_update, in microseconds.
+    double offset{0.0};
+    /// Drift the conversions apply: the filter's estimate once significant, otherwise 0.
+    double drift{0.0};
+    /// Client time of the latest measurement, in microseconds.
+    int64_t last_update{0};
+    /// Whether the filter has taken at least one measurement.
+    bool synced{false};
+
+    /// @brief Converts a client timestamp to the equivalent server timestamp.
+    int64_t compute_server_time(int64_t client_time) const;
+
+    /// @brief Converts a server timestamp to the equivalent client timestamp.
+    int64_t compute_client_time(int64_t server_time) const;
+
+    bool operator==(const TimeTransform&) const = default;
+};
 
 /// @brief Two-dimensional Kalman filter for NTP-style time synchronization between client and
 /// server.
@@ -37,8 +58,8 @@ namespace sendspin {
 /// from network disruptions or server clock adjustments.
 ///
 /// All computations use double precision arithmetic to maintain microsecond-level accuracy over
-/// extended periods. Thread-safe access to the current time transformation is provided via
-/// std::mutex.
+/// extended periods. A filter belongs to one connection and is used on the protocol task only;
+/// other threads read its transform().
 class SendspinTimeFilter {
 public:
     /// @brief Configuration parameters for the time synchronization filter.
@@ -149,13 +170,13 @@ public:
     /// @return True if the filter has been updated with at least one time measurement.
     bool has_update() const;
 
+    /// @brief Returns the conversion as of the latest measurement.
+    TimeTransform transform() const;
+
 protected:
     // ========================================
     // Member variables
     // ========================================
-
-    // Struct fields
-    mutable std::mutex state_mutex_;
 
     // 64-bit fields
     const double adaptive_forgetting_cutoff;

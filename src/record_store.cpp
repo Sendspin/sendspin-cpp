@@ -218,22 +218,24 @@ void RecordStore::provision_pairing_psk_if_needed() {
 // PSK resolution
 // ============================================================================
 
-std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk_id,
+std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(std::string_view psk_id,
                                                           PskCategory category) const {
     // No lock: this runs on the protocol task, which makes every change to records_, and the main
     // loop's persist_records() only reads records_ (see the persistence locking note below).
     // Only the declared category's candidates are searched (connection.md "Pre-Shared Key"): the
     // same psk_id under another category is a lookup miss, which keeps a server from using, say, a
     // long-term PSK as though it were the Pairing PSK and inheriting that category's activities.
+    // Every id below is PEER_ID_SIZE characters (psk_id_for(), the record codec and the handshake
+    // that bound the record), so each assign() fits.
     switch (category) {
         case PskCategory::LONG_TERM: {
             const SendspinPairingRecord* rec = this->record_by_psk_id(psk_id);
             if (rec != nullptr) {
                 ResolvedPsk r;
-                r.psk_id = rec->psk_id;
+                (void)r.psk_id.assign(rec->psk_id);
                 r.psk = rec->psk;
                 r.category = PskCategory::LONG_TERM;
-                r.counterparty_id = rec->server_id;
+                (void)r.counterparty_id.assign(rec->server_id);
                 return r;
             }
             break;
@@ -241,7 +243,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
         case PskCategory::PAIRING: {
             if (this->pairing_psk_.has_value() && this->pairing_psk_->psk_id == psk_id) {
                 ResolvedPsk r;
-                r.psk_id = this->pairing_psk_->psk_id;
+                (void)r.psk_id.assign(this->pairing_psk_->psk_id);
                 r.psk = this->pairing_psk_->psk;
                 r.category = PskCategory::PAIRING;
                 return r;
@@ -251,7 +253,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
         case PskCategory::SENTINEL: {
             if (psk_id == SENTINEL_PSK_ID) {
                 ResolvedPsk r;
-                r.psk_id = SENTINEL_PSK_ID;
+                (void)r.psk_id.assign(SENTINEL_PSK_ID);
                 r.psk = SENTINEL_PSK;
                 r.category = PskCategory::SENTINEL;
                 return r;
@@ -267,7 +269,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
 // Long-term record management
 // ============================================================================
 
-size_t RecordStore::find_index(const std::string& psk_id) const {
+size_t RecordStore::find_index(std::string_view psk_id) const {
     for (size_t i = 0; i < this->records_.size(); ++i) {
         if (this->records_[i].record.psk_id == psk_id) {
             return i;
@@ -302,7 +304,7 @@ void RecordStore::mark_slot_dirty_locked(uint8_t slot) {
     }
 }
 
-const SendspinPairingRecord* RecordStore::record_by_psk_id(const std::string& psk_id) const {
+const SendspinPairingRecord* RecordStore::record_by_psk_id(std::string_view psk_id) const {
     size_t idx = this->find_index(psk_id);
     if (idx == NPOS) {
         return nullptr;
@@ -310,7 +312,7 @@ const SendspinPairingRecord* RecordStore::record_by_psk_id(const std::string& ps
     return &this->records_[idx].record;
 }
 
-const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string& server_id) const {
+const SendspinPairingRecord* RecordStore::record_by_server_id(std::string_view server_id) const {
     for (const auto& stored : this->records_) {
         if (stored.record.server_id == server_id) {
             return &stored.record;
@@ -319,15 +321,15 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
     return nullptr;
 }
 
-bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_use) {
+bool RecordStore::evict_one_locked(std::span<const IdText* const> psk_ids_in_use) {
     // records_ runs least-recently-used first (see note_record_played), so the first record no open
     // connection is resolving against is the victim pairing.md "Pairing Records" leaves to the
     // implementation. Evicting one that backs an open connection would strand a live session on a
     // PSK this store no longer holds.
     for (size_t i = 0; i < this->records_.size(); ++i) {
         const std::string& psk_id = this->records_[i].record.psk_id;
-        if (std::find(psk_ids_in_use.begin(), psk_ids_in_use.end(), psk_id) !=
-            psk_ids_in_use.end()) {
+        if (std::any_of(psk_ids_in_use.begin(), psk_ids_in_use.end(),
+                        [&psk_id](const IdText* in_use) { return *in_use == psk_id; })) {
             continue;
         }
         SS_LOGW(TAG, "Evicting record %s for server_id=%s to make room for a new pairing",
@@ -341,14 +343,13 @@ bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_us
 }
 
 bool RecordStore::store_record_superseding(SendspinPairingRecord record,
-                                           const std::vector<std::string>& psk_ids_in_use) {
+                                           std::span<const IdText* const> psk_ids_in_use) {
     // RAM-only: runs on the protocol task (the server/pair-finalize ack handler), where the
     // record must resolve before the handler returns, since the server's follow-up re-handshake
     // is the next message on that thread.
     std::lock_guard<std::mutex> lock(this->mutex_);
 
     size_t idx = this->find_index(record.psk_id);
-    const std::string incoming_psk_id = record.psk_id;
     const bool is_insert = (idx == NPOS);
 
     // Capacity: a replace by psk_id never grows the store, and neither does an insert that
@@ -363,7 +364,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
             // connection budget rules out (see MIN_MAX_RECORDS). Fails closed: the connection
             // drops when the server rekeys onto a PSK this store cannot resolve.
             SS_LOGW(TAG, "Storage full (%zu/%zu) and nothing evictable; rejecting record %s",
-                    this->records_.size(), this->max_records_, incoming_psk_id.c_str());
+                    this->records_.size(), this->max_records_, record.psk_id.c_str());
             return false;
         }
     }
@@ -379,13 +380,14 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
         this->order_dirty_ = true;
     }
 
-    // Retire any other record still bound to this server_id (see the header).
-    const std::string superseded_server_id = this->records_[idx].record.server_id;
+    // Retire any other record still bound to this server_id (see the header). idx follows the
+    // new record across each erase, so records_[idx] is read afresh on every pass.
     uint8_t retired_slot = UNASSIGNED_SLOT;
     for (size_t i = 0; i < this->records_.size();) {
-        if (i != idx && this->records_[i].record.server_id == superseded_server_id) {
+        const std::string& server_id = this->records_[idx].record.server_id;
+        if (i != idx && this->records_[i].record.server_id == server_id) {
             SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
-                    this->records_[i].record.psk_id.c_str(), superseded_server_id.c_str());
+                    this->records_[i].record.psk_id.c_str(), server_id.c_str());
             this->mark_slot_dirty_locked(this->records_[i].slot);
             this->order_dirty_ = true;
             retired_slot = this->records_[i].slot;
@@ -462,7 +464,7 @@ bool RecordStore::has_pending_writes() const {
     return this->order_dirty_ || !this->dirty_slots_.empty();
 }
 
-bool RecordStore::note_record_removed(const std::string& psk_id) {
+bool RecordStore::note_record_removed(std::string_view psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     const size_t idx = this->find_index(psk_id);
     if (idx == NPOS) {
@@ -474,7 +476,7 @@ bool RecordStore::note_record_removed(const std::string& psk_id) {
     return true;
 }
 
-bool RecordStore::note_record_played(const std::string& psk_id) {
+bool RecordStore::note_record_played(std::string_view psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     const size_t idx = this->find_index(psk_id);
     // A record that is already the most recent moves nothing and writes nothing, which is every
@@ -495,18 +497,21 @@ bool RecordStore::note_record_played(const std::string& psk_id) {
 // Pairing outcome
 // ============================================================================
 
-RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(const std::string& server_id) {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-
-    SendspinPairingRecord record;
-    record.psk_id = psk_id_for(psk);
-    record.psk = psk;
-    record.server_id = server_id;
-
+std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
+    std::string_view server_id) {
+    // Minted straight into the outcome, which wipes its PSK however this returns.
     PairingOutcome outcome;
-    outcome.psk = psk;
-    outcome.record = std::move(record);
+    platform_random_bytes(outcome.psk.data(), outcome.psk.size());
+
+    // The fallible overload: a pairing that cannot hash its PSK fails, where the std::array one
+    // would abort.
+    std::optional<std::string> psk_id = psk_id_for(outcome.psk.data(), outcome.psk.size());
+    if (!psk_id.has_value()) {
+        return std::nullopt;
+    }
+    outcome.record.psk_id = std::move(*psk_id);
+    outcome.record.psk = outcome.psk;
+    outcome.record.server_id = server_id;
     return outcome;
 }
 
@@ -535,6 +540,10 @@ std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
     if (this->provider_ == nullptr) {
         this->dirty_slots_.clear();
         this->order_dirty_ = false;
+        return writes;
+    }
+    // A flush staged only for the last-played server owes no record write: skip the reserve.
+    if (this->dirty_slots_.empty() && !this->order_dirty_) {
         return writes;
     }
     writes.reserve(this->dirty_slots_.size() + 1);

@@ -77,7 +77,7 @@ public:
     void close_transport_now() override;
 
     /// @brief Sends a text message to the server
-    SsErr send_text_message(const std::string& message) override;
+    SsErr send_text_message(const char* text, size_t len) override;
 
     /// @brief Sends a binary message to the server
     SsErr send_binary_message(const uint8_t* data, size_t len) override;

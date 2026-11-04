@@ -27,9 +27,10 @@ namespace sendspin {
 static const char* const TAG = "sendspin.decoder";
 
 void SendspinDecoder::reset_decoders() {
+    // Kept, reset, for the next FLAC stream: one decoder object per sync task run rather than
+    // one per codec header.
     if (this->flac_decoder_ != nullptr) {
         this->flac_decoder_->reset();
-        this->flac_decoder_.reset();
     }
 
 #ifdef SENDSPIN_ENABLE_OPUS
@@ -48,9 +49,15 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
 
     switch (chunk_type) {
         case CHUNK_TYPE_FLAC_HEADER: {
-            this->flac_decoder_ = std::make_unique<micro_flac::FLACDecoder>();
-            this->flac_decoder_->set_crc_check_enabled(
-                false);  // Disable CRC check for small speed up
+            // Created on the first FLAC header; reset_decoders() readies it for each later one.
+            // operator new, unlike the Opus state's PlatformBuffer: micro-flac makes operator new
+            // allocations of its own (its Ogg demuxer, its metadata blocks), so placing this
+            // object in a PlatformBuffer would move only one of them.
+            if (this->flac_decoder_ == nullptr) {
+                this->flac_decoder_ = std::make_unique<micro_flac::FLACDecoder>();
+                // Disable CRC check for small speed up; reset() keeps the setting.
+                this->flac_decoder_->set_crc_check_enabled(false);
+            }
 
             size_t bytes_consumed = 0;
             size_t samples_decoded = 0;

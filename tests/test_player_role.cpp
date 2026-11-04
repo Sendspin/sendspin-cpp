@@ -194,7 +194,7 @@ TEST(PlayerRoleSupportedCommands, EachAdjustableControlAddsItsCommandAndField) {
         std::optional<bool> mute;
         bool delay;
         bool toggled;
-        std::vector<Cmd> commands;
+        EnumSet<Cmd> commands;
     };
     const Row rows[] = {
         {"Control: defaults", std::nullopt, std::nullopt, false, false, {Cmd::VOLUME, Cmd::MUTE}},
@@ -378,7 +378,7 @@ public:
     SsErr send_binary_message(const uint8_t*, size_t) override {
         return SsErr::OK;
     }
-    SsErr send_text_message(const std::string&) override {
+    SsErr send_text_message(const char* /*text*/, size_t /*len*/) override {
         return SsErr::OK;
     }
 };
@@ -416,7 +416,7 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
             client.protocol_task_->publish_state(client.build_client_state());
             ClientStateMessage snapshot;
             ASSERT_TRUE(client.protocol_task_->take_state(snapshot));
-            client.adopt_client_state(std::move(snapshot));
+            client.adopt_client_state(snapshot);
         };
 
         client.set_available(row.available_when_adopted);
@@ -427,9 +427,8 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
         }
 
         auto conn = std::make_shared<PlayerOwnerConnection>();
-        conn->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    std::vector<std::string>{"player@v1"}, std::nullopt,
-                                    std::nullopt);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"player@v1"},
+                                    std::nullopt, std::nullopt);
         client.connection_manager_->install_admitted(conn, role_mask_bit(SendspinRole::PLAYER));
 
         InboundMessage message = receive_into_ring(ring, audio_chunk(), 0);
@@ -785,7 +784,7 @@ TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
         params.codec = row.codec;
         params.sample_rate = 48000;
         params.bit_depth = 24;
-        impl->handle_stream_start(params);
+        impl->handle_stream_start(std::move(params));
 
         void* header_item = impl->sync_task->take_item(0);
         ASSERT_NE(header_item, nullptr);

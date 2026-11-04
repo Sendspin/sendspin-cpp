@@ -21,6 +21,7 @@
 #include "platform/time.h"
 #include "protocol_messages.h"
 #include "protocol_task.h"
+#include "source_encoder_flac.h"
 #include "source_encoder_opus.h"
 #include "source_role_impl.h"
 
@@ -48,8 +49,7 @@ size_t source_chunk_bytes(const SourceRoleConfig& config) {
         return 0;
     }
     const uint64_t frames = source_ms_to_frames(config.chunk_duration_ms, config.sample_rate);
-    const size_t max_audio_bytes = MAX_TRANSPORT_PLAINTEXT - SOURCE_CHUNK_HEADER_SIZE;
-    if (frames == 0 || frames > max_audio_bytes / bytes_per_frame) {
+    if (frames == 0 || frames > SOURCE_MAX_PAYLOAD_BYTES / bytes_per_frame) {
         return 0;
     }
     return static_cast<size_t>(frames) * bytes_per_frame;
@@ -74,18 +74,31 @@ size_t source_capture_ring_bytes(const SourceRoleConfig& config) {
 // Lifecycle
 // ============================================================================
 
+/// @brief Message bytes each outbound item of a config is acquired with: the chunk header, the
+/// largest payload and AEAD_TAG_SIZE of room for the in-place encrypt's tag. The largest payload is
+/// the PCM chunk, which a FLAC or OPUS role still streams to a server that does not list its
+/// codec, or the codec's largest output when that is larger (an Opus packet can outgrow a short
+/// chunk's PCM, and a FLAC frame of incompressible audio always outgrows it).
+static size_t chunk_message_bytes(const SourceRoleConfig& config, size_t chunk_bytes,
+                                  const FlacSourceEncoder* flac_encoder) {
+    size_t payload = chunk_bytes;
+    if (config.codec == SendspinCodecFormat::OPUS) {
+        payload = std::max(chunk_bytes, OpusSourceEncoder::MAX_PACKET_BYTES);
+    } else if (config.codec == SendspinCodecFormat::FLAC) {
+        payload = std::max(chunk_bytes, flac_encoder->max_payload_bytes());
+    }
+    return SOURCE_CHUNK_HEADER_SIZE + payload + AEAD_TAG_SIZE;
+}
+
 SourceTask::SourceTask(SourceRole::Impl* role)
-    : role_(role),
+    : flac_encoder_(role->config.codec == SendspinCodecFormat::FLAC
+                        ? std::make_unique<FlacSourceEncoder>(role->config)
+                        : nullptr),
+      role_(role),
       bytes_per_frame_(source_bytes_per_frame(role->config.channels, role->config.bit_depth)),
       chunk_bytes_(source_chunk_bytes(role->config)),
-      // The largest payload: the PCM chunk, which an OPUS role still streams to a server that
-      // does not list opus, and for an OPUS config an Opus packet, which can outgrow a short
-      // chunk's PCM. AEAD_TAG_SIZE of room behind the message takes the in-place encrypt's tag.
-      chunk_message_bytes_(SOURCE_CHUNK_HEADER_SIZE +
-                           (role->config.codec == SendspinCodecFormat::OPUS
-                                ? std::max(this->chunk_bytes_, OpusSourceEncoder::MAX_PACKET_BYTES)
-                                : this->chunk_bytes_) +
-                           AEAD_TAG_SIZE) {}
+      chunk_message_bytes_(
+          chunk_message_bytes(role->config, this->chunk_bytes_, this->flac_encoder_.get())) {}
 
 SourceTask::~SourceTask() {
     this->stop();
@@ -120,6 +133,9 @@ bool SourceTask::start(ProtocolTask* protocol_task) {
         return false;  // Unreachable: validate_config() refuses OPUS without the encoder
 #endif
     }
+    if (this->flac_encoder_ != nullptr && !this->flac_encoder_->init(config)) {
+        return false;  // Logged by the encoder
+    }
     auto outbound_ring = std::make_unique<OutboundRing>();
     if (!outbound_ring->create(
             derive_outbound_ring_bytes(this->chunk_message_bytes_, OUTBOUND_RING_ITEM_COUNT),
@@ -134,9 +150,12 @@ bool SourceTask::start(ProtocolTask* protocol_task) {
     this->chunk_item_ = nullptr;
     this->encoder_generation_ = 0;
     this->opus_warm_ = false;
-    const size_t stack_size = config.codec == SendspinCodecFormat::OPUS
-                                  ? SourceRoleConfig::DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE
-                                  : SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE;
+    size_t stack_size = SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE;
+    if (config.codec == SendspinCodecFormat::OPUS) {
+        stack_size = SourceRoleConfig::DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE;
+    } else if (config.codec == SendspinCodecFormat::FLAC) {
+        stack_size = SourceRoleConfig::DEFAULT_FLAC_SOURCE_TASK_STACK_SIZE;
+    }
     platform_configure_thread("SsSrc", stack_size, static_cast<int>(config.priority),
                               config.psram_stack);
     this->task_thread_ = std::thread(thread_entry, this);
@@ -386,11 +405,21 @@ void SourceTask::flush_to_live() {
     }
 }
 
+std::optional<std::string_view> SourceTask::codec_header(SendspinCodecFormat codec) const {
+    if (codec == SendspinCodecFormat::FLAC && this->flac_encoder_ != nullptr) {
+        return this->flac_encoder_->codec_header();
+    }
+    return std::nullopt;
+}
+
 SourceEncoder* SourceTask::encoder_for(SendspinCodecFormat codec) {
-    // Opus is chosen only for an OPUS config (SourceRole::Impl::choose_codec()), whose start()
-    // created the encoder
+    // A codec is chosen only for a config of that codec (SourceRole::Impl::choose_codec()), whose
+    // task has the encoder
     if (codec == SendspinCodecFormat::OPUS && this->opus_encoder_ != nullptr) {
         return this->opus_encoder_.get();
+    }
+    if (codec == SendspinCodecFormat::FLAC && this->flac_encoder_ != nullptr) {
+        return this->flac_encoder_.get();
     }
     return &this->pcm_encoder_;
 }

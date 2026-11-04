@@ -15,7 +15,6 @@
 #include "platform/base64.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
-#include "platform/secure_zero.h"
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
 #include "sendspin/config.h"
@@ -86,6 +85,46 @@ static std::optional<bool> read_bool_field(JsonVariantConst var, const char* nam
     return var.as<bool>();
 }
 
+/// @brief Reads a stream/end or stream/clear `roles` list into `out`: nullopt when absent or null,
+/// otherwise the stream roles it names ('player', 'artwork', 'visualizer'), any other entry
+/// ignored.
+/// @return false (logged) when `roles` is present but not an array.
+static bool read_stream_roles(JsonVariantConst var, const char* type, StreamRoles* out) {
+    if (var.isNull()) {
+        *out = std::nullopt;
+        return true;
+    }
+    if (!var.is<JsonArrayConst>()) {
+        SS_LOGE(TAG, "Invalid %s message: roles is not an array", type);
+        return false;
+    }
+    EnumSet<SendspinRole> roles;
+    for (JsonVariantConst role : var.as<JsonArrayConst>()) {
+        const std::string_view name = role | std::string_view("");
+        if (name == "player") {
+            roles.insert(SendspinRole::PLAYER);
+        } else if (name == "artwork") {
+            roles.insert(SendspinRole::ARTWORK);
+        } else if (name == "visualizer") {
+            roles.insert(SendspinRole::VISUALIZER);
+        }
+    }
+    *out = roles;
+    return true;
+}
+
+/// @brief Reads a friendly name: messaging.md "server/hello" and "group/update" cap one at
+/// MAX_FRIENDLY_NAME_BYTES, and a longer one is truncated at a UTF-8 character boundary (logged),
+/// never rejected. `var` must hold a string.
+static std::string_view read_friendly_name(JsonVariantConst var, const char* field) {
+    const auto text = var.as<std::string_view>();
+    const std::string_view kept = utf8_truncate(text, MAX_FRIENDLY_NAME_BYTES);
+    if (kept.size() != text.size()) {
+        SS_LOGW(TAG, "Truncating %s: longer than %zu bytes", field, MAX_FRIENDLY_NAME_BYTES);
+    }
+    return kept;
+}
+
 /// @brief Reads an enum field parsed from a wire string via `from_string`. Absent or null returns
 /// nullopt silently; a present non-string, or a string that `from_string` does not recognize, is
 /// logged and returns nullopt. The caller picks the policy: an optional field leaves its current
@@ -104,8 +143,9 @@ static std::optional<E> read_enum_field(JsonVariantConst var, const char* name,
     const auto text = var.as<std::string_view>();
     std::optional<E> value = from_string(text);
     if (!value) {
+        const std::string_view logged = peer_text_for_log(text);
         SS_LOGW(TAG, "Ignoring field '%s': unknown value '%.*s'", name,
-                static_cast<int>(text.size()), text.data());
+                static_cast<int>(logged.size()), logged.data());
     }
     return value;
 }
@@ -266,59 +306,55 @@ static void parse_color_field(JsonVariantConst var, const char* name,
 // Message type determination
 
 SendspinServerToClientMessageType determine_message_type(JsonObject root) {
-    // Compared in place against the arena's NUL-terminated string: extracting an
-    // std::string here would heap-allocate for every type name longer than the SSO limit.
-    const char* type_str = root["type"].as<const char*>();
-    if (type_str == nullptr) {
-        return SendspinServerToClientMessageType::UNKNOWN;
-    }
+    // Read in place with its length, so a type with an escaped NUL matches no name below.
+    const std::string_view type = root["type"] | std::string_view("");
 
-    if (std::strcmp(type_str, "server/hello") == 0) {
+    if (type == "server/hello") {
         return SendspinServerToClientMessageType::SERVER_HELLO;
     }
-    if (std::strcmp(type_str, "server/activate") == 0) {
+    if (type == "server/activate") {
         return SendspinServerToClientMessageType::SERVER_ACTIVATE;
     }
-    if (std::strcmp(type_str, "server/time") == 0) {
+    if (type == "server/time") {
         return SendspinServerToClientMessageType::SERVER_TIME;
     }
-    if (std::strcmp(type_str, "server/state") == 0) {
+    if (type == "server/state") {
         return SendspinServerToClientMessageType::SERVER_STATE;
     }
-    if (std::strcmp(type_str, "server/command") == 0) {
+    if (type == "server/command") {
         return SendspinServerToClientMessageType::SERVER_COMMAND;
     }
-    if (std::strcmp(type_str, "stream/start") == 0) {
+    if (type == "stream/start") {
         return SendspinServerToClientMessageType::STREAM_START;
     }
-    if (std::strcmp(type_str, "stream/end") == 0) {
+    if (type == "stream/end") {
         return SendspinServerToClientMessageType::STREAM_END;
     }
-    if (std::strcmp(type_str, "stream/clear") == 0) {
+    if (type == "stream/clear") {
         return SendspinServerToClientMessageType::STREAM_CLEAR;
     }
-    if (std::strcmp(type_str, "group/update") == 0) {
+    if (type == "group/update") {
         return SendspinServerToClientMessageType::GROUP_UPDATE;
     }
-    if (std::strcmp(type_str, "noise/handshake") == 0) {
+    if (type == "noise/handshake") {
         return SendspinServerToClientMessageType::NOISE_HANDSHAKE;
     }
-    if (std::strcmp(type_str, "server/pair-finalize") == 0) {
+    if (type == "server/pair-finalize") {
         return SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE;
     }
-    if (std::strcmp(type_str, "pair/abort") == 0) {
+    if (type == "pair/abort") {
         return SendspinServerToClientMessageType::PAIR_ABORT;
     }
-    if (std::strcmp(type_str, "server/unpair") == 0) {
+    if (type == "server/unpair") {
         return SendspinServerToClientMessageType::SERVER_UNPAIR;
     }
-    if (std::strcmp(type_str, "server/pair-init") == 0) {
+    if (type == "server/pair-init") {
         return SendspinServerToClientMessageType::SERVER_PAIR_INIT;
     }
-    if (std::strcmp(type_str, "server/pair-auth") == 0) {
+    if (type == "server/pair-auth") {
         return SendspinServerToClientMessageType::SERVER_PAIR_AUTH;
     }
-    if (std::strcmp(type_str, "server/pair-confirm") == 0) {
+    if (type == "server/pair-confirm") {
         return SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM;
     }
 
@@ -337,7 +373,8 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
     if (hello_msg == nullptr) {
         return true;
     }
-    hello_msg->name = root["payload"]["name"].as<std::string>();
+    // read_friendly_name() cuts it to the name's capacity.
+    (void)hello_msg->name.assign(read_friendly_name(root["payload"]["name"], "server/hello name"));
 
     // roles/source/v1.md "server/hello source@v1 support object": supported_codecs is a required
     // list of strings that must include flac and pcm, and a source ignores the codec identifiers
@@ -348,9 +385,7 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
         if (!codecs.is<JsonArrayConst>()) {
             SS_LOGW(TAG, "Ignoring server/hello source@v1_support: missing supported_codecs");
         } else {
-            constexpr uint8_t REQUIRED = source_codec_bit(SendspinCodecFormat::PCM) |
-                                         source_codec_bit(SendspinCodecFormat::FLAC);
-            uint8_t accepted = 0;
+            EnumSet<SendspinCodecFormat> accepted;
             bool all_strings = true;
             for (JsonVariantConst codec : codecs.as<JsonArrayConst>()) {
                 if (!codec.is<const char*>()) {
@@ -358,12 +393,13 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
                     break;
                 }
                 if (auto format = codec_format_from_string(codec.as<std::string_view>())) {
-                    accepted |= source_codec_bit(*format);
+                    accepted.insert(*format);
                 }
             }
             if (!all_strings) {
                 SS_LOGW(TAG, "Ignoring server/hello source@v1_support: non-string codec entry");
-            } else if ((accepted & REQUIRED) != REQUIRED) {
+            } else if (!accepted.contains(SendspinCodecFormat::PCM) ||
+                       !accepted.contains(SendspinCodecFormat::FLAC)) {
                 SS_LOGW(TAG, "Ignoring server/hello source@v1_support: pcm or flac not listed");
             } else {
                 hello_msg->source_codecs = accepted;
@@ -384,28 +420,35 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
         return true;
     }
 
-    activate_msg->activities.clear();
+    activate_msg->activities = ActivitySet{};
     JsonArrayConst activities_array = root["payload"]["activities"].as<JsonArrayConst>();
     for (JsonVariantConst act_var : activities_array) {
         if (act_var.is<const char*>()) {
             auto act = activity_from_string(act_var.as<std::string_view>());
             if (act.has_value()) {
-                activate_msg->activities.push_back(act.value());
+                activate_msg->activities.insert(act.value());
             }
         }
     }
 
-    // active_roles is optional and sticky (omitted = keep prior set).
+    // messaging.md "server/activate": active_roles is an optional string[] and sticky (omitted
+    // keeps the prior set). A present non-array rejects the message, as stream/end's roles does.
+    // A non-string entry elsewhere is skipped: in stream/end's roles it only narrows what the
+    // message applies to, and in activities it narrows the declared set, which admission reads,
+    // but every subset of an allowed set is allowed, so it cannot widen what is admitted. Here
+    // skipping it would hide a non-empty set ("Playback-capable connections"), so it counts.
     JsonVariantConst roles_var = root["payload"]["active_roles"];
-    if (roles_var.is<JsonArrayConst>()) {
-        activate_msg->active_roles = std::vector<std::string>{};
-        for (JsonVariantConst role_var : roles_var.as<JsonArrayConst>()) {
-            if (role_var.is<const char*>()) {
-                activate_msg->active_roles->push_back(role_var.as<std::string>());
-            }
-        }
-    } else {
+    if (roles_var.isNull()) {
         activate_msg->active_roles = std::nullopt;
+    } else if (roles_var.is<JsonArrayConst>()) {
+        ActiveRoles roles;
+        for (JsonVariantConst role_var : roles_var.as<JsonArrayConst>()) {
+            roles.add(role_var | std::string_view(""));
+        }
+        activate_msg->active_roles = roles;
+    } else {
+        SS_LOGE(TAG, "Invalid server/activate message: active_roles is not an array");
+        return false;
     }
 
     // pairing object: required when 'pairing' is in activities, ignored otherwise (the
@@ -490,7 +533,8 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
     // Parse optional group_name; use empty string to signal clearing
     JsonVariantConst group_name_var = root["payload"]["group_name"];
     if (group_name_var.is<const char*>()) {
-        group_msg->group.group_name = group_name_var.as<std::string>();
+        group_msg->group.group_name =
+            std::string(read_friendly_name(group_name_var, "group/update group_name"));
     } else if (!group_name_var.isUnbound() && group_name_var.isNull()) {
         // Field set to null: use empty string to clear
         group_msg->group.group_name = "";
@@ -698,153 +742,165 @@ bool process_server_state_controller(JsonObject root,
     return true;
 }
 
-bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg) {
+// stream/start's sections, each parsed straight into the caller's optional rather than into a
+// local that is then moved in: both copies would otherwise be live at once in the protocol task's
+// frame. Each returns true when its section is absent or valid, and false when it is malformed.
+
+static bool process_stream_start_player(JsonObject payload,
+                                        std::optional<ServerPlayerStreamObject>* player) {
+    if (!payload["player"].is<JsonObject>()) {
+        return true;
+    }
+    ServerPlayerStreamObject& player_obj = player->emplace();
+    if (!process_player_stream_object(payload["player"], &player_obj, true)) {
+        return false;
+    }
+    if (!player_obj.is_complete()) {
+        SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
+        return false;
+    }
+    return true;
+}
+
+static bool process_stream_start_artwork(JsonObject payload,
+                                         std::optional<ServerArtworkStreamObject>* artwork) {
+    if (!payload["artwork"].is<JsonObject>()) {
+        return true;
+    }
+    // roles/artwork/v1.md "stream/start artwork object": the channels array is required, and never
+    // longer than 4, the slots a binary message's type byte can address.
+    if (!payload["artwork"]["channels"].is<JsonArray>()) {
+        SS_LOGE(TAG, "Invalid stream/start message: artwork object without a channels array");
+        return false;
+    }
+    JsonArray channels_array = payload["artwork"]["channels"].as<JsonArray>();
+    if (channels_array.size() > ARTWORK_MAX_SLOTS) {
+        SS_LOGE(TAG, "Invalid stream/start message: %zu artwork channels, at most %zu",
+                channels_array.size(), ARTWORK_MAX_SLOTS);
+        return false;
+    }
+    auto& channels = artwork->emplace().channels.emplace();
+    for (JsonObject channel_json : channels_array) {
+        ServerArtworkChannelObject channel{};
+        if (!process_artwork_channel_object(channel_json, &channel)) {
+            return false;
+        }
+        if (!channel.is_complete()) {
+            SS_LOGE(TAG, "Invalid stream/start message: incomplete artwork channel");
+            return false;
+        }
+        channels.push_back(channel);
+    }
+    return true;
+}
+
+static bool process_stream_start_visualizer(
+    JsonObject payload, std::optional<ServerVisualizerStreamObject>* visualizer) {
+    if (!payload["visualizer"].is<JsonObject>()) {
+        return true;
+    }
+    ServerVisualizerStreamObject& vis_obj = visualizer->emplace();
+    JsonObject vis_json = payload["visualizer"];
+
+    // roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": types (a string[])
+    // and rate_max are required, and tracks_downbeats is required if types includes 'beat'. An
+    // unrecognized type string is skipped like any unrecognized enum value.
+    const auto rate_max = read_uint_field<uint16_t>(vis_json["rate_max"], "rate_max");
+    if (!vis_json["types"].is<JsonArray>() || !rate_max.has_value()) {
+        SS_LOGE(TAG, "Invalid stream/start message: incomplete visualizer object");
+        return false;
+    }
+    vis_obj.rate_max = *rate_max;
+    bool lists_beat = false;
+    bool lists_spectrum = false;
+    JsonArray types_array = vis_json["types"].as<JsonArray>();
+    for (JsonVariant type_var : types_array) {
+        if (!type_var.is<const char*>()) {
+            SS_LOGE(TAG, "Invalid stream/start message: a visualizer type that is not a string");
+            return false;
+        }
+        if (auto type = read_enum_field(type_var, "types", visualizer_data_type_from_string)) {
+            vis_obj.types.push_back(*type);
+            lists_beat = lists_beat || *type == VisualizerDataType::BEAT;
+            lists_spectrum = lists_spectrum || *type == VisualizerDataType::SPECTRUM;
+        }
+    }
+
+    if (lists_beat) {
+        const auto tracks_downbeats =
+            read_bool_field(vis_json["tracks_downbeats"], "tracks_downbeats");
+        if (!tracks_downbeats.has_value()) {
+            SS_LOGE(TAG, "Invalid stream/start message: beat listed without tracks_downbeats");
+            return false;
+        }
+        vis_obj.tracks_downbeats = *tracks_downbeats;
+    }
+
+    // The same section sends the spectrum object "only if `types` includes 'spectrum'". Without a
+    // valid one the size of a binary spectrum message is indeterminate, so none could be
+    // validated: an absent or malformed field leaves the config unset, which rejects the stream
+    // rather than acting on a fabricated default.
+    if (vis_json["spectrum"].is<JsonObject>()) {
+        JsonObject spec_json = vis_json["spectrum"];
+        auto n_disp_bins = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1);
+        auto scale =
+            read_enum_field(spec_json["scale"], "scale", visualizer_spectrum_scale_from_string);
+        auto f_min = read_uint_field<uint16_t>(spec_json["f_min"], "f_min");
+        auto f_max = read_uint_field<uint16_t>(spec_json["f_max"], "f_max");
+        if (n_disp_bins && scale && f_min && f_max) {
+            vis_obj.spectrum = VisualizerSpectrumConfig{*n_disp_bins, *scale, *f_min, *f_max};
+        }
+    }
+    if (lists_spectrum && !vis_obj.spectrum.has_value()) {
+        SS_LOGE(TAG, "Invalid stream/start message: SPECTRUM advertised without a valid "
+                     "spectrum config");
+        return false;
+    }
+    return true;
+}
+
+bool process_stream_start_message(JsonObject root, EnumSet<SendspinRole> roles,
+                                  StreamStartMessage* stream_msg) {
     if (stream_msg == nullptr) {
         return true;
     }
 
-    // Each section is parsed straight into the caller's struct rather than into a local that is
-    // then moved in. Both copies would otherwise be live at once in this frame, which matters on
-    // the ESP httpd task (4 KB stack); on a parse failure the section is reset instead.
-
-    if (root["payload"]["player"].is<JsonObject>()) {
-        ServerPlayerStreamObject& player_obj = stream_msg->player.emplace();
-        if (!process_player_stream_object(root["payload"]["player"], &player_obj, true)) {
-            stream_msg->player.reset();
-            return false;
-        }
-        if (!player_obj.is_complete()) {
-            SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
-            stream_msg->player.reset();
-            return false;
-        }
+    // Only the sections of `roles` are parsed, so a section no role takes is neither copied nor
+    // validated, as with server/state. A malformed section that is parsed rejects the whole
+    // message and resets every section, so a well-formed section beside it never starts half the
+    // stream the server asked for.
+    JsonObject payload = root["payload"];
+    const bool valid = (!roles.contains(SendspinRole::PLAYER) ||
+                        process_stream_start_player(payload, &stream_msg->player)) &&
+                       (!roles.contains(SendspinRole::ARTWORK) ||
+                        process_stream_start_artwork(payload, &stream_msg->artwork)) &&
+                       (!roles.contains(SendspinRole::VISUALIZER) ||
+                        process_stream_start_visualizer(payload, &stream_msg->visualizer));
+    if (!valid) {
+        stream_msg->player.reset();
+        stream_msg->artwork.reset();
+        stream_msg->visualizer.reset();
     }
-
-    if (root["payload"]["artwork"]["channels"].is<JsonArray>()) {
-        std::vector<ServerArtworkChannelObject>& channels =
-            stream_msg->artwork.emplace().channels.emplace();
-
-        JsonArray channels_array = root["payload"]["artwork"]["channels"].as<JsonArray>();
-        for (JsonObject channel_json : channels_array) {
-            ServerArtworkChannelObject channel{};
-            if (process_artwork_channel_object(channel_json, &channel)) {
-                if (!channel.is_complete()) {
-                    SS_LOGE(TAG, "Invalid stream/start message: incomplete artwork channel");
-                    stream_msg->artwork.reset();
-                    return false;
-                }
-                channels.push_back(channel);
-            } else {
-                stream_msg->artwork.reset();
-                return false;
-            }
-        }
-    }
-
-    if (root["payload"]["visualizer"].is<JsonObject>()) {
-        ServerVisualizerStreamObject& vis_obj = stream_msg->visualizer.emplace();
-        JsonObject vis_json = root["payload"]["visualizer"];
-
-        // Parse types array
-        if (vis_json["types"].is<JsonArray>()) {
-            JsonArray types_array = vis_json["types"].as<JsonArray>();
-            for (JsonVariant type_var : types_array) {
-                if (auto type =
-                        read_enum_field(type_var, "types", visualizer_data_type_from_string)) {
-                    vis_obj.types.push_back(*type);
-                }
-            }
-        }
-
-        if (auto v = read_uint_field<uint16_t>(vis_json["rate_max"], "rate_max")) {
-            vis_obj.rate_max = *v;
-        }
-
-        if (auto v = read_bool_field(vis_json["tracks_downbeats"], "tracks_downbeats")) {
-            vis_obj.tracks_downbeats = *v;
-        }
-
-        // Parse spectrum config if present. Every field is required by the spec; if any is
-        // absent or malformed, leave the config unset so the SPECTRUM validation below rejects
-        // the stream rather than acting on a fabricated default.
-        if (vis_json["spectrum"].is<JsonObject>()) {
-            JsonObject spec_json = vis_json["spectrum"];
-            auto n_disp_bins = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1);
-            auto scale =
-                read_enum_field(spec_json["scale"], "scale", visualizer_spectrum_scale_from_string);
-            auto f_min = read_uint_field<uint16_t>(spec_json["f_min"], "f_min");
-            auto f_max = read_uint_field<uint16_t>(spec_json["f_max"], "f_max");
-            if (n_disp_bins && scale && f_min && f_max) {
-                vis_obj.spectrum = VisualizerSpectrumConfig{*n_disp_bins, *scale, *f_min, *f_max};
-            }
-        }
-
-        // If SPECTRUM is advertised, a fully valid spectrum config must be present; otherwise the
-        // expected size of binary spectrum messages is indeterminate and they could not be
-        // validated. The defect is local to the visualizer object, so drop only that object and
-        // let a well-formed player/artwork start in the same message go through.
-        bool advertises_spectrum = false;
-        for (auto type : vis_obj.types) {
-            if (type == VisualizerDataType::SPECTRUM) {
-                advertises_spectrum = true;
-                break;
-            }
-        }
-        if (advertises_spectrum && !vis_obj.spectrum.has_value()) {
-            SS_LOGE(TAG, "Ignoring visualizer stream config: SPECTRUM advertised without valid "
-                         "spectrum config");
-            stream_msg->visualizer.reset();
-        }
-    }
-
-    return true;
+    return valid;
 }
 
 bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg) {
     if (end_msg == nullptr) {
         return true;
     }
-
-    // Parse optional roles array
-    if (root["payload"]["roles"].is<JsonArray>()) {
-        std::vector<std::string> roles;
-        JsonArray roles_array = root["payload"]["roles"].as<JsonArray>();
-        for (JsonVariant role_var : roles_array) {
-            if (role_var.is<const char*>()) {
-                roles.push_back(role_var.as<std::string>());
-            }
-        }
-        end_msg->roles = std::move(roles);
-    }
-
-    return true;
+    return read_stream_roles(root["payload"]["roles"], "stream/end", &end_msg->roles);
 }
 
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg) {
     if (clear_msg == nullptr) {
         return true;
     }
-
-    // Parse optional roles array
-    if (root["payload"]["roles"].is<JsonArray>()) {
-        std::vector<std::string> roles;
-        JsonArray roles_array = root["payload"]["roles"].as<JsonArray>();
-        for (JsonVariant role_var : roles_array) {
-            if (role_var.is<const char*>()) {
-                roles.push_back(role_var.as<std::string>());
-            }
-        }
-        clear_msg->roles = std::move(roles);
-    }
-
-    return true;
+    return read_stream_roles(root["payload"]["roles"], "stream/clear", &clear_msg->roles);
 }
 
 // Message formatting
 
-std::string format_client_hello_message(const ClientHelloMessage* msg,
-                                        SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_hello_message(const ClientHelloMessage* msg, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/hello";
@@ -873,25 +929,22 @@ std::string format_client_hello_message(const ClientHelloMessage* msg,
         JsonObject methods_obj = root["payload"]["supported_pair_methods"].to<JsonObject>();
         for (const auto& desc : msg->supported_pair_methods) {
             JsonObject method_obj = methods_obj[to_cstr(desc.method)].to<JsonObject>();
-            const auto& out_channels = desc.out_channels;
-            if (out_channels.has_value() && !out_channels->empty()) {
+            if (!desc.out_channels.empty()) {
                 JsonArray ch_arr = method_obj["out_channels"].to<JsonArray>();
-                for (const auto& ch : out_channels.value()) {
+                for (const auto& ch : desc.out_channels) {
                     ch_arr.add(to_cstr(ch));
                 }
             }
-            const auto& formats = desc.formats;
-            if (formats.has_value() && !formats->empty()) {
+            if (!desc.formats.empty()) {
                 JsonArray fmt_arr = method_obj["formats"].to<JsonArray>();
-                for (const auto& fmt : formats.value()) {
+                for (const auto& fmt : desc.formats) {
                     fmt_arr.add(to_cstr(fmt));
                 }
             }
-            const auto& locations = desc.locations;
-            if (locations.has_value() && !locations->empty()) {
+            if (!desc.locations.empty()) {
                 JsonArray loc_arr = method_obj["locations"].to<JsonArray>();
-                for (const auto& loc : locations.value()) {
-                    loc_arr.add(loc.c_str());
+                for (const auto& loc : desc.locations) {
+                    loc_arr.add(loc);
                 }
             }
         }
@@ -944,15 +997,9 @@ std::string format_client_hello_message(const ClientHelloMessage* msg,
             root["payload"][app_role.role + "_support"] = serialized(app_role.support_json.value());
         }
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_state_message(const ClientStateMessage* msg,
-                                        SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_state_message(const ClientStateMessage* msg, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/state";
@@ -973,9 +1020,8 @@ std::string format_client_state_message(const ClientStateMessage* msg,
         // roles/player/v1.md "client/state player object": supported_commands is a required key
         // that is empty when the player accepts no commands, so the array is emitted even then.
         JsonArray commands_list = root["payload"]["player"]["supported_commands"].to<JsonArray>();
-        for (const auto& cmd : player_state.supported_commands) {
-            commands_list.add(to_cstr(cmd));
-        }
+        player_state.supported_commands.for_each(
+            [&commands_list](SendspinPlayerCommand cmd) { commands_list.add(to_cstr(cmd)); });
     }
 
     if (msg->artwork.has_value()) {
@@ -1019,15 +1065,9 @@ std::string format_client_state_message(const ClientStateMessage* msg,
             source_json["signal"] = to_cstr(msg->source.value().signal.value());
         }
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_stream_start_message(const ClientStreamStartMessage* msg,
-                                               SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_stream_start_message(const ClientStreamStartMessage* msg, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     // roles/source/v1.md "client-stream/start": bit_depth is required even for opus, which ignores
@@ -1041,51 +1081,31 @@ std::string format_client_stream_start_message(const ClientStreamStartMessage* m
     if (msg->codec_header.has_value()) {
         source_json["codec_header"] = msg->codec_header.value();
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_stream_end_message(SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_stream_end_message(JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client-stream/end";
     // roles/source/v1.md "client-stream/end": no payload fields, but the envelope carries a payload
     // object like every other message.
     root["payload"].to<JsonObject>();
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_leave_message(SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_leave_message(JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/leave";
     // messaging.md "client/leave": no payload fields, but the envelope carries a payload object
     // like every other message.
     root["payload"].to<JsonObject>();
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_goodbye_message(SendspinGoodbyeReason reason,
-                                          SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_goodbye_message(SendspinGoodbyeReason reason, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/goodbye";
     root["payload"]["reason"] = to_cstr(reason);
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
 namespace {
@@ -1204,9 +1224,7 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
     return static_cast<size_t>(p - buf);
 }
 
-std::string format_client_command_message(const ClientCommandControllerObject& cmd,
-                                          SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_command_message(const ClientCommandControllerObject& cmd, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/command";
@@ -1224,68 +1242,38 @@ std::string format_client_command_message(const ClientCommandControllerObject& c
     if (cmd.command == SendspinControllerCommand::SEEK_RELATIVE && cmd.offset_ms.has_value()) {
         controller["offset_ms"] = cmd.offset_ms.value();
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
 // ============================================================================
 // Pairing-PSK protocol messages
 // ============================================================================
 
-std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk,
-                                                SendspinArenaAllocator& arena) {
+void build_client_pair_finalize_message(const std::array<uint8_t, 32>& psk, JsonDocument& doc) {
     // The document holds the base64 long-term PSK, which admits a server permanently; the arena
-    // wipes every block it frees, and the caller wipes the returned string once it has been sent
-    // (see handle_enter_pairing_psk()). The encoded copy staged on the way is wiped here.
-    JsonDocument doc = make_json_document(arena);
+    // wipes every block it frees, and the text send_json() serializes is encrypted over in place
+    // or wiped (NoiseTransport::send_staged_json()).
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
-    // Encode the 32-byte PSK as 43-char base64url (no padding).
-    std::string psk_b64 = b64url_encode(psk.data(), psk.size());
-    root["payload"]["long_term_psk"] = psk_b64;
-    secure_zero(psk_b64.data(), psk_b64.size());
-
-    // Reserved to the exact length so serializeJson() writes in place: a growing string would
-    // leave PSK-bearing copies behind in the heap blocks it outgrew, which nothing wipes.
-    std::string output;
-    output.reserve(measureJson(doc));
-    serializeJson(doc, output);
-    return output;
+    b64url_encode_to(root["payload"]["long_term_psk"], psk);
 }
 
-std::string format_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
-                                                        SendspinArenaAllocator& arena) {
-    // Wiped like format_client_pair_finalize_message(); see the note there.
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
+                                                JsonDocument& doc) {
+    // Wiped like build_client_pair_finalize_message(); see the note there.
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
     // Pairing-code flows only (pairing.md "Wrapping"); exactly one of long_term_psk/wrapped_psk
     // is present per message.
-    std::string wrapped_b64 = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
-    root["payload"]["wrapped_psk"] = wrapped_b64;
-    secure_zero(wrapped_b64.data(), wrapped_b64.size());
-
-    // Reserved to the exact length, as in format_client_pair_finalize_message().
-    std::string output;
-    output.reserve(measureJson(doc));
-    serializeJson(doc, output);
-    return output;
+    b64url_encode_to(root["payload"]["wrapped_psk"], wrapped_psk);
 }
 
-std::string format_pair_abort_message(PairAbortReason reason, SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_pair_abort_message(PairAbortReason reason, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "pair/abort";
     root["payload"]["reason"] = to_cstr(reason);
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
 bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
@@ -1301,8 +1289,9 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
     const auto reason_str = root["payload"]["reason"].as<std::string_view>();
     auto reason = pair_abort_reason_from_string(reason_str);
     if (!reason.has_value()) {
-        SS_LOGW(TAG, "pair/abort: unrecognized reason '%.*s'", static_cast<int>(reason_str.size()),
-                reason_str.data());
+        const std::string_view logged = peer_text_for_log(reason_str);
+        SS_LOGW(TAG, "pair/abort: unrecognized reason '%.*s'", static_cast<int>(logged.size()),
+                logged.data());
         return false;
     }
 
@@ -1329,17 +1318,14 @@ bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* pa
         SS_LOGE(TAG, "server/pair-init: nonce_A is not a string");
         return false;
     }
-    auto decoded = b64url_decode(nonce_var.as<std::string>());
-    if (!decoded.has_value() || decoded->size() != 32) {
+    std::array<uint8_t, 32> nonce_a{};
+    if (!b64url_decode_exact(nonce_var.as<std::string_view>(), nonce_a)) {
         SS_LOGE(TAG, "server/pair-init: nonce_A is not 32 base64url-encoded bytes");
         return false;
     }
-    if (payload == nullptr) {
-        return true;
+    if (payload != nullptr) {
+        payload->nonce_a = nonce_a;
     }
-    std::array<uint8_t, 32> nonce_a{};
-    std::memcpy(nonce_a.data(), decoded->data(), nonce_a.size());
-    payload->nonce_a = nonce_a;
     return true;
 }
 
@@ -1349,17 +1335,14 @@ bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* pa
         return false;
     }
 
-    if (payload == nullptr) {
-        return true;
-    }
-
-    const std::string msg1_b64 = root["payload"]["pake_msg_1"].as<std::string>();
-    auto msg1_bytes = b64url_decode(msg1_b64);
-    if (!msg1_bytes.has_value() || msg1_bytes->size() != 32) {
+    std::array<uint8_t, 32> pake_msg_1{};
+    if (!b64url_decode_exact(root["payload"]["pake_msg_1"].as<std::string_view>(), pake_msg_1)) {
         SS_LOGE(TAG, "server/pair-auth: pake_msg_1 is not 32 bytes");
         return false;
     }
-    std::memcpy(payload->pake_msg_1.data(), msg1_bytes->data(), 32);
+    if (payload != nullptr) {
+        payload->pake_msg_1 = pake_msg_1;
+    }
     return true;
 }
 
@@ -1369,119 +1352,78 @@ bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPaylo
         return false;
     }
 
-    if (payload == nullptr) {
-        return true;
-    }
-
-    const std::string kc_b64 = root["payload"]["server_kc"].as<std::string>();
-    auto kc_bytes = b64url_decode(kc_b64);
-    if (!kc_bytes.has_value() || kc_bytes->size() != 64) {
+    std::array<uint8_t, 64> server_kc{};
+    if (!b64url_decode_exact(root["payload"]["server_kc"].as<std::string_view>(), server_kc)) {
         SS_LOGE(TAG, "server/pair-confirm: server_kc is not 64 bytes");
         return false;
     }
-    std::memcpy(payload->server_kc.data(), kc_bytes->data(), 64);
+    if (payload != nullptr) {
+        payload->server_kc = server_kc;
+    }
     return true;
 }
 
-std::string format_client_pair_pending_message(uint32_t pairing_index,
-                                               SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_pending_message(uint32_t pairing_index, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-pending";
     root["payload"]["pairing_index"] = pairing_index;
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
-                                            uint32_t pairing_index, SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_init_message(const std::array<uint8_t, 32>& commit_b, uint32_t pairing_index,
+                                    JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
-    root["payload"]["commit_B"] = b64url_encode(commit_b.data(), commit_b.size());
+    b64url_encode_to(root["payload"]["commit_B"], commit_b);
     root["payload"]["pairing_index"] = pairing_index;
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_init_message(uint32_t pairing_index, SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_init_message(uint32_t pairing_index, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
     // commit_B belongs to the dynamic pairing code flow only; pairing_index is required on
     // every client/pair-init (pairing.md "client/pair-init").
     root["payload"]["pairing_index"] = pairing_index;
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_retry_message(SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_retry_message(JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-retry";
     // Empty payload, emitted explicitly so the message carries the object every other pairing
     // message does (pairing.md "Client -> Server: client/pair-retry").
     root["payload"].to<JsonObject>();
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
 }
 
-std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2,
-                                            SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-auth";
-    root["payload"]["pake_msg_2"] = b64url_encode(pake_msg_2.data(), pake_msg_2.size());
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
+    b64url_encode_to(root["payload"]["pake_msg_2"], pake_msg_2);
 }
 
-std::string format_client_pair_confirm_message(
+void build_client_pair_confirm_message(
     const std::array<uint8_t, 64>& client_kc,
-    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b, SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b, JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";
-    root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
+    b64url_encode_to(root["payload"]["client_kc"], client_kc);
     // The commitment opening crosses the wire sealed under the CPace output, never in the clear
     // (pairing.md "Wrapping"): an observer that cannot complete the PAKE cannot reconstruct the
     // pairing code from the handshake it watched.
-    root["payload"]["wrapped_nonce_B"] =
-        b64url_encode(wrapped_nonce_b.data(), wrapped_nonce_b.size());
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
+    b64url_encode_to(root["payload"]["wrapped_nonce_B"], wrapped_nonce_b);
 }
 
-std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
-                                               SendspinArenaAllocator& arena) {
-    JsonDocument doc = make_json_document(arena);
+void build_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
+                                       JsonDocument& doc) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";
     // The static flow sends no commit_B, so it has no opening to wrap.
-    root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
+    b64url_encode_to(root["payload"]["client_kc"], client_kc);
 }
 
 }  // namespace sendspin

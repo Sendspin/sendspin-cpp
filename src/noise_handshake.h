@@ -41,18 +41,17 @@
 
 #include "crypto/keys.h"
 #include "noise_session.h"
+#include "platform/memory.h"
 #include "record_store.h"
 #include <ArduinoJson.h>
 
 #include <array>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
-#include <string>
+#include <span>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 namespace sendspin {
 
@@ -61,15 +60,57 @@ class SendspinArenaAllocator;
 /// @brief Outcome of a successful Noise handshake (initial or re-handshake).
 struct NoiseHandshakeResult {
     /// The cipher session ready for transport-mode encrypt/decrypt.
-    std::unique_ptr<NoiseSession> session;
+    NoiseSession session;
     /// Server's public key peer_id (43-char base64url).
-    std::string server_id;
-    /// The PSK record that admitted the connection.
-    ResolvedPsk resolved_psk;
-    /// Serialized noise/handshake msg2 JSON to send to the peer.
-    /// Non-empty only for re-handshake results (initial handshake sends msg2 inline).
-    std::string msg2_text;
+    IdText server_id;
+    /// psk_id of the PSK that admitted the connection. The handshake has already mixed the PSK
+    /// into session's keys, so the result carries none of its bytes.
+    IdText psk_id;
+    /// Category of that PSK.
+    PskCategory psk_category{PskCategory::SENTINEL};
+    /// The Noise msg2 bytes to send to the peer, in a noise/handshake envelope
+    /// (build_noise_handshake_message()). Set only for re-handshake results (initial handshake
+    /// sends msg2 inline).
+    NoiseMsg2 msg2_bytes{};
 };
+
+/// @brief Why a server refused our client/init: the reasons messaging.md "server/error" defines,
+/// plus UNKNOWN for any other text or none
+enum class ServerErrorReason : uint8_t {
+    UNSUPPORTED_VERSION,  ///< "unsupported_version"
+    UNSUPPORTED_SUITE,    ///< "unsupported_suite"
+    MALFORMED,            ///< "malformed"
+    UNKNOWN,              ///< Any other reason, or none
+};
+
+/// @brief Parses a server/error reason; UNKNOWN for text messaging.md does not define
+inline ServerErrorReason server_error_reason_from_string(std::string_view text) {
+    if (text == "unsupported_version") {
+        return ServerErrorReason::UNSUPPORTED_VERSION;
+    }
+    if (text == "unsupported_suite") {
+        return ServerErrorReason::UNSUPPORTED_SUITE;
+    }
+    if (text == "malformed") {
+        return ServerErrorReason::MALFORMED;
+    }
+    return ServerErrorReason::UNKNOWN;
+}
+
+/// @brief Wire string for a ServerErrorReason; "unknown" for UNKNOWN.
+inline const char* to_cstr(ServerErrorReason reason) {
+    switch (reason) {
+        case ServerErrorReason::UNSUPPORTED_VERSION:
+            return "unsupported_version";
+        case ServerErrorReason::UNSUPPORTED_SUITE:
+            return "unsupported_suite";
+        case ServerErrorReason::MALFORMED:
+            return "malformed";
+        case ServerErrorReason::UNKNOWN:
+            return "unknown";
+    }
+    return "unknown";
+}
 
 /// @brief Result of processing one incoming WS frame during the handshake.
 enum class HandshakeFrameResult : uint8_t {
@@ -82,6 +123,10 @@ enum class HandshakeFrameResult : uint8_t {
 // noise/handshake envelope
 // ============================================================================
 
+/// @brief Builds a noise/handshake envelope carrying `msg2` base64url-encoded, into the
+/// caller-owned `doc`: {"type":"noise/handshake","payload":{"data":"..."}}
+void build_noise_handshake_message(const NoiseMsg2& msg2, JsonDocument& doc);
+
 /// @brief Reads the Noise message bytes a noise/handshake envelope carries: its payload.data,
 /// base64url-decoded.
 ///
@@ -89,9 +134,10 @@ enum class HandshakeFrameResult : uint8_t {
 /// re-handshake's, so the caller can release the parsed envelope before the handshake runs.
 /// @param envelope    Parsed noise/handshake envelope; its type is the caller's to check.
 /// @param log_context Prefix for the failure log line.
-/// @return The decoded bytes, or nullopt (logged) when data is missing, empty or not base64url.
-std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst envelope,
-                                                              const char* log_context);
+/// @return The decoded bytes, or nullopt (logged) when data is missing, empty, not base64url or
+///         longer than MAX_HANDSHAKE_MSG1_BYTES, or when their buffer cannot be allocated.
+std::optional<PlatformBuffer> read_noise_handshake_data(JsonObjectConst envelope,
+                                                        const char* log_context);
 
 // ============================================================================
 // Re-handshake helper
@@ -111,18 +157,18 @@ std::optional<std::vector<uint8_t>> read_noise_handshake_data(JsonObjectConst en
 ///   4. Bind the resolved PSK onto the same session (NoiseSession::set_psk).
 ///   5. Write msg2 and split -> new session.
 ///
-/// @param msg1_bytes     The re-handshake msg1 (Noise bytes, decoded from the envelope).
+/// @param msg1_bytes     The re-handshake msg1 (Noise bytes, decoded from the envelope); cleared
+///                       on return.
 /// @param server_id      Known server peer_id (43-char base64url) from the prior handshake.
 /// @param identity       Our static X25519 identity.
 /// @param record_store   Record store for psk_id resolution (read-only on protocol task).
 /// @param suite_name     Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
 /// @param prior_h        32-byte handshake hash from the prior session (used as prologue).
-/// @param arena          The client's JSON arena: msg1's payload is parsed and the msg2 envelope
-///                       built in it, one after the other.
-/// @return Populated NoiseHandshakeResult (session + msg2_text to send) on success,
+/// @param arena          The client's JSON arena, which msg1's payload is parsed in.
+/// @return Populated NoiseHandshakeResult (session + msg2_bytes to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
-    const std::vector<uint8_t>& msg1_bytes, const std::string& server_id, const Identity& identity,
+    std::span<uint8_t> msg1_bytes, const IdText& server_id, const Identity& identity,
     const RecordStore& record_store, const char* suite_name, const std::array<uint8_t, 32>& prior_h,
     SendspinArenaAllocator& arena);
 
@@ -132,8 +178,8 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(
 
 /// @brief Noise handshake state machine for the Sendspin client (Noise responder).
 ///
-/// build_client_init() produces the first cleartext frame, on_text_frame() takes each incoming
-/// text frame, and take_result() yields the session once that returns COMPLETE.
+/// build_client_init() produces the first cleartext frame, and on_text_frame() takes each
+/// incoming text frame, handing out the session with the frame that completes the handshake.
 ///
 /// Threading: runs entirely on the protocol task, which is where RecordStore::resolve_by_psk_id()
 /// runs (see record_store.h).
@@ -160,29 +206,29 @@ public:
     // Drive the state machine
     // ========================================
 
-    /// @brief Serialize and return the client/init TEXT frame, or an empty string on error.
+    /// @brief Serialize and return the client/init TEXT frame, or an empty view on error. The view
+    /// is of the text the handshake retains for its prologue, valid while this object lives.
     /// Call this immediately after the WS connection is open, before reading frames.
-    std::string build_client_init();
+    std::string_view build_client_init();
 
     /// @brief Process one incoming WS text frame.
     /// Must be called in sequence: server/init, then noise/handshake msg1.
-    /// @param send_fn  Callable that sends a TEXT frame to the peer.
-    ///                 Signature: `bool send_fn(const std::string& text)`.
+    /// @param send_fn   Callable that sends a JSON message to the peer as a TEXT frame.
+    ///                  Signature: `bool send_fn(const JsonDocument& msg)`.
+    /// @param completed Set to the handshake's result when this returns COMPLETE, untouched
+    ///                  otherwise.
     HandshakeFrameResult on_text_frame(std::string_view text,
-                                       const std::function<bool(const std::string&)>& send_fn);
+                                       const std::function<bool(const JsonDocument&)>& send_fn,
+                                       std::optional<NoiseHandshakeResult>& completed);
 
-    /// @brief The reason carried by a server/error received during the handshake, or empty.
+    /// @brief The reason carried by a server/error received during the handshake, or nullopt
+    /// when none arrived.
     ///
     /// messaging.md "server/error": the server sends one in place of server/init when it cannot
     /// accept our client/init. The message is unauthenticated, so connection.md "Failure Handling"
     /// makes the reason a hint for logging and operator display.
-    const std::string& server_error_reason() const {
+    std::optional<ServerErrorReason> server_error_reason() const {
         return this->server_error_reason_;
-    }
-
-    /// @brief Take ownership of the handshake result (only valid after COMPLETE).
-    std::optional<NoiseHandshakeResult> take_result() {
-        return std::move(this->result_);
     }
 
 private:
@@ -201,32 +247,31 @@ private:
 
     /// @brief Validate the fields read from a server/init frame.
     /// @param version   payload.version (0 when absent).
-    /// @param server_id payload.server_id (empty when absent).
-    /// @param text      Exact received bytes, retained for the handshake prologue.
-    bool handle_server_init(int version, std::string server_id, std::string_view text);
+    /// @param server_id payload.server_id (empty when absent or longer than a peer_id).
+    /// @param text      Exact received bytes, retained for the handshake prologue; refused when
+    ///                  longer than MAX_SERVER_INIT_BYTES.
+    bool handle_server_init(int version, const IdText& server_id, std::string_view text);
 
     /// @brief Authenticate and respond to the noise/handshake msg1.
-    /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data()).
+    /// @param msg1_bytes The msg1 Noise bytes, read from the frame (read_noise_handshake_data());
+    ///                   cleared on return.
     /// @param send_fn    Sends the msg2 frame back to the peer.
+    /// @param completed  Set to the handshake's result on success.
     /// @return true when msg1 authenticated and msg2 was sent.
-    bool handle_msg1(const std::vector<uint8_t>& msg1_bytes,
-                     const std::function<bool(const std::string&)>& send_fn);
+    bool handle_msg1(std::span<uint8_t> msg1_bytes,
+                     const std::function<bool(const JsonDocument&)>& send_fn,
+                     std::optional<NoiseHandshakeResult>& completed);
 
     // Struct fields
-    /// Exact bytes of the client/init frame we sent (retained for prologue).
-    std::string client_init_text_;
-
-    /// Result available after COMPLETE.
-    std::optional<NoiseHandshakeResult> result_;
+    /// The prologue: the exact bytes of the client/init we sent, then of the server/init we
+    /// received, in one buffer sized for both when client/init is built.
+    PlatformBuffer prologue_;
 
     /// Reason from a received server/error. See server_error_reason().
-    std::string server_error_reason_;
+    std::optional<ServerErrorReason> server_error_reason_;
 
     /// server_id decoded from server/init (43-char base64url).
-    std::string server_id_;
-
-    /// Exact bytes of the server/init frame we received (retained for prologue).
-    std::string server_init_text_;
+    IdText server_id_;
 
     const char* suite_name_;
 
@@ -236,6 +281,11 @@ private:
     SendspinArenaAllocator& arena_;
     const Identity& identity_;
     const RecordStore& record_store_;
+
+    // size_t fields
+    /// Bytes of prologue_ holding client/init, then server/init.
+    size_t client_init_size_{0};
+    size_t server_init_size_{0};
 
     // 32-bit fields
     State state_{State::INIT};

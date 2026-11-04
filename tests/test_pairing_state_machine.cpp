@@ -22,7 +22,7 @@
 // The device under test is the CPace RESPONDER; the "server" side is simulated in-test with
 // a CPace INITIATOR (see cpace.h). A FakeConnection (adapted from TestConnection in
 // tests/test_noise_transport.cpp) stands in for the transport: it reports a canned Noise
-// handshake hash while leaving the Noise session unset, so SendspinConnection::send_app_json
+// handshake hash while leaving the Noise session unset, so SendspinConnection::send_json
 // emits raw JSON via send_text_message, which this file parses directly with ArduinoJson.
 //
 // The fixture stops the protocol task right after start() and plays its part on the test
@@ -52,6 +52,7 @@
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
+#include "test_util.h"
 #include "wrap_test_helpers.h"
 
 #include <ArduinoJson.h>
@@ -100,7 +101,8 @@ public:
     }
     bool is_connected() const override { return this->connected_; }
 
-    SsErr send_text_message(const std::string& msg) override {
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         sent_text_.push_back(msg);
         return SsErr::OK;
     }
@@ -113,7 +115,7 @@ public:
     // Test-only seam: canned handshake hash without a Noise session
 
     /// Report a fixed 32-byte handshake hash while leaving noise_session_ (and therefore
-    /// noise_active_) unset, so send_app_json() routes through send_text_message() as raw JSON.
+    /// noise_active_) unset, so send_json() routes through send_text_message() as raw JSON.
     std::optional<std::array<uint8_t, 32>> get_noise_handshake_hash() const override {
         return this->canned_hash_;
     }
@@ -416,7 +418,7 @@ protected:
     void SetUp() override {
         // The harness defaults to a device able to emit a dynamic pairing code (spec "PAKE"'s
         // pairing-method admissibility check in ConnectionManager::on_server_activate() mirrors
-        // build_hello_message()'s gating exactly). Tests that need a different capability shape
+        // build_client_hello()'s gating exactly). Tests that need a different capability shape
         // call init_client() again.
         this->init_client(/*pairing_code_emission_supported=*/true);
     }
@@ -524,7 +526,8 @@ protected:
         const std::string& server_id, SendspinPairMethod method,
         SendspinPairingCodeFormat format = SendspinPairingCodeFormat::DIGITS) {
         auto conn = std::make_shared<FakeConnection>();
-        conn->set_noise_handshake_result(server_id, PskCategory::SENTINEL, /*psk_id=*/"");
+        conn->set_noise_handshake_result(id_text(server_id), PskCategory::SENTINEL,
+                                         /*psk_id=*/IdText{});
         conn->apply_server_activate({SendspinActivity::PAIRING}, std::nullopt, method,
                                     method == SendspinPairMethod::DYNAMIC_PAIRING_CODE
                                         ? std::optional<SendspinPairingCodeFormat>(format)
@@ -543,7 +546,8 @@ protected:
     /// exercised end to end (not bypassed through the handle_enter_pairing() seam).
     FakeConnection* inject_provisional_current_connection(const std::string& server_id) {
         auto conn = std::make_shared<FakeConnection>();
-        conn->set_noise_handshake_result(server_id, PskCategory::SENTINEL, /*psk_id=*/"");
+        conn->set_noise_handshake_result(id_text(server_id), PskCategory::SENTINEL,
+                                         /*psk_id=*/IdText{});
         FakeConnection* raw = conn.get();
         this->injected_conn_ = conn;
         this->admit(conn);
@@ -605,11 +609,11 @@ protected:
     }
 
     /// Apply a server/activate on the injected current connection through the real activation
-    /// path, ConnectionManager::on_server_activate() (trust check, apply_server_activate, then
-    /// either the already-admitted branch's leftover-activate handling or
+    /// path, ConnectionManager::on_server_activate() (admissibility check, apply_server_activate,
+    /// then either the already-admitted branch's leftover-activate handling or
     /// on_handshake_complete()): the call process_json_message() makes on the protocol task.
-    void post_activate(std::vector<SendspinActivity> activities,
-                       std::optional<std::vector<std::string>> active_roles,
+    void post_activate(ActivitySet activities,
+                       std::optional<ActiveRoles> active_roles,
                        std::optional<SendspinPairMethod> pairing_method,
                        std::optional<SendspinPairingCodeFormat> pairing_format = std::nullopt) {
         ServerActivateMessage message;
@@ -617,8 +621,7 @@ protected:
         message.active_roles = std::move(active_roles);
         message.pairing_method = pairing_method;
         message.pairing_format = pairing_format;
-        this->client_->connection_manager_->on_server_activate(this->injected_conn_.get(),
-                                                               std::move(message));
+        this->client_->connection_manager_->on_server_activate(this->injected_conn_.get(), message);
     }
 
     /// Put the injected connection into, or out of, the state
@@ -674,11 +677,15 @@ protected:
 
     /// Return the `locations` array on the client/hello descriptor for `method`, or nullopt when
     /// the descriptor omits the hint. Fails the calling test if the method is not advertised at
-    /// all. build_hello_message() is private; this is the -fno-access-control seam for it.
+    /// all. build_client_hello() is private; this is the -fno-access-control seam for it.
     std::optional<std::vector<std::string>> hello_locations(const char* method) {
         JsonDocument doc;
         JsonObject root;
-        EXPECT_TRUE(parse_json(this->client_->build_hello_message(), doc, root));
+        ClientHelloMessage hello;
+        this->client_->build_client_hello(hello);
+        EXPECT_TRUE(parse_json(
+            built_text([&](JsonDocument& message) { build_client_hello_message(&hello, message); }),
+            doc, root));
         JsonVariantConst desc = root["payload"]["supported_pair_methods"][method];
         if (!desc.isUnbound()) {
             if (desc["locations"].isUnbound()) {
@@ -1099,6 +1106,10 @@ TEST_F(PairingStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyWithdrawnC
         << "on_clear_pairing_code must not fire twice for one pairing attempt";
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
+    // The failure names the server whose attempt it was.
+    const std::string server_id(this->injected_conn_->get_server_id().view());
+    ASSERT_FALSE(server_id.empty());
+    EXPECT_EQ(this->listener_.last_failed_server_id(), server_id);
 }
 
 // ============================================================================
@@ -1310,7 +1321,7 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
         << "client/state must keep flowing while activities declare pairing";
 
     // The activate that leaves pairing changes nothing about any of this.
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->post_activate({}, ActiveRoles{}, std::nullopt);
     this->pump();
     ASSERT_FALSE(conn->has_activity(SendspinActivity::PAIRING));
     conn->time_frame_tag_ = 0;
@@ -2057,13 +2068,13 @@ TEST_F(PairingStateMachineTest, SubsequentActivateEntersPairingForEitherCodeMeth
         const int windows_before = this->listener_.count(PairingEventKind::OPEN_WINDOW);
 
         // First activate: empty activities -> connection goes operational, no pairing.
-        this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+        this->post_activate({}, ActiveRoles{}, std::nullopt);
         this->pump();
         EXPECT_EQ(this->listener_.count(PairingEventKind::STARTED), started_before);
         EXPECT_TRUE(conn->sent_text_.empty());
 
         // Subsequent activate declaring [pairing] -> must enter pairing.
-        this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{}, row.method,
+        this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{}, row.method,
                             row.format);
         this->pump();
 
@@ -2101,12 +2112,12 @@ TEST_F(PairingStateMachineTest, UnofferedFormatOnActivationIsRejected) {
     }
     FakeConnection* conn = this->inject_provisional_current_connection("server-badformat");
 
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->post_activate({}, ActiveRoles{}, std::nullopt);
     this->pump();
     ASSERT_TRUE(conn->sent_text_.empty());
 
     // A format this device does not advertise.
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+    this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                         SendspinPairingCodeFormat::QR_CODE);
     this->pump();
@@ -2118,7 +2129,7 @@ TEST_F(PairingStateMachineTest, UnofferedFormatOnActivationIsRejected) {
     EXPECT_EQ(conn->disconnect_count_, 0) << "the connection must stay open after the abort";
 
     // Missing entirely on a dynamic_pairing_code activation (a required field): also rejected.
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+    this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE, std::nullopt);
     this->pump();
     ASSERT_EQ(conn->sent_text_.size(), 2u);
@@ -2126,7 +2137,7 @@ TEST_F(PairingStateMachineTest, UnofferedFormatOnActivationIsRejected) {
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
 
     // Control: the format this device does advertise starts the attempt.
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+    this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                         SendspinPairingCodeFormat::DIGITS);
     this->pump();
@@ -2145,11 +2156,11 @@ TEST_F(PairingStateMachineTest, PairingActivateWithoutMethodIsAborted) {
     this->enable_unpaired_access();
     FakeConnection* conn = this->inject_provisional_current_connection("server-no-method");
 
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->post_activate({}, ActiveRoles{}, std::nullopt);
     this->pump();
     ASSERT_TRUE(conn->sent_text_.empty());
 
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{}, std::nullopt);
+    this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{}, std::nullopt);
     this->pump();
 
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
@@ -2160,7 +2171,7 @@ TEST_F(PairingStateMachineTest, PairingActivateWithoutMethodIsAborted) {
     EXPECT_EQ(conn->disconnect_count_, 0) << "the connection must stay open after the abort";
 
     // The same refusal with roles declared beside the pairing activity.
-    const std::vector<std::string> roles{"metadata@v1"};
+    const ActiveRoles roles{"metadata@v1"};
     this->post_activate({SendspinActivity::PAIRING}, roles, std::nullopt);
     this->pump();
     ASSERT_EQ(conn->sent_text_.size(), 2u);
@@ -2184,11 +2195,11 @@ TEST_F(PairingStateMachineTest, UnofferedPairingMethodOnActivationIsRejected) {
     this->init_client(/*pairing_code_emission_supported=*/true);
     FakeConnection* conn = this->inject_provisional_current_connection("server-unoffered-method");
 
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->post_activate({}, ActiveRoles{}, std::nullopt);
     this->pump();
     ASSERT_TRUE(conn->sent_text_.empty());
 
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+    this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{},
                         SendspinPairMethod::STATIC_PAIRING_CODE);
     this->pump();
 
@@ -2200,7 +2211,7 @@ TEST_F(PairingStateMachineTest, UnofferedPairingMethodOnActivationIsRejected) {
 
     // Control: the method this device does offer starts the attempt, so the refusal above is the
     // offer rule and not the gate refusing every pairing activate.
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+    this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                         SendspinPairingCodeFormat::DIGITS);
     this->pump();
@@ -2419,7 +2430,7 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
     conn->pairing_session().attempt_deadline_us = platform_time_us() + 120LL * 1000LL * 1000LL;
 
     // The server leaves pairing without finalizing: activate instead of pair-finalize.
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->post_activate({}, ActiveRoles{}, std::nullopt);
     this->pump();
 
     // Going operational must have discarded the pending record and reset the pairing session.
@@ -2503,10 +2514,9 @@ TEST_F(PairingStateMachineTest, CancellingActivateDismissesThePromptItLeftShowin
             conn->set_pairing_in_progress(false);
         }
         if (row.reselect_pairing) {
-            this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
-                                row.method);
+            this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{}, row.method);
         } else {
-            this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+            this->post_activate({}, ActiveRoles{}, std::nullopt);
         }
         this->pump();
 
@@ -2566,7 +2576,7 @@ TEST_F(PairingStateMachineTest, AbortThenRestartReachesTheListenerInOrder) {
         if (row.drain_between) {
             this->pump();
         }
-        this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+        this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{},
                             SendspinPairMethod::STATIC_PAIRING_CODE);
         this->pump();
 
@@ -2613,13 +2623,13 @@ TEST_F(PairingStateMachineTest, PairingIndexIncrementsAcrossRepeatedPairingActiv
 
     // An empty activate first, so the pairing activates that follow are subsequent ones on an
     // already-operational connection (the path a repeat actually takes).
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->post_activate({}, ActiveRoles{}, std::nullopt);
     this->pump();
     ASSERT_TRUE(conn->sent_text_.empty());
     EXPECT_EQ(conn->get_pairing_index(), 0u) << "a non-pairing activate must not count";
 
     for (uint32_t expected = 1; expected <= 3; ++expected) {
-        this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+        this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{},
                             SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                             SendspinPairingCodeFormat::DIGITS);
         this->pump();
@@ -2653,7 +2663,7 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     // becomes true), no pairing. Needed so the next two activates are genuinely "subsequent" and
     // take the same real arbitration path SubsequentActivateEntersStaticCodePairing exercises,
     // rather than the nursery-promotion path (which this lightweight harness does not model).
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->post_activate({}, ActiveRoles{}, std::nullopt);
     this->pump();
     EXPECT_TRUE(conn->sent_text_.empty());
 
@@ -2661,7 +2671,7 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     // (PskCategory::SENTINEL, not PAIRING), so category_ok fails and the admissibility gate rejects
     // it with pair/abort(method_not_supported) and leaves the connection open, WITHOUT ever
     // reaching handle_enter_pairing(). The counter must still have advanced to 1.
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+    this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{},
                         SendspinPairMethod::PAIRING_PSK);
     this->pump();
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
@@ -2675,7 +2685,7 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     // dynamic method does not require a Pairing-category PSK; offered: an out-channel and a
     // format are configured). Must proceed into pairing and its client/pair-init must carry
     // pairing_index == 2: BOTH the rejected and the accepted activate counted.
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+    this->post_activate({SendspinActivity::PAIRING}, ActiveRoles{},
                         SendspinPairMethod::DYNAMIC_PAIRING_CODE,
                         SendspinPairingCodeFormat::DIGITS);
     this->pump();
@@ -2900,13 +2910,13 @@ TEST_F(PairingStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlayba
     // landed, so get_activities() still reports [PAIRING].
     current->note_pairing_finalize_ack();
     ASSERT_TRUE(current->is_pairing_finalized());
-    ASSERT_EQ(current->get_activities().size(), 1u);
+    ASSERT_EQ(current->get_activities(), ActivitySet{SendspinActivity::PAIRING});
 
     // A rank-0 peer (no activities) whose server_id is the last playback server: exactly the
     // inputs admission rule 5 keys on.
     auto newcomer = std::make_shared<FakeConnection>();
-    newcomer->set_noise_handshake_result("old-playback-server", PskCategory::SENTINEL,
-                                         /*psk_id=*/"");
+    newcomer->set_noise_handshake_result(id_text("old-playback-server"), PskCategory::SENTINEL,
+                                         /*psk_id=*/IdText{});
     newcomer->apply_server_activate({}, std::nullopt, std::nullopt, std::nullopt);
 
     EXPECT_FALSE(this->would_switch_to(current, newcomer.get(), "old-playback-server"))
@@ -2915,7 +2925,8 @@ TEST_F(PairingStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlayba
 
     // The shield really is suppressed though: a rank-2 playback peer wins.
     auto playback = std::make_shared<FakeConnection>();
-    playback->set_noise_handshake_result("playback-server", PskCategory::SENTINEL, /*psk_id=*/"");
+    playback->set_noise_handshake_result(id_text("playback-server"), PskCategory::SENTINEL,
+                                         /*psk_id=*/IdText{});
     playback->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
                                     std::nullopt);
     EXPECT_TRUE(this->would_switch_to(current, playback.get(), "old-playback-server"))

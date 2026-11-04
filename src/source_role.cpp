@@ -17,6 +17,7 @@
 #include "platform/logging.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
+#include "source_encoder_flac.h"
 #include "source_role_impl.h"
 #include "time_filter.h"
 
@@ -93,6 +94,29 @@ static bool validate_opus_config(const SourceRoleConfig& config) {
     return valid;
 }
 
+/// @brief The FLAC-only format rules, which micro-flac's encoder decides (at most 8 channels and
+/// 1048575 Hz, at least 16 frames a chunk), plus a worst-case frame that fits one transport
+/// message. Checked once the chunk itself is known to be usable.
+static bool validate_flac_config(const SourceRoleConfig& config) {
+    const size_t max_payload = FlacSourceEncoder::max_payload_bytes(config);
+    if (max_payload == 0) {
+        SS_LOGE(TAG,
+                "Rejecting source config: flac cannot encode %u channels at %" PRIu32
+                " Hz in %" PRIu32
+                " ms chunks (at most 8 channels and 1048575 Hz, at least 16 frames a chunk)",
+                config.channels, config.sample_rate, config.chunk_duration_ms);
+        return false;
+    }
+    if (max_payload > SOURCE_MAX_PAYLOAD_BYTES) {
+        SS_LOGE(TAG,
+                "Rejecting source config: a %" PRIu32
+                " ms flac frame can outgrow one transport message",
+                config.chunk_duration_ms);
+        return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Impl constructor / destructor
 // ============================================================================
@@ -112,8 +136,9 @@ bool SourceRole::Impl::validate_config(const SourceRoleConfig& config) {
     bool valid = true;
     if (config.codec == SendspinCodecFormat::OPUS) {
         valid = validate_opus_config(config);
-    } else if (config.codec != SendspinCodecFormat::PCM) {
-        SS_LOGE(TAG, "Rejecting source config: codec must be pcm or opus");
+    } else if (config.codec != SendspinCodecFormat::PCM &&
+               config.codec != SendspinCodecFormat::FLAC) {
+        SS_LOGE(TAG, "Rejecting source config: codec must be pcm, flac, or opus");
         valid = false;
     }
     if (config.sample_rate == 0) {
@@ -144,6 +169,8 @@ bool SourceRole::Impl::validate_config(const SourceRoleConfig& config) {
                 "transport message",
                 config.chunk_duration_ms);
         valid = false;
+    } else if (valid && config.codec == SendspinCodecFormat::FLAC) {
+        valid = validate_flac_config(config);
     }
     if (config.capture_buffer_ms == 0) {
         SS_LOGE(TAG, "Rejecting source config: capture_buffer_ms must be > 0");
@@ -317,8 +344,7 @@ void SourceRole::Impl::send_chunks(SendspinConnection* owner) {
         // as possible, on the thread that feeds it.
         uint8_t* message = outbound_item_message(item);
         message[0] = SENDSPIN_BINARY_SOURCE_AUDIO;
-        host_to_be64(owner->get_time_filter()->compute_server_time(header.capture_time_us),
-                     message + 1);
+        host_to_be64(owner->time_filter().compute_server_time(header.capture_time_us), message + 1);
         // The send chain owns the item from here on (OutboundRing "Lending"). A failure after
         // the encrypt closes the connection, which the loss pass that follows drops.
         (void)owner->send_app_binary_lent(*ring, item, capacity, header.data_len);
@@ -404,8 +430,10 @@ void SourceRole::Impl::try_open(SendspinConnection& conn) {
     start_msg.channels = this->config.channels;
     start_msg.sample_rate = this->config.sample_rate;
     start_msg.bit_depth = this->config.bit_depth;
-    if (conn.send_app_json(format_client_stream_start_message(&start_msg, *this->json_arena)) !=
-        SsErr::OK) {
+    start_msg.codec_header = this->task->codec_header(codec);
+    JsonDocument json = make_json_document(*this->json_arena);
+    build_client_stream_start_message(&start_msg, json);
+    if (conn.send_json(json) != SsErr::OK) {
         // The authorization is consumed: the server must send another start.
         SS_LOGW(TAG, "Failed to send client-stream/start; stream not opened");
         return;
@@ -450,7 +478,9 @@ void SourceRole::Impl::enqueue_stream_event(SourceStreamEventType event) const {
 
 void SourceRole::Impl::send_stream_end(SendspinConnection& conn) const {
     // A failure after the encrypt closes the connection, which ends the stream at the server too.
-    (void)conn.send_app_json(format_client_stream_end_message(*this->json_arena));
+    JsonDocument json = make_json_document(*this->json_arena);
+    build_client_stream_end_message(json);
+    (void)conn.send_json(json);
 }
 
 }  // namespace sendspin

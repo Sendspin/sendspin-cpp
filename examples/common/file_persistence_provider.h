@@ -24,11 +24,14 @@
 /// implements the provider against NVS/Preferences instead.
 ///
 /// The file holds plaintext secrets (the static private key, long-term PSKs, and the Pairing
-/// PSK), so it is written owner-only (0600) via POSIX open()/fchmod and
-/// fsync'd before the rename that makes it visible, with the containing directory fsync'd
-/// after: see write_file() in the .cpp. If this is copied elsewhere, keep that behavior or swap
-/// in an equivalent for the target platform; do not fall back to a bare std::ofstream. Two
-/// fsyncs of a small local file stay within the single bounded operation the provider contract
+/// PSK). On POSIX it is written owner-only (0600) via open()/fchmod and fsync'd before the
+/// rename that makes it visible, with the containing directory fsync'd after. Windows has no
+/// creation mode: the file inherits its directory's ACL, which this code does not tighten (under
+/// %USERPROFILE% it grants only the user, SYSTEM and Administrators; elsewhere, whatever that
+/// directory grants), and it is _commit()ed before MoveFileExA(MOVEFILE_WRITE_THROUGH) replaces
+/// the old one. See write_file() in the .cpp. If this is copied elsewhere, keep that behavior or
+/// swap in an equivalent for the target platform; do not fall back to a bare std::ofstream. These
+/// flushes of a small local file stay within the single bounded operation the provider contract
 /// allows.
 ///
 /// A file that is not this key-to-base64url-blob layout will not load; delete it and let the

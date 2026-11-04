@@ -14,11 +14,15 @@
 
 /// @file base64.h
 /// @brief Platform-abstracted base64: `platform_base64_*` wrap mbedTLS on ESP and a built-in
-/// codec on host, for the standard `+`/`/` alphabet with `=` padding; `b64url_*` are portable
-/// wrappers for the URL-safe alphabet used by Noise key identifiers (PSK IDs, peer IDs).
+/// codec on host, for the standard `+`/`/` alphabet with `=` padding; base64_encode() is its
+/// portable string form, and `b64url_*` are portable wrappers for the URL-safe alphabet used by
+/// Noise key identifiers (PSK IDs, peer IDs), pairing values and Noise handshake messages.
 
 #pragma once
 
+#include "platform/secure_zero.h"
+
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -186,89 +190,151 @@ inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const
 // both platforms. Both transliterate the alphabet and delegate the bit-accumulator work to
 // platform_base64_encode/decode rather than hand-rolling a second codec. mbedTLS's decoder
 // requires input padded to a multiple of 4, so decode always re-pads; the host decoder strips
-// trailing `=` itself, so one path is correct on both platforms.
+// trailing `=` itself, so one path is correct on both platforms. The `_into` forms write to a
+// caller's buffer and allocate nothing.
 // ============================================================================
 
 namespace sendspin {
 
-/// @brief Encode bytes to base64url: an ASCII string of `A-Z a-z 0-9 - _`, no `=` padding.
-inline std::string b64url_encode(const uint8_t* data, size_t len) {
+/// @brief Encode bytes to standard base64 (RFC 4648 section 4): `+`/`/`, `=`-padded.
+inline std::string base64_encode(const uint8_t* data, size_t len) {
     if (len == 0) {
         return std::string();
     }
 
-    // Standard base64 (`+`/`/`, `=`-padded) output length, including room for the trailing NUL
-    // both platform_base64_encode implementations write per the mbedtls_base64_encode contract.
-    // Encoded straight into the returned string, which only ever shrinks from here, so no
-    // intermediate heap block holds the encoding: callers encoding secrets (the pairing PSK)
-    // wipe the one string they get back and leave no other copy.
+    // Output length, including room for the trailing NUL both platform_base64_encode
+    // implementations write per the mbedtls_base64_encode contract.
     const size_t padded_len = (len / 3 + (len % 3 != 0 ? 1 : 0)) * 4;
     std::string out(padded_len + 1, '\0');
     size_t olen = 0;
     // out is sized exactly per platform_base64_encode's own contract, so this cannot fail.
     platform_base64_encode(reinterpret_cast<uint8_t*>(out.data()), out.size(), &olen, data, len);
     out.resize(olen);
+    return out;
+}
 
-    for (char& c : out) {
-        if (c == '+') {
-            c = '-';
-        } else if (c == '/') {
-            c = '_';
+/// @brief Buffer size b64url_encode_into() needs for `len` bytes: the padded standard encoding
+/// and its NUL, which the platform encoders write before the padding is stripped.
+constexpr size_t b64url_encode_buffer_size(size_t len) {
+    return (len + 2) / 3 * 4 + 1;
+}
+
+/// @brief Encode bytes to base64url into a caller's buffer.
+/// @param dst Output buffer; a nonempty encoding is NUL-terminated in it.
+/// @param cap Size of dst: at least b64url_encode_buffer_size(len).
+/// @return The encoding, a view into dst; empty when cap is smaller than that.
+inline std::string_view b64url_encode_into(char* dst, size_t cap, const uint8_t* data, size_t len) {
+    size_t olen = 0;
+    if (platform_base64_encode(reinterpret_cast<uint8_t*>(dst), cap, &olen, data, len) != 0) {
+        return {};
+    }
+    while (olen > 0 && dst[olen - 1] == '=') {
+        dst[--olen] = '\0';
+    }
+    for (size_t i = 0; i < olen; ++i) {
+        if (dst[i] == '+') {
+            dst[i] = '-';
+        } else if (dst[i] == '/') {
+            dst[i] = '_';
         }
     }
-    while (!out.empty() && out.back() == '=') {
-        out.pop_back();
-    }
+    return {dst, olen};
+}
+
+/// @brief Encode bytes to base64url: an ASCII string of `A-Z a-z 0-9 - _`, no `=` padding.
+inline std::string b64url_encode(const uint8_t* data, size_t len) {
+    // Encoded straight into the returned string, so it stays the only copy of the encoding:
+    // callers encoding a secret wipe the one string they get back.
+    std::string out(b64url_encode_buffer_size(len), '\0');
+    out.resize(b64url_encode_into(out.data(), out.size(), data, len).size());
     return out;
+}
+
+/// @brief Bytes a base64url string decodes to, ignoring trailing `=` padding.
+/// @return nullopt when the length is not a base64 length under any padding.
+inline std::optional<size_t> b64url_decoded_size(std::string_view s) {
+    while (!s.empty() && s.back() == '=') {
+        s.remove_suffix(1);
+    }
+    if (s.size() % 4 == 1) {
+        return std::nullopt;
+    }
+    return s.size() / 4 * 3 + (s.size() % 4 == 0 ? 0 : s.size() % 4 - 1);
+}
+
+/// @brief Decode base64url into a caller's buffer, tolerating missing `=` padding.
+///
+/// Each group of four characters is transliterated to the standard alphabet on the stack and
+/// decoded on its own, so no copy of the input is made.
+/// @param dst Output buffer.
+/// @param cap Size of dst: at least b64url_decoded_size(s).
+/// @return The number of bytes written, or nullopt on invalid input or a smaller cap.
+inline std::optional<size_t> b64url_decode_into(std::string_view s, uint8_t* dst, size_t cap) {
+    const std::optional<size_t> size = b64url_decoded_size(s);
+    if (!size.has_value() || size.value() > cap) {
+        return std::nullopt;
+    }
+    while (!s.empty() && s.back() == '=') {
+        s.remove_suffix(1);
+    }
+
+    size_t written = 0;
+    for (size_t i = 0; i < s.size(); i += 4) {
+        // Explicitly whitelists [A-Za-z0-9], '-' and '_'. Anything else (a literal '+' or '/',
+        // whitespace, a stray '=') is rejected here rather than passed through:
+        // platform_base64_decode's host implementation silently skips '\n'/'\r'/' ' instead of
+        // rejecting them, so strictness must not depend on the platform decoder's laxity, or
+        // accepted input would silently diverge between host and ESP (mbedTLS rejects those
+        // bytes outright).
+        uint8_t group[4] = {'=', '=', '=', '='};
+        for (size_t k = 0; k < 4 && i + k < s.size(); ++k) {
+            char c = s[i + k];
+            if (c == '-') {
+                c = '+';
+            } else if (c == '_') {
+                c = '/';
+            } else if ((c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9')) {
+                return std::nullopt;
+            }
+            group[k] = static_cast<uint8_t>(c);
+        }
+        size_t olen = 0;
+        if (platform_base64_decode(dst + written, cap - written, &olen, group, sizeof(group)) !=
+            0) {
+            return std::nullopt;
+        }
+        written += olen;
+    }
+    return written;
+}
+
+/// @brief Decode base64url that must carry exactly N bytes straight into `out`, tolerating
+/// missing `=` padding.
+/// @return false on invalid input or any other length, with `out` unspecified.
+template <size_t N>
+inline bool b64url_decode_exact(std::string_view s, std::array<uint8_t, N>& out) {
+    return b64url_decode_into(s, out.data(), out.size()) == N;
+}
+
+/// @brief Assigns `bytes` base64url-encoded (no padding) to `field`, which must copy it (a JSON
+/// member does), through a stack buffer wiped afterwards, so a secret is left only in `field`.
+template <typename Field, size_t N>
+inline void b64url_encode_to(Field field, const std::array<uint8_t, N>& bytes) {
+    std::array<char, b64url_encode_buffer_size(N)> text{};
+    field = b64url_encode_into(text.data(), text.size(), bytes.data(), bytes.size());
+    secure_zero(text.data(), text.size());
 }
 
 /// @brief Decode base64url, tolerating missing `=` padding; nullopt on invalid input.
 inline std::optional<std::vector<uint8_t>> b64url_decode(std::string_view s) {
-    size_t slen = s.size();
-
-    while (slen > 0 && s[slen - 1] == '=') {
-        --slen;
-    }
-
-    // Transliterate to the standard alphabet, explicitly whitelisting [A-Za-z0-9], '-', and
-    // '_'. Anything else (a literal '+' or '/', whitespace, or any other byte) is rejected
-    // here rather than passed through: platform_base64_decode's host implementation silently
-    // skips '\n'/'\r'/' ' instead of rejecting them, so strictness must not depend on the
-    // platform decoder's laxity, or accepted input would silently diverge between host and
-    // ESP (mbedTLS rejects those bytes outright).
-    std::string std_b64;
-    std_b64.reserve(slen + 3);
-    for (size_t i = 0; i < slen; ++i) {
-        char c = s[i];
-        if (c == '-') {
-            c = '+';
-        } else if (c == '_') {
-            c = '/';
-        } else {
-            const bool is_alnum =
-                (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
-            if (!is_alnum) {
-                return std::nullopt;
-            }
-        }
-        std_b64 += c;
-    }
-
-    if (std_b64.size() % 4 == 1) {
-        return std::nullopt;  // Not a valid base64 length under any padding.
-    }
-    while (std_b64.size() % 4 != 0) {
-        std_b64 += '=';
-    }
-
-    std::vector<uint8_t> out((std_b64.size() / 4) * 3);
-    size_t olen = 0;
-    if (platform_base64_decode(out.data(), out.size(), &olen,
-                               reinterpret_cast<const uint8_t*>(std_b64.data()),
-                               std_b64.size()) != 0) {
+    const std::optional<size_t> size = b64url_decoded_size(s);
+    if (!size.has_value()) {
         return std::nullopt;
     }
-    out.resize(olen);
+    std::vector<uint8_t> out(size.value());
+    if (!b64url_decode_into(s, out.data(), out.size()).has_value()) {
+        return std::nullopt;
+    }
     return out;
 }
 

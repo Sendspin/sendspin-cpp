@@ -130,8 +130,8 @@ struct SendspinTracedMessage {
     uint64_t connection_id{0};
     SendspinTraceDirection direction{SendspinTraceDirection::INBOUND};
     /// False for a cleartext text frame (the handshake, or a message sent before the transport is
-    /// up); true for a transport message, type byte first. Outbound fragments are traced one by
-    /// one; inbound messages once reassembled.
+    /// up); true for a transport message, type byte first. Inbound messages are traced once
+    /// reassembled; outbound ones always fit one frame.
     bool binary{false};
     /// Inbound: the receive stamp; outbound: just before encryption or the cleartext send. On the
     /// clock SendspinClient::get_client_time() converts to.
@@ -303,6 +303,11 @@ struct SendspinClientConfig {
                                   ///< + 1 (avoids conflict with web_server component)
     uint16_t server_port{DEFAULT_SERVER_PORT};  ///< WebSocket server port
 
+    /// @brief Whether to run the WebSocket server that servers connect to. Off leaves connect_to()
+    /// as the only way a server reaches the client, for a client that dials one configured server
+    /// and must not be reachable by any other; `server_port` is then unused.
+    bool accept_inbound_connections{true};
+
     /// @brief Default maximum simultaneous inbound connections: one established connection, two
     /// unproven connections awaiting the hello handshake (the manager's nursery capacity), and
     /// one spare so a surplus peer can still be accepted long enough to receive a graceful
@@ -310,8 +315,8 @@ struct SendspinClientConfig {
     /// accept (on ESP the surplus peer waits unanswered in the TCP backlog instead).
     static constexpr uint8_t DEFAULT_SERVER_MAX_CONNECTIONS = 4U;
 
-    uint8_t server_max_connections{
-        DEFAULT_SERVER_MAX_CONNECTIONS};  ///< Maximum simultaneous connections
+    /// @brief Maximum simultaneous inbound connections, clamped to 7 on ESP
+    uint8_t server_max_connections{DEFAULT_SERVER_MAX_CONNECTIONS};
 
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
     static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
@@ -340,8 +345,8 @@ struct SendspinClientConfig {
     /// Defaults to PREFER_EXTERNAL (SPIRAM), falling back to internal RAM.
     MemoryLocation inbound_ring_location{MemoryLocation::PREFER_EXTERNAL};
 
-    /// @brief Memory placement for the Noise transport's fragment reassembly buffer, the ~64 KB
-    /// fragmentation frame buffer, and the outbound send scratch buffer (ESP-IDF only; ignored on
+    /// @brief Memory placement for the Noise transport's fragment reassembly buffer and the
+    /// outbound send buffer every JSON message is serialized into (ESP-IDF only; ignored on
     /// host). The reassembly buffer grows with the largest fragmented message received (a player
     /// audio chunk, bounded by the buffer capacity the player role advertises) and retains its
     /// capacity, so PREFER_EXTERNAL keeps it out of internal RAM.
@@ -434,7 +439,8 @@ struct PlayerRoleConfig {
     /// whatever priming silence is still unsent, so those two terms overlap in part.
     /// @return Lead time in milliseconds, saturated at the field's maximum.
     static constexpr uint16_t pipeline_lead_time_ms(uint16_t extra_startup_silence_ms) {
-        constexpr uint32_t MAX = std::numeric_limits<uint16_t>::max();
+        // Parenthesized so the max() macro from a consumer's <windows.h> cannot expand it
+        constexpr uint32_t MAX = (std::numeric_limits<uint16_t>::max)();
         const uint32_t lead = static_cast<uint32_t>(INITIAL_SYNC_PRIMING_MS) +
                               extra_startup_silence_ms + PIPELINE_START_ALLOWANCE_MS;
         return static_cast<uint16_t>(lead < MAX ? lead : MAX);
@@ -701,6 +707,10 @@ struct SourceRoleConfig {
     /// tools/stack_usage/README.md.
     static constexpr size_t DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE = 6656U;
 
+    /// @brief Source task stack size in bytes for a FLAC config (ESP-IDF only). Derived in
+    /// tools/stack_usage/README.md.
+    static constexpr size_t DEFAULT_FLAC_SOURCE_TASK_STACK_SIZE = 5120U;
+
     /// @brief Opus bitrate bounds in bit/s: the range opus.h documents for OPUS_SET_BITRATE (the
     /// encoder clamps anything outside it). Not named OPUS_BITRATE_*, which opus.h defines as
     /// macros.
@@ -725,8 +735,9 @@ struct SourceRoleConfig {
 
     /// @brief Chunk duration in milliseconds, within [CHUNK_MIN_MS, CHUNK_MAX_MS]. One chunk, with
     /// its 9-byte header, must also fit one Noise transport message (65519 bytes), which bounds
-    /// the duration for wide or deep formats. OPUS takes only 5, 10, 20, 40, or 60: a chunk is
-    /// one Opus frame.
+    /// the duration for wide or deep formats. FLAC needs at least 16 frames a chunk (one FLAC
+    /// block), and its worst-case frame, a little over the chunk's PCM, must fit the message too.
+    /// OPUS takes only 5, 10, 20, 40, or 60: a chunk is one Opus frame.
     uint32_t chunk_duration_ms{DEFAULT_CHUNK_MS};
 
     /// @brief Capture buffer in milliseconds of audio in the configured format; must be > 0.
@@ -736,7 +747,7 @@ struct SourceRoleConfig {
     uint32_t capture_buffer_ms{DEFAULT_CAPTURE_BUFFER_MS};
 
     /// @brief Opus bitrate in bit/s, within [MIN_OPUS_BITRATE, MAX_OPUS_BITRATE]. Ignored (and
-    /// not validated) for PCM.
+    /// not validated) for PCM and FLAC.
     uint32_t opus_bitrate{DEFAULT_OPUS_BITRATE};
 
     unsigned priority{DEFAULT_SOURCE_TASK_PRIORITY};  ///< FreeRTOS priority for the source task
@@ -747,18 +758,20 @@ struct SourceRoleConfig {
     MemoryLocation buffer_location{MemoryLocation::PREFER_EXTERNAL};
 
     // 8-bit fields
-    /// @brief Codec the role streams in: PCM (the capture bytes, untouched) or OPUS (each chunk
-    /// encoded into one CELT-only packet; needs SENDSPIN_ENABLE_OPUS). An OPUS role streams PCM
-    /// to a server whose server/hello does not list opus (roles/source/v1.md "server/hello
-    /// source@v1 support object"). OPUS costs the encoder state plus the source task's own
-    /// micro-opus scratch arena (about 120 KB, PSRAM-preferring, allocated before the first opus
-    /// chunk is encoded).
+    /// @brief Codec the role streams in: PCM (the capture bytes, untouched), FLAC (each chunk
+    /// encoded losslessly into one FLAC frame), or OPUS (each chunk encoded into one CELT-only
+    /// packet; needs SENDSPIN_ENABLE_OPUS). A FLAC or OPUS role streams PCM to a server whose
+    /// server/hello does not list its codec (roles/source/v1.md "server/hello source@v1 support
+    /// object"). FLAC costs the micro-flac encoder (about 2 KB) and a chunk of scratch. OPUS costs
+    /// the encoder state plus the source task's own micro-opus scratch arena (about 120 KB,
+    /// PSRAM-preferring, allocated before the first opus chunk is encoded).
     SendspinCodecFormat codec{SendspinCodecFormat::PCM};
 
     /// @brief Opus encoder complexity, at most MAX_OPUS_COMPLEXITY. Ignored (and not validated)
-    /// for PCM.
+    /// for PCM and FLAC.
     uint8_t opus_complexity{DEFAULT_OPUS_COMPLEXITY};
-    uint8_t channels{2};      ///< Capture channel count; must be > 0 (1 or 2 for OPUS)
+    uint8_t channels{2};      ///< Capture channel count; must be > 0 (at most 8 for FLAC, 1 or 2
+                              ///< for OPUS)
     uint8_t bit_depth{16};    ///< Bits per sample: 16, 24 (3 packed bytes), or 32 (16 for OPUS)
     bool line_sense{false};   ///< Advertise signal sensing (see SourceRole::set_signal())
     bool psram_stack{false};  ///< Allocate the source task stack in PSRAM (ESP-IDF only)

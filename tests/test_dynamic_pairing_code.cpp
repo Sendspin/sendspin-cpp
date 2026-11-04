@@ -110,10 +110,12 @@ TEST(DynamicPairingCode, ParseServerPairInitRejectsMalformedNonce) {
     std::array<uint8_t, 32> nonce_a{};
     for (int i = 0; i < 32; ++i) nonce_a[i] = static_cast<uint8_t>(i);
     std::array<uint8_t, 16> short_nonce{};
+    std::array<uint8_t, 33> long_nonce{};
 
     const ParseRow rows[] = {
         {"nonce_A-not-a-string", R"({"type":"server/pair-init","payload":{"nonce_A":5}})", false},
         {"nonce_A-16-bytes", make_pair_init_json(b64url(short_nonce)), false},
+        {"nonce_A-33-bytes", make_pair_init_json(b64url(long_nonce)), false},
         {"nonce_A-not-base64",
          R"({"type":"server/pair-init","payload":{"nonce_A":"!!!not_base64!!!"}})", false},
         // Control: a 32-byte base64url nonce_A.
@@ -198,10 +200,12 @@ TEST(DynamicPairingCode, ParseServerPairAuthRejectsMalformedPakeMsg1) {
     std::array<uint8_t, 32> pake_msg_1{};
     for (int i = 0; i < 32; ++i) pake_msg_1[i] = static_cast<uint8_t>(i + 10);
     std::array<uint8_t, 16> short_share{};
+    std::array<uint8_t, 33> long_share{};
 
     const ParseRow rows[] = {
         {"pake_msg_1-missing", R"({"type":"server/pair-auth","payload":{}})", false},
         {"pake_msg_1-16-bytes", make_pair_auth_json(b64url(short_share)), false},
+        {"pake_msg_1-33-bytes", make_pair_auth_json(b64url(long_share)), false},
         {"pake_msg_1-not-base64",
          R"({"type":"server/pair-auth","payload":{"pake_msg_1":"!!!not_valid!!!"}})", false},
         // Control: a 32-byte base64url pake_msg_1.
@@ -230,10 +234,12 @@ TEST(DynamicPairingCode, ParseServerPairConfirmRejectsMalformedServerKc) {
     std::array<uint8_t, 64> server_kc{};
     for (int i = 0; i < 64; ++i) server_kc[i] = static_cast<uint8_t>(i);
     std::array<uint8_t, 32> short_kc{};
+    std::array<uint8_t, 65> long_kc{};
 
     const ParseRow rows[] = {
         {"server_kc-missing", R"({"type":"server/pair-confirm","payload":{}})", false},
         {"server_kc-32-bytes", make_pair_confirm_json(b64url(short_kc)), false},
+        {"server_kc-65-bytes", make_pair_confirm_json(b64url(long_kc)), false},
         {"server_kc-not-base64",
          R"({"type":"server/pair-confirm","payload":{"server_kc":"!!!not_valid!!!"}})", false},
         // Control: a 64-byte base64url server_kc.
@@ -254,17 +260,20 @@ TEST(DynamicPairingCode, ParseServerPairConfirmRejectsMalformedServerKc) {
 }
 
 // ============================================================================
-// format_client_pair_init_message
+// build_client_pair_init_message
 // ============================================================================
 
 TEST(DynamicPairingCode, FormatClientPairInitWireShape) {
     std::array<uint8_t, 32> commit_b{};
     for (int i = 0; i < 32; ++i) commit_b[i] = static_cast<uint8_t>(i);
 
-    const std::string out = format_client_pair_init_message(commit_b, /*pairing_index=*/3, TestArena());
+    const std::string out = built_text([&](JsonDocument& message) {
+        build_client_pair_init_message(commit_b, /*pairing_index=*/3, message);
+    });
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_init produced invalid JSON";
+    ASSERT_FALSE(deserializeJson(doc, out))
+        << "build_client_pair_init_message produced invalid JSON";
 
     EXPECT_STREQ(doc["type"], "client/pair-init");
 
@@ -286,17 +295,19 @@ TEST(DynamicPairingCode, FormatClientPairInitWireShape) {
 }
 
 // ============================================================================
-// format_client_pair_auth_message
+// build_client_pair_auth_message
 // ============================================================================
 
 TEST(DynamicPairingCode, FormatClientPairAuthWireShape) {
     std::array<uint8_t, 32> pake_msg_2{};
     for (int i = 0; i < 32; ++i) pake_msg_2[i] = static_cast<uint8_t>(i + 64);
 
-    const std::string out = format_client_pair_auth_message(pake_msg_2, TestArena());
+    const std::string out = built_text(
+        [&](JsonDocument& message) { build_client_pair_auth_message(pake_msg_2, message); });
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_auth produced invalid JSON";
+    ASSERT_FALSE(deserializeJson(doc, out))
+        << "build_client_pair_auth_message produced invalid JSON";
 
     EXPECT_STREQ(doc["type"], "client/pair-auth");
 
@@ -313,7 +324,7 @@ TEST(DynamicPairingCode, FormatClientPairAuthWireShape) {
 }
 
 // ============================================================================
-// format_client_pair_confirm_message
+// build_client_pair_confirm_message
 // ============================================================================
 
 TEST(DynamicPairingCode, FormatClientPairConfirmWireShape) {
@@ -324,10 +335,13 @@ TEST(DynamicPairingCode, FormatClientPairConfirmWireShape) {
         wrapped_nonce[i] = static_cast<uint8_t>(i + 100);
     }
 
-    const std::string out = format_client_pair_confirm_message(client_kc, wrapped_nonce, TestArena());
+    const std::string out = built_text([&](JsonDocument& message) {
+        build_client_pair_confirm_message(client_kc, wrapped_nonce, message);
+    });
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_confirm produced invalid JSON";
+    ASSERT_FALSE(deserializeJson(doc, out))
+        << "build_client_pair_confirm_message produced invalid JSON";
 
     EXPECT_STREQ(doc["type"], "client/pair-confirm");
 
@@ -432,15 +446,18 @@ TEST(DynamicPairingCodeCPace, MismatchedAssociatedDataFailsVerify) {
 TEST(DynamicPairingCode, ClientHelloDescriptorCarriesChannelsAndFormats) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
+    const std::vector<SendspinPairingCodeChannel> configured_channels = {
+        SendspinPairingCodeChannel::DISPLAY, SendspinPairingCodeChannel::SPEAKER};
+    const std::vector<SendspinPairingCodeFormat> configured_formats = {
+        SendspinPairingCodeFormat::DIGITS, SendspinPairingCodeFormat::QR_CODE};
     PairMethodDescriptor dynamic_desc;
     dynamic_desc.method = SendspinPairMethod::DYNAMIC_PAIRING_CODE;
-    dynamic_desc.out_channels = std::vector<SendspinPairingCodeChannel>{
-        SendspinPairingCodeChannel::DISPLAY, SendspinPairingCodeChannel::SPEAKER};
-    dynamic_desc.formats = std::vector<SendspinPairingCodeFormat>{
-        SendspinPairingCodeFormat::DIGITS, SendspinPairingCodeFormat::QR_CODE};
-    msg.supported_pair_methods.push_back(std::move(dynamic_desc));
+    dynamic_desc.out_channels = configured_channels;
+    dynamic_desc.formats = configured_formats;
+    msg.supported_pair_methods.push_back(dynamic_desc);
 
-    const std::string out = format_client_hello_message(&msg, TestArena());
+    const std::string out =
+        built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); });
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
 
@@ -475,9 +492,10 @@ TEST(StaticPairingCode, ClientHelloDescriptorShape) {
     msg.name = "TestDevice";
     PairMethodDescriptor static_desc;
     static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
-    msg.supported_pair_methods.push_back(std::move(static_desc));
+    msg.supported_pair_methods.push_back(static_desc);
 
-    const std::string out = format_client_hello_message(&msg, TestArena());
+    const std::string out =
+        built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); });
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
 
@@ -496,12 +514,14 @@ TEST(StaticPairingCode, ClientHelloDescriptorShape) {
 TEST(StaticPairingCode, ClientHelloLocationsHint) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
+    const std::vector<std::string> configured_locations = {"device", "leaflet"};
     PairMethodDescriptor static_desc;
     static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
-    static_desc.locations = std::vector<std::string>{"device", "leaflet"};
-    msg.supported_pair_methods.push_back(std::move(static_desc));
+    static_desc.locations = configured_locations;
+    msg.supported_pair_methods.push_back(static_desc);
 
-    const std::string out = format_client_hello_message(&msg, TestArena());
+    const std::string out =
+        built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); });
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
 

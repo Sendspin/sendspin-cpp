@@ -18,7 +18,6 @@
 #include "platform/base64.h"
 #include "platform/crypto.h"
 
-#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -60,7 +59,7 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
     // failed. This overload's non-optional return type is depended on throughout the tree
     // (record store, tests) as a plain std::string, so there is no safe value to
     // return on failure; fail loudly rather than silently deriving a psk_id from a
-    // zero digest (matching the CSPRNG-failure precedent in platform_random_bytes()).
+    // zero digest.
     auto result = psk_id_for(psk.data(), psk.size());
     if (!result.has_value()) {
         abort();
@@ -72,21 +71,22 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
 // Peer ids
 // ============================================================================
 
+static_assert(std::tuple_size_v<PeerIdText> == b64url_encode_buffer_size(X25519_KEY_SIZE));
+
 std::optional<std::array<uint8_t, X25519_KEY_SIZE>> public_key_from_peer_id(
-    const std::string& peer_id) {
+    std::string_view peer_id) {
     if (peer_id.size() != PEER_ID_SIZE) {
         return std::nullopt;
     }
-    auto decoded = b64url_decode(peer_id);
-    if (!decoded.has_value() || decoded->size() != X25519_KEY_SIZE) {
+    std::array<uint8_t, X25519_KEY_SIZE> key{};
+    if (!b64url_decode_exact(peer_id, key)) {
         return std::nullopt;
     }
     // The last character carries 2 unused bits; a nonzero pair decodes to the same key.
-    if (b64url_encode(decoded->data(), decoded->size()) != peer_id) {
+    PeerIdText text{};
+    if (b64url_encode_into(text.data(), text.size(), key.data(), key.size()) != peer_id) {
         return std::nullopt;
     }
-    std::array<uint8_t, X25519_KEY_SIZE> key{};
-    std::copy(decoded->begin(), decoded->end(), key.begin());
     return key;
 }
 
@@ -101,6 +101,11 @@ Identity::~Identity() {
 
 std::string Identity::peer_id() const {
     return b64url_encode(this->public_bytes.data(), this->public_bytes.size());
+}
+
+std::string_view Identity::peer_id(PeerIdText& text) const {
+    return b64url_encode_into(text.data(), text.size(), this->public_bytes.data(),
+                              this->public_bytes.size());
 }
 
 std::optional<Identity> Identity::generate() {

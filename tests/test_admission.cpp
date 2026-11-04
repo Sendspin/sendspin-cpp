@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Unit tests for the admission/trust enforcement and arbitration functions:
+// Unit tests for the admissibility check and the arbitration functions:
 // the allowed-activity-set table and rejection order in messaging.md "server/activate", and the
 // priority rules in connection.md "Multiple servers (server-initiated)".
 
@@ -25,13 +25,13 @@
 
 #include <cstdint>
 #include <initializer_list>
-#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
-using Acts = std::vector<SendspinActivity>;
+using Acts = ActivitySet;
 
 static const auto PB = SendspinActivity::PLAYBACK;
 static const auto PR = SendspinActivity::PAIRING;
@@ -280,7 +280,7 @@ TEST(ActivityRank, HighestDeclaredActivityWins) {
 
 static bool admit(const Acts& incoming_acts, const std::string& incoming_id,
                   const Acts& admitted_acts, const std::string& admitted_id, bool has_admitted,
-                  const std::optional<std::string>& last_playback = std::nullopt,
+                  std::string_view last_playback = {},
                   bool admitted_pairing_in_flight = true) {
     return should_admit_connection(incoming_acts, incoming_id, admitted_acts, admitted_id,
                                    has_admitted, last_playback, admitted_pairing_in_flight);
@@ -323,7 +323,7 @@ TEST(ShouldAdmitConnection, RankAndPairingShieldDecideDisplacement) {
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         EXPECT_EQ(admit(row.incoming, "server-new", row.admitted, "server-old", row.has_admitted,
-                        std::nullopt, row.admitted_pairing_in_flight),
+                        {}, row.admitted_pairing_in_flight),
                   row.expected);
     }
 }
@@ -335,14 +335,14 @@ TEST(ShouldAdmitConnection, BothRankZeroResolveByLastPlaybackServer) {
         const char* name;
         std::string incoming_id;
         std::string admitted_id;
-        std::optional<std::string> last_playback;
+        std::string last_playback;  // empty for none
         bool expected;
     };
     const Row rows[] = {
         {"incoming-is-last-playback", "server_a", "server_b", "server_a", true},  // Control:
         {"admitted-is-last-playback", "server_b", "server_a", "server_a", false},
         {"neither-is-last-playback", "server_c", "server_b", "server_a", false},
-        {"no-last-playback", "server_a", "server_b", std::nullopt, false},
+        {"no-last-playback", "server_a", "server_b", "", false},
         // Both match: the incumbent is already the last-playback server, so there is nothing to
         // gain by swapping.
         {"both-are-last-playback", "server_a", "server_a", "server_a", false},
@@ -367,10 +367,10 @@ TEST(ShouldAdmitConnection, FinalizedPairingNoLongerBlocksHigherRankedIncoming) 
     const Acts admitted{SendspinActivity::PAIRING};   // rank 1
 
     EXPECT_FALSE(should_admit_connection(incoming, "server-new", admitted, "server-pairing", true,
-                                         std::nullopt, /*admitted_pairing_in_flight=*/true))
+                                         {}, /*admitted_pairing_in_flight=*/true))
         << "a pairing still in flight must not be displaced";
     EXPECT_TRUE(should_admit_connection(incoming, "server-new", admitted, "server-pairing", true,
-                                        std::nullopt, /*admitted_pairing_in_flight=*/false))
+                                        {}, /*admitted_pairing_in_flight=*/false))
         << "a pairing that already finalized must not keep blocking a rank-2 incoming";
 }
 

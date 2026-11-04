@@ -284,7 +284,7 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
         .supported_formats = this->config.audio_formats,
         .buffer_capacity = this->advertised_buffer_capacity(),
     };
-    msg.player_v1_support = std::move(player_support);
+    msg.player_v1_support = player_support;
 }
 
 size_t PlayerRole::Impl::buffer_capacity_share() const {
@@ -317,16 +317,16 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     // and muted are required only alongside their command, so a withheld command omits its value.
     if (this->volume_adjustable) {
         player_state.volume = this->volume;
-        player_state.supported_commands.push_back(SendspinPlayerCommand::VOLUME);
+        player_state.supported_commands.insert(SendspinPlayerCommand::VOLUME);
     }
     if (this->mute_adjustable) {
         player_state.muted = this->muted;
-        player_state.supported_commands.push_back(SendspinPlayerCommand::MUTE);
+        player_state.supported_commands.insert(SendspinPlayerCommand::MUTE);
     }
     if (adjustable) {
-        player_state.supported_commands.push_back(SendspinPlayerCommand::SET_OUTPUT_DELAY);
+        player_state.supported_commands.insert(SendspinPlayerCommand::SET_OUTPUT_DELAY);
     }
-    msg.player = std::move(player_state);
+    msg.player = player_state;
 }
 
 std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* data, size_t len) {
@@ -367,7 +367,7 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
                                generation);
 }
 
-void PlayerRole::Impl::handle_stream_start(ServerPlayerStreamObject player_obj) {
+void PlayerRole::Impl::handle_stream_start(ServerPlayerStreamObject&& player_obj) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
     // Numbers the codec header and the STREAM_START, so the sync task starts the stream only on
@@ -718,7 +718,7 @@ void PlayerRole::Impl::complete_teardown() {
 // Impl: Helpers
 // ============================================================================
 
-bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint16_t ordinal,
+bool PlayerRole::Impl::hand_flac_header(std::string_view codec_header, uint16_t ordinal,
                                         uint32_t generation) const {
     InboundConsumer& inbound = this->sync_task->inbound();
     InboundRing* ring = inbound.ring();

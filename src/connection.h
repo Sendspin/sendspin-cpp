@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -190,7 +191,7 @@ public:
 
     /// @brief Return true if a Noise handshake driver has been installed on this connection.
     bool has_noise_handshake() const {
-        return this->noise_handshake_ != nullptr;
+        return this->noise_handshake_.has_value();
     }
 
     /// @brief Return the full Noise suite name supplied at init_noise_handshake() (e.g.
@@ -220,44 +221,30 @@ public:
     /// the new keys; neither hello is re-sent, and the manager's nursery is not involved (the
     /// connection stays current/established throughout, with no drop/reconnect).
     ///
-    /// @param msg1_bytes  The re-handshake msg1 Noise bytes (read_noise_handshake_data()).
+    /// @param msg1_bytes  The re-handshake msg1 Noise bytes (read_noise_handshake_data()); cleared
+    ///                    on return.
     /// @return true on success (session swapped; a post-swap server/activate is expected next).
     ///         false on any failure (caller should close the WebSocket).
-    bool handle_noise_rehandshake(const std::vector<uint8_t>& msg1_bytes);
+    bool handle_noise_rehandshake(std::span<uint8_t> msg1_bytes);
 
-    /// @brief Encrypt and send a JSON string as a Noise transport binary frame, through
-    /// NoiseTransport::send_json() and settle_noise_send().
-    /// @return SsErr::OK on success.
-    SsErr send_encrypted_text(const char* json, size_t len) {
-        return this->settle_noise_send(this->noise_transport_.send_json(json, len));
-    }
-
-    /// @brief std::string overload of send_encrypted_text().
-    SsErr send_encrypted_text(const std::string& json) {
-        return this->send_encrypted_text(json.data(), json.size());
-    }
-
-    /// @brief Send an application-level JSON message.
+    /// @brief Sends a JSON message: serialized straight into the Noise transport's send buffer
+    /// (NoiseTransport::stage_json()), then encrypted there once the transport is active, or sent
+    /// from there as a cleartext text frame before the handshake.
     ///
-    /// This is the single choke point for all post-handshake application JSON.
-    /// - If the Noise transport is active, routes through send_encrypted_text() so the
-    ///   frame is encrypted.
-    /// - If not yet encrypted (pre-handshake), routes through send_text_message().
-    ///
-    /// All role senders use this method. client/time is the one exception: send_time_message()
-    /// calls NoiseTransport::send_json() directly to pass its write hook, and settles its result
-    /// the same way. Protocol task only, like every send on a connection. On an ESP outbound
-    /// connection the transport send blocks for up to its 10 ms send timeout
-    /// (src/esp/client_connection.cpp), once per frame.
+    /// The one way a JSON document leaves the client: every application message, the goodbye,
+    /// and the initial handshake's msg2. The others stage their text the same way: client/time
+    /// is formatted into the send buffer by send_time_message(), and the re-handshake's msg2 goes
+    /// out under the old session by handle_noise_rehandshake(). client/init alone is sent from
+    /// the text the handshake retains for its prologue. Protocol task only, like every send on a
+    /// connection. On an ESP outbound connection the transport send blocks for up to its 10 ms
+    /// send timeout (src/esp/client_connection.cpp).
     ///
     /// A failure after the encrypt closes the connection (settle_noise_send()); one before it
     /// leaves the connection open. Either way the caller only sees the error.
-    /// @return SsErr::OK if queued/sent, error code otherwise.
-    SsErr send_app_json(const std::string& json);
-
-    /// @brief Pointer/length form of send_app_json(); encrypts straight from the caller's
-    /// buffer, and the pre-handshake text fallback builds the string it needs
-    SsErr send_app_json(const char* json, size_t len);
+    /// @return SsErr::OK if queued/sent; NO_MEM when the message could not be staged (the
+    ///         document overflowed its allocator, it is longer than one frame, or the send
+    ///         buffer could not grow); another error code otherwise.
+    SsErr send_json(const JsonDocument& doc);
 
     /// @brief Send an application binary message lying in an outbound ring item, encrypted in
     /// place and lent to the transport until its frame is written (NoiseTransport::
@@ -266,7 +253,7 @@ public:
     /// Item ownership: OutboundRing, "Lending". Binary application messages exist only under the
     /// Noise transport, so there is no cleartext fallback: before the handshake, or once
     /// accepts_app_sends() is false, the item is returned unsent with INVALID_STATE. A failure
-    /// after the encrypt closes the connection (settle_noise_send()), as for send_app_json().
+    /// after the encrypt closes the connection (settle_noise_send()), as for send_json().
     /// @param message_capacity As OutboundRing::take() reported it.
     /// @param plaintext_len    Bytes of the message, type byte first, at the start of the item's
     ///                         message bytes.
@@ -302,10 +289,10 @@ public:
         return this->last_receive_time_us_.load(std::memory_order_relaxed);
     }
 
-    /// @brief Sends a text message to the peer.
-    /// @param message The message string to send.
+    /// @brief Sends a text message to the peer. The transport copies or writes the text before it
+    /// returns.
     /// @return SsErr::OK if queued/sent, error code otherwise.
-    virtual SsErr send_text_message(const std::string& message) = 0;
+    virtual SsErr send_text_message(const char* text, size_t len) = 0;
 
     /// @brief Sends a client/time message and records it as the frame in flight (see
     /// time_frame_tag_). Needs the Noise transport, which is_operational() implies. Protocol task
@@ -342,11 +329,11 @@ public:
     /// connection.md "Failure Handling": handshake-phase failures, an AEAD failure once in
     /// transport mode, and malformed fragment sequences all close the WebSocket without sending a
     /// client/goodbye (or any other application-level message). Called on the protocol task, from
-    /// the receive path and settle_noise_send(), so this routes to close_transport_now()
-    /// (non-blocking on every platform) instead of disconnect() (which can block on a transport
-    /// join; see close_transport_now()).
-    /// The inbound gate is detached first, so nothing the peer sent after the failure is processed,
-    /// and the protocol task reports the loss.
+    /// the receive path, settle_noise_send() and send_noise_client_init(), so this routes to
+    /// close_transport_now() (non-blocking on every platform) instead of disconnect() (which can
+    /// block on a transport join; see close_transport_now()). The inbound gate is detached first,
+    /// so nothing the peer sent after the failure is processed, and the protocol task reports the
+    /// loss.
     void close_silently(SendspinGoodbyeReason /*reason*/) {
         this->detach_inbound();
         this->close_transport_now();
@@ -358,13 +345,14 @@ public:
 
     /// @brief Gets the server ID from the Noise handshake result (set at COMPLETE; empty until
     /// then when a Noise handshake is installed on this connection).
-    const std::string& get_server_id() const {
-        return this->server_information_.server_id;
+    const IdText& get_server_id() const {
+        return this->server_id_;
     }
 
-    /// @brief Gets the server information from the server/hello message (empty until received).
-    const ServerInformationObject& get_server_information() const {
-        return this->server_information_;
+    /// @brief Gets the server's friendly name from the server/hello message (empty until
+    /// received).
+    const ServerName& get_server_name() const {
+        return this->server_name_;
     }
 
     /// @brief Whether server/hello's source@v1 support object lists `codec` among the codecs the
@@ -372,7 +360,7 @@ public:
     /// object"). False for every codec before server/hello, or when it carried no valid object.
     /// Protocol task only.
     bool server_accepts_source_codec(SendspinCodecFormat codec) const {
-        return (this->server_source_codecs_ & source_codec_bit(codec)) != 0;
+        return this->server_source_codecs_.contains(codec);
     }
 
     // ========================================
@@ -380,12 +368,12 @@ public:
     // ========================================
 
     /// @brief Returns the current activity set declared by server/activate. Protocol task only.
-    const std::vector<SendspinActivity>& get_activities() const {
+    ActivitySet get_activities() const {
         return this->activities_;
     }
 
     /// @brief Returns the sticky active_roles set declared by server/activate. Protocol task only.
-    const std::vector<std::string>& get_active_roles() const {
+    ActiveRoles get_active_roles() const {
         return this->active_roles_;
     }
 
@@ -404,9 +392,10 @@ public:
     }
 
     /// @brief Returns the psk_id of the matched PSK (set at COMPLETE and rewritten at every
-    /// in-band re-handshake; empty for Sentinel or when no Noise handshake has completed).
+    /// in-band re-handshake; SENTINEL_PSK_ID for the Sentinel PSK, empty until a Noise handshake
+    /// completes).
     /// Protocol task only, the thread that writes it.
-    const std::string& get_psk_id() const {
+    const IdText& get_psk_id() const {
         return this->psk_id_;
     }
 
@@ -585,26 +574,20 @@ public:
     /// name this library implements.
     ///
     /// The one activation test in the library: the receive gate, the send gate, the client/state
-    /// role objects and role removal all read the mask active_role_mask() builds with the same
-    /// exact-version test (role_in()) role removal applies, so none of them can disagree. The
-    /// mask is rebuilt by apply_server_activate(). Protocol task only.
+    /// role objects and role removal all read the mask ActiveRoles builds with the same
+    /// exact-version test (role_from_string()), so none of them can disagree. Protocol task only.
     bool is_role_active(SendspinRole role) const {
-        return (this->active_role_mask_ & role_mask_bit(role)) != 0;
+        return (this->active_roles_.mask() & role_mask_bit(role)) != 0;
     }
 
     /// @brief The active roles as a bitmask of role_mask_bit() values. Protocol task only.
     uint16_t get_active_role_mask() const {
-        return this->active_role_mask_;
+        return this->active_roles_.mask();
     }
 
     /// @brief Returns true if the given activity is in the current activity set.
     bool has_activity(SendspinActivity activity) const {
-        for (const auto& a : this->activities_) {
-            if (a == activity) {
-                return true;
-            }
-        }
-        return false;
+        return this->activities_.contains(activity);
     }
 
     /// @brief Applies a server/activate update: stores activities and updates active_roles
@@ -618,24 +601,14 @@ public:
     ///                       include 'pairing'").
     /// @param pairing_format Emission format from the pairing object (dynamic_pairing_code
     ///                       only); stored under the same PAIRING-activity condition.
-    void apply_server_activate(const std::vector<SendspinActivity>& activities,
-                               const std::optional<std::vector<std::string>>& active_roles,
+    void apply_server_activate(ActivitySet activities, std::optional<ActiveRoles> active_roles,
                                const std::optional<SendspinPairMethod>& pairing_method,
                                const std::optional<SendspinPairingCodeFormat>& pairing_format) {
         this->activities_ = activities;
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
         }
-        // Rebuilt on every activation, sticky set included, so the mask cannot drift from
-        // active_roles_.
-        this->active_role_mask_ = active_role_mask(this->active_roles_);
-        bool has_pairing = false;
-        for (const auto& a : activities) {
-            if (a == SendspinActivity::PAIRING) {
-                has_pairing = true;
-                break;
-            }
-        }
+        const bool has_pairing = activities.contains(SendspinActivity::PAIRING);
         this->pairing_method_ = has_pairing ? pairing_method : std::nullopt;
         this->pairing_format_ = has_pairing ? pairing_format : std::nullopt;
         this->first_activate_received_ = true;
@@ -643,32 +616,20 @@ public:
         this->pairing_finalized_ = false;
     }
 
-    /// @brief Gets the time filter for this connection
-    /// @return Pointer to the time filter, or nullptr if not initialized.
-    SendspinTimeFilter* get_time_filter() {
-        return this->time_filter_.get();
+    /// @brief This connection's time filter. Protocol task only; other threads read its transform
+    /// through ConnectionManager::clock().
+    SendspinTimeFilter& time_filter() {
+        return this->time_filter_;
     }
-
-    /// @brief Returns a shared reference to this connection's time filter, for ConnectionManager's
-    /// time filter slot (see ConnectionManager::time_filter())
-    /// @return The time filter, or nullptr if not initialized.
-    std::shared_ptr<SendspinTimeFilter> get_shared_time_filter() const {
+    const SendspinTimeFilter& time_filter() const {
         return this->time_filter_;
     }
 
     /// @brief Returns true if the time filter has received at least one measurement
     /// @return True if time synchronization has started, false otherwise.
     bool is_time_synced() const {
-        if (this->time_filter_ == nullptr) {
-            return false;
-        }
-        return this->time_filter_->has_update();
+        return this->time_filter_.has_update();
     }
-
-    /// @brief Initializes the time filter with Kalman parameters. Call once, before the connection
-    /// can enter a manager slot: ConnectionManager's time filter slot copies this filter at install
-    /// and never refreshes it.
-    void init_time_filter();
 
     /// @brief This connection's time burst, which feeds its time filter. Protocol task only: the
     /// burst sends its client/time frames there and is fed the server/time replies there.
@@ -681,12 +642,12 @@ public:
     void wake_protocol_task() const;
 
     // ========================================
-    // Configuration setters (called by hub after receiving server/hello message)
+    // Handshake state (protocol task unless noted)
     // ========================================
 
     /// @brief Sets the client hello sent flag
     /// @param sent True if client hello message has been sent.
-    /// @note Called by hub to track handshake state.
+    /// @note Protocol task only: the nursery scan, once it sends client/hello.
     void set_client_hello_sent(bool sent) {
         this->client_hello_sent_ = sent;
     }
@@ -707,23 +668,23 @@ public:
         return this->client_hello_sent_;
     }
 
-    /// @brief Marks that the WebSocket upgrade completed
+    /// @brief Marks that the WebSocket upgrade completed. Transport thread.
     /// @note Distinct from is_connected(): on ESP the socket is accepted before any WebSocket
     ///       handshake, so this flag signals that the peer spoke WebSocket.
     void mark_ws_upgraded() {
         this->ws_upgraded_.store(true, std::memory_order_release);
     }
 
-    /// @brief Returns whether the WebSocket upgrade completed.
+    /// @brief Returns whether the WebSocket upgrade completed. Any thread.
     bool is_ws_upgraded() const {
         return this->ws_upgraded_.load(std::memory_order_acquire);
     }
 
     /// @brief Sets the server_id and PSK metadata from the Noise handshake result.
     /// Called at COMPLETE in connection.cpp.
-    void set_noise_handshake_result(const std::string& server_id, PskCategory psk_category,
-                                    const std::string& psk_id) {
-        this->server_information_.server_id = server_id;
+    void set_noise_handshake_result(const IdText& server_id, PskCategory psk_category,
+                                    const IdText& psk_id) {
+        this->server_id_ = server_id;
         this->psk_category_ = psk_category;
         this->psk_id_ = psk_id;
     }
@@ -735,7 +696,7 @@ public:
 
     /// @brief Sets the server hello received flag
     /// @param received True if server hello message has been received.
-    /// @note Called by hub when SERVER_HELLO is processed.
+    /// @note Protocol task only: the server/hello dispatch.
     void set_server_hello_received(bool received) {
         this->server_hello_received_ = received;
     }
@@ -743,15 +704,14 @@ public:
     /// @brief Records the codecs server/hello's source@v1 support object lists
     /// (ServerHelloMessage::source_codecs); nullopt for a hello without a valid object. Protocol
     /// task only, from the server/hello dispatch.
-    void set_server_source_codecs(std::optional<uint8_t> codecs) {
-        this->server_source_codecs_ = codecs.value_or(0);
+    void set_server_source_codecs(std::optional<EnumSet<SendspinCodecFormat>> codecs) {
+        this->server_source_codecs_ = codecs.value_or(EnumSet<SendspinCodecFormat>{});
     }
 
-    /// @brief Sets the server information (from server/hello message)
-    /// @param info The ServerInformationObject received during the hello handshake.
-    /// @note Called by hub after receiving server/hello message.
-    void set_server_information(ServerInformationObject info) {
-        this->server_information_ = std::move(info);
+    /// @brief Sets the server's friendly name from server/hello; the server_id the handshake
+    /// recorded stays.
+    void set_server_name(const ServerName& name) {
+        this->server_name_ = name;
     }
 
     // ========================================
@@ -817,7 +777,7 @@ public:
     void notify_transport_closed();
 
     // ========================================
-    // Initialization setters (called by hub before start)
+    // Initialization setters (ConnectionManager, before the protocol task can reach the connection)
     // ========================================
 
     /// @brief Sets the memory location preference for the fallback buffer the transport
@@ -829,7 +789,7 @@ public:
     }
 
     /// @brief Sets the memory location preference for the Noise transport's buffers: fragment
-    /// reassembly, the fragmentation frame buffer, and the reused send buffer.
+    /// reassembly and the reused send buffer.
     /// @param location PREFER_EXTERNAL (SPIRAM-first) or PREFER_INTERNAL (internal-RAM-first).
     /// @note Must be called before the handshake completes; takes effect on the next allocation.
     void set_noise_buffer_location(MemoryLocation location) {
@@ -892,6 +852,13 @@ protected:
     /// encrypt. Protocol task only.
     /// @param err The send's result, returned unchanged.
     SsErr settle_noise_send(SsErr err);
+
+    /// @brief Serializes `doc` into the Noise transport's send buffer behind the JSON type byte
+    /// (NoiseTransport::stage_json()), sized exactly with measureJson(), so the text is never
+    /// built anywhere else. Protocol task only.
+    /// @return The staged text, or an empty view (logged) when `doc` overflowed its allocator or
+    ///         stage_json() refused it.
+    std::string_view stage_json(const JsonDocument& doc);
 
     /// @brief Classifies a complete transport message: type 0 as JSON, stripping its type byte,
     /// all others as binary role messages. Protocol task only.
@@ -1033,8 +1000,8 @@ protected:
     /// reader threads.
     InboundGate inbound_gate_;
 
-    /// Encrypted transport: owns the cipher session, outbound fragmentation, and inbound
-    /// reassembly. Protocol task only; see noise_transport.h.
+    /// Encrypted transport: owns the cipher session and inbound reassembly. Protocol task only;
+    /// see noise_transport.h.
     NoiseTransport noise_transport_;
 
 #ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
@@ -1043,11 +1010,6 @@ protected:
     MessageTracer message_tracer_;
 #endif
 
-    /// Server identity: name from server/hello, server_id from the Noise handshake result
-    /// (or re-handshake; unchanged across a re-handshake since it is the same server). Protocol
-    /// task only; ConnectionManager publishes a copy to other threads at admission.
-    ServerInformationObject server_information_{};
-
     /// The pairing record staged by the attempt in flight, committed by the
     /// server/pair-finalize handler (nullopt = nothing to store). Protocol task only.
     std::optional<SendspinPairingRecord> pending_pairing_record_{};
@@ -1055,14 +1017,15 @@ protected:
     /// Sends this connection's client/time bursts and feeds its time filter. Protocol task only.
     SendspinTimeBurst time_burst_{};
 
+    /// Time synchronization filter (Kalman-based), fed by time_burst_. Protocol task only; other
+    /// threads read its transform through ConnectionManager::clock().
+    SendspinTimeFilter time_filter_{};
+
+    /// Noise handshake driver, from init_noise_handshake() until the handshake completes or
+    /// aborts. Protocol task only.
+    std::optional<NoiseHandshake> noise_handshake_;
+
     // Pointer fields
-
-    /// Time synchronization filter (Kalman-based). Shared so role threads can hold it without
-    /// holding this connection (ConnectionManager::time_filter()).
-    std::shared_ptr<SendspinTimeFilter> time_filter_;
-
-    /// Noise handshake driver (active from connection open until handshake complete).
-    std::unique_ptr<NoiseHandshake> noise_handshake_;
 
     /// Retained for re-handshake: pointer to the client identity supplied at
     /// init_noise_handshake(). Lifetime is owned by SendspinClient (outlives connections).
@@ -1121,20 +1084,26 @@ protected:
     /// Retained for re-handshake: Noise suite name supplied at init_noise_handshake().
     const char* noise_suite_name_ = nullptr;
 
-    /// psk_id of the PSK matched by the Noise handshake (empty for Sentinel, or when no
-    /// Noise handshake has completed). Written at handshake COMPLETE and at every in-band
+    /// psk_id of the PSK matched by the Noise handshake (SENTINEL_PSK_ID for the Sentinel PSK,
+    /// empty until a Noise handshake completes). Written at handshake COMPLETE and at every in-band
     /// re-handshake. Protocol task only.
-    std::string psk_id_{};
+    IdText psk_id_{};
 
-    // Vector fields
+    /// Server identity: server_id from the Noise handshake result (or re-handshake; unchanged
+    /// across a re-handshake since it is the same server), name from server/hello. Protocol task
+    /// only; ConnectionManager publishes a copy to other threads at admission.
+    IdText server_id_{};
+    ServerName server_name_{};
 
-    /// Activities declared by server/activate (empty until the first activate is applied).
-    /// Protocol task only: see apply_server_activate().
-    std::vector<SendspinActivity> activities_{};
+    // Struct fields
 
     /// Active roles declared by server/activate (sticky: preserved across activates that omit
     /// the field). Empty until the first activate that includes active_roles. Protocol task only.
-    std::vector<std::string> active_roles_{};
+    ActiveRoles active_roles_{};
+
+    /// Activities declared by server/activate (empty until the first activate is applied).
+    /// Protocol task only: see apply_server_activate().
+    ActivitySet activities_{};
 
     /// Pairing method from the pairing object of the last pairing server/activate; nullopt
     /// outside a pairing activation. Read by the pairing flow. Protocol task only.
@@ -1168,12 +1137,6 @@ protected:
     /// performs the write (the ESP server's httpd worker); read on the protocol task
     /// (claim_time_frame()). 32 bits because a 64-bit atomic takes a lock on the ESP32 family.
     std::atomic<uint32_t> time_frame_sent_us_{0};
-
-    // 16-bit fields
-
-    /// active_roles_ as a bitmask of the roles this library implements (see is_role_active()).
-    /// Rebuilt by apply_server_activate(). Protocol task only.
-    uint16_t active_role_mask_{0};
 
     // 8-bit fields
 
@@ -1224,7 +1187,8 @@ protected:
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
     /// Written from the transport connected callback (transport thread), read by the manager on
-    /// the protocol task, hence atomic. See mark_ws_upgraded().
+    /// the protocol task and by the host client's close_transport_now() on the transport thread,
+    /// hence atomic. See mark_ws_upgraded().
     std::atomic<bool> ws_upgraded_{false};
 
     /// The kind of the message in fallback_buf_ (TEXT or BINARY: a continuation frame does not
@@ -1248,9 +1212,9 @@ protected:
     /// not reused. Protocol task only.
     bool server_hello_received_{false};
 
-    /// The codecs server/hello's source@v1 support object lists, one source_codec_bit() each (see
-    /// server_accepts_source_codec()). Protocol task only.
-    uint8_t server_source_codecs_{0};
+    /// The codecs server/hello's source@v1 support object lists (server_accepts_source_codec()).
+    /// Protocol task only.
+    EnumSet<SendspinCodecFormat> server_source_codecs_{};
 
     /// True after the first server/activate message has been received and applied, until a
     /// re-handshake or a pairing-finalize ack rewinds it. Protocol task only.

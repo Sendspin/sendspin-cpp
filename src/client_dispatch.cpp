@@ -71,10 +71,10 @@ namespace {
 ///
 /// messaging.md "Communication" keeps a message the client implements *recognized* while its role
 /// is inactive ("An ID the receiver implements is still recognized when its role is inactive"), so
-/// this is not the unknown-message rule: the message is parsed and validated as usual, the
-/// connection is never closed for it, and only the role's own handling is skipped. messaging.md
-/// "server/activate" requires the mirror of this of servers, so a role removal the peer has not
-/// yet seen never costs the connection.
+/// this is not the unknown-message rule: the message stays recognized and the connection is never
+/// closed for it, while what it carries for a role the connection does not take is skipped
+/// unparsed. messaging.md "server/activate" requires the mirror of this of servers, so a role
+/// removal the peer has not yet seen never costs the connection.
 ///
 /// The handler a true verdict admits loads the role's teardown generation itself and stamps what
 /// it queues with it for the drains to check (RoleTeardown). Protocol task only.
@@ -129,7 +129,7 @@ uint32_t SendspinClient::protocol_tick() {
     {
         ClientStateMessage snapshot;
         if (this->protocol_task_->take_state(snapshot)) {
-            this->adopt_client_state(std::move(snapshot));
+            this->adopt_client_state(snapshot);
         }
     }
 
@@ -316,8 +316,9 @@ void SendspinClient::handle_command(ProtocolCommand& command) {
     // formats nothing.
     SendspinConnection* conn = manager.role_send_target(SendspinRole::CONTROLLER);
     if (conn != nullptr) {
-        conn->send_app_json(
-            format_client_command_message(command.controller_command, *this->json_arena_));
+        JsonDocument json = make_json_document(*this->json_arena_);
+        build_client_command_message(command.controller_command, json);
+        conn->send_json(json);
     }
 }
 
@@ -325,8 +326,8 @@ void SendspinClient::process_inbound(SendspinConnection& conn, InboundMessage& m
     // One reset per inbound message of any kind, the Noise handshake frames included, reclaiming
     // what the documents of the previous one stranded (see SendspinArenaAllocator). Safe: this is
     // called only from the tick's top level, where no arena document is live; every document the
-    // task parsed or built since the last reset was destroyed before its parser or builder
-    // returned.
+    // task parsed or built since the last reset was destroyed before the handler that parsed or
+    // built it returned.
     this->json_arena_->reset();
     InboundMessage complete;
     switch (conn.process_inbound_message(message, complete)) {
@@ -393,30 +394,53 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::STREAM_START: {
             SS_LOGD(TAG, "Stream Started");
 
+            // As with server/state, each section's role gate is decided before the parse (see
+            // process_stream_start_message()).
+            EnumSet<SendspinRole> take;
+#ifdef SENDSPIN_ENABLE_PLAYER
+            if (this->player_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
+                take.insert(SendspinRole::PLAYER);
+            }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+            if (this->artwork_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
+                take.insert(SendspinRole::ARTWORK);
+            }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+            if (this->visualizer_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
+                take.insert(SendspinRole::VISUALIZER);
+            }
+#endif
+
             StreamStartMessage stream_msg;
-            if (!parsed.extract<process_stream_start_message>(&stream_msg)) {
+            if (!parsed.extract([take, &stream_msg](JsonObject root) {
+                    return process_stream_start_message(root, take, &stream_msg);
+                })) {
                 SS_LOGE(TAG, "Failed to parse stream/start message");
                 break;
             }
 
+            // The parser fills only the sections in `take`.
 #ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_ && stream_msg.player.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                this->player_->impl_->handle_stream_start(stream_msg.player.value());
+            if (stream_msg.player.has_value()) {
+                this->player_->impl_->handle_stream_start(std::move(stream_msg.player.value()));
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
-            if (this->artwork_ && stream_msg.artwork.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
+            if (stream_msg.artwork.has_value()) {
                 this->artwork_->impl_->handle_stream_start(stream_msg.artwork.value());
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-            if (this->visualizer_ && stream_msg.visualizer.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
-                this->visualizer_->impl_->handle_stream_start(stream_msg.visualizer.value());
+            if (stream_msg.visualizer.has_value()) {
+                this->visualizer_->impl_->handle_stream_start(
+                    std::move(stream_msg.visualizer.value()));
             }
 #endif
             break;
@@ -424,21 +448,12 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::STREAM_END: {
             StreamEndMessage end_msg;
             if (parsed.extract<process_stream_end_message>(&end_msg)) {
-                bool end_player = !end_msg.roles.has_value();
-                bool end_artwork = !end_msg.roles.has_value();
-                bool end_visualizer = !end_msg.roles.has_value();
-
-                if (end_msg.roles.has_value()) {
-                    for (const auto& role : end_msg.roles.value()) {
-                        if (role == "player") {
-                            end_player = true;
-                        } else if (role == "artwork") {
-                            end_artwork = true;
-                        } else if (role == "visualizer") {
-                            end_visualizer = true;
-                        }
-                    }
-                }
+                const auto ends = [&end_msg](SendspinRole role) {
+                    return !end_msg.roles.has_value() || end_msg.roles->contains(role);
+                };
+                const bool end_player = ends(SendspinRole::PLAYER);
+                const bool end_artwork = ends(SendspinRole::ARTWORK);
+                const bool end_visualizer = ends(SendspinRole::VISUALIZER);
 
                 SS_LOGD(TAG, "Stream ended - player:%d artwork:%d visualizer:%d", end_player,
                         end_artwork, end_visualizer);
@@ -472,18 +487,11 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             if (parsed.extract<process_stream_clear_message>(&clear_msg)) {
                 // messaging.md "stream/clear": only player and visualizer streams clear, and an
                 // omitted roles list clears both.
-                bool clear_player = !clear_msg.roles.has_value();
-                bool clear_visualizer = !clear_msg.roles.has_value();
-
-                if (clear_msg.roles.has_value()) {
-                    for (const auto& role : clear_msg.roles.value()) {
-                        if (role == "player") {
-                            clear_player = true;
-                        } else if (role == "visualizer") {
-                            clear_visualizer = true;
-                        }
-                    }
-                }
+                const auto clears = [&clear_msg](SendspinRole role) {
+                    return !clear_msg.roles.has_value() || clear_msg.roles->contains(role);
+                };
+                const bool clear_player = clears(SendspinRole::PLAYER);
+                const bool clear_visualizer = clears(SendspinRole::VISUALIZER);
 
                 SS_LOGD(TAG, "Stream clear - player:%d visualizer:%d", clear_player,
                         clear_visualizer);
@@ -509,30 +517,29 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             ServerHelloMessage hello_msg;
             if (parsed.extract<process_server_hello_message>(&hello_msg)) {
                 // server_id comes from the Noise handshake result (already set on the
-                // connection); server/hello supplies the display name.
-                ServerInformationObject info = conn->get_server_information();
-                info.name = hello_msg.name;
-                conn->set_server_information(std::move(info));
+                // connection); server/hello supplies the friendly name.
+                conn->set_server_name(hello_msg.name);
                 conn->set_server_source_codecs(hello_msg.source_codecs);
                 // The nursery scan later in this tick sends client/hello in reply; nothing
                 // needs to be scheduled here.
                 conn->set_server_hello_received(true);
 
-                SS_LOGD(TAG, "Connected to server '%s' (server_id=%s)", hello_msg.name.c_str(),
-                        conn->get_server_id().c_str());
+                SS_LOGD(TAG, "Connected to server '%s' (server_id=%s)",
+                        conn->get_server_name().c_str(), conn->get_server_id().c_str());
             }
             break;
         }
         case SendspinServerToClientMessageType::SERVER_ACTIVATE: {
             ServerActivateMessage activate_msg;
             if (parsed.extract<process_server_activate_message>(&activate_msg)) {
-                SS_LOGD(TAG, "server/activate received (activities_count=%zu)",
-                        activate_msg.activities.size());
-                // Applied before the next message is parsed: trust enforcement, role
+                SS_LOGD(TAG, "server/activate received (playback=%d, pairing=%d)",
+                        activate_msg.activities.contains(SendspinActivity::PLAYBACK),
+                        activate_msg.activities.contains(SendspinActivity::PAIRING));
+                // Applied before the next message is parsed: the admissibility check, role
                 // ownership and, for a nursery connection that is now operational, admission
                 // all land here, so the role traffic the server sends behind this activate
                 // meets the gate this activation set.
-                this->connection_manager_->on_server_activate(conn, std::move(activate_msg));
+                this->connection_manager_->on_server_activate(conn, activate_msg);
             }
             break;
         }
@@ -542,11 +549,11 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             // is ordered with the decrypt of the next frame and with every send
             // (connection.md "Re-handshake").
             SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
-            const std::optional<std::vector<uint8_t>> msg1_bytes =
-                parsed.extract([](JsonObjectConst root) {
-                    return read_noise_handshake_data(root, "re-handshake");
-                });
-            if (!msg1_bytes.has_value() || !conn->handle_noise_rehandshake(msg1_bytes.value())) {
+            std::optional<PlatformBuffer> msg1_bytes = parsed.extract([](JsonObjectConst root) {
+                return read_noise_handshake_data(root, "re-handshake");
+            });
+            if (!msg1_bytes.has_value() ||
+                !conn->handle_noise_rehandshake({msg1_bytes->data(), msg1_bytes->size()})) {
                 SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
                 // Do not leave a half-swapped session. UNAUTHORIZED is the closest available
                 // reason for a crypto failure, though close_silently() never transmits it
@@ -757,7 +764,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             break;
         }
         case SendspinServerToClientMessageType::SERVER_UNPAIR: {
-            // server/unpair. Trust gating (LONG_TERM only) happens in handle_server_unpair.
+            // server/unpair. The LONG_TERM-only check happens in handle_server_unpair.
             parsed.release();
             SS_LOGI(TAG, "server/unpair received (psk_id=%s)", conn->get_psk_id().c_str());
             this->connection_manager_->on_server_unpair(conn);
@@ -805,10 +812,11 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         }
         default: {
             // Nothing acts on an unhandled message, so its type is read in place.
-            const char* type = parsed.read([](JsonObject root) {
-                return root["type"].is<const char*>() ? root["type"].as<const char*>() : "unknown";
+            const std::string_view type = parsed.read([](JsonObject root) {
+                return peer_text_for_log(root["type"] | std::string_view("unknown"));
             });
-            SS_LOGW(TAG, "Unhandled server message type: %s", type);
+            SS_LOGW(TAG, "Unhandled server message type: %.*s", static_cast<int>(type.size()),
+                    type.data());
         }
     }
 }

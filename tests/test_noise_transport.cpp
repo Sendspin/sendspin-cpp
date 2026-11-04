@@ -30,6 +30,7 @@
 #include "inbound_ring.h"
 #include "inbound_test_helpers.h"
 #include "lifecycle_test_fixtures.h"
+#include "log_capture.h"
 #include "loopback_connection.h"
 #include "crypto/keys.h"
 #include "noise_handshake.h"
@@ -78,6 +79,43 @@ extern "C" {
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
+namespace {
+
+/// A parsed copy of `json`, for send_json().
+JsonDocument json_doc(const std::string& json) {
+    JsonDocument doc;
+    deserializeJson(doc, json);
+    return doc;
+}
+
+/// A document send_json() serializes to exactly `len` (at least 2) bytes: a JSON string of 'A's.
+JsonDocument json_doc_of_length(size_t len) {
+    JsonDocument doc;
+    doc.set(std::string(len - 2, 'A'));
+    return doc;
+}
+
+/// An allocator that refuses every request, so a document built on it overflows, as one does when
+/// the arena's heap fallback fails.
+struct RefusingAllocator : ArduinoJson::Allocator {
+    void* allocate(size_t /*size*/) override { return nullptr; }
+    void deallocate(void* /*ptr*/) override {}
+    void* reallocate(void* /*ptr*/, size_t /*new_size*/) override { return nullptr; }
+};
+
+/// Pads `json` to exactly `size` bytes with an unrecognized field, which messaging.md "Forward
+/// compatibility" has the client ignore, inserted before the closing brace that sits
+/// `brace_from_end` bytes from the end.
+void pad_with_unknown_field(std::string& json, size_t size, size_t brace_from_end) {
+    const size_t field_overhead = std::string_view(R"(,"pad":"")").size();
+    ASSERT_LT(json.size() + field_overhead, size);
+    const size_t xs = size - json.size() - field_overhead;
+    json.insert(json.size() - brace_from_end, R"(,"pad":")" + std::string(xs, 'x') + "\"");
+    ASSERT_EQ(json.size(), size);
+}
+
+}  // namespace
+
 // ============================================================================
 // Suite-parameterized full handshake tests
 // ============================================================================
@@ -99,7 +137,7 @@ TEST(NoiseHandshakeLoopback, KKpsk2ChaChaPoly_FullHandshake) {
 
 // raw_decrypt() (from noise_test_helpers.h) decrypts one frame using the initiator recv cipher.
 
-TEST(NoiseTransport, SendEncryptedText_SmallJson_ChaChaPoly) {
+TEST(NoiseTransport, SendJson_SmallJson_ChaChaPoly) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
 
@@ -108,7 +146,7 @@ TEST(NoiseTransport, SendEncryptedText_SmallJson_ChaChaPoly) {
     conn.set_noise_session(std::move(r->responder_session));
 
     std::string json = "{\"type\":\"test\",\"value\":123}";
-    EXPECT_EQ(conn.send_encrypted_text(json), SsErr::OK);
+    EXPECT_EQ(conn.send_json(json_doc(json)), SsErr::OK);
 
     ASSERT_EQ(conn.sent_binary_.size(), 1u);
     const auto& ct = conn.sent_binary_[0];
@@ -122,26 +160,26 @@ TEST(NoiseTransport, SendEncryptedText_SmallJson_ChaChaPoly) {
     EXPECT_EQ(recovered, json);
 }
 
-// send_app_json routes plaintext before a transport session exists and encrypted afterwards, on
+// send_json routes plaintext before a transport session exists and encrypted afterwards, on
 // NoiseTransport::is_active(). The two frames below are the whole contract: the handshake leg
 // goes out in the clear, everything after it is a sealed frame.
-TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
+TEST(NoiseTransport, SendJson_RoutesRawBeforeSessionEncryptedAfter) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
 
     TestConnection conn;
 
-    // Before a session: send_app_json must send a raw TEXT frame.
+    // Before a session: send_json must send a raw TEXT frame.
     const std::string pre = "{\"type\":\"client/init\"}";
-    EXPECT_EQ(conn.send_app_json(pre), SsErr::OK);
+    EXPECT_EQ(conn.send_json(json_doc(pre)), SsErr::OK);
     ASSERT_EQ(conn.sent_text_.size(), 1u);
     EXPECT_EQ(conn.sent_text_[0], pre);
     EXPECT_TRUE(conn.sent_binary_.empty());
 
-    // After installing a session: send_app_json must encrypt (binary frame), no new TEXT frame.
+    // After installing a session: send_json must encrypt (binary frame), no new TEXT frame.
     conn.set_noise_session(std::move(r->responder_session));
     const std::string post = "{\"type\":\"client/state\",\"value\":7}";
-    EXPECT_EQ(conn.send_app_json(post), SsErr::OK);
+    EXPECT_EQ(conn.send_json(json_doc(post)), SsErr::OK);
     EXPECT_EQ(conn.sent_text_.size(), 1u);  // unchanged
     ASSERT_EQ(conn.sent_binary_.size(), 1u);
 
@@ -160,8 +198,7 @@ TEST(NoiseTransport, ReceiveEncryptedBinary_JsonDispatch) {
     ASSERT_TRUE(r.has_value());
 
     TestConnection conn;
-    // The responder (client) recv cipher was not exposed in LoopbackResult;
-    // we'll use send_encrypted_text to produce a ciphertext and inject it back.
+    // The ciphertext is sealed with the initiator's send cipher, as the server would seal it.
 
     // Build a JSON frame: [0x00 | utf8(json)]
     std::string json = "{\"type\":\"server/play\"}";
@@ -214,15 +251,17 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+    std::optional<NoiseHandshakeResult> completed;
 
-    std::string client_init = nh.build_client_init();
+    std::string client_init(nh.build_client_init());
     std::string server_init_text = make_server_init(server_id.peer_id());
     std::string prologue_str = client_init + server_init_text;
     const uint8_t* prologue = reinterpret_cast<const uint8_t*>(prologue_str.data());
     size_t prologue_len = prologue_str.size();
 
     // server/init: NEED_MORE
-    auto r1 = nh.on_text_frame(server_init_text, [](const std::string&) { return true; });
+    auto r1 =
+        nh.on_text_frame(server_init_text, [](const JsonDocument&) { return true; }, completed);
     EXPECT_EQ(r1, HandshakeFrameResult::NEED_MORE);
 
     // The initiator uses the stored PSK, so only the counterparty binding differs.
@@ -236,7 +275,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id_val);
     ASSERT_FALSE(msg1_text.empty());
 
-    auto r2 = nh.on_text_frame(msg1_text, [](const std::string&) { return true; });
+    auto r2 = nh.on_text_frame(msg1_text, [](const JsonDocument&) { return true; }, completed);
     EXPECT_EQ(r2, HandshakeFrameResult::ABORT);
 }
 
@@ -278,12 +317,14 @@ Msg1Outcome run_msg1_with_payload(
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
-    const std::string client_init = nh.build_client_init();
+    std::optional<NoiseHandshakeResult> completed;
+    const std::string client_init(nh.build_client_init());
     const std::string server_init_text = make_server_init(server_id.peer_id());
     const std::string prologue_str = client_init + server_init_text;
 
-    EXPECT_EQ(nh.on_text_frame(server_init_text, [](const std::string&) { return true; }),
-              HandshakeFrameResult::NEED_MORE);
+    EXPECT_EQ(
+        nh.on_text_frame(server_init_text, [](const JsonDocument&) { return true; }, completed),
+        HandshakeFrameResult::NEED_MORE);
 
     NoiseHandshakeState* init_hs_raw = build_initiator(
         std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
@@ -301,19 +342,20 @@ Msg1Outcome run_msg1_with_payload(
 
     Msg1Outcome outcome;
     std::string captured_msg2;
-    outcome.result = nh.on_text_frame(msg1_text, [&captured_msg2](const std::string& text) {
-        captured_msg2 = text;
-        return true;
-    });
+    outcome.result = nh.on_text_frame(
+        msg1_text,
+        [&captured_msg2](const JsonDocument& msg) {
+            captured_msg2 = to_text(msg);
+            return true;
+        },
+        completed);
     if (outcome.result != HandshakeFrameResult::COMPLETE) {
         return outcome;
     }
 
-    auto result = nh.take_result();
-    EXPECT_TRUE(result.has_value());
-    if (result.has_value()) {
-        outcome.category = result->resolved_psk.category;
-        EXPECT_NE(result->session, nullptr) << "a completed handshake must carry its session";
+    EXPECT_TRUE(completed.has_value());
+    if (completed.has_value()) {
+        outcome.category = completed->psk_category;
     }
 
     // The peer holds the PSK it referenced, so it can only read message 2 if the client bound the
@@ -364,6 +406,22 @@ TEST(NoiseHandshakeDriver, UnknownPskIdFallsBackToTheSentinelPsk) {
         EXPECT_EQ(outcome.category, PskCategory::SENTINEL) << "category " << category;
         EXPECT_FALSE(outcome.peer_read_msg2) << "category " << category;
     }
+
+    // An id longer than any psk_id is the same miss, though the record it extends is stored.
+    Msg1Outcome over_long = run_msg1_with_payload([](const std::string& psk_id) {
+        return R"({"psk_id":")" + psk_id + R"(x","psk_category":"lt"})";
+    });
+    EXPECT_EQ(over_long.result, HandshakeFrameResult::COMPLETE);
+    EXPECT_EQ(over_long.category, PskCategory::SENTINEL);
+    EXPECT_FALSE(over_long.peer_read_msg2);
+
+    // So is the stored id with more after a NUL: the id is read at its full length.
+    Msg1Outcome nul_suffixed = run_msg1_with_payload([](const std::string& psk_id) {
+        return R"({"psk_id":")" + psk_id + R"(\u0000x","psk_category":"lt"})";
+    });
+    EXPECT_EQ(nul_suffixed.result, HandshakeFrameResult::COMPLETE);
+    EXPECT_EQ(nul_suffixed.category, PskCategory::SENTINEL);
+    EXPECT_FALSE(nul_suffixed.peer_read_msg2);
 }
 
 // messaging.md "noise/handshake": the payload declares which category the referenced PSK is used
@@ -379,6 +437,8 @@ TEST(NoiseHandshakeDriver, Msg1PayloadPskCategoryIsValidated) {
     };
     const Row rows[] = {
         {"code outside the defined set", R"(,"psk_category":"xx")", HandshakeFrameResult::ABORT},
+        {"a defined code with more after a NUL", R"(,"psk_category":"lt\u0000x")",
+         HandshakeFrameResult::ABORT},
         {"no psk_category at all", "", HandshakeFrameResult::ABORT},
         // Control: the category the client actually holds the psk_id in resolves to the record,
         // and the peer that sent message 1 can read the message 2 that comes back.
@@ -401,39 +461,104 @@ TEST(NoiseHandshakeDriver, Msg1PayloadPskCategoryIsValidated) {
 }
 
 // messaging.md "server/error": the server sends it in place of server/init when it cannot accept
-// our client/init, then closes. The handshake aborts, and the reason it carries is logged rather
-// than the frame being treated as an unparseable server/init.
+// our client/init, then closes. The handshake aborts, and the reason it carries is kept as one of
+// the reasons the spec defines, any other text (or none) as UNKNOWN, rather than the frame being
+// treated as an unparseable server/init.
 TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingServerInitAborts) {
-    Identity client_id = Identity::generate().value();
-    RecordStore rs(nullptr);
+    struct Row {
+        const char* frame;
+        std::optional<ServerErrorReason> expected;
+    };
+    const Row rows[] = {
+        {R"({"type":"server/error","payload":{"reason":"unsupported_version"}})",
+         ServerErrorReason::UNSUPPORTED_VERSION},
+        {R"({"type":"server/error","payload":{"reason":"unsupported_suite"}})",
+         ServerErrorReason::UNSUPPORTED_SUITE},
+        {R"({"type":"server/error","payload":{"reason":"malformed"}})",
+         ServerErrorReason::MALFORMED},
+        {R"({"type":"server/error","payload":{"reason":"Malformed"}})", ServerErrorReason::UNKNOWN},
+        {R"({"type":"server/error","payload":{"reason":"malformed\u0000x"}})",
+         ServerErrorReason::UNKNOWN},
+        {R"({"type":"server/error","payload":{"reason":7}})", ServerErrorReason::UNKNOWN},
+        {R"({"type":"server/error","payload":{}})", ServerErrorReason::UNKNOWN},
+        // Control: an abort on a frame that is not a server/error leaves no reason to report, so
+        // the connection does not attribute a generic failure to the server.
+        {R"({"type":"server/init","payload":{"version":99}})", std::nullopt},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.frame);
+        Identity client_id = Identity::generate().value();
+        RecordStore rs(nullptr);
 
-    TestArena arena;
-    NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
-    nh.build_client_init();
+        TestArena arena;
+        NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+        std::optional<NoiseHandshakeResult> completed;
+        nh.build_client_init();
 
-    auto r = nh.on_text_frame(R"({"type":"server/error","payload":{"reason":"unsupported_suite"}})",
-                              [](const std::string&) { return true; });
-    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
-    EXPECT_EQ(nh.server_error_reason(), "unsupported_suite");
+        auto r = nh.on_text_frame(row.frame, [](const JsonDocument&) { return true; }, completed);
+        EXPECT_EQ(r, HandshakeFrameResult::ABORT);
+        EXPECT_EQ(nh.server_error_reason(), row.expected);
+    }
 }
 
-// Control: the same abort from a frame that is not a server/error leaves no reason to report, so
-// the connection does not attribute a generic failure to the server.
-TEST(NoiseHandshakeDriver, AbortWithoutServerErrorReportsNoReason) {
-    Identity client_id = Identity::generate().value();
-    RecordStore rs(nullptr);
+// The handshake's frames are unauthenticated, so the text it logs from them, an unexpected type
+// or a server/error reason, is cut to PEER_TEXT_LOG_BYTES.
+TEST(NoiseHandshakeDriver, UnexpectedPeerTextIsLoggedOnlyUpToTheBound) {
+    const std::string text(4 * PEER_TEXT_LOG_BYTES, 'x');
+    struct Row {
+        const char* name;
+        std::string frame;
+    };
+    const Row rows[] = {
+        {"an unexpected type", R"({"type":")" + text + R"(","payload":{}})"},
+        {"a server/error reason",
+         R"({"type":"server/error","payload":{"reason":")" + text + R"("}})"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Identity client_id = Identity::generate().value();
+        RecordStore rs(nullptr);
+        TestArena arena;
+        NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+        std::optional<NoiseHandshakeResult> completed;
+        nh.build_client_init();
 
-    TestArena arena;
-    NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
-    nh.build_client_init();
-
-    auto r = nh.on_text_frame(R"({"type":"server/init","payload":{"version":99}})",
-                              [](const std::string&) { return true; });
-    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
-    EXPECT_TRUE(nh.server_error_reason().empty());
+        StderrCapture capture;
+        EXPECT_EQ(nh.on_text_frame(row.frame, [](const JsonDocument&) { return true; }, completed),
+                  HandshakeFrameResult::ABORT);
+        const std::string log = capture.release();
+        EXPECT_NE(log.find(text.substr(0, PEER_TEXT_LOG_BYTES)), std::string::npos)
+            << "Control: the text is logged at all: " << log;
+        EXPECT_EQ(log.find(text.substr(0, PEER_TEXT_LOG_BYTES + 1)), std::string::npos) << log;
+    }
 }
 
-// The same frame after server/init, while the client is waiting for Noise message 1, is refused
+// A noise/handshake data field longer than any message 1 the client could read is refused before
+// its buffer is allocated, so a pre-admission frame cannot make the client hold a peer-sized decode
+// buffer.
+TEST(NoiseHandshakeDriver, HandshakeDataLongerThanAMsg1IsRefused) {
+    struct Row {
+        const char* name;
+        size_t bytes;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: longest-msg1", MAX_HANDSHAKE_MSG1_BYTES, true},
+        {"one-byte-over", MAX_HANDSHAKE_MSG1_BYTES + 1, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        const std::vector<uint8_t> bytes(row.bytes, 0x5A);
+        const std::string frame = R"({"type":"noise/handshake","payload":{"data":")" +
+                                  b64url_encode(bytes.data(), bytes.size()) + R"("}})";
+        JsonDocument doc;
+        ASSERT_EQ(deserializeJson(doc, frame), DeserializationError::Ok);
+        EXPECT_EQ(read_noise_handshake_data(doc.as<JsonObjectConst>(), "test").has_value(),
+                  row.accepted);
+    }
+}
+
+// A server/error after server/init, while the client is waiting for Noise message 1, is refused
 // the same way instead of being read as a handshake message.
 TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
     Identity client_id = Identity::generate().value();
@@ -442,33 +567,45 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+    std::optional<NoiseHandshakeResult> completed;
     nh.build_client_init();
     ASSERT_EQ(nh.on_text_frame(make_server_init(server_id.peer_id()),
-                               [](const std::string&) { return true; }),
+                               [](const JsonDocument&) { return true; }, completed),
               HandshakeFrameResult::NEED_MORE);
 
     auto r = nh.on_text_frame(R"({"type":"server/error","payload":{"reason":"malformed"}})",
-                              [](const std::string&) { return true; });
+                              [](const JsonDocument&) { return true; }, completed);
     EXPECT_EQ(r, HandshakeFrameResult::ABORT);
-    EXPECT_EQ(nh.server_error_reason(), "malformed");
+    EXPECT_EQ(nh.server_error_reason(), ServerErrorReason::MALFORMED);
 }
 
-// A server/init is accepted only when its type, its server_id and its version are all usable:
-// the server_id names the key and goes into the prologue, so both are checked before the
-// handshake reads a Noise byte (connection.md "Handshake").
+// A server/init is accepted only when its type, its server_id, its version and its length are all
+// usable: the server_id names the key and the frame goes into the prologue, so each is checked
+// before the handshake reads a Noise byte (connection.md "Handshake").
 TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
-    enum class ServerId : uint8_t { REAL, TOO_LONG, NON_CANONICAL };
+    enum class ServerId : uint8_t { REAL, TOO_LONG, NON_CANONICAL, NUL_SUFFIXED };
     struct Row {
         const char* name;
-        const char* type;
+        std::string_view type;
         ServerId server_id;
         int version;
         HandshakeFrameResult expected;
+        size_t padded_to{0};  // the frame's length after an unknown top-level field, 0 for none
     };
     const Row rows[] = {
+        // The prologue keeps at most MAX_SERVER_INIT_BYTES of server/init.
+        {"longer than the prologue keeps", "server/init", ServerId::REAL, 1,
+         HandshakeFrameResult::ABORT, MAX_SERVER_INIT_BYTES + 1},
+        {"Control: exactly as long as the prologue keeps", "server/init", ServerId::REAL, 1,
+         HandshakeFrameResult::NEED_MORE, MAX_SERVER_INIT_BYTES},
         // The payload is the control's, so only the type field can produce the abort: a frame
         // whose payload would pass must still be refused for arriving under another type.
         {"another envelope type", "wrong/type", ServerId::REAL, 1, HandshakeFrameResult::ABORT},
+        // A field is read at its full length, so a NUL cannot cut it back to an acceptable value.
+        {"the right type with more after a NUL", std::string_view("server/init\0x", 13),
+         ServerId::REAL, 1, HandshakeFrameResult::ABORT},
+        {"the server_id with more after a NUL", "server/init", ServerId::NUL_SUFFIXED, 1,
+         HandshakeFrameResult::ABORT},
         // A peer id is PEER_ID_SIZE characters of base64url; anything else cannot name a key.
         {"server_id of the wrong length", "server/init", ServerId::TOO_LONG, 1,
          HandshakeFrameResult::ABORT},
@@ -489,6 +626,7 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
 
         TestArena arena;
         NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+        std::optional<NoiseHandshakeResult> completed;
         nh.build_client_init();
 
         std::string peer_id = server_id.peer_id();
@@ -496,9 +634,16 @@ TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
             peer_id = std::string(PEER_ID_SIZE + 2, 'A');
         } else if (row.server_id == ServerId::NON_CANONICAL) {
             peer_id = non_canonical_spelling(peer_id);
+        } else if (row.server_id == ServerId::NUL_SUFFIXED) {
+            peer_id += std::string("\0x", 2);
         }
-        EXPECT_EQ(nh.on_text_frame(make_server_init(peer_id, row.version, row.type),
-                                   [](const std::string&) { return true; }),
+        std::string frame = make_server_init(peer_id, row.version, row.type);
+        if (row.padded_to != 0) {
+            // Inside the payload, whose closing brace precedes the envelope's.
+            pad_with_unknown_field(frame, row.padded_to, 2);
+            ASSERT_FALSE(HasFatalFailure());
+        }
+        EXPECT_EQ(nh.on_text_frame(frame, [](const JsonDocument&) { return true; }, completed),
                   row.expected);
     }
 }
@@ -969,7 +1114,7 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
 // cipher (advances its nonce).
 
 /// Split a type-prefixed plaintext into wire fragment frames, per messaging.md
-/// "Fragmentation" and matching NoiseTransport::fragment_and_send_locked().
+/// "Fragmentation", as a server sends a message longer than one frame.
 static std::vector<std::vector<uint8_t>> server_fragment_frames(
     const std::vector<uint8_t>& plaintext) {
     std::vector<std::vector<uint8_t>> frames;
@@ -1113,106 +1258,9 @@ TEST(NoiseTransport, CleartextFrameInTransportModeClosesSilently) {
 }
 
 // ============================================================================
-// Fragmentation threshold: exactly at and one byte over MAX_TRANSPORT_PLAINTEXT
-// ============================================================================
-
-TEST(NoiseTransport, FragmentBoundaryExactLimit) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    // plaintext = [0x00] + json, and MAX_TRANSPORT_PLAINTEXT (65519) counts the type byte.
-    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
-    constexpr size_t TAG = 16;  // AEAD tag appended to every frame's plaintext
-
-    // json of (maxp - 1) bytes -> plaintext exactly maxp -> a single (unfragmented) frame.
-    EXPECT_EQ(conn.send_encrypted_text(std::string(maxp - 1, 'A')), SsErr::OK);
-    ASSERT_EQ(conn.sent_binary_.size(), 1u);
-    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG);
-
-    conn.sent_binary_.clear();
-
-    // json of maxp bytes -> plaintext (maxp + 1) -> exactly two frames.
-    //
-    // Assert each frame's exact size, not just the frame count: the split point is wire format
-    // (messaging.md "Fragmentation"), so an off-by-one in fragment_and_send_locked's
-    // first_cap/cont_cap would still emit two frames that this transport happily reassembles,
-    // while a conforming peer would disagree about where the boundary falls.
-    //
-    // First frame is [1, flags, orig_type, data[:first_cap]], so its plaintext fills the cap
-    // exactly at 3 + (maxp - 3) == maxp. That leaves data_len - (maxp - 3) == 3 bytes for the
-    // continuation frame, whose plaintext is [1, flags, those 3 bytes] == 5 bytes.
-    EXPECT_EQ(conn.send_encrypted_text(std::string(maxp, 'A')), SsErr::OK);
-    ASSERT_EQ(conn.sent_binary_.size(), 2u);
-    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG)
-        << "first fragment must fill MAX_TRANSPORT_PLAINTEXT exactly";
-    EXPECT_EQ(conn.sent_binary_[1].size(), 5u + TAG)
-        << "continuation must carry exactly the bytes the first frame's cap left over";
-
-    conn.sent_binary_.clear();
-
-    // One byte further: the continuation grows by exactly one, confirming the leftover tracks
-    // data_len rather than the frame count staying coincidentally right.
-    EXPECT_EQ(conn.send_encrypted_text(std::string(maxp + 1, 'A')), SsErr::OK);
-    ASSERT_EQ(conn.sent_binary_.size(), 2u);
-    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG);
-    EXPECT_EQ(conn.sent_binary_[1].size(), 6u + TAG);
-}
-
-// The frame sizes above pin where the split falls, but not what the header bytes are. Decrypt the
-// emitted frames and assert the layout messaging.md "Fragmentation" specifies, byte by byte, so a
-// transposed flags/orig_type or a wrong flag bit fails a layout test rather than showing up as an
-// unrelated failure elsewhere.
-TEST(NoiseTransport, FragmentHeaderBytesMatchTheWireFormat) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
-    const size_t first_cap = maxp - 3;
-    const size_t cont_cap = maxp - 2;
-
-    // One byte past what two frames carry, so there is a first, a middle and a last fragment and
-    // every flags combination the send path emits appears exactly once.
-    const std::string json(first_cap + cont_cap + 1, 'A');
-    ASSERT_EQ(conn.send_encrypted_text(json), SsErr::OK);
-    ASSERT_EQ(conn.sent_binary_.size(), 3u);
-
-    std::vector<std::vector<uint8_t>> frames;
-    for (const auto& ct : conn.sent_binary_) {
-        auto pt = raw_decrypt(r->initiator.recv_cs, ct);
-        ASSERT_FALSE(pt.empty());
-        frames.push_back(std::move(pt));
-    }
-
-    // First fragment: [1][FIRST][orig_type][data...]
-    EXPECT_EQ(frames[0][0], MSG_TYPE_FRAGMENT);
-    EXPECT_EQ(frames[0][1], FRAGMENT_FLAG_FIRST) << "the first fragment sets bit 1 and not bit 0";
-    EXPECT_EQ(frames[0][2], MSG_TYPE_JSON_BODY) << "orig_type is byte 2, after the flags";
-    EXPECT_EQ(frames[0][3], 'A') << "the data starts at byte 3";
-    EXPECT_EQ(frames[0].size(), 3 + first_cap);
-
-    // Middle fragment: [1][0][data...], no orig_type.
-    EXPECT_EQ(frames[1][0], MSG_TYPE_FRAGMENT);
-    EXPECT_EQ(frames[1][1], 0u) << "a middle fragment is neither first nor last";
-    EXPECT_EQ(frames[1][2], 'A') << "a continuation's data starts at byte 2";
-    EXPECT_EQ(frames[1].size(), 2 + cont_cap) << "a middle fragment fills cont_cap";
-
-    // Last fragment: [1][LAST][data...]
-    EXPECT_EQ(frames[2][0], MSG_TYPE_FRAGMENT);
-    EXPECT_EQ(frames[2][1], FRAGMENT_FLAG_LAST) << "the last fragment sets bit 0 and not bit 1";
-    EXPECT_EQ(frames[2][2], 'A');
-    EXPECT_EQ(frames[2].size(), 3u);
-}
-
-// ============================================================================
-// send_buf_ growth: the reused non-fragmented send buffer grows on demand instead of a fixed
-// MAX_TRANSPORT_PLAINTEXT + 16 allocation. There is no accessor for its capacity, so these
-// exercise growth indirectly: a sequence of increasing sizes (including a shrink back down,
+// send_buf_ growth: the reused send buffer grows on demand instead of a fixed
+// MAX_TRANSPORT_PLAINTEXT + 16 allocation. There is no accessor for its capacity, so this
+// exercises growth indirectly: a sequence of increasing sizes (including a shrink back down,
 // which must not lose or corrupt data) and the exact MAX_TRANSPORT_PLAINTEXT boundary, all
 // round-tripping through encrypt/decrypt correctly on one shared transport instance.
 // ============================================================================
@@ -1226,19 +1274,16 @@ TEST(NoiseTransport, SendJson_GrowingSizesRoundTrip) {
 
     const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
     // json length -> plaintext length (1 + json length) stays <= maxp for every size here, so
-    // every send takes the single-frame (non-fragmented, send_buf_-backed) path. Includes a
-    // shrink (8192 -> 64) to confirm a smaller send after a large one still works correctly.
-    const size_t json_lens[] = {0, 1, 64, 200, 2000, 8192, 64, maxp - 1};
+    // every send is one frame staged in send_buf_. Includes a shrink (8192 -> 64) to confirm a
+    // smaller send after a large one still works correctly.
+    const size_t json_lens[] = {2, 64, 200, 2000, 8192, 64, maxp - 1};
 
     for (size_t json_len : json_lens) {
-        std::string json;
-        json.reserve(json_len);
-        for (size_t i = 0; i < json_len; ++i) {
-            json.push_back(static_cast<char>('a' + (i % 26)));
-        }
+        const std::string json = '"' + std::string(json_len - 2, 'A') + '"';
 
         conn.sent_binary_.clear();
-        ASSERT_EQ(conn.send_encrypted_text(json), SsErr::OK) << "json_len=" << json_len;
+        ASSERT_EQ(conn.send_json(json_doc_of_length(json_len)), SsErr::OK)
+            << "json_len=" << json_len;
         ASSERT_EQ(conn.sent_binary_.size(), 1u) << "json_len=" << json_len;
 
         auto pt = raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
@@ -1249,73 +1294,6 @@ TEST(NoiseTransport, SendJson_GrowingSizesRoundTrip) {
     }
 }
 
-TEST(NoiseTransport, SendBinary_GrowingSizesUpToMaxTransportPlaintextRoundTrip) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
-    // Total length including the leading type byte; maxp is the largest size the non-fragmented
-    // send_binary path ever handles (see send_binary's doc comment).
-    const size_t lens[] = {1, 32, 512, 4096, maxp};
-
-    for (size_t len : lens) {
-        std::vector<uint8_t> data(len);
-        data[0] = SENDSPIN_BINARY_PLAYER_AUDIO;  // arbitrary non-JSON role type byte
-        for (size_t i = 1; i < len; ++i) {
-            data[i] = static_cast<uint8_t>(i);
-        }
-
-        conn.sent_binary_.clear();
-        ASSERT_EQ(conn.test_send_binary(data.data(), data.size()), SsErr::OK) << "len=" << len;
-        ASSERT_EQ(conn.sent_binary_.size(), 1u) << "len=" << len;
-
-        auto pt = raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
-        ASSERT_EQ(pt.size(), len) << "len=" << len;
-        EXPECT_EQ(pt, data) << "len=" << len;
-    }
-}
-
-TEST(NoiseTransport, SendBinaryRejectsTheFragmentMessageType) {
-    // messaging.md "Fragmentation" reserves ID 1 for the transport and forbids it as an
-    // orig_type, so a role message may never claim it. Nothing reaches the wire.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    const std::vector<uint8_t> fragment_typed = {MSG_TYPE_FRAGMENT, 0xAA, 0xBB};
-    EXPECT_EQ(conn.test_send_binary(fragment_typed.data(), fragment_typed.size()), SsErr::FAIL);
-    EXPECT_TRUE(conn.sent_binary_.empty());
-
-    // Control: the same payload behind a role type byte is sent.
-    const std::vector<uint8_t> role_typed = {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA, 0xBB};
-    EXPECT_EQ(conn.test_send_binary(role_typed.data(), role_typed.size()), SsErr::OK);
-    EXPECT_EQ(conn.sent_binary_.size(), 1u);
-}
-
-TEST(NoiseTransport, SendBinaryRejectsAnEmptyPayload) {
-    // A zero-length binary message has no type byte, so there is nothing to check ID 1 against
-    // and nothing for a receiver to route. It is refused before the type read rather than sealed
-    // and put on the wire.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    const std::vector<uint8_t> payload = {SENDSPIN_BINARY_PLAYER_AUDIO};
-    EXPECT_EQ(conn.test_send_binary(payload.data(), 0), SsErr::FAIL);
-    EXPECT_TRUE(conn.sent_binary_.empty()) << "an empty binary message reached the wire";
-
-    // Control: the same buffer with its one byte counted is sent.
-    EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::OK);
-    EXPECT_EQ(conn.sent_binary_.size(), 1u);
-}
-
 TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
     // Every transport send is guarded on is_active(): with no session installed there is no
     // cipher to seal with, and the caller is told the state is wrong rather than having its
@@ -1324,10 +1302,16 @@ TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
     TestConnection conn;
     TestOutboundRing lent(64);
 
+    // A refused JSON message is wiped where it was staged: it may carry key material
+    // (client/pair-finalize), which a successful send would have encrypted over.
     const std::string json = R"({"type":"client/state"})";
-    EXPECT_EQ(conn.send_encrypted_text(json), SsErr::INVALID_STATE);
+    char* staged = conn.noise_transport_.stage_json(json.size());
+    ASSERT_NE(staged, nullptr);
+    std::memcpy(staged, json.data(), json.size());
+    EXPECT_EQ(conn.noise_transport_.send_staged_json(json.size()), SsErr::INVALID_STATE);
+    EXPECT_EQ(std::string(staged, json.size()), std::string(json.size(), '\0'))
+        << "the refused message was left staged";
     const std::vector<uint8_t> payload = {SENDSPIN_BINARY_PLAYER_AUDIO, 0x01};
-    EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::INVALID_STATE);
     void* refused = lent.take_filled(payload);
     ASSERT_NE(refused, nullptr);
     EXPECT_EQ(conn.send_app_binary_lent(lent.ring, refused, lent.capacity, payload.size()),
@@ -1336,16 +1320,15 @@ TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
     EXPECT_TRUE(conn.sent_text_.empty()) << "a lent message went out in the clear";
     EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT) << "the refused item was not returned";
 
-    // Control: with a session installed the same three calls seal and send.
+    // Control: with a session installed the same two calls seal and send.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     conn.set_noise_session(std::move(r->responder_session));
-    EXPECT_EQ(conn.send_encrypted_text(json), SsErr::OK);
-    EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::OK);
+    EXPECT_EQ(conn.send_json(json_doc(json)), SsErr::OK);
     void* sent = lent.take_filled(payload);
     ASSERT_NE(sent, nullptr);
     EXPECT_EQ(conn.send_app_binary_lent(lent.ring, sent, lent.capacity, payload.size()), SsErr::OK);
-    EXPECT_EQ(conn.sent_binary_.size(), 3u);
+    EXPECT_EQ(conn.sent_binary_.size(), 2u);
     EXPECT_EQ(lent.free_items(), OUTBOUND_RING_ITEM_COUNT);
 }
 
@@ -1374,7 +1357,7 @@ TEST(NoiseTransport, EncryptInPlaceRefusesMissingTagRoomAndMarksAFailedEncrypt) 
         ASSERT_TRUE(r.has_value());
         NoiseCipherState* send_cs = r->responder_session->send_cipher_;
         NoiseTransport transport;
-        transport.activate(std::move(r->responder_session));
+        transport.activate(std::move(*r->responder_session));
         if (row.c == Case::NONCE_EXHAUSTED) {
             ASSERT_EQ(noise_cipherstate_set_nonce(send_cs, UINT64_MAX), NOISE_ERROR_NONE);
         }
@@ -1407,15 +1390,21 @@ TEST(NoiseTransport, EncryptInPlaceRefusesMissingTagRoomAndMarksAFailedEncrypt) 
 // ============================================================================
 
 // Noise message 1 that cannot be read as one aborts the handshake rather than being retried or
-// ignored (connection.md "Failure Handling").
+// ignored (connection.md "Failure Handling"), and so does one whose payload is longer than the
+// MAX_HANDSHAKE_MESSAGE_BYTES the client decrypts.
 TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
     struct Row {
         const char* name;
         bool well_formed;                  // build message 1 with a real initiator
         std::vector<uint8_t> noise_bytes;  // the frame's noise bytes when it is not well formed
         HandshakeFrameResult expected;
+        size_t payload_size{0};  // a well-formed payload padded to this length, 0 for unpadded
     };
     const Row rows[] = {
+        {"a payload longer than the client decrypts", true, {}, HandshakeFrameResult::ABORT,
+         MAX_HANDSHAKE_MESSAGE_BYTES + 1},
+        {"Control: a payload exactly as long as the client decrypts", true, {},
+         HandshakeFrameResult::COMPLETE, MAX_HANDSHAKE_MESSAGE_BYTES},
         {"empty noise bytes", false, {}, HandshakeFrameResult::ABORT},
         // Well-formed base64url, but fails Noise authentication as message 1.
         {"garbage of a plausible length", false, std::vector<uint8_t>(64, 0xAB),
@@ -1435,13 +1424,16 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
 
         TestArena arena;
         NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
-        const std::string client_init = nh.build_client_init();
+        std::optional<NoiseHandshakeResult> completed;
+        const std::string client_init(nh.build_client_init());
         const std::string server_init_text = make_server_init(server_id.peer_id());
-        auto send_fn = [](const std::string&) { return true; };
-        ASSERT_EQ(nh.on_text_frame(server_init_text, send_fn), HandshakeFrameResult::NEED_MORE);
+        auto send_fn = [](const JsonDocument&) { return true; };
+        ASSERT_EQ(nh.on_text_frame(server_init_text, send_fn, completed),
+                  HandshakeFrameResult::NEED_MORE);
 
         if (!row.well_formed) {
-            EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope(row.noise_bytes), send_fn),
+            EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope(row.noise_bytes), send_fn,
+                                       completed),
                       row.expected);
             continue;
         }
@@ -1456,9 +1448,14 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
         ASSERT_NE(init_hs_raw, nullptr);
         HsGuard guard(init_hs_raw);
 
-        const std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id_for(psk));
+        std::string payload = R"({"psk_id":")" + psk_id_for(psk) + R"(","psk_category":"lt"})";
+        if (row.payload_size != 0) {
+            pad_with_unknown_field(payload, row.payload_size, 1);
+            ASSERT_FALSE(HasFatalFailure());
+        }
+        const std::string msg1_text = build_msg1_envelope_with_payload(init_hs_raw, payload);
         ASSERT_FALSE(msg1_text.empty());
-        EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn), row.expected);
+        EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn, completed), row.expected);
     }
 }
 
@@ -1481,34 +1478,31 @@ public:
         return SsErr::OK;
     }
 
-    /// Sends through NoiseTransport::send_json() with a write hook, which send_app_json() does
-    /// not expose.
+    /// Stages a JSON message and sends it with a write hook, as send_time_message() does;
+    /// send_json() takes none.
     SsErr send_json_with_hook(const std::string& json, const NoiseTransport::FrameWriteHook& hook) {
-        return this->noise_transport_.send_json(json.data(), json.size(), hook);
+        char* staged = this->noise_transport_.stage_json(json.size());
+        if (staged == nullptr) {
+            return SsErr::NO_MEM;
+        }
+        std::memcpy(staged, json.data(), json.size());
+        return this->noise_transport_.send_staged_json(json.size(), hook);
     }
 
     std::vector<NoiseTransport::FrameWriteHook> hooks_;
 };
 
-// The hook marks the moment the message goes to the socket, so only the last frame of a
-// fragmented message may carry it.
-TEST(NoiseTransport, SendJsonWriteHookRidesTheLastFrame) {
+// The hook marks the moment the message goes to the socket, so it rides the message's frame.
+TEST(NoiseTransport, SendStagedJsonHandsItsWriteHookToTheFrame) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     DeferredWriteConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
-    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
     auto hook = []() {};
 
     ASSERT_EQ(conn.send_json_with_hook("{}", hook), SsErr::OK);
     ASSERT_EQ(conn.hooks_.size(), 1U);
     EXPECT_TRUE(conn.hooks_[0]);
-
-    conn.hooks_.clear();
-    ASSERT_EQ(conn.send_json_with_hook(std::string(maxp, 'A'), hook), SsErr::OK);
-    ASSERT_EQ(conn.hooks_.size(), 2U);
-    EXPECT_FALSE(conn.hooks_[0]);
-    EXPECT_TRUE(conn.hooks_[1]);
 }
 
 // On a transport that writes synchronously, the default send_transport_frame() runs the hook
@@ -1621,7 +1615,6 @@ TEST(TimeBurst, CountsOnlyTheReplyToItsPendingMessage) {
     ASSERT_TRUE(r.has_value());
     DeferredWriteConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
-    conn.init_time_filter();
     conn.set_client_hello_sent(true);
     conn.set_server_hello_received(true);
     auto reply = [](int64_t echo) {
@@ -1664,7 +1657,6 @@ TEST(TimeBurst, TimedOutMessageIsRetired) {
     ASSERT_TRUE(r.has_value());
     DeferredWriteConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
-    conn.init_time_filter();
     conn.set_client_hello_sent(true);
     conn.set_server_hello_received(true);
 
@@ -1708,9 +1700,9 @@ TEST(NoiseTransport, TimeMessageNeedsTheNoiseTransport) {
 TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
     enum class Send : uint8_t {
         SINGLE,
-        FRAGMENTED,
+        OVERSIZED_JSON,
+        OVERFLOWED_JSON,
         NO_FRAME_SINK,
-        FRAGMENT_TYPED_BINARY,
         ENCRYPT_FAILS,
         LENT,
         FRAGMENT_TYPED_LENT,
@@ -1730,12 +1722,12 @@ TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
         {"Control: the write succeeds", Send::SINGLE, -1, false, false, SsErr::OK, false, false,
          0},
         {"the write fails", Send::SINGLE, 0, false, false, SsErr::FAIL, true, true, 1},
-        {"a later fragment's write fails", Send::FRAGMENTED, 1, false, false, SsErr::FAIL, true,
-         true, 1},
         {"refused before the encrypt: no frame sink", Send::NO_FRAME_SINK, -1, false, false,
          SsErr::INVALID_STATE, false, false, 0},
-        {"refused before the encrypt: a fragment-typed binary message",
-         Send::FRAGMENT_TYPED_BINARY, -1, false, false, SsErr::FAIL, false, false, 0},
+        {"refused before the encrypt: a JSON message longer than one frame", Send::OVERSIZED_JSON,
+         -1, false, false, SsErr::NO_MEM, false, false, 0},
+        {"refused before the encrypt: a JSON document that overflowed its allocator",
+         Send::OVERFLOWED_JSON, -1, false, false, SsErr::NO_MEM, false, false, 0},
         {"the write fails on a detached connection", Send::SINGLE, 0, true, false, SsErr::FAIL,
          true, true, 0},
         {"the write is refused by a closed transport", Send::SINGLE, -1, false, true,
@@ -1765,29 +1757,42 @@ TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
             conn.lose_transport();
         }
 
+        // A refusal before the encrypt, or a failed encrypt, leaves the plaintext staged: it must be
+        // wiped, as a client/pair-finalize there carries the long-term PSK.
+        const std::string state_json = R"({"type":"client/state"})";
+        auto staged_is_wiped = [&conn, &state_json]() {
+            const uint8_t* staged = conn.noise_transport_.send_buf_.data();
+            return std::all_of(staged, staged + 1 + state_json.size(),
+                               [](uint8_t b) { return b == 0; });
+        };
         SsErr err = SsErr::OK;
         switch (row.send) {
             case Send::SINGLE:
-                err = conn.send_app_json(R"({"type":"client/state"})");
+                err = conn.send_json(json_doc(R"({"type":"client/state"})"));
                 break;
-            case Send::FRAGMENTED:
-                err = conn.send_app_json(std::string(MAX_TRANSPORT_PLAINTEXT * 2, 'A'));
+            case Send::OVERSIZED_JSON:
+                err = conn.send_json(json_doc_of_length(MAX_TRANSPORT_PLAINTEXT));
                 break;
+            case Send::OVERFLOWED_JSON: {
+                RefusingAllocator refusing;
+                JsonDocument doc(&refusing);
+                doc["type"] = "client/state";
+                ASSERT_TRUE(doc.overflowed());
+                err = conn.send_json(doc);
+                break;
+            }
             case Send::NO_FRAME_SINK: {
                 NoiseTransport::FrameSink sink = std::move(conn.noise_transport_.frame_sink_);
                 conn.noise_transport_.frame_sink_ = nullptr;
-                err = conn.send_app_json(R"({"type":"client/state"})");
+                err = conn.send_json(json_doc(state_json));
                 conn.noise_transport_.frame_sink_ = std::move(sink);
-                break;
-            }
-            case Send::FRAGMENT_TYPED_BINARY: {
-                const std::vector<uint8_t> fragment_typed = {MSG_TYPE_FRAGMENT, 0xAA};
-                err = conn.test_send_binary(fragment_typed.data(), fragment_typed.size());
+                EXPECT_TRUE(staged_is_wiped()) << "the refused message was left staged";
                 break;
             }
             case Send::ENCRYPT_FAILS:
                 ASSERT_EQ(noise_cipherstate_set_nonce(send_cs, UINT64_MAX), NOISE_ERROR_NONE);
-                err = conn.send_app_json(R"({"type":"client/state"})");
+                err = conn.send_json(json_doc(state_json));
+                EXPECT_TRUE(staged_is_wiped()) << "the unencrypted message was left staged";
                 break;
             case Send::LENT:
             case Send::FRAGMENT_TYPED_LENT: {
@@ -1812,7 +1817,7 @@ TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
         // The next send: refused once desynced, otherwise authenticated by the peer.
         const size_t frames_before = conn.sent_binary_.size();
         conn.writes_before_refusal = -1;
-        const SsErr next = conn.send_app_json(R"({"type":"client/goodbye"})");
+        const SsErr next = conn.send_json(json_doc(R"({"type":"client/goodbye"})"));
         if (row.desynced) {
             EXPECT_EQ(next, SsErr::INVALID_STATE);
             EXPECT_EQ(conn.sent_binary_.size(), frames_before)
@@ -1991,12 +1996,10 @@ TEST(NoiseTransport, ASendFailureAfterTheEncryptDropsTheConnectionInItsTick) {
         auto conn = std::make_shared<FailingWriteConnection>();
         conn->set_json_arena(*client.json_arena_);
         conn->set_noise_session(std::move(r->responder_session));
-        conn->init_time_filter();
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
-        conn->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    std::vector<std::string>{"controller@v1"}, std::nullopt,
-                                    std::nullopt);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"controller@v1"},
+                                    std::nullopt, std::nullopt);
         // Not due until the row opens it, so only the row's own site sends.
         conn->time_burst().last_burst_complete_time_ = platform_time_us() / 1000;
         manager.install_admitted(conn, role_mask_bit(SendspinRole::CONTROLLER));
@@ -2072,7 +2075,6 @@ TEST(TimeBurst, AnUnsentTimeMessageCountsAsTimedOut) {
             ASSERT_TRUE(r.has_value());
             conn.set_noise_session(std::move(r->responder_session));
         }
-        conn.init_time_filter();
         conn.set_client_hello_sent(true);
         conn.set_server_hello_received(true);
 

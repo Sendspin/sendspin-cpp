@@ -19,11 +19,13 @@
 #pragma once
 
 #include "constants.h"
+#include "crypto/keys.h"
 #include "inline_vector.h"
 #include "protocol_messages.h"
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/types.h"
+#include "time_filter.h"
 
 #include <array>
 #include <atomic>
@@ -33,7 +35,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <vector>
+#include <string_view>
 
 namespace sendspin {
 
@@ -42,7 +44,6 @@ class SendspinArenaAllocator;
 class SendspinClient;
 class SendspinConnection;
 class SendspinServerConnection;
-class SendspinTimeFilter;
 class SendspinWsServer;
 
 /// @brief Converts a duration in seconds to microseconds at compile time.
@@ -264,9 +265,10 @@ public:
     /// - SendspinClient::cleanup_connection_state() resets the client-wide state (event ring,
     ///   group, time-sync report, pairing notes) only when the teardown covers every role,
     ///   which is keyed on no remaining connection owning one.
-    /// - The time filter and server information slots follow primary() (the player's owner, else
-    ///   the first admitted), so a role owned by another connection converts with the wrong clock.
-    /// - group/update, leave() and get_server_information() are singular: they follow primary().
+    /// - clock() and the server information follow primary() (the player's owner, else the first
+    ///   admitted), so a role owned by another connection converts with the wrong clock.
+    /// - group/update, leave(), get_server_information() and is_paired() are singular: they follow
+    ///   primary().
     /// - The artwork binary gate (SendspinClient::process_binary_message()) passes any admitted
     ///   connection while none owns the role.
     /// - A role released by a dropped connection is not reassigned to another admitted connection
@@ -370,19 +372,27 @@ public:
         return this->connected_.load(std::memory_order_acquire);
     }
 
-    /// @brief Returns the time filter of the primary admitted connection (see primary()), or
-    /// nullptr when none is admitted. Any thread.
+    /// @brief Returns whether the primary admitted connection is a paired session, keyed by the
+    /// long-term PSK of a pairing record (README.md "Definitions"); false when none is admitted.
+    /// Any thread: reads a flag refresh_published_state() writes each tick.
+    bool is_paired() const {
+        return this->paired_.load(std::memory_order_acquire);
+    }
+
+    /// @brief Returns the clock of the primary admitted connection (see primary()), as of the
+    /// protocol task's last refresh_published_state(), or nullopt when none is admitted. Any
+    /// thread.
     ///
     /// Reads published_ behind the leaf published_mutex_, so a role thread converting
     /// timestamps (the sync task per chunk, the visualizer drain per frame) never waits on the
-    /// protocol task. Hands out the filter, never the connection: a connection's destructor can
-    /// join its transport thread, which must not happen on a role thread, while the filter's last
-    /// drop only frees memory.
-    std::shared_ptr<SendspinTimeFilter> time_filter() const;
+    /// protocol task. A copy of the filter's transform, so a reader shares nothing with the
+    /// connection or its filter.
+    std::optional<TimeTransform> clock() const;
 
-    /// @brief Returns a copy of the primary admitted connection's server information, or nullopt
-    /// when none is admitted. Any thread: reads a slot written at admission and cleared on the
-    /// drop, behind the leaf published_mutex_.
+    /// @brief Returns the primary admitted connection's server information, or nullopt when none
+    /// is admitted. Any thread: copies the inline id and name out of a slot written at admission
+    /// and cleared on the drop, behind the leaf published_mutex_, and builds the strings on the
+    /// caller's thread.
     std::optional<ServerInformationObject> server_information() const;
 
     // ========================================
@@ -457,10 +467,10 @@ public:
     // Protocol task: message handlers
     // ========================================
 
-    /// @brief Applies a server/activate: trust enforcement, pairing-method admissibility, role
-    /// ownership and removals, and, for a nursery connection that is now operational, admission
-    /// before this returns.
-    void on_server_activate(SendspinConnection* conn, ServerActivateMessage&& msg);
+    /// @brief Applies a server/activate: the admissibility check, the pairing-method check,
+    /// role ownership and removals, and, for a nursery connection that is now operational,
+    /// admission before this returns.
+    void on_server_activate(SendspinConnection* conn, const ServerActivateMessage& msg);
 
     /// @brief Handles a pair/abort from the server (an unrecognized reason arrives as
     /// METHOD_NOT_SUPPORTED). Only an admitted connection hosts a pairing attempt.
@@ -483,7 +493,9 @@ public:
 
     /// @brief psk_ids backing a currently-open connection, admitted or in the nursery. These are
     /// the records a completed pairing must not evict (pairing.md "Pairing Records").
-    [[nodiscard]] std::vector<std::string> open_connection_psk_ids() const;
+    /// Each points into its connection, so it is valid only within the protocol-task step that
+    /// called this, which owns every connection.
+    [[nodiscard]] InlineVector<const IdText*, MAX_OPEN_CONNECTIONS> open_connection_psk_ids() const;
 
     // ========================================
     // Protocol task: tick
@@ -521,10 +533,10 @@ public:
     ///         burst waiting for its grant adds no deadline, since the grant wakes the task.
     uint32_t run_time_sync();
 
-    /// @brief Refreshes what other threads read without a protocol-task lock: the time filter and
-    /// server-information slots (from primary()), and lowers the connected flag when no admitted
-    /// connection is operational. Called at the end of every tick and after every change to the
-    /// admitted array.
+    /// @brief Refreshes what other threads read without a protocol-task lock: each admitted slot's
+    /// clock, the primary() slot, its server information and whether its session is paired, and
+    /// lowers the connected flag when no admitted connection is operational. Called at the end of
+    /// every tick and after every change to the admitted array.
     void refresh_published_state();
 
     /// @brief Publishes the connected flag (is_connected()) as it stands, raising it as well as
@@ -561,9 +573,10 @@ public:
     /// @brief The admitted connection that owns `role`, or nullptr when none does.
     SendspinConnection* role_owner(SendspinRole role) const;
 
-    /// @brief The admitted connection whose clock and server information the client reports: the
-    /// owner of the player role, or the first admitted connection when no connection owns it.
-    /// With MAX_ADMITTED 1 that is the admitted connection. nullptr when none is admitted.
+    /// @brief The admitted connection whose clock, server information and paired flag the client
+    /// reports: the owner of the player role, or the first admitted connection when no connection
+    /// owns it. With MAX_ADMITTED 1 that is the admitted connection. nullptr when none is
+    /// admitted.
     AdmittedEntry* primary();
 
     /// @brief Whether an admitted connection is connected and operational: what is_connected()
@@ -590,11 +603,14 @@ public:
 
     /// @brief Sets the last-played server_id for handoff preference decisions. Main loop before the
     /// protocol task starts (SendspinClient::load_last_played_server()), protocol task after.
-    /// @param server_id The server_id of the last-played server; empty clears it.
-    void set_last_played_server_id(const std::string& server_id);
+    /// @param server_id The server_id of the last-played server; empty, or longer than a peer_id,
+    ///                  clears it.
+    void set_last_played_server_id(std::string_view server_id) {
+        (void)this->last_played_server_id_.assign(server_id);
+    }
 
-    /// @brief Returns the current last-played server_id, or nullopt if unset. Protocol task.
-    const std::optional<std::string>& last_played_server_id() const {
+    /// @brief Returns the current last-played server_id, empty if unset. Protocol task.
+    const IdText& last_played_server_id() const {
         return this->last_played_server_id_;
     }
 
@@ -668,7 +684,7 @@ private:
                                         std::optional<SendspinGoodbyeReason> reason);
 
     /// @brief Refuses an accept queued before admission closed and taken after: goodbye with
-    /// reason shutdown and a close, and the connection kept for finish_stop().
+    /// reason shutdown and a close, and the connection released.
     void refuse_accept(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Goodbyes and closes `conn` with reason shutdown, and keeps it for finish_stop(). Its
@@ -708,7 +724,7 @@ private:
 
     /// @brief Decides whether an incoming connection should displace an admitted one.
     ///
-    /// Applies admission.h::should_admit_connection; trust enforcement runs earlier, on the
+    /// Applies admission.h::should_admit_connection; the admissibility check runs earlier, on the
     /// activate.
     /// @param admitted The admitted connection the incoming one conflicts with, or nullptr.
     /// @param new_conn The newly proven candidate connection. Must not be null.
@@ -754,7 +770,7 @@ private:
     /// Removing a record from the RecordStore does not by itself end a session that is already
     /// running on it: a connection caches its resolved psk_id and PSK category at Noise-handshake
     /// completion (see SendspinConnection::get_psk_category()) and never re-resolves them against
-    /// the store. Without this sweep a revoked device would keep its LONG_TERM trust (and with
+    /// the store. Without this sweep a revoked device would keep its LONG_TERM category (and with
     /// it playback) until it happened to disconnect, so revocation would not take effect until
     /// the peer's next connection.
     ///
@@ -762,7 +778,7 @@ private:
     ///
     /// @param psk_id psk_id whose sessions are no longer trusted.
     /// @param except Connection to leave alone (its caller is already dropping it), or nullptr.
-    void drop_connections_using_psk_id(const std::string& psk_id, const SendspinConnection* except);
+    void drop_connections_using_psk_id(const IdText& psk_id, const SendspinConnection* except);
 
     // ========================================
     // Pairing handlers
@@ -784,8 +800,7 @@ private:
     /// @param server_id conn->get_server_id(), captured by handle_enter_pairing().
     /// @param selected_method The selected method; DYNAMIC_PAIRING_CODE or STATIC_PAIRING_CODE.
     void handle_enter_pairing_code(SendspinConnection* conn, uint32_t pairing_index,
-                                   const std::string& server_id,
-                                   SendspinPairMethod selected_method);
+                                   const IdText& server_id, SendspinPairMethod selected_method);
 
     /// @brief Runs the Pairing-PSK branch of handle_enter_pairing(): resolves the pairing
     /// outcome and sends client/pair-init followed by client/pair-finalize with the long-term
@@ -794,7 +809,7 @@ private:
     /// @param pairing_index Current pairing_index counter, captured by handle_enter_pairing().
     /// @param server_id conn->get_server_id(), captured by handle_enter_pairing().
     void handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
-                                  const std::string& server_id);
+                                  const IdText& server_id);
 
     /// @brief Handles a pair/abort on an admitted connection.
     /// Cleans up pairing state. Per pairing.md "pair/abort", only closes the connection for reason
@@ -926,10 +941,10 @@ private:
     // Released outbound connections waiting for their transports to finish (see ReapEntry).
     // Protocol task, then the main loop while the client is stopped.
     InlineVector<ReapEntry, REAPING_CAPACITY + 1> reaping_;
-    // Connections the shutdown pass took out of the slots, and accepts it refused, closed by
-    // their disconnect() and kept for finish_stop() to release. Written by the protocol task's
-    // shutdown pass, read on the main loop once the task is joined.
-    std::vector<std::shared_ptr<SendspinConnection>> closing_;
+    // Connections the shutdown pass took out of the slots, closed by their disconnect() and kept
+    // for finish_stop() to release: at most the admitted and nursery ones. Written by the
+    // protocol task's shutdown pass, read on the main loop once the task is joined.
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> closing_;
 
     // Pointer fields
     SendspinClient* client_;
@@ -942,9 +957,9 @@ private:
     std::unique_ptr<SendspinWsServer> ws_server_;
 
     // String fields
-    /// server_id of the last-played server; nullopt if unset. Written on the main loop by
+    /// server_id of the last-played server; empty if unset. Written on the main loop by
     /// start()'s load, before the protocol task runs, then protocol task only.
-    std::optional<std::string> last_played_server_id_;
+    IdText last_played_server_id_;
 
     // 64-bit fields
     /// From resolve_liveness_timeout_ms(), in microseconds; 0 or negative disables the check.
@@ -986,18 +1001,35 @@ private:
     /// What is_connected() reports. Written by the protocol task (raised by publish_connected(),
     /// lowered by refresh_published_state() too), read from any thread.
     std::atomic<bool> connected_{false};
+    /// What is_paired() reports. Written by the protocol task (refresh_published_state()), read
+    /// from any thread.
+    std::atomic<bool> paired_{false};
 
-    /// @brief What other threads read of the primary admitted connection, written together
-    struct PublishedPrimary {
-        std::shared_ptr<SendspinTimeFilter> time_filter;
-        std::optional<ServerInformationObject> server_information;
+    /// @brief Each admitted slot's clock (admitted_[slot]), nullopt for a free slot
+    using ClockSlots = std::array<std::optional<TimeTransform>, MAX_ADMITTED>;
+
+    /// @brief The primary connection's server identity, held inline so the publish copies it
+    /// without a heap allocation
+    struct PublishedServer {
+        IdText server_id{};
+        ServerName name{};
     };
-    /// Guards published_. A leaf (docs/conventions.md): held only to copy or swap a member, so it
-    /// also serialises the role threads' time_filter() reads behind server_information() copies.
+
+    /// @brief What other threads read of the admitted connections
+    struct PublishedState {
+        ClockSlots clocks{};
+        /// The slot in clocks of the primary connection (primary()), MAX_ADMITTED for none.
+        size_t primary_slot{MAX_ADMITTED};
+        /// The primary connection's server identity.
+        std::optional<PublishedServer> server;
+    };
+    /// Guards published_. A leaf (docs/conventions.md): held only to copy a member, so it
+    /// also serialises the role threads' clock() reads behind server_information() copies.
     mutable std::mutex published_mutex_;
-    /// Written by the protocol task (refresh_published_state()); read from any thread
-    /// (time_filter(), server_information()): role threads, the main loop, the consumer.
-    PublishedPrimary published_;
+    /// Written by the protocol task (refresh_published_state()), which, as its only writer, also
+    /// reads it without the lock; read from any thread (clock(), server_information()): role
+    /// threads, the main loop, the consumer.
+    PublishedState published_;
 };
 
 }  // namespace sendspin

@@ -99,9 +99,11 @@ constexpr uint16_t VISUALIZER_OFFSET_TEST_PORT = 19088;
 constexpr uint16_t VISUALIZER_HELD_END_TEST_PORT = 19099;
 constexpr uint16_t VISUALIZER_HELD_CLEAR_TEST_PORT = 19100;
 constexpr uint16_t VISUALIZER_HELD_TEARDOWN_TEST_PORT = 19104;
+constexpr uint16_t STREAM_ROLES_TEST_PORT = 19105;
 constexpr uint16_t HELLO_TEST_PORT = 19090;
 constexpr uint16_t OUTBOUND_GOODBYE_TEST_PORT = 19069;
 constexpr uint16_t NETWORK_PROVIDER_TEST_PORT = 19086;
+constexpr uint16_t INBOUND_OFF_TEST_PORT = 19106;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -557,6 +559,56 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     client.stop();
 }
 
+// messaging.md "stream/end" and "stream/clear": a roles list confines each message to the roles
+// it names. Each row's first message names only the player. The second names the visualizer and
+// is the Control: its callback is queued behind anything the first fired on the same ordered event
+// ring, so once it arrives the first has shown whether it reached the visualizer.
+TEST(ClientLifecycle, StreamEndAndClearReachOnlyTheNamedRoles) {
+    struct Row {
+        const char* name;
+        const char* first;
+        const char* barrier;
+        bool barrier_is_clear;
+    };
+    const Row rows[] = {
+        {"stream/end naming only the player",
+         R"({"type":"stream/end","payload":{"roles":["player"]}})",
+         R"({"type":"stream/clear","payload":{"roles":["visualizer"]}})", true},
+        {"stream/clear naming only the player",
+         R"({"type":"stream/clear","payload":{"roles":["player"]}})",
+         R"({"type":"stream/end","payload":{"roles":["visualizer"]}})", false},
+    };
+
+    CountingVisualizerListener listener;
+    auto config = make_config(STREAM_ROLES_TEST_PORT);
+    config.time_burst_interval_ms = 100;
+    PairedClientBundle bundle(std::move(config));
+    SendspinClient& client = bundle.client();
+    client.add_visualizer(make_visualizer_config()).set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    auto server = connect_paired_server(bundle.peer, STREAM_ROLES_TEST_PORT, options);
+    pump_until_synced(client);
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
+        const int ends = listener.stream_ends;
+        const int clears = listener.stream_clears;
+        ASSERT_TRUE(server->send_app_json(row.first));
+        ASSERT_TRUE(server->send_app_json(row.barrier));
+        if (row.barrier_is_clear) {
+            pump_until(client, [&] { return listener.stream_clears > clears; });
+            EXPECT_EQ(listener.stream_ends, ends) << "the end reached a role it did not name";
+        } else {
+            pump_until(client, [&] { return listener.stream_ends > ends; });
+            EXPECT_EQ(listener.stream_clears, clears) << "the clear reached a role it did not name";
+        }
+    }
+    client.stop();
+}
+
 // stream/end, stream/clear and a teardown each return the frame the drain thread holds for its
 // display time, and those listed behind it, undelivered. One frame goes first, and the thread
 // holds it once the list is empty with its charge outstanding; stamped an hour ahead, a held
@@ -874,7 +926,7 @@ public:
     SsErr send_binary_message(const uint8_t*, size_t) override {
         return SsErr::OK;
     }
-    SsErr send_text_message(const std::string&) override {
+    SsErr send_text_message(const char* /*text*/, size_t /*len*/) override {
         return SsErr::OK;
     }
 };
@@ -885,8 +937,9 @@ class HelloCountingConnection : public StubConnection {
 public:
     explicit HelloCountingConnection(SsErr result) : result_(result) {}
 
-    // No Noise session, so send_app_json() routes the hello here as raw text.
-    SsErr send_text_message(const std::string& msg) override {
+    // No Noise session, so send_json() routes the hello here as raw text.
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         if (msg.find("client/hello") != std::string::npos) {
             ++this->hellos;
         }
@@ -977,7 +1030,9 @@ size_t queued_commands(ProtocolTask& task) {
 // its push (ProtocolTask::close_accepts(), which ConnectionManager::close_admission() calls), so
 // its transport closes it without a goodbye and nothing is left queued for stop() to refuse. The
 // test thread plays the protocol task, so the accept provably sits in the queue when admission
-// closes. The open row is the control: the same queued accept is admitted and owed no goodbye.
+// closes, and the final tick releases the refused connection rather than keeping it beside the
+// shutdown pass's. The open row is the control: the same queued accept is admitted and owed no
+// goodbye.
 // The nursery-full rejection is covered by ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer.
 // Each row connects a real peer, and the Control row watches 200 ms for a goodbye that must not
 // come, so the table takes most of a second.
@@ -1019,6 +1074,9 @@ TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
                 wait_until([&] { return peer->goodbye_reason().has_value(); });
                 EXPECT_EQ(peer->goodbye_reason().value_or(""), "shutdown")
                     << "a newcomer refused at stop() must be told why";
+                // closing_ holds only the shutdown pass's connections, which bounds it.
+                EXPECT_TRUE(client.connection_manager_->closing_.empty())
+                    << "a refused accept was kept for finish_stop()";
                 break;
             case Taker::AFTER_CLOSE:
                 // No timeout: a delivery the queue took instead would never be closed here, since
@@ -1558,8 +1616,9 @@ public:
     void disconnect(SendspinGoodbyeReason reason) override {
         this->events.push_back("goodbye " + std::to_string(static_cast<int>(reason)));
     }
-    // No Noise session, so send_app_json() routes a message here as raw text.
-    SsErr send_text_message(const std::string& msg) override {
+    // No Noise session, so send_json() routes a message here as raw text.
+    SsErr send_text_message(const char* text, size_t len) override {
+        const std::string msg(text, len);
         if (msg.find("client/leave") != std::string::npos) {
             this->events.emplace_back("leave");
         } else if (msg.find("client/command") != std::string::npos) {
@@ -1736,7 +1795,7 @@ TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
         ConnectionManager& manager = *client.connection_manager_;
         manager.liveness_timeout_us_ = 0;
         auto conn = std::make_shared<RecordingConnection>();
-        conn->apply_server_activate({}, std::vector<std::string>{"player@v1", "controller@v1"},
+        conn->apply_server_activate({}, ActiveRoles{"player@v1", "controller@v1"},
                                     std::nullopt, std::nullopt);
         conn->set_client_hello_sent(row.operational);
         conn->set_server_hello_received(row.operational);
@@ -1897,14 +1956,25 @@ TEST(ClientLifecycle, AnAcceptBehindADisconnectFindsTheNurserySlotsItFreed) {
 // is_connected() is raised only at the end of a tick, after every handler of that tick has run,
 // so a thread that sees it true also sees the tick's whole effect (the published slots and the
 // events it queued for the drain): a connection admitted (install_admitted(), which refreshes
-// the published slots mid-handler) and made operational (on_handshake_complete(), which queues
-// the trust event) reads as not yet connected until the tick ends. A loss lowers the flag at
-// once, without a tick: the
-// drop row refreshes and reads false. The test thread plays the protocol task. The stand-in is a
-// LONG_TERM connection with its hellos and its activation done; the liveness check is off.
+// the published slots mid-handler) and made operational (on_handshake_complete()) reads as not
+// yet connected until the tick ends. A loss lowers the flag at once, without a tick: the drop row
+// refreshes and reads false. is_paired() follows the same connection: true for this LONG_TERM
+// session, false once it is dropped, and still true while a re-handshake awaits its
+// server/activate, when is_connected() already reads false. The test thread plays the protocol
+// task. The stand-in has its hellos and its activation done; the liveness check is off.
 TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
-    for (const bool drop : {false, true}) {
-        SCOPED_TRACE(drop ? "a drop lowers the flag without a tick" : "an admission raises it");
+    enum class Then : uint8_t { NOTHING, DROP, REHANDSHAKE };
+    struct Case {
+        const char* what;
+        Then then;
+    };
+    const Case cases[] = {
+        {"Control: an admission raises it", Then::NOTHING},
+        {"a drop lowers the flag without a tick", Then::DROP},
+        {"a re-handshake lowers it until its server/activate", Then::REHANDSHAKE},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.what);
         TestNetworkProvider network;
         SendspinClient client(make_config(0));
         client.set_network_provider(&network);
@@ -1913,10 +1983,10 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
         ConnectionManager& manager = *client.connection_manager_;
         manager.liveness_timeout_us_ = 0;
         auto conn = std::make_shared<StubConnection>();
-        conn->set_noise_handshake_result("server", PskCategory::LONG_TERM, "psk");
+        conn->set_noise_handshake_result(id_text("server"), PskCategory::LONG_TERM, id_text("psk"));
         conn->set_client_hello_sent(true);
         conn->set_server_hello_received(true);
-        conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::vector<std::string>{},
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{},
                                     std::nullopt, std::nullopt);
 
         manager.install_admitted(conn, 0);
@@ -1925,10 +1995,26 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
         EXPECT_FALSE(client.is_connected()) << "raised before the tick ended";
         (void) client.protocol_tick();
         ASSERT_TRUE(client.is_connected()) << "the end of the tick did not raise it";
+        EXPECT_TRUE(client.is_paired()) << "the LONG_TERM session read as unpaired";
 
-        if (drop) {
+        if (c.then == Then::DROP) {
             manager.drop_connection(conn.get(), std::nullopt);
             EXPECT_FALSE(client.is_connected()) << "a loss waited for the end of a tick";
+            EXPECT_FALSE(client.is_paired()) << "the dropped session still read as paired";
+        } else if (c.then == Then::REHANDSHAKE) {
+            // What handle_noise_rehandshake() leaves: the same LONG_TERM session, not yet
+            // re-activated.
+            conn->first_activate_received_ = false;
+            manager.refresh_published_state();
+            EXPECT_FALSE(client.is_connected()) << "connected before the re-activation";
+            (void) client.protocol_tick();
+            EXPECT_FALSE(client.is_connected()) << "a tick raised it before the re-activation";
+            EXPECT_TRUE(client.is_paired())
+                << "the session awaiting re-activation read as unpaired";
+            conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{}, std::nullopt,
+                                        std::nullopt);
+            (void) client.protocol_tick();
+            EXPECT_TRUE(client.is_connected()) << "the re-activation did not raise it";
         }
         client.stop();
     }
@@ -2031,6 +2117,43 @@ TEST(ClientLifecycle, TheNetworkProviderIsCalledOnTheMainLoopOnly) {
     EXPECT_GT(network.callers.size(), start_calls) << "Control: loop() did not poll the provider";
     for (const std::thread::id caller : network.callers) {
         EXPECT_EQ(caller, main_loop) << "the provider was called off the main loop";
+    }
+}
+
+// With accept_inbound_connections off the client never listens, yet connect_to() still dials.
+// Control: the default listens on the configured port.
+TEST(ClientLifecycle, TurningOffInboundConnectionsLeavesOnlyConnectTo) {
+    struct Row {
+        const char* name;
+        bool accept_inbound;
+    };
+    const Row rows[] = {
+        {"off: nothing listens", false},
+        {"Control: on: the server listens", true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClientConfig config = make_config(INBOUND_OFF_TEST_PORT);
+        config.accept_inbound_connections = row.accept_inbound;
+        SendspinClient client(std::move(config));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        pump_for(client, 100);
+        EXPECT_EQ(port_accepts(INBOUND_OFF_TEST_PORT), row.accept_inbound);
+
+        SilentListener silent;
+        ASSERT_NE(silent.port(), 0);
+        client.connect_to(loopback_url(silent.port()));
+        const int fd = silent.accept_connection();
+        EXPECT_GE(fd, 0) << "connect_to() did not dial";
+        // Ends the handshake at once, so the destructor does not wait out its timeout.
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        silent.close();
+        pump_for(client, 100);
+        client.stop();
     }
 }
 
@@ -2677,7 +2800,7 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
             params.sample_rate = 48000;
             params.channels = 2;
             params.bit_depth = 16;
-            impl.handle_stream_start(params);
+            impl.handle_stream_start(std::move(params));
             pump_until(client, [&] { return impl.sync_task->is_running(); });
             impl.handle_stream_end();
             pump_until(client, [&] { return !client.is_started(); });
@@ -3074,7 +3197,7 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params);
+            player.handle_stream_start(ServerPlayerStreamObject{params});
         };
         const auto end = [&] { player.handle_stream_end(); };
 
@@ -3164,7 +3287,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params);
+            player.handle_stream_start(ServerPlayerStreamObject{params});
         };
 
         start();
@@ -3405,13 +3528,10 @@ struct ConnectionObservation {
 
 /// Connection stand-in that records where it was destroyed and how many goodbyes it was asked
 /// for. The tests drive the stream through the player's own handlers, so no message traffic
-/// reaches it: it exists to carry the stream's time filter, and to be goodbyed and freed. Its
-/// filter is created with it, as production does before a connection can enter a slot.
+/// reaches it: it exists to carry the stream's time filter, and to be goodbyed and freed.
 class ObservedConnection : public StubConnection {
 public:
-    explicit ObservedConnection(ConnectionObservation* obs) : obs_(obs) {
-        this->init_time_filter();
-    }
+    explicit ObservedConnection(ConnectionObservation* obs) : obs_(obs) {}
     ~ObservedConnection() override {
         this->obs_->destroyed_on = std::this_thread::get_id();
         this->obs_->destroyed.store(true);
@@ -3484,14 +3604,15 @@ constexpr int64_t SEEDED_SERVER_OFFSET_US = -10LL * 60 * 1000 * 1000;
 /// A stand-in connection whose time filter has taken one measurement of SEEDED_SERVER_OFFSET_US.
 std::shared_ptr<ObservedConnection> make_synced_connection(ConnectionObservation* obs) {
     auto conn = std::make_shared<ObservedConnection>(obs);
-    conn->get_time_filter()->update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000,
-                                    platform_time_us());
+    conn->time_filter().update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000, platform_time_us());
     return conn;
 }
 
 // The time filter slot follows the primary admitted connection's filter: a synced connection
 // converts with its offset, a vacated slot reads as unsynced, the slot never keeps a connection
-// alive, and an unsynced newcomer installed over a synced one reads its own filter.
+// alive, an unsynced newcomer installed over a synced one reads its own filter, and each of that
+// newcomer's measurements, its first and a later correction, reaches the slot at the protocol
+// task's next publish.
 TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheAdmittedConnection) {
     ConnectionObservation dropped_obs;  // All outlive the client
     ConnectionObservation replaced_obs;
@@ -3513,8 +3634,24 @@ TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheAdmittedConnection) {
 
     (void) replace_admitted(manager, make_synced_connection(&replaced_obs));
     ASSERT_TRUE(client.is_time_synced());
-    (void) replace_admitted(manager, std::make_shared<ObservedConnection>(&newcomer_obs));
+    auto newcomer = std::make_shared<ObservedConnection>(&newcomer_obs);
+    (void) replace_admitted(manager, newcomer);
     EXPECT_FALSE(client.is_time_synced()) << "the newcomer read the replaced connection's filter";
+
+    // Each measurement is stamped after the last: the filter skips one that is not.
+    const int64_t first_measured_at = platform_time_us();
+    newcomer->time_filter().update(SEEDED_SERVER_OFFSET_US, /*max_error=*/1000, first_measured_at);
+    manager.refresh_published_state();
+    EXPECT_TRUE(client.is_time_synced()) << "a measurement after admission never reached the slot";
+    EXPECT_EQ(client.get_client_time(SERVER_TS_US), SERVER_TS_US - SEEDED_SERVER_OFFSET_US);
+
+    // A second measurement takes its offset as is, with no drift applied yet.
+    constexpr int64_t CORRECTED_OFFSET_US = SEEDED_SERVER_OFFSET_US + 5000;
+    newcomer->time_filter().update(CORRECTED_OFFSET_US, /*max_error=*/1000,
+                                   first_measured_at + 1000);
+    manager.refresh_published_state();
+    EXPECT_EQ(client.get_client_time(SERVER_TS_US), SERVER_TS_US - CORRECTED_OFFSET_US)
+        << "a correction after the first measurement never reached the slot";
 }
 
 // The sync task converts chunks with the current connection's offset. The fed

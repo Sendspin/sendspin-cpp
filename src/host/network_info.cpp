@@ -52,15 +52,13 @@ static const char* const TAG = "sendspin.network_info";
 
 namespace {
 
-/// @brief Size of a formatted MAC string buffer: "aa:bb:cc:dd:ee:ff" plus null terminator.
-constexpr size_t MAC_STR_BUF_SIZE = 18;
 /// @brief First octet of the IPv4 loopback range 127.0.0.0/8.
 constexpr uint8_t IPV4_LOOPBACK_FIRST_OCTET = 127;
 /// @brief High 16 bits of the IPv4 link-local range 169.254.0.0/16.
 constexpr uint16_t IPV4_LINK_LOCAL_PREFIX = 0xA9FE;
 
 /// @brief Formats six MAC octets as lowercase colon-separated text, or nullopt if all zero.
-std::optional<std::string> format_mac(const uint8_t* mac) {
+std::optional<MacAddressText> format_mac(const uint8_t* mac) {
     bool all_zero = true;
     for (int i = 0; i < 6; i++) {
         if (mac[i] != 0) {
@@ -72,10 +70,10 @@ std::optional<std::string> format_mac(const uint8_t* mac) {
         return std::nullopt;
     }
 
-    char buf[MAC_STR_BUF_SIZE];
-    std::snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3],
-                  mac[4], mac[5]);
-    return std::string(buf);
+    MacAddressText text{};
+    std::snprintf(text.data(), text.size(), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2],
+                  mac[3], mac[4], mac[5]);
+    return text;
 }
 
 /// @brief True if `sa` is a routable (non-loopback, non-link-local) IPv4/IPv6 address.
@@ -113,7 +111,7 @@ bool is_routable_ip(const struct sockaddr* sa) {
 
 #if defined(_WIN32)
 
-std::optional<std::string> platform_get_interface_mac() {
+std::optional<MacAddressText> platform_get_interface_mac() {
     // A first call with no buffer reports the size it needs; retry if the adapter list grows
     // between calls.
     const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
@@ -153,7 +151,7 @@ std::optional<std::string> platform_get_interface_mac() {
 
         auto result = format_mac(adapter->PhysicalAddress);
         if (result.has_value()) {
-            SS_LOGD(TAG, "auto-detected MAC %s on adapter %s", result->c_str(),
+            SS_LOGD(TAG, "auto-detected MAC %s on adapter %s", result->data(),
                     adapter->AdapterName);
             return result;
         }
@@ -163,7 +161,7 @@ std::optional<std::string> platform_get_interface_mac() {
 
 #else
 
-std::optional<std::string> platform_get_interface_mac() {
+std::optional<MacAddressText> platform_get_interface_mac() {
     struct ifaddrs* ifaddr = nullptr;
     if (getifaddrs(&ifaddr) != 0 || ifaddr == nullptr) {
         SS_LOGW(TAG, "getifaddrs failed; cannot auto-detect MAC address");
@@ -180,7 +178,7 @@ std::optional<std::string> platform_get_interface_mac() {
         }
     }
 
-    std::optional<std::string> result;
+    std::optional<MacAddressText> result;
     for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == nullptr || ifa->ifa_name == nullptr) {
             continue;
@@ -217,7 +215,7 @@ std::optional<std::string> platform_get_interface_mac() {
         result = format_mac(sll->sll_addr);
 #endif
         if (result.has_value()) {
-            SS_LOGD(TAG, "auto-detected MAC %s on interface %s", result->c_str(), ifa->ifa_name);
+            SS_LOGD(TAG, "auto-detected MAC %s on interface %s", result->data(), ifa->ifa_name);
             break;
         }
     }

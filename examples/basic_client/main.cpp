@@ -51,7 +51,12 @@
 #include "portaudio_sink.h"
 #endif
 
+#ifdef _WIN32
+#include "win_getopt.h"
+#include <conio.h>  // _kbhit, _getch
+#else
 #include <getopt.h>
+#endif
 
 #ifdef SENDSPIN_HAS_MDNS
 // IWYU pragma: begin_keep
@@ -70,6 +75,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -144,13 +150,32 @@ static std::atomic<bool> running{true};
 /// The pairing-window gesture and its cancellation, relayed from a signal handler: SIGUSR1 opens
 /// the window pairing.md "Pairing Window" gates every static_pairing_code attempt on, SIGUSR2
 /// closes it. A headless example has no button to press, and a flag is the one thing a signal
-/// handler may safely set.
+/// handler may safely set. Windows has no SIGUSR1/SIGUSR2, so console keys polled by the main
+/// loop stand in for them.
 static std::atomic<bool> window_gesture{false};
 static std::atomic<bool> window_cancel{false};
 
 static void signal_handler(int /*sig*/) {
     running.store(false);
 }
+
+#ifdef _WIN32
+static constexpr const char* WINDOW_GESTURE_HOW = "press 'p' in this console";
+static constexpr const char* WINDOW_CANCEL_HOW = "'c'";
+
+static void poll_window_keys() {
+    while (_kbhit() != 0) {
+        const int key = _getch();
+        if (key == 'p') {
+            window_gesture.store(true);
+        } else if (key == 'c') {
+            window_cancel.store(true);
+        }
+    }
+}
+#else
+static constexpr const char* WINDOW_GESTURE_HOW = "send SIGUSR1 to this process";
+static constexpr const char* WINDOW_CANCEL_HOW = "SIGUSR2";
 
 static void window_signal_handler(int sig) {
     if (sig == SIGUSR1) {
@@ -160,6 +185,9 @@ static void window_signal_handler(int sig) {
     }
 }
 
+static void poll_window_keys() {}
+#endif
+
 static void print_usage(const char* prog) {
     fprintf(stderr, "Usage: %s [options] [name]\n", prog);
     fprintf(stderr, "  name          Friendly name (default: \"Basic Client\")\n\n");
@@ -167,8 +195,9 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  -u URL        Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)\n");
     fprintf(stderr, "  -p PORT       Listen on PORT (default: %u)\n", DEFAULT_SENDSPIN_PORT);
     fprintf(stderr, "  -s CODE       Offer the static pairing code CODE (8 digits) instead of\n");
-    fprintf(stderr, "                the dynamic one; SIGUSR1 is the pairing-window gesture and\n");
-    fprintf(stderr, "                SIGUSR2 cancels it\n");
+    fprintf(stderr, "                the dynamic one; for the pairing-window gesture, %s\n",
+            WINDOW_GESTURE_HOW);
+    fprintf(stderr, "                (%s cancels it)\n", WINDOW_CANCEL_HOW);
     fprintf(stderr, "  -a            Enable unpaired access, so a server can stream without\n");
     fprintf(stderr, "                pairing first\n");
     fprintf(stderr, "  -F            The server cannot set the volume, which starts at full scale\n");
@@ -203,8 +232,10 @@ int main(int argc, char* argv[]) {
     // Set up signal handler for clean shutdown
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+#ifndef _WIN32
     std::signal(SIGUSR1, window_signal_handler);
     std::signal(SIGUSR2, window_signal_handler);
+#endif
 
     // Parse command line options
     LogLevel log_level = LogLevel::INFO;
@@ -403,14 +434,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        void on_trust_changed(ConnectionTrust trust) override {
-            if (trust == ConnectionTrust::USER) {
-                fprintf(stderr, ">>> Trust: user (paired server)\n");
-            } else {
-                fprintf(stderr, ">>> Trust: none (unpaired)\n");
-            }
-        }
-
         void on_pairing_started(const std::string& server_id) override {
             fprintf(stderr, ">>> Pairing started with server: %s\n", server_id.c_str());
         }
@@ -418,7 +441,7 @@ int main(int argc, char* argv[]) {
         void on_pairing_succeeded(const std::string& server_id) override {
             fprintf(stderr, ">>> Pairing succeeded with server: %s\n", server_id.c_str());
             fprintf(stderr, "    Long-term record stored. Future connections from this server\n");
-            fprintf(stderr, "    will be trusted (ConnectionTrust::USER).\n");
+            fprintf(stderr, "    will be paired sessions.\n");
         }
 
         void on_pairing_failed(const std::string& server_id,
@@ -449,8 +472,9 @@ int main(int argc, char* argv[]) {
 
         void on_open_pairing_window() override {
             fprintf(stderr,
-                    "\n>>> Pairing window gesture required: send SIGUSR1 to this process to "
-                    "allow the attempt (SIGUSR2 cancels it).\n\n");
+                    "\n>>> Pairing window gesture required: %s to allow the attempt (%s "
+                    "cancels it).\n\n",
+                    WINDOW_GESTURE_HOW, WINDOW_CANCEL_HOW);
         }
 
         void on_close_pairing_window() override {
@@ -532,7 +556,9 @@ int main(int argc, char* argv[]) {
 
     // Main loop
     int tick = 0;
+    std::optional<bool> reported_paired;
     while (running.load()) {
+        poll_window_keys();
         if (window_gesture.exchange(false)) {
             fprintf(stderr, ">>> Pairing window gesture received\n");
             client.confirm_pairing_window();
@@ -542,6 +568,16 @@ int main(int argc, char* argv[]) {
             client.cancel_pairing_window();
         }
         client.loop();
+        // Read before is_connected() (see SendspinClient::is_paired()).
+        const bool paired = client.is_paired();
+        if (client.is_connected()) {
+            if (reported_paired != paired) {
+                reported_paired = paired;
+                fprintf(stderr, ">>> Session: %s\n", paired ? "paired" : "unpaired");
+            }
+        } else {
+            reported_paired.reset();
+        }
 #ifdef BASIC_CLIENT_HAS_AUDIO_SINK
         // Sync audio sink volume periodically (catches all volume change sources)
         if (++tick % 25 == 0) {

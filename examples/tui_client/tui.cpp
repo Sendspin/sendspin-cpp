@@ -68,9 +68,9 @@ struct TuiSnapshot {
     std::string connected_host;
     uint16_t connected_port{0};
 
-    // Identity and trust
+    // Identity and pairing
     std::string client_id;
-    ConnectionTrust trust{ConnectionTrust::NONE};
+    bool paired{false};
     std::string pairing_status;
     std::string pairing_token;
 
@@ -128,7 +128,7 @@ static TuiSnapshot take_snapshot(TuiState& state) {
     snap.connected_host = state.connected_host;
     snap.connected_port = state.connected_port;
     snap.client_id = state.client_id;
-    snap.trust = state.trust;
+    snap.paired = state.paired;
     snap.pairing_status = state.pairing_status;
     snap.pairing_token = state.pairing_token;
     snap.server_selector_active = state.server_selector_active;
@@ -417,7 +417,7 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     auto host_display = snap.connected_host.empty() ? "\u2014" : snap.connected_host;
     auto port_display = snap.connected_port > 0 ? std::to_string(snap.connected_port) : "\u2014";
 
-    // Build server info rows: group, trust, and identity shown when applicable
+    // Build server info rows: group, pairing, and identity shown when applicable
     Elements server_rows;
     server_rows.push_back(hbox({text("  Status: ") | color(Color::White) | dim, text(connection_str) | bold | color(connection_color)}));
     server_rows.push_back(info_row("Host:    ", host_display, !snap.connected_host.empty()));
@@ -428,11 +428,9 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
         server_rows.push_back(info_row("Group:   ", snap.group_name, true));
     }
     if (snap.connected) {
-        std::string trust_str = (snap.trust == ConnectionTrust::USER) ? "user (paired)" : "none";
-        Color trust_color = (snap.trust == ConnectionTrust::USER) ? Color::Green : Color::GrayDark;
         server_rows.push_back(hbox({
-            text("  Trust:  ") | color(Color::White) | dim,
-            text(trust_str) | color(trust_color),
+            text("  Paired: ") | color(Color::White) | dim,
+            text(snap.paired ? "yes" : "no") | color(snap.paired ? Color::Green : Color::GrayDark),
         }));
     }
     if (!snap.pairing_status.empty()) {
@@ -707,11 +705,11 @@ static Element render_server_selector(const TuiSnapshot& snap) {
     });
 }
 
-// Shown until the client is paired: the Pairing PSK token an operator pastes into a server
-// that only offers the mandatory pairing_psk method (dynamic_pairing_code needs nothing shown
-// here; the code itself appears in the Server panel's pairing status row instead). Wrapped across
-// the full terminal width since the token (107 chars) does not fit any of the three info panels
-// above.
+// Shown while the client has no paired session: the Pairing PSK token an operator pastes into a
+// server that only offers the mandatory pairing_psk method (dynamic_pairing_code needs nothing
+// shown here; the code itself appears in the Server panel's pairing status row instead). Wrapped
+// across the full terminal width since the token (107 chars) does not fit any of the three info
+// panels above.
 static Element render_pairing_token(const TuiSnapshot& snap) {
     return window(text(" Pairing Token ") | bold,
                   vbox({
@@ -772,9 +770,9 @@ static Element render_tui(TuiState& state) {
     if (!snap.artwork_channels.empty() || snap.color_received) {
         sections.push_back(render_artwork_and_color(snap));
     }
-    // Show the Pairing PSK token only until this connection is paired: once trust is USER,
-    // the token has already served its purpose and the vertical space goes back to filler().
-    if (!snap.pairing_token.empty() && snap.trust != ConnectionTrust::USER) {
+    // Show the Pairing PSK token only while the client has no paired session: during one, the
+    // vertical space goes back to filler().
+    if (!snap.pairing_token.empty() && !snap.paired) {
         sections.push_back(render_pairing_token(snap));
     }
     sections.push_back(filler());
@@ -1106,6 +1104,8 @@ void update_polled_state(TuiState& state, SendspinClient& client) {
     }
     state.track_duration_ms = client.metadata() ? client.metadata()->get_track_duration_ms() : 0;
 #endif
+    // Read before is_connected() (see SendspinClient::is_paired()).
+    state.paired = client.is_paired();
     state.connected = client.is_connected();
     state.time_synced = client.is_time_synced();
 #ifdef SENDSPIN_ENABLE_PLAYER

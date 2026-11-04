@@ -19,6 +19,10 @@
 #pragma once
 
 #include "crypto/psk_wrap.h"
+#include "enum_set.h"
+#include "inline_text.h"
+#include "inline_vector.h"
+#include "platform/network_info.h"
 #include "sendspin/color_role.h"
 #include "sendspin/config.h"
 #include "sendspin/controller_role.h"
@@ -32,9 +36,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace sendspin {
@@ -137,7 +144,7 @@ enum class SendspinRole : uint8_t {
     VISUALIZER,  // Audio visualization role
     COLOR,       // Audio-derived color palette role
     SOURCE,      // Audio capture role (streams to the server)
-    COUNT,       // Not a role; bounds the walk in active_role_mask(). Keep last.
+    COUNT,       // Not a role; bounds the walk in role_from_string(). Keep last.
 };
 
 /// @brief Protocol wire string for a role (e.g. "player@v1")
@@ -162,22 +169,6 @@ inline const char* to_cstr(SendspinRole role) {
     }
 }
 
-/// @brief Whether a versioned role name is in an active_roles set
-///
-/// The comparison is on the exact versioned name this library implements, not the family, because
-/// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
-/// version that was active: a client offered `player@v1` that is handed `player@v2` implements
-/// neither the new version's behavior nor, any longer, the old one's.
-inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole role) {
-    const char* name = to_cstr(role);
-    for (const auto& active : active_roles) {
-        if (active == name) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /// @brief Bit that represents `role` in an active-role mask
 inline uint16_t role_mask_bit(SendspinRole role) {
     return static_cast<uint16_t>(1U << static_cast<uint8_t>(role));
@@ -189,20 +180,63 @@ static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 16, "role mask is a u
 static constexpr uint16_t ALL_ROLES_MASK =
     static_cast<uint16_t>((1U << static_cast<uint8_t>(SendspinRole::COUNT)) - 1U);
 
-/// @brief Builds the mask of roles this library implements that `active_roles` names.
+/// @brief The role this library implements under a versioned role name, or nullopt
 ///
-/// The mask is what the receive path reads, so it is built with the same exact-version test role
-/// removal uses and the two can never disagree.
-inline uint16_t active_role_mask(const std::vector<std::string>& active_roles) {
-    uint16_t mask = 0;
+/// The comparison is on the exact versioned name this library implements, not the family, because
+/// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
+/// version that was active: a client offered `player@v1` that is handed `player@v2` implements
+/// neither the new version's behavior nor, any longer, the old one's.
+inline std::optional<SendspinRole> role_from_string(std::string_view name) {
     for (uint8_t i = 0; i < static_cast<uint8_t>(SendspinRole::COUNT); ++i) {
         const auto role = static_cast<SendspinRole>(i);
-        if (role_in(active_roles, role)) {
-            mask |= role_mask_bit(role);
+        if (name == to_cstr(role)) {
+            return role;
         }
     }
-    return mask;
+    return std::nullopt;
 }
+
+/// @brief A server/activate active_roles set, as the client acts on it: the roles this library
+/// implements that it names, and whether it has any entry at all
+///
+/// The mask is what the receive and send gates, the client/state role objects and role removal
+/// all read, so none of them can disagree. A role this library does not implement still makes
+/// the set non-empty: messaging.md "Playback-capable connections" requires an empty set of a
+/// connection that is not playback-capable, whatever it names.
+class ActiveRoles {
+public:
+    ActiveRoles() = default;
+    ActiveRoles(std::initializer_list<std::string_view> names) {
+        for (const std::string_view name : names) {
+            this->add(name);
+        }
+    }
+
+    /// @brief Adds one active_roles entry: its versioned role name, or an empty name for an entry
+    /// that is not a string.
+    void add(std::string_view name) {
+        this->names_any_ = true;
+        if (const std::optional<SendspinRole> role = role_from_string(name)) {
+            this->mask_ |= role_mask_bit(role.value());
+        }
+    }
+
+    /// @brief The named roles this library implements, as role_mask_bit() bits.
+    uint16_t mask() const {
+        return this->mask_;
+    }
+
+    /// @brief Whether the list had no entries, whatever they named.
+    bool empty() const {
+        return !this->names_any_;
+    }
+
+    bool operator==(const ActiveRoles&) const = default;
+
+private:
+    uint16_t mask_{0};
+    bool names_any_{false};
+};
 
 /// @brief Activity declared in a server/activate message.
 /// A connection declares a SET of activities rather than a single reason (messaging.md
@@ -234,6 +268,9 @@ inline std::optional<SendspinActivity> activity_from_string(std::string_view str
     }
     return std::nullopt;
 }
+
+/// @brief The activities a server/activate declares: a set, its members unordered and unique
+using ActivitySet = EnumSet<SendspinActivity>;
 
 /// @brief Pairing method on the wire (advertised in client/hello, selected in server/activate).
 enum class SendspinPairMethod : uint8_t {
@@ -422,12 +459,13 @@ inline std::optional<SendspinPlaybackState> playback_state_from_string(std::stri
     return std::nullopt;
 }
 
-/// @brief Optional hardware and software identity fields sent in client/hello messages
+/// @brief Optional hardware and software identity fields sent in client/hello messages, viewing
+/// the strings they name
 struct DeviceInfoObject {
-    std::optional<std::string> product_name{};
-    std::optional<std::string> manufacturer{};
-    std::optional<std::string> software_version{};
-    std::optional<std::string> mac_address{};
+    std::optional<std::string_view> product_name{};
+    std::optional<std::string_view> manufacturer{};
+    std::optional<std::string_view> software_version{};
+    std::optional<std::string_view> mac_address{};
 };
 
 // --- player_role.h ---
@@ -484,9 +522,10 @@ inline std::optional<SendspinPlayerCommand> player_command_from_string(std::stri
     return std::nullopt;
 }
 
-/// @brief Player capabilities advertised to the server during the hello handshake
+/// @brief Player capabilities advertised to the server during the hello handshake, viewing the
+/// player config's formats
 struct PlayerSupportObject {
-    std::vector<AudioSupportedFormatObject> supported_formats{};
+    std::span<const AudioSupportedFormatObject> supported_formats{};
     size_t buffer_capacity{};
 };
 
@@ -500,7 +539,7 @@ struct ClientPlayerStateObject {
     uint16_t output_delay_ms{};
     uint16_t required_lead_time_ms{};
     uint16_t min_buffer_ms{};
-    std::vector<SendspinPlayerCommand> supported_commands{};
+    EnumSet<SendspinPlayerCommand> supported_commands{};
 };
 
 // --- controller_role.h ---
@@ -674,6 +713,9 @@ struct ArtworkChannelFormatObject {
     uint16_t height{};
 };
 
+/// @brief Maximum number of artwork slots (2-bit slot field in protocol binary type byte)
+static constexpr size_t ARTWORK_MAX_SLOTS = 4;
+
 /// @brief Server-side description of one artwork channel's format and dimensions
 struct ServerArtworkChannelObject {
     std::optional<SendspinImageSource> source;
@@ -695,19 +737,21 @@ struct ServerArtworkChannelObject {
 
 /// @brief Artwork stream parameters sent by the server in stream/start messages
 struct ServerArtworkStreamObject {
-    std::optional<std::vector<ServerArtworkChannelObject>> channels;
+    std::optional<InlineVector<ServerArtworkChannelObject, ARTWORK_MAX_SLOTS>> channels;
 };
 
 /// @brief Visualizer stream configuration reported by the client in client/state messages
 struct ClientVisualizerStateObject {
-    std::vector<VisualizerDataType> types{};
+    /// Views the role's configuration; see ClientStateMessage.
+    std::span<const VisualizerDataType> types{};
     uint16_t rate_max{};
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 
 /// @brief Artwork channel configuration reported by the client in client/state messages
 struct ClientArtworkStateObject {
-    std::vector<ArtworkChannelFormatObject> channels;
+    /// Views the role's channels; see ClientStateMessage.
+    std::span<const ArtworkChannelFormatObject> channels{};
 };
 
 // --- visualizer_role.h ---
@@ -819,32 +863,41 @@ struct ClientSourceStateObject {
 // Message envelope structs
 // ============================================================================
 
-/// @brief A pairing method descriptor for client/hello supported_pair_methods.
-/// Optional fields are omitted from the wire when not set (omit_none semantics). The methods are
-/// held as a list rather than a map because the wire object has at most two keys and the
-/// descriptor names its own: `method` is serialized as the key this descriptor sits under, not as
-/// a field of it (pairing.md "client/hello pair-method descriptor").
+/// @brief A pairing method descriptor for client/hello supported_pair_methods, viewing the lists
+/// it names.
+/// An empty list is omitted from the wire (omit_none semantics). The methods are held as a list
+/// rather than a map because the wire object has at most two keys and the descriptor names its
+/// own: `method` is serialized as the key this descriptor sits under, not as a field of it
+/// (pairing.md "client/hello pair-method descriptor").
 struct PairMethodDescriptor {
     SendspinPairMethod method{SendspinPairMethod::PAIRING_PSK};
     /// @brief Channels the dynamic pairing code is conveyed through. Required and non-empty on
-    /// the dynamic_pairing_code descriptor, absent on the others.
-    std::optional<std::vector<SendspinPairingCodeChannel>> out_channels;
+    /// the dynamic_pairing_code descriptor, empty on the others.
+    std::span<const SendspinPairingCodeChannel> out_channels;
     /// @brief Emission formats the client offers. Required and non-empty on the
-    /// dynamic_pairing_code descriptor, absent on the others.
-    std::optional<std::vector<SendspinPairingCodeFormat>> formats;
+    /// dynamic_pairing_code descriptor, empty on the others.
+    std::span<const SendspinPairingCodeFormat> formats;
     /// @brief Where the operator can find the method's configured secret:
     /// 'device' | 'leaflet' | 'operator'. Informational hint for static_pairing_code and
-    /// pairing_psk only; absent for dynamic_pairing_code, whose code has no resting place.
-    std::optional<std::vector<std::string>> locations;
+    /// pairing_psk only; empty for dynamic_pairing_code, whose code has no resting place.
+    std::span<const std::string> locations;
 };
+
+/// @brief Most pair methods a client/hello lists: pairing_psk and at most one pairing-code method
+/// (messaging.md "client/hello").
+static constexpr size_t MAX_HELLO_PAIR_METHODS = 2;
 
 /// @brief Outgoing client/hello handshake message sent at connection startup.
 /// Under encryption, client_id and version are carried in client/init (the cleartext Noise
-/// handshake frame), not repeated here.
+/// handshake frame), not repeated here. Its strings and lists view the client's config and roles,
+/// so it is built and serialized in one go and never outlives them.
 struct ClientHelloMessage {
-    std::string name{};
+    std::string_view name{};
     std::optional<DeviceInfoObject> device_info{};
-    std::vector<SendspinRole> supported_roles{};
+    /// @brief Storage for a MAC address detected at build time, which device_info views; the view
+    /// stays valid because the message can be neither copied nor moved (deleted below).
+    MacAddressText detected_mac{};
+    InlineVector<SendspinRole, static_cast<size_t>(SendspinRole::COUNT)> supported_roles{};
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
     std::optional<SourceSupportObject> source_v1_support{};
@@ -852,8 +905,14 @@ struct ClientHelloMessage {
     /// is
     std::vector<SendspinApplicationRole> application_roles{};
     bool unpaired_access_enabled{false};
-    std::vector<PairMethodDescriptor> supported_pair_methods{};
+    InlineVector<PairMethodDescriptor, MAX_HELLO_PAIR_METHODS> supported_pair_methods{};
+
+    ClientHelloMessage() = default;
+    ClientHelloMessage(const ClientHelloMessage&) = delete;
+    ClientHelloMessage& operator=(const ClientHelloMessage&) = delete;
 };
+static_assert(!std::is_copy_constructible_v<ClientHelloMessage> &&
+              !std::is_move_constructible_v<ClientHelloMessage>);
 
 /// @brief Outgoing client/state message reporting client playback state to the server
 struct ClientStateMessage {
@@ -863,6 +922,13 @@ struct ClientStateMessage {
     std::optional<ClientVisualizerStateObject> visualizer{};
     std::optional<ClientSourceStateObject> source{};
 };
+
+// Built on the main loop and copied for each connection on the protocol task, so it owns nothing
+// on the heap (docs/internals.md "Memory"). Unlike ClientHelloMessage it is kept across ticks:
+// its role-object views stay valid because the viewed role configuration is fixed from add_*(),
+// which may be called only while the client is stopped (client.h "Role registration"), and the
+// protocol task reads only a snapshot that its run's start() or a later publish_state() wrote.
+static_assert(std::is_trivially_copyable_v<ClientStateMessage>);
 
 /// @brief The client/state one connection receives: the snapshot's availability and the role
 /// objects of the roles in `roles` only
@@ -899,35 +965,39 @@ struct ClientStreamStartMessage {
     uint8_t channels{};
     uint32_t sample_rate{};
     uint8_t bit_depth{};
-    std::optional<std::string> codec_header{};
+    /// Views the source encoder's header; the message is built and serialized in one go.
+    std::optional<std::string_view> codec_header{};
 };
 
-/// @brief Bit that represents `codec` in a codec mask
-constexpr uint8_t source_codec_bit(SendspinCodecFormat codec) {
-    return static_cast<uint8_t>(1U << static_cast<uint8_t>(codec));
-}
-
-// Every codec, UNSUPPORTED included, has a bit in a uint8_t mask
+// Every codec, UNSUPPORTED (the last) included, is an EnumSet<SendspinCodecFormat> member
 static_assert(static_cast<uint8_t>(SendspinCodecFormat::UNSUPPORTED) < 8,
-              "codec mask is a uint8_t");
+              "EnumSet<SendspinCodecFormat> needs 8 bits");
+
+/// @brief Longest friendly name the server sends, in UTF-8 bytes: messaging.md "server/hello"
+/// caps `name` and "group/update" caps `group_name` at 64 bytes, and a client truncates a longer
+/// one at a UTF-8 character boundary.
+constexpr size_t MAX_FRIENDLY_NAME_BYTES = 64;
+
+/// @brief The server's friendly name from server/hello, cut to MAX_FRIENDLY_NAME_BYTES
+using ServerName = InlineText<MAX_FRIENDLY_NAME_BYTES>;
 
 /// @brief Parsed server/hello handshake message received at connection startup.
 /// server_id comes from the Noise handshake result (set on the connection at COMPLETE), and
 /// activities/active_roles come from the server/activate message that follows.
 struct ServerHelloMessage {
-    std::string name{};
-    /// Codecs the server accepts in client-stream/start, as source_codec_bit() bits; a set value
-    /// always carries the PCM and FLAC bits, nullopt when server/hello carried no valid
-    /// source@v1_support object (roles/source/v1.md "server/hello source@v1 support object").
-    std::optional<uint8_t> source_codecs{};
+    ServerName name{};
+    /// Codecs the server accepts in client-stream/start; a set value always holds PCM and FLAC,
+    /// nullopt when server/hello carried no valid source@v1_support object (roles/source/v1.md
+    /// "server/hello source@v1 support object").
+    std::optional<EnumSet<SendspinCodecFormat>> source_codecs{};
 };
 
 /// @brief Parsed server/activate message that follows server/hello.
 /// Declares the server's current activity set and active roles for this connection
 /// (messaging.md "server/activate").
 struct ServerActivateMessage {
-    std::vector<SendspinActivity> activities{};
-    std::optional<std::vector<std::string>> active_roles;  // sticky: nullopt = keep prior set
+    ActivitySet activities{};
+    std::optional<ActiveRoles> active_roles;  // sticky: nullopt = keep prior set
     /// From payload.pairing.method: the pairing method the server picked. nullopt when the
     /// message carries no pairing object or names an unrecognized method string.
     std::optional<SendspinPairMethod> pairing_method;
@@ -949,14 +1019,20 @@ struct StreamStartMessage {
     std::optional<ServerVisualizerStreamObject> visualizer;
 };
 
+static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 8, "EnumSet<SendspinRole> needs 8 bits");
+
+/// @brief The roles a stream/end or stream/clear names; nullopt when it omits the list, which
+/// applies it to every role it covers (messaging.md "stream/end", "stream/clear")
+using StreamRoles = std::optional<EnumSet<SendspinRole>>;
+
 /// @brief Parsed stream/end message listing which roles the stream end applies to
 struct StreamEndMessage {
-    std::optional<std::vector<std::string>> roles{};
+    StreamRoles roles{};
 };
 
 /// @brief Parsed stream/clear message listing which roles the buffer flush applies to
 struct StreamClearMessage {
-    std::optional<std::vector<std::string>> roles{};
+    StreamRoles roles{};
 };
 
 /// @brief Parsed pair/abort message (received or sent during a pairing exchange)
@@ -996,10 +1072,11 @@ struct ServerPairConfirmPayload {
 // Every process_*() below takes the parsed JSON object and fills the caller-owned output it is
 // handed, returning false on a missing or malformed required field; the output holds copies, never
 // a view into the document, so the caller can release the document before acting on it
-// (ParsedJsonMessage::extract()). Every format_*() that returns a std::string builds its document
-// in the `arena` it is handed (the client's, on the protocol task) and destroys it before it
-// returns (a document that fits one variant pool frees the arena back down to where it found it;
-// see SendspinArenaAllocator). It never resets the arena.
+// (ParsedJsonMessage::extract()). Every build_*_message() fills the caller-owned document it is
+// handed, made by make_json_document() from the client's arena on the protocol task, for
+// SendspinConnection::send_json() to serialize straight into the transport's send buffer; the
+// caller destroys it once sent (a document that fits one variant pool frees the arena back down
+// to where it found it; see SendspinArenaAllocator). Neither ever resets the arena.
 
 /// @brief Determines the message type of an incoming server-to-client JSON message; UNKNOWN if
 /// not recognized
@@ -1063,38 +1140,41 @@ bool process_server_state_color(JsonObject root, ServerColorStateObject* color);
 bool process_server_state_controller(JsonObject root,
                                      ServerStateControllerObject* controller_state);
 
-/// @brief Parses a stream/start JSON message into the provided struct
-bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg);
+/// @brief Parses the sections of a stream/start JSON message that `roles` names into the provided
+/// struct
+/// @param roles The roles whose sections are parsed; any other section is skipped unvalidated.
+/// @return false (logged, every section reset) when a parsed section is malformed, which rejects
+/// the message.
+bool process_stream_start_message(JsonObject root, EnumSet<SendspinRole> roles,
+                                  StreamStartMessage* stream_msg);
 
 /// @brief Parses a stream/end JSON message into the provided struct
+/// @return false (logged) when `roles` is present but not an array, which rejects the message.
 bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg);
 
 /// @brief Parses a stream/clear JSON message into the provided struct
+/// @return false (logged) when `roles` is present but not an array, which rejects the message.
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg);
 
-/// @brief Formats a client/hello message as a JSON string
-std::string format_client_hello_message(const ClientHelloMessage* msg,
-                                        SendspinArenaAllocator& arena);
+/// @brief Builds a client/hello message
+void build_client_hello_message(const ClientHelloMessage* msg, JsonDocument& doc);
 
-/// @brief Formats a client/state message as a JSON string
-std::string format_client_state_message(const ClientStateMessage* msg,
-                                        SendspinArenaAllocator& arena);
+/// @brief Builds a client/state message
+void build_client_state_message(const ClientStateMessage* msg, JsonDocument& doc);
 
-/// @brief Formats a client-stream/start message as a JSON string
-std::string format_client_stream_start_message(const ClientStreamStartMessage* msg,
-                                               SendspinArenaAllocator& arena);
+/// @brief Builds a client-stream/start message
+void build_client_stream_start_message(const ClientStreamStartMessage* msg, JsonDocument& doc);
 
-/// @brief Formats a client-stream/end message as a JSON string
+/// @brief Builds a client-stream/end message
 /// roles/source/v1.md "client-stream/end": ends the input stream; no payload fields.
-std::string format_client_stream_end_message(SendspinArenaAllocator& arena);
+void build_client_stream_end_message(JsonDocument& doc);
 
-/// @brief Formats a client/leave message as a JSON string
+/// @brief Builds a client/leave message
 /// messaging.md "client/leave": leaves the client's current group; no payload fields.
-std::string format_client_leave_message(SendspinArenaAllocator& arena);
+void build_client_leave_message(JsonDocument& doc);
 
-/// @brief Formats a client/goodbye message as a JSON string
-std::string format_client_goodbye_message(SendspinGoodbyeReason reason,
-                                          SendspinArenaAllocator& arena);
+/// @brief Builds a client/goodbye message
+void build_client_goodbye_message(SendspinGoodbyeReason reason, JsonDocument& doc);
 
 /// Buffer size for format_client_time_message(). Fits the longest possible message:
 /// prefix (54) + '-' (1) + 19 digits + suffix (2) = 76 bytes, rounded up.
@@ -1109,26 +1189,24 @@ static constexpr size_t TIME_MESSAGE_BUF_SIZE = 96;
 /// @return Number of bytes written (excluding any null terminator), or 0 on error.
 size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted);
 
-/// @brief Formats a client/command message as a JSON string
+/// @brief Builds a client/command message
 /// @param cmd The playback command plus any command-specific parameters. Only the parameter
 /// relevant to the command is serialized (e.g. position_ms for SEEK); others are ignored.
-std::string format_client_command_message(const ClientCommandControllerObject& cmd,
-                                          SendspinArenaAllocator& arena);
+void build_client_command_message(const ClientCommandControllerObject& cmd, JsonDocument& doc);
 
-/// @brief Formats a client/pair-finalize message carrying long_term_psk directly (Pairing PSK
+/// @brief Builds a client/pair-finalize message carrying long_term_psk directly (Pairing PSK
 /// flow only). The PSK is 32 raw bytes, base64url-encoded (no padding, 43 chars).
-std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk,
-                                                SendspinArenaAllocator& arena);
+void build_client_pair_finalize_message(const std::array<uint8_t, 32>& psk, JsonDocument& doc);
 
-/// @brief Formats a client/pair-finalize message carrying wrapped_psk (pairing-code flows only;
+/// @brief Builds a client/pair-finalize message carrying wrapped_psk (pairing-code flows only;
 /// see pairing.md "Wrapping"). wrapped_psk is 48 raw bytes, base64url-encoded (no padding, 64
 /// chars).
-std::string format_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
-                                                        SendspinArenaAllocator& arena);
+void build_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
+                                                JsonDocument& doc);
 
-/// @brief Formats a pair/abort message as a JSON string.
+/// @brief Builds a pair/abort message.
 /// Sent by the client when it cannot proceed with the selected pairing method.
-std::string format_pair_abort_message(PairAbortReason reason, SendspinArenaAllocator& arena);
+void build_pair_abort_message(PairAbortReason reason, JsonDocument& doc);
 
 /// @brief Parses a pair/abort JSON message into the provided struct; false on a missing or
 /// unrecognized reason
@@ -1153,54 +1231,51 @@ bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* pa
 /// @param payload [out] Struct to populate; nullptr for validation-only.
 bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload);
 
-/// @brief Formats a client/pair-pending message as a JSON string.
+/// @brief Builds a client/pair-pending message.
 /// Sent immediately on receiving a pairing server/activate whose attempt is gesture-gated while
 /// no pairing window is open; client/pair-init follows once a window opens. Does not start the
 /// attempt or its timeout.
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
 ///                      handshake (see SendspinConnection::get_pairing_index()).
-std::string format_client_pair_pending_message(uint32_t pairing_index,
-                                               SendspinArenaAllocator& arena);
+void build_client_pair_pending_message(uint32_t pairing_index, JsonDocument& doc);
 
-/// @brief Formats a client/pair-init message as a JSON string.
+/// @brief Builds a client/pair-init message.
 /// Starts the dynamic-pairing-code attempt; carries commit_B = SHA-256(PAIRING_COMMIT_LABEL ||
 /// nonce_B) and the required pairing_index counter (pairing.md "Pairing index").
 /// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
-std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
-                                            uint32_t pairing_index, SendspinArenaAllocator& arena);
+void build_client_pair_init_message(const std::array<uint8_t, 32>& commit_b, uint32_t pairing_index,
+                                    JsonDocument& doc);
 
-/// @brief Formats a client/pair-init message with only pairing_index.
+/// @brief Builds a client/pair-init message with only pairing_index.
 /// The form used by every flow that carries no commit_B: the static pairing code, sent after the
 /// operator confirms the pairing-window gesture and before starting CPace RESPONDER, and Pairing
 /// PSK, sent immediately before client/pair-finalize (pairing.md "Pairing PSK Flow").
-std::string format_client_pair_init_message(uint32_t pairing_index, SendspinArenaAllocator& arena);
+void build_client_pair_init_message(uint32_t pairing_index, JsonDocument& doc);
 
-/// @brief Formats a client/pair-retry message as a JSON string.
+/// @brief Builds a client/pair-retry message.
 /// Sent in place of client/pair-confirm when server_kc fails to verify and the client admits
 /// another round (pairing.md "Client -> Server: client/pair-retry"). The payload is empty: the
 /// attempt, its pairing code and its running attempt timeout all carry over.
-std::string format_client_pair_retry_message(SendspinArenaAllocator& arena);
+void build_client_pair_retry_message(JsonDocument& doc);
 
-/// @brief Formats a client/pair-auth message as a JSON string.
+/// @brief Builds a client/pair-auth message.
 /// Sent in response to server/pair-auth; carries the client's CPace public share.
 /// @param pake_msg_2 32-byte client CPace public share (base64url-encoded on the wire).
-std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2,
-                                            SendspinArenaAllocator& arena);
+void build_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2, JsonDocument& doc);
 
-/// @brief Formats a client/pair-confirm message as a JSON string.
+/// @brief Builds a client/pair-confirm message.
 /// Sent in response to server/pair-confirm in the Dynamic Pairing Code Flow; carries client_kc
 /// and the sealed opening of the commitment sent earlier as commit_B.
 /// @param client_kc       64-byte client CPace confirmation tag (base64url-encoded on the wire).
 /// @param wrapped_nonce_b 48-byte wrapping of nonce_B (base64url-encoded on the wire, 64 chars);
 ///                        see pairing.md "Wrapping".
-std::string format_client_pair_confirm_message(
+void build_client_pair_confirm_message(
     const std::array<uint8_t, 64>& client_kc,
-    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b, SendspinArenaAllocator& arena);
+    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b, JsonDocument& doc);
 
-/// @brief Formats a client/pair-confirm message with no commitment opening (the Static Pairing
+/// @brief Builds a client/pair-confirm message with no commitment opening (the Static Pairing
 /// Code Flow, which sends no commit_B and so has nothing to open).
 /// @param client_kc 64-byte client CPace confirmation tag (base64url-encoded on the wire).
-std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
-                                               SendspinArenaAllocator& arena);
+void build_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc, JsonDocument& doc);
 
 }  // namespace sendspin

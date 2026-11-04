@@ -23,10 +23,10 @@ using namespace sendspin;
 // sandboxed CI runner), so this asserts the contract rather than a specific value: the result is
 // either absent or a well-formed lowercase colon-separated MAC.
 TEST(NetworkInfo, InterfaceMacIsWellFormedOrAbsent) {
-    const std::optional<std::string> mac = platform_get_interface_mac();
+    const std::optional<MacAddressText> mac = platform_get_interface_mac();
     if (!mac.has_value()) {
         GTEST_SKIP() << "no routable interface detected in this environment";
     }
     const std::regex mac_re("^[0-9a-f]{2}(:[0-9a-f]{2}){5}$");
-    EXPECT_TRUE(std::regex_match(*mac, mac_re)) << "malformed MAC: " << *mac;
+    EXPECT_TRUE(std::regex_match(mac->data(), mac_re)) << "malformed MAC: " << mac->data();
 }

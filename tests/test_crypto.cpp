@@ -31,6 +31,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -193,8 +194,8 @@ TEST(CryptoConstants, SentinelPskMatchesSpecHex) {
 }
 
 TEST(CryptoConstants, SentinelPskIdMatchesSpecConstant) {
-    // psk_id_for(SENTINEL_PSK) must equal the spec's published identifier.
-    EXPECT_EQ(SENTINEL_PSK_ID, "GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo");
+    // The published identifier must be the one psk_id_for() derives from the Sentinel PSK.
+    EXPECT_EQ(psk_id_for(SENTINEL_PSK), SENTINEL_PSK_ID);
 }
 
 TEST(CryptoConstants, PskIdLabelIsLiteralUtf8NoNul) {
@@ -250,20 +251,49 @@ TEST(B64Url, DecodeToleratesMissingPadding) {
     EXPECT_EQ(std::string(r2->begin(), r2->end()), "fooba");
 }
 
-TEST(B64Url, DecodeRejectsInvalidCharacter) {
-    // '+' and '/' are not part of the URL-safe alphabet.
-    EXPECT_FALSE(b64url_decode("Zm9v+g").has_value());
-    EXPECT_FALSE(b64url_decode("Zm9v/g").has_value());
+// The buffer forms need their full buffer: one byte short refuses, an exact fit succeeds. "Zm9vYg" is two groups, so the short decode buffer runs out at the second.
+TEST(B64Url, IntoFormsNeedTheirFullBuffer) {
+    const std::array<uint8_t, 4> foob = {'f', 'o', 'o', 'b'};
+    ASSERT_EQ(b64url_encode_buffer_size(foob.size()), 9u);
+    for (const size_t cap : {8u, 9u}) {
+        std::array<char, 9> text{};
+        const std::string_view encoded = b64url_encode_into(text.data(), cap, foob.data(), 4);
+        EXPECT_EQ(encoded, cap == 9 ? "Zm9vYg" : "") << "cap " << cap;
+    }
+    ASSERT_EQ(b64url_decoded_size("Zm9vYg"), 4u);
+    for (const size_t cap : {3u, 4u}) {
+        std::array<uint8_t, 4> bytes{};
+        const std::optional<size_t> written = b64url_decode_into("Zm9vYg", bytes.data(), cap);
+        if (cap == 4) {
+            ASSERT_EQ(written, 4u);
+            EXPECT_EQ(bytes, foob);
+        } else {
+            EXPECT_FALSE(written.has_value()) << "cap " << cap;
+        }
+    }
 }
 
-TEST(B64Url, DecodeRejectsEmbeddedWhitespace) {
-    // platform_base64_decode's host implementation silently skips '\n'/'\r'/' ' rather than
-    // rejecting them; b64url_decode must reject regardless of that platform-decoder laxity, so
-    // accepted input does not silently diverge between host and ESP (mbedTLS rejects these
-    // outright).
-    EXPECT_FALSE(b64url_decode("Zm9v\nYg").has_value());
-    EXPECT_FALSE(b64url_decode("Zm9v\rYg").has_value());
-    EXPECT_FALSE(b64url_decode("Zm9v Yg").has_value());
+// Inputs the host decoder alone would accept but mbedTLS rejects, refused on both platforms: the
+// host platform_base64_decode silently skips '\n'/'\r'/' ', and turns a lone last character into
+// zero bytes. The control decodes, so a rejection comes from the input, not the setup.
+TEST(B64Url, DecodeRejectsWhatMbedtlsRejects) {
+    struct Row {
+        const char* name;
+        std::string_view input;
+        bool decodes;
+    };
+    const Row rows[] = {
+        {"control", "Zm9vYg", true},
+        {"'+' is not URL-safe", "Zm9v+g", false},
+        {"'/' is not URL-safe", "Zm9v/g", false},
+        {"embedded newline", "Zm9v\nYg", false},
+        {"embedded carriage return", "Zm9v\rYg", false},
+        {"embedded space", "Zm9v Yg", false},
+        {"a lone last character", "Zm9vY", false},
+    };
+    for (const Row& row : rows) {
+        EXPECT_EQ(b64url_decode(row.input).has_value(), row.decodes) << row.name;
+    }
 }
 
 // ============================================================================

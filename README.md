@@ -12,7 +12,7 @@ Standalone C++ library implementing the [Sendspin synchronized audio streaming p
 - Modular Sendspin role composition: artwork, color, controller, metadata, player, source, and visualizer
 - WebSocket client and server support
 - Mandatory Noise KKpsk2 encryption on every connection, with Pairing PSK token and pairing code pairing
-- Decodes FLAC and PCM and streams captured PCM, plus Opus decode and encode when built with `SENDSPIN_ENABLE_OPUS` (the default)
+- Decodes FLAC and PCM and streams captured audio as FLAC or PCM, plus Opus decode and encode when built with `SENDSPIN_ENABLE_OPUS` (the default)
 - Cross-platform: ESP-IDF (ESP32) and host (macOS/Linux)
 
 ## Documentation
@@ -30,7 +30,7 @@ cmake -B build
 cmake --build build
 ```
 
-Dependencies (fetched automatically via CMake FetchContent): ArduinoJson, noise-c, IXWebSocket, micro-flac for the player role, and micro-opus for the player or source role when `SENDSPIN_ENABLE_OPUS` is on.
+Dependencies (fetched automatically via CMake FetchContent): ArduinoJson, noise-c, IXWebSocket, micro-flac for the player or source role, and micro-opus for the player or source role when `SENDSPIN_ENABLE_OPUS` is on.
 
 ### ESP-IDF
 

@@ -33,7 +33,7 @@ enum class SendspinGoodbyeReason : uint8_t {
     SHUTDOWN,            // Client is shutting down
     RESTART,             // Client is restarting
     USER_REQUEST,        // User explicitly requested disconnect
-    UNAUTHORIZED,        // Server requested an activity the client's trust level does not permit
+    UNAUTHORIZED,        // Session not permitted its activities or roles, or its record revoked
     PAIRING_REQUIRED,    // Server requested playback but client requires pairing first
     CONCURRENT_ATTEMPT,  // Incoming connection rejected because another is already admitted
     UNPAIRED,            // Server unpaired this device via server/unpair
@@ -42,6 +42,7 @@ enum class SendspinGoodbyeReason : uint8_t {
 /// @brief Server identity fields received in server/hello messages
 struct ServerInformationObject {
     std::string server_id{};
+    /// At most 64 bytes in UTF-8, cut at a character boundary
     std::string name{};
 };
 
@@ -55,6 +56,7 @@ enum class SendspinPlaybackState : uint8_t {
 struct GroupUpdateObject {
     std::optional<SendspinPlaybackState> playback_state{};
     std::optional<std::string> group_id{};
+    /// At most 64 bytes in UTF-8, cut at a character boundary
     std::optional<std::string> group_name{};
 };
 
@@ -67,15 +69,8 @@ enum class MemoryLocation : uint8_t {
 };
 
 // ============================================================================
-// Encryption / trust types (public API surface)
+// Pairing types (public API surface)
 // ============================================================================
-
-/// @brief Trust level of an active connection, from the PSK category matched during the Noise
-/// handshake
-enum class ConnectionTrust : uint8_t {
-    NONE,  // No long-term pairing record; Sentinel or Pairing PSK was used.
-    USER,  // Long-term pairing record matched; connection is from a paired server.
-};
 
 /// @brief Reason a pairing exchange was aborted.
 ///

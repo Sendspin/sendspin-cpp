@@ -187,11 +187,11 @@ SourceRoleConfig source_config;
 source_config.sample_rate = 48000;
 source_config.channels = 2;
 source_config.bit_depth = 16;
-source_config.codec = SendspinCodecFormat::PCM;  // or OPUS, in a build with SENDSPIN_ENABLE_OPUS
+source_config.codec = SendspinCodecFormat::PCM;  // or FLAC, or OPUS with SENDSPIN_ENABLE_OPUS
 auto& source = client.add_source(source_config);
 ```
 
-An invalid config (see [SourceRoleConfig](#sourceroleconfig)) leaves the role inert; a valid config whose buffers cannot be allocated fails `client.start()` instead. An `OPUS` role streams Opus only to a server whose `server/hello` lists it, and the same capture as PCM otherwise.
+An invalid config (see [SourceRoleConfig](#sourceroleconfig)) leaves the role inert; a valid config whose buffers cannot be allocated fails `client.start()` instead. A `FLAC` or `OPUS` role streams its codec only to a server whose `server/hello` lists it, and the same capture as PCM otherwise.
 
 Feed the capture to `write_audio()` from one capture thread, with the capture time of each buffer's first sample on the client's clock (`SendspinClient::now_us()`), or 0 to have the write stamped as ending now:
 
@@ -710,7 +710,7 @@ struct MyClientListener : SendspinClientListener {
     }
 
     // Called when pairing completes successfully and the long-term record is stored.
-    // Subsequent connections from this server will report ConnectionTrust::USER.
+    // Subsequent connections from this server are paired sessions (is_paired()).
     void on_pairing_succeeded(const std::string& server_id) override {
         printf("Pairing succeeded with server %s\n", server_id.c_str());
     }
@@ -720,16 +720,6 @@ struct MyClientListener : SendspinClientListener {
     // and protocol errors (reported as UNKNOWN) close it.
     void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
         printf("Pairing failed with server %s\n", server_id.c_str());
-    }
-
-    // Called after the Noise handshake completes, and again after each successful
-    // re-handshake (notably the post-pairing rekey).
-    // trust reflects the PSK category used:
-    //   ConnectionTrust::USER  -- long-term record: a paired server
-    //   ConnectionTrust::NONE  -- Sentinel or Pairing PSK (unpaired access)
-    void on_trust_changed(ConnectionTrust trust) override {
-        bool paired = (trust == ConnectionTrust::USER);
-        update_trust_indicator(paired);
     }
 
     // Dynamic pairing code: emit/withdraw the code the device derived. Only invoked when
@@ -784,7 +774,7 @@ client.set_persistence_provider(&persistence_provider); // Optional
 ```cpp
 // Start the role threads and the protocol task, and arm the WebSocket server (it listens before
 // start() returns when the network provider already reports ready, otherwise once loop() finds it
-// ready).
+// ready; with accept_inbound_connections off, no server starts).
 // Task priorities and PSRAM settings are taken from SendspinClientConfig.
 if (!client.start()) {
     // Handle failure
@@ -792,7 +782,8 @@ if (!client.start()) {
 }
 
 // Optionally initiate a client-side connection to a known server URL.
-// Without this, the client waits for incoming server connections.
+// Without this, the client waits for incoming server connections. With
+// accept_inbound_connections off, this is the only way a server reaches it.
 client.connect_to("ws://192.168.1.10:8928/sendspin");
 
 // Main loop: call loop() periodically to deliver callbacks. Connection work runs on the library's
@@ -851,8 +842,8 @@ printf("client_id: %s\n", client.client_id().c_str());
 
 ### Pairing
 
-Pairing creates a long-term trust record for a specific server. After pairing, connections
-from that server resolve via the long-term PSK and report `ConnectionTrust::USER`.
+Pairing creates a long-term record for a specific server. After pairing, connections from that
+server resolve via the long-term PSK and are paired sessions (`is_paired()`).
 
 Pairing is server-initiated. The server includes `pairing` in the `activities` of its
 `server/activate` message; the library handles the exchange automatically. The application
@@ -979,23 +970,22 @@ The secrets themselves are `pairing_psk` (or the generated Pairing PSK) and
 `static_pairing_code` in the same config, so an application that sets one sets its hint beside
 it.
 
-### Trust Levels
+### Paired Sessions
 
-`ConnectionTrust` reflects which PSK resolved during the Noise handshake:
+`is_paired()` reports whether the active connection is a paired session, which the PSK that
+resolved during the Noise handshake decides:
 
-| Value | PSK used | Meaning |
-|-------|---------|---------|
-| `ConnectionTrust::USER` | Long-term record | Server holds a record minted for it during pairing |
-| `ConnectionTrust::NONE` | Sentinel or Pairing PSK | Unpaired access |
+| PSK used | `is_paired()` | Meaning |
+|---------|---------------|---------|
+| Long-term record | `true` | Server holds a record minted for it during pairing |
+| Sentinel or Pairing PSK | `false` | Unpaired access |
 
-`on_trust_changed` fires after `server/activate` is processed and the connection is promoted
-to current, and again after each successful in-band re-handshake on that same connection.
-Pairing an already-connected server therefore delivers the callback twice: once with
-`ConnectionTrust::NONE` at admission, then again with `ConnectionTrust::USER` once the
-post-pairing rekey completes. Connections that are rejected (e.g., an unpaired server
-declaring playback or active roles while unpaired access is disabled) do not fire this
-callback. The last reported trust describes the connection only while `is_connected()` is
-true: a disconnect fires no `on_trust_changed`.
+Like `is_connected()`, it can be called from any thread and reflects the protocol task's last
+tick, and it reads `false` while no connection is admitted. An in-band re-handshake can change
+it on the same connection: pairing an already-connected server turns it `true` once the
+post-pairing rekey completes. Read it before `is_connected()`: between a re-handshake and the
+`server/activate` that follows it, it already describes the new session while `is_connected()`
+reads `false`, and a `true` `is_connected()` read after it means that session is activated.
 
 ### Unpaired Access
 
@@ -1034,8 +1024,8 @@ A call on a running client applies the new value to the live connections as `pai
   would cost that pairing attempt. If it activates idle instead, it keeps the `client/hello` it
   already read until it reconnects.
 
-Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
-unpaired access after the device is paired is the typical production configuration.
+Connections admitted with the Sentinel PSK are unpaired sessions (`is_paired()` reads `false`).
+Disabling unpaired access after the device is paired is the typical production configuration.
 
 ## Sending Commands
 
@@ -1161,6 +1151,7 @@ The client and roles expose query methods for polling state in your main loop or
 
 ```cpp
 // Client state
+bool paired = client.is_paired();              // Active connection is a paired session (read first)
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
 const GroupUpdateObject& group = client.get_group_state();   // Group id, name, playback state (all optional)
@@ -1215,7 +1206,7 @@ non-blocking.
 Callable from any thread: `connect_to()`, `disconnect()`, `leave()`,
 `confirm_pairing_window()`, `cancel_pairing_window()`, `set_unpaired_access_enabled()` and the
 getters `is_started()`, `is_connected()`, `is_time_synced()`, `get_client_time()`,
-`get_server_information()` and `is_unpaired_access_enabled()`. The
+`get_server_information()`, `is_paired()` and `is_unpaired_access_enabled()`. The
 requests take effect on the protocol task's next tick; the getters read what that task last
 published. Controller commands are queued, so a burst of them can fill the
 queue (see [Sending Commands](#sending-commands)); `connect_to()`, `disconnect()`, `leave()`,
@@ -1318,9 +1309,9 @@ Available options (all `ON` by default):
 | `SENDSPIN_ENABLE_ARTWORK` | Artwork role |
 | `SENDSPIN_ENABLE_VISUALIZER` | Visualizer role |
 | `SENDSPIN_ENABLE_COLOR` | Color role |
-| `SENDSPIN_ENABLE_SOURCE` | Source role (audio capture streamed to the server), source task |
+| `SENDSPIN_ENABLE_SOURCE` | Source role (audio capture streamed to the server), audio encoders (micro-flac, and micro-opus with `SENDSPIN_ENABLE_OPUS`), source task |
 
-When `SENDSPIN_ENABLE_PLAYER` is `OFF`, micro-flac is not fetched, and micro-opus is fetched only for the source role. `SENDSPIN_ENABLE_OPUS=OFF` drops micro-opus alone, for products that cannot ship Opus (see the patent note in the player and source role specs); the player then refuses `OPUS` entries in `audio_formats`, and the source refuses an `OPUS` codec in its config.
+When `SENDSPIN_ENABLE_PLAYER` is `OFF`, micro-flac and micro-opus are fetched only for the source role, whose FLAC and Opus encoders they provide. `SENDSPIN_ENABLE_OPUS=OFF` drops micro-opus alone, for products that cannot ship Opus (see the patent note in the player and source role specs); the player then refuses `OPUS` entries in `audio_formats`, and the source refuses an `OPUS` codec in its config.
 
 ### Message trace (host only)
 
@@ -1347,7 +1338,7 @@ CONFIG_SENDSPIN_ENABLE_COLOR=y
 CONFIG_SENDSPIN_ENABLE_SOURCE=y
 ```
 
-The component also selects esp_websocket_client's `ESP_WS_CLIENT_SEPARATE_TX_LOCK`, so sends on an outbound connection (`connect_to()`) take their own lock rather than the one the client task holds while the receive handler waits for inbound ring space. With the source role and Opus enabled, micro-opus must stay in its thread-safe pseudostack allocation mode (the default); the build fails otherwise.
+The component also selects esp_websocket_client's `ESP_WS_CLIENT_SEPARATE_TX_LOCK`, so sends on an outbound connection (`connect_to()`) take their own lock rather than the one the client task holds while the receive handler waits for inbound ring space. With the source role and Opus enabled, micro-opus must stay in its thread-safe pseudostack allocation mode (the default); the build fails otherwise. The source's FLAC encoder never turns on micro-flac's LPC or Rice partitioning, so a build that needs neither elsewhere can turn off `MICRO_FLAC_ENCODER_ENABLE_LPC` (about 19 KB of flash) and `MICRO_FLAC_ENCODER_ENABLE_RICE_PARTITIONS` in Kconfig.
 
 ### Effect on the API
 
@@ -1383,14 +1374,15 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `protocol_task_priority` | `unsigned` | `5` | FreeRTOS priority for the protocol task (ESP-IDF only). Defaults to the httpd task's priority, below the player's sync task. |
 | `protocol_task_stack_size` | `size_t` | `7168` | Protocol task stack size in bytes (ESP-IDF only). Every Noise handshake (including the in-band re-handshake after pairing, with its X25519 crypto), the pairing exchange (CPace and SHA-512), the JSON parse, the role handlers and every send run on this task. Derived as for `httpd_stack_size`. Values below the default are clamped up to it with a warning. |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
-| `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye) |
+| `accept_inbound_connections` | `bool` | `true` | Whether to run the WebSocket server that servers connect to. `false` leaves `connect_to()` as the only way a server reaches the client, for a client that dials one configured server and must not be reachable by any other; `server_port` is then unused. |
+| `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye); at most 7 on ESP, where a larger value is clamped |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |
 | `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
 | `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
 | `liveness_timeout_ms` | `std::optional<int64_t>` | unset (`60000` with default burst settings) | Milliseconds of inbound silence before the established connection is dropped as dead, with a `restart` goodbye so a server that was only slow reconnects. Unset derives it from the time burst settings, tolerating two consecutive unanswered time messages. An explicit value below `time_burst_interval_ms + time_burst_response_timeout_ms` drops healthy connections. Set or derived, it is capped at `SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS` (30 minutes). `0` disables the check. |
 | `inbound_ring_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the shared inbound ring every admitted connection receives into (sized from the player's `audio_buffer_capacity`, the visualizer's `buffer_capacity`, one image per artwork channel in flight plus the artwork images that arrive behind a held audio chunk, and a baseline every configuration pays, which is also its floor, of two of the longest messages the enabled roles need in one piece: 131,152 bytes with the artwork role or a player whose advertised buffer reaches a Noise frame, 32,880 with neither and no larger visualizer message, two of the player's longest chunks in between; audio is decoded straight out of it) and each connection's fallback buffer, which holds a pre-admission message or a message longer than the ring takes. The sizing budgets the control messages and time replies that arrive while the oldest held audio chunk or visualizer frame, or an artwork part waiting for the decode thread to copy it, is out; an exhausted ring closes the connection ([The Inbound Ring](internals.md#the-inbound-ring)). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
-| `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `inbound_ring_location` (which covers the inbound ring). ESP-IDF only; ignored on host. |
+| `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the outbound send buffer every JSON message is serialized into. The reassembly buffer grows with the largest fragmented message received (a player audio chunk) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `inbound_ring_location` (which covers the inbound ring). ESP-IDF only; ignored on host. |
 | `pairing_psk` | `std::optional<SendspinPsk>` | unset | A factory-provisioned Pairing PSK (32 bytes). Outranks a stored one and is never persisted; an all-zero key or the Sentinel PSK makes `start()` fail. Unset loads the stored one or generates and persists one on first boot. See [Pairing PSK](#pairing-psk). |
 | `static_pairing_code` | `std::optional<std::string>` | unset | The device's static pairing code, exactly 8 decimal digits. The `static_pairing_code` method is advertised only when this is set and `dynamic_pairing_code` is not advertised. An invalid value makes `start()` fail. |
 | `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
@@ -1494,34 +1486,24 @@ Configuration passed to `client.add_source()`. A value that breaks any rule belo
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `codec` | `SendspinCodecFormat` | `PCM` | `PCM` sends the capture bytes untouched; `OPUS` encodes each chunk into one CELT-only Opus packet (needs `SENDSPIN_ENABLE_OPUS`). `FLAC` is not accepted. `OPUS` costs the encoder state plus a micro-opus scratch arena for the source task (about 120 KB, PSRAM-preferring, allocated before the first Opus chunk is encoded), separate from the one the player's sync task holds. |
+| `codec` | `SendspinCodecFormat` | `PCM` | `PCM` sends the capture bytes untouched; `FLAC` encodes each chunk losslessly into one FLAC frame; `OPUS` encodes each chunk into one CELT-only Opus packet (needs `SENDSPIN_ENABLE_OPUS`). `FLAC` costs the micro-flac encoder (about 2 KB) and a chunk of scratch. `OPUS` costs the encoder state plus a micro-opus scratch arena for the source task (about 120 KB, PSRAM-preferring, allocated before the first Opus chunk is encoded), separate from the one the player's sync task holds. |
 | `sample_rate` | `uint32_t` | `48000` | Capture rate in Hz, more than 0. `OPUS` takes 8000, 12000, 16000, 24000, or 48000. |
-| `channels` | `uint8_t` | `2` | Capture channel count, at least 1 (1 or 2 for `OPUS`) |
+| `channels` | `uint8_t` | `2` | Capture channel count, at least 1 (at most 8 for `FLAC`, 1 or 2 for `OPUS`) |
 | `bit_depth` | `uint8_t` | `16` | 16, 24 (3 packed bytes), or 32; `OPUS` takes 16 |
-| `chunk_duration_ms` | `uint32_t` | `20` | Audio per chunk, 5 to 150 ms; one chunk with its header must fit one Noise transport message. `OPUS` takes 5, 10, 20, 40, or 60. |
+| `chunk_duration_ms` | `uint32_t` | `20` | Audio per chunk, 5 to 150 ms; one chunk with its header must fit one Noise transport message. `FLAC` needs at least 16 frames a chunk, and its worst-case frame, a little over the PCM, must fit too. `OPUS` takes 5, 10, 20, 40, or 60. |
 | `capture_buffer_ms` | `uint32_t` | `500` | More than 0 ms; about the longest network stall the stream rides out without a gap; a longer one resumes from live capture. A single write must fit in just under 5/8 of it. |
-| `opus_bitrate` | `uint32_t` | `128000` | Opus bitrate in bit/s, 500 to 512000; ignored for `PCM` |
-| `opus_complexity` | `uint8_t` | `2` | Opus encoder complexity, at most 10; ignored for `PCM` |
+| `opus_bitrate` | `uint32_t` | `128000` | Opus bitrate in bit/s, 500 to 512000; ignored for `PCM` and `FLAC` |
+| `opus_complexity` | `uint8_t` | `2` | Opus encoder complexity, at most 10; ignored for `PCM` and `FLAC` |
 | `line_sense` | `bool` | `false` | Advertise signal sensing; see `SourceRole::set_signal()` |
-| `buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Placement of the capture buffer and the chunk buffer (ESP-IDF only) |
+| `buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Placement of the capture buffer, the chunk buffer and a `FLAC` or `OPUS` encoder's chunk scratch (ESP-IDF only) |
 | `priority` | `unsigned` | `3` | FreeRTOS priority for the source task, below the protocol and httpd tasks (ESP-IDF only) |
 | `psram_stack` | `bool` | `false` | Allocate the source task stack in PSRAM (ESP-IDF only) |
 
-The capture buffer is allocated by the first `start()` and kept until the client is destroyed, since the capture thread may write at any time; the chunk buffer, which holds a few chunks for the protocol task to send, lives from each `start()` to its `stop()`.
+The capture buffer and an encoder's chunk scratch are allocated by the first `start()` and kept until the client is destroyed, since the capture thread may write at any time; the FLAC encoder itself is created by `add_source()`. The chunk buffer, which holds a few chunks for the protocol task to send, lives from each `start()` to its `stop()`.
 
 ---
 
 ## Enums Reference
-
-### ConnectionTrust
-
-| Value | Description |
-|---|---|
-| `NONE` | Sentinel or Pairing PSK was used; this server has not been paired |
-| `USER` | Long-term record matched; the server is paired |
-
-Reported via `SendspinClientListener::on_trust_changed` on admission and again after each
-successful in-band re-handshake. See [Trust Levels](#trust-levels).
 
 ### SendspinPairAbortReason
 
@@ -1563,7 +1545,7 @@ format arrives as the `format` argument of `on_display_pairing_code`.
 
 | Value | Description |
 |---|---|
-| `FLAC` | FLAC lossless audio |
+| `FLAC` | FLAC lossless audio; decodable by the player role and encodable by the source role |
 | `OPUS` | Opus lossy audio; decodable, and encodable by the source role, only in a build with `SENDSPIN_ENABLE_OPUS` |
 | `PCM` | Raw PCM audio |
 | `UNSUPPORTED` | Unsupported codec |
@@ -1606,7 +1588,7 @@ These represent commands the server can send to the player. The player advertise
 | `SHUTDOWN` | Device is shutting down |
 | `RESTART` | Device is restarting |
 | `USER_REQUEST` | User requested disconnect |
-| `UNAUTHORIZED` | Server requested an activity its trust level does not permit |
+| `UNAUTHORIZED` | Server declared activities or roles the session does not permit, or its pairing record was revoked |
 | `PAIRING_REQUIRED` | Server requested playback but the client requires pairing first |
 | `CONCURRENT_ATTEMPT` | Incoming connection rejected because another is already admitted. Distinct from the same-named `SendspinPairAbortReason`, which is specific to pairing |
 | `UNPAIRED` | Server unpaired this device via `server/unpair` |
@@ -1688,4 +1670,4 @@ Set with `SendspinClient::set_log_level()`. Only affects host builds; ESP-IDF bu
 | `PREFER_EXTERNAL` | Prefer SPIRAM, fall back to internal RAM (ESP-IDF only) |
 | `PREFER_INTERNAL` | Prefer internal RAM, fall back to SPIRAM (ESP-IDF only) |
 
-Used by `SendspinClientConfig::inbound_ring_location` to control where the shared inbound ring and the per-connection fallback buffers are allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and fragmentation buffers are allocated, by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated, and by `SourceRoleConfig::buffer_location` to control where the source's capture and chunk buffers are allocated. Ignored on host platforms (no internal/external distinction).
+Used by `SendspinClientConfig::inbound_ring_location` to control where the shared inbound ring and the per-connection fallback buffers are allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and send buffers are allocated, by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated, and by `SourceRoleConfig::buffer_location` to control where the source's capture and chunk buffers are allocated. Ignored on host platforms (no internal/external distinction).
