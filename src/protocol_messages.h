@@ -197,7 +197,7 @@ inline std::optional<SendspinRole> role_from_string(std::string_view name) {
 }
 
 /// @brief A server/activate active_roles set, as the client acts on it: the roles this library
-/// implements that it names, and whether it names any role at all
+/// implements that it names, and whether it has any entry at all
 ///
 /// The mask is what the receive and send gates, the client/state role objects and role removal
 /// all read, so none of them can disagree. A role this library does not implement still makes
@@ -212,7 +212,8 @@ public:
         }
     }
 
-    /// @brief Adds one versioned role name to the set.
+    /// @brief Adds one active_roles entry: its versioned role name, or an empty name for an entry
+    /// that is not a string.
     void add(std::string_view name) {
         this->names_any_ = true;
         if (const std::optional<SendspinRole> role = role_from_string(name)) {
@@ -225,7 +226,7 @@ public:
         return this->mask_;
     }
 
-    /// @brief Whether no role was named, implemented here or not.
+    /// @brief Whether the list had no entries, whatever they named.
     bool empty() const {
         return !this->names_any_;
     }

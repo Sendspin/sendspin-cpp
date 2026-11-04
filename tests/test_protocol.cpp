@@ -1605,8 +1605,9 @@ TEST(Protocol, ServerActivateParsesTheActivitiesList) {
 
 // messaging.md "server/activate": a present active_roles is the new set, read as the roles this
 // library implements plus whether it names any role at all. A version this library does not
-// implement sets no bit but still makes the set non-empty, which admission reads. A null one keeps
-// the prior set, and one that is not an array rejects the activate.
+// implement sets no bit but still makes the set non-empty, which admission reads, and so does an
+// entry that is not a string. A null active_roles keeps the prior set, and one that is not an array
+// rejects the activate.
 TEST(Protocol, ServerActivateReadsActiveRoles) {
     struct Row {
         const char* name;
@@ -1623,7 +1624,7 @@ TEST(Protocol, ServerActivateReadsActiveRoles) {
          false},
         {"a version this library does not implement", R"(["player@v2"])", true, true, 0, false},
         {"an explicit empty set", "[]", true, true, 0, true},
-        {"no string element", "[7]", true, true, 0, true},
+        {"an entry that is not a string", "[7]", true, true, 0, false},
         {"null keeps the prior set", "null", true, false, 0, false},
         {"a string", R"("player@v1")", false, false, 0, false},
         {"an object", R"({"player@v1":true})", false, false, 0, false},
