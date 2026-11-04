@@ -42,6 +42,12 @@ hunks: resource problems live in context.
   loop tick) must not allocate. Look for `new`, `malloc`, `std::string` and
   `std::vector` growth, and temporary `JsonDocument`s inside them. Persistent
   reusable buffers are the established pattern.
+- After `start()`, connection setup and message handling allocate through the
+  `platform_malloc` family only, never `operator new` (`std::string`,
+  `std::vector`, `make_shared`, a `std::function` with a wide capture): on
+  ESPHome `operator new` is internal-RAM-only and aborts. A new site belongs
+  in `docs/internals.md` "Memory" or is a finding (`docs/conventions.md`,
+  "Embedded resource discipline").
 - Allocation goes through the `platform_malloc` family or
   `PlatformBuffer`/`TransferBuffer` with a deliberate `MemoryLocation`:
   internal RAM for latency-critical or DMA-adjacent data, SPIRAM-preferring

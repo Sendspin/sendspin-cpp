@@ -4,7 +4,7 @@ Standalone C++ library implementing the Sendspin synchronized audio streaming pr
 
 ## Architecture
 
-The library provides `SendspinClient` as the main public API. It handles the full protocol lifecycle: WebSocket connections, time synchronization, audio decoding/sync, and message routing. One library-owned protocol task owns every connection and does all protocol work; transports only receive (into the shared inbound ring or a connection's fallback buffer) and report closes; `loop()` only polls the network provider and drains the inbox (and, while stopped, frees parked outbound attempts). `docs/internals.md` has the threads, the cross-thread channels, the tick order and the cross-file invariants.
+The library provides `SendspinClient` as the main public API. It handles the full protocol lifecycle: WebSocket connections, time synchronization, audio decoding/sync, and message routing. One library-owned protocol task owns every connection and does all protocol work; transports only receive (into the shared inbound ring or a connection's fallback buffer) and report closes; `loop()` only polls the network provider and drains the inbox (and, while stopped, frees parked outbound attempts). `docs/internals.md` has the threads, the cross-thread channels, the tick order, the allocation model and the cross-file invariants.
 
 ### Key classes
 
@@ -60,7 +60,7 @@ examples/source_client/     - Host example streaming the default PortAudio input
 tests/                      - Host unit tests (GoogleTest)
 tests/esp_idf/              - Build-only ESP-IDF project checking the component's codec dependencies
 tools/stack_usage/          - Script and indirect-call tables that derive the ESP task stack defaults from -fcallgraph-info
-docs/                       - integration-guide.md (consumer guide), internals.md (how the parts fit together: threads, cross-thread channels, tick order, cross-file invariants), playback-sync.md (clock sync and audio alignment), conventions.md (normative design standards)
+docs/                       - integration-guide.md (consumer guide), internals.md (how the parts fit together: threads, cross-thread channels, tick order, memory, cross-file invariants), playback-sync.md (clock sync and audio alignment), conventions.md (normative design standards)
 .claude/skills/             - Review checklists applying the standards to a diff (docs-sync, embedded-review, house-patterns, test-standards)
 ```
 
@@ -94,7 +94,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 
 - **ESP-IDF**: Used as an IDF component via `idf_component.yml`. Sources defined in `cmake/sources.cmake`.
 - **Host (CMake)**: `cmake -B build && cmake --build build`. Uses ccache when installed (`SENDSPIN_USE_CCACHE`, default on when standalone). Fetches dependencies via FetchContent: ArduinoJson, noise-c, IXWebSocket, micro-flac for the player or source role, and micro-opus for the player or source role when `SENDSPIN_ENABLE_OPUS` is on.
-- **Tests**: `cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tests --target sendspin_tests` and `ctest --test-dir build-tests --output-on-failure`.
+- **Tests**: `cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tests --target sendspin_tests` and `ctest --test-dir build-tests --output-on-failure`. The target also builds `sendspin_alloc_tests`, which counts the library's `operator new` calls from accept to admission, for a `client/state` and for a time burst; `SENDSPIN_ALLOC_REPORT=1` prints them grouped by call site.
 - **ThreadSanitizer tests**: `cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tsan --target sendspin_tests` and `TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure`. `ENABLE_TSAN` applies the thread sanitizer to every target, including the fetched dependencies, and cannot be combined with `ENABLE_SANITIZERS`.
 - **Message trace**: `-DSENDSPIN_ENABLE_MESSAGE_TRACE=ON` compiles in `SendspinClientConfig::message_trace` and `tests/test_message_trace.cpp`; CI's test and TSan jobs build it on, the build and no-opus jobs off.
 - **Stack budgets**: the ESP task stack defaults in `config.h` are static call-graph bounds from `tools/stack_usage/` (recipe and per-task figures in its README); re-derive them, and update the README table with them, after a change that deepens a task's call chain.
@@ -107,7 +107,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - C++20 (`gnu++20` on ESP, `cxx_std_20` on host)
 - Namespace: `sendspin`
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
-- Memory: the `platform_malloc` family from `platform/memory.h`, never raw `heap_caps_malloc`/`malloc` in core code (variant semantics under Platform abstraction above)
+- Memory: the `platform_malloc` family from `platform/memory.h`, never raw `heap_caps_malloc`/`malloc` in core code (variant semantics under Platform abstraction above); `operator new` only at construction, `add_*()` and `start()`, with bounded values held inline (`InlineText`, `InlineVector`, `EnumSet`). `docs/internals.md` "Memory" lists the exceptions
 - Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer. Connection state belongs to the protocol task; requests that act on a connection go through its command queue or, for latest-wins lifecycle requests, its request slot, and work bound for the main loop goes through the inbox. Every library lock is a leaf, so there is no lock order.
 - Tests: host-only and white-box; a test file that reaches private members compiles with `-fno-access-control` (`tests/CMakeLists.txt` says what and why), never through a production seam
 - Apache 2.0 license headers on all files

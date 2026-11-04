@@ -1,6 +1,6 @@
 # Sendspin-cpp Internals
 
-This document maps how the library's parts work together: which threads exist, how state crosses between them, the order of one protocol-task tick and one `loop()` drain, and the invariants that span several files. It covers only facts that span files. Why a single function or member behaves as it does is documented at that function or member, and the protocol itself is specified by the Sendspin spec, cited here by section. The design rules new code must follow are in `docs/conventions.md`. How the library keeps audio in time with the server (clock sync and the sync task's alignment) is in `docs/playback-sync.md`.
+This document maps how the library's parts work together: which threads exist, how state crosses between them, the order of one protocol-task tick and one `loop()` drain, where memory comes from, and the invariants that span several files. It covers only facts that span files. Why a single function or member behaves as it does is documented at that function or member, and the protocol itself is specified by the Sendspin spec, cited here by section. The design rules new code must follow are in `docs/conventions.md`. How the library keeps audio in time with the server (clock sync and the sync task's alignment) is in `docs/playback-sync.md`.
 
 ## Code Organization
 
@@ -453,3 +453,27 @@ On ESP, a `SendspinServerConnection`'s lifetime belongs to its httpd session rat
 4. On close, httpd calls `close_fn`, which marks the connection's inbound gate closed and wakes the protocol task; the task drops its observer once the messages the session delivered before closing are processed. httpd calls `free_fn` once no worker is queued for the session.
 
 On host, IXWebSocket callbacks hold a `weak_ptr` to the connection the manager accepted and lock it per message, so this scheme is not needed. A connection the client refuses at delivery is closed and released by the open handler once the delivery has returned, so the refusal does not destroy it inside the delivery either; holding it until the socket's Close would only add a reference cycle through the WebSocket's own callback, since its destructor is trivial and the IX server owns the WebSocket.
+
+## Memory
+
+The library allocates from heaps that fail differently. `operator new`, behind every `std::string`, `std::vector` and `std::make_shared` and any `std::function` whose capture outgrows its small buffer, draws on ESPHome only on internal RAM and aborts when it fails. The `platform_malloc` family (`src/platform/memory.h`, behind `PlatformBuffer` and the JSON arena's overflow) places each block by its `MemoryLocation`, and noise-c allocates its handshake, cipher and hash states with `calloc`; both report a failure, which the caller turns into a refused or closed connection or a dropped message. The exceptions are drawing random bytes (`platform_random_bytes()`) and hashing a PSK into its `psk_id` (`psk_id_for()` on a `std::array`), which abort when noise-c cannot allocate the random or hash state. Construction, `add_*()` and `start()` use any of them. After `start()`, the per-connection and per-message buffers come from the `platform_malloc` family: the JSON arena's overflow, the handshake's prologue, msg1 and msg2 buffers, the fallback buffer, the Noise transport's reassembly and send buffers, and on ESP a send that does not fit the `FixedBlockPool`. The host transport, whose IXWebSocket API copies each frame into a `std::string`, and the host-only message trace sit outside this model: ESP replaces the first with esp_http_server and esp_websocket_client and builds without the second.
+
+Bounded values stay inline: the ids and names a connection holds (`IdText`, `ServerName`), activity and player command sets (`EnumSet`), role sets (`ActiveRoles` and role masks), the protocol task's slot tables (`InlineVector`), and each connection's `NoiseSession`, which owns the noise-c handshake and cipher states, and `NoiseHandshake`. A getter that returns `std::string`, such as the server's id and name, builds it from the inline value on the caller's thread.
+
+`operator new` runs after `start()` at these places:
+
+| What | When |
+|------|------|
+| The connection object, one block that holds its Noise session, handshake and pairing session | Each ESP accept, on the httpd task, with the `shared_ptr` the httpd session slot holds; each `connect_to()`, its URL copied into the request slot on the caller's thread and into the transport on the protocol task. A host accept's is the IXWebSocket transport's |
+| Message fields held on the heap: track metadata, controller `supported_commands`, `group/update`'s `group_id` and `group_name`, `stream/start`'s `codec_header`, artwork channels and visualizer types, and the `stream/end` and `stream/clear` role lists | Each message that carries them, parsed on the protocol task. `group/update`'s fields are copied again into the inbox slot's merged value on the protocol task and into the client's group state on the main loop |
+| The artwork channels and visualizer types of `client/state` | Each `client/state` with the artwork or visualizer role: built on the main loop, copied for each connection on the protocol task |
+| The CPace round state, each built pairing message's base64 fields, the pairing notes for the main loop, a new pairing record | Each pairing exchange, on the protocol task |
+| The record store's list of changed slots; its slot and order blob writes | A pairing or a `server/unpair`, on the protocol task; the flush that follows a pairing, a `server/unpair` or a playback handoff to another paired server, on the main loop |
+| The decode buffer's `TransferBuffer`; a FLAC decoder | The first codec header after `start()`, and each FLAC codec header, on the sync task |
+| The source's codec header | Each source stream start, on the protocol task |
+| The visualizer's spectrum bins | The first spectrum frame after `start()`, and one with more bins, on the drain thread |
+| The player's stream events held for the sync task's idle | Events beyond the list's kept capacity, on the main loop |
+| The ESP server's pending upgrades (`pending_`) and the list a reap collects them in | An upgrade waiting for delivery, on the httpd task; a reap at its deadline, on the protocol task |
+| `closing_` | The shutdown pass, on the protocol task |
+
+The `std::function`s built after `start()` allocate nothing because each capture is one pointer, which fits both standard libraries' small buffer: the Noise transport's frame sinks, set as each connection is constructed; the frame write hook a time send builds, which ESP copies into each send; and the handshake's send function, built for each handshake frame. A change to one of these captures is checked against that buffer, since a callable that does not fit it allocates on every copy.

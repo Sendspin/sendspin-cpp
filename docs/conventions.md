@@ -171,6 +171,18 @@ checklists in `.claude/skills/` apply these standards to a diff.
   Watch for aggressive inlining aggregating several frames into one.
 - Hot paths (per audio chunk, per binary message, per visualizer frame) do not
   allocate. Reuse persistent buffers; size them once with a stated derivation.
+- `operator new` is for construction, `add_*()` and `start()`: on ESPHome it
+  draws only on internal RAM and aborts when it fails. After `start()`, a
+  connection's handshake and admission and the messages that follow allocate
+  only through the `platform_malloc` family, whose failure refuses or closes
+  the connection or drops the message. A value with a bound is held inline
+  (`InlineText`, `InlineVector`, `EnumSet`, `std::array`), and text from a peer
+  is bounded where it is parsed: read in place, refused past its cap, or cut to
+  its field's size. A public type keeps `std::string` and `std::vector`; where
+  its value has a bound, the library holds it inline and builds the public
+  type on the thread that hands it to the consumer. `docs/internals.md`
+  "Memory" lists the `operator new` allocations that remain after `start()`,
+  and `sendspin_alloc_tests` counts them on the paths it walks.
 - Buffer and queue capacities are justified numbers. Derive related constants
   from each other (`constexpr size_t X = Y / 4;`) so they cannot drift apart,
   and do not grow a budget without recording why.
@@ -285,7 +297,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
 
 - `docs/internals.md` holds only facts that span files: the thread model,
   cross-thread channels, the protocol task's tick and the `loop()` drain order,
-  and invariants that hold
+  the allocation model, and invariants that hold
   across classes. Why a single function or member behaves as it does belongs
   in a comment at that function or member, and protocol behavior is cited
   from the spec rather than restated. Do not add test names or numeric
