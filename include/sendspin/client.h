@@ -225,6 +225,12 @@ public:
     }
 };
 
+// <windows.h> (wingdi.h) defines ERROR as a macro unless NOGDI is set; set it aside so the
+// enumerator below compiles when a consumer includes <windows.h> first. Code that names
+// LogLevel::ERROR after <windows.h> still needs NOGDI or its own #undef ERROR.
+#pragma push_macro("ERROR")
+#undef ERROR
+
 /// @brief Log severity levels for host builds
 /// Has no effect on ESP-IDF builds
 enum class LogLevel : uint8_t {
@@ -235,6 +241,8 @@ enum class LogLevel : uint8_t {
     DEBUG = 4,
     VERBOSE = 5,
 };
+
+#pragma pop_macro("ERROR")
 
 // Forward declarations
 class ConnectionManager;
