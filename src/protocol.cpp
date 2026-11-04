@@ -433,9 +433,10 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
 
     // messaging.md "server/activate": active_roles is an optional string[] and sticky (omitted
     // keeps the prior set). A present non-array rejects the message, as stream/end's roles does.
-    // Unlike activities and stream/end's roles, where a non-string entry only narrows what the
-    // message applies to, a non-string entry here names no role but still makes the set
-    // non-empty, which admission reads ("Playback-capable connections").
+    // A non-string entry elsewhere is skipped: in stream/end's roles it only narrows what the
+    // message applies to, and in activities it narrows the declared set, which admission reads,
+    // but every subset of an allowed set is allowed, so it cannot widen what is admitted. Here
+    // skipping it would hide a non-empty set ("Playback-capable connections"), so it counts.
     JsonVariantConst roles_var = root["payload"]["active_roles"];
     if (roles_var.isNull()) {
         activate_msg->active_roles = std::nullopt;
