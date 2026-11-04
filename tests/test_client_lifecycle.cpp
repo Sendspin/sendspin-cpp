@@ -102,6 +102,7 @@ constexpr uint16_t VISUALIZER_HELD_TEARDOWN_TEST_PORT = 19104;
 constexpr uint16_t HELLO_TEST_PORT = 19090;
 constexpr uint16_t OUTBOUND_GOODBYE_TEST_PORT = 19069;
 constexpr uint16_t NETWORK_PROVIDER_TEST_PORT = 19086;
+constexpr uint16_t INBOUND_OFF_TEST_PORT = 19105;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -2060,6 +2061,43 @@ TEST(ClientLifecycle, TheNetworkProviderIsCalledOnTheMainLoopOnly) {
     EXPECT_GT(network.callers.size(), start_calls) << "Control: loop() did not poll the provider";
     for (const std::thread::id caller : network.callers) {
         EXPECT_EQ(caller, main_loop) << "the provider was called off the main loop";
+    }
+}
+
+// With accept_inbound_connections off the client never listens, yet connect_to() still dials.
+// Control: the default listens on the configured port.
+TEST(ClientLifecycle, TurningOffInboundConnectionsLeavesOnlyConnectTo) {
+    struct Row {
+        const char* name;
+        bool accept_inbound;
+    };
+    const Row rows[] = {
+        {"off: nothing listens", false},
+        {"Control: on: the server listens", true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClientConfig config = make_config(INBOUND_OFF_TEST_PORT);
+        config.accept_inbound_connections = row.accept_inbound;
+        SendspinClient client(std::move(config));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        pump_for(client, 100);
+        EXPECT_EQ(port_accepts(INBOUND_OFF_TEST_PORT), row.accept_inbound);
+
+        SilentListener silent;
+        ASSERT_NE(silent.port(), 0);
+        client.connect_to(loopback_url(silent.port()));
+        const int fd = silent.accept_connection();
+        EXPECT_GE(fd, 0) << "connect_to() did not dial";
+        // Ends the handshake at once, so the destructor does not wait out its timeout.
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        silent.close();
+        pump_for(client, 100);
+        client.stop();
     }
 }
 

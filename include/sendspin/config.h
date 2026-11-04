@@ -283,6 +283,12 @@ struct SendspinClientConfig {
                                   ///< + 1 (avoids conflict with web_server component)
     uint16_t server_port{DEFAULT_SERVER_PORT};  ///< WebSocket server port
 
+    /// @brief Whether to run the WebSocket server that servers connect to. Off leaves connect_to()
+    /// as the only way a server reaches the client, for a client that dials one configured server
+    /// and must not be reachable by any other; `server_port` and `server_max_connections` are then
+    /// unused.
+    bool accept_inbound_connections{true};
+
     /// @brief Default maximum simultaneous inbound connections: one established connection, two
     /// unproven connections awaiting the hello handshake (the manager's nursery capacity), and
     /// one spare so a surplus peer can still be accepted long enough to receive a graceful

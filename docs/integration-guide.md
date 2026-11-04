@@ -771,7 +771,8 @@ if (!client.start()) {
 }
 
 // Optionally initiate a client-side connection to a known server URL.
-// Without this, the client waits for incoming server connections.
+// Without this, the client waits for incoming server connections. With
+// accept_inbound_connections off, this is the only way a server reaches it.
 client.connect_to("ws://192.168.1.10:8928/sendspin");
 
 // Main loop: call loop() periodically to deliver callbacks. Connection work runs on the library's
@@ -1362,6 +1363,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `protocol_task_priority` | `unsigned` | `5` | FreeRTOS priority for the protocol task (ESP-IDF only). Defaults to the httpd task's priority, below the player's sync task. |
 | `protocol_task_stack_size` | `size_t` | `7168` | Protocol task stack size in bytes (ESP-IDF only). Every Noise handshake (including the in-band re-handshake after pairing, with its X25519 crypto), the pairing exchange (CPace and SHA-512), the JSON parse, the role handlers and every send run on this task. Derived as for `httpd_stack_size`. Values below the default are clamped up to it with a warning. |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
+| `accept_inbound_connections` | `bool` | `true` | Whether to run the WebSocket server that servers connect to. `false` leaves `connect_to()` as the only way a server reaches the client, for a client that dials one configured server and must not be reachable by any other; `server_port` and `server_max_connections` are then unused. |
 | `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye) |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |
