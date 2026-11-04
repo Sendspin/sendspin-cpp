@@ -321,15 +321,15 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(std::string_view s
     return nullptr;
 }
 
-bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_use) {
+bool RecordStore::evict_one_locked(std::span<const IdText* const> psk_ids_in_use) {
     // records_ runs least-recently-used first (see note_record_played), so the first record no open
     // connection is resolving against is the victim pairing.md "Pairing Records" leaves to the
     // implementation. Evicting one that backs an open connection would strand a live session on a
     // PSK this store no longer holds.
     for (size_t i = 0; i < this->records_.size(); ++i) {
         const std::string& psk_id = this->records_[i].record.psk_id;
-        if (std::find(psk_ids_in_use.begin(), psk_ids_in_use.end(), psk_id) !=
-            psk_ids_in_use.end()) {
+        if (std::any_of(psk_ids_in_use.begin(), psk_ids_in_use.end(),
+                        [&psk_id](const IdText* in_use) { return *in_use == psk_id; })) {
             continue;
         }
         SS_LOGW(TAG, "Evicting record %s for server_id=%s to make room for a new pairing",
@@ -343,14 +343,13 @@ bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_us
 }
 
 bool RecordStore::store_record_superseding(SendspinPairingRecord record,
-                                           const std::vector<std::string>& psk_ids_in_use) {
+                                           std::span<const IdText* const> psk_ids_in_use) {
     // RAM-only: runs on the protocol task (the server/pair-finalize ack handler), where the
     // record must resolve before the handler returns, since the server's follow-up re-handshake
     // is the next message on that thread.
     std::lock_guard<std::mutex> lock(this->mutex_);
 
     size_t idx = this->find_index(record.psk_id);
-    const std::string incoming_psk_id = record.psk_id;
     const bool is_insert = (idx == NPOS);
 
     // Capacity: a replace by psk_id never grows the store, and neither does an insert that
@@ -365,7 +364,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
             // connection budget rules out (see MIN_MAX_RECORDS). Fails closed: the connection
             // drops when the server rekeys onto a PSK this store cannot resolve.
             SS_LOGW(TAG, "Storage full (%zu/%zu) and nothing evictable; rejecting record %s",
-                    this->records_.size(), this->max_records_, incoming_psk_id.c_str());
+                    this->records_.size(), this->max_records_, record.psk_id.c_str());
             return false;
         }
     }
@@ -381,13 +380,14 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
         this->order_dirty_ = true;
     }
 
-    // Retire any other record still bound to this server_id (see the header).
-    const std::string superseded_server_id = this->records_[idx].record.server_id;
+    // Retire any other record still bound to this server_id (see the header). idx follows the
+    // new record across each erase, so records_[idx] is read afresh on every pass.
     uint8_t retired_slot = UNASSIGNED_SLOT;
     for (size_t i = 0; i < this->records_.size();) {
-        if (i != idx && this->records_[i].record.server_id == superseded_server_id) {
+        const std::string& server_id = this->records_[idx].record.server_id;
+        if (i != idx && this->records_[i].record.server_id == server_id) {
             SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
-                    this->records_[i].record.psk_id.c_str(), superseded_server_id.c_str());
+                    this->records_[i].record.psk_id.c_str(), server_id.c_str());
             this->mark_slot_dirty_locked(this->records_[i].slot);
             this->order_dirty_ = true;
             retired_slot = this->records_[i].slot;

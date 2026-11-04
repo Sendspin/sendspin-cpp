@@ -27,7 +27,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
-#include <string>
+#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -169,7 +169,7 @@ struct PlayerRole::Impl : RoleTeardown {
     /// `ordinal`. Protocol task only.
     /// @return false when the sync task is not running, the header does not decode, or the ring
     ///         had no room in time.
-    bool hand_flac_header(const std::string& codec_header, uint16_t ordinal,
+    bool hand_flac_header(std::string_view codec_header, uint16_t ordinal,
                           uint32_t generation) const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it, and carrying a STREAM_START's `ordinal`.

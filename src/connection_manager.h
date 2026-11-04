@@ -494,7 +494,9 @@ public:
 
     /// @brief psk_ids backing a currently-open connection, admitted or in the nursery. These are
     /// the records a completed pairing must not evict (pairing.md "Pairing Records").
-    [[nodiscard]] std::vector<std::string> open_connection_psk_ids() const;
+    /// Each points into its connection, so it is valid only within the protocol-task step that
+    /// called this, which owns every connection.
+    [[nodiscard]] InlineVector<const IdText*, MAX_OPEN_CONNECTIONS> open_connection_psk_ids() const;
 
     // ========================================
     // Protocol task: tick

@@ -71,17 +71,9 @@ static size_t serialize_client_init(std::string_view client_id, const char* suit
     return serializeJson(doc, out.as<char>(), size + 1);
 }
 
-bool build_noise_handshake_message(std::span<const uint8_t> noise_bytes, JsonDocument& doc) {
-    PlatformBuffer encoded;
-    if (!encoded.allocate(b64url_encode_buffer_size(noise_bytes.size()))) {
-        SS_LOGE(TAG, "noise/handshake: no memory to encode %zu bytes", noise_bytes.size());
-        return false;
-    }
+void build_noise_handshake_message(const NoiseMsg2& msg2, JsonDocument& doc) {
     doc["type"] = "noise/handshake";
-    // Copied into the document, which outlives the scratch buffer.
-    doc["payload"]["data"] = b64url_encode_into(encoded.as<char>(), encoded.size(),
-                                                noise_bytes.data(), noise_bytes.size());
-    return true;
+    b64url_encode_to(doc["payload"]["data"], msg2);
 }
 
 // ============================================================================
@@ -470,7 +462,8 @@ bool NoiseHandshake::handle_msg1(std::span<uint8_t> msg1_bytes,
 
     // Send noise/handshake msg2 as a TEXT frame
     JsonDocument msg2 = make_json_document(this->arena_);
-    if (!build_noise_handshake_message(core->msg2_bytes, msg2) || !send_fn(msg2)) {
+    build_noise_handshake_message(core->msg2_bytes, msg2);
+    if (!send_fn(msg2)) {
         SS_LOGE(TAG, "handle_msg1: failed to send noise/handshake msg2");
         return false;
     }

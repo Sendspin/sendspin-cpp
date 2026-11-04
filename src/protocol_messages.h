@@ -19,6 +19,7 @@
 #pragma once
 
 #include "crypto/psk_wrap.h"
+#include "enum_set.h"
 #include "inline_text.h"
 #include "inline_vector.h"
 #include "platform/network_info.h"
@@ -33,7 +34,6 @@
 #include <ArduinoJson.h>
 
 #include <array>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -267,50 +267,6 @@ inline std::optional<SendspinActivity> activity_from_string(std::string_view str
     }
     return std::nullopt;
 }
-
-/// @brief A set of the enumerators 0-7 of `E`, one bit each, visited in enumerator order
-template <typename E>
-class EnumSet {
-    static_assert(std::is_enum_v<E> && sizeof(E) == 1, "EnumSet holds a one-byte enum");
-
-public:
-    EnumSet() = default;
-    EnumSet(std::initializer_list<E> members) {
-        for (const E member : members) {
-            this->insert(member);
-        }
-    }
-
-    void insert(E member) {
-        this->bits_ |= bit(member);
-    }
-
-    bool contains(E member) const {
-        return (this->bits_ & bit(member)) != 0;
-    }
-
-    /// @brief Calls fn(member) for each member, in enumerator order.
-    template <typename Fn>
-    void for_each(Fn&& fn) const {
-        for (uint8_t value = 0; value < CAPACITY; ++value) {
-            if ((this->bits_ & (1U << value)) != 0) {
-                fn(static_cast<E>(value));
-            }
-        }
-    }
-
-    bool operator==(const EnumSet&) const = default;
-
-private:
-    static constexpr uint8_t CAPACITY = 8;
-
-    static uint8_t bit(E member) {
-        assert(static_cast<uint8_t>(member) < CAPACITY && "EnumSet holds enumerators 0-7");
-        return static_cast<uint8_t>(1U << static_cast<uint8_t>(member));
-    }
-
-    uint8_t bits_{0};
-};
 
 /// @brief The activities a server/activate declares: a set, its members unordered and unique
 using ActivitySet = EnumSet<SendspinActivity>;
@@ -1009,14 +965,9 @@ struct ClientStreamStartMessage {
     std::optional<std::string_view> codec_header{};
 };
 
-/// @brief Bit that represents `codec` in a codec mask
-constexpr uint8_t source_codec_bit(SendspinCodecFormat codec) {
-    return static_cast<uint8_t>(1U << static_cast<uint8_t>(codec));
-}
-
-// Every codec, UNSUPPORTED included, has a bit in a uint8_t mask
+// Every codec, UNSUPPORTED (the last) included, is an EnumSet<SendspinCodecFormat> member
 static_assert(static_cast<uint8_t>(SendspinCodecFormat::UNSUPPORTED) < 8,
-              "codec mask is a uint8_t");
+              "EnumSet<SendspinCodecFormat> needs 8 bits");
 
 /// @brief Longest friendly name the server sends, in UTF-8 bytes: messaging.md "server/hello"
 /// caps `name` and "group/update" caps `group_name` at 64 bytes, and a client truncates a longer
@@ -1031,10 +982,10 @@ using ServerName = InlineText<MAX_FRIENDLY_NAME_BYTES>;
 /// activities/active_roles come from the server/activate message that follows.
 struct ServerHelloMessage {
     ServerName name{};
-    /// Codecs the server accepts in client-stream/start, as source_codec_bit() bits; a set value
-    /// always carries the PCM and FLAC bits, nullopt when server/hello carried no valid
-    /// source@v1_support object (roles/source/v1.md "server/hello source@v1 support object").
-    std::optional<uint8_t> source_codecs{};
+    /// Codecs the server accepts in client-stream/start; a set value always holds PCM and FLAC,
+    /// nullopt when server/hello carried no valid source@v1_support object (roles/source/v1.md
+    /// "server/hello source@v1 support object").
+    std::optional<EnumSet<SendspinCodecFormat>> source_codecs{};
 };
 
 /// @brief Parsed server/activate message that follows server/hello.

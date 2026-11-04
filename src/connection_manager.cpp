@@ -922,17 +922,17 @@ void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
     this->drop_connection(conn, std::nullopt);
 }
 
-std::vector<std::string> ConnectionManager::open_connection_psk_ids() const {
-    std::vector<std::string> psk_ids;
-    psk_ids.reserve(MAX_OPEN_CONNECTIONS);
+InlineVector<const IdText*, ConnectionManager::MAX_OPEN_CONNECTIONS>
+ConnectionManager::open_connection_psk_ids() const {
+    InlineVector<const IdText*, MAX_OPEN_CONNECTIONS> psk_ids;
     for (const auto& entry : this->admitted_) {
         if (entry.conn != nullptr && !entry.conn->get_psk_id().empty()) {
-            psk_ids.emplace_back(entry.conn->get_psk_id().view());
+            psk_ids.push_back(&entry.conn->get_psk_id());
         }
     }
     for (const auto& entry : this->nursery_) {
         if (!entry.conn->get_psk_id().empty()) {
-            psk_ids.emplace_back(entry.conn->get_psk_id().view());
+            psk_ids.push_back(&entry.conn->get_psk_id());
         }
     }
     return psk_ids;

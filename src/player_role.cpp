@@ -718,7 +718,7 @@ void PlayerRole::Impl::complete_teardown() {
 // Impl: Helpers
 // ============================================================================
 
-bool PlayerRole::Impl::hand_flac_header(const std::string& codec_header, uint16_t ordinal,
+bool PlayerRole::Impl::hand_flac_header(std::string_view codec_header, uint16_t ordinal,
                                         uint32_t generation) const {
     InboundConsumer& inbound = this->sync_task->inbound();
     InboundRing* ring = inbound.ring();

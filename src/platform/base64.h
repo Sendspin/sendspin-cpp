@@ -16,9 +16,11 @@
 /// @brief Platform-abstracted base64: `platform_base64_*` wrap mbedTLS on ESP and a built-in
 /// codec on host, for the standard `+`/`/` alphabet with `=` padding; base64_encode() is its
 /// portable string form, and `b64url_*` are portable wrappers for the URL-safe alphabet used by
-/// Noise key identifiers (PSK IDs, peer IDs).
+/// Noise key identifiers (PSK IDs, peer IDs), pairing values and Noise handshake messages.
 
 #pragma once
+
+#include "platform/secure_zero.h"
 
 #include <array>
 #include <cstddef>
@@ -312,6 +314,15 @@ inline std::optional<size_t> b64url_decode_into(std::string_view s, uint8_t* dst
 template <size_t N>
 inline bool b64url_decode_exact(std::string_view s, std::array<uint8_t, N>& out) {
     return b64url_decode_into(s, out.data(), out.size()) == N;
+}
+
+/// @brief Assigns `bytes` base64url-encoded (no padding) to `field`, which must copy it (a JSON
+/// member does), through a stack buffer wiped afterwards, so a secret is left only in `field`.
+template <typename Field, size_t N>
+inline void b64url_encode_to(Field field, const std::array<uint8_t, N>& bytes) {
+    std::array<char, b64url_encode_buffer_size(N)> text{};
+    field = b64url_encode_into(text.data(), text.size(), bytes.data(), bytes.size());
+    secure_zero(text.data(), text.size());
 }
 
 /// @brief Decode base64url, tolerating missing `=` padding; nullopt on invalid input.
