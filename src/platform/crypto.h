@@ -390,8 +390,9 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
 
 /// @brief Fill a buffer with cryptographically secure random bytes.
 /// Runs noise-c's ChaCha20 generator with its state on the stack, seeded from the OS
-/// entropy source on host and the ESP32 hardware RNG on ESP; nothing is allocated, so it
-/// cannot fail for a non-null `out`.
+/// entropy source on host and the ESP32 hardware RNG on ESP. Nothing is allocated, so on ESP
+/// it cannot fail for a non-null `out`; on host noise-c exits the process when the OS source
+/// cannot be read.
 inline void platform_random_bytes(uint8_t* out, size_t len) {
     [[maybe_unused]] const int err = noise_randstate_generate_simple(out, len);
     assert(err == NOISE_ERROR_NONE && "platform_random_bytes() needs a buffer");
