@@ -238,6 +238,11 @@ protected:
     /// it played on its own went unreported. New audio starts no earlier than now.
     static int64_t starved_playtime_floor(int64_t playtime_us, int64_t now_us);
 
+    /// @brief Whether a chunk is so late that decoding it cannot produce audio worth playing: more
+    /// than LATE_CHUNK_SKIP_US behind the playtime estimate, so handle_synchronize_audio() would
+    /// drop every frame it decoded to. A smaller lateness keeps a playable remainder.
+    static bool chunk_is_unplayably_late(int64_t client_timestamp, int64_t playtime_us);
+
     /// @brief Sends one chunk of pending silence (initial-sync priming or hard-sync gap fill) to
     /// the sink and updates the playtime estimate. No-op when no silence is pending.
     void send_pending_silence(SyncContext& sync_context);

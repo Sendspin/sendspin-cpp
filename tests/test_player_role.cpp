@@ -1061,6 +1061,32 @@ TEST(PlayerHardSync, AStarvedEstimateIsFlooredAtNow) {
     }
 }
 
+// A chunk is discarded undecoded only when it is later than the longest audio a chunk can decode
+// to. Up to that point handle_synchronize_audio() drops only the late prefix and plays the rest, so
+// a few milliseconds of lateness must not cost the whole chunk.
+TEST(PlayerHardSync, OnlyAChunkLaterThanItsOwnLengthIsSkipped) {
+    constexpr int64_t PLAYTIME = 1'000'000'000;
+    struct Row {
+        const char* name;
+        int64_t client_timestamp;
+        bool expected;
+    };
+    const Row rows[] = {
+        {"Control: due after the estimate", PLAYTIME + 50'000, false},
+        {"Control: due exactly at the estimate", PLAYTIME, false},
+        {"behind by the hard-sync threshold", PLAYTIME - 5'000, false},
+        {"behind by a typical chunk", PLAYTIME - 25'000, false},
+        {"behind by exactly the longest chunk", PLAYTIME - 150'000, false},
+        {"behind by just over the longest chunk", PLAYTIME - 150'001, true},
+        {"behind by a long underrun", PLAYTIME - 20'000'000, true},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(SyncTask::chunk_is_unplayably_late(row.client_timestamp, PLAYTIME), row.expected);
+    }
+}
+
 namespace {
 
 // A sink that accepts every write and records the bytes in order.
