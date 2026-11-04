@@ -35,6 +35,7 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <gtest/gtest.h>
+#include <ArduinoJson.h>
 
 #include <algorithm>
 #include <array>
@@ -424,6 +425,20 @@ void expect_library_allocations(const Window& window, const char* title, size_t 
     }
 }
 
+/// Checks that the `index`th client/state `server` received carries both configured artwork
+/// channels and the visualizer's loudness type, so the window just closed measured their build.
+/// Parsed after the window closes, outside the count.
+void expect_role_objects(const FakeEncryptedServer& server, size_t index) {
+    const std::vector<std::string> states = server.client_states();
+    ASSERT_GT(states.size(), index);
+    JsonDocument doc;
+    ASSERT_EQ(deserializeJson(doc, states[index]), DeserializationError::Ok);
+    EXPECT_EQ(doc["payload"]["artwork"]["channels"].size(), 2U);
+    EXPECT_STREQ(doc["payload"]["artwork"]["channels"][1]["source"], "artist");
+    EXPECT_EQ(doc["payload"]["visualizer"]["types"].size(), 1U);
+    EXPECT_STREQ(doc["payload"]["visualizer"]["types"][0], "loudness");
+}
+
 constexpr uint16_t ALLOCATION_TEST_PORT = 19300;
 constexpr int TIME_BURST_SIZE = 8;
 
@@ -478,6 +493,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
                    [&] { return client.is_connected() && server->client_state_count() > 0; });
     expect_library_allocations(close_window(), "accept to admission and the first client/state",
                                ADMISSION_ALLOCATIONS);
+    expect_role_objects(*server, 0);
 
     pump_while_not(client, [&] { return client.is_time_synced(); });
 
@@ -486,6 +502,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     client.set_available(false);
     pump_while_not(client, [&] { return server->client_state_count() > states_before; });
     expect_library_allocations(close_window(), "client/state", CLIENT_STATE_ALLOCATIONS);
+    expect_role_objects(*server, static_cast<size_t>(states_before));
 
     // Opens just after the main loop reports a completed burst and closes once it reports the
     // next: one burst's sends, its replies and its completion. The next burst starts

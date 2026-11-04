@@ -957,8 +957,8 @@ struct ClientStateMessage {
 // Built on the main loop and copied for each connection on the protocol task, so it owns nothing
 // on the heap (docs/internals.md "Memory"). Unlike ClientHelloMessage it is kept across ticks:
 // its role-object views stay valid because the viewed role configuration is fixed from add_*(),
-// which replaces a role only while the client is stopped, and the protocol task reads only a
-// snapshot that its run's start() or a later publish_state() wrote.
+// which may be called only while the client is stopped (client.h "Role registration"), and the
+// protocol task reads only a snapshot that its run's start() or a later publish_state() wrote.
 static_assert(std::is_trivially_copyable_v<ClientStateMessage>);
 
 /// @brief The client/state one connection receives: the snapshot's availability and the role

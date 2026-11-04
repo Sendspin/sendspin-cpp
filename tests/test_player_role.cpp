@@ -416,7 +416,7 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
             client.protocol_task_->publish_state(client.build_client_state());
             ClientStateMessage snapshot;
             ASSERT_TRUE(client.protocol_task_->take_state(snapshot));
-            client.adopt_client_state(std::move(snapshot));
+            client.adopt_client_state(snapshot);
         };
 
         client.set_available(row.available_when_adopted);
