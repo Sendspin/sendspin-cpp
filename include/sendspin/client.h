@@ -972,7 +972,7 @@ private:
     void note_pairing_failed(std::string_view server_id, SendspinPairAbortReason reason);
 
     /// @brief Queue an on_display_pairing_code notification
-    void note_display_pairing_code(const std::string& code, SendspinPairingCodeFormat format);
+    void note_display_pairing_code(std::string_view code, SendspinPairingCodeFormat format);
 
     /// @brief Queue an on_clear_pairing_code notification
     void note_clear_pairing_code();

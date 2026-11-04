@@ -242,7 +242,7 @@ inline std::string_view b64url_encode_into(char* dst, size_t cap, const uint8_t*
 /// @brief Encode bytes to base64url: an ASCII string of `A-Z a-z 0-9 - _`, no `=` padding.
 inline std::string b64url_encode(const uint8_t* data, size_t len) {
     // Encoded straight into the returned string, so it stays the only copy of the encoding:
-    // callers encoding secrets (the pairing PSK) wipe the one string they get back.
+    // callers encoding a secret wipe the one string they get back.
     std::string out(b64url_encode_buffer_size(len), '\0');
     out.resize(b64url_encode_into(out.data(), out.size(), data, len).size());
     return out;

@@ -281,9 +281,11 @@ public:
 
     /// @brief Mint a pairing outcome: a fresh PSK bound to server_id and the record holding it.
     ///
-    /// Minting cannot fail on a full store: store_record_superseding() supersedes a re-pair's
+    /// Minting never fails on a full store: store_record_superseding() supersedes a re-pair's
     /// existing record and evicts for a net-new one (pairing.md "Pairing Records").
-    [[nodiscard]] PairingOutcome resolve_pairing_outcome(std::string_view server_id);
+    /// @return nullopt when the PSK's psk_id cannot be derived (noise-c could not allocate the
+    ///         hash state).
+    [[nodiscard]] std::optional<PairingOutcome> resolve_pairing_outcome(std::string_view server_id);
 
 private:
     // ========================================

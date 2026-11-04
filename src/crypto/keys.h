@@ -46,7 +46,8 @@ namespace sendspin {
 std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk);
 
 /// @brief Derive the psk_id for an arbitrary-length PSK buffer.
-/// Returns std::nullopt if len != NOISE_PSK_SIZE.
+/// Returns std::nullopt if len != NOISE_PSK_SIZE or the SHA-256 cannot be computed (e.g. a
+/// noise-c allocation failure).
 std::optional<std::string> psk_id_for(const uint8_t* psk, size_t len);
 
 // ============================================================================

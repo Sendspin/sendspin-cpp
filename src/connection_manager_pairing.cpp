@@ -297,10 +297,16 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
 
 void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
                                                  const IdText& server_id) {
-    // resolve_pairing_outcome mints the long-term PSK and the record that holds it. It cannot
-    // fail: a pairing never fails for lack of record storage (pairing.md "Pairing Records"),
-    // and room for the record is made where it is stored.
+    // resolve_pairing_outcome mints the long-term PSK and the record that holds it. A pairing
+    // never fails for lack of record storage (pairing.md "Pairing Records"): room for the record
+    // is made where it is stored.
     auto outcome = this->client_->record_store_->resolve_pairing_outcome(server_id.view());
+    if (!outcome.has_value()) {
+        SS_LOGE(TAG, "handle_enter_pairing_psk: minting the long-term PSK failed for server_id=%s",
+                server_id.c_str());
+        this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+        return;
+    }
 
     // pairing.md "Pairing PSK Flow": after the pairing server/activate the client sends
     // client/pair-init followed immediately by client/pair-finalize, without waiting for a
@@ -319,12 +325,12 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
     // The message carries the raw base64 long-term PSK: the arena wipes the document, and its
     // serialized text is encrypted over in place or wiped (NoiseTransport::send_staged_json()).
     JsonDocument json = make_json_document(this->json_arena());
-    build_client_pair_finalize_message(outcome.psk, json);
+    build_client_pair_finalize_message(outcome->psk, json);
     conn->send_json(json);
 
     // Hold the pending record: committed to the RecordStore by the server/pair-finalize handler
     // on ack.
-    conn->set_pending_pairing_record(std::move(outcome.record));
+    conn->set_pending_pairing_record(std::move(outcome->record));
 }
 
 void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortReason reason) {
@@ -691,13 +697,19 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     // Now run the same resolve_pairing_outcome path as pairing_psk, then send
     // client/pair-finalize. The server will respond with server/pair-finalize.
     auto outcome = store.resolve_pairing_outcome(server_id.view());
+    if (!outcome.has_value()) {
+        SS_LOGE(TAG, "handle_pairing_message: minting the long-term PSK failed for server_id=%s",
+                server_id.c_str());
+        this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+        return;
+    }
 
     // The code-based flows carry the new PSK wrapped under the CPace output, not in the clear
     // (pairing.md "Wrapping"). K_wrap = SHA-256(PSK_WRAP_LABEL || sid || ISK); the PSK is
     // sealed with the connection's negotiated AEAD, a 12-byte all-zero nonce, and empty AD. The
     // label differs from the one nonce_B was sealed under, so the two fields never share a key.
     auto wrapped =
-        wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), outcome.psk);
+        wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), outcome->psk);
     if (!wrapped.has_value()) {
         SS_LOGE(TAG, "handle_pairing_message: wrapping the long-term PSK failed for server_id=%s",
                 server_id.c_str());
@@ -712,7 +724,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     JsonDocument json = make_json_document(this->json_arena());
     build_client_pair_finalize_wrapped_message(wrapped.value(), json);
     conn->send_json(json);
-    conn->set_pending_pairing_record(std::move(outcome.record));
+    conn->set_pending_pairing_record(std::move(outcome->record));
 
     ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_FINALIZE;
 }
