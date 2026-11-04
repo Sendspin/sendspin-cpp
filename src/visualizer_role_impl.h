@@ -181,6 +181,8 @@ struct VisualizerRole::Impl : RoleTeardown {
     // ========================================
 
     // Struct fields
+    /// Fixed at construction: client/state snapshots view its stream types
+    /// (ClientVisualizerStateObject::types).
     VisualizerRoleConfig config;
     VisualizerSupportObject visualizer_support;
 

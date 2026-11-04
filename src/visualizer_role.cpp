@@ -271,7 +271,7 @@ void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     visualizer_state.types = this->config.stream.types;
     visualizer_state.rate_max = this->config.stream.rate_max;
     visualizer_state.spectrum = this->config.stream.spectrum;
-    msg.visualizer = std::move(visualizer_state);
+    msg.visualizer = visualizer_state;
 }
 
 // ============================================================================

@@ -1027,9 +1027,10 @@ TEST(Protocol, FormatClientHelloVisualizerSupport) {
 TEST(Protocol, FormatClientStateVisualizerCarriesStreamConfig) {
     ClientStateMessage msg;
     ClientVisualizerStateObject vis{};
-    vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
-                 VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
-                 VisualizerDataType::PEAK};
+    const std::array types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
+                              VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
+                              VisualizerDataType::PEAK};
+    vis.types = types;
     vis.rate_max = 60;
     vis.spectrum = VisualizerSpectrumConfig{
         .n_disp_bins = 32,
@@ -1244,9 +1245,12 @@ TEST(Protocol, FormatClientStatePlayerReportsZeroTimingFields) {
 // serializer that wrote one channel's value under another's key would be caught.
 TEST(Protocol, FormatClientStateArtworkChannels) {
     ClientStateMessage msg;
+    const std::array<ArtworkChannelFormatObject, 2> channel_formats = {{
+        {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 240},
+        {SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 48},
+    }};
     ClientArtworkStateObject artwork{};
-    artwork.channels.push_back({SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 240});
-    artwork.channels.push_back({SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 48});
+    artwork.channels = channel_formats;
     msg.artwork = artwork;
 
     JsonDocument doc;
@@ -1273,8 +1277,11 @@ TEST(Protocol, FormatClientStateArtworkChannels) {
 // are required only for a channel that is actually served.
 TEST(Protocol, FormatClientStateArtworkNoneChannelOmitsFormatAndSize) {
     ClientStateMessage msg;
+    const std::array<ArtworkChannelFormatObject, 1> channel_formats = {{
+        {SendspinImageSource::NONE, SendspinImageFormat::JPEG, 320, 240},
+    }};
     ClientArtworkStateObject artwork{};
-    artwork.channels.push_back({SendspinImageSource::NONE, SendspinImageFormat::JPEG, 320, 240});
+    artwork.channels = channel_formats;
     msg.artwork = artwork;
 
     JsonDocument doc;

@@ -1529,7 +1529,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     conn->send_json(json);
 }
 
-void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {
+void SendspinClient::adopt_client_state(const ClientStateMessage& snapshot) {
 #ifdef SENDSPIN_ENABLE_SOURCE
     // roles/source/v1.md "Source command semantics": a source that becomes unavailable clears its
     // authorization and ends its input stream before it reports available: false.
@@ -1538,7 +1538,7 @@ void SendspinClient::adopt_client_state(ClientStateMessage&& snapshot) {
             this->connection_manager_->role_owner(SendspinRole::SOURCE));
     }
 #endif
-    this->task_state_->client_state = std::move(snapshot);
+    this->task_state_->client_state = snapshot;
     this->connection_manager_->for_each_admitted(
         [this](AdmittedEntry& entry) { this->publish_client_state(entry.conn.get()); });
 }

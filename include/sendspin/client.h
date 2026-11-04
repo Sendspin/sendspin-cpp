@@ -897,7 +897,7 @@ private:
     /// @brief Makes `snapshot` the client/state every admitted connection's is built from, and
     /// sends each admitted connection its copy (publish_client_state()). An unavailable snapshot
     /// first ends the source's input stream. Protocol task only.
-    void adopt_client_state(ClientStateMessage&& snapshot);
+    void adopt_client_state(const ClientStateMessage& snapshot);
 
     /// @brief Whether the adopted client/state snapshot reports the client available; false before
     /// the first is adopted (adopt_client_state()). Protocol task only.

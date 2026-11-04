@@ -185,7 +185,7 @@ void ArtworkRole::Impl::build_state_fields(ClientStateMessage& msg) const {
 
     ClientArtworkStateObject artwork_state{};
     artwork_state.channels = this->artwork_channels;
-    msg.artwork = std::move(artwork_state);
+    msg.artwork = artwork_state;
 }
 
 // ============================================================================

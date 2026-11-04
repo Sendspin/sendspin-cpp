@@ -782,14 +782,16 @@ struct ServerArtworkStreamObject {
 
 /// @brief Visualizer stream configuration reported by the client in client/state messages
 struct ClientVisualizerStateObject {
-    std::vector<VisualizerDataType> types{};
+    /// Views the role's configuration; see ClientStateMessage.
+    std::span<const VisualizerDataType> types{};
     uint16_t rate_max{};
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 
 /// @brief Artwork channel configuration reported by the client in client/state messages
 struct ClientArtworkStateObject {
-    std::vector<ArtworkChannelFormatObject> channels;
+    /// Views the role's channels; see ClientStateMessage.
+    std::span<const ArtworkChannelFormatObject> channels{};
 };
 
 // --- visualizer_role.h ---
@@ -951,6 +953,13 @@ struct ClientStateMessage {
     std::optional<ClientVisualizerStateObject> visualizer{};
     std::optional<ClientSourceStateObject> source{};
 };
+
+// Built on the main loop and copied for each connection on the protocol task, so it owns nothing
+// on the heap (docs/internals.md "Memory"). Unlike ClientHelloMessage it is kept across ticks:
+// its role-object views stay valid because the viewed role configuration is fixed from add_*(),
+// which replaces a role only while the client is stopped, and the protocol task reads only a
+// snapshot that its run's start() or a later publish_state() wrote.
+static_assert(std::is_trivially_copyable_v<ClientStateMessage>);
 
 /// @brief The client/state one connection receives: the snapshot's availability and the role
 /// objects of the roles in `roles` only

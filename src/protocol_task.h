@@ -241,15 +241,15 @@ public:
     /// @brief Replaces the latest client/state snapshot and wakes the task. Main loop
     /// (SendspinClient::publish_state() and start()).
     ///
-    /// One slot beside the command queue: a snapshot is never refused, only the newest matters,
-    /// and the one it replaces is destroyed outside the lock. The tick applies it after draining
-    /// the command queue; its order relative to queued commands is not a semantic requirement,
-    /// since a snapshot describes the client's whole state rather than a step.
-    void publish_state(ClientStateMessage state);
+    /// One slot beside the command queue: a snapshot is never refused, and only the newest
+    /// matters. The tick applies it after draining the command queue; its order relative to
+    /// queued commands is not a semantic requirement, since a snapshot describes the client's
+    /// whole state rather than a step.
+    void publish_state(const ClientStateMessage& state);
 
     /// @brief Takes the latest snapshot, if one was published since the last take. Protocol task
     /// only.
-    /// @param[out] out Receives the snapshot; what it held before is destroyed outside the lock.
+    /// @param[out] out Receives the snapshot.
     /// @return false when no snapshot is waiting.
     bool take_state(ClientStateMessage& out);
 
@@ -295,7 +295,7 @@ private:
     /// Created in the constructor, before any thread that wakes the task exists.
     EventFlags event_flags_;
     /// The newest client/state snapshot not yet taken. Written by the main loop, taken by the
-    /// protocol task; guarded by command_mutex_ and only ever swapped under it.
+    /// protocol task; guarded by command_mutex_.
     std::optional<ClientStateMessage> latest_state_;
     std::thread thread_;
     /// The protocol work, set by start() before the thread exists and read only by the thread.
