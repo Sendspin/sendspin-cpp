@@ -180,7 +180,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
   (`std::span`, `std::string_view`) when it is configuration fixed from
   `add_*()`, and text from a peer
   is bounded where it is parsed: read in place, refused past its cap, or cut to
-  its field's size. A public type keeps `std::string` and `std::vector`; where
+  its field's size. Peer text a log line prints that no field bounds (a type, a
+  reason, an unrecognized value) is cut to `PEER_TEXT_LOG_BYTES`
+  (`peer_text_for_log()`). A public type keeps `std::string` and `std::vector`; where
   its value has a bound, the library holds it inline and builds the public
   type on the thread that hands it to the consumer. `docs/internals.md`
   "Memory" lists the `operator new` allocations that remain after `start()`,

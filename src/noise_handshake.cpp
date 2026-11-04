@@ -16,6 +16,7 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "inline_text.h"
 #include "noise_session.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
@@ -31,10 +32,6 @@
 static const char* const TAG = "sendspin.noise_handshake";
 
 namespace sendspin {
-
-/// Most bytes of unauthenticated peer text (a frame's type, a server/error reason) one log line
-/// prints. The longest such value messaging.md defines is 19 bytes.
-static constexpr size_t PEER_TEXT_LOG_BYTES = 32;
 
 static_assert(MAX_HANDSHAKE_MSG1_BYTES ==
                   X25519_KEY_SIZE + MAX_HANDSHAKE_MESSAGE_BYTES + AEAD_TAG_SIZE,
@@ -340,7 +337,7 @@ void NoiseHandshake::take_server_error(JsonObjectConst root, const char* log_con
     // place and logged only up to PEER_TEXT_LOG_BYTES, never copied.
     const std::string_view text = root["payload"]["reason"] | std::string_view("");
     this->server_error_reason_ = server_error_reason_from_string(text);
-    const std::string_view logged = text.substr(0, PEER_TEXT_LOG_BYTES);
+    const std::string_view logged = peer_text_for_log(text);
     SS_LOGE(TAG, "%s: server/error, reason='%.*s'; the server refused the connection", log_context,
             static_cast<int>(logged.size()), logged.data());
 }
@@ -381,7 +378,7 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
             return false;
         }
         if (type != expected_type) {
-            const std::string_view logged = type.substr(0, PEER_TEXT_LOG_BYTES);
+            const std::string_view logged = peer_text_for_log(type);
             SS_LOGE(TAG, "%s: unexpected type '%.*s'", log_context, static_cast<int>(logged.size()),
                     logged.data());
             return false;

@@ -153,8 +153,9 @@ static std::optional<E> read_enum_field(JsonVariantConst var, const char* name,
     const auto text = var.as<std::string_view>();
     std::optional<E> value = from_string(text);
     if (!value) {
+        const std::string_view logged = peer_text_for_log(text);
         SS_LOGW(TAG, "Ignoring field '%s': unknown value '%.*s'", name,
-                static_cast<int>(text.size()), text.data());
+                static_cast<int>(logged.size()), logged.data());
     }
     return value;
 }
@@ -315,59 +316,55 @@ static void parse_color_field(JsonVariantConst var, const char* name,
 // Message type determination
 
 SendspinServerToClientMessageType determine_message_type(JsonObject root) {
-    // Compared in place against the arena's NUL-terminated string: extracting an
-    // std::string here would heap-allocate for every type name longer than the SSO limit.
-    const char* type_str = root["type"].as<const char*>();
-    if (type_str == nullptr) {
-        return SendspinServerToClientMessageType::UNKNOWN;
-    }
+    // Read in place with its length, so a type with an escaped NUL matches no name below.
+    const std::string_view type = root["type"] | std::string_view("");
 
-    if (std::strcmp(type_str, "server/hello") == 0) {
+    if (type == "server/hello") {
         return SendspinServerToClientMessageType::SERVER_HELLO;
     }
-    if (std::strcmp(type_str, "server/activate") == 0) {
+    if (type == "server/activate") {
         return SendspinServerToClientMessageType::SERVER_ACTIVATE;
     }
-    if (std::strcmp(type_str, "server/time") == 0) {
+    if (type == "server/time") {
         return SendspinServerToClientMessageType::SERVER_TIME;
     }
-    if (std::strcmp(type_str, "server/state") == 0) {
+    if (type == "server/state") {
         return SendspinServerToClientMessageType::SERVER_STATE;
     }
-    if (std::strcmp(type_str, "server/command") == 0) {
+    if (type == "server/command") {
         return SendspinServerToClientMessageType::SERVER_COMMAND;
     }
-    if (std::strcmp(type_str, "stream/start") == 0) {
+    if (type == "stream/start") {
         return SendspinServerToClientMessageType::STREAM_START;
     }
-    if (std::strcmp(type_str, "stream/end") == 0) {
+    if (type == "stream/end") {
         return SendspinServerToClientMessageType::STREAM_END;
     }
-    if (std::strcmp(type_str, "stream/clear") == 0) {
+    if (type == "stream/clear") {
         return SendspinServerToClientMessageType::STREAM_CLEAR;
     }
-    if (std::strcmp(type_str, "group/update") == 0) {
+    if (type == "group/update") {
         return SendspinServerToClientMessageType::GROUP_UPDATE;
     }
-    if (std::strcmp(type_str, "noise/handshake") == 0) {
+    if (type == "noise/handshake") {
         return SendspinServerToClientMessageType::NOISE_HANDSHAKE;
     }
-    if (std::strcmp(type_str, "server/pair-finalize") == 0) {
+    if (type == "server/pair-finalize") {
         return SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE;
     }
-    if (std::strcmp(type_str, "pair/abort") == 0) {
+    if (type == "pair/abort") {
         return SendspinServerToClientMessageType::PAIR_ABORT;
     }
-    if (std::strcmp(type_str, "server/unpair") == 0) {
+    if (type == "server/unpair") {
         return SendspinServerToClientMessageType::SERVER_UNPAIR;
     }
-    if (std::strcmp(type_str, "server/pair-init") == 0) {
+    if (type == "server/pair-init") {
         return SendspinServerToClientMessageType::SERVER_PAIR_INIT;
     }
-    if (std::strcmp(type_str, "server/pair-auth") == 0) {
+    if (type == "server/pair-auth") {
         return SendspinServerToClientMessageType::SERVER_PAIR_AUTH;
     }
-    if (std::strcmp(type_str, "server/pair-confirm") == 0) {
+    if (type == "server/pair-confirm") {
         return SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM;
     }
 
@@ -445,9 +442,12 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
         }
     }
 
-    // active_roles is optional and sticky (omitted = keep prior set).
+    // messaging.md "server/activate": active_roles is an optional string[] and sticky (omitted
+    // keeps the prior set). A present non-array rejects the message, as stream/end's roles does.
     JsonVariantConst roles_var = root["payload"]["active_roles"];
-    if (roles_var.is<JsonArrayConst>()) {
+    if (roles_var.isNull()) {
+        activate_msg->active_roles = std::nullopt;
+    } else if (roles_var.is<JsonArrayConst>()) {
         ActiveRoles roles;
         for (JsonVariantConst role_var : roles_var.as<JsonArrayConst>()) {
             if (role_var.is<const char*>()) {
@@ -456,7 +456,8 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
         }
         activate_msg->active_roles = roles;
     } else {
-        activate_msg->active_roles = std::nullopt;
+        SS_LOGE(TAG, "Invalid server/activate message: active_roles is not an array");
+        return false;
     }
 
     // pairing object: required when 'pairing' is in activities, ignored otherwise (the
@@ -1285,8 +1286,9 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
     const auto reason_str = root["payload"]["reason"].as<std::string_view>();
     auto reason = pair_abort_reason_from_string(reason_str);
     if (!reason.has_value()) {
-        SS_LOGW(TAG, "pair/abort: unrecognized reason '%.*s'", static_cast<int>(reason_str.size()),
-                reason_str.data());
+        const std::string_view logged = peer_text_for_log(reason_str);
+        SS_LOGW(TAG, "pair/abort: unrecognized reason '%.*s'", static_cast<int>(logged.size()),
+                logged.data());
         return false;
     }
 

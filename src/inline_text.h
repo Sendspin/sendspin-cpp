@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// @file inline_text.h
-/// @brief Bounded text held inside the object, and UTF-8-safe truncation
+/// @brief Bounded text held inside the object, UTF-8-safe truncation, and the peer-text log bound
 
 #pragma once
 
@@ -48,6 +48,16 @@ inline std::string_view utf8_truncate(std::string_view text, size_t max_bytes) {
         --len;
     }
     return text.substr(0, len);
+}
+
+/// @brief Most bytes of a peer's text (a message type, a reason, an unrecognized value) one log
+/// line prints. Every such value messaging.md and pairing.md define fits; the longest,
+/// "pairing_code_mismatch", is 21 bytes.
+constexpr size_t PEER_TEXT_LOG_BYTES = 32;
+
+/// @brief `text` cut to at most PEER_TEXT_LOG_BYTES, for a log line's `%.*s`
+inline std::string_view peer_text_for_log(std::string_view text) {
+    return utf8_truncate(text, PEER_TEXT_LOG_BYTES);
 }
 
 /// @brief Text of at most N bytes held inline, NUL-terminated

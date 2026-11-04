@@ -688,7 +688,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn,
     // (unlike the reasons above, this does not close the connection).
     // A pairing activate that names no usable method (pairing object absent, or a
     // method string this client does not recognize; process_server_activate_message
-    // logs the raw value) cannot start any flow.
+    // logs the unrecognized value) cannot start any flow.
     if (is_pairing_activate && !msg.pairing_method.has_value()) {
         refuse_activate(conn, "declares pairing with no usable pairing.method",
                         "absent or unrecognized", this->json_arena());

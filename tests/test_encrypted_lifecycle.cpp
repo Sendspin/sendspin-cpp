@@ -33,6 +33,7 @@
 #include "inbound_ring.h"
 #include "inbox.h"
 #include "lifecycle_test_fixtures.h"
+#include "log_capture.h"
 #include "platform/crypto.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
@@ -2088,6 +2089,21 @@ TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
     EXPECT_EQ(admitted.time_frame_tag_, 0U) << "the reply to the frame in flight takes it";
 
     client.stop();
+}
+
+// Any connection keyed with the published Sentinel PSK can send a message of a type no handler
+// takes; its warning prints at most PEER_TEXT_LOG_BYTES of that type.
+TEST(EncryptedLifecycle, AnUnhandledTypeIsLoggedOnlyUpToTheBound) {
+    DispatchTestClient bundle("Unhandled Type Log Test Client");
+    DispatchTestConnection& conn = bundle.connection();
+
+    const std::string type(4 * PEER_TEXT_LOG_BYTES, 'x');
+    StderrCapture capture;
+    bundle.deliver(conn, R"({"type":")" + type + R"("})");
+    const std::string log = capture.release();
+    EXPECT_NE(log.find(type.substr(0, PEER_TEXT_LOG_BYTES)), std::string::npos)
+        << "Control: the type is logged at all: " << log;
+    EXPECT_EQ(log.find(type.substr(0, PEER_TEXT_LOG_BYTES + 1)), std::string::npos) << log;
 }
 
 // messaging.md "server/state": each metadata object carries the role's full state, so what a
