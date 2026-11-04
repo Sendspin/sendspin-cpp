@@ -266,7 +266,12 @@ else()
     # Examples
     if(BUILD_EXAMPLES)
         add_subdirectory(examples/basic_client)
-        add_subdirectory(examples/tui_client)
+        # tui_client parses its options with POSIX getopt(), which Windows lacks
+        if(NOT WIN32)
+            add_subdirectory(examples/tui_client)
+        else()
+            message(STATUS "Skipping tui_client example (POSIX-only)")
+        endif()
         # source_client demonstrates only the source role, so the whole target is gated on it
         if(SENDSPIN_ENABLE_SOURCE)
             add_subdirectory(examples/source_client)
