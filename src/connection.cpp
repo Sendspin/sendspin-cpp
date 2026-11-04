@@ -343,9 +343,7 @@ bool SendspinConnection::handle_noise_rehandshake(std::span<uint8_t> msg1_bytes)
 
     // Commit: encrypt msg2 under the OLD session and send it, then swap to the new session.
     JsonDocument msg2 = make_json_document(*this->json_arena_);
-    if (!build_noise_handshake_message(result->msg2_bytes, msg2)) {
-        return false;
-    }
+    build_noise_handshake_message(result->msg2_bytes, msg2);
     const std::string_view msg2_text = this->stage_json(msg2);
     if (msg2_text.data() == nullptr) {
         SS_LOGE(TAG, "handle_noise_rehandshake: failed to stage msg2");

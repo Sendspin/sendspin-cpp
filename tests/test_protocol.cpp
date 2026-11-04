@@ -804,16 +804,16 @@ TEST(Protocol, FriendlyNamesAreTruncatedToTheirCap) {
 // client-stream/start, which must include pcm and flac, with unrecognized identifiers ignored. A
 // malformed object rejects only itself, never the hello.
 TEST(Protocol, ServerHelloSourceSupportListsAcceptedCodecs) {
-    constexpr uint8_t PCM_FLAC =
-        source_codec_bit(SendspinCodecFormat::PCM) | source_codec_bit(SendspinCodecFormat::FLAC);
+    using Codecs = EnumSet<SendspinCodecFormat>;
+    const Codecs PCM_FLAC{SendspinCodecFormat::PCM, SendspinCodecFormat::FLAC};
     struct Row {
         const char* payload;
-        std::optional<uint8_t> codecs;
+        std::optional<Codecs> codecs;
     };
     const Row rows[] = {
         // Control: a listed codec set parses.
         {R"("source@v1_support":{"supported_codecs":["pcm","flac","opus"]})",
-         PCM_FLAC | source_codec_bit(SendspinCodecFormat::OPUS)},
+         Codecs{SendspinCodecFormat::PCM, SendspinCodecFormat::FLAC, SendspinCodecFormat::OPUS}},
         // An unrecognized identifier is dropped, the rest kept.
         {R"("source@v1_support":{"supported_codecs":["pcm","mp3","flac"]})", PCM_FLAC},
         // A repeated identifier names its codec once.

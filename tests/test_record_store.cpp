@@ -59,6 +59,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -801,16 +802,19 @@ TEST(RecordStore, ANewRecordIsNotTheNextVictim) {
 // least recently used one.
 TEST(RecordStore, EvictionSkipsRecordsBackingOpenConnections) {
     RecordStore store(nullptr);
-    std::vector<std::string> psk_ids;
+    std::vector<IdText> psk_id_texts(RecordStore::DEFAULT_MAX_RECORDS);
+    std::vector<const IdText*> psk_ids;
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
         auto outcome =
             store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i))).value();
-        psk_ids.push_back(outcome.record.psk_id);
+        ASSERT_TRUE(psk_id_texts[i].assign(outcome.record.psk_id));
+        psk_ids.push_back(&psk_id_texts[i]);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
 
     auto overflow = store.resolve_pairing_outcome(test_peer_id("server-overflow")).value();
-    ASSERT_TRUE(store.store_record_superseding(overflow.record, {psk_ids.front()}));
+    ASSERT_TRUE(store.store_record_superseding(overflow.record,
+                                               std::span<const IdText* const>(psk_ids).first(1)));
 
     EXPECT_NE(store.record_by_server_id(test_peer_id("server-0")), nullptr)
         << "the record an open connection resolves against must survive";
@@ -823,11 +827,13 @@ TEST(RecordStore, EvictionSkipsRecordsBackingOpenConnections) {
 // assertion), so the store is driven here directly.
 TEST(RecordStore, NothingEvictableRejectsTheRecord) {
     RecordStore store(nullptr);
-    std::vector<std::string> psk_ids;
+    std::vector<IdText> psk_id_texts(RecordStore::DEFAULT_MAX_RECORDS);
+    std::vector<const IdText*> psk_ids;
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
         auto outcome =
             store.resolve_pairing_outcome(test_peer_id("server-" + std::to_string(i))).value();
-        psk_ids.push_back(outcome.record.psk_id);
+        ASSERT_TRUE(psk_id_texts[i].assign(outcome.record.psk_id));
+        psk_ids.push_back(&psk_id_texts[i]);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
 

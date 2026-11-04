@@ -37,6 +37,7 @@ add_executable(sendspin_tests
     test_protocol_task.cpp
     test_inbox.cpp
     test_player_role.cpp
+    test_enum_set.cpp
     test_inline_text.cpp
     test_inline_vector.cpp
     test_fixed_block_pool.cpp

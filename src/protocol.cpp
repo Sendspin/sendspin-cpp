@@ -15,7 +15,6 @@
 #include "platform/base64.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
-#include "platform/secure_zero.h"
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
 #include "sendspin/config.h"
@@ -112,15 +111,6 @@ static bool read_stream_roles(JsonVariantConst var, const char* type, StreamRole
     }
     *out = roles;
     return true;
-}
-
-/// @brief Writes `bytes` base64url-encoded (no padding) into `field`, which copies it, through a
-/// stack buffer wiped afterwards, so a pairing secret leaves no copy outside the document.
-template <typename Field, size_t N>
-static void write_b64url(Field field, const std::array<uint8_t, N>& bytes) {
-    std::array<char, b64url_encode_buffer_size(N)> text{};
-    field = b64url_encode_into(text.data(), text.size(), bytes.data(), bytes.size());
-    secure_zero(text.data(), text.size());
 }
 
 /// @brief Reads a friendly name: messaging.md "server/hello" and "group/update" cap one at
@@ -395,9 +385,7 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
         if (!codecs.is<JsonArrayConst>()) {
             SS_LOGW(TAG, "Ignoring server/hello source@v1_support: missing supported_codecs");
         } else {
-            constexpr uint8_t REQUIRED = source_codec_bit(SendspinCodecFormat::PCM) |
-                                         source_codec_bit(SendspinCodecFormat::FLAC);
-            uint8_t accepted = 0;
+            EnumSet<SendspinCodecFormat> accepted;
             bool all_strings = true;
             for (JsonVariantConst codec : codecs.as<JsonArrayConst>()) {
                 if (!codec.is<const char*>()) {
@@ -405,12 +393,13 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
                     break;
                 }
                 if (auto format = codec_format_from_string(codec.as<std::string_view>())) {
-                    accepted |= source_codec_bit(*format);
+                    accepted.insert(*format);
                 }
             }
             if (!all_strings) {
                 SS_LOGW(TAG, "Ignoring server/hello source@v1_support: non-string codec entry");
-            } else if ((accepted & REQUIRED) != REQUIRED) {
+            } else if (!accepted.contains(SendspinCodecFormat::PCM) ||
+                       !accepted.contains(SendspinCodecFormat::FLAC)) {
                 SS_LOGW(TAG, "Ignoring server/hello source@v1_support: pcm or flac not listed");
             } else {
                 hello_msg->source_codecs = accepted;
@@ -1252,7 +1241,7 @@ void build_client_pair_finalize_message(const std::array<uint8_t, 32>& psk, Json
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
-    write_b64url(root["payload"]["long_term_psk"], psk);
+    b64url_encode_to(root["payload"]["long_term_psk"], psk);
 }
 
 void build_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk,
@@ -1263,7 +1252,7 @@ void build_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& w
     root["type"] = "client/pair-finalize";
     // Pairing-code flows only (pairing.md "Wrapping"); exactly one of long_term_psk/wrapped_psk
     // is present per message.
-    write_b64url(root["payload"]["wrapped_psk"], wrapped_psk);
+    b64url_encode_to(root["payload"]["wrapped_psk"], wrapped_psk);
 }
 
 void build_pair_abort_message(PairAbortReason reason, JsonDocument& doc) {
@@ -1372,7 +1361,7 @@ void build_client_pair_init_message(const std::array<uint8_t, 32>& commit_b, uin
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
-    write_b64url(root["payload"]["commit_B"], commit_b);
+    b64url_encode_to(root["payload"]["commit_B"], commit_b);
     root["payload"]["pairing_index"] = pairing_index;
 }
 
@@ -1398,7 +1387,7 @@ void build_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2, J
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-auth";
-    write_b64url(root["payload"]["pake_msg_2"], pake_msg_2);
+    b64url_encode_to(root["payload"]["pake_msg_2"], pake_msg_2);
 }
 
 void build_client_pair_confirm_message(
@@ -1407,11 +1396,11 @@ void build_client_pair_confirm_message(
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";
-    write_b64url(root["payload"]["client_kc"], client_kc);
+    b64url_encode_to(root["payload"]["client_kc"], client_kc);
     // The commitment opening crosses the wire sealed under the CPace output, never in the clear
     // (pairing.md "Wrapping"): an observer that cannot complete the PAKE cannot reconstruct the
     // pairing code from the handshake it watched.
-    write_b64url(root["payload"]["wrapped_nonce_B"], wrapped_nonce_b);
+    b64url_encode_to(root["payload"]["wrapped_nonce_B"], wrapped_nonce_b);
 }
 
 void build_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
@@ -1420,7 +1409,7 @@ void build_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
 
     root["type"] = "client/pair-confirm";
     // The static flow sends no commit_B, so it has no opening to wrap.
-    write_b64url(root["payload"]["client_kc"], client_kc);
+    b64url_encode_to(root["payload"]["client_kc"], client_kc);
 }
 
 }  // namespace sendspin

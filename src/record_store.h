@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -194,7 +195,7 @@ public:
     ///        exists.
     /// @return true when stored; false only when every record at capacity is in use.
     bool store_record_superseding(SendspinPairingRecord record,
-                                  const std::vector<std::string>& psk_ids_in_use = {});
+                                  std::span<const IdText* const> psk_ids_in_use = {});
 
     /// @brief Save the record slots that changed since the last call, plus the record-order
     /// blob when the eviction order moved. Main loop only: it calls the provider. The deferred
@@ -372,7 +373,7 @@ private:
     /// make room for a net-new one. Call with mutex_ held.
     /// @param psk_ids_in_use psk_ids that must not be evicted (see store_record_superseding).
     /// @return true when a record was evicted.
-    bool evict_one_locked(const std::vector<std::string>& psk_ids_in_use);
+    bool evict_one_locked(std::span<const IdText* const> psk_ids_in_use);
 
     /// @brief Encode every owed write and clear the dirty bookkeeping. Call with mutex_ held, so
     /// each blob is exactly what is in memory at that moment.
