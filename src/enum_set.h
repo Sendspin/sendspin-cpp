@@ -13,21 +13,24 @@
 // limitations under the License.
 
 /// @file enum_set.h
-/// @brief Set of a one-byte enum's enumerators, held in one byte
+/// @brief Set of a one-byte enum's enumerators, held in one byte or two
 
 #pragma once
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <type_traits>
 
 namespace sendspin {
 
-/// @brief A set of the enumerators 0-7 of `E`, one bit each, visited in enumerator order
-template <typename E>
+/// @brief A set of the enumerators 0 to Capacity - 1 of `E`, one bit each, visited in enumerator
+/// order; Capacity 16 holds them in two bytes
+template <typename E, size_t Capacity = 8>
 class EnumSet {
     static_assert(std::is_enum_v<E> && sizeof(E) == 1, "EnumSet holds a one-byte enum");
+    static_assert(Capacity == 8 || Capacity == 16, "EnumSet holds 8 or 16 enumerators");
 
 public:
     EnumSet() = default;
@@ -48,7 +51,7 @@ public:
     /// @brief Calls fn(member) for each member, in enumerator order.
     template <typename Fn>
     void for_each(Fn&& fn) const {
-        for (uint8_t value = 0; value < CAPACITY; ++value) {
+        for (size_t value = 0; value < Capacity; ++value) {
             if ((this->bits_ & (1U << value)) != 0) {
                 fn(static_cast<E>(value));
             }
@@ -58,14 +61,15 @@ public:
     bool operator==(const EnumSet&) const = default;
 
 private:
-    static constexpr uint8_t CAPACITY = 8;
+    using Bits = std::conditional_t<Capacity == 8, uint8_t, uint16_t>;
 
-    static uint8_t bit(E member) {
-        assert(static_cast<uint8_t>(member) < CAPACITY && "EnumSet holds enumerators 0-7");
-        return static_cast<uint8_t>(1U << static_cast<uint8_t>(member));
+    static Bits bit(E member) {
+        assert(static_cast<uint8_t>(member) < Capacity &&
+               "EnumSet holds enumerators below Capacity");
+        return static_cast<Bits>(1U << static_cast<uint8_t>(member));
     }
 
-    uint8_t bits_{0};
+    Bits bits_{0};
 };
 
 }  // namespace sendspin

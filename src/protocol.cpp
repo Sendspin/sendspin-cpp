@@ -685,8 +685,7 @@ bool process_server_state_color(JsonObject root, ServerColorStateObject* color) 
     return true;
 }
 
-bool process_server_state_controller(JsonObject root,
-                                     ServerStateControllerObject* controller_state) {
+bool process_server_state_controller(JsonObject root, ControllerStatePayload* controller_state) {
     if (controller_state == nullptr || !root["payload"]["controller"].is<JsonObject>()) {
         return false;
     }
@@ -695,21 +694,22 @@ bool process_server_state_controller(JsonObject root,
     // messaging.md "server/state": every message carries the full state of each role object it
     // includes, so an included controller object is parsed into a fresh state rather than
     // overlaid on what came before (matching the metadata and color parsers).
-    *controller_state = ServerStateControllerObject{};
+    *controller_state = ControllerStatePayload{};
 
     // Parse supported_commands array. The controller role is frozen at v1, so an unrecognized
-    // command is a non-compliant value rather than a forward-compatible one: drop and log it.
+    // command is a non-compliant value rather than a forward-compatible one: drop and log it. The
+    // commands are held as a set, so the public list orders them by enumerator and collapses a
+    // repeat: roles/controller/v1.md "server/state controller object" makes them a subset, with
+    // no order.
     if (controller_object["supported_commands"].is<JsonArray>()) {
-        std::vector<SendspinControllerCommand> commands;
         JsonArrayConst commands_array =
             controller_object["supported_commands"].as<JsonArrayConst>();
         for (JsonVariantConst command_var : commands_array) {
             if (auto command = read_enum_field(command_var, "supported_commands",
                                                controller_command_from_string)) {
-                commands.push_back(*command);
+                controller_state->supported_commands.insert(*command);
             }
         }
-        controller_state->supported_commands = std::move(commands);
     }
 
     // Parse volume
@@ -794,17 +794,19 @@ static bool process_stream_start_artwork(JsonObject payload,
     return true;
 }
 
-static bool process_stream_start_visualizer(
-    JsonObject payload, std::optional<ServerVisualizerStreamObject>* visualizer) {
+static bool process_stream_start_visualizer(JsonObject payload,
+                                            std::optional<VisualizerStreamPayload>* visualizer) {
     if (!payload["visualizer"].is<JsonObject>()) {
         return true;
     }
-    ServerVisualizerStreamObject& vis_obj = visualizer->emplace();
+    VisualizerStreamPayload& vis_obj = visualizer->emplace();
     JsonObject vis_json = payload["visualizer"];
 
     // roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": types (a string[])
     // and rate_max are required, and tracks_downbeats is required if types includes 'beat'. An
-    // unrecognized type string is skipped like any unrecognized enum value.
+    // unrecognized type string is skipped like any unrecognized enum value. The types are held as a
+    // set, so the public list orders them by enumerator and collapses a repeat: the same section
+    // makes them a subset of the requested types, with no order.
     const auto rate_max = read_uint_field<uint16_t>(vis_json["rate_max"], "rate_max");
     if (!vis_json["types"].is<JsonArray>() || !rate_max.has_value()) {
         SS_LOGE(TAG, "Invalid stream/start message: incomplete visualizer object");
@@ -820,7 +822,7 @@ static bool process_stream_start_visualizer(
             return false;
         }
         if (auto type = read_enum_field(type_var, "types", visualizer_data_type_from_string)) {
-            vis_obj.types.push_back(*type);
+            vis_obj.types.insert(*type);
             lists_beat = lists_beat || *type == VisualizerDataType::BEAT;
             lists_spectrum = lists_spectrum || *type == VisualizerDataType::SPECTRUM;
         }

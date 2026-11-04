@@ -2416,8 +2416,8 @@ struct StateRoleAccess {
     bool keeps_state;
 };
 
-ServerStateControllerObject controller_state_with(uint8_t value) {
-    ServerStateControllerObject state;
+ControllerStatePayload controller_state_with(uint8_t value) {
+    ControllerStatePayload state;
     state.volume = value;
     return state;
 }
@@ -2453,8 +2453,8 @@ ServerCommandMessage player_volume_with(uint8_t value) {
     return cmd;
 }
 
-ServerVisualizerStreamObject visualizer_stream_with(uint8_t value) {
-    ServerVisualizerStreamObject stream;
+VisualizerStreamPayload visualizer_stream_with(uint8_t value) {
+    VisualizerStreamPayload stream;
     stream.types = {VisualizerDataType::LOUDNESS};
     stream.rate_max = value;
     return stream;

@@ -445,16 +445,18 @@ constexpr int TIME_BURST_SIZE = 8;
 constexpr size_t ADMISSION_ALLOCATIONS = 0;
 constexpr size_t CLIENT_STATE_ALLOCATIONS = 0;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;
-// The visualizer types list stream/start's parse builds, moved from there into the role's slot.
-constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 1;
+constexpr size_t CONTROLLER_STATE_ALLOCATIONS = 0;
+constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 0;
 constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 
 // One paired connection with a player, a controller, metadata, two artwork channels and a
 // visualizer, so the player, artwork and visualizer objects of client/state are built: from the
 // fake server's connect through admission and the first client/state, then one client/state
-// publish, then one full burst of client/time and server/time exchanges, then an artwork and
-// visualizer stream/start and a stream/end and a stream/clear that name their roles, then a
-// stream/start whose player section the connection, no longer owning the player, does not take.
+// publish, then one full burst of client/time and server/time exchanges, then the first
+// controller server/state, then an artwork and visualizer stream/start and a stream/end and a
+// stream/clear that name their roles, then a stream/start whose player section the connection, no
+// longer owning the player, does not take. The roles' public command and type lists are reserved
+// when the roles are built, so even the first fill on the main loop allocates nothing.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -474,7 +476,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     client.set_listener(&burst_listener);
     CountingPlayerListener player_listener;
     client.add_player(make_pcm_player_config()).set_listener(&player_listener);
-    client.add_controller();
+    ControllerRole& controller = client.add_controller();
     client.add_metadata();
     ArtworkRoleConfig artwork_config;
     artwork_config.preferred_formats = {
@@ -482,7 +484,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
         {SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 64},
     };
     client.add_artwork(std::move(artwork_config));
-    client.add_visualizer(make_visualizer_config());
+    CountingVisualizerListener visualizer_listener;
+    client.add_visualizer(make_visualizer_config()).set_listener(&visualizer_listener);
     ASSERT_TRUE(bundle.start());
 
     FakeEncryptedServerOptions options;
@@ -519,6 +522,26 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     expect_library_allocations(close_window(), "client/time and server/time burst",
                                TIME_BURST_ALLOCATIONS);
 
+    // Every command, so a reservation short of the full set fails the window. The main loop has
+    // applied the state once get_controller_state() reports its volume.
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"server/state","payload":{"controller":{"supported_commands":)"
+            R"(["play","pause","stop","next","previous","volume","mute","repeat_off",)"
+            R"("repeat_one","repeat_all","shuffle","unshuffle","switch","seek",)"
+            R"("seek_relative"],"volume":20,"muted":false,"repeat":"off","shuffle":false,)"
+            R"("seek_max_ms":1000}}})"));
+    }
+    pump_while_not(client, [&] { return controller.get_controller_state().volume == 20; });
+    expect_library_allocations(close_window(), "controller server/state",
+                               CONTROLLER_STATE_ALLOCATIONS);
+    EXPECT_EQ(controller.get_controller_state().supported_commands.size(),
+              CONTROLLER_COMMAND_COUNT);
+
+    const int starts_before_streams = visualizer_listener.stream_starts;
+
     // Closes on the client/state the trailing volume command publishes, which the protocol task
     // sends only after handling the three stream messages ahead of it.
     const int states_before_streams = server->client_state_count();
@@ -541,6 +564,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     expect_library_allocations(close_window(),
                                "stream/start, stream/end and stream/clear with roles",
                                STREAM_MESSAGES_ALLOCATIONS);
+    EXPECT_EQ(visualizer_listener.stream_starts, starts_before_streams + 1)
+        << "the window closed before the main loop reported the visualizer stream";
 
     // An activation that leaves the player out takes the role from the connection, outside any
     // window. The window holds a stream/start whose player section carries a FLAC codec_header

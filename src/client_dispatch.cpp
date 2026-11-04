@@ -439,8 +439,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
             if (stream_msg.visualizer.has_value()) {
-                this->visualizer_->impl_->handle_stream_start(
-                    std::move(stream_msg.visualizer.value()));
+                this->visualizer_->impl_->handle_stream_start(stream_msg.visualizer.value());
             }
 #endif
             break;
@@ -596,7 +595,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             const bool take_controller =
                 this->controller_ &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::CONTROLLER);
-            ServerStateControllerObject controller_state;
+            ControllerStatePayload controller_state;
             bool controller_valid = false;
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
@@ -628,7 +627,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 
 #ifdef SENDSPIN_ENABLE_CONTROLLER
             if (controller_valid) {
-                this->controller_->impl_->handle_server_state(std::move(controller_state));
+                this->controller_->impl_->handle_server_state(controller_state);
             }
 #endif
 

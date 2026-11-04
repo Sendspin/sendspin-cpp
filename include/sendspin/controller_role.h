@@ -59,6 +59,7 @@ enum class SendspinRepeatMode : uint8_t {
 
 /// @brief Controller state received from the server in server/state messages
 struct ServerStateControllerObject {
+    /// Each once, in enumerator order
     std::vector<SendspinControllerCommand> supported_commands{};
     uint8_t volume{};
     bool muted{};
