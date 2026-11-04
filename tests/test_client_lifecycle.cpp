@@ -1030,7 +1030,9 @@ size_t queued_commands(ProtocolTask& task) {
 // its push (ProtocolTask::close_accepts(), which ConnectionManager::close_admission() calls), so
 // its transport closes it without a goodbye and nothing is left queued for stop() to refuse. The
 // test thread plays the protocol task, so the accept provably sits in the queue when admission
-// closes. The open row is the control: the same queued accept is admitted and owed no goodbye.
+// closes, and the final tick releases the refused connection rather than keeping it beside the
+// shutdown pass's. The open row is the control: the same queued accept is admitted and owed no
+// goodbye.
 // The nursery-full rejection is covered by ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer.
 // Each row connects a real peer, and the Control row watches 200 ms for a goodbye that must not
 // come, so the table takes most of a second.
@@ -1072,6 +1074,9 @@ TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
                 wait_until([&] { return peer->goodbye_reason().has_value(); });
                 EXPECT_EQ(peer->goodbye_reason().value_or(""), "shutdown")
                     << "a newcomer refused at stop() must be told why";
+                // closing_ holds only the shutdown pass's connections, which bounds it.
+                EXPECT_TRUE(client.connection_manager_->closing_.empty())
+                    << "a refused accept was kept for finish_stop()";
                 break;
             case Taker::AFTER_CLOSE:
                 // No timeout: a delivery the queue took instead would never be closed here, since

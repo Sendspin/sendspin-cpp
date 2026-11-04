@@ -288,7 +288,7 @@ PairingUiSnapshot ConnectionManager::finish_stop() {
     }
     // Released here, after the server stop: an outbound connection's destructor stops its
     // transport synchronously, and every outbound one of these had opened.
-    std::vector<std::shared_ptr<SendspinConnection>> releasing;
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> releasing;
     releasing.swap(this->closing_);
     releasing.clear();
     this->reap_finished(false);
@@ -416,11 +416,10 @@ void ConnectionManager::accept(std::shared_ptr<SendspinConnection> conn) {
 
 void ConnectionManager::refuse_accept(std::shared_ptr<SendspinConnection> conn) {
     // Queued before admission closed and taken after (a stop() under way): the slots are being
-    // emptied, so the newcomer gets a goodbye and a close instead of one, and is kept for
-    // finish_stop().
+    // emptied, so the newcomer gets a goodbye and a close instead of one. It is inbound, so its
+    // destructor joins nothing and it is released here, leaving closing_ to the shutdown pass.
     SS_LOGD(TAG, "Not accepting connections, rejecting new connection");
-    conn->detach_inbound();
-    this->goodbye_for_shutdown(std::move(conn));
+    this->release_connection(std::move(conn), SendspinGoodbyeReason::SHUTDOWN);
 }
 
 void ConnectionManager::goodbye_for_shutdown(std::shared_ptr<SendspinConnection> conn) {

@@ -36,7 +36,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace sendspin {
 
@@ -685,7 +684,7 @@ private:
                                         std::optional<SendspinGoodbyeReason> reason);
 
     /// @brief Refuses an accept queued before admission closed and taken after: goodbye with
-    /// reason shutdown and a close, and the connection kept for finish_stop().
+    /// reason shutdown and a close, and the connection released.
     void refuse_accept(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Goodbyes and closes `conn` with reason shutdown, and keeps it for finish_stop(). Its
@@ -942,10 +941,10 @@ private:
     // Released outbound connections waiting for their transports to finish (see ReapEntry).
     // Protocol task, then the main loop while the client is stopped.
     InlineVector<ReapEntry, REAPING_CAPACITY + 1> reaping_;
-    // Connections the shutdown pass took out of the slots, and accepts it refused, closed by
-    // their disconnect() and kept for finish_stop() to release. Written by the protocol task's
-    // shutdown pass, read on the main loop once the task is joined.
-    std::vector<std::shared_ptr<SendspinConnection>> closing_;
+    // Connections the shutdown pass took out of the slots, closed by their disconnect() and kept
+    // for finish_stop() to release: at most the admitted and nursery ones. Written by the
+    // protocol task's shutdown pass, read on the main loop once the task is joined.
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> closing_;
 
     // Pointer fields
     SendspinClient* client_;
