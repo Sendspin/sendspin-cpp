@@ -85,8 +85,10 @@ endif()
 # player_ and each role's impl_ (the sync task, which a feeder thread hands chunks to directly, and
 # the visualizer's drain list, whose links it reads under the list's lock); ProtocolTask's
 # command_mutex_ and command_count_ (how many commands wait); ConnectionManager's admitted_,
-# nursery_, install_admitted(), refresh_published_state(), scan_nursery(), close_admission() and
-# drop_connection() (to install, swap out, and drop a stand-in connection, and to run one scan);
+# nursery_, closing_ (an accept refused at stop() is released at once rather than held until
+# finish_stop(), which the peer cannot tell apart), install_admitted(), refresh_published_state(),
+# scan_nursery(), close_admission() and drop_connection() (to install, swap out, and drop a
+# stand-in connection, and to run one scan);
 # and SendspinConnection's noise_handshake_complete_ (a stand-in's finished handshake) and its
 # transport side, begin_inbound_message() and end_inbound_message() (a stand-in's transport writing
 # a ring item and a fallback message). The ring-size tables read SendspinClient::inbound_ring_ and

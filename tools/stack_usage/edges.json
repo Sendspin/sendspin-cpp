@@ -96,7 +96,7 @@
    "sym:SendspinWsServer14close_callback"
   ],
   "httpd_sess_free_ctx": [
-   "sym:SendspinWsServer13open_callbackEPviE.*UlS1_E_"
+   "sym:SendspinWsServer20release_session_slotEPv"
   ],
   "httpd_sess_new": [
    "sym:SendspinWsServer13open_callback"
@@ -272,11 +272,11 @@
   "sym:SendspinWsServer13open_callbackEPvi$": [
    "sym:_Function_handlerIFvvEZN8sendspin17ConnectionManager5startEvEUlvE_E9_M_invoke"
   ],
-  "sym:SendspinWsServer13open_callbackEPviE.*UlS1_E_": [
-   "sym:_Sp_counted_ptr_inplaceIN8sendspin24SendspinServerConnection.*_M_disposeEv"
-  ],
   "sym:SendspinWsServer16deliver_upgradedEi$": [
    "sym:_Function_handlerIFbRKSt10shared_ptrIN8sendspin24SendspinServerConnection.*M_invoke"
+  ],
+  "sym:SendspinWsServer20release_session_slotEPv": [
+   "sym:_Sp_counted_ptr_inplaceIN8sendspin24SendspinServerConnection.*_M_disposeEv"
   ],
   "sym:_Sp_counted_ptr_inplaceIN8sendspin24SendspinServerConnection.*_M_disposeEv": [
    "sym:SendspinServerConnectionD2Ev$"

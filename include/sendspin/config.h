@@ -295,8 +295,8 @@ struct SendspinClientConfig {
     /// accept (on ESP the surplus peer waits unanswered in the TCP backlog instead).
     static constexpr uint8_t DEFAULT_SERVER_MAX_CONNECTIONS = 4U;
 
-    uint8_t server_max_connections{
-        DEFAULT_SERVER_MAX_CONNECTIONS};  ///< Maximum simultaneous connections
+    /// @brief Maximum simultaneous inbound connections, clamped to 7 on ESP
+    uint8_t server_max_connections{DEFAULT_SERVER_MAX_CONNECTIONS};
 
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
     static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
