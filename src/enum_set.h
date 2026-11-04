@@ -51,7 +51,7 @@ public:
     /// @brief Calls fn(member) for each member, in enumerator order.
     template <typename Fn>
     void for_each(Fn&& fn) const {
-        for (uint8_t value = 0; value < Capacity; ++value) {
+        for (size_t value = 0; value < Capacity; ++value) {
             if ((this->bits_ & (1U << value)) != 0) {
                 fn(static_cast<E>(value));
             }
