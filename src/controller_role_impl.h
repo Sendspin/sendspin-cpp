@@ -90,8 +90,8 @@ struct ControllerRole::Impl : RoleTeardown {
     // ========================================
 
     // Struct fields
-    /// Filled in place (apply_state()), so its supported_commands allocates only when a state
-    /// lists more commands than any before it.
+    /// Filled in place (apply_state()) into the supported_commands capacity the constructor
+    /// reserves for every command, so a fill never allocates.
     ServerStateControllerObject controller_state{};
 
     // Pointer fields

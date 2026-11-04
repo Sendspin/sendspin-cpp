@@ -919,8 +919,6 @@ TEST(Protocol, StreamStartRejectsAnIncompleteVisualizerSection) {
     }
 }
 
-// The color parser reads each component as a uint8, so a non-integer (or out-of-range) component
-// fails the type check and the whole color is left without a value.
 // supported_commands is validated element-by-element. The controller role is frozen at v1, so an
 // unrecognized command is a non-compliant value that is dropped (and logged), while the valid
 // commands around it are kept. roles/controller/v1.md "server/state controller object" makes them

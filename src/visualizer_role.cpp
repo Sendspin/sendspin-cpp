@@ -130,6 +130,7 @@ VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
       client(client),
       event_state(std::make_unique<EventState>()) {
     this->drain_task = std::make_unique<DrainTask>();
+    this->stream_object.types.reserve(VISUALIZER_DATA_TYPE_COUNT);
 }
 
 VisualizerRole::Impl::~Impl() {

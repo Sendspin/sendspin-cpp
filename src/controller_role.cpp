@@ -25,7 +25,9 @@ namespace sendspin {
 // ============================================================================
 
 ControllerRole::Impl::Impl(SendspinClient* client)
-    : client(client), event_state(std::make_unique<EventState>()) {}
+    : client(client), event_state(std::make_unique<EventState>()) {
+    this->controller_state.supported_commands.reserve(CONTROLLER_COMMAND_COUNT);
+}
 
 // ============================================================================
 // ControllerRole forwarding (public API → Impl)

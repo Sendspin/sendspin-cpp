@@ -663,6 +663,10 @@ static_assert(static_cast<uint8_t>(SendspinControllerCommand::SEEK_RELATIVE) < 1
 
 using ControllerCommandSet = EnumSet<SendspinControllerCommand, 16>;
 
+/// @brief How many controller commands exist, the most a server can list
+inline constexpr size_t CONTROLLER_COMMAND_COUNT =
+    static_cast<size_t>(SendspinControllerCommand::SEEK_RELATIVE) + 1;
+
 /// @brief A parsed server/state controller object: ServerStateControllerObject with its
 /// supported_commands held as a set, which the main loop lists into the public object
 struct ControllerStatePayload {
@@ -842,6 +846,10 @@ inline std::optional<VisualizerSpectrumScale> visualizer_spectrum_scale_from_str
 // Every visualizer type, PEAK (the last) included, is an EnumSet<VisualizerDataType> member
 static_assert(static_cast<uint8_t>(VisualizerDataType::PEAK) < 8,
               "EnumSet<VisualizerDataType> needs 8 bits");
+
+/// @brief How many visualizer types exist, the most a stream can list
+inline constexpr size_t VISUALIZER_DATA_TYPE_COUNT =
+    static_cast<size_t>(VisualizerDataType::PEAK) + 1;
 
 /// @brief A parsed stream/start visualizer object: ServerVisualizerStreamObject with its types
 /// held as a set, which the main loop lists into the public object

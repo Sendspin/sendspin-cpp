@@ -452,12 +452,11 @@ constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 // One paired connection with a player, a controller, metadata, two artwork channels and a
 // visualizer, so the player, artwork and visualizer objects of client/state are built: from the
 // fake server's connect through admission and the first client/state, then one client/state
-// publish, then one full burst of client/time and server/time exchanges, then a controller
-// server/state listing no more commands than the one before it, then an artwork and visualizer
-// stream/start listing no more visualizer types than the stream before it and a stream/end and a
+// publish, then one full burst of client/time and server/time exchanges, then the first
+// controller server/state, then an artwork and visualizer stream/start and a stream/end and a
 // stream/clear that name their roles, then a stream/start whose player section the connection, no
-// longer owning the player, does not take. The roles' public command and type lists grow on the
-// main loop only past their longest so far, so each window follows a message that sized them.
+// longer owning the player, does not take. The roles' public command and type lists are reserved
+// when the roles are built, so even the first fill on the main loop allocates nothing.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -523,41 +522,25 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     expect_library_allocations(close_window(), "client/time and server/time burst",
                                TIME_BURST_ALLOCATIONS);
 
-    // Each state's volume tells the main loop's application of it apart; the first sizes the
-    // public command list.
-    const auto controller_state = [](const char* commands, int volume) {
-        return std::string(R"({"type":"server/state","payload":{"controller":{"supported_commands":)") +
-               commands + R"(,"volume":)" + std::to_string(volume) +
-               R"(,"muted":false,"repeat":"off","shuffle":false}}})";
-    };
-    {
-        TestOwned test_owned;
-        ASSERT_TRUE(server->send_app_json(controller_state(R"(["play","pause","next"])", 20)));
-    }
-    pump_while_not(client, [&] { return controller.get_controller_state().volume == 20; });
+    // Every command, so a reservation short of the full set fails the window. The main loop has
+    // applied the state once get_controller_state() reports its volume.
     open_window();
     {
         TestOwned test_owned;
-        ASSERT_TRUE(server->send_app_json(controller_state(R"(["pause","play"])", 21)));
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"server/state","payload":{"controller":{"supported_commands":)"
+            R"(["play","pause","stop","next","previous","volume","mute","repeat_off",)"
+            R"("repeat_one","repeat_all","shuffle","unshuffle","switch","seek",)"
+            R"("seek_relative"],"volume":20,"muted":false,"repeat":"off","shuffle":false,)"
+            R"("seek_max_ms":1000}}})"));
     }
-    pump_while_not(client, [&] { return controller.get_controller_state().volume == 21; });
+    pump_while_not(client, [&] { return controller.get_controller_state().volume == 20; });
     expect_library_allocations(close_window(), "controller server/state",
                                CONTROLLER_STATE_ALLOCATIONS);
-    EXPECT_EQ(controller.get_controller_state().supported_commands.size(), 2U);
+    EXPECT_EQ(controller.get_controller_state().supported_commands.size(),
+              CONTROLLER_COMMAND_COUNT);
 
-    // A visualizer stream, outside any window, sizes the public types list.
-    const int starts_before_warm_up = visualizer_listener.stream_starts;
-    const int ends_before_warm_up = visualizer_listener.stream_ends;
-    {
-        TestOwned test_owned;
-        ASSERT_TRUE(server->send_app_json(
-            R"({"type":"stream/start","payload":{"visualizer":{"types":["loudness"],)"
-            R"("rate_max":30}}})"));
-        ASSERT_TRUE(
-            server->send_app_json(R"({"type":"stream/end","payload":{"roles":["visualizer"]}})"));
-    }
-    pump_while_not(client,
-                   [&] { return visualizer_listener.stream_ends > ends_before_warm_up; });
+    const int starts_before_streams = visualizer_listener.stream_starts;
 
     // Closes on the client/state the trailing volume command publishes, which the protocol task
     // sends only after handling the three stream messages ahead of it.
@@ -581,7 +564,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     expect_library_allocations(close_window(),
                                "stream/start, stream/end and stream/clear with roles",
                                STREAM_MESSAGES_ALLOCATIONS);
-    EXPECT_EQ(visualizer_listener.stream_starts, starts_before_warm_up + 2)
+    EXPECT_EQ(visualizer_listener.stream_starts, starts_before_streams + 1)
         << "the window closed before the main loop reported the visualizer stream";
 
     // An activation that leaves the player out takes the role from the connection, outside any

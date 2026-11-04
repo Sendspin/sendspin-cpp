@@ -186,8 +186,9 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// (ClientVisualizerStateObject::types).
     VisualizerRoleConfig config;
     VisualizerSupportObject visualizer_support;
-    /// The stream on_visualizer_stream_start() reports, filled in place from each applied config,
-    /// so its types allocates only when a stream lists more types than any before it. Main loop.
+    /// The stream on_visualizer_stream_start() reports, filled in place from each applied config
+    /// into the types capacity the constructor reserves for every type, so a fill never
+    /// allocates. Main loop.
     ServerVisualizerStreamObject stream_object{};
 
     // Pointer fields
