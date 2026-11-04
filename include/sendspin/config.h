@@ -154,12 +154,14 @@ using SendspinMessageTraceFn = std::function<void(const SendspinTracedMessage& m
 /// it: the server may list it in active_roles, and the application defines what that means.
 struct SendspinApplicationRole {
     /// @brief Versioned role name: a leading `_`, a name, `@`, and a version, in visible ASCII
+    /// other than `"` and `\`, at most 64 bytes, a library limit the specification does not set
     /// (e.g. "_myapp_display@v1"). Include a vendor prefix to avoid collisions.
     std::string role;
 
     /// @brief The role's support object as serialized JSON (e.g. `{"port":8930}`), sent as
-    /// "<role>_support" as the library re-serializes it; unset sends none. It must parse as a
-    /// JSON object that re-serializes as valid JSON (see the integration guide).
+    /// "<role>_support" as the library re-serializes it; unset sends none. It must be one JSON
+    /// object meeting the integration guide's rules, and the hello it is sent in must fit the
+    /// 16384 bytes messaging.md "client/hello" allows.
     std::optional<std::string> support_json{};
 };
 
@@ -227,9 +229,9 @@ struct SendspinClientConfig {
     std::vector<std::string> static_pairing_code_locations{};
 
     /// @brief Application-specific roles listed in client/hello `supported_roles` after the
-    /// library's own, in this order. A role whose name is not `_<name>@<version>`, a repeated
-    /// name, or a support object SendspinApplicationRole::support_json does not admit is rejected:
-    /// start() logs an error and returns false.
+    /// library's own, in this order. A name SendspinApplicationRole::role does not admit, a
+    /// repeated name, or a support object SendspinApplicationRole::support_json does not admit is
+    /// rejected: start() logs an error and returns false.
     std::vector<SendspinApplicationRole> application_roles{};
 
     /// @brief Default maximum number of long-term pairing records the store retains. Each record

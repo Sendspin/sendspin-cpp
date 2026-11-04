@@ -887,6 +887,14 @@ struct PairMethodDescriptor {
 /// (messaging.md "client/hello").
 static constexpr size_t MAX_HELLO_PAIR_METHODS = 2;
 
+/// @brief Most bytes of UTF-8 JSON a client/hello may take (messaging.md "client/hello"). A server
+/// may close a connection whose hello is longer.
+constexpr size_t MAX_CLIENT_HELLO_BYTES = 16384;
+
+/// @brief Most nesting levels a client/hello may take, the root object being level 1
+/// (messaging.md "client/hello").
+constexpr size_t MAX_CLIENT_HELLO_NESTING = 10;
+
 /// @brief Outgoing client/hello handshake message sent at connection startup.
 /// Under encryption, client_id and version are carried in client/init (the cleartext Noise
 /// handshake frame), not repeated here. Its strings and lists view the client's config and roles,
@@ -901,9 +909,9 @@ struct ClientHelloMessage {
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
     std::optional<SourceSupportObject> source_v1_support{};
-    /// Listed after supported_roles; each support_json is start()'s re-serialized object, sent as
-    /// is
-    std::vector<SendspinApplicationRole> application_roles{};
+    /// @brief The configured application-specific roles, listed after supported_roles; each
+    /// support_json is start()'s re-serialized object, sent as is.
+    std::span<const SendspinApplicationRole> application_roles{};
     bool unpaired_access_enabled{false};
     InlineVector<PairMethodDescriptor, MAX_HELLO_PAIR_METHODS> supported_pair_methods{};
 
@@ -1158,6 +1166,16 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
 
 /// @brief Builds a client/hello message
 void build_client_hello_message(const ClientHelloMessage* msg, JsonDocument& doc);
+
+/// @brief Whether every client/hello a connection could send from `msg` fits
+/// MAX_CLIENT_HELLO_BYTES
+///
+/// Two fields can differ between connections: the unpaired-access flag, which can change while
+/// running, and a MAC address the platform detects only once the network is up. `msg` is set to
+/// the longer value of each ("false", and a MAC address where device_info has none) before it is
+/// measured.
+/// @return false (logged) when that hello is over the cap or cannot be built.
+bool client_hello_fits(ClientHelloMessage& msg);
 
 /// @brief Builds a client/state message
 void build_client_state_message(const ClientStateMessage* msg, JsonDocument& doc);

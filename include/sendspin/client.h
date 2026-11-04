@@ -861,8 +861,12 @@ private:
     void process_inbound(SendspinConnection& conn, InboundMessage& message);
 
     /// @brief Fills `msg` with the client/hello fields from config and every role, viewing them.
-    /// Protocol task.
+    /// Protocol task, or start() before the task runs.
     void build_client_hello(ClientHelloMessage& msg);
+
+    /// @brief Whether the longest client/hello a connection could send fits messaging.md's cap
+    /// (client_hello_fits()). start() only, once the roles have started.
+    bool hello_within_cap();
 
     /// @brief Builds the client/state snapshot publish_state() hands the protocol task: the
     /// availability and every role's state object. Main loop only, where that state lives.

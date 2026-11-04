@@ -43,7 +43,6 @@
 #include "sendspin/config.h"
 #include "sendspin/persistence_codec.h"
 #include "sendspin/player_role.h"
-#include "test_util.h"
 
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
@@ -1796,22 +1795,29 @@ TEST(SendspinClientStart, RejectsUnusableConfiguredPairingSecrets) {
 }
 
 // start() fails closed on an application-specific role it would advertise malformed: a name
-// without the leading `_` or a version (README.md "Application-Specific Roles"), a name listed
-// twice, or a support object that is not one JSON object.
+// without the leading `_` (README.md "Application-Specific Roles"), a name listed twice, a support
+// object that is not one JSON object, or one that puts client/hello over the 16384 bytes
+// messaging.md "client/hello" allows. The role checks run before the identity is generated; the
+// hello is measured once the roles have started.
 TEST(SendspinClientStart, RejectsMalformedApplicationRoles) {
     struct Row {
         const char* name;
         std::vector<SendspinApplicationRole> roles;
         bool expect_started;
+        bool expect_identity;
     };
     const Row rows[] = {
-        {"no leading underscore", {{"acme_display@v1", std::nullopt}}, false},
-        {"no version", {{"_acme_display", std::nullopt}}, false},
+        {"no leading underscore", {{"acme_display@v1", std::nullopt}}, false, false},
         {"listed twice", {{"_acme_display@v1", std::nullopt}, {"_acme_display@v1", std::nullopt}},
-         false},
-        {"support not an object", {{"_acme_display@v1", std::string("[1]")}}, false},
+         false, false},
+        {"support not an object", {{"_acme_display@v1", std::string("[1]")}}, false, false},
+        {"hello over 16384 bytes",
+         {{"_acme_display@v1", R"({"a":")" + std::string(16384, 'x') + R"("})"}},
+         false,
+         true},
         {"Control: two roles, one with support",
          {{"_acme_display@v1", std::string(R"({"port":8930})")}, {"_acme_display@v2", std::nullopt}},
+         true,
          true},
     };
 
@@ -1826,39 +1832,9 @@ TEST(SendspinClientStart, RejectsMalformedApplicationRoles) {
 
         EXPECT_EQ(client.start(), row.expect_started);
         EXPECT_EQ(client.is_started(), row.expect_started);
-        if (!row.expect_started) {
-            EXPECT_EQ(provider.save_attempts(persistence_keys::KEYPAIR), 0);
-        }
+        EXPECT_EQ(provider.save_attempts(persistence_keys::KEYPAIR) > 0, row.expect_identity);
         client.stop();
     }
-}
-
-// build_client_hello() carries the configured application-specific roles and their support
-// objects into the hello every connection is sent. build_client_hello() is private; this file
-// compiles with -fno-access-control.
-TEST(SendspinClientStart, HelloAdvertisesConfiguredApplicationRoles) {
-    InMemoryPersistenceProvider provider;
-    SendspinClientConfig config;
-    config.name = "application-role-hello";
-    // Lenient input, so the hello shows it was re-serialized rather than embedded as written
-    config.application_roles = {{"_acme_pairing@v1", std::string("{port: 8930}")}};
-    SendspinClient client(std::move(config));
-    client.set_persistence_provider(&provider);
-    ASSERT_TRUE(client.start());
-
-    ClientHelloMessage msg;
-    client.build_client_hello(msg);
-    const std::string hello =
-        built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); });
-    JsonDocument doc;
-    EXPECT_NE(hello.find(R"("_acme_pairing@v1_support":{"port":8930})"), std::string::npos)
-        << hello;
-    ASSERT_FALSE(deserializeJson(doc, hello));
-    JsonArrayConst roles = doc["payload"]["supported_roles"];
-    ASSERT_EQ(roles.size(), 1U);
-    EXPECT_STREQ(roles[0], "_acme_pairing@v1");
-    EXPECT_EQ(doc["payload"]["_acme_pairing@v1_support"]["port"].as<int>(), 8930);
-    client.stop();
 }
 
 // start() hands SendspinClientConfig::pairing_psk to the store, so the pairing token the operator

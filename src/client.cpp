@@ -350,8 +350,10 @@ bool SendspinClient::start() {
     for (size_t i = 0; i < this->config_.application_roles.size(); ++i) {
         SendspinApplicationRole& app_role = this->config_.application_roles[i];
         if (!is_valid_application_role_name(app_role.role)) {
-            SS_LOGE(TAG, "Application role \"%s\" is not _<name>@<version>; cannot start",
-                    app_role.role.c_str());
+            SS_LOGE(TAG,
+                    "Application role \"%s\" is not a _<name>@<version> of at most %zu bytes; "
+                    "cannot start",
+                    app_role.role.c_str(), MAX_APPLICATION_ROLE_NAME_BYTES);
             return false;
         }
         for (size_t j = 0; j < i; ++j) {
@@ -444,6 +446,16 @@ bool SendspinClient::start() {
     }
 #endif
     if (!roles_started) {
+        this->stop_role_threads();
+        this->release_inbound_ring();
+        return false;
+    }
+
+    // messaging.md "client/hello": a server may close a connection whose hello is over the size
+    // cap, and every connection sends the same one, so a configuration (large application support
+    // objects, mostly) that would put it over fails closed here. Checked once the roles have
+    // started, which fixes the capacities they advertise.
+    if (!this->hello_within_cap()) {
         this->stop_role_threads();
         this->release_inbound_ring();
         return false;
@@ -1429,9 +1441,15 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
 #endif
 }
 
+bool SendspinClient::hello_within_cap() {
+    ClientHelloMessage hello;
+    this->build_client_hello(hello);
+    return client_hello_fits(hello);
+}
+
 void SendspinClient::build_client_hello(ClientHelloMessage& msg) {
-    // Reached only from ConnectionManager::send_hello_message(), so only for a connection, so
-    // only after a successful start(): record_store_ exists and is dereferenced unguarded below.
+    // Reached from start(), once the roles have started and before the protocol task runs, and
+    // from ConnectionManager::send_hello_message() for each connection.
     msg.name = this->config_.name;
 
     const auto view = [](const std::optional<std::string>& value) {
@@ -1481,6 +1499,7 @@ void SendspinClient::build_client_hello(ClientHelloMessage& msg) {
     }
 
     msg.unpaired_access_enabled = this->unpaired_access_enabled_.load(std::memory_order_acquire);
+    // Validated and normalized by start(), and fixed until stop()
     msg.application_roles = this->config_.application_roles;
 
     // Let each role add its fields to the hello message
