@@ -33,6 +33,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace sendspin {
@@ -150,8 +151,8 @@ public:
 
     /// @brief The client-stream/start `codec_header` of a stream of `codec`: the FLAC header for
     /// flac, absent otherwise. Protocol task, from SourceRole::Impl::try_open(); fixed since
-    /// construction.
-    std::optional<std::string> codec_header(SendspinCodecFormat codec) const;
+    /// construction, so the view is valid for the task's life.
+    std::optional<std::string_view> codec_header(SendspinCodecFormat codec) const;
 
 protected:
     /// @brief Entry point for the thread

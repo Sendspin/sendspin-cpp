@@ -575,6 +575,79 @@ TEST(Protocol, StreamStartArtworkFieldsRequiredUnlessSourceNone) {
     }
 }
 
+// roles/artwork/v1.md "stream/start artwork object": the channels array is never longer than 4,
+// the slots a binary message can address, so a longer one rejects the message.
+TEST(Protocol, StreamStartArtworkChannelsAtMostFour) {
+    const std::string channel = R"({"source":"none"})";
+    for (const size_t count : {size_t{4}, size_t{5}}) {
+        SCOPED_TRACE(count);
+        std::string channels = "[";
+        for (size_t i = 0; i < count; ++i) {
+            channels += (i == 0 ? "" : ",") + channel;
+        }
+        channels += "]";
+        JsonDocument doc;
+        JsonObject root;
+        const std::string json =
+            R"({"type":"stream/start","payload":{"artwork":{"channels":)" + channels + "}}}";
+        ASSERT_TRUE(parse(json.c_str(), doc, root));
+        StreamStartMessage msg;
+        // Control: four channels, every slot, are accepted.
+        const bool accepted = count <= 4;
+        EXPECT_EQ(process_stream_start_message(root, &msg), accepted);
+        if (accepted) {
+            ASSERT_TRUE(msg.artwork.has_value());
+            EXPECT_EQ(msg.artwork->channels->size(), count);
+        }
+    }
+}
+
+// messaging.md "stream/end" and "stream/clear": `roles` names the unversioned stream roles; an
+// omitted list applies to every role, and an entry that names none of them is ignored. A `roles`
+// that is present but not an array is malformed and rejects the message.
+TEST(Protocol, StreamEndAndClearRolesParse) {
+    struct Row {
+        const char* payload;
+        bool accepted;
+        std::optional<EnumSet<SendspinRole>> expected;
+    };
+    const Row rows[] = {
+        {R"({})", true, std::nullopt},
+        {R"({"roles":null})", true, std::nullopt},
+        {R"({"roles":["player"]})", true, EnumSet<SendspinRole>{SendspinRole::PLAYER}},
+        {R"({"roles":["artwork","visualizer"]})", true,
+         EnumSet<SendspinRole>{SendspinRole::ARTWORK, SendspinRole::VISUALIZER}},
+        {R"({"roles":["player@v1","controller",7]})", true, EnumSet<SendspinRole>{}},
+        {R"({"roles":"player"})", false, std::nullopt},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.payload);
+        for (const char* type : {"stream/end", "stream/clear"}) {
+            SCOPED_TRACE(type);
+            JsonDocument doc;
+            JsonObject root;
+            const std::string json =
+                std::string(R"({"type":")") + type + R"(","payload":)" + row.payload + "}";
+            ASSERT_TRUE(parse(json.c_str(), doc, root));
+            StreamRoles roles;
+            bool accepted = false;
+            if (std::string_view(type) == "stream/end") {
+                StreamEndMessage msg;
+                accepted = process_stream_end_message(root, &msg);
+                roles = msg.roles;
+            } else {
+                StreamClearMessage msg;
+                accepted = process_stream_clear_message(root, &msg);
+                roles = msg.roles;
+            }
+            EXPECT_EQ(accepted, row.accepted);
+            if (row.accepted) {
+                EXPECT_EQ(roles, row.expected);
+            }
+        }
+    }
+}
+
 // Enum fields are validated against the known wire strings: a recognized value is applied, an
 // unrecognized one is dropped (leaving the field untouched) rather than clearing or storing garbage.
 TEST(Protocol, GroupUpdatePlaybackStateValidation) {

@@ -1340,7 +1340,7 @@ std::vector<uint8_t> music_bytes(size_t frames, const SourceRoleConfig& config, 
 
 /// Decodes a stream back to packed PCM as a server does, from client-stream/start's Base64
 /// codec_header and the chunk payloads, each of which must be exactly one frame.
-std::vector<uint8_t> decode_flac(const std::string& codec_header,
+std::vector<uint8_t> decode_flac(std::string_view codec_header,
                                  const std::vector<std::vector<uint8_t>>& frames) {
     std::vector<uint8_t> header(codec_header.size());
     size_t header_len = 0;
@@ -1496,7 +1496,7 @@ TEST(SourceFlacChunks, EachChunkIsOneFrameReservedAtTheWorstCase) {
                   FIRST_CAPTURE_US + static_cast<int64_t>(n) * CHUNK_MS * 1000);
         frames.push_back(payload);
     }
-    const std::optional<std::string> codec_header =
+    const std::optional<std::string_view> codec_header =
         rig.task.codec_header(SendspinCodecFormat::FLAC);
     ASSERT_TRUE(codec_header.has_value());
     EXPECT_EQ(decode_flac(*codec_header, frames), capture);

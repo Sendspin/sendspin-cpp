@@ -957,7 +957,9 @@ ServerArtworkStreamObject two_channel_stream(uint16_t channel0_width, uint16_t c
     channel1.width = channel1_width;
 
     ServerArtworkStreamObject stream;
-    stream.channels = std::vector<ServerArtworkChannelObject>{channel0, channel1};
+    stream.channels.emplace();
+    stream.channels->push_back(channel0);
+    stream.channels->push_back(channel1);
     return stream;
 }
 
@@ -983,7 +985,7 @@ TEST(ArtworkStreamStart, PendingImagesSurviveOnlyUnchangedChannels) {
         bool display_survives;
     };
     ServerArtworkStreamObject truncated = two_channel_stream(100, 100);
-    truncated.channels->pop_back();
+    truncated.channels->erase(truncated.channels->begin() + 1);
 
     std::vector<Row> rows;
     rows.push_back({"Control: the channel's entry is unchanged", {1}, two_channel_stream(100, 100),

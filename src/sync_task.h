@@ -310,7 +310,8 @@ protected:
     void apply_stream_clear(SyncContext& sync_context);
 
     /// @brief Gives up the active stream after a decode buffer allocation failure: frees the
-    /// decode buffer and the codec state so nothing stays allocated, and marks the stream
+    /// decode buffer and resets the codec state (the FLAC decoder object is kept for the next FLAC
+    /// stream), and marks the stream
     /// abandoned so the inner loop leaves for IDLE. IDLE returns the stream's remaining chunks as
     /// it takes them, so none stays charged to the player, and starts again on a later stream's
     /// codec header.

@@ -756,6 +756,9 @@ struct ArtworkChannelFormatObject {
     uint16_t height{};
 };
 
+/// @brief Maximum number of artwork slots (2-bit slot field in protocol binary type byte)
+static constexpr size_t ARTWORK_MAX_SLOTS = 4;
+
 /// @brief Server-side description of one artwork channel's format and dimensions
 struct ServerArtworkChannelObject {
     std::optional<SendspinImageSource> source;
@@ -777,7 +780,7 @@ struct ServerArtworkChannelObject {
 
 /// @brief Artwork stream parameters sent by the server in stream/start messages
 struct ServerArtworkStreamObject {
-    std::optional<std::vector<ServerArtworkChannelObject>> channels;
+    std::optional<InlineVector<ServerArtworkChannelObject, ARTWORK_MAX_SLOTS>> channels;
 };
 
 /// @brief Visualizer stream configuration reported by the client in client/state messages
@@ -935,7 +938,7 @@ struct ClientHelloMessage {
     std::string_view name{};
     std::optional<DeviceInfoObject> device_info{};
     /// @brief Storage for a MAC address detected at build time, which device_info views; the view
-    /// stays valid because the message can be neither copied nor moved (its InlineVectors).
+    /// stays valid because the message can be neither copied nor moved (deleted below).
     MacAddressText detected_mac{};
     InlineVector<SendspinRole, static_cast<size_t>(SendspinRole::COUNT)> supported_roles{};
     std::optional<PlayerSupportObject> player_v1_support{};
@@ -943,7 +946,13 @@ struct ClientHelloMessage {
     std::optional<SourceSupportObject> source_v1_support{};
     bool unpaired_access_enabled{false};
     InlineVector<PairMethodDescriptor, MAX_HELLO_PAIR_METHODS> supported_pair_methods{};
+
+    ClientHelloMessage() = default;
+    ClientHelloMessage(const ClientHelloMessage&) = delete;
+    ClientHelloMessage& operator=(const ClientHelloMessage&) = delete;
 };
+static_assert(!std::is_copy_constructible_v<ClientHelloMessage> &&
+              !std::is_move_constructible_v<ClientHelloMessage>);
 
 /// @brief Outgoing client/state message reporting client playback state to the server
 struct ClientStateMessage {
@@ -996,7 +1005,8 @@ struct ClientStreamStartMessage {
     uint8_t channels{};
     uint32_t sample_rate{};
     uint8_t bit_depth{};
-    std::optional<std::string> codec_header{};
+    /// Views the source encoder's header; the message is built and serialized in one go.
+    std::optional<std::string_view> codec_header{};
 };
 
 /// @brief Bit that represents `codec` in a codec mask
@@ -1054,14 +1064,20 @@ struct StreamStartMessage {
     std::optional<ServerVisualizerStreamObject> visualizer;
 };
 
+static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 8, "EnumSet<SendspinRole> needs 8 bits");
+
+/// @brief The roles a stream/end or stream/clear names; nullopt when it omits the list, which
+/// applies it to every role it covers (messaging.md "stream/end", "stream/clear")
+using StreamRoles = std::optional<EnumSet<SendspinRole>>;
+
 /// @brief Parsed stream/end message listing which roles the stream end applies to
 struct StreamEndMessage {
-    std::optional<std::vector<std::string>> roles{};
+    StreamRoles roles{};
 };
 
 /// @brief Parsed stream/clear message listing which roles the buffer flush applies to
 struct StreamClearMessage {
-    std::optional<std::vector<std::string>> roles{};
+    StreamRoles roles{};
 };
 
 /// @brief Parsed pair/abort message (received or sent during a pairing exchange)
@@ -1173,9 +1189,11 @@ bool process_server_state_controller(JsonObject root,
 bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg);
 
 /// @brief Parses a stream/end JSON message into the provided struct
+/// @return false (logged) when `roles` is present but not an array, which rejects the message.
 bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg);
 
 /// @brief Parses a stream/clear JSON message into the provided struct
+/// @return false (logged) when `roles` is present but not an array, which rejects the message.
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg);
 
 /// @brief Builds a client/hello message

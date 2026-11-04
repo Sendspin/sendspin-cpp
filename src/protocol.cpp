@@ -86,6 +86,34 @@ static std::optional<bool> read_bool_field(JsonVariantConst var, const char* nam
     return var.as<bool>();
 }
 
+/// @brief Reads a stream/end or stream/clear `roles` list into `out`: nullopt when absent or null,
+/// otherwise the stream roles it names ('player', 'artwork', 'visualizer'), any other entry
+/// ignored.
+/// @return false (logged) when `roles` is present but not an array.
+static bool read_stream_roles(JsonVariantConst var, const char* type, StreamRoles* out) {
+    if (var.isNull()) {
+        *out = std::nullopt;
+        return true;
+    }
+    if (!var.is<JsonArrayConst>()) {
+        SS_LOGE(TAG, "Invalid %s message: roles is not an array", type);
+        return false;
+    }
+    EnumSet<SendspinRole> roles;
+    for (JsonVariantConst role : var.as<JsonArrayConst>()) {
+        const std::string_view name = role | std::string_view("");
+        if (name == "player") {
+            roles.insert(SendspinRole::PLAYER);
+        } else if (name == "artwork") {
+            roles.insert(SendspinRole::ARTWORK);
+        } else if (name == "visualizer") {
+            roles.insert(SendspinRole::VISUALIZER);
+        }
+    }
+    *out = roles;
+    return true;
+}
+
 /// @brief Writes `bytes` base64url-encoded (no padding) into `field`, which copies it, through a
 /// stack buffer wiped afterwards, so a pairing secret leaves no copy outside the document.
 template <typename Field, size_t N>
@@ -745,10 +773,15 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
     }
 
     if (root["payload"]["artwork"]["channels"].is<JsonArray>()) {
-        std::vector<ServerArtworkChannelObject>& channels =
-            stream_msg->artwork.emplace().channels.emplace();
-
         JsonArray channels_array = root["payload"]["artwork"]["channels"].as<JsonArray>();
+        // roles/artwork/v1.md "stream/start artwork object": the channels array is never longer
+        // than 4, the slots a binary message's type byte can address.
+        if (channels_array.size() > ARTWORK_MAX_SLOTS) {
+            SS_LOGE(TAG, "Invalid stream/start message: %zu artwork channels, at most %zu",
+                    channels_array.size(), ARTWORK_MAX_SLOTS);
+            return false;
+        }
+        auto& channels = stream_msg->artwork.emplace().channels.emplace();
         for (JsonObject channel_json : channels_array) {
             ServerArtworkChannelObject channel{};
             if (process_artwork_channel_object(channel_json, &channel)) {
@@ -828,40 +861,14 @@ bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg) {
     if (end_msg == nullptr) {
         return true;
     }
-
-    // Parse optional roles array
-    if (root["payload"]["roles"].is<JsonArray>()) {
-        std::vector<std::string> roles;
-        JsonArray roles_array = root["payload"]["roles"].as<JsonArray>();
-        for (JsonVariant role_var : roles_array) {
-            if (role_var.is<const char*>()) {
-                roles.push_back(role_var.as<std::string>());
-            }
-        }
-        end_msg->roles = std::move(roles);
-    }
-
-    return true;
+    return read_stream_roles(root["payload"]["roles"], "stream/end", &end_msg->roles);
 }
 
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg) {
     if (clear_msg == nullptr) {
         return true;
     }
-
-    // Parse optional roles array
-    if (root["payload"]["roles"].is<JsonArray>()) {
-        std::vector<std::string> roles;
-        JsonArray roles_array = root["payload"]["roles"].as<JsonArray>();
-        for (JsonVariant role_var : roles_array) {
-            if (role_var.is<const char*>()) {
-                roles.push_back(role_var.as<std::string>());
-            }
-        }
-        clear_msg->roles = std::move(roles);
-    }
-
-    return true;
+    return read_stream_roles(root["payload"]["roles"], "stream/clear", &clear_msg->roles);
 }
 
 // Message formatting

@@ -66,7 +66,8 @@ add_executable(sendspin_tests
 
 # test_decoder.cpp calls SyncTask::decode_whole_chunk(), the sync task's chunk-resume loop, which
 # is a protected static member: it grows the decode buffer, resumes the decoder and rolls a failed
-# chunk back, and nothing on the public surface reaches it without the sync thread.
+# chunk back, and nothing on the public surface reaches it without the sync thread. It also reads
+# SendspinDecoder::flac_decoder_, since a decoder object kept across streams shows nowhere else.
 set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Built only with the trace it tests.
