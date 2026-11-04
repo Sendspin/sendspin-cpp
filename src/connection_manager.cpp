@@ -224,7 +224,7 @@ void ConnectionManager::start() {
     this->shutdown_ui_ = {false, false};
     this->ws_server_start_retry_time_us_ = 0;
 
-    if (this->ws_server_ == nullptr) {
+    if (this->ws_server_ == nullptr && this->client_->config_.accept_inbound_connections) {
         // First start: create the server object and configure it once. The config is immutable
         // for the client's lifetime, so a restart reuses these values along with the object.
         this->ws_server_ = std::make_unique<SendspinWsServer>();
