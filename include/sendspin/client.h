@@ -319,7 +319,8 @@ public:
     /// @brief Starts the role threads and the protocol task, and arms the WebSocket server
     ///
     /// The server starts listening before this returns when the network provider already reports
-    /// ready, and otherwise on the protocol task once a loop() finds it ready. If a role fails to
+    /// ready, and otherwise on the protocol task once a loop() finds it ready. With
+    /// SendspinClientConfig::accept_inbound_connections off, no server starts. If a role fails to
     /// start, the roles that did start are stopped again so a corrected retry begins from the
     /// stopped state. A rejected configured pairing secret (SendspinClientConfig::pairing_psk or
     /// static_pairing_code) fails every start() of this instance, since the config is fixed at

@@ -285,8 +285,7 @@ struct SendspinClientConfig {
 
     /// @brief Whether to run the WebSocket server that servers connect to. Off leaves connect_to()
     /// as the only way a server reaches the client, for a client that dials one configured server
-    /// and must not be reachable by any other; `server_port` and `server_max_connections` are then
-    /// unused.
+    /// and must not be reachable by any other; `server_port` is then unused.
     bool accept_inbound_connections{true};
 
     /// @brief Default maximum simultaneous inbound connections: one established connection, two
