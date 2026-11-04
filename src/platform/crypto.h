@@ -23,9 +23,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -389,26 +389,13 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
 // ============================================================================
 
 /// @brief Fill a buffer with cryptographically secure random bytes.
-/// Routes through noise-c's `noise_randstate_*` abstraction which uses the OS
-/// entropy source on host (/dev/urandom) and the ESP32 hardware RNG on ESP.
+/// Runs noise-c's ChaCha20 generator with its state on the stack, seeded from the OS
+/// entropy source on host and the ESP32 hardware RNG on ESP. Nothing is allocated, so on ESP
+/// it cannot fail for a non-null `out`; on host noise-c exits the process when the OS source
+/// cannot be read.
 inline void platform_random_bytes(uint8_t* out, size_t len) {
-    NoiseRandState* rng = nullptr;
-    int err = noise_randstate_new(&rng);
-    if (err != NOISE_ERROR_NONE || rng == nullptr) {
-        // Fail closed: there is no safe fallback for a CSPRNG failure. Returning without
-        // writing `out` would leave a predictable (often all-zero) value, which is fatal for
-        // key/nonce generation (e.g. a CPace scalar or a pairing-code nonce). Abort instead.
-        abort();
-    }
-    noise_randstate_generate(rng, out, len);
-    noise_randstate_free(rng);
-}
-
-/// @brief Generate `len` cryptographically secure random bytes.
-inline std::vector<uint8_t> platform_random_bytes(size_t len) {
-    std::vector<uint8_t> out(len);
-    platform_random_bytes(out.data(), len);
-    return out;
+    [[maybe_unused]] const int err = noise_randstate_generate_simple(out, len);
+    assert(err == NOISE_ERROR_NONE && "platform_random_bytes() needs a buffer");
 }
 
 // ============================================================================

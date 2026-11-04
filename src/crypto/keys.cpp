@@ -59,7 +59,7 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
     // failed. This overload's non-optional return type is depended on throughout the tree
     // (record store, tests) as a plain std::string, so there is no safe value to
     // return on failure; fail loudly rather than silently deriving a psk_id from a
-    // zero digest (matching the CSPRNG-failure precedent in platform_random_bytes()).
+    // zero digest.
     auto result = psk_id_for(psk.data(), psk.size());
     if (!result.has_value()) {
         abort();
