@@ -758,7 +758,8 @@ TEST(CPaceDeriveRejects, StartRejectsAnOversizedSidOrAd) {
         bool started;
     };
     const Row rows[] = {
-        {"every field at its limit", CPACE_MAX_SID_SIZE, CPACE_MAX_AD_SIZE, CPACE_MAX_AD_SIZE, true},
+        {"Control: every field at its limit", CPACE_MAX_SID_SIZE, CPACE_MAX_AD_SIZE,
+         CPACE_MAX_AD_SIZE, true},
         {"sid", CPACE_MAX_SID_SIZE + 1, 0, 0, false},
         {"ad", 32, CPACE_MAX_AD_SIZE + 1, 0, false},
         {"peer ad", 32, 0, CPACE_MAX_AD_SIZE + 1, false},

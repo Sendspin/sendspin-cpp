@@ -151,7 +151,12 @@ endif()
 # frame written without a Noise session that another thread may read; the wake test restarts the
 # protocol task (protocol_task_->start()) with liveness off (liveness_timeout_us_) so the grant is
 # the only wake, and polls the client's Inbox through a role's impl_->inbox, which also lets the
-# reorder table fill the event ring. The stream-events table drives the player's
+# reorder table fill the event ring. The re-entrant pairing table queues pairing notes as the
+# protocol task's handlers do (SendspinClient's note_open_pairing_window(),
+# note_display_pairing_code() and note_clear_pairing_code()), since no public call shows a prompt,
+# and from inside its listener runs the final tick stop() would join (close_admission(),
+# protocol_tick()), so the shutdown pass takes the prompt flags it set on its stand-in's
+# pairing_session() (window_shown and code_emitted). The stream-events table drives the player's
 # handle_stream_start() and handle_stream_end() as the task would, and stages one interleaving by
 # waiting on the sync task's item list and the player's sync-idle topic bit, and its clear row calls
 # handle_stream_clear() the same way. The next-stream header table plays the sync task itself on

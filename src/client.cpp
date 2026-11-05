@@ -1036,16 +1036,17 @@ void SendspinClient::drain_inbox() {
     // dispatched, and every note taken finds its write performed.
     // Moved out for the dispatch and back after it, so a listener callback that re-enters the
     // drain (a stop() whose dismissals it drains) cannot touch the batch this frame is delivering.
-    // That nested drain finds the buffer gone and reserves another before trading it to the slot,
-    // which therefore keeps its room; the one this frame moves back replaces the nested drain's.
+    // That nested drain finds the buffer gone and, only when it has notes to take, reserves
+    // another before trading it to the slot, which therefore keeps its room; the one this frame
+    // moves back, emptied, replaces the nested drain's.
     std::vector<PairingNote> notes = std::move(es.drained_pairing_notes);
-    notes.clear();
-    if (notes.capacity() < PAIRING_NOTE_CAPACITY) {
-        notes.reserve(PAIRING_NOTE_CAPACITY);
+    bool notes_taken = false;
+    if ((slot_bits & INBOX_TOPIC_PAIRING) != 0 && es.drain_generation == drain_generation) {
+        if (notes.capacity() < PAIRING_NOTE_CAPACITY) {
+            notes.reserve(PAIRING_NOTE_CAPACITY);
+        }
+        notes_taken = es.pairing_slot.exchange(notes);
     }
-    const bool notes_taken = (slot_bits & INBOX_TOPIC_PAIRING) != 0 &&
-                             es.drain_generation == drain_generation &&
-                             es.pairing_slot.exchange(notes);
     this->flush_pending_persistence();
     if (notes_taken && es.drain_generation == drain_generation) {
         if (this->listener_ != nullptr) {
@@ -1096,6 +1097,7 @@ void SendspinClient::drain_inbox() {
             }
         }
     }
+    notes.clear();
     es.drained_pairing_notes = std::move(notes);
 
     // --- Role events: bit-gated so an idle tick performs zero inbox mutex acquisitions here ---
