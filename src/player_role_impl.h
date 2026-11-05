@@ -27,7 +27,6 @@
 #include <atomic>
 #include <memory>
 #include <optional>
-#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -36,6 +35,7 @@ class SendspinClient;
 class SendspinPersistenceProvider;
 struct ClientHelloMessage;
 struct ClientStateMessage;
+struct PlayerStreamPayload;
 
 /// @brief Deferred stream lifecycle callback types queued from the protocol task
 enum class PlayerStreamCallbackType : uint8_t {
@@ -109,7 +109,7 @@ struct PlayerRole::Impl : RoleTeardown {
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted chunk; `data` points at its message type byte.
     void handle_binary(InboundMessage& message);
-    void handle_stream_start(ServerPlayerStreamObject&& player_obj);
+    void handle_stream_start(const PlayerStreamPayload& player);
     void handle_stream_end() const;
     void handle_stream_clear();
     void handle_server_command(const ServerCommandMessage& cmd) const;
@@ -164,13 +164,6 @@ struct PlayerRole::Impl : RoleTeardown {
     // Helpers
     // ========================================
 
-    /// @brief Base64-decodes a FLAC codec header straight into a ring item (waiting up to
-    /// INBOUND_ACQUIRE_TIMEOUT_MS for space) and hands it to the sync task numbered with
-    /// `ordinal`. Protocol task only.
-    /// @return false when the sync task is not running, the header does not decode, or the ring
-    ///         had no room in time.
-    bool hand_flac_header(std::string_view codec_header, uint16_t ordinal,
-                          uint32_t generation) const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it, and carrying a STREAM_START's `ordinal`.
     void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation,

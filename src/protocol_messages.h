@@ -529,6 +529,21 @@ struct PlayerSupportObject {
     size_t buffer_capacity{};
 };
 
+/// @brief A decoded FLAC codec_header: the `fLaC` marker, the STREAMINFO metadata block header
+/// and its 34-byte body (roles/player/v1.md "Codec framing").
+inline constexpr size_t FLAC_CODEC_HEADER_BYTES = 42;
+using FlacCodecHeader = std::array<uint8_t, FLAC_CODEC_HEADER_BYTES>;
+
+/// @brief A parsed stream/start player object: the public ServerPlayerStreamObject, plus the
+/// decoded codec header the sync task's decoder takes, which only a FLAC stream carries
+struct PlayerStreamPayload {
+    ServerPlayerStreamObject params{};
+    std::optional<FlacCodecHeader> flac_header{};
+};
+
+static_assert(std::is_trivially_copyable_v<PlayerStreamPayload>,
+              "parsed on the protocol task with nothing on the heap");
+
 /// @brief Protocol maximum for every volume field: volume is 0-100 on the wire.
 static constexpr uint8_t VOLUME_MAX = 100;
 
@@ -1066,7 +1081,7 @@ struct GroupUpdateMessage {
 
 /// @brief Parsed stream/start message with per-role stream parameters
 struct StreamStartMessage {
-    std::optional<ServerPlayerStreamObject> player;
+    std::optional<PlayerStreamPayload> player;
     std::optional<ServerArtworkStreamObject> artwork;
     std::optional<VisualizerStreamPayload> visualizer;
 };

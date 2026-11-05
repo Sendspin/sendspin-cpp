@@ -39,6 +39,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -518,8 +519,68 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
     StreamStartMessage ok;
     EXPECT_TRUE(process_stream_start_message(root_ok, STREAM_START_ROLES, &ok));
     ASSERT_TRUE(ok.player.has_value());
-    ASSERT_TRUE(ok.player->channels.has_value());
-    EXPECT_EQ(ok.player->channels.value(), 2);
+    ASSERT_TRUE(ok.player->params.channels.has_value());
+    EXPECT_EQ(ok.player->params.channels.value(), 2);
+}
+
+// roles/player/v1.md "Codec framing": a FLAC codec_header is required and carries the fLaC marker
+// followed by the STREAMINFO block, in standard Base64, so the parse accepts exactly that
+// (with STREAMINFO marked as the last metadata block) and decodes it. pcm carries none, and a
+// header beside it is not read.
+TEST(Protocol, StreamStartFlacCodecHeaderMustBeMarkerAndStreamInfo) {
+    // What the control row's header decodes to: fLaC, a last STREAMINFO block header of length
+    // 34, and a 48 kHz stereo 16-bit STREAMINFO.
+    constexpr FlacCodecHeader DECODED = {'f',  'L',  'a',  'C',  0x80, 0x00, 0x00, 0x22, 0x10,
+                                         0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x0b, 0xb8, 0x02, 0xf0};
+    struct Row {
+        const char* name;
+        const char* codec;
+        const char* header;  // The codec_header member, or nullptr to omit it
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: the marker and a last STREAMINFO", "flac",
+         R"("ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", true},
+        {"no header", "flac", nullptr, false},
+        {"bad Base64", "flac", R"("ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAA*")", false},
+        {"a space in place of a character", "flac",
+         R"("ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAA ")", false},
+        {"an extra padding character", "flac",
+         R"("ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA=")", false},
+        {"the marker misspelled", "flac",
+         R"("ZkxBQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", false},
+        {"STREAMINFO not marked last", "flac",
+         R"("ZkxhQwAAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", false},
+        {"a block type other than STREAMINFO", "flac",
+         R"("ZkxhQ4EAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", false},
+        {"a block length other than 34", "flac",
+         R"("ZkxhQ4AAACEQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", false},
+        {"pcm without a header", "pcm", nullptr, true},
+        {"pcm beside a header it does not read", "pcm", R"("not base64")", true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        std::string player = std::string(R"({"codec":")") + row.codec +
+                             R"(","sample_rate":48000,"channels":2,"bit_depth":16)";
+        if (row.header != nullptr) {
+            player += std::string(R"(,"codec_header":)") + row.header;
+        }
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":)" + player + "}}}", doc,
+                          root));
+        StreamStartMessage msg;
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), row.accepted);
+        ASSERT_EQ(msg.player.has_value(), row.accepted);
+        if (row.accepted) {
+            const bool flac = std::string_view(row.codec) == "flac";
+            ASSERT_EQ(msg.player->flac_header.has_value(), flac);
+            if (flac) {
+                EXPECT_EQ(*msg.player->flac_header, DECODED);
+            }
+        }
+    }
 }
 
 // A stream/start carrying a malformed section is rejected whole, so a well-formed section beside
