@@ -628,12 +628,15 @@ struct VisualizerSupportObject {
 
 /// @brief Visualization data the client asks the server to stream, reported in client/state
 struct VisualizerStreamConfig {
-    /// @brief Data types the client wants to receive. May be empty to request no data
+    /// @brief Data types the client wants to receive. May be empty to request no data. A type a
+    /// stream serves outside them is dropped (docs/integration-guide.md, VisualizerStreamConfig)
     std::vector<VisualizerDataType> types{};
     /// @brief Maximum periodic visualization frames per second (applies to LOUDNESS, F_PEAK,
     /// SPECTRUM). Event types (BEAT, PEAK) are not throttled. Set to the display refresh rate
     uint16_t rate_max{};
-    /// @brief Spectrum configuration, required if types includes SPECTRUM
+    /// @brief Spectrum configuration, required if types includes SPECTRUM. A served spectrum that
+    /// does not match it (fewer bins allowed) is dropped (docs/integration-guide.md,
+    /// VisualizerStreamConfig)
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 

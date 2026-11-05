@@ -32,9 +32,10 @@ class SendspinClient;
 // Visualizer types
 // ============================================================================
 
-/// @brief Visualizer stream parameters sent by the server in stream/start messages
+/// @brief A visualizer stream/start as admitted: what the client will receive, which leaves out
+/// what the server sent beyond the request
 struct ServerVisualizerStreamObject {
-    /// @brief Data types the server will stream, each once, in enumerator order
+    /// @brief Data types the client will receive, each once, in enumerator order
     std::vector<VisualizerDataType> types{};
     /// @brief Periodic frames per second the server will emit
     uint16_t rate_max{};

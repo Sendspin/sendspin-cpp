@@ -484,6 +484,7 @@ TEST(VisualizerSpectrumWiring, OnlyRequestedTypesAndAMatchingSpectrumAreAdmitted
         VisualizerDataType handed;
         bool expected_admitted;
         uint8_t expected_bins;
+        bool expected_downbeats{false};
     };
     const std::vector<Row> rows = {
         {"Control: spectrum matching the request is admitted", spectrum_and_loudness, four_bins,
@@ -505,6 +506,21 @@ TEST(VisualizerSpectrumWiring, OnlyRequestedTypesAndAMatchingSpectrumAreAdmitted
          four_bins, VisualizerDataType::SPECTRUM, false, 0},
         {"loudness the configuration does not request is dropped", {VisualizerDataType::SPECTRUM},
          four_bins, VisualizerDataType::LOUDNESS, false, 4},
+        {"beat the configuration does not request is dropped with its downbeats",
+         spectrum_and_loudness, four_bins, VisualizerDataType::BEAT, false, 4, false},
+        {"Control: requested beat keeps its downbeats",
+         {VisualizerDataType::SPECTRUM, VisualizerDataType::LOUDNESS, VisualizerDataType::BEAT},
+         four_bins, VisualizerDataType::BEAT, true, 4, true},
+    };
+    const auto wire_type = [](VisualizerDataType type) -> uint8_t {
+        switch (type) {
+            case VisualizerDataType::SPECTRUM:
+                return SENDSPIN_BINARY_VISUALIZER_SPECTRUM;
+            case VisualizerDataType::BEAT:
+                return SENDSPIN_BINARY_VISUALIZER_BEAT;
+            default:
+                return SENDSPIN_BINARY_VISUALIZER_LOUDNESS;
+        }
     };
 
     // A timestamp, then five bins, one more than requested.
@@ -517,30 +533,35 @@ TEST(VisualizerSpectrumWiring, OnlyRequestedTypesAndAMatchingSpectrumAreAdmitted
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
+        StreamStartCounter listener;
+        impl->listener = &listener;
         impl->config.stream.types = row.requested;
         impl->config.stream.spectrum = four_bins;
 
-        // The server serves both types whatever was requested.
+        // The server serves all three types, tracking downbeats, whatever was requested.
         VisualizerStreamPayload stream;
-        stream.types = {VisualizerDataType::SPECTRUM, VisualizerDataType::LOUDNESS};
+        stream.types = {VisualizerDataType::SPECTRUM, VisualizerDataType::LOUDNESS,
+                        VisualizerDataType::BEAT};
+        stream.tracks_downbeats = true;
         stream.spectrum = row.served_spectrum;
         impl->handle_stream_start(stream);
         take_in_ring_order(*impl->drain_task->inbound.ring());
 
-        hand(*impl,
-             row.handed == VisualizerDataType::SPECTRUM ? SENDSPIN_BINARY_VISUALIZER_SPECTRUM
-                                                        : SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
-             data);
+        hand(*impl, wire_type(row.handed), data);
         Entry entry;
         EXPECT_EQ(pop_entry(*impl, entry), row.expected_admitted);
         EXPECT_EQ(impl->spectrum_bin_count, row.expected_bins);
 
         // The stream the main loop reports is the admitted one.
-        VisualizerStreamPayload reported;
-        uint32_t stamp = 0;
-        ASSERT_TRUE(impl->event_state->config_slot.take(reported, stamp));
-        EXPECT_EQ(reported.types.contains(row.handed), row.expected_admitted);
-        EXPECT_EQ(reported.spectrum.has_value(), row.expected_bins != 0);
+        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START,
+                                       impl->cleanup_generation.load());
+        ASSERT_EQ(listener.starts, 1);
+        const ServerVisualizerStreamObject& heard = listener.last;
+        EXPECT_EQ(std::find(heard.types.begin(), heard.types.end(), row.handed) !=
+                      heard.types.end(),
+                  row.expected_admitted);
+        EXPECT_EQ(heard.spectrum.has_value(), row.expected_bins != 0);
+        EXPECT_EQ(heard.tracks_downbeats, row.expected_downbeats);
     }
 }
 
