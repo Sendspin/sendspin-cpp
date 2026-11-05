@@ -127,6 +127,7 @@ constexpr uint16_t UNPAIRED_TOGGLE_OUTBOUND_TEST_PORT = 19095;
 constexpr uint16_t UNPAIRED_TOGGLE_REKEY_TEST_PORT = 19096;
 constexpr uint16_t UNPAIRED_TOGGLE_STOPPED_TEST_PORT = 19097;
 constexpr uint16_t UNPAIRED_TOGGLE_NURSERY_PAIRING_TEST_PORT = 19098;
+constexpr uint16_t UNPAIRED_BAD_METHOD_TEST_PORT = 19204;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob() to a record slot key, so the pairing-flow test below
@@ -469,6 +470,43 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
            "told pairing is what is missing";
 
     pump_for(client, 100);
+}
+
+// messaging.md "server/activate", first rejection rule: pairing_required only when enabling
+// unpaired access would make the whole activation admissible, pairing method included. A
+// Sentinel session declaring playback alongside pairing_psk stays inadmissible with unpaired
+// access on, so it is unauthorized; the same activation naming an offered method is the control.
+TEST(EncryptedLifecycle, UnpairedPlaybackWithUnusablePairingMethodIsUnauthorized) {
+    TestNetworkProvider network;
+    InMemoryPersistenceProvider persistence;
+    SendspinClientConfig config;
+    config.name = "Unpaired Bad Method Test Client";
+    config.server_port = UNPAIRED_BAD_METHOD_TEST_PORT;
+    config.static_pairing_code = "13572468";
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    struct Row {
+        const char* method;
+        const char* expected;
+    };
+    for (const Row& row : {Row{"pairing_psk", "unauthorized"},
+                           Row{"static_pairing_code", "pairing_required"}}) {
+        SCOPED_TRACE(row.method);
+        FakeEncryptedServerOptions options;
+        options.first_activities_json = R"(["playback","pairing"])";
+        options.first_roles_json = R"([])";
+        options.first_pairing_method = row.method;
+        FakeEncryptedServer server(server_url(UNPAIRED_BAD_METHOD_TEST_PORT),
+                                   std::string(NOISE_SUITE_CHACHAPOLY), Identity::generate().value(),
+                                   std::string(SENTINEL_PSK_ID), SENTINEL_PSK, options);
+        pump_until(client, [&] { return server.closed(); });
+        EXPECT_EQ(server.goodbye_reason(), std::optional<std::string>(row.expected));
+    }
+
+    client.stop();
 }
 
 // The hello must advertise a pairing method the server can actually start. pairing_psk is the

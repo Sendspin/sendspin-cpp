@@ -19,12 +19,14 @@
 #include "admission.h"
 #include "protocol_messages.h"
 #include "record_store.h"
+#include "sendspin/config.h"
 #include "sendspin/types.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -189,24 +191,30 @@ TEST(RejectReason, PairingRequiredOnlyWhereUnpairedAccessWouldHaveAdmitted) {
         Acts activities;
         bool has_roles;
         bool unpaired_access;
+        bool pairing_ok;
         SendspinGoodbyeReason expected;
     };
     const auto PAIRING_REQUIRED = SendspinGoodbyeReason::PAIRING_REQUIRED;
     const auto UNAUTHORIZED = SendspinGoodbyeReason::UNAUTHORIZED;
     const Row rows[] = {
-        {"Sentinel/[playback]/no-roles", SENTINEL, Acts{PB}, false, false, PAIRING_REQUIRED},
-        {"Sentinel/[playback]/roles", SENTINEL, Acts{PB}, true, false, PAIRING_REQUIRED},
-        {"Sentinel/[]/roles", SENTINEL, Acts{}, true, false, PAIRING_REQUIRED},
+        {"Sentinel/[playback]/no-roles", SENTINEL, Acts{PB}, false, false, true, PAIRING_REQUIRED},
+        {"Sentinel/[playback]/roles", SENTINEL, Acts{PB}, true, false, true, PAIRING_REQUIRED},
+        {"Sentinel/[]/roles", SENTINEL, Acts{}, true, false, true, PAIRING_REQUIRED},
         // The Pairing PSK gates playback on unpaired access exactly as the Sentinel PSK does.
-        {"Pairing/[playback]/no-roles", PAIRING_CAT, Acts{PB}, false, false, PAIRING_REQUIRED},
-        {"Pairing/[pairing,playback]/no-roles", PAIRING_CAT, Acts{PR, PB}, false, false,
+        {"Pairing/[playback]/no-roles", PAIRING_CAT, Acts{PB}, false, false, true,
          PAIRING_REQUIRED},
+        {"Pairing/[pairing,playback]/no-roles", PAIRING_CAT, Acts{PR, PB}, false, false, true,
+         PAIRING_REQUIRED},
+        // A refused pairing object stays refused with unpaired access on, so enabling it would
+        // not have admitted the activation.
+        {"Sentinel/[pairing,playback]/bad-method", SENTINEL, Acts{PR, PB}, false, false, false,
+         UNAUTHORIZED},
         // Pairing is not a long-term activity set under any setting, so enabling unpaired access
         // would not have admitted it.
-        {"LongTerm/[pairing]/no-unpaired", LONG_TERM, Acts{PR}, false, false, UNAUTHORIZED},
-        {"LongTerm/[pairing,playback]/no-unpaired", LONG_TERM, Acts{PR, PB}, false, false,
+        {"LongTerm/[pairing]/no-unpaired", LONG_TERM, Acts{PR}, false, false, true, UNAUTHORIZED},
+        {"LongTerm/[pairing,playback]/no-unpaired", LONG_TERM, Acts{PR, PB}, false, false, true,
          UNAUTHORIZED},
-        {"LongTerm/[pairing]/unpaired", LONG_TERM, Acts{PR}, false, true, UNAUTHORIZED},
+        {"LongTerm/[pairing]/unpaired", LONG_TERM, Acts{PR}, false, true, true, UNAUTHORIZED},
     };
 
     for (const Row& row : rows) {
@@ -214,8 +222,63 @@ TEST(RejectReason, PairingRequiredOnlyWhereUnpairedAccessWouldHaveAdmitted) {
         // Call the production function the activate handler calls: a local reimplementation of the
         // same condition would keep this test green no matter what the handler does.
         EXPECT_EQ(inadmissible_reject_reason(row.category, row.activities, row.has_roles,
-                                             row.unpaired_access),
+                                             row.unpaired_access, row.pairing_ok),
                   row.expected);
+    }
+}
+
+// messaging.md "server/activate": the pairing object must name a method matching the PSK
+// category and offered by the client, and a dynamic_pairing_code one an offered format.
+TEST(PairingMethodRefusal, AcceptsOnlyAnOfferedMethodMatchingThePsk) {
+    using M = SendspinPairMethod;
+    using F = SendspinPairingCodeFormat;
+    SendspinClientConfig dynamic_cfg;
+    dynamic_cfg.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+    dynamic_cfg.pairing_code_formats = {F::DIGITS};
+    SendspinClientConfig static_cfg;
+    static_cfg.static_pairing_code = "13572468";
+    const SendspinClientConfig psk_only_cfg;
+
+    struct Row {
+        const char* name;
+        PskCategory category;
+        Acts activities;
+        std::optional<M> method;
+        std::optional<F> format;
+        const SendspinClientConfig* config;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"no-pairing-activity/ignores-object", SENTINEL, Acts{PB}, std::nullopt, std::nullopt,
+         &psk_only_cfg, true},
+        {"pairing_psk/pairing-psk", PAIRING_CAT, Acts{PR}, M::PAIRING_PSK, std::nullopt,
+         &psk_only_cfg, true},
+        {"pairing_psk/sentinel", SENTINEL, Acts{PR, PB}, M::PAIRING_PSK, std::nullopt,
+         &psk_only_cfg, false},
+        {"method-absent", SENTINEL, Acts{PR}, std::nullopt, std::nullopt, &psk_only_cfg, false},
+        {"static/offered", SENTINEL, Acts{PR}, M::STATIC_PAIRING_CODE, std::nullopt, &static_cfg,
+         true},
+        {"static/on-pairing-psk", PAIRING_CAT, Acts{PR}, M::STATIC_PAIRING_CODE, std::nullopt,
+         &static_cfg, false},
+        {"static/not-offered", SENTINEL, Acts{PR}, M::STATIC_PAIRING_CODE, std::nullopt,
+         &psk_only_cfg, false},
+        {"dynamic/offered-format", SENTINEL, Acts{PR}, M::DYNAMIC_PAIRING_CODE, F::DIGITS,
+         &dynamic_cfg, true},
+        {"dynamic/unoffered-format", SENTINEL, Acts{PR}, M::DYNAMIC_PAIRING_CODE, F::QR_CODE,
+         &dynamic_cfg, false},
+        {"dynamic/no-format", SENTINEL, Acts{PR}, M::DYNAMIC_PAIRING_CODE, std::nullopt,
+         &dynamic_cfg, false},
+        {"dynamic/not-offered", SENTINEL, Acts{PR}, M::DYNAMIC_PAIRING_CODE, F::DIGITS,
+         &static_cfg, false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        ServerActivateMessage msg;
+        msg.activities = row.activities;
+        msg.pairing_method = row.method;
+        msg.pairing_format = row.format;
+        EXPECT_EQ(pairing_method_refusal(row.category, msg, *row.config) == nullptr, row.accepted);
     }
 }
 
