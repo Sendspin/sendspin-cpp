@@ -93,7 +93,8 @@ endif()
 # and SendspinConnection's noise_handshake_complete_ (a stand-in's finished handshake) and its
 # transport side, begin_inbound_message() and end_inbound_message() (a stand-in's transport writing
 # a ring item and a fallback message). The ring-size tables read SendspinClient::inbound_ring_ and
-# InboundRing::storage_, the ring a start() created, whose size no public call reports, and build
+# InboundRing::storage_, the ring a start() created, whose size no public call reports (and the
+# oversized-hello rollback reads inbound_ring_ to see a refused start() released it), and build
 # the player_'s and visualizer_'s client/hello fields through their impl_, the buffer_capacity a
 # hello advertises, which no public call returns. The returned-LOCAL-item destruction test reads
 # InboundRing::ring_'s host items_waiting_ under its mtx_ (the chunk was copied into the ring) and

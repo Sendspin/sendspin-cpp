@@ -17,6 +17,7 @@
 // malformed-input handling) where a bug is silent rather than a crash, plus a hand-rolled int64
 // formatter that we can check against snprintf as a free correctness oracle.
 
+#include "application_role.h"
 #include "log_capture.h"
 #include "platform/base64.h"
 #include "protocol_messages.h"
@@ -1249,6 +1250,180 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
     EXPECT_FALSE(doc["payload"]["device_info"]["manufacturer"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["software_version"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["mac_address"].is<const char*>());
+}
+
+// ============================================================================
+// Application-specific roles in client/hello
+// ============================================================================
+
+// messaging.md "client/hello": application-specific roles follow the library's own roles in
+// supported_roles, and a support object is keyed "<role>_support", for a name as long as start()
+// admits too. The role without one sends no key, and the defined role keeps its place and its
+// support object.
+TEST(Protocol, FormatClientHelloApplicationRoles) {
+    ClientHelloMessage msg;
+    msg.name = "Speaker";
+    msg.supported_roles.push_back(SendspinRole::VISUALIZER);
+    VisualizerSupportObject vis{};
+    vis.buffer_capacity = 4096;
+    msg.visualizer_support = vis;
+    const std::string longest =
+        "_" + std::string(MAX_APPLICATION_ROLE_NAME_BYTES - 4, 'a') + "@v1";
+    const SendspinApplicationRole app_roles[] = {
+        {"_acme_pairing@v1", std::string(R"({"port":8930})")},
+        {"_acme_display@v2", std::nullopt},
+        {longest, std::string(R"({"b":true})")},
+    };
+    msg.application_roles = app_roles;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
+    JsonArrayConst roles = doc["payload"]["supported_roles"];
+    ASSERT_EQ(roles.size(), 4U);
+    EXPECT_STREQ(roles[0], "visualizer@v1");
+    EXPECT_STREQ(roles[1], "_acme_pairing@v1");
+    EXPECT_STREQ(roles[2], "_acme_display@v2");
+    EXPECT_EQ(roles[3].as<std::string>(), longest);
+
+    JsonObjectConst support = doc["payload"]["_acme_pairing@v1_support"];
+    ASSERT_FALSE(support.isNull());
+    EXPECT_EQ(support.size(), 1U);
+    EXPECT_EQ(support["port"].as<int>(), 8930);
+    EXPECT_TRUE(doc["payload"]["_acme_display@v2_support"].isUnbound());
+    EXPECT_TRUE(doc["payload"][longest + "_support"]["b"].as<bool>());
+    EXPECT_EQ(doc["payload"]["visualizer@v1_support"]["buffer_capacity"].as<int>(), 4096);
+}
+
+// README.md "Application-Specific Roles": a leading `_` and an explicit `@version`.
+TEST(ApplicationRole, NameNeedsLeadingUnderscoreAndVersion) {
+    struct Row {
+        const char* name;
+        std::string role;
+        bool expect_ok;
+    };
+    // MAX_APPLICATION_ROLE_NAME_BYTES bytes with "_" and "@v1"
+    const std::string longest =
+        "_" + std::string(MAX_APPLICATION_ROLE_NAME_BYTES - 4, 'a') + "@v1";
+    const Row rows[] = {
+        {"defined role", "player@v1", false},
+        {"no version", "_acme_display", false},
+        {"empty version", "_acme_display@", false},
+        {"no name", "_@v1", false},
+        {"two @", "_acme@v1@v2", false},
+        {"space", "_acme display@v1", false},
+        {"quote, which JSON escapes", "_acme\"display@v1", false},
+        {"backslash, which JSON escapes", "_acme\\display@v1", false},
+        {"DEL", "_acme\x7f" "display@v1", false},
+        {"non-ASCII", "_acme\xc3\xa9@v1", false},
+        {"empty", "", false},
+        {"one byte too long", "_a" + longest.substr(1), false},
+        // Control: well-formed names, the shortest and the longest included.
+        {"vendor-prefixed", "_acme_display@v1", true},
+        {"shortest", "_a@1", true},
+        {"longest", longest, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(is_valid_application_role_name(row.role), row.expect_ok);
+    }
+}
+
+// The support object is embedded without a second parse, so start() sends ArduinoJson's own
+// serialization: anything but one JSON object, an object nested deeper than client/hello's 10
+// levels leave room for under its root and payload (messaging.md "client/hello"), or strings that
+// are not UTF-8 or hold a control byte (which the serializer would emit raw), is refused, and
+// lenient input the parser accepts goes out as standard JSON.
+TEST(ApplicationRole, SupportJsonIsNormalizedToOneObject) {
+    struct Row {
+        const char* name;
+        std::string json;
+        std::optional<std::string> expect;
+    };
+    // An object nested `levels` deep, itself level 1
+    const auto nested = [](size_t levels) {
+        std::string json = "{}";
+        for (size_t i = 1; i < levels; ++i) {
+            json = R"({"a":)" + json + "}";
+        }
+        return json;
+    };
+    const Row rows[] = {
+        {"nested 9 levels", nested(9), std::nullopt},
+        {"array", "[1]", std::nullopt},
+        {"number", "8930", std::nullopt},
+        {"truncated", R"({"port":)", std::nullopt},
+        {"trailing value", R"({"port":1}{})", std::nullopt},
+        {"trailing junk", R"({"port":1} x)", std::nullopt},
+        {"invalid UTF-8", "{\"a\":\"\xc3\x28\"}", std::nullopt},
+        {"surrogate in UTF-8", "{\"a\":\"\xed\xa0\x80\"}", std::nullopt},
+        {"empty", "", std::nullopt},
+        {"unquoted key", "{port:1}", R"({"port":1})"},
+        {"single quotes", "{'a':'b'}", R"({"a":"b"})"},
+        {"raw control byte", "{\"a\":\"x\x01\"}", std::nullopt},
+        {"escaped control byte", R"({"a":"x\u0001"})", std::nullopt},
+        // Control: objects, with surrounding whitespace, nesting and multi-byte UTF-8.
+        {"object", R"({"port":8930})", R"({"port":8930})"},
+        {"empty object", "{}", "{}"},
+        {"padded", " { \"a\" : {\"b\":[1,2]}}\n", R"({"a":{"b":[1,2]}})"},
+        {"nested 8 levels", nested(8), nested(8)},
+        {"UTF-8", "{\"a\":\"\xc3\xa9\xf0\x9f\x8e\xb5\"}", "{\"a\":\"\xc3\xa9\xf0\x9f\x8e\xb5\"}"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(normalize_support_object_json(row.json), row.expect);
+    }
+}
+
+// messaging.md "client/hello": at most 16384 bytes. client_hello_fits() measures the longest hello
+// a connection could send from the one start() builds: unpaired access off ("false" is longer than
+// "true") and a MAC address where none was detected yet.
+TEST(Protocol, ClientHelloFitsMeasuresTheLongestHello) {
+    constexpr size_t CAP = 16384;
+    const auto wire_size = [](const ClientHelloMessage& msg) {
+        return built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); })
+            .size();
+    };
+    // What a detected MAC adds to the hello
+    size_t mac_bytes = 0;
+    {
+        ClientHelloMessage msg;
+        msg.device_info.emplace();
+        const size_t without = wire_size(msg);
+        msg.device_info->mac_address = "aa:bb:cc:dd:ee:ff";
+        mac_bytes = wire_size(msg) - without;
+    }
+
+    struct Row {
+        const char* name;
+        bool unpaired_access;
+        bool has_mac;
+        size_t size;  // the hello's size as given, set by padding its name
+        bool expect_fits;
+    };
+    const Row rows[] = {
+        {"one byte over", false, true, CAP + 1, false},
+        {"a MAC detected later puts it over", false, false, CAP - mac_bytes + 1, false},
+        {"unpaired access turned off puts it over", true, true, CAP, false},
+        // Control: the longest hello exactly at the cap.
+        {"exactly the cap", false, true, CAP, true},
+        {"room left for a MAC detected later", false, false, CAP - mac_bytes, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        ClientHelloMessage msg;
+        msg.device_info.emplace();
+        if (row.has_mac) {
+            msg.device_info->mac_address = "aa:bb:cc:dd:ee:ff";
+        }
+        msg.unpaired_access_enabled = row.unpaired_access;
+        msg.name = "";  // a default string_view, with no data, goes out as null
+        const std::string name(row.size - wire_size(msg), 'n');
+        msg.name = name;
+        ASSERT_EQ(wire_size(msg), row.size);
+        EXPECT_EQ(client_hello_fits(msg), row.expect_fits);
+    }
 }
 
 // messaging.md "client/leave": the message carries no payload fields, but the envelope shape is

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "application_role.h"
 #include "platform/base64.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
@@ -33,6 +34,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -956,6 +958,9 @@ void build_client_hello_message(const ClientHelloMessage* msg, JsonDocument& doc
     for (const auto& role : msg->supported_roles) {
         supported_roles_list.add(to_cstr(role));
     }
+    for (const auto& app_role : msg->application_roles) {
+        supported_roles_list.add(app_role.role);
+    }
 
     if (msg->player_v1_support.has_value()) {
         JsonArray formats_list =
@@ -987,6 +992,49 @@ void build_client_hello_message(const ClientHelloMessage* msg, JsonDocument& doc
             source_json["features"]["line_sense"] = true;
         }
     }
+
+    // messaging.md "client/hello": an application-specific role's support object is keyed
+    // "<role>_support". start() replaced the text with ArduinoJson's own serialization of one
+    // JSON object, so it is embedded without a second parse, and held the name to
+    // MAX_APPLICATION_ROLE_NAME_BYTES, so the key is built on the stack rather than in a
+    // std::string.
+    constexpr std::string_view SUPPORT_SUFFIX = "_support";
+    for (const SendspinApplicationRole& app_role : msg->application_roles) {
+        if (!app_role.support_json.has_value()) {
+            continue;
+        }
+        std::array<char, MAX_APPLICATION_ROLE_NAME_BYTES + SUPPORT_SUFFIX.size() + 1> key{};
+        const size_t role_size = app_role.role.copy(key.data(), MAX_APPLICATION_ROLE_NAME_BYTES);
+        SUPPORT_SUFFIX.copy(key.data() + role_size, SUPPORT_SUFFIX.size());
+        const std::string& support = app_role.support_json.value();
+        root["payload"][key.data()] = serialized(support.data(), support.size());
+    }
+}
+
+bool client_hello_fits(ClientHelloMessage& msg) {
+    // A MAC address as text, without its NUL
+    static constexpr std::string_view LONGEST_MAC = "00:00:00:00:00:00";
+    static_assert(LONGEST_MAC.size() + 1 == MAC_ADDRESS_TEXT_SIZE);
+    msg.unpaired_access_enabled = false;
+    if (msg.device_info.has_value() && !msg.device_info->mac_address.has_value()) {
+        msg.device_info->mac_address = LONGEST_MAC;
+    }
+
+    // Capacity 0: every block comes from the platform allocator, wiped and freed on return
+    SendspinArenaAllocator allocator(0);
+    JsonDocument doc = make_json_document(allocator);
+    build_client_hello_message(&msg, doc);
+    if (doc.overflowed()) {
+        SS_LOGE(TAG, "Out of memory measuring the client/hello");
+        return false;
+    }
+    const size_t size = measureJson(doc);
+    if (size > MAX_CLIENT_HELLO_BYTES) {
+        SS_LOGE(TAG, "client/hello would be %zu bytes, over the %zu messaging.md allows", size,
+                MAX_CLIENT_HELLO_BYTES);
+        return false;
+    }
+    return true;
 }
 
 void build_client_state_message(const ClientStateMessage* msg, JsonDocument& doc) {

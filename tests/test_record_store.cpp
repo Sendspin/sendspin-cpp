@@ -44,6 +44,7 @@
 #include "sendspin/persistence_codec.h"
 #include "sendspin/player_role.h"
 
+#include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -1789,6 +1790,49 @@ TEST(SendspinClientStart, RejectsUnusableConfiguredPairingSecrets) {
             }
             EXPECT_FALSE(client.start()) << "the config is fixed, so a retry is refused too";
         }
+        client.stop();
+    }
+}
+
+// start() fails closed on an application-specific role it would advertise malformed: a name
+// without the leading `_` (README.md "Application-Specific Roles"), a name listed twice, a support
+// object that is not one JSON object, or one that puts client/hello over the 16384 bytes
+// messaging.md "client/hello" allows. The role checks run before the identity is generated; the
+// hello is measured once the roles have started.
+TEST(SendspinClientStart, RejectsMalformedApplicationRoles) {
+    struct Row {
+        const char* name;
+        std::vector<SendspinApplicationRole> roles;
+        bool expect_started;
+        bool expect_identity;
+    };
+    const Row rows[] = {
+        {"no leading underscore", {{"acme_display@v1", std::nullopt}}, false, false},
+        {"listed twice", {{"_acme_display@v1", std::nullopt}, {"_acme_display@v1", std::nullopt}},
+         false, false},
+        {"support not an object", {{"_acme_display@v1", std::string("[1]")}}, false, false},
+        {"hello over 16384 bytes",
+         {{"_acme_display@v1", R"({"a":")" + std::string(16384, 'x') + R"("})"}},
+         false,
+         true},
+        {"Control: two roles, one with support",
+         {{"_acme_display@v1", std::string(R"({"port":8930})")}, {"_acme_display@v2", std::nullopt}},
+         true,
+         true},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InMemoryPersistenceProvider provider;
+        SendspinClientConfig config;
+        config.name = "application-role-validation";
+        config.application_roles = row.roles;
+        SendspinClient client(std::move(config));
+        client.set_persistence_provider(&provider);
+
+        EXPECT_EQ(client.start(), row.expect_started);
+        EXPECT_EQ(client.is_started(), row.expect_started);
+        EXPECT_EQ(provider.save_attempts(persistence_keys::KEYPAIR) > 0, row.expect_identity);
         client.stop();
     }
 }

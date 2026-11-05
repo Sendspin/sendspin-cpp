@@ -439,6 +439,31 @@ void expect_role_objects(const FakeEncryptedServer& server, size_t index) {
     EXPECT_STREQ(doc["payload"]["visualizer"]["types"][0], "loudness");
 }
 
+/// Checks that the client/hello `server` received lists both configured application roles and
+/// carries the one support object as start() normalized it, so the admission window measured
+/// their build. Read after the window closes, outside the count.
+void expect_application_roles(const FakeEncryptedServer& server) {
+    const std::vector<FakeEncryptedServer::WireMessage> messages = server.messages();
+    const auto hello = std::find_if(messages.begin(), messages.end(), [](const auto& message) {
+        return message.type == "client/hello";
+    });
+    ASSERT_NE(hello, messages.end());
+    const std::string text(hello->body.begin(), hello->body.end());
+    // The configured text has an unquoted key, which only the wire text can show was quoted
+    EXPECT_NE(
+        text.find(R"("_allocation_test_local_pairing@v1_support":{"port":8930,)"
+                  R"("path":"/allocation-test-endpoint"})"),
+        std::string::npos)
+        << text;
+    JsonDocument doc;
+    ASSERT_EQ(deserializeJson(doc, text), DeserializationError::Ok);
+    JsonArrayConst roles = doc["payload"]["supported_roles"];
+    ASSERT_GE(roles.size(), 2U);
+    EXPECT_STREQ(roles[roles.size() - 2], "_allocation_test_local_pairing@v1");
+    EXPECT_STREQ(roles[roles.size() - 1], "_allocation_test_display@v1");
+    EXPECT_TRUE(doc["payload"]["_allocation_test_display@v1_support"].isUnbound());
+}
+
 constexpr uint16_t ALLOCATION_TEST_PORT = 19300;
 constexpr int TIME_BURST_SIZE = 8;
 
@@ -449,9 +474,10 @@ constexpr size_t CONTROLLER_STATE_ALLOCATIONS = 0;
 constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 0;
 constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 
-// One paired connection with a player, a controller, metadata, two artwork channels and a
-// visualizer, so the player, artwork and visualizer objects of client/state are built: from the
-// fake server's connect through admission and the first client/state, then one client/state
+// One paired connection with a player, a controller, metadata, two artwork channels, a visualizer
+// and two application-specific roles, one with a support object, so client/hello lists the
+// application roles and the player, artwork and visualizer objects of client/state are built: from
+// the fake server's connect through admission and the first client/state, then one client/state
 // publish, then one full burst of client/time and server/time exchanges, then the first
 // controller server/state, then an artwork and visualizer stream/start and a stream/end and a
 // stream/clear that name their roles, then a stream/start whose player section the connection, no
@@ -469,6 +495,11 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     config.server_port = ALLOCATION_TEST_PORT;
     config.time_burst_size = static_cast<uint8_t>(TIME_BURST_SIZE);
     config.time_burst_interval_ms = 100;
+    config.application_roles = {
+        {"_allocation_test_local_pairing@v1",
+         std::string(R"({port:8930,"path":"/allocation-test-endpoint"})")},
+        {"_allocation_test_display@v1", std::nullopt},
+    };
 
     BurstCountingListener burst_listener;  // Outlives the client
     PairedClientBundle bundle(config);
@@ -502,6 +533,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     expect_library_allocations(close_window(), "accept to admission and the first client/state",
                                ADMISSION_ALLOCATIONS);
     expect_role_objects(*server, 0);
+    expect_application_roles(*server);
 
     pump_while_not(client, [&] { return client.is_time_synced(); });
 

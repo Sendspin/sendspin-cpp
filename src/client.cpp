@@ -14,6 +14,7 @@
 
 #include "sendspin/client.h"
 
+#include "application_role.h"
 #include "connection.h"
 #include "connection_manager.h"
 #include "crypto/keys.h"
@@ -346,6 +347,36 @@ bool SendspinClient::start() {
                 STATIC_PAIRING_CODE_DIGITS);
         return false;
     }
+    for (size_t i = 0; i < this->config_.application_roles.size(); ++i) {
+        SendspinApplicationRole& app_role = this->config_.application_roles[i];
+        if (!is_valid_application_role_name(app_role.role)) {
+            SS_LOGE(TAG,
+                    "Application role \"%s\" is not a _<name>@<version> of at most %zu bytes; "
+                    "cannot start",
+                    app_role.role.c_str(), MAX_APPLICATION_ROLE_NAME_BYTES);
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (this->config_.application_roles[j].role == app_role.role) {
+                SS_LOGE(TAG, "Application role \"%s\" is listed twice; cannot start",
+                        app_role.role.c_str());
+                return false;
+            }
+        }
+        if (app_role.support_json.has_value()) {
+            // Replaced by the parser's own output, which is what client/hello embeds
+            std::optional<std::string> normalized =
+                normalize_support_object_json(app_role.support_json.value());
+            if (!normalized.has_value()) {
+                SS_LOGE(TAG,
+                        "Support object for application role \"%s\" is not a JSON object; "
+                        "cannot start",
+                        app_role.role.c_str());
+                return false;
+            }
+            app_role.support_json = std::move(normalized);
+        }
+    }
 
     // lifecycle_ stays STOPPED until every step below has succeeded. Marking the client running
     // up front would report it started even when this function returns false (e.g. identity
@@ -415,6 +446,16 @@ bool SendspinClient::start() {
     }
 #endif
     if (!roles_started) {
+        this->stop_role_threads();
+        this->release_inbound_ring();
+        return false;
+    }
+
+    // messaging.md "client/hello": a server may close a connection whose hello is over the size
+    // cap, and every connection sends the same one, so a configuration (large application support
+    // objects, mostly) that would put it over fails closed here. Checked once the roles have
+    // started, which fixes the capacities they advertise.
+    if (!this->hello_within_cap()) {
         this->stop_role_threads();
         this->release_inbound_ring();
         return false;
@@ -1400,9 +1441,15 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
 #endif
 }
 
+bool SendspinClient::hello_within_cap() {
+    ClientHelloMessage hello;
+    this->build_client_hello(hello);
+    return client_hello_fits(hello);
+}
+
 void SendspinClient::build_client_hello(ClientHelloMessage& msg) {
-    // Reached only from ConnectionManager::send_hello_message(), so only for a connection, so
-    // only after a successful start(): record_store_ exists and is dereferenced unguarded below.
+    // Reached from start(), once the roles have started and before the protocol task runs, and
+    // from ConnectionManager::send_hello_message() for each connection.
     msg.name = this->config_.name;
 
     const auto view = [](const std::optional<std::string>& value) {
@@ -1452,6 +1499,8 @@ void SendspinClient::build_client_hello(ClientHelloMessage& msg) {
     }
 
     msg.unpaired_access_enabled = this->unpaired_access_enabled_.load(std::memory_order_acquire);
+    // Validated and normalized by start(), and fixed until stop()
+    msg.application_roles = this->config_.application_roles;
 
     // Let each role add its fields to the hello message
 #ifdef SENDSPIN_ENABLE_PLAYER

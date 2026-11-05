@@ -104,6 +104,7 @@ constexpr uint16_t HELLO_TEST_PORT = 19090;
 constexpr uint16_t OUTBOUND_GOODBYE_TEST_PORT = 19069;
 constexpr uint16_t NETWORK_PROVIDER_TEST_PORT = 19086;
 constexpr uint16_t INBOUND_OFF_TEST_PORT = 19106;
+constexpr uint16_t HELLO_CAP_ROLLBACK_TEST_PORT = 19107;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -484,6 +485,29 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     stream_audio_until(client, *server, listener, 1);  // The rolled-back player plays again
     client.stop();
     EXPECT_EQ(listener.stream_ends, 1);
+}
+
+// start() measures client/hello once the roles have started, so a hello over the 16384 bytes
+// messaging.md "client/hello" allows rolls them back as a failed role start does: the player's
+// sync task is stopped and the inbound ring released, and a second start() is refused the same
+// way rather than finding them still running. Whether the sync task was stopped (its consumer
+// unbound) and the ring released is read directly: nothing public reports either.
+TEST(ClientLifecycle, OversizedHelloRollsBackStartedRoles) {
+    CountingPlayerListener listener;
+    SendspinClientConfig config = make_config(HELLO_CAP_ROLLBACK_TEST_PORT);
+    config.application_roles = {
+        {"_acme_display@v1", R"({"a":")" + std::string(16384, 'x') + R"("})"}};
+    PairedClientBundle bundle(std::move(config));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        SCOPED_TRACE(attempt);
+        EXPECT_FALSE(bundle.start());
+        EXPECT_FALSE(client.is_started());
+        EXPECT_EQ(client.player_->impl_->sync_task->inbound().ring(), nullptr);
+        EXPECT_EQ(client.inbound_ring_, nullptr);
+    }
 }
 
 /// How far ahead of now a visualizer frame is stamped so it is still in the future when the drain
