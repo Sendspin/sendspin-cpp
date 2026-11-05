@@ -493,6 +493,7 @@ TEST(EncryptedLifecycle, UnpairedPlaybackWithUnusablePairingMethodIsUnauthorized
         const char* expected;
     };
     for (const Row& row : {Row{"pairing_psk", "unauthorized"},
+                           // Control: an offered method keeps pairing_required.
                            Row{"static_pairing_code", "pairing_required"}}) {
         SCOPED_TRACE(row.method);
         FakeEncryptedServerOptions options;

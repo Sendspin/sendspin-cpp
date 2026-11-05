@@ -238,6 +238,9 @@ TEST(PairingMethodRefusal, AcceptsOnlyAnOfferedMethodMatchingThePsk) {
     SendspinClientConfig static_cfg;
     static_cfg.static_pairing_code = "13572468";
     const SendspinClientConfig psk_only_cfg;
+    // Formats listed but no out-channel: the dynamic code is not offered, yet its format would be.
+    SendspinClientConfig formats_only_cfg;
+    formats_only_cfg.pairing_code_formats = {F::DIGITS};
 
     struct Row {
         const char* name;
@@ -249,27 +252,28 @@ TEST(PairingMethodRefusal, AcceptsOnlyAnOfferedMethodMatchingThePsk) {
         bool accepted;
     };
     const Row rows[] = {
-        {"no-pairing-activity/ignores-object", SENTINEL, Acts{PB}, std::nullopt, std::nullopt,
-         &psk_only_cfg, true},
+        // pairing_psk on the Sentinel PSK would be refused if the object were checked.
+        {"no-pairing-activity/ignores-object", SENTINEL, Acts{PB}, M::PAIRING_PSK, std::nullopt,
+         &psk_only_cfg, true},  // Control:
         {"pairing_psk/pairing-psk", PAIRING_CAT, Acts{PR}, M::PAIRING_PSK, std::nullopt,
-         &psk_only_cfg, true},
+         &psk_only_cfg, true},  // Control:
         {"pairing_psk/sentinel", SENTINEL, Acts{PR, PB}, M::PAIRING_PSK, std::nullopt,
          &psk_only_cfg, false},
         {"method-absent", SENTINEL, Acts{PR}, std::nullopt, std::nullopt, &psk_only_cfg, false},
         {"static/offered", SENTINEL, Acts{PR}, M::STATIC_PAIRING_CODE, std::nullopt, &static_cfg,
-         true},
+         true},  // Control:
         {"static/on-pairing-psk", PAIRING_CAT, Acts{PR}, M::STATIC_PAIRING_CODE, std::nullopt,
          &static_cfg, false},
         {"static/not-offered", SENTINEL, Acts{PR}, M::STATIC_PAIRING_CODE, std::nullopt,
          &psk_only_cfg, false},
         {"dynamic/offered-format", SENTINEL, Acts{PR}, M::DYNAMIC_PAIRING_CODE, F::DIGITS,
-         &dynamic_cfg, true},
+         &dynamic_cfg, true},  // Control:
         {"dynamic/unoffered-format", SENTINEL, Acts{PR}, M::DYNAMIC_PAIRING_CODE, F::QR_CODE,
          &dynamic_cfg, false},
         {"dynamic/no-format", SENTINEL, Acts{PR}, M::DYNAMIC_PAIRING_CODE, std::nullopt,
          &dynamic_cfg, false},
         {"dynamic/not-offered", SENTINEL, Acts{PR}, M::DYNAMIC_PAIRING_CODE, F::DIGITS,
-         &static_cfg, false},
+         &formats_only_cfg, false},
     };
 
     for (const Row& row : rows) {
