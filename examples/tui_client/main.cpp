@@ -1042,7 +1042,7 @@ int main(int argc, char* argv[]) {
                 state.connected_port = DEFAULT_SENDSPIN_PORT;
             }
         }
-        client.connect_to(connect_url);
+        client.connect_to(std::move(connect_url));
     }
 
     // Create FTXUI screen and component

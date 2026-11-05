@@ -14,6 +14,7 @@
 
 #include "ws_server.h"
 
+#include "connection_block.h"
 #include "constants.h"
 #include "lwip/sockets.h"  // for close()
 #include "platform/compiler.h"
@@ -49,75 +50,6 @@ static const char* const TAG = "sendspin.ws_server";
 /// sockets are a transport concern the manager never sees, so the bound lives here. The host build
 /// has no equivalent: IXWebSocket applies its own 3 s server-side handshake timeout.
 static constexpr int64_t WS_UPGRADE_TIMEOUT_US = 5LL * 1000 * 1000;
-
-/// @brief Bytes reserved for one accepted connection: the object plus the control block
-/// std::allocate_shared() places it in, whose fit ConnectionBlockAllocator::allocate() checks at
-/// compile time
-static constexpr size_t CONNECTION_BLOCK_BYTES = sizeof(SendspinServerConnection) + 32;
-
-namespace {
-
-/// @brief Hands std::allocate_shared() one block reserved before the call, and frees it with
-/// platform_free() once the control block goes
-///
-/// allocate_shared() constructs into whatever allocate() returns, so an allocator cannot report a
-/// failure by returning nullptr. The block is reserved from the platform_malloc family first
-/// (make_connection()), where a failure refuses the session instead of aborting as operator new
-/// does, and allocate() only hands it over.
-template <typename T>
-class ConnectionBlockAllocator {
-public:
-    using value_type = T;
-
-    explicit ConnectionBlockAllocator(void* block) : block_(block) {}
-
-    /// @brief The rebind allocate_shared() performs to allocate its control block
-    template <typename U>
-    ConnectionBlockAllocator(const ConnectionBlockAllocator<U>& other) : block_(other.block()) {}
-
-    T* allocate(size_t n) {
-        static_assert(sizeof(T) <= CONNECTION_BLOCK_BYTES,
-                      "CONNECTION_BLOCK_BYTES must hold the connection's control block");
-        assert(n == 1);
-        (void)n;
-        return static_cast<T*>(this->block_);
-    }
-
-    void deallocate(T* p, size_t /*n*/) {
-        platform_free(p);
-    }
-
-    void* block() const {
-        return this->block_;
-    }
-
-    template <typename U>
-    bool operator==(const ConnectionBlockAllocator<U>& other) const {
-        return this->block_ == other.block();
-    }
-
-private:
-    void* block_;
-};
-
-}  // namespace
-
-/// @brief Creates an accepted session's connection in a block from the internal-RAM-preferring
-/// platform heap
-///
-/// The PSRAM fallback is safe: IDF's default STDATOMIC_S32C1I_SPIRAM_WORKAROUND covers the
-/// std::atomic members in external RAM on ESP32/S3, and the object embeds no FreeRTOS object or
-/// portMUX and is touched by no ISR.
-/// @return nullptr when the block cannot be allocated.
-static std::shared_ptr<SendspinServerConnection> make_connection(httpd_handle_t handle, int sockfd,
-                                                                 SendBlockPools& send_pools) {
-    void* block = platform_malloc_internal(CONNECTION_BLOCK_BYTES);
-    if (block == nullptr) {
-        return nullptr;
-    }
-    return std::allocate_shared<SendspinServerConnection>(
-        ConnectionBlockAllocator<SendspinServerConnection>(block), handle, sockfd, send_pools);
-}
 
 SendspinWsServer::~SendspinWsServer() {
     this->stop();
@@ -348,7 +280,8 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
         assert(false && "no free session slot under max_open_sockets <= MAX_SESSIONS");
         return ESP_FAIL;
     }
-    auto conn = make_connection(handle, sockfd, server->send_pools_);
+    auto conn =
+        make_connection_in_block<SendspinServerConnection>(handle, sockfd, server->send_pools_);
     if (conn == nullptr) {
         SS_LOGE(TAG, "No memory for a connection; refusing the session");
         return ESP_FAIL;

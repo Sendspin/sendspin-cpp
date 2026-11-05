@@ -784,7 +784,8 @@ if (!client.start()) {
 
 // Optionally initiate a client-side connection to a known server URL.
 // Without this, the client waits for incoming server connections. With
-// accept_inbound_connections off, this is the only way a server reaches it.
+// accept_inbound_connections off, this is the only way a server reaches it. The URL is taken by
+// value: pass a temporary, or std::move() a string you no longer need, to avoid a copy.
 client.connect_to("ws://192.168.1.10:8928/sendspin");
 
 // Main loop: call loop() periodically to deliver callbacks. Connection work runs on the library's

@@ -105,7 +105,7 @@ uint32_t SendspinClient::protocol_tick() {
     {
         LifecycleRequests requests;
         if (this->protocol_task_->take_requests(requests)) {
-            this->apply_lifecycle_requests(requests);
+            this->apply_lifecycle_requests(std::move(requests));
         }
         ProtocolCommand command;
         while (this->protocol_task_->take_command(command)) {
@@ -244,7 +244,7 @@ uint32_t SendspinClient::protocol_tick() {
     return next_deadline;
 }
 
-void SendspinClient::apply_lifecycle_requests(const LifecycleRequests& requests) {
+void SendspinClient::apply_lifecycle_requests(LifecycleRequests&& requests) {
     ConnectionManager& manager = *this->connection_manager_;
     // The gate handle_command() applies to every consumer command, for the same reason.
     if (!manager.is_accepting()) {
@@ -277,7 +277,7 @@ void SendspinClient::apply_lifecycle_requests(const LifecycleRequests& requests)
         manager.disconnect(requests.disconnect.value());
     }
     if (requests.connect_to.has_value()) {
-        manager.connect_to(requests.connect_to.value());
+        manager.connect_to(std::move(requests.connect_to.value()));
     }
 }
 

@@ -427,10 +427,11 @@ public:
     void accept(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Initiates an outbound connection to a Sendspin server (SendspinClient::connect_to()).
-    /// Logs an error and connects nothing when the connection's inbound gate has no event group
+    /// Logs an error and connects nothing when the connection's block cannot be allocated
+    /// (make_connection_in_block()) or its inbound gate has no event group
     /// (InboundGate::is_created()).
     /// @param url WebSocket URL of the server to connect to.
-    void connect_to(const std::string& url);
+    void connect_to(std::string url);
 
     /// @brief Goodbyes and drops every connected managed connection (SendspinClient::disconnect())
     /// through drop_connection(), so the goodbye is the last thing on the wire (the pairing
