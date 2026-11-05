@@ -247,7 +247,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     rec.psk_id = psk_id_val;
     rec.psk = psk;
     rec.server_id = other_server.peer_id();  // bound to other_server
-    rs.store_record_superseding(std::move(rec), {});
+    rs.store_record_superseding(PairingRecord(rec), {});
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
@@ -312,7 +312,7 @@ Msg1Outcome run_msg1_with_payload(
         rec.psk_id = psk_id;
         rec.psk = psk;
         rec.server_id = server_id.peer_id();
-        rs.store_record_superseding(std::move(rec), {});
+        rs.store_record_superseding(PairingRecord(rec), {});
     }
 
     TestArena arena;

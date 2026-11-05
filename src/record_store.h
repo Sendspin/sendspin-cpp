@@ -21,17 +21,21 @@
 /// accepted Pairing PSK, or the Sentinel PSK. A psk_id held only under another category is a
 /// miss.
 ///
-/// The record types are the public ones from `sendspin/config.h`, so the persistence provider
-/// can pass them through without conversion.
+/// The store holds each record as a PairingRecord, its ids inline, and turns it into the codec
+/// blob of `sendspin/persistence_codec.h` for the persistence provider.
 
 #pragma once
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "pairing_record.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/persistence_keys.h"
 
+#include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -194,7 +198,7 @@ public:
     ///        shorter than the capacity (see RecordStore::MIN_MAX_RECORDS), so a victim always
     ///        exists.
     /// @return true when stored; false only when every record at capacity is in use.
-    bool store_record_superseding(SendspinPairingRecord record,
+    bool store_record_superseding(const PairingRecord& record,
                                   std::span<const IdText* const> psk_ids_in_use = {});
 
     /// @brief Save the record slots that changed since the last call, plus the record-order
@@ -204,8 +208,8 @@ public:
     /// value.
     ///
     /// Several mutations between two calls coalesce: a slot is written once, carrying whatever
-    /// it holds at this call. A rejected write is not retried, so the slot leaves the dirty set
-    /// either way and RAM stays authoritative for the boot.
+    /// it holds when this call encodes it. A rejected write is not retried, so the slot leaves
+    /// the dirty set either way and RAM stays authoritative for the boot.
     ///
     /// A batch in which the provider accepted a record slot ends with one provider commit(); a
     /// batch of the order blob alone does not, since the order is advisory.
@@ -265,7 +269,7 @@ public:
     /// holds it.
     struct PairingOutcome {
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-        SendspinPairingRecord record;
+        PairingRecord record;
 
         PairingOutcome() = default;
         PairingOutcome(const PairingOutcome&) = default;
@@ -274,7 +278,7 @@ public:
         PairingOutcome& operator=(PairingOutcome&&) = default;
 
         /// @brief Wipes `psk` on destruction; same discipline as SendspinPairingRecord (see
-        /// config.h). The contained record wipes its own copy independently.
+        /// config.h). The contained PairingRecord wipes its own copy independently.
         ~PairingOutcome() {
             detail::secure_zero_psk(this->psk);
         }
@@ -307,16 +311,20 @@ private:
     /// store bookkeeping, not part of the record's storage format: it is recovered on load from
     /// which key the record came out of.
     struct StoredRecord {
-        SendspinPairingRecord record;
+        PairingRecord record;
         uint8_t slot{UNASSIGNED_SLOT};
     };
 
-    /// @brief One owed provider write: a slot key or persistence_keys::RECORD_ORDER, with the
-    /// bytes to store. An all-zero blob for a slot key frees that slot.
-    struct SlotWrite {
-        std::string key;
-        std::vector<uint8_t> blob;
-    };
+    /// @brief Bytes one provider write carries at most: a record slot's RECORD_SLOT_SIZE, or the
+    /// order blob's one byte per slot, at most MAX_MAX_RECORDS.
+    static constexpr size_t MAX_WRITE_SIZE =
+        std::max(persistence_keys::RECORD_SLOT_SIZE, MAX_MAX_RECORDS);
+
+    /// @brief The one buffer persist_records() encodes each owed write into in turn.
+    using WriteBuffer = std::array<uint8_t, MAX_WRITE_SIZE>;
+
+    /// @brief One bit per slot the store may use.
+    using SlotSet = std::bitset<MAX_MAX_RECORDS>;
 
     // ========================================
     // Construction helpers
@@ -357,11 +365,10 @@ private:
 
     /// @brief The long-term record for psk_id, or nullptr. Call with mutex_ held, or on the
     /// protocol task; the pointer does not survive a mutation of records_.
-    [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(std::string_view psk_id) const;
+    [[nodiscard]] const PairingRecord* record_by_psk_id(std::string_view psk_id) const;
 
     /// @brief The record bound to server_id, or nullptr. Same rules.
-    [[nodiscard]] const SendspinPairingRecord* record_by_server_id(
-        std::string_view server_id) const;
+    [[nodiscard]] const PairingRecord* record_by_server_id(std::string_view server_id) const;
 
     /// @brief Sentinel find_index() returns for a psk_id the store does not hold.
     static constexpr size_t NPOS = static_cast<size_t>(-1);
@@ -375,17 +382,22 @@ private:
     /// @return true when a record was evicted.
     bool evict_one_locked(std::span<const IdText* const> psk_ids_in_use);
 
-    /// @brief Encode every owed write and clear the dirty bookkeeping. Call with mutex_ held, so
-    /// each blob is exactly what is in memory at that moment.
-    /// @return The writes to perform, in slot order with the order blob last; empty when nothing
-    ///         is owed or there is no provider.
-    [[nodiscard]] std::vector<SlotWrite> take_dirty_writes_locked();
+    /// @brief Encode the blob a slot owes: the record it holds, or zeros when it is free. Call
+    /// with mutex_ held, so the blob is exactly what is in memory at that moment.
+    /// @param slot The slot to encode.
+    /// @param buffer Where to encode it.
+    /// @return The encoded bytes, a view into `buffer`.
+    [[nodiscard]] std::span<uint8_t> encode_slot_locked(uint8_t slot, WriteBuffer& buffer) const;
+
+    /// @brief Encode the record-order blob. Same rules as encode_slot_locked().
+    [[nodiscard]] std::span<uint8_t> encode_order_locked(WriteBuffer& buffer) const;
 
     /// @brief Hand one encoded write to the provider and wipe it. Call with mutex_ dropped: the
     /// provider write is flash I/O.
-    /// @param write The key and blob to store; the blob is wiped in place before returning.
+    /// @param key The slot key or persistence_keys::RECORD_ORDER.
+    /// @param blob The bytes to store; wiped in place before returning.
     /// @return true on success, false on a rejected write.
-    bool save_slot_write(SlotWrite& write);
+    bool save_write(const std::string& key, std::span<uint8_t> blob);
 
     // Struct fields
     /// Mutable so the const `has_pending_writes` can lock it.
@@ -394,10 +406,11 @@ private:
     std::optional<SendspinPairingPsk> pairing_psk_;
 
     /// Least recently used first: the order eviction and persistence_keys::RECORD_ORDER read.
+    /// Reserved for max_records_ at construction, which no mutation exceeds.
     std::vector<StoredRecord> records_;
 
     /// Slots whose stored blob no longer matches records_, awaiting the next persist_records().
-    std::vector<uint8_t> dirty_slots_;
+    SlotSet dirty_slots_;
 
     // Pointer fields
     SendspinPersistenceProvider* provider_{nullptr};

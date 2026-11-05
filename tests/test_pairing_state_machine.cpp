@@ -655,7 +655,7 @@ protected:
         auto record = conn->take_pending_pairing_record();
         ASSERT_TRUE(record.has_value()) << "no record was staged for the ack to commit";
         ASSERT_TRUE(this->client_->record_store_->store_record_superseding(
-            std::move(record.value()),
+            record.value(),
             this->client_->connection_manager_->open_connection_psk_ids()));
         this->client_->connection_manager_->on_pairing_succeeded(conn);
         conn->note_pairing_finalize_ack();
@@ -2424,8 +2424,8 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
 
     // Simulate the state after client/pair-finalize: a pending pairing record awaiting the ack.
-    SendspinPairingRecord pending;
-    pending.psk_id = "test-psk-id";
+    PairingRecord pending;
+    pending.psk_id = id_text("test-psk-id");
     conn->set_pending_pairing_record(pending);
     conn->pairing_session().attempt_deadline_us = platform_time_us() + 120LL * 1000LL * 1000LL;
 

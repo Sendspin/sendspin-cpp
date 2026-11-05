@@ -231,7 +231,8 @@ set_source_files_properties(test_inbound_ring.cpp PROPERTIES COMPILE_OPTIONS -fn
 
 # test_record_store.cpp reads records_ directly and calls the store's private locked-context
 # lookups (record_by_psk_id, record_by_server_id); the store deliberately exposes no copying
-# accessor for them, since nothing in the library needs one.
+# accessor for them, since nothing in the library needs one. It also reads the address of
+# records_'s block, the only sign of whether a change after construction reallocated it.
 set_source_files_properties(test_record_store.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and
