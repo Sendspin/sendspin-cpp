@@ -1962,6 +1962,10 @@ TEST(PskZeroization, EveryPskCarryingStructWipesOnDestruction) {
         expect_psk_wiped_on_destruction<ResolvedPsk>();
     }
     {
+        SCOPED_TRACE("PairingRecord");
+        expect_psk_wiped_on_destruction<PairingRecord>();
+    }
+    {
         SCOPED_TRACE("RecordStore::PairingOutcome");
         expect_psk_wiped_on_destruction<RecordStore::PairingOutcome>();
     }

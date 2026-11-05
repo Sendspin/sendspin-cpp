@@ -246,7 +246,8 @@ struct SendspinClientConfig {
     /// requires room for at least 5, so a smaller value is raised to that floor; a value above
     /// 255 is lowered to that ceiling, so the highest slot is 254 and the record-order blob
     /// (`persistence_keys::RECORD_ORDER` in sendspin/persistence_keys.h) keeps byte value 255
-    /// free as its padding.
+    /// free as its padding. Each record of the clamped cap reserves about 123 B of internal RAM
+    /// at start().
     size_t max_pairing_records{DEFAULT_MAX_PAIRING_RECORDS};
 
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
