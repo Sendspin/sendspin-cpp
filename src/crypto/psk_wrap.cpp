@@ -16,12 +16,10 @@
 
 #include "platform/crypto.h"
 
-#include <cstring>
-
 namespace sendspin {
 
 std::optional<std::array<uint8_t, 32>> derive_wrap_key(
-    std::string_view label_view, const std::vector<uint8_t>& sid,
+    std::string_view label_view, std::span<const uint8_t> sid,
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk) {
     const auto* label = reinterpret_cast<const uint8_t*>(label_view.data());
     size_t label_len = label_view.size();
@@ -45,25 +43,24 @@ std::optional<std::array<uint8_t, 32>> derive_wrap_key(
 }
 
 std::optional<std::array<uint8_t, WRAPPED_VALUE_SIZE>> wrap_value(
-    std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
+    std::string_view label, const char* cipher_name, const CPace& cpace,
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk, const std::array<uint8_t, 32>& value) {
     if (cipher_name == nullptr) {
         return std::nullopt;
     }
-    auto k_wrap = derive_wrap_key(label, sid, isk);
+    auto k_wrap = derive_wrap_key(label, cpace.sid(), isk);
     if (!k_wrap.has_value()) {
         return std::nullopt;
     }
-    auto ct = aead_oneshot_encrypt(cipher_name, k_wrap->data(), k_wrap->size(), value.data(),
-                                   value.size());
-    // K_wrap has done its job. Wiped here, before the branches, so every exit path below is
-    // covered by the one call. The ciphertext it produced is not secret.
+    std::array<uint8_t, WRAPPED_VALUE_SIZE> out{};
+    const bool sealed = aead_oneshot_encrypt(cipher_name, k_wrap->data(), k_wrap->size(),
+                                             value.data(), value.size(), out.data(), out.size());
+    // K_wrap has done its job. Wiped here, before the branch, so both exit paths are covered by
+    // the one call. The ciphertext it produced is not secret.
     secure_zero_container(k_wrap.value());
-    if (!ct.has_value() || ct->size() != WRAPPED_VALUE_SIZE) {
+    if (!sealed) {
         return std::nullopt;
     }
-    std::array<uint8_t, WRAPPED_VALUE_SIZE> out{};
-    std::memcpy(out.data(), ct->data(), WRAPPED_VALUE_SIZE);
     return out;
 }
 

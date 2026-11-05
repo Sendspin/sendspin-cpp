@@ -34,8 +34,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
-#include <vector>
 
 namespace sendspin {
 
@@ -57,16 +57,19 @@ static constexpr std::string_view NONCE_WRAP_LABEL{"sendspin-pair-nonce-wrap-v1"
 ///         noise-c allocation failure); callers must not treat that as a recoverable all-zero
 ///         key.
 std::optional<std::array<uint8_t, 32>> derive_wrap_key(
-    std::string_view label, const std::vector<uint8_t>& sid,
+    std::string_view label, std::span<const uint8_t> sid,
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk);
 
 /// @brief Seal a 32-byte value under K_wrap using the named AEAD cipher ("ChaChaPoly"), a
 /// 12-byte all-zero nonce, and empty associated data.
 /// @param label       Per-field wrap label (PSK_WRAP_LABEL or NONCE_WRAP_LABEL).
 /// @param cipher_name Noise-c cipher name for the connection's negotiated suite.
+/// @param cpace       The CPace run whose sid K_wrap binds, read here to keep it off the
+///                    pairing confirm's frame on the protocol task's deepest chain.
+/// @param isk         That run's ISK (CPace::isk()), held by the caller for both wraps.
 /// @return The 48-byte wrapped field (ciphertext || tag), or nullopt on a cipher failure.
 std::optional<std::array<uint8_t, WRAPPED_VALUE_SIZE>> wrap_value(
-    std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
+    std::string_view label, const char* cipher_name, const CPace& cpace,
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk, const std::array<uint8_t, 32>& value);
 
 }  // namespace sendspin

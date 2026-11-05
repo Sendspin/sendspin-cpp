@@ -608,6 +608,13 @@ public:
         return this->learned_psk_id_;
     }
 
+    // The hash of the most recent completed Noise handshake, which a pairing-code attempt binds
+    // its code and CPace sid to (pairing.md "PAKE").
+    std::array<uint8_t, 32> handshake_hash() const {
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        return this->prior_h_;
+    }
+
     // Sends an arbitrary application JSON message over the active encrypted session.
     bool send_app_json(const std::string& json) {
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);

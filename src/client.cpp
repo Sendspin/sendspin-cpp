@@ -103,6 +103,18 @@ static_assert(PAIRING_CODE_TOKEN_LENGTH <= PEER_ID_SIZE &&
                   static_cast<size_t>(DYNAMIC_PAIRING_CODE_DIGITS) <= PEER_ID_SIZE,
               "every emitted pairing code fits PairingNote::text");
 
+/// @brief Pairing notes the slot and the drain each keep room for, the most one attempt queues:
+/// the two dismissals of the attempt before it, its start, its window and code prompts, their two
+/// dismissals and its outcome. A larger batch grows the room, which both buffers then keep.
+constexpr size_t PAIRING_NOTE_CAPACITY = 8;
+
+/// @brief An empty note list with room for PAIRING_NOTE_CAPACITY notes
+std::vector<PairingNote> reserved_pairing_notes() {
+    std::vector<PairingNote> notes;
+    notes.reserve(PAIRING_NOTE_CAPACITY);
+    return notes;
+}
+
 /// @brief Builds a note carrying `text`, a server_id or an emitted pairing code
 PairingNote make_text_note(PairingNoteType type, std::string_view text) {
     PairingNote note{.type = type};
@@ -207,8 +219,12 @@ struct SendspinClient::EventState {
     /// grants each acquire (SendspinClient::high_performance_granted_).
     InboxSlot<HighPerformanceRequests> high_performance_slot{inbox, INBOX_TOPIC_HIGH_PERFORMANCE};
     /// Pairing listener notifications, appended on the protocol task in the order they happen and
-    /// dispatched by the drain.
-    InboxSlot<std::vector<PairingNote>> pairing_slot{inbox, INBOX_TOPIC_PAIRING};
+    /// dispatched by the drain, which trades buffers with it (InboxSlot::exchange()) so neither
+    /// side's reserved room leaves with a batch.
+    InboxSlot<std::vector<PairingNote>> pairing_slot{inbox, INBOX_TOPIC_PAIRING,
+                                                     reserved_pairing_notes()};
+    /// The drain's buffer for the pairing notes, empty between drains. Main loop only.
+    std::vector<PairingNote> drained_pairing_notes{reserved_pairing_notes()};
     /// Bumped by stop() before its teardown so a drain frame already on the stack (a listener
     /// callback that called stop()) abandons what it has not delivered yet: the events it copied
     /// out, the rest of the pairing notes, the role drains and the group update. Main loop only.
@@ -1018,9 +1034,19 @@ void SendspinClient::drain_inbox() {
     // the protocol task requests the write before it queues the PAIRING_SUCCEEDED note, so the
     // flush (which polls for itself) runs after the notes are taken and before they are
     // dispatched, and every note taken finds its write performed.
-    std::vector<PairingNote> notes;
-    const bool notes_taken = (slot_bits & INBOX_TOPIC_PAIRING) != 0 &&
-                             es.drain_generation == drain_generation && es.pairing_slot.take(notes);
+    // Moved out for the dispatch and back after it, so a listener callback that re-enters the
+    // drain (a stop() whose dismissals it drains) cannot touch the batch this frame is delivering.
+    // That nested drain finds the buffer gone and, only when it has notes to take, reserves
+    // another before trading it to the slot, which therefore keeps its room; the one this frame
+    // moves back, emptied, replaces the nested drain's.
+    std::vector<PairingNote> notes = std::move(es.drained_pairing_notes);
+    bool notes_taken = false;
+    if ((slot_bits & INBOX_TOPIC_PAIRING) != 0 && es.drain_generation == drain_generation) {
+        if (notes.capacity() < PAIRING_NOTE_CAPACITY) {
+            notes.reserve(PAIRING_NOTE_CAPACITY);
+        }
+        notes_taken = es.pairing_slot.exchange(notes);
+    }
     this->flush_pending_persistence();
     if (notes_taken && es.drain_generation == drain_generation) {
         if (this->listener_ != nullptr) {
@@ -1071,6 +1097,8 @@ void SendspinClient::drain_inbox() {
             }
         }
     }
+    notes.clear();
+    es.drained_pairing_notes = std::move(notes);
 
     // --- Role events: bit-gated so an idle tick performs zero inbox mutex acquisitions here ---
     // Each role drain takes its slot first and catches the role up on its teardowns before
@@ -1228,7 +1256,8 @@ std::optional<std::string> SendspinClient::format_pairing_token(
     if (this->identity_ == nullptr) {
         return std::nullopt;
     }
-    return sendspin::format_pairing_token(this->identity_->public_bytes, pairing_psk);
+    return std::string(
+        sendspin::format_pairing_token(this->identity_->public_bytes, pairing_psk).view());
 }
 
 std::optional<std::string> SendspinClient::pairing_token() const {

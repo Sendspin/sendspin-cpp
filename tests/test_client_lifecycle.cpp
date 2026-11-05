@@ -2939,6 +2939,108 @@ TEST(ClientLifecycle, AFullTeardownKeepsTheDismissalsOfShownPrompts) {
     }
 }
 
+/// Calls stop(), and then start() when `restart` is set, from inside the first
+/// on_display_pairing_code(). The test thread plays the protocol task, so the listener runs the
+/// final tick stop() would join first: admission closes, then the shutdown pass takes the
+/// admitted connection's prompt flags.
+class StopFromPairingPromptListener : public PairingPromptLog {
+public:
+    StopFromPairingPromptListener(SendspinClient*& client, bool reenter, bool restart)
+        : client_(client), reenter_(reenter), restart_(restart) {}
+
+    void on_display_pairing_code(const std::string& code,
+                                 SendspinPairingCodeFormat format) override {
+        PairingPromptLog::on_display_pairing_code(code, format);
+        if (this->reenter_ && !this->reentered_) {
+            this->reentered_ = true;
+            this->client_->connection_manager_->close_admission();
+            (void) this->client_->protocol_tick();
+            this->client_->stop();
+            if (this->restart_) {
+                this->restart_result = this->client_->start();
+            }
+        }
+    }
+
+    bool restart_result{false};
+
+private:
+    SendspinClient*& client_;
+    bool reenter_;
+    bool restart_;
+    bool reentered_{false};
+};
+
+// A pairing listener may call stop(), and start() after it, from inside the callback that shows a
+// code. stop() dismisses the code and the pairing window it was shown under exactly once, from its
+// own drain; the drain that showed the code abandons the rest of its batch, so the next round's
+// code queued behind it is never shown. After a restart the next batch drains as any other.
+// Control: without the re-entry both codes are shown and nothing is dismissed.
+TEST(ClientLifecycle, StopFromInsideAPairingCallbackDismissesThePromptOnce) {
+    struct Row {
+        const char* name;
+        bool reenter;
+        bool restart;
+        int expected_displays;
+        int expected_dismissals;
+    };
+    const Row rows[] = {
+        {"Control: no re-entry", false, false, 2, 0},
+        {"stop() with the next round's code queued behind", true, false, 1, 1},
+        {"stop() then start()", true, true, 1, 1},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SendspinClient* client_ref = nullptr;
+        StopFromPairingPromptListener log(client_ref, row.reenter, row.restart);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client_ref = &client;
+        client.set_network_provider(&network);
+        client.set_listener(&log);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+
+        // An attempt under a pairing window the operator was shown, with its code emitted.
+        auto conn = std::make_shared<StubConnection>();
+        conn->pairing_session().window_shown = true;
+        conn->pairing_session().code_emitted = true;
+        client.connection_manager_->install_admitted(conn, 0);
+        client.note_open_pairing_window();
+        client.loop();
+        ASSERT_EQ(log.opens, 1);
+
+        client.note_display_pairing_code("111111", SendspinPairingCodeFormat::DIGITS);
+        client.note_display_pairing_code("222222", SendspinPairingCodeFormat::DIGITS);
+        client.loop();
+        if (row.restart) {
+            ASSERT_TRUE(log.restart_result) << "start() from inside the callback was refused";
+            client.protocol_task_->stop();
+        }
+
+        EXPECT_EQ(log.displays, row.expected_displays);
+        EXPECT_EQ(log.clears, row.expected_dismissals);
+        EXPECT_EQ(log.closes, row.expected_dismissals);
+        client.loop();  // A later loop() delivers nothing the re-entry abandoned.
+        EXPECT_EQ(log.displays, row.expected_displays);
+        EXPECT_EQ(log.clears, row.expected_dismissals);
+
+        if (row.restart) {
+            client.note_display_pairing_code("333333", SendspinPairingCodeFormat::DIGITS);
+            client.note_clear_pairing_code();
+            client.loop();
+            EXPECT_EQ(log.displays, row.expected_displays + 1);
+            EXPECT_EQ(log.clears, row.expected_dismissals + 1);
+        }
+        // stop()'s order with the task played here, for a run the re-entry did not end.
+        if (client.is_started()) {
+            client.connection_manager_->close_admission();
+            (void) client.protocol_tick();
+        }
+        client.stop();
+    }
+}
+
 // ============================================================================
 // The high-performance grant
 // ============================================================================

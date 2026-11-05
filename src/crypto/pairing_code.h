@@ -17,13 +17,15 @@
 
 #pragma once
 
+#include "inline_text.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace sendspin {
 
@@ -56,6 +58,16 @@ static constexpr size_t QR_PAIRING_CODE_SIZE = 24;
 /// @brief Fixed length of a static pairing code, in decimal digits
 /// (pairing.md "Static Pairing Code Flow").
 static constexpr int STATIC_PAIRING_CODE_DIGITS = 8;
+
+/// @brief Longest pairing code CPace consumes as PRS, in bytes (pairing.md "PAKE"): the qr_code
+/// format's raw code, longer than either decimal code's ASCII digits.
+static constexpr size_t PAIRING_PRS_MAX_SIZE = QR_PAIRING_CODE_SIZE;
+static_assert(static_cast<size_t>(STATIC_PAIRING_CODE_DIGITS) <= PAIRING_PRS_MAX_SIZE &&
+                  static_cast<size_t>(DYNAMIC_PAIRING_CODE_DIGITS) <= PAIRING_PRS_MAX_SIZE,
+              "every pairing code fits PAIRING_PRS_MAX_SIZE");
+
+/// @brief A dynamic pairing code in the `digits` emission format, held inline.
+using DynamicPairingCodeDigits = InlineText<static_cast<size_t>(DYNAMIC_PAIRING_CODE_DIGITS)>;
 
 // ============================================================================
 // Pairing-code helpers
@@ -105,7 +117,7 @@ std::optional<std::array<uint8_t, 32>> pairing_code_digest(const uint8_t* handsh
 
 /// @brief Reduce a pairing-code digest to the `digits` emission format: the digest read as an
 /// unsigned big-endian 256-bit integer modulo 10^6, left-padded to exactly six ASCII digits
-std::string pairing_code_digits(const std::array<uint8_t, 32>& digest);
+DynamicPairingCodeDigits pairing_code_digits(const std::array<uint8_t, 32>& digest);
 
 /// @brief Take the `qr_code` emission format's pairing code from a digest: its first
 /// QR_PAIRING_CODE_SIZE bytes, raw
@@ -115,8 +127,9 @@ std::array<uint8_t, QR_PAIRING_CODE_SIZE> pairing_code_qr_bytes(
 /// @brief Return the bytes CPace consumes as PRS for a decimal pairing code: its ASCII digits
 /// (pairing.md "PAKE"). Shared by both the dynamic `digits` format and the static pairing code,
 /// which encode their codes identically.
-inline std::vector<uint8_t> pairing_code_digits_prs(const std::string& code) {
-    return std::vector<uint8_t>(code.begin(), code.end());
+/// @return A view of `code`'s characters, valid while `code` is.
+inline std::span<const uint8_t> pairing_code_digits_prs(std::string_view code) {
+    return {reinterpret_cast<const uint8_t*>(code.data()), code.size()};
 }
 
 }  // namespace sendspin

@@ -67,6 +67,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -378,9 +379,9 @@ struct ServerStandIn {
 
     /// Start the initiator over the PRS the operator entered and the sid for one round; the
     /// defaults are make_sid()'s (see its doc comment).
-    bool start(const std::vector<uint8_t>& prs, const std::array<uint8_t, 32>& handshake_hash,
+    bool start(std::span<const uint8_t> prs, const std::array<uint8_t, 32>& handshake_hash,
                uint32_t pairing_index = 1, uint32_t round = 1) {
-        this->prs = prs;
+        this->prs.assign(prs.begin(), prs.end());
         const std::vector<uint8_t> empty;
         return this->initiator.start(CPaceRole::INITIATOR, prs,
                                      make_sid(handshake_hash, pairing_index, round), empty,
@@ -749,10 +750,11 @@ protected:
         if (conn->pairing_session().format == SendspinPairingCodeFormat::QR_CODE) {
             auto code = pairing_code_qr_bytes(digest.value());
             out.prs.assign(code.begin(), code.end());
-            out.emitted = format_pairing_code_token(code);
+            out.emitted = std::string(format_pairing_code_token(code).view());
         } else {
-            out.emitted = pairing_code_digits(digest.value());
-            out.prs = pairing_code_digits_prs(out.emitted);
+            out.emitted = std::string(pairing_code_digits(digest.value()).view());
+            const auto prs = pairing_code_digits_prs(out.emitted);
+            out.prs.assign(prs.begin(), prs.end());
         }
 
         ServerPairingMessage pair_init_event;
@@ -1053,7 +1055,8 @@ TEST_F(PairingStateMachineTest, DynamicCodeQrFormatHappyPath) {
 
     // The server derives the same 24 bytes and runs CPace over them, not over the token text.
     EXPECT_EQ(display.prs.size(), QR_PAIRING_CODE_SIZE);
-    EXPECT_NE(display.prs, pairing_code_digits_prs(emitted))
+    const auto token_bytes = pairing_code_digits_prs(emitted);
+    EXPECT_NE(display.prs, std::vector<uint8_t>(token_bytes.begin(), token_bytes.end()))
         << "the token's characters are not the PRS";
     ServerStandIn server;
     ASSERT_TRUE(server.start(display.prs, display.handshake_hash));

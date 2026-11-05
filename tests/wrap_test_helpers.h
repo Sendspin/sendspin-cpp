@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -41,7 +42,7 @@
 /// @param wrapped     The 48-byte wrapped field (ciphertext || tag).
 /// @return The 32-byte value, or nullopt when authentication fails.
 inline std::optional<std::array<uint8_t, 32>> unwrap_value_as_server(
-    std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
+    std::string_view label, const char* cipher_name, std::span<const uint8_t> sid,
     const std::array<uint8_t, sendspin::CPACE_ISK_SIZE>& isk,
     const std::array<uint8_t, sendspin::WRAPPED_VALUE_SIZE>& wrapped) {
     auto k_wrap = sendspin::derive_wrap_key(label, sid, isk);

@@ -64,6 +64,13 @@ std::vector<uint8_t> make_fixed_sid(uint32_t round = 1) {
     return sid;
 }
 
+/// A started CPace run whose sid is `sid`, the form wrap_value() takes it in.
+CPace run_with_sid(const std::vector<uint8_t>& sid) {
+    CPace run;
+    EXPECT_TRUE(run.start(CPaceRole::RESPONDER, sid, sid, {}, {}, {}));
+    return run;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -139,7 +146,7 @@ TEST(PskWrap, RoundTripChaChaPoly) {
         psk[i] = static_cast<uint8_t>(0xA0 + i);
     }
 
-    auto wrapped = wrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid, isk, psk);
+    auto wrapped = wrap_value(PSK_WRAP_LABEL, "ChaChaPoly", run_with_sid(sid), isk, psk);
     ASSERT_TRUE(wrapped.has_value());
     EXPECT_EQ(wrapped->size(), WRAPPED_VALUE_SIZE);
     EXPECT_EQ(wrapped->size(), 48u);
@@ -160,8 +167,8 @@ TEST(PskWrap, DifferentSidsProduceDifferentWrappedPsk) {
     auto sid_a = make_fixed_sid();
     auto sid_b = make_fixed_sid(/*round=*/2);
 
-    auto wrapped_a = wrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid_a, isk, psk);
-    auto wrapped_b = wrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid_b, isk, psk);
+    auto wrapped_a = wrap_value(PSK_WRAP_LABEL, "ChaChaPoly", run_with_sid(sid_a), isk, psk);
+    auto wrapped_b = wrap_value(PSK_WRAP_LABEL, "ChaChaPoly", run_with_sid(sid_b), isk, psk);
     ASSERT_TRUE(wrapped_a.has_value());
     ASSERT_TRUE(wrapped_b.has_value());
     EXPECT_NE(wrapped_a.value(), wrapped_b.value());
@@ -182,13 +189,13 @@ TEST(PskWrap, UnknownCipherNameFails) {
     const auto isk = make_fixed_isk();
     std::array<uint8_t, 32> psk{};
 
-    EXPECT_FALSE(wrap_value(PSK_WRAP_LABEL, "NotACipher", sid, isk, psk).has_value());
-    EXPECT_FALSE(wrap_value(PSK_WRAP_LABEL, nullptr, sid, isk, psk).has_value());
+    EXPECT_FALSE(wrap_value(PSK_WRAP_LABEL, "NotACipher", run_with_sid(sid), isk, psk).has_value());
+    EXPECT_FALSE(wrap_value(PSK_WRAP_LABEL, nullptr, run_with_sid(sid), isk, psk).has_value());
     // Control: the cipher name the negotiated suite yields wraps.
     const char* negotiated =
         aead_cipher_name_from_noise_suite("Noise_KKpsk2_25519_ChaChaPoly_SHA256");
     ASSERT_NE(negotiated, nullptr);
-    EXPECT_TRUE(wrap_value(PSK_WRAP_LABEL, negotiated, sid, isk, psk).has_value());
+    EXPECT_TRUE(wrap_value(PSK_WRAP_LABEL, negotiated, run_with_sid(sid), isk, psk).has_value());
 }
 
 // ============================================================================
