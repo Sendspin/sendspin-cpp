@@ -490,8 +490,8 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
 // start() measures client/hello once the roles have started, so a hello over the 16384 bytes
 // messaging.md "client/hello" allows rolls them back as a failed role start does: the player's
 // sync task is stopped and the inbound ring released, and a second start() is refused the same
-// way rather than finding them still running. Whether the ring was released is read directly:
-// nothing public reports it.
+// way rather than finding them still running. Whether the sync task was stopped (its consumer
+// unbound) and the ring released is read directly: nothing public reports either.
 TEST(ClientLifecycle, OversizedHelloRollsBackStartedRoles) {
     CountingPlayerListener listener;
     SendspinClientConfig config = make_config(HELLO_CAP_ROLLBACK_TEST_PORT);
@@ -505,6 +505,7 @@ TEST(ClientLifecycle, OversizedHelloRollsBackStartedRoles) {
         SCOPED_TRACE(attempt);
         EXPECT_FALSE(bundle.start());
         EXPECT_FALSE(client.is_started());
+        EXPECT_EQ(client.player_->impl_->sync_task->inbound().ring(), nullptr);
         EXPECT_EQ(client.inbound_ring_, nullptr);
     }
 }

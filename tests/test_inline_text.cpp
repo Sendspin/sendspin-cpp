@@ -77,6 +77,8 @@ TEST(InlineText, IsValidUtf8FollowsRfc3629) {
         {"lead byte past F4", "\xF5\x80\x80\x80", false},
         {"lone continuation byte", "\x80", false},
         {"continuation byte above BF", "\xC3\xC0", false},
+        {"3-byte, bad third byte", "\xE2\x82\x28", false},
+        {"4-byte, bad fourth byte", "\xF0\x9F\x98\x28", false},
         {"cut short", std::string_view(CUT_SHORT, 2), false},
         // Control: the edges each range admits, and ASCII.
         {"ASCII", "a\x7F", true},
