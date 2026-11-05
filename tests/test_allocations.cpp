@@ -526,7 +526,10 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     SendspinClient& client = bundle.client();
     client.set_listener(&burst_listener);
     WindowClosingPlayerListener player_listener;
-    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
+    // Lists FLAC for the streams below (roles/player/v1.md "stream/start player object")
+    PlayerRoleConfig player_config = make_pcm_player_config();
+    player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, 48000, 16});
+    client.add_player(std::move(player_config)).set_listener(&player_listener);
     ControllerRole& controller = client.add_controller();
     client.add_metadata();
     ArtworkRoleConfig artwork_config;

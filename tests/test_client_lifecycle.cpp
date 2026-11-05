@@ -2824,7 +2824,7 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
             params.sample_rate = 48000;
             params.channels = 2;
             params.bit_depth = 16;
-            impl.handle_stream_start({std::move(params)});
+            impl.handle_stream_start({params});
             pump_until(client, [&] { return impl.sync_task->is_running(); });
             impl.handle_stream_end();
             pump_until(client, [&] { return !client.is_started(); });

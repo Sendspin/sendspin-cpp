@@ -784,7 +784,7 @@ TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
         params.codec = row.codec;
         params.sample_rate = 48000;
         params.bit_depth = 24;
-        impl->handle_stream_start({std::move(params)});
+        impl->handle_stream_start({params});
 
         void* header_item = impl->sync_task->take_item(0);
         ASSERT_NE(header_item, nullptr);
@@ -812,7 +812,7 @@ TEST(PlayerStreamStart, FlacHandsTheParsedHeaderToTheSyncTask) {
         header[i] = static_cast<uint8_t>(i);
     }
     payload.flac_header = header;
-    impl->handle_stream_start(std::move(payload));
+    impl->handle_stream_start(payload);
 
     void* header_item = impl->sync_task->take_item(0);
     ASSERT_NE(header_item, nullptr);
