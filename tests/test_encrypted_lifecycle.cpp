@@ -3028,7 +3028,7 @@ TEST(EncryptedLifecycle, AnEvictionBeforeTheFlushSparesTheRecordJustPlayed) {
 
     // What a protocol-task pair-finalize at capacity does, landing before the flush.
     SendspinPairingRecord incoming = make_record_for(Identity::generate().value());
-    ASSERT_TRUE(client.record_store_->store_record_superseding(incoming,
+    ASSERT_TRUE(client.record_store_->store_record_superseding(PairingRecord(incoming),
                                                                manager.open_connection_psk_ids()));
 
     EXPECT_TRUE(
@@ -3375,7 +3375,7 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     record.psk.fill(0x3C);
     record.psk_id = psk_id_for(record.psk);
     record.server_id = test_peer_id("unpair-window-server");
-    ASSERT_TRUE(client.record_store_->store_record_superseding(record, {}));
+    ASSERT_TRUE(client.record_store_->store_record_superseding(PairingRecord(record), {}));
 
     DispatchTestConnection conn;
     conn.set_noise_handshake_result(id_text(record.server_id), PskCategory::LONG_TERM,

@@ -35,22 +35,6 @@
 namespace sendspin {
 
 // ============================================================================
-// PSK-ID derivation
-// ============================================================================
-
-/// @brief Derive the psk_id for a 32-byte PSK.
-/// @param psk  Exactly NOISE_PSK_SIZE (32) bytes.
-/// @return base64url(SHA-256(PSK_ID_LABEL || psk)), a 43-char string with no `=`.
-/// Never throws; calls abort() if the underlying SHA-256 computation fails (e.g. a noise-c
-/// allocation failure), which is not expected to happen in practice.
-std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk);
-
-/// @brief Derive the psk_id for an arbitrary-length PSK buffer.
-/// Returns std::nullopt if len != NOISE_PSK_SIZE or the SHA-256 cannot be computed (e.g. a
-/// noise-c allocation failure).
-std::optional<std::string> psk_id_for(const uint8_t* psk, size_t len);
-
-// ============================================================================
 // X25519 Identity (long-term static keypair)
 // ============================================================================
 
@@ -135,5 +119,21 @@ struct Identity {
     static std::optional<Identity> from_private_bytes(
         const std::array<uint8_t, X25519_KEY_SIZE>& priv);
 };
+
+// ============================================================================
+// PSK-ID derivation
+// ============================================================================
+
+/// @brief Derive the psk_id for a 32-byte PSK.
+/// @param psk  Exactly NOISE_PSK_SIZE (32) bytes.
+/// @return base64url(SHA-256(PSK_ID_LABEL || psk)), a 43-char string with no `=`.
+/// Never throws; calls abort() if the underlying SHA-256 computation fails (e.g. a noise-c
+/// allocation failure), which is not expected to happen in practice.
+std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk);
+
+/// @brief Derive the psk_id for an arbitrary-length PSK buffer, held inline.
+/// Returns std::nullopt if len != NOISE_PSK_SIZE or the SHA-256 cannot be computed (e.g. a
+/// noise-c allocation failure).
+std::optional<IdText> psk_id_for(const uint8_t* psk, size_t len);
 
 }  // namespace sendspin

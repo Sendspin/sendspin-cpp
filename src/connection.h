@@ -542,13 +542,13 @@ public:
     /// server/pair-finalize (the commit happens in that handler, before the server's re-handshake
     /// msg1, the next message, resolves the new PSK against the RecordStore). Latest wins.
     /// Protocol task only.
-    void set_pending_pairing_record(SendspinPairingRecord record) {
-        this->pending_pairing_record_ = std::move(record);
+    void set_pending_pairing_record(const PairingRecord& record) {
+        this->pending_pairing_record_ = record;
     }
 
     /// @brief Returns and clears the pending pairing record. A returned value is a record to
     /// store; nullopt means there was no pending pairing. Protocol task only.
-    std::optional<SendspinPairingRecord> take_pending_pairing_record() {
+    std::optional<PairingRecord> take_pending_pairing_record() {
         return std::exchange(this->pending_pairing_record_, std::nullopt);
     }
 
@@ -1012,7 +1012,7 @@ protected:
 
     /// The pairing record staged by the attempt in flight, committed by the
     /// server/pair-finalize handler (nullopt = nothing to store). Protocol task only.
-    std::optional<SendspinPairingRecord> pending_pairing_record_{};
+    std::optional<PairingRecord> pending_pairing_record_{};
 
     /// Sends this connection's client/time bursts and feeds its time filter. Protocol task only.
     SendspinTimeBurst time_burst_{};

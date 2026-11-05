@@ -330,7 +330,7 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
 
     // Hold the pending record: committed to the RecordStore by the server/pair-finalize handler
     // on ack.
-    conn->set_pending_pairing_record(std::move(outcome->record));
+    conn->set_pending_pairing_record(outcome->record);
 }
 
 void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortReason reason) {
@@ -724,7 +724,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     JsonDocument json = make_json_document(this->json_arena());
     build_client_pair_finalize_wrapped_message(wrapped.value(), json);
     conn->send_json(json);
-    conn->set_pending_pairing_record(std::move(outcome->record));
+    conn->set_pending_pairing_record(outcome->record);
 
     ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_FINALIZE;
 }

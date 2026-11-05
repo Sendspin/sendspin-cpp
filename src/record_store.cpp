@@ -66,6 +66,9 @@ std::optional<T> load_decode_wipe(SendspinPersistenceProvider& provider, const c
 RecordStore::RecordStore(SendspinPersistenceProvider* provider, const SendspinClientConfig& config)
     : provider_(provider),
       max_records_(std::clamp(config.max_pairing_records, MIN_MAX_RECORDS, MAX_MAX_RECORDS)) {
+    // Every mutation runs on the protocol task after start(), where the store must not grow: a
+    // store never holds more than max_records_ records, even in the middle of one.
+    this->records_.reserve(this->max_records_);
     // The provider is a pure byte store, so decoding happens entirely on this side of the
     // interface.
     if (this->provider_ != nullptr) {
@@ -93,7 +96,7 @@ void RecordStore::load_records_from_provider() {
     // between boots orphans the records above it rather than loading them.
     //
     // load_decode_wipe() logs the warning and wipes the raw blob on both paths; the raw blob holds
-    // the PSK (even when it failed to decode), mirroring the save-path wipe in save_slot_write().
+    // the PSK (even when it failed to decode), mirroring the save-path wipe in save_write().
     for (size_t slot = 0; slot < this->max_records_; ++slot) {
         const std::string key = persistence_keys::record_slot_key(slot);
         auto decoded = load_decode_wipe<SendspinPairingRecord>(
@@ -117,7 +120,7 @@ void RecordStore::load_records_from_provider() {
             continue;
         }
         this->records_.push_back(
-            StoredRecord{std::move(decoded.value()), static_cast<uint8_t>(slot)});
+            StoredRecord{PairingRecord(decoded.value()), static_cast<uint8_t>(slot)});
     }
     this->load_record_order_from_provider();
 }
@@ -131,22 +134,18 @@ void RecordStore::load_record_order_from_provider() {
     // order records_ is kept in and evict_one_locked() reads. A byte naming no loaded record
     // (stale, or a slot that failed to decode) is skipped, and a loaded record the blob does not
     // name sorts after the ones it does, in slot order: a damaged order blob costs recency, not
-    // records.
-    std::vector<StoredRecord> ordered;
-    ordered.reserve(this->records_.size());
+    // records. Reordered in place, keeping the reservation the constructor made.
+    size_t placed = 0;
     for (uint8_t slot : blob.value()) {
-        auto it = std::find_if(this->records_.begin(), this->records_.end(),
+        const auto unplaced = this->records_.begin() + static_cast<ptrdiff_t>(placed);
+        auto it = std::find_if(unplaced, this->records_.end(),
                                [slot](const StoredRecord& s) { return s.slot == slot; });
         if (it == this->records_.end()) {
             continue;
         }
-        ordered.push_back(std::move(*it));
-        this->records_.erase(it);
+        std::rotate(unplaced, it, it + 1);
+        ++placed;
     }
-    for (auto& remaining : this->records_) {
-        ordered.push_back(std::move(remaining));
-    }
-    this->records_ = std::move(ordered);
 }
 
 void RecordStore::load_pairing_psk_from_provider() {
@@ -225,17 +224,17 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(std::string_view psk_i
     // Only the declared category's candidates are searched (connection.md "Pre-Shared Key"): the
     // same psk_id under another category is a lookup miss, which keeps a server from using, say, a
     // long-term PSK as though it were the Pairing PSK and inheriting that category's activities.
-    // Every id below is PEER_ID_SIZE characters (psk_id_for(), the record codec and the handshake
-    // that bound the record), so each assign() fits.
+    // Every id below is PEER_ID_SIZE characters (psk_id_for() and the Sentinel PSK's published
+    // id), so each assign() fits.
     switch (category) {
         case PskCategory::LONG_TERM: {
-            const SendspinPairingRecord* rec = this->record_by_psk_id(psk_id);
+            const PairingRecord* rec = this->record_by_psk_id(psk_id);
             if (rec != nullptr) {
                 ResolvedPsk r;
-                (void)r.psk_id.assign(rec->psk_id);
+                r.psk_id = rec->psk_id;
                 r.psk = rec->psk;
                 r.category = PskCategory::LONG_TERM;
-                (void)r.counterparty_id.assign(rec->server_id);
+                r.counterparty_id = rec->server_id;
                 return r;
             }
             break;
@@ -298,13 +297,10 @@ uint8_t RecordStore::first_free_slot_locked() const {
 
 void RecordStore::mark_slot_dirty_locked(uint8_t slot) {
     // One write carries every change made to the slot since the last flush.
-    if (std::find(this->dirty_slots_.begin(), this->dirty_slots_.end(), slot) ==
-        this->dirty_slots_.end()) {
-        this->dirty_slots_.push_back(slot);
-    }
+    this->dirty_slots_.set(slot);
 }
 
-const SendspinPairingRecord* RecordStore::record_by_psk_id(std::string_view psk_id) const {
+const PairingRecord* RecordStore::record_by_psk_id(std::string_view psk_id) const {
     size_t idx = this->find_index(psk_id);
     if (idx == NPOS) {
         return nullptr;
@@ -312,7 +308,7 @@ const SendspinPairingRecord* RecordStore::record_by_psk_id(std::string_view psk_
     return &this->records_[idx].record;
 }
 
-const SendspinPairingRecord* RecordStore::record_by_server_id(std::string_view server_id) const {
+const PairingRecord* RecordStore::record_by_server_id(std::string_view server_id) const {
     for (const auto& stored : this->records_) {
         if (stored.record.server_id == server_id) {
             return &stored.record;
@@ -327,7 +323,7 @@ bool RecordStore::evict_one_locked(std::span<const IdText* const> psk_ids_in_use
     // implementation. Evicting one that backs an open connection would strand a live session on a
     // PSK this store no longer holds.
     for (size_t i = 0; i < this->records_.size(); ++i) {
-        const std::string& psk_id = this->records_[i].record.psk_id;
+        const IdText& psk_id = this->records_[i].record.psk_id;
         if (std::any_of(psk_ids_in_use.begin(), psk_ids_in_use.end(),
                         [&psk_id](const IdText* in_use) { return *in_use == psk_id; })) {
             continue;
@@ -342,14 +338,14 @@ bool RecordStore::evict_one_locked(std::span<const IdText* const> psk_ids_in_use
     return false;
 }
 
-bool RecordStore::store_record_superseding(SendspinPairingRecord record,
+bool RecordStore::store_record_superseding(const PairingRecord& record,
                                            std::span<const IdText* const> psk_ids_in_use) {
     // RAM-only: runs on the protocol task (the server/pair-finalize ack handler), where the
     // record must resolve before the handler returns, since the server's follow-up re-handshake
     // is the next message on that thread.
     std::lock_guard<std::mutex> lock(this->mutex_);
 
-    size_t idx = this->find_index(record.psk_id);
+    size_t idx = this->find_index(record.psk_id.view());
     const bool is_insert = (idx == NPOS);
 
     // Capacity: a replace by psk_id never grows the store, and neither does an insert that
@@ -357,7 +353,8 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
     // record in the same locked section. Anything else is a genuine net-new record, which at
     // capacity evicts one rather than failing the pairing (pairing.md "Pairing Records").
     if (is_insert) {
-        const bool will_supersede_existing = this->record_by_server_id(record.server_id) != nullptr;
+        const bool will_supersede_existing =
+            this->record_by_server_id(record.server_id.view()) != nullptr;
         if (!will_supersede_existing && !this->has_capacity_locked() &&
             !this->evict_one_locked(psk_ids_in_use)) {
             // Only reachable if every record at capacity backs an open connection, which the
@@ -369,30 +366,19 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
         }
     }
 
-    if (!is_insert) {
-        // A replace keeps the slot it already occupies, so only that one blob is rewritten.
-        this->records_[idx].record = std::move(record);
-    } else {
-        // The slot is assigned after the retire below, which may be what frees one: a re-pair at
-        // capacity supersedes rather than evicts.
-        this->records_.push_back(StoredRecord{std::move(record), UNASSIGNED_SLOT});
-        idx = this->records_.size() - 1;
-        this->order_dirty_ = true;
-    }
-
-    // Retire any other record still bound to this server_id (see the header). idx follows the
-    // new record across each erase, so records_[idx] is read afresh on every pass.
+    // Retire any other record still bound to this server_id (see the header), ahead of the
+    // insert below, so the store never holds more than max_records_ and the push stays within
+    // the reservation. A replaced record's idx follows it across each erase.
     uint8_t retired_slot = UNASSIGNED_SLOT;
     for (size_t i = 0; i < this->records_.size();) {
-        const std::string& server_id = this->records_[idx].record.server_id;
-        if (i != idx && this->records_[i].record.server_id == server_id) {
+        if (i != idx && this->records_[i].record.server_id == record.server_id) {
             SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
-                    this->records_[i].record.psk_id.c_str(), server_id.c_str());
+                    this->records_[i].record.psk_id.c_str(), record.server_id.c_str());
             this->mark_slot_dirty_locked(this->records_[i].slot);
             this->order_dirty_ = true;
             retired_slot = this->records_[i].slot;
             this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(i));
-            if (i < idx) {
+            if (!is_insert && i < idx) {
                 --idx;
             }
             continue;  // The element that shifted into position i still needs checking.
@@ -400,13 +386,19 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
         ++i;
     }
 
-    if (this->records_[idx].slot == UNASSIGNED_SLOT) {
+    if (!is_insert) {
+        // A replace keeps the slot it already occupies, so only that one blob is rewritten.
+        this->records_[idx].record = record;
+    } else {
         // A supersede takes the slot its own retire just freed, so re-pairing a server costs one
         // record-sized write rather than a write of the new record plus a zeroed write of the old
         // slot. Anything else takes the lowest free slot, which at capacity is the one the
         // eviction above freed.
-        this->records_[idx].slot =
+        const uint8_t slot =
             (retired_slot != UNASSIGNED_SLOT) ? retired_slot : this->first_free_slot_locked();
+        this->records_.push_back(StoredRecord{record, slot});
+        idx = this->records_.size() - 1;
+        this->order_dirty_ = true;
     }
     // The capacity check, the eviction and the retire above between them guarantee a free slot
     // below the cap; writing UNASSIGNED_SLOT would name a key the load path never reads.
@@ -418,36 +410,60 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
 }
 
 bool RecordStore::persist_records() {
-    std::vector<SlotWrite> writes;
+    // What is owed as of this call; see the locking note above encode_slot_locked().
+    SlotSet slots;
+    bool order_owed = false;
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        writes = this->take_dirty_writes_locked();
+        slots = std::exchange(this->dirty_slots_, SlotSet{});
+        order_owed = std::exchange(this->order_dirty_, false);
     }
+    if (this->provider_ == nullptr) {
+        return true;
+    }
+    // Nothing is retried, and RAM stays authoritative for this boot. What a rejection costs
+    // depends on what the write carries, so the message does too.
+    WriteBuffer buffer;
     bool all_accepted = true;
     bool slot_accepted = false;
-    for (auto& write : writes) {
-        if (this->save_slot_write(write)) {
-            slot_accepted |= write.key != persistence_keys::RECORD_ORDER;
+    for (size_t slot = 0; slot < slots.size(); ++slot) {
+        if (!slots.test(slot)) {
+            continue;
+        }
+        // At most seven characters, inside every standard library's inline std::string capacity.
+        const std::string key = persistence_keys::record_slot_key(slot);
+        std::span<uint8_t> blob;
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            blob = this->encode_slot_locked(static_cast<uint8_t>(slot), buffer);
+        }
+        if (this->save_write(key, blob)) {
+            slot_accepted = true;
             continue;
         }
         all_accepted = false;
-        // Nothing is retried, and RAM stays authoritative for this boot. What a rejection costs
-        // depends on what the write carries, so the message does too. The recency order is
-        // advisory: the next boot rebuilds it from use, and it is written on every playback
-        // handoff, so against a full or read-only store it stays quiet. A record slot decides
-        // which records the next boot holds, so losing one warns.
-        if (write.key == persistence_keys::RECORD_ORDER) {
-            SS_LOGD(TAG,
-                    "Provider rejected the \"%s\" write; the next boot rebuilds it from use, and "
-                    "no record is at stake",
-                    write.key.c_str());
-            continue;
-        }
+        // A record slot decides which records the next boot holds, so losing one warns.
         SS_LOGW(TAG,
                 "Provider rejected the \"%s\" write; that change is RAM-only for this boot: "
                 "a record stored since the last accepted write will not survive a reboot, and "
                 "a record dropped since it will be valid again after one",
-                write.key.c_str());
+                key.c_str());
+    }
+    if (order_owed) {
+        std::span<uint8_t> blob;
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            blob = this->encode_order_locked(buffer);
+        }
+        if (!this->save_write(persistence_keys::RECORD_ORDER, blob)) {
+            all_accepted = false;
+            // The recency order is advisory: the next boot rebuilds it from use, and it is written
+            // on every playback handoff, so against a full or read-only store it stays quiet.
+            SS_LOGD(TAG,
+                    "Provider rejected the \"%s\" write; the next boot rebuilds it from use, and "
+                    "no record is at stake",
+                    persistence_keys::RECORD_ORDER);
+        }
     }
     if (slot_accepted && !this->provider_->commit()) {
         all_accepted = false;
@@ -461,7 +477,7 @@ bool RecordStore::persist_records() {
 
 bool RecordStore::has_pending_writes() const {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    return this->order_dirty_ || !this->dirty_slots_.empty();
+    return this->order_dirty_ || this->dirty_slots_.any();
 }
 
 bool RecordStore::note_record_removed(std::string_view psk_id) {
@@ -505,13 +521,14 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
 
     // The fallible overload: a pairing that cannot hash its PSK fails, where the std::array one
     // would abort.
-    std::optional<std::string> psk_id = psk_id_for(outcome.psk.data(), outcome.psk.size());
+    std::optional<IdText> psk_id = psk_id_for(outcome.psk.data(), outcome.psk.size());
     if (!psk_id.has_value()) {
         return std::nullopt;
     }
-    outcome.record.psk_id = std::move(*psk_id);
+    outcome.record.psk_id = psk_id.value();
     outcome.record.psk = outcome.psk;
-    outcome.record.server_id = server_id;
+    // The pairing connection's server_id, an IdText itself, so the assign() fits.
+    (void)outcome.record.server_id.assign(server_id);
     return outcome;
 }
 
@@ -524,77 +541,56 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
 // ============================================================================
 //
 // Every path that mutates records_ marks the slots whose stored blob no longer matches it (and
-// the order blob, when the recency order moved). The next persist_records() encodes those writes
-// under mutex_ (take_dirty_writes_locked()), then drops the lock before handing each blob to the
-// provider (save_slot_write()). The provider write is an NVS commit on ESP, tens of milliseconds
-// per key, and the protocol-task mutators take the same mutex.
+// the order blob, when the recency order moved). persist_records() takes that owed set under
+// mutex_, then encodes each write under mutex_ (encode_slot_locked(), encode_order_locked()) and
+// drops the lock before handing it to the provider (save_write()). The provider write is an NVS
+// commit on ESP, tens of milliseconds per key, and the protocol-task mutators take the same mutex.
+// The writes are encoded one at a time into one buffer, so a flush holds one blob on the main
+// loop's stack however many slots it writes.
 //
-// The two halves need not be atomic: persist_records() is main-loop-only, so blobs cannot land
-// out of order, and the writers that can slip into the gap (the protocol-task mutators
+// The steps need not be atomic: persist_records() is main-loop-only, so blobs cannot land out of
+// order, and the writers that can slip into a gap (the protocol-task mutators
 // store_record_superseding, note_record_removed and note_record_played) are RAM-only and their
-// callers schedule a flush, which redoes whatever slot they dirtied.
-// A resolve in the gap sees the new RAM state, which is the authority for the boot; the blobs
-// only decide what survives a reboot.
-std::vector<RecordStore::SlotWrite> RecordStore::take_dirty_writes_locked() {
-    std::vector<SlotWrite> writes;
-    if (this->provider_ == nullptr) {
-        this->dirty_slots_.clear();
-        this->order_dirty_ = false;
-        return writes;
+// callers schedule a flush, which redoes whatever slot they dirtied. A slot one of them changes
+// after the owed set was taken may be written with its new content by this flush as well.
+// A resolve in a gap sees the new RAM state, which is the authority for the boot; the blobs only
+// decide what survives a reboot.
+std::span<uint8_t> RecordStore::encode_slot_locked(uint8_t slot, WriteBuffer& buffer) const {
+    const std::span<uint8_t, persistence_keys::RECORD_SLOT_SIZE> blob =
+        std::span(buffer).first<persistence_keys::RECORD_SLOT_SIZE>();
+    // A slot nothing occupies is written as zeros, which is how the store frees it: an evicted,
+    // revoked or superseded record must not come back at the next boot.
+    std::fill(blob.begin(), blob.end(), 0);
+    const StoredRecord* held = this->record_in_slot(slot);
+    if (held != nullptr && !encode_pairing_record_into(held->record, blob)) {
+        // Unreachable for a paired server: the handshake refuses a server_id that is not a
+        // canonical public key. Freeing the slot keeps whatever it held before from coming back
+        // in its place.
+        SS_LOGE(TAG, "Record %s has an unstorable server_id; it will not survive a reboot",
+                held->record.psk_id.c_str());
     }
-    // A flush staged only for the last-played server owes no record write: skip the reserve.
-    if (this->dirty_slots_.empty() && !this->order_dirty_) {
-        return writes;
-    }
-    writes.reserve(this->dirty_slots_.size() + 1);
-    for (uint8_t slot : this->dirty_slots_) {
-        SlotWrite write;
-        write.key = persistence_keys::record_slot_key(slot);
-        // A slot nothing occupies is written as zeros, which is how the store frees it: an
-        // evicted, revoked or superseded record must not come back at the next boot.
-        write.blob.assign(persistence_keys::RECORD_SLOT_SIZE, 0);
-        const StoredRecord* held = this->record_in_slot(slot);
-        if (held != nullptr) {
-            auto encoded = encode_pairing_record(held->record);
-            if (encoded.has_value()) {
-                std::copy(encoded->begin(), encoded->end(), write.blob.begin());
-                secure_zero(encoded->data(), encoded->size());
-            } else {
-                // Unreachable for a paired server: the handshake refuses a server_id that is not
-                // a canonical public key. Freeing the slot keeps whatever it held before from
-                // coming back in its place.
-                SS_LOGE(TAG, "Record %s has an unstorable server_id; it will not survive a reboot",
-                        held->record.psk_id.c_str());
-            }
-        }
-        writes.push_back(std::move(write));
-    }
-    this->dirty_slots_.clear();
-
-    if (this->order_dirty_) {
-        SlotWrite order;
-        order.key = persistence_keys::RECORD_ORDER;
-        // Advisory: recency is rebuilt from use, so the next boot costs at most one eviction of
-        // the wrong record.
-        // Fixed at one byte per slot the store may use, whatever it holds now, padded with a
-        // value no slot takes.
-        order.blob.assign(this->max_records_, UNASSIGNED_SLOT);
-        for (size_t i = 0; i < this->records_.size(); ++i) {
-            order.blob[i] = this->records_[i].slot;
-        }
-        writes.push_back(std::move(order));
-        this->order_dirty_ = false;
-    }
-    return writes;
+    return blob;
 }
 
-bool RecordStore::save_slot_write(SlotWrite& write) {
-    // Only reached for a write take_dirty_writes_locked() produced, which it does only when a
-    // provider is set.
-    const bool ok = this->provider_->save_blob(write.key, write.blob.data(), write.blob.size());
+std::span<uint8_t> RecordStore::encode_order_locked(WriteBuffer& buffer) const {
+    // Advisory: recency is rebuilt from use, so the next boot costs at most one eviction of the
+    // wrong record.
+    // Fixed at one byte per slot the store may use, whatever it holds now, padded with a value no
+    // slot takes.
+    const std::span<uint8_t> blob = std::span(buffer).first(this->max_records_);
+    std::fill(blob.begin(), blob.end(), UNASSIGNED_SLOT);
+    for (size_t i = 0; i < this->records_.size(); ++i) {
+        blob[i] = this->records_[i].slot;
+    }
+    return blob;
+}
+
+bool RecordStore::save_write(const std::string& key, std::span<uint8_t> blob) {
+    // Only reached from persist_records() with a provider set.
+    const bool ok = this->provider_->save_blob(key, blob.data(), blob.size());
     // An encoded record holds the PSK; wipe it now that save_blob() has its own copy (or has
     // rejected it).
-    secure_zero(write.blob.data(), write.blob.size());
+    secure_zero(blob.data(), blob.size());
     return ok;
 }
 

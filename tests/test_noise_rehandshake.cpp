@@ -95,7 +95,7 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
     rec.psk_id = r.psk_id;
     rec.psk = r.psk;
     rec.server_id = r.server_id.peer_id();
-    rs.store_record_superseding(std::move(rec), {});
+    rs.store_record_superseding(PairingRecord(rec), {});
 
     // Run initial handshake via NoiseHandshake state machine
     TestArena arena;
@@ -342,7 +342,7 @@ TEST(NoiseRehandshake, RehandshakeRotatesKeys_ChaChaPoly) {
         rec.psk_id = rehs_psk_id;
         rec.psk = rehs_psk;
         rec.server_id = init.server_id.peer_id();
-        rs.store_record_superseding(std::move(rec), {});
+        rs.store_record_superseding(PairingRecord(rec), {});
 
         auto rr_opt = run_rehandshake(suite, init, rs, rehs_psk, rehs_psk_id);
         ASSERT_TRUE(rr_opt.has_value()) << "re-handshake failed";

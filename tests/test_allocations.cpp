@@ -13,9 +13,10 @@
 // limitations under the License.
 
 // Counts the library's operator new calls while a connection is accepted, handshakes and is
-// admitted, and on the per-message paths after it. On ESPHome builds operator new draws only on
-// internal RAM and aborts when it fails, so each allocation in these windows is one that internal
-// heap exhaustion turns into a crash instead of a refused connection.
+// admitted, on the per-message paths after it, and through the record store's flushes. On ESPHome
+// builds operator new draws only on internal RAM and aborts when it fails, so each allocation in
+// these windows is one that internal heap exhaustion turns into a crash instead of a refused
+// connection.
 //
 // This file replaces the global allocation functions, so it builds into its own binary
 // (sendspin_alloc_tests): in sendspin_tests the replacement would take the place of the
@@ -28,6 +29,7 @@
 // with SENDSPIN_ALLOC_REPORT=1 to print each window's allocations grouped by call site, with each
 // frame's offset into the binary for atos or addr2line; a count that differs prints its window.
 
+#include "fake_persistence.h"
 #include "lifecycle_test_fixtures.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
@@ -688,6 +690,159 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
                                UNTAKEN_STREAM_START_ALLOCATIONS);
     EXPECT_EQ(player_listener.stream_starts, player_starts_before_untaken)
         << "the player started a stream from a connection that did not own it";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+/// A blob store whose own bookkeeping is the test's: the main loop calls it inside the record
+/// flushes the windows below measure.
+class TestOwnedPersistence : public InMemoryPersistenceProvider {
+public:
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        TestOwned test_owned;
+        return InMemoryPersistenceProvider::save_blob(key, data, len);
+    }
+
+    bool commit() override {
+        TestOwned test_owned;
+        return InMemoryPersistenceProvider::commit();
+    }
+
+    /// save_attempts() without the test's own allocations, for a pump predicate.
+    int writes(const std::string& key) const {
+        TestOwned test_owned;
+        return this->save_attempts(key);
+    }
+};
+
+/// Counts on_pairing_succeeded() on the main loop (the test thread).
+class PairingCountingListener : public SendspinClientListener {
+public:
+    void on_pairing_succeeded(const std::string& /*server_id*/) override {
+        ++this->succeeded;
+    }
+
+    int succeeded{0};
+};
+
+constexpr uint16_t RECORD_FLUSH_TEST_PORT = 19301;
+constexpr uint16_t PAIRING_TEST_PORT = 19302;
+
+constexpr size_t PLAYBACK_HANDOFF_ALLOCATIONS = 0;
+constexpr size_t UNPAIR_ALLOCATIONS = 0;
+// The growth of the pairing-note list the protocol task fills for the main loop (two), and the
+// std::string server_id on_pairing_started() and on_pairing_succeeded() each take (two).
+constexpr size_t PAIRING_ALLOCATIONS = 4;
+
+// Two paired servers, the incoming one's record the least recently used: from the incoming
+// server's connect, through the playback activate that displaces the incumbent and the main
+// loop's flush of the record order it moved, then a server/unpair of the incoming server's record
+// through the flush that empties its slot.
+TEST(Allocations, RecordFlushesAfterAPlaybackHandoffAndAnUnpair) {
+    PairedPeer incoming = make_paired_peer();
+    PairedPeer incumbent = make_paired_peer();
+    TestOwnedPersistence persistence;
+    seed_records(persistence, {incoming.record, incumbent.record});
+
+    SendspinClientConfig config;
+    config.name = "Allocation Test Record Flush Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.server_port = RECORD_FLUSH_TEST_PORT;
+    TestNetworkProvider network;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = "[]";
+    std::unique_ptr<FakeEncryptedServer> incumbent_server =
+        connect_paired_server(incumbent, RECORD_FLUSH_TEST_PORT, options);
+    pump_while_not(client, [&] {
+        return client.is_connected() && persistence.writes(persistence_keys::LAST_PLAYED) > 0;
+    });
+
+    const int order_writes = persistence.writes(persistence_keys::RECORD_ORDER);
+    std::unique_ptr<FakeEncryptedServer> incoming_server;
+    open_window();
+    {
+        TestOwned test_owned;
+        incoming_server = connect_paired_server(incoming, RECORD_FLUSH_TEST_PORT, options);
+    }
+    pump_while_not(client, [&] {
+        return persistence.writes(persistence_keys::RECORD_ORDER) > order_writes &&
+               persistence.writes(persistence_keys::LAST_PLAYED) > 1;
+    });
+    expect_library_allocations(close_window(), "playback handoff and its record flush",
+                               PLAYBACK_HANDOFF_ALLOCATIONS);
+    EXPECT_EQ(stored_record_order(persistence), (std::vector<uint8_t>{1, 0}))
+        << "the handoff must make the incoming server's record the most recent";
+
+    const int slot_writes = persistence.writes(persistence_keys::record_slot_key(0));
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(incoming_server->send_app_json(R"({"type":"server/unpair","payload":{}})"));
+    }
+    pump_while_not(client, [&] {
+        return persistence.writes(persistence_keys::record_slot_key(0)) > slot_writes;
+    });
+    expect_library_allocations(close_window(), "server/unpair and its record flush",
+                               UNPAIR_ALLOCATIONS);
+    EXPECT_EQ(persisted_psk_ids(persistence), std::vector<std::string>{incumbent.record.psk_id})
+        << "the unpair must empty the incoming server's slot";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A pairing_psk pairing (pairing.md "Pairing PSK Flow") on a connection made on the configured
+// Pairing PSK, from the pairing activate through the main loop's flush of the new record and the
+// on_pairing_succeeded() that follows it.
+TEST(Allocations, PairingThroughItsRecordFlush) {
+    std::array<uint8_t, NOISE_PSK_SIZE> pairing_psk{};
+    platform_random_bytes(pairing_psk.data(), pairing_psk.size());
+    TestOwnedPersistence persistence;
+    PairingCountingListener listener;  // Outlives the client
+
+    SendspinClientConfig config;
+    config.name = "Allocation Test Pairing Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.server_port = PAIRING_TEST_PORT;
+    config.pairing_psk = SendspinPsk(pairing_psk);
+    TestNetworkProvider network;
+    SendspinClient client(config);
+    client.set_listener(&listener);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    // The activate waits for the test, so the window opens after the hello exchange.
+    FakeEncryptedServerOptions options;
+    options.psk_category = "pr";
+    options.suppress_activate = true;
+    FakeEncryptedServer server(server_url(PAIRING_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                               Identity::generate().value(), psk_id_for(pairing_psk), pairing_psk,
+                               options);
+    pump_while_not(client, [&] {
+        TestOwned test_owned;
+        return !server.hello_pair_methods().empty();
+    });
+
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server.send_app_json(
+            R"({"type":"server/activate","payload":{"activities":["pairing"],"active_roles":[],)"
+            R"("pairing":{"method":"pairing_psk"}}})"));
+    }
+    pump_while_not(client, [&] { return listener.succeeded > 0; });
+    expect_library_allocations(close_window(), "pairing through its record flush",
+                               PAIRING_ALLOCATIONS);
+    EXPECT_EQ(persisted_psk_ids(persistence),
+              std::vector<std::string>{server.learned_psk_id().value_or("")})
+        << "the flush must store the record the pairing minted";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

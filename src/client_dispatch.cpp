@@ -713,8 +713,8 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             auto record = conn->take_pending_pairing_record();
             bool stored_record = false;
             if (record.has_value() && this->record_store_ != nullptr) {
-                // Logged before the store takes ownership of the record; a rejection warns
-                // from inside store_record_superseding().
+                // Logged before the store is asked; a rejection warns from inside
+                // store_record_superseding().
                 SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
                         record->psk_id.c_str());
                 // store_record_superseding() mutates RAM only. At capacity it evicts the
@@ -729,8 +729,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 // whatever this server held before, so the prior record for the same
                 // server_id must be retired or the old PSK stays valid forever.
                 if (this->record_store_->store_record_superseding(
-                        std::move(record.value()),
-                        this->connection_manager_->open_connection_psk_ids())) {
+                        record.value(), this->connection_manager_->open_connection_psk_ids())) {
                     stored_record = true;
                 }
             } else {
