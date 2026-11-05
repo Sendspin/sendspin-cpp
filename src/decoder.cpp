@@ -20,17 +20,32 @@
 
 #include <algorithm>
 #include <cstring>
-#include <memory>
+#include <new>
 
 namespace sendspin {
 
 static const char* const TAG = "sendspin.decoder";
 
+// Internal RAM: a few hundred bytes of decoder state read on every frame. micro-flac's working
+// buffers, tens of KB, stay where its own memory preference puts them.
+static constexpr MemoryLocation FLAC_STATE_LOCATION = MemoryLocation::PREFER_INTERNAL;
+
+// The platform heaps align every block to at least a pointer (ESP-IDF's to 4 bytes).
+static_assert(alignof(micro_flac::FLACDecoder) <= alignof(void*),
+              "a platform heap block must be aligned for the FLAC decoder");
+
+SendspinDecoder::~SendspinDecoder() {
+    // flac_decoder_buf_ frees the storage after this body.
+    if (micro_flac::FLACDecoder* flac = this->flac_decoder()) {
+        flac->~FLACDecoder();
+    }
+}
+
 void SendspinDecoder::reset_decoders() {
     // Kept, reset, for the next FLAC stream: one decoder object per sync task run rather than
     // one per codec header.
-    if (this->flac_decoder_ != nullptr) {
-        this->flac_decoder_->reset();
+    if (micro_flac::FLACDecoder* flac = this->flac_decoder()) {
+        flac->reset();
     }
 
 #ifdef SENDSPIN_ENABLE_OPUS
@@ -49,21 +64,28 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
 
     switch (chunk_type) {
         case CHUNK_TYPE_FLAC_HEADER: {
-            // Created on the first FLAC header; reset_decoders() readies it for each later one.
-            // operator new, unlike the Opus state's PlatformBuffer: micro-flac makes operator new
-            // allocations of its own (its Ogg demuxer, its metadata blocks), so placing this
-            // object in a PlatformBuffer would move only one of them.
-            if (this->flac_decoder_ == nullptr) {
-                this->flac_decoder_ = std::make_unique<micro_flac::FLACDecoder>();
+            // Constructed in its buffer on the first FLAC header; reset_decoders() readies it for
+            // each later one. micro-flac allocates the rest of its state with FLAC_MALLOC, which
+            // fails without aborting; its operator new allocations, an Ogg demuxer and stored
+            // metadata blocks, never run here, as the parser admits only a codec_header of fLaC
+            // and a last STREAMINFO block (decode_flac_codec_header() in protocol.cpp).
+            micro_flac::FLACDecoder* flac = this->flac_decoder();
+            if (flac == nullptr) {
+                if (!this->flac_decoder_buf_.allocate(sizeof(micro_flac::FLACDecoder),
+                                                      FLAC_STATE_LOCATION)) {
+                    SS_LOGE(TAG, "Failed to allocate %zu bytes for FLAC decoder",
+                            sizeof(micro_flac::FLACDecoder));
+                    return false;
+                }
+                flac = new (this->flac_decoder_buf_.data()) micro_flac::FLACDecoder();
                 // Disable CRC check for small speed up; reset() keeps the setting.
-                this->flac_decoder_->set_crc_check_enabled(false);
+                flac->set_crc_check_enabled(false);
             }
 
             size_t bytes_consumed = 0;
             size_t samples_decoded = 0;
-            auto result =
-                this->flac_decoder_->decode(data, data_size, static_cast<uint8_t*>(nullptr), 0,
-                                            bytes_consumed, samples_decoded);
+            auto result = flac->decode(data, data_size, static_cast<uint8_t*>(nullptr), 0,
+                                       bytes_consumed, samples_decoded);
 
             if (result == micro_flac::FLAC_DECODER_NEED_MORE_DATA) {
                 SS_LOGW(TAG, "Need more data to decode FLAC header");
@@ -75,7 +97,7 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
                 return false;
             }
 
-            const auto& info = this->flac_decoder_->get_stream_info();
+            const auto& info = flac->get_stream_info();
             this->current_codec_ = SendspinCodecFormat::FLAC;
             this->current_stream_info_ =
                 AudioStreamInfo(static_cast<uint8_t>(info.bits_per_sample()),
@@ -160,16 +182,16 @@ bool SendspinDecoder::decode_audio_chunk(const uint8_t* data, size_t data_size,
         std::memcpy(output_buffer, data, copy);
         *consumed = copy;
         *decoded_size = copy;
-    } else if ((this->flac_decoder_ != nullptr) &&
-               (this->current_codec_ == SendspinCodecFormat::FLAC)) {
+    } else if (micro_flac::FLACDecoder* flac = this->flac_decoder();
+               (flac != nullptr) && (this->current_codec_ == SendspinCodecFormat::FLAC)) {
         // roles/player/v1.md "Codec framing": a FLAC chunk carries one or more complete frames,
         // and micro-flac decodes one per call.
         while (*consumed < data_size) {
             size_t bytes_consumed = 0;
             size_t samples_decoded = 0;
-            auto result = this->flac_decoder_->decode(
-                data + *consumed, data_size - *consumed, output_buffer + *decoded_size,
-                output_buffer_size - *decoded_size, bytes_consumed, samples_decoded);
+            auto result =
+                flac->decode(data + *consumed, data_size - *consumed, output_buffer + *decoded_size,
+                             output_buffer_size - *decoded_size, bytes_consumed, samples_decoded);
 
             if (result == micro_flac::FLAC_DECODER_ERROR_OUTPUT_TOO_SMALL) {
                 break;  // No room for another frame; the caller grows the buffer and resumes.

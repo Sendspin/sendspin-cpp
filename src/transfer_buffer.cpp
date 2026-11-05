@@ -25,23 +25,26 @@ namespace sendspin {
 // ============================================================================
 
 TransferBuffer::~TransferBuffer() {
-    this->deallocate_buffer();
-}
-
-std::unique_ptr<TransferBuffer> TransferBuffer::create(size_t buffer_size,
-                                                       MemoryLocation location) {
-    std::unique_ptr<TransferBuffer> buffer(new TransferBuffer());
-
-    if (!buffer->allocate_buffer(buffer_size, location)) {
-        return nullptr;
-    }
-
-    return buffer;
+    this->deallocate();
 }
 
 // ============================================================================
 // Public API
 // ============================================================================
+
+bool TransferBuffer::allocate(size_t buffer_size, MemoryLocation location) {
+    // PlatformBuffer::allocate() frees the held block first, so a failure leaves none.
+    const bool allocated = this->buffer_.allocate(buffer_size, location);
+    this->data_start_ = this->buffer_.data();
+    this->buffer_length_ = 0;
+    return allocated;
+}
+
+void TransferBuffer::deallocate() {
+    this->buffer_.reset();
+    this->data_start_ = nullptr;
+    this->buffer_length_ = 0;
+}
 
 size_t TransferBuffer::transfer_data_to_sink(uint32_t timeout_ms) {
     size_t bytes_written = 0;
@@ -92,26 +95,6 @@ bool TransferBuffer::reallocate(size_t new_buffer_size) {
 
     this->data_start_ = this->buffer_.data();
     return true;
-}
-
-// ============================================================================
-// Private helpers
-// ============================================================================
-
-bool TransferBuffer::allocate_buffer(size_t buffer_size, MemoryLocation location) {
-    if (!this->buffer_.allocate(buffer_size, location)) {
-        return false;
-    }
-
-    this->data_start_ = this->buffer_.data();
-    this->buffer_length_ = 0;
-    return true;
-}
-
-void TransferBuffer::deallocate_buffer() {
-    this->buffer_.reset();
-    this->data_start_ = nullptr;
-    this->buffer_length_ = 0;
 }
 
 }  // namespace sendspin

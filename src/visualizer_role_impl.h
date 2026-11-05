@@ -62,7 +62,8 @@ struct VisualizerDelivery {
 /// @param payload          Bytes following the entry's wire-type byte and 8-byte timestamp.
 /// @param configured_bins  Negotiated spectrum n_disp_bins (0 if SPECTRUM was not negotiated).
 /// @param tracks_downbeats Whether the active stream reports downbeats.
-/// @param spectrum_out     Scratch vector reused for SPECTRUM bins; resized to configured_bins.
+/// @param spectrum_out     Scratch vector reused for SPECTRUM bins; resized to configured_bins,
+///                         which the drain thread keeps within its capacity.
 /// @return What to deliver; Kind::None if the entry is malformed, short, or non-deliverable.
 VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* payload,
                                              size_t payload_len, uint8_t configured_bins,
@@ -102,6 +103,10 @@ struct VisualizerRole::Impl : RoleTeardown {
         /// Its item list's flags also carry the drain thread's command bits.
         InboundConsumer inbound;
         std::thread drain_thread;
+        /// The bins on_spectrum() receives, reserved by start() for configured_spectrum_bins(),
+        /// beyond which no spectrum is admitted, so the drain thread never grows it. Main loop in
+        /// start() before the thread is spawned, then the drain thread.
+        std::vector<uint16_t> spectrum_bins;
     };
 
     /// @brief Deferred event state for the visualizer stream config, delivered to the main thread
@@ -171,6 +176,9 @@ struct VisualizerRole::Impl : RoleTeardown {
     void signal_boundary();
     /// @brief Whether a boundary has passed since `item` was listed. Drain thread.
     bool is_stale(void* item) const;
+    /// @brief The spectrum bins the configuration requests: n_disp_bins when its types include
+    /// SPECTRUM, otherwise none.
+    uint8_t configured_spectrum_bins() const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
     void enqueue_stream_event(VisualizerEventType event, uint32_t generation) const;

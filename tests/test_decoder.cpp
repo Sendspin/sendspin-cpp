@@ -37,7 +37,6 @@ using sendspin::AudioStreamInfo;
 using sendspin::SendspinDecoder;
 using sendspin::SyncContext;
 using sendspin::SyncTask;
-using sendspin::TransferBuffer;
 
 namespace {
 
@@ -128,12 +127,12 @@ TEST(Decoder, FlacStreamAfterAResetDecodesOnTheSameDecoder) {
     int calls = 0;
     ASSERT_EQ(decode_resuming(decoder, FLAC_FRAMES, 3 * FLAC_FRAME_PCM_BYTES, &calls),
               flac_source_pcm());
-    const micro_flac::FLACDecoder* const first = decoder.flac_decoder_.get();
+    const micro_flac::FLACDecoder* const first = decoder.flac_decoder();
 
     decoder.reset_decoders();
-    EXPECT_EQ(decoder.flac_decoder_.get(), first) << "the reset released the FLAC decoder";
+    EXPECT_EQ(decoder.flac_decoder(), first) << "the reset released the FLAC decoder";
     start_flac(decoder);
-    EXPECT_EQ(decoder.flac_decoder_.get(), first) << "a new FLAC decoder was built for the stream";
+    EXPECT_EQ(decoder.flac_decoder(), first) << "a new FLAC decoder was built for the stream";
     EXPECT_EQ(decode_resuming(decoder, FLAC_FRAMES, 3 * FLAC_FRAME_PCM_BYTES, &calls),
               flac_source_pcm());
 }
@@ -262,10 +261,9 @@ void start_context(SyncContext& context, const std::vector<uint8_t>& header,
     ASSERT_TRUE(context.decoder->process_header(header.data(), header.size(), header_type,
                                                 &context.current_stream_info));
     context.bytes_per_frame = context.current_stream_info.frames_to_bytes(1);
-    context.decode_buffer =
-        TransferBuffer::create(context.decoder->get_decode_buffer_size() + context.bytes_per_frame,
-                               sendspin::MemoryLocation::PREFER_EXTERNAL);
-    ASSERT_NE(context.decode_buffer, nullptr);
+    ASSERT_TRUE(context.decode_buffer.allocate(
+        context.decoder->get_decode_buffer_size() + context.bytes_per_frame,
+        sendspin::MemoryLocation::PREFER_EXTERNAL));
 }
 
 /// Storage for an inbound ring item holding `chunk` as its encoded bytes, laid out as the sync
@@ -327,11 +325,11 @@ TEST(SyncTaskDecodeWholeChunk, DecodesEveryFrameOrLeavesTheBufferEmpty) {
         EXPECT_EQ(SyncTask::decode_whole_chunk(context),
                   row.output_bytes != 0 ? sendspin::DecodeResult::SUCCESS
                                         : sendspin::DecodeResult::FAILED);
-        EXPECT_EQ(context.decode_buffer->available(), row.output_bytes);
+        EXPECT_EQ(context.decode_buffer.available(), row.output_bytes);
         if (row.header_type == sendspin::CHUNK_TYPE_FLAC_HEADER && row.output_bytes != 0) {
             const std::vector<uint8_t> pcm = flac_source_pcm();
-            ASSERT_EQ(context.decode_buffer->available(), pcm.size());
-            EXPECT_EQ(std::memcmp(context.decode_buffer->get_buffer_start(), pcm.data(), pcm.size()),
+            ASSERT_EQ(context.decode_buffer.available(), pcm.size());
+            EXPECT_EQ(std::memcmp(context.decode_buffer.get_buffer_start(), pcm.data(), pcm.size()),
                       0);
         }
     }

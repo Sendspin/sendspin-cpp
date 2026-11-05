@@ -1469,7 +1469,7 @@ Configuration passed to `client.add_visualizer()`.
 
 | Field | Type | Description |
 |---|---|---|
-| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`); may be empty to request none |
+| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`); may be empty to request none. A type a stream serves outside them is dropped |
 | `rate_max` | `uint16_t` | Maximum periodic frames per second; set to the display refresh rate. Must be positive when `types` is non-empty, or `SendspinClient::start()` fails |
 | `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types`, or `SendspinClient::start()` fails |
 
@@ -1477,7 +1477,7 @@ Configuration passed to `client.add_visualizer()`.
 
 | Field | Type | Description |
 |---|---|---|
-| `n_disp_bins` | `uint8_t` | Number of frequency bins to receive |
+| `n_disp_bins` | `uint8_t` | Number of frequency bins to receive; `start()` reserves this many for `on_spectrum()`. A stream may serve fewer; one that serves more, or another `scale` or frequency range, drops its spectrum frames |
 | `scale` | `VisualizerSpectrumScale` | Frequency scale (`MEL`, `LOG`, or `LIN`) |
 | `f_min` | `uint16_t` | Minimum frequency in Hz |
 | `f_max` | `uint16_t` | Maximum frequency in Hz |

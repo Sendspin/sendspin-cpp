@@ -775,9 +775,10 @@ void send_spectrum_until(SendspinClient& client, FakeEncryptedServer& server,
 }
 
 // roles/visualizer/v1.md "Server -> Client: stream/start": the served spectrum object, not the
-// requested one, governs how many bins each frame carries. The negotiated count is what the
-// drain thread decodes with, so it is pinned where a consumer sees it: a stream that serves two
-// bins to a client that asked for four hands on_spectrum the first two of each wire frame.
+// requested one, governs how many bins each frame carries, up to the requested count (a served
+// count above it drops the spectrum frames). The negotiated count is what the drain thread
+// decodes with, so it is pinned where a consumer sees it: a stream that serves two bins to a
+// client that asked for four hands on_spectrum the first two of each wire frame.
 TEST(ClientLifecycle, TheServedSpectrumBinCountGovernsTheDeliveredFrame) {
     RecordingSpectrumListener listener;
     auto config = make_config(VISUALIZER_SPECTRUM_TEST_PORT);
