@@ -820,7 +820,7 @@ static bool handle_selector_key(const Event& event, SendspinClient& client, TuiS
             state.connected_port = server.port;
             state.server_selector_active = false;
         }
-        client.connect_to(url);
+        client.connect_to(std::move(url));
         return true;
     }
 

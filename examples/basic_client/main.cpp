@@ -549,7 +549,7 @@ int main(int argc, char* argv[]) {
     // Auto-connect if a URL was provided via -u
     if (!connect_url.empty()) {
         fprintf(stderr, "Connecting to %s...\n", connect_url.c_str());
-        client.connect_to(connect_url);
+        client.connect_to(std::move(connect_url));
     }
 
     fprintf(stderr, "Press Ctrl+C to stop.\n\n");

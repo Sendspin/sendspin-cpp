@@ -122,9 +122,12 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_role_deactivation.cpp`: a later `server/activate` that removes a role: output stopped,
   buffers and state dropped, the roles it keeps left alone, and a removed role added back.
 - `test_allocations.cpp`: how many times the library calls `operator new` from a connection's
-  accept to its admission, for a `client/state`, for a time burst, for a controller
-  `server/state`, for the `stream/*` messages and for a `stream/start` section the connection's
-  roles do not take. It replaces the global allocation functions, so it builds into its own
+  accept to its admission, from `connect_to()` to admission, for a `client/state`, for a time
+  burst, for a controller `server/state`, for the `stream/*` messages, for a FLAC `stream/start`
+  the player takes, for a `stream/start` section the connection's roles do not take, and through
+  the record flush that follows each of a playback handoff to another paired server, a
+  `server/unpair`, a `pairing_psk` pairing and a dynamic pairing code pairing in each emission
+  format. It replaces the global allocation functions, so it builds into its own
   binary, `sendspin_alloc_tests`, which building `sendspin_tests` also builds. Run it with
   `SENDSPIN_ALLOC_REPORT=1` to print each allocation grouped by call site.
 - `test_crypto.cpp`, `test_cpace.cpp`, `test_pairing_code.cpp`, `test_psk_wrap.cpp`,

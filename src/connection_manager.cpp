@@ -17,6 +17,7 @@
 #include "admission.h"
 #include "client_connection.h"
 #include "connection.h"
+#include "connection_block.h"
 #include "constants.h"
 #include "crypto/constants.h"
 #include "platform/json_arena.h"
@@ -426,10 +427,14 @@ void ConnectionManager::goodbye_for_shutdown(std::shared_ptr<SendspinConnection>
     this->closing_.push_back(std::move(conn));
 }
 
-void ConnectionManager::connect_to(const std::string& url) {
+void ConnectionManager::connect_to(std::string url) {
     SS_LOGI(TAG, "Initiating client connection to: %s", url.c_str());
 
-    auto client_conn = std::make_shared<SendspinClientConnection>(url);
+    auto client_conn = make_connection_in_block<SendspinClientConnection>(std::move(url));
+    if (client_conn == nullptr) {
+        SS_LOGE(TAG, "No memory for the connection; not connecting");
+        return;
+    }
     if (!client_conn->inbound_gate().is_created()) {
         SS_LOGE(TAG, "No event group for the connection's inbound gate; not connecting");
         return;

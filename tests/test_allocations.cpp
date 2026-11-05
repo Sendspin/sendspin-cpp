@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Counts the library's operator new calls while a connection is accepted, handshakes and is
-// admitted, on the per-message paths after it, and through the record store's flushes. On ESPHome
-// builds operator new draws only on internal RAM and aborts when it fails, so each allocation in
-// these windows is one that internal heap exhaustion turns into a crash instead of a refused
-// connection.
+// Counts the library's operator new calls while a connection is accepted or opened by
+// connect_to(), handshakes and is admitted, on the per-message paths after it, and through the
+// record store's flushes. On ESPHome builds operator new draws only on internal RAM and aborts when
+// it fails, so each allocation in these windows is one that internal heap exhaustion turns into a
+// crash instead of a refused connection.
 //
 // This file replaces the global allocation functions, so it builds into its own binary
 // (sendspin_alloc_tests): in sendspin_tests the replacement would take the place of the
@@ -24,10 +24,14 @@
 //
 // Every allocation inside a window records its size and stack, and the stack decides whose it is:
 // the fake server's handlers and its IXWebSocket client thread are the test's own; IXWebSocket's
-// server threads and the host transport classes are the host transport, which ESP replaces with
-// esp_http_server; everything else is the library's. Only the library's count is asserted. Run
-// with SENDSPIN_ALLOC_REPORT=1 to print each window's allocations grouped by call site, with each
-// frame's offset into the binary for atos or addr2line; a count that differs prints its window.
+// server threads, the host server connection and the host client connection's start() and
+// send_ws_frame() are the host transport, which ESP replaces with esp_http_server and
+// esp_websocket_client; everything else is the library's. The labels follow the inbound windows:
+// in the connect_to() window the fake server's ix::WebSocketServer threads print as host transport
+// and the library's IXWebSocket client threads as the test's. Neither is the library's, so the
+// count is unaffected. Only the library's count is asserted. Run with SENDSPIN_ALLOC_REPORT=1 to
+// print each window's allocations grouped by call site, with each frame's offset into the binary
+// for atos or addr2line; a count that differs prints its window.
 
 #include "crypto/cpace.h"
 #include "crypto/pairing_code.h"
@@ -270,7 +274,8 @@ Allocation classify(const AllocationRecord& record) {
     bool host_transport = false;
     for (int i = 0; i < record.frame_count; ++i) {
         Frame frame = resolve(record.frames[i]);
-        if (names_any(frame.name, {"FakeEncryptedServer", "NoiseInitiatorFixtureBase"})) {
+        if (names_any(frame.name, {"FakeEncryptedServer", "FakeOutboundEncryptedServer",
+                                   "NoiseInitiatorFixtureBase"})) {
             fixture = true;
         }
         if (names_any(frame.name, {"ix::WebSocketServer", "ix::SocketServer"})) {
@@ -283,7 +288,9 @@ Allocation classify(const AllocationRecord& record) {
         if (in_namespace(frame, "sendspin::")) {
             if (allocation.chain.empty() &&
                 names_any(function_name(frame.name),
-                          {"SendspinServerConnection", "SendspinWsServer"})) {
+                          {"SendspinServerConnection", "SendspinWsServer",
+                           "SendspinClientConnection::start",
+                           "SendspinClientConnection::send_ws_frame"})) {
                 host_transport = true;
             }
             allocation.chain.push_back(std::move(frame));
@@ -731,6 +738,40 @@ public:
 
     int succeeded{0};
 };
+
+constexpr uint16_t OUTBOUND_TEST_PORT = 19305;
+
+constexpr size_t OUTBOUND_ADMISSION_ALLOCATIONS = 0;
+
+// A connect_to() to a paired server listening for it, from the call through admission. The URL,
+// built before the window, is moved in. The refusal when the connection's block cannot be
+// allocated is untested: reaching it would need a fault-injection seam in the platform heap.
+TEST(Allocations, ConnectToThroughAdmission) {
+    SendspinClientConfig config;
+    config.name = "Allocation Test Outbound Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.accept_inbound_connections = false;
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    FakeOutboundEncryptedServer server(OUTBOUND_TEST_PORT, std::string(NOISE_SUITE_CHACHAPOLY),
+                                       bundle.peer.server_identity, bundle.peer.record.psk_id,
+                                       bundle.peer.psk);
+    ASSERT_TRUE(server.listen());
+    server.start();
+    // Longer than libc++'s 22-character inline capacity, so a copy in the library is counted.
+    std::string url = server_url(OUTBOUND_TEST_PORT);
+
+    open_window();
+    client.connect_to(std::move(url));
+    pump_while_not(client, [&] { return client.is_connected(); });
+    expect_library_allocations(close_window(), "connect_to() through admission",
+                               OUTBOUND_ADMISSION_ALLOCATIONS);
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
 
 constexpr uint16_t RECORD_FLUSH_TEST_PORT = 19301;
 constexpr uint16_t PAIRING_TEST_PORT = 19302;

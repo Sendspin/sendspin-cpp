@@ -697,7 +697,7 @@ void SendspinClient::release_inbound_ring() {
     this->inbound_ring_.reset();
 }
 
-void SendspinClient::connect_to(const std::string& url) {
+void SendspinClient::connect_to(std::string url) {
     // Running implies start() succeeded, so identity_ and record_store_ exist for the protocol
     // task to hand to init_noise_handshake() once the WebSocket upgrade completes; a connection
     // built before that would dereference null there.
@@ -705,7 +705,7 @@ void SendspinClient::connect_to(const std::string& url) {
         SS_LOGW(TAG, "connect_to() ignored: client is not running");
         return;
     }
-    this->protocol_task_->post_requests({.connect_to = url});
+    this->protocol_task_->post_requests({.connect_to = std::move(url)});
 }
 
 void SendspinClient::disconnect(SendspinGoodbyeReason reason) {
