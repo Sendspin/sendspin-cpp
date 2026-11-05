@@ -30,15 +30,39 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
+#include <utility>
 #include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local
+
+namespace {
+
+/// Collects what the CPace LV encoders feed it, so a test can read the bytes they hash.
+struct ByteSink {
+    std::vector<uint8_t> bytes;
+
+    void update(const uint8_t* data, size_t len) {
+        this->bytes.insert(this->bytes.end(), data, data + len);
+    }
+};
+
+/// draft-irtf-cfrg-cpace-21 `lv_cat` of `parts`: cpace_prepend_len() over each in turn.
+std::vector<uint8_t> lv_cat(std::initializer_list<std::pair<const uint8_t*, size_t>> parts) {
+    ByteSink sink;
+    for (const auto& [data, len] : parts) {
+        cpace_prepend_len(sink, data, len);
+    }
+    return sink.bytes;
+}
+
+}  // namespace
 
 // ============================================================================
 // Building-block KATs
 // ============================================================================
 
-// --- cpace_prepend_len / cpace_lv_cat ---
+// --- cpace_prepend_len / lv_cat ---
 // Reference: _prepend_len / _lv_cat in cpace.py. Expected values from running the Python
 // reference.
 
@@ -63,16 +87,16 @@ TEST(CPacePrimitives, EncodingPrimitiveKats) {
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        auto result = cpace_prepend_len(row.data.empty() ? nullptr : row.data.data(),
-                                        row.data.size());
-        EXPECT_EQ(to_hex(result), row.expected_hex);
+        ByteSink result;
+        cpace_prepend_len(result, row.data.empty() ? nullptr : row.data.data(), row.data.size());
+        EXPECT_EQ(to_hex(result.bytes), row.expected_hex);
     }
 
     // _lv_cat is prepend_len applied to each element and concatenated:
     // _lv_cat(b'hello', b'world') = b'\x05hello\x05world'.
     const uint8_t* hello = reinterpret_cast<const uint8_t*>("hello");
     const uint8_t* world = reinterpret_cast<const uint8_t*>("world");
-    EXPECT_EQ(to_hex(cpace_lv_cat({{hello, 5}, {world, 5}})), "0568656c6c6f05776f726c64");
+    EXPECT_EQ(to_hex(lv_cat({{hello, 5}, {world, 5}})), "0568656c6c6f05776f726c64");
 }
 
 // --- cpace_generator_string ---
@@ -82,7 +106,9 @@ TEST(CPacePrimitives, GeneratorStringKat) {
     // Expected hex from Python reference.
     const uint8_t* prs = reinterpret_cast<const uint8_t*>("1234");
     const uint8_t* sid = reinterpret_cast<const uint8_t*>("test-session-id-1234567890123456");
-    auto gs = cpace_generator_string(prs, 4, nullptr, 0, sid, 32);
+    ByteSink sink;
+    cpace_generator_string(sink, prs, 4, nullptr, 0, sid, 32);
+    const std::vector<uint8_t>& gs = sink.bytes;
     EXPECT_EQ(gs.size(), 162u);
     // Expected: from Python _generator_string(b'1234', b'', b'test-session-id-1234567890123456')
     // Structure: lv(DSI=8B) + lv(prs=4B) + lv(113 zero bytes) + lv(ci='') + lv(sid=32B)
@@ -326,13 +352,13 @@ struct FixedExchange {
         if (!x25519_scalar_mult(SCALAR_A, Yb.data(), shared.data())) return false;
 
         // Transcript: lv_cat(Ya, '') + lv_cat(Yb, '')
-        auto t_a = cpace_lv_cat({{Ya.data(), 32}, {nullptr, 0}});
-        auto t_b = cpace_lv_cat({{Yb.data(), 32}, {nullptr, 0}});
+        auto t_a = lv_cat({{Ya.data(), 32}, {nullptr, 0}});
+        auto t_b = lv_cat({{Yb.data(), 32}, {nullptr, 0}});
 
         // ISK = SHA512(lv_cat(DSI_ISK, sid, shared) + transcript)
         const auto* dsi_isk = reinterpret_cast<const uint8_t*>(CPACE_DSI_ISK.data());
         size_t dsi_isk_len = CPACE_DSI_ISK.size();
-        auto lv_prefix = cpace_lv_cat({
+        auto lv_prefix = lv_cat({
             {dsi_isk, dsi_isk_len},
             {sid, sid_len},
             {shared.data(), 32},
@@ -719,6 +745,37 @@ TEST(CPaceDeriveRejects, DeriveBeforeStartIsRejected) {
     CPace started;
     ASSERT_TRUE(started.start(CPaceRole::RESPONDER, prs, sid, ci, ad, ad));
     EXPECT_TRUE(started.derive(peer.public_share().data(), CPACE_SHARE_SIZE));
+}
+
+// start() holds the sid and both ADs inline, so one past its capacity must fail the start rather
+// than overrun it, and a failed start leaves nothing to derive from.
+TEST(CPaceDeriveRejects, StartRejectsAnOversizedSidOrAd) {
+    struct Row {
+        const char* name;
+        size_t sid_size;
+        size_t ad_size;
+        size_t peer_ad_size;
+        bool started;
+    };
+    const Row rows[] = {
+        {"every field at its limit", CPACE_MAX_SID_SIZE, CPACE_MAX_AD_SIZE, CPACE_MAX_AD_SIZE, true},
+        {"sid", CPACE_MAX_SID_SIZE + 1, 0, 0, false},
+        {"ad", 32, CPACE_MAX_AD_SIZE + 1, 0, false},
+        {"peer ad", 32, 0, CPACE_MAX_AD_SIZE + 1, false},
+    };
+    const std::vector<uint8_t> prs(6, 0x31);
+    const std::vector<uint8_t> ci;
+    CPace peer;
+    ASSERT_TRUE(peer.start(CPaceRole::INITIATOR, prs, std::vector<uint8_t>(32, 0x01), ci, ci, ci));
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        CPace side;
+        EXPECT_EQ(side.start(CPaceRole::RESPONDER, prs, std::vector<uint8_t>(row.sid_size, 0x01),
+                             ci, std::vector<uint8_t>(row.ad_size, 0x02),
+                             std::vector<uint8_t>(row.peer_ad_size, 0x03)),
+                  row.started);
+        EXPECT_EQ(side.derive(peer.public_share().data(), CPACE_SHARE_SIZE), row.started);
+    }
 }
 
 TEST(CPaceDeriveRejects, TagBeforeDeriveReturnsNullopt) {

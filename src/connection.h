@@ -20,6 +20,7 @@
 
 #include "crypto/cpace.h"
 #include "crypto/keys.h"
+#include "crypto/pairing_code.h"
 #include "inbound_ring.h"
 #ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
 #include "message_trace.h"
@@ -36,8 +37,10 @@
 #include "time_burst.h"
 #include "time_filter.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -463,8 +466,8 @@ public:
         std::array<uint8_t, 32> nonce_a{};
         std::array<uint8_t, 32> handshake_hash{};
         /// The pairing code as CPace consumes it (PRS, pairing.md "PAKE"): the six or eight ASCII
-        /// digits, or the 24 raw bytes of the qr_code emission format.
-        std::vector<uint8_t> prs;
+        /// digits, or the 24 raw bytes of the qr_code emission format. Set through set_prs().
+        std::array<uint8_t, PAIRING_PRS_MAX_SIZE> prs{};
         /// platform_time_us() deadline for the whole attempt; the Pairing PSK Flow arms it too.
         int64_t attempt_deadline_us{0};
         /// pairing_index captured when this attempt entered pairing (see
@@ -480,19 +483,29 @@ public:
         /// Emission format the server selected; meaningful for DYNAMIC_PAIRING_CODE only.
         SendspinPairingCodeFormat format{SendspinPairingCodeFormat::DIGITS};
         PairingStep step{PairingStep::IDLE};
+        uint8_t prs_size{0};       ///< Bytes of `prs` that hold the code; 0 until set_prs().
         bool code_emitted{false};  ///< True once a code was surfaced via on_display_pairing_code.
         bool window_shown{false};  ///< True once on_open_pairing_window was surfaced.
 
         PairingSession() = default;
 
-        /// @brief Wipes the pairing code and both binding nonces on destruction. `prs` lives on
-        /// the heap, so releasing it unwiped would leave the code in freed memory.
+        /// @brief Wipes the pairing code and both binding nonces on destruction.
         ~PairingSession() {
             secure_zero_container(this->nonce_b);
             secure_zero_container(this->nonce_a);
-            if (!this->prs.empty()) {
-                secure_zero(this->prs.data(), this->prs.size());
-            }
+            secure_zero_container(this->prs);
+        }
+
+        /// @brief Holds `code` as the attempt's PRS; at most PAIRING_PRS_MAX_SIZE bytes.
+        void set_prs(std::span<const uint8_t> code) {
+            assert(code.size() <= this->prs.size());
+            std::copy(code.begin(), code.end(), this->prs.begin());
+            this->prs_size = static_cast<uint8_t>(code.size());
+        }
+
+        /// @brief The PRS set_prs() holds; empty before it is set.
+        std::span<const uint8_t> prs_view() const {
+            return {this->prs.data(), this->prs_size};
         }
 
         /// Reached only by reference (pairing_session()); a copy would carry the code and the

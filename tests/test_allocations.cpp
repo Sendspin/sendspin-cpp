@@ -29,10 +29,15 @@
 // with SENDSPIN_ALLOC_REPORT=1 to print each window's allocations grouped by call site, with each
 // frame's offset into the binary for atos or addr2line; a count that differs prints its window.
 
+#include "crypto/cpace.h"
+#include "crypto/pairing_code.h"
+#include "crypto/psk_wrap.h"
 #include "fake_persistence.h"
 #include "lifecycle_test_fixtures.h"
+#include "platform/base64.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "wrap_test_helpers.h"
 #include <cxxabi.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -50,6 +55,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -731,9 +737,9 @@ constexpr uint16_t PAIRING_TEST_PORT = 19302;
 
 constexpr size_t PLAYBACK_HANDOFF_ALLOCATIONS = 0;
 constexpr size_t UNPAIR_ALLOCATIONS = 0;
-// The growth of the pairing-note list the protocol task fills for the main loop (two), and the
-// std::string server_id on_pairing_started() and on_pairing_succeeded() each take (two).
-constexpr size_t PAIRING_ALLOCATIONS = 4;
+// The std::string server_id on_pairing_started() and on_pairing_succeeded() each take on the main
+// loop: a public listener signature's cost.
+constexpr size_t PAIRING_ALLOCATIONS = 2;
 
 // Two paired servers, the incoming one's record the least recently used: from the incoming
 // server's connect, through the playback activate that displaces the incumbent and the main
@@ -846,6 +852,223 @@ TEST(Allocations, PairingThroughItsRecordFlush) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+/// Keeps the code a pairing emits, which the test enters into its server as the operator would.
+/// Main loop (the test thread) only.
+class CodePairingListener : public PairingCountingListener {
+public:
+    void on_display_pairing_code(const std::string& code,
+                                 SendspinPairingCodeFormat /*format*/) override {
+        TestOwned test_owned;
+        this->code = code;
+    }
+
+    std::string code;
+};
+
+/// The body of the first message of `type` the client sent `server`, if one arrived.
+std::optional<std::string> client_message(const FakeEncryptedServer& server,
+                                          std::string_view type) {
+    for (const FakeEncryptedServer::WireMessage& message : server.messages()) {
+        if (message.type == type) {
+            return std::string(message.body.begin(), message.body.end());
+        }
+    }
+    return std::nullopt;
+}
+
+/// Whether the client sent `server` a message of `type`, or one that ends the round short of it.
+bool client_sent_or_ended(const FakeEncryptedServer& server, std::string_view type) {
+    return client_message(server, type) || client_message(server, "client/pair-retry") ||
+           client_message(server, "pair/abort") || server.closed();
+}
+
+/// The base64url field `field` of the payload of the client's message of `type`, decoded.
+std::vector<uint8_t> client_field(const FakeEncryptedServer& server, std::string_view type,
+                                  const char* field) {
+    const std::optional<std::string> body = client_message(server, type);
+    if (!body.has_value()) {
+        ADD_FAILURE() << "the client ended the round before " << type;
+        return {};
+    }
+    JsonDocument doc;
+    EXPECT_EQ(deserializeJson(doc, *body), DeserializationError::Ok);
+    return b64url_decode(doc["payload"][field] | "").value_or(std::vector<uint8_t>{});
+}
+
+/// The 24-byte code a version-1 pairing token carries, decoded as a server does (pairing.md
+/// "Pairing Token"): each '9' back to '2', then unpadded RFC 4648 base32.
+std::vector<uint8_t> pairing_token_code(const std::string& token) {
+    std::vector<uint8_t> code;
+    uint32_t bits = 0;
+    int bit_count = 0;
+    for (char c : token.substr(4)) {
+        c = c == '9' ? '2' : c;
+        bits = (bits << 5) | static_cast<uint32_t>(c >= 'A' ? c - 'A' : c - '2' + 26);
+        bit_count += 5;
+        if (bit_count >= 8) {
+            bit_count -= 8;
+            code.push_back(static_cast<uint8_t>(bits >> bit_count));
+        }
+    }
+    return code;
+}
+
+/// The sid of one round of a pairing attempt (pairing.md "PAKE").
+std::vector<uint8_t> pake_sid(const std::array<uint8_t, 32>& handshake_hash,
+                              uint32_t pairing_index, uint32_t round) {
+    const std::string_view label = "sendspin-pair-pake-v1";
+    std::vector<uint8_t> sid(label.begin(), label.end());
+    sid.insert(sid.end(), handshake_hash.begin(), handshake_hash.end());
+    for (uint32_t counter : {pairing_index, round}) {
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            sid.push_back(static_cast<uint8_t>(counter >> shift));
+        }
+    }
+    return sid;
+}
+
+constexpr uint16_t CODE_PAIRING_DIGITS_TEST_PORT = 19303;
+constexpr uint16_t CODE_PAIRING_QR_TEST_PORT = 19304;
+
+// Only the listener's std::string arguments on the main loop: the server_id on_pairing_started()
+// and on_pairing_succeeded() each take, and for a qr_code the 43-character token
+// on_display_pairing_code() takes, past both standard libraries' inline capacity. Six digits fit it.
+constexpr size_t CODE_PAIRING_DIGITS_ALLOCATIONS = 2;
+constexpr size_t CODE_PAIRING_QR_ALLOCATIONS = 3;
+
+struct CodePairingRow {
+    const char* format;
+    uint16_t port;
+    size_t expected;
+};
+
+/// Runs one Dynamic Pairing Code Flow round (pairing.md "Dynamic Pairing Code Flow") in `format`
+/// against a server the test plays with the library's CPace, from the pairing activate through
+/// the main loop's flush of the new record and the on_pairing_succeeded() that follows it.
+void run_code_pairing(const CodePairingRow& row) {
+    TestOwnedPersistence persistence;
+    CodePairingListener listener;  // Outlives the client
+
+    SendspinClientConfig config;
+    config.name = "Allocation Test Code Pairing Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.server_port = row.port;
+    config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+    config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS,
+                                   SendspinPairingCodeFormat::QR_CODE};
+    TestNetworkProvider network;
+    SendspinClient client(config);
+    client.set_listener(&listener);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    // A pairing-code method is refused on the Pairing PSK (admission.h), so the code flow runs on
+    // the Sentinel PSK.
+    FakeEncryptedServerOptions options;
+    options.suppress_activate = true;
+    FakeEncryptedServer server(server_url(row.port), std::string(NOISE_SUITE_CHACHAPOLY),
+                               Identity::generate().value(), std::string(SENTINEL_PSK_ID),
+                               SENTINEL_PSK, options);
+    pump_while_not(client, [&] {
+        TestOwned test_owned;
+        return !server.hello_pair_methods().empty();
+    });
+
+    // Pumps from this function rather than a helper taking the server: classify() counts a stack
+    // with a frame naming FakeEncryptedServer as the fixture's, and the predicate's type would name
+    // it on every library frame below the pump.
+    const auto await_field = [&](std::string_view type, const char* field) {
+        pump_while_not(client, [&] {
+            TestOwned test_owned;
+            return client_sent_or_ended(server, type);
+        });
+        TestOwned test_owned;
+        return client_field(server, type, field);
+    };
+
+    CPace server_cpace;
+    std::vector<uint8_t> wrapped_psk;
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server.send_app_json(
+            std::string(R"({"type":"server/activate","payload":{"activities":["pairing"],)") +
+            R"("active_roles":[],"pairing":{"method":"dynamic_pairing_code","format":")" +
+            row.format + R"("}}})"));
+    }
+    ASSERT_FALSE(await_field("client/pair-init", "commit_B").empty());
+    {
+        TestOwned test_owned;
+        std::array<uint8_t, PAIRING_NONCE_SIZE> nonce_a{};
+        platform_random_bytes(nonce_a.data(), nonce_a.size());
+        ASSERT_TRUE(server.send_app_json(R"({"type":"server/pair-init","payload":{"nonce_A":")" +
+                                         b64url_encode(nonce_a.data(), nonce_a.size()) + R"("}})"));
+    }
+    pump_while_not(client, [&] { return !listener.code.empty() || server.closed(); });
+    ASSERT_FALSE(listener.code.empty()) << "the client closed before it emitted a code";
+    {
+        TestOwned test_owned;
+        const bool qr = std::string_view(row.format) == "qr_code";
+        const std::vector<uint8_t> prs =
+            qr ? pairing_token_code(listener.code)
+               : std::vector<uint8_t>(listener.code.begin(), listener.code.end());
+        const std::string_view server_ad = "server";
+        const std::string_view client_ad = "client";
+        ASSERT_TRUE(server_cpace.start(
+            CPaceRole::INITIATOR, prs,
+            pake_sid(server.handshake_hash(), server.pair_init().value().pairing_index, 1), {},
+            std::vector<uint8_t>(server_ad.begin(), server_ad.end()),
+            std::vector<uint8_t>(client_ad.begin(), client_ad.end())));
+        const auto& share = server_cpace.public_share();
+        ASSERT_TRUE(server.send_app_json(R"({"type":"server/pair-auth","payload":{"pake_msg_1":")" +
+                                         b64url_encode(share.data(), share.size()) + R"("}})"));
+    }
+    const std::vector<uint8_t> client_share = await_field("client/pair-auth", "pake_msg_2");
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server_cpace.derive(client_share.data(), client_share.size()));
+        const auto server_kc = server_cpace.tag().value();
+        ASSERT_TRUE(server.send_app_json(
+            R"({"type":"server/pair-confirm","payload":{"server_kc":")" +
+            b64url_encode(server_kc.data(), server_kc.size()) + R"("}})"));
+    }
+    wrapped_psk = await_field("client/pair-finalize", "wrapped_psk");
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server.send_app_json(R"({"type":"server/pair-finalize","payload":{}})"));
+    }
+    pump_while_not(client, [&] { return listener.succeeded > 0 || server.closed(); });
+    expect_library_allocations(close_window(), row.format, row.expected);
+
+    // The server can open the PSK the client wrapped (pairing.md "Wrapping"), and it is the one
+    // the flush stored.
+    ASSERT_EQ(wrapped_psk.size(), WRAPPED_VALUE_SIZE);
+    std::array<uint8_t, WRAPPED_VALUE_SIZE> wrapped{};
+    std::copy(wrapped_psk.begin(), wrapped_psk.end(), wrapped.begin());
+    const auto psk = unwrap_value_as_server(PSK_WRAP_LABEL, "ChaChaPoly", server_cpace.sid(),
+                                            server_cpace.isk().value(), wrapped);
+    ASSERT_TRUE(psk.has_value());
+    EXPECT_EQ(persisted_psk_ids(persistence), std::vector<std::string>{psk_id_for(psk.value())})
+        << "the flush must store the record the pairing minted";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A Dynamic Pairing Code Flow pairing in each emission format, the code CPace's PRS and the new
+// PSK wrapped under its ISK, from the pairing activate through the record flush.
+TEST(Allocations, CodePairingThroughItsRecordFlush) {
+    const CodePairingRow rows[] = {
+        {"digits", CODE_PAIRING_DIGITS_TEST_PORT, CODE_PAIRING_DIGITS_ALLOCATIONS},
+        {"qr_code", CODE_PAIRING_QR_TEST_PORT, CODE_PAIRING_QR_ALLOCATIONS},
+    };
+    for (const CodePairingRow& row : rows) {
+        SCOPED_TRACE(row.format);
+        run_code_pairing(row);
+    }
 }
 
 }  // namespace

@@ -29,12 +29,13 @@
 
 #pragma once
 
+#include "inline_text.h"
 #include "keys.h"
 #include "pairing_code.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <string>
 
 namespace sendspin {
 
@@ -52,17 +53,23 @@ static constexpr char PAIRING_CODE_TOKEN_VERSION = '1';
 /// padding character is stripped).
 static constexpr size_t PAIRING_CODE_TOKEN_LENGTH = 43;
 
+/// @brief A version-0 pairing token's text, held inline.
+using PairingPskToken = InlineText<PAIRING_PSK_TOKEN_LENGTH>;
+
+/// @brief A version-1 pairing token's text, held inline.
+using PairingCodeToken = InlineText<PAIRING_CODE_TOKEN_LENGTH>;
+
 /// @brief Build a version-0 pairing token from a client's static public key and its Sendspin
 /// Pairing PSK.
 /// @param client_key   32-byte raw Curve25519 public key (the same bytes whose base64url form
 ///                     is the client_id).
-/// @return The 107-character token string (e.g. "SP:0AAAQ...").
-std::string format_pairing_token(const std::array<uint8_t, X25519_KEY_SIZE>& client_key,
-                                 const std::array<uint8_t, NOISE_PSK_SIZE>& pairing_psk);
+/// @return The 107-character token (e.g. "SP:0AAAQ...").
+PairingPskToken format_pairing_token(const std::array<uint8_t, X25519_KEY_SIZE>& client_key,
+                                     const std::array<uint8_t, NOISE_PSK_SIZE>& pairing_psk);
 
 /// @brief Build a version-1 pairing token carrying a dynamic pairing code, the form the
 /// `qr_code` emission format presents (pairing.md "Dynamic Pairing Code Flow").
-/// @return The 43-character token string (e.g. "SP:14DQ...").
-std::string format_pairing_code_token(const std::array<uint8_t, QR_PAIRING_CODE_SIZE>& code);
+/// @return The 43-character token (e.g. "SP:14DQ...").
+PairingCodeToken format_pairing_code_token(const std::array<uint8_t, QR_PAIRING_CODE_SIZE>& code);
 
 }  // namespace sendspin

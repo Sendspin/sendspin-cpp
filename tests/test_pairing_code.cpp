@@ -215,14 +215,14 @@ TEST(PairingCodeDigest, LengthGuardsRejectWrongSizedArguments) {
 TEST(PairingCodeDigits, Kat) {
     auto digest = digest_of(kat_inputs());
     ASSERT_TRUE(digest.has_value());
-    EXPECT_EQ(pairing_code_digits(*digest), "564919");
+    EXPECT_EQ(pairing_code_digits(*digest).view(), "564919");
 }
 
 TEST(PairingCodeDigits, KatAllZeros) {
     DeriveInputs in;
     auto digest = digest_of(in);
     ASSERT_TRUE(digest.has_value());
-    EXPECT_EQ(pairing_code_digits(*digest), "593986");
+    EXPECT_EQ(pairing_code_digits(*digest).view(), "593986");
 }
 
 TEST(PairingCodeDigits, ZeroPadsToSixDigits) {
@@ -230,7 +230,7 @@ TEST(PairingCodeDigits, ZeroPadsToSixDigits) {
     // over the whole 256-bit digest, and the result is left-padded to exactly six ASCII digits.
     std::array<uint8_t, 32> digest{};
     digest[31] = 5;
-    EXPECT_EQ(pairing_code_digits(digest), "000005");
+    EXPECT_EQ(pairing_code_digits(digest).view(), "000005");
 }
 
 TEST(PairingCodeDigits, ReducesTheWholeBigEndianDigest) {
@@ -238,7 +238,7 @@ TEST(PairingCodeDigits, ReducesTheWholeBigEndianDigest) {
     // produces: taking the low bytes alone would give "000000".
     std::array<uint8_t, 32> digest{};
     digest[0] = 1;
-    EXPECT_EQ(pairing_code_digits(digest), "662656");
+    EXPECT_EQ(pairing_code_digits(digest).view(), "662656");
 }
 
 // ============================================================================
