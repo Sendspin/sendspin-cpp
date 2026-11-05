@@ -57,6 +57,21 @@ static constexpr uint32_t UNDERFLOW_SILENCE_KEEPALIVE_MS = 20U;
 /// sink before returning to its inner loop to re-check flags and drift.
 static constexpr uint32_t AUDIO_WRITE_TIMEOUT_MS = 20U;
 
+/// @brief Longest stretch (us) the sync task's inner loop runs without waiting (on its item list or
+/// on sink backpressure) before it sleeps for SYNC_BUSY_YIELD_MS. The task runs above the
+/// consumer's main loop and, like the protocol task, is not pinned to a core, so while both catch
+/// up on a backlog (after a receive stall: decrypting the refill, then decoding audio that is
+/// already late without writing it) they can hold every core for seconds and trip the ESP-IDF task
+/// watchdog (5 s by default) on the starved main loop.
+static constexpr int64_t SYNC_MAX_BUSY_US = 50000;
+
+/// @brief Time (us) a transfer to the sink must take to count as a wait on sink backpressure
+static constexpr int64_t SYNC_SINK_WAIT_US = 1000;
+
+/// @brief Sleep (ms) taken once the inner loop has been busy for SYNC_MAX_BUSY_US. Two ticks at
+/// 1 kHz: enough for a lower-priority task to run, small against the sink's buffer.
+static constexpr uint32_t SYNC_BUSY_YIELD_MS = 2U;
+
 /// @brief Minimum sleep (ms) after an initial-sync push, to let the audio stack begin draining
 /// before the next push.
 static constexpr uint32_t INITIAL_SYNC_SETTLE_MIN_MS = 2U;
@@ -397,6 +412,17 @@ int64_t SyncTask::starved_playtime_floor(int64_t playtime_us, int64_t now_us) {
     return playtime_us;
 }
 
+bool SyncTask::busy_yield_due(int64_t busy_since_us, int64_t now_us) {
+    return now_us - busy_since_us > SYNC_MAX_BUSY_US;
+}
+
+void SyncTask::yield_if_busy(SyncContext& sync_context) {
+    if (busy_yield_due(sync_context.busy_since_us, platform_time_us())) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(SYNC_BUSY_YIELD_MS));
+        sync_context.busy_since_us = platform_time_us();
+    }
+}
+
 void SyncTask::send_pending_silence(SyncContext& sync_context) {
     if (sync_context.silence_remaining == 0) {
         return;
@@ -452,6 +478,8 @@ void SyncTask::fill_underflow_silence(SyncContext& sync_context) {
 }
 
 bool SyncTask::transfer_audio(SyncContext& sync_context) {
+    const int64_t write_start_us = platform_time_us();
+
     // Pending silence (priming or hard-sync gap fill) goes out before the decoded chunk
     this->send_pending_silence(sync_context);
 
@@ -459,6 +487,13 @@ bool SyncTask::transfer_audio(SyncContext& sync_context) {
         size_t decode_bytes_written =
             sync_context.decode_buffer->transfer_data_to_sink(AUDIO_WRITE_TIMEOUT_MS);
         this->track_sent_audio(sync_context, decode_bytes_written);
+    }
+
+    // Writes that took this long waited on sink backpressure (a copy alone takes microseconds),
+    // which is how steady-state playback paces the loop, so it was not busy
+    const int64_t write_end_us = platform_time_us();
+    if (write_end_us - write_start_us >= SYNC_SINK_WAIT_US) {
+        sync_context.busy_since_us = write_end_us;
     }
 
     // When decode buffer fully consumed and released, mark done
@@ -481,7 +516,8 @@ bool SyncTask::load_next_chunk(SyncContext& sync_context) {
     if (sync_context.encoded_item == nullptr) {
         void* item = this->take_item(ENCODED_CHUNK_RECEIVE_TIMEOUT_MS);
         if (item == nullptr) {
-            // No chunk available to process
+            // No chunk available to process; the take waited, so the loop was not busy
+            sync_context.busy_since_us = platform_time_us();
             return false;
         }
         const ChunkType type = chunk_type(item);
@@ -1024,6 +1060,7 @@ void SyncTask::thread_entry(void* params) {
         }
 
         SyncTaskState sync_state = SyncTaskState::INITIAL_SYNC;
+        sync_context.busy_since_us = platform_time_us();
 
         // === INNER LOOP: state machine for active stream ===
         while (true) {
@@ -1032,6 +1069,9 @@ void SyncTask::thread_entry(void* params) {
                 sync_context.next_header != nullptr || sync_context.abandoned) {
                 break;
             }
+            // A backlog of late chunks is skipped, or decoded and dropped, without waiting on the
+            // item list or the sink, so bound the busy stretch here
+            this_task->yield_if_busy(sync_context);
             if (flags & COMMAND_STREAM_CLEAR) {
                 // Seek within the current stream: discard buffered audio up to the marker, keep the
                 // codec/decoder and playtime accounting, and continue decoding the new audio.

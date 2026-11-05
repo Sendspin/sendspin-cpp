@@ -76,6 +76,7 @@ struct SyncContext {
     // 64-bit fields
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
     int64_t new_audio_client_playtime{0};
+    int64_t busy_since_us{0};  // When the inner loop last waited or yielded (yield_if_busy())
 
     // size_t fields
     size_t bytes_per_frame{0};
@@ -237,6 +238,14 @@ protected:
     /// HARD_SYNC_THRESHOLD_US: every frame sent has played, so the sink starved, and the silence
     /// it played on its own went unreported. New audio starts no earlier than now.
     static int64_t starved_playtime_floor(int64_t playtime_us, int64_t now_us);
+
+    /// @brief True once the inner loop has run for more than SYNC_MAX_BUSY_US since `busy_since_us`
+    /// without waiting.
+    static bool busy_yield_due(int64_t busy_since_us, int64_t now_us);
+
+    /// @brief Sleeps for SYNC_BUSY_YIELD_MS once busy_yield_due(), so lower-priority tasks (the
+    /// consumer's main loop) run while the task works off a backlog, then restarts the busy clock.
+    void yield_if_busy(SyncContext& sync_context);
 
     /// @brief Sends one chunk of pending silence (initial-sync priming or hard-sync gap fill) to
     /// the sink and updates the playtime estimate. No-op when no silence is pending.

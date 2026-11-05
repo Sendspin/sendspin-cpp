@@ -38,9 +38,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <thread>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1082,6 +1084,47 @@ TEST(PlayerHardSync, AStarvedEstimateIsFlooredAtNow) {
     }
 }
 
+// After a receive stall the backlog can keep the inner loop from ever waiting; it must still let
+// lower-priority tasks run (the consumer's main loop feeds the task watchdog).
+TEST(PlayerSyncTask, ABusyStretchLongerThanTheBudgetYields) {
+    constexpr int64_t SINCE = 1'000'000'000;
+    struct Row {
+        const char* name;
+        int64_t now;
+        bool expected;
+    };
+    const Row rows[] = {
+        {"Control: just waited", SINCE, false},
+        {"Control: busy for exactly the budget", SINCE + 50'000, false},
+        {"busy for just over the budget", SINCE + 50'001, true},
+        {"busy for seconds", SINCE + 5'000'000, true},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(SyncTask::busy_yield_due(SINCE, row.now), row.expected);
+    }
+}
+
+TEST(PlayerSyncTask, YieldingRestartsTheBusyClock) {
+    SyncTask task;
+    SyncContext sync_context{};
+    sync_context.busy_since_us = platform_time_us() - 1'000'000;
+
+    const int64_t before = platform_time_us();
+    task.yield_if_busy(sync_context);
+    const int64_t after = platform_time_us();
+
+    EXPECT_GE(after - before, 2'000);  // slept SYNC_BUSY_YIELD_MS
+    EXPECT_GE(sync_context.busy_since_us, before);
+    EXPECT_LE(sync_context.busy_since_us, after);
+
+    // Control: within the budget it neither sleeps nor moves the clock
+    const int64_t since = sync_context.busy_since_us;
+    task.yield_if_busy(sync_context);
+    EXPECT_EQ(sync_context.busy_since_us, since);
+}
+
 namespace {
 
 // A sink that accepts every write and records the bytes in order.
@@ -1139,4 +1182,50 @@ TEST(PlayerHardSync, AfterAnUnderrunTheGapIsMeasuredFromNow) {
     EXPECT_LE(silence_frames, LEAD_FRAMES);
     // Control: the chunk follows the silence whole.
     EXPECT_EQ(sink.written.end() - first_chunk_byte, static_cast<std::ptrdiff_t>(chunk_bytes));
+}
+
+namespace {
+
+// A sink that takes every write after a delay, like one applying backpressure.
+struct SlowSink : PlayerRoleListener {
+    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
+        std::this_thread::sleep_for(delay);
+        return length;
+    }
+    std::chrono::milliseconds delay{0};
+};
+
+}  // namespace
+
+// Steady-state playback waits on the sink rather than on the item list; that wait must count, or
+// the loop would sleep on top of it every SYNC_MAX_BUSY_US.
+TEST(PlayerSyncTask, AWriteThatWaitsOnTheSinkRestartsTheBusyClock) {
+    for (const auto delay : {std::chrono::milliseconds(3), std::chrono::milliseconds(0)}) {
+        SCOPED_TRACE(delay.count() ? "waits on the sink" : "Control: the sink takes it at once");
+        auto impl = make_impl();
+        SlowSink sink;
+        sink.delay = delay;
+        impl->listener = &sink;
+
+        SyncContext context;
+        context.current_stream_info = AudioStreamInfo(16, 2, 44100);
+        context.bytes_per_frame = context.current_stream_info.frames_to_bytes(1);
+        const size_t chunk_bytes = context.current_stream_info.frames_to_bytes(441);
+        context.decode_buffer =
+            TransferBuffer::create(chunk_bytes, MemoryLocation::PREFER_INTERNAL);
+        context.decode_buffer->set_listener(&sink);
+        context.decode_buffer->increase_buffer_length(chunk_bytes);
+        context.release_chunk = true;
+        const int64_t since = platform_time_us() - 40'000;
+        context.busy_since_us = since;
+
+        const int64_t before = platform_time_us();
+        impl->sync_task->transfer_audio(context);
+
+        if (delay.count() != 0) {
+            EXPECT_GE(context.busy_since_us, before);
+        } else {
+            EXPECT_EQ(context.busy_since_us, since);
+        }
+    }
 }
