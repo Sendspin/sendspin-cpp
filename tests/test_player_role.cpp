@@ -563,7 +563,7 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
             // still full when the marker is handed over.
             held = player->sync_task->take_item(0);
             ASSERT_NE(held, nullptr);
-            player->handle_stream_start(pcm_stream_params());
+            player->handle_stream_start({pcm_stream_params()});
             player->handle_stream_clear();
             take_in_ring_order(ring);
             EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), one_chunk);
@@ -784,7 +784,7 @@ TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
         params.codec = row.codec;
         params.sample_rate = 48000;
         params.bit_depth = 24;
-        impl->handle_stream_start(std::move(params));
+        impl->handle_stream_start({std::move(params)});
 
         void* header_item = impl->sync_task->take_item(0);
         ASSERT_NE(header_item, nullptr);
@@ -799,6 +799,27 @@ TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
         ASSERT_TRUE(impl->event_state->stream_params_slot.take(published, generation));
         EXPECT_EQ(published.bit_depth, row.decoded_bit_depth);
     }
+}
+
+// roles/player/v1.md "Codec framing": the sync task's FLAC decoder starts from the codec header the
+// parse decoded, so the item it takes holds exactly those bytes, typed as a FLAC header.
+TEST(PlayerStreamStart, FlacHandsTheParsedHeaderToTheSyncTask) {
+    auto impl = make_impl();
+    PlayerStreamPayload payload{pcm_stream_params()};
+    payload.params.codec = SendspinCodecFormat::FLAC;
+    FlacCodecHeader header{'f', 'L', 'a', 'C', 0x80, 0x00, 0x00, 0x22};
+    for (size_t i = 8; i < header.size(); ++i) {
+        header[i] = static_cast<uint8_t>(i);
+    }
+    payload.flac_header = header;
+    impl->handle_stream_start(std::move(payload));
+
+    void* header_item = impl->sync_task->take_item(0);
+    ASSERT_NE(header_item, nullptr);
+    EXPECT_EQ(inbound_item_header(header_item)->type, CHUNK_TYPE_FLAC_HEADER);
+    ASSERT_EQ(SyncTask::encoded_size(header_item), header.size());
+    EXPECT_EQ(std::memcmp(SyncTask::encoded_data(header_item), header.data(), header.size()), 0);
+    impl->sync_task->inbound().return_item(header_item);
 }
 
 // ============================================================================

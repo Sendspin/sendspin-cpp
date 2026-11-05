@@ -2542,7 +2542,7 @@ const StateRoleAccess STATE_ROLES[] = {
      true, false},
     {"player stream params",
      [](SendspinClient& c, uint8_t v) {
-         c.player_->impl_->handle_stream_start(player_stream_with(v));
+         c.player_->impl_->handle_stream_start({player_stream_with(v)});
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          PlayerRole::Impl& impl = *c.player_->impl_;
@@ -2824,7 +2824,7 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
             params.sample_rate = 48000;
             params.channels = 2;
             params.bit_depth = 16;
-            impl.handle_stream_start(std::move(params));
+            impl.handle_stream_start({std::move(params)});
             pump_until(client, [&] { return impl.sync_task->is_running(); });
             impl.handle_stream_end();
             pump_until(client, [&] { return !client.is_started(); });
@@ -3221,7 +3221,7 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(ServerPlayerStreamObject{params});
+            player.handle_stream_start({params});
         };
         const auto end = [&] { player.handle_stream_end(); };
 
@@ -3311,7 +3311,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(ServerPlayerStreamObject{params});
+            player.handle_stream_start({params});
         };
 
         start();
@@ -3432,14 +3432,13 @@ void drain_ring_as_protocol_task(InboundRing& ring, const ConnectionList& connec
 }
 
 /// Hands `count` marked 20 ms chunks straight to the sync task, stamped in the server's clock from
-/// `first_timestamp` onward, each in an item acquired from the inbound ring the way the protocol
-/// task writes a chunk it copies. Bypasses the server so a test can feed audio while it holds a
+/// `first_timestamp` onward, each copied into an item the way the protocol task hands over a chunk
+/// that arrived outside the ring. Bypasses the server so a test can feed audio while it holds a
 /// lock the client's own loop needs. Protocol-task work: the caller plays the task
-/// (play_protocol_task()). A batch that finds the ring full stops early; the caller's next batch
-/// retries.
+/// (play_protocol_task()). A batch that finds the ring full or the quota spent stops early; the
+/// caller's next batch retries.
 void feed_marked_chunks(PlayerRole::Impl& impl, int64_t first_timestamp, int count) {
     SyncTask& sync_task = *impl.sync_task;
-    InboundRing* ring = sync_task.inbound().ring();
     constexpr size_t FRAME_OFFSET = 13;  // type byte, server timestamp, send_ahead
     std::vector<uint8_t> message(FRAME_OFFSET + SINK_CHUNK_BYTES, SINK_AUDIO_MARK);
     message[0] = SENDSPIN_BINARY_PLAYER_AUDIO;
@@ -3450,20 +3449,16 @@ void feed_marked_chunks(PlayerRole::Impl& impl, int64_t first_timestamp, int cou
             message[1 + byte] = static_cast<uint8_t>(static_cast<uint64_t>(timestamp) >>
                                                      (56 - 8 * byte));
         }
-        void* item = ring->acquire_local(message.size(), 0);
-        if (item == nullptr) {
+        InboundMessage chunk{.data = message.data(), .len = message.size()};
+        if (!sync_task.inbound().hand_message(
+                chunk,
+                {.data_len = static_cast<uint32_t>(SINK_CHUNK_BYTES),
+                 .serial = 0,
+                 .type = CHUNK_TYPE_ENCODED_AUDIO,
+                 .data_offset = FRAME_OFFSET},
+                impl.cleanup_generation.load(std::memory_order_acquire))) {
             return;
         }
-        std::memcpy(inbound_item_bytes(item), message.data(), message.size());
-        ring->complete(item);
-        // Over quota, hand() returns the item itself.
-        (void)sync_task.inbound().hand(item, message.size(),
-                                       {.data_len = static_cast<uint32_t>(SINK_CHUNK_BYTES),
-                                        .serial = 0,
-                                        .type = CHUNK_TYPE_ENCODED_AUDIO,
-                                        .data_offset = FRAME_OFFSET},
-                                       impl.cleanup_generation.load(std::memory_order_acquire),
-                                       /*exempt=*/false);
         timestamp += 20 * 1000;
     }
 }
@@ -3615,7 +3610,7 @@ void start_stream_on(SendspinClient& client, std::shared_ptr<ObservedConnection>
     play_protocol_task(client);
     (void) replace_admitted(*client.connection_manager_, std::move(conn));
     PlayerRole::Impl& impl = *client.player_->impl_;
-    impl.handle_stream_start(pcm_stream_params());
+    impl.handle_stream_start({pcm_stream_params()});
     SyncTask& sync_task = *impl.sync_task;
     pump_until(client, [&] { return sync_task.is_running(); });
 }

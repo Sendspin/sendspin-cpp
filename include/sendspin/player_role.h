@@ -24,7 +24,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <string>
 
 namespace sendspin {
 
@@ -47,7 +46,6 @@ struct ServerPlayerStreamObject {
     std::optional<uint32_t> sample_rate;
     std::optional<uint8_t> channels;
     std::optional<uint8_t> bit_depth;
-    std::optional<std::string> codec_header;
 
     bool is_complete() const {
         return codec.has_value() && sample_rate.has_value() && channels.has_value() &&

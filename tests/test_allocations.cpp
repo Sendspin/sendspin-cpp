@@ -414,6 +414,24 @@ public:
     int bursts{0};
 };
 
+/// Closes the open window in on_stream_start() when asked to. The main loop calls it before it
+/// signals the sync task to start the stream, and the sync task decodes nothing before that
+/// signal, so the window holds the protocol task's and the main loop's work on a stream/start and
+/// none of the sync task's.
+class WindowClosingPlayerListener : public CountingPlayerListener {
+public:
+    void on_stream_start() override {
+        CountingPlayerListener::on_stream_start();
+        if (this->close_on_start) {
+            this->close_on_start = false;
+            this->window = close_window();
+        }
+    }
+
+    bool close_on_start{false};
+    Window window;
+};
+
 void expect_library_allocations(const Window& window, const char* title, size_t expected) {
     EXPECT_FALSE(window.overflowed) << title;
     EXPECT_EQ(window.count(Owner::LIBRARY), expected) << title;
@@ -472,6 +490,7 @@ constexpr size_t CLIENT_STATE_ALLOCATIONS = 0;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;
 constexpr size_t CONTROLLER_STATE_ALLOCATIONS = 0;
 constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 0;
+constexpr size_t PLAYER_FLAC_STREAM_START_ALLOCATIONS = 0;
 constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 
 // One paired connection with a player, a controller, metadata, two artwork channels, a visualizer
@@ -480,9 +499,10 @@ constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 // the fake server's connect through admission and the first client/state, then one client/state
 // publish, then one full burst of client/time and server/time exchanges, then the first
 // controller server/state, then an artwork and visualizer stream/start and a stream/end and a
-// stream/clear that name their roles, then a stream/start whose player section the connection, no
-// longer owning the player, does not take. The roles' public command and type lists are reserved
-// when the roles are built, so even the first fill on the main loop allocates nothing.
+// stream/clear that name their roles, then a FLAC stream/start the player takes, then a
+// stream/start whose player section the connection, no longer owning the player, does not take.
+// The roles' public command and type lists are reserved when the roles are built, so even the
+// first fill on the main loop allocates nothing.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -505,7 +525,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     PairedClientBundle bundle(config);
     SendspinClient& client = bundle.client();
     client.set_listener(&burst_listener);
-    CountingPlayerListener player_listener;
+    WindowClosingPlayerListener player_listener;
     client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     ControllerRole& controller = client.add_controller();
     client.add_metadata();
@@ -599,10 +619,48 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     EXPECT_EQ(visualizer_listener.stream_starts, starts_before_streams + 1)
         << "the window closed before the main loop reported the visualizer stream";
 
+    // A FLAC stream/start the player takes, its codec header the fLaC marker and STREAMINFO of a
+    // 48 kHz stereo 16-bit stream: the parse decodes it into fixed storage and the player copies
+    // it into the sync task's ring item.
+    constexpr const char* FLAC_STREAM_START =
+        R"({"type":"stream/start","payload":{"player":{"codec":"flac","sample_rate":48000,)"
+        R"("channels":2,"bit_depth":16,)"
+        R"("codec_header":"ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA"}}})";
+    constexpr const char* PLAYER_STREAM_END =
+        R"({"type":"stream/end","payload":{"roles":["player"]}})";
+    const auto play_flac_stream = [&](bool measured) {
+        const int starts_before = player_listener.stream_starts;
+        const int ends_before = player_listener.stream_ends;
+        if (measured) {
+            player_listener.close_on_start = true;
+            open_window();
+        }
+        {
+            TestOwned test_owned;
+            ASSERT_TRUE(server->send_app_json(FLAC_STREAM_START));
+        }
+        pump_while_not(client, [&] { return player_listener.stream_starts > starts_before; });
+        if (measured) {
+            expect_library_allocations(player_listener.window,
+                                       "FLAC stream/start the player takes",
+                                       PLAYER_FLAC_STREAM_START_ALLOCATIONS);
+        }
+        {
+            TestOwned test_owned;
+            ASSERT_TRUE(server->send_app_json(PLAYER_STREAM_END));
+        }
+        pump_while_not(client, [&] { return player_listener.stream_ends > ends_before; });
+    };
+    // The first, outside any window, grows the main loop's held stream event list, which keeps
+    // its capacity for later streams.
+    play_flac_stream(false);
+    // The second closes as the main loop reports the stream started.
+    play_flac_stream(true);
+
     // An activation that leaves the player out takes the role from the connection, outside any
-    // window. The window holds a stream/start whose player section carries a FLAC codec_header
-    // longer than either standard library's inline capacity, which a parse would copy, and closes
-    // on the client/state of the activation behind it that hands the player back.
+    // window. The window holds a FLAC stream/start whose player section a parse would validate
+    // and decode, and closes on the client/state of the activation behind it that hands the
+    // player back.
     const int states_before_removal = server->client_state_count();
     {
         TestOwned test_owned;
@@ -612,13 +670,11 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     }
     pump_while_not(client, [&] { return server->client_state_count() > states_before_removal; });
     const int states_before_untaken = server->client_state_count();
+    const int player_starts_before_untaken = player_listener.stream_starts;
     open_window();
     {
         TestOwned test_owned;
-        ASSERT_TRUE(server->send_app_json(
-            R"({"type":"stream/start","payload":{"player":{"codec":"flac","sample_rate":48000,)"
-            R"("channels":2,"bit_depth":16,)"
-            R"("codec_header":"ZkxhQwAAACIQABAAAAANAAANC7gB8AAAAAAAAAAAAAAAAAAAAAAAAAAA"}}})"));
+        ASSERT_TRUE(server->send_app_json(FLAC_STREAM_START));
         ASSERT_TRUE(server->send_app_json(
             R"({"type":"server/activate","payload":{"activities":["playback"],"active_roles":)"
             R"(["player@v1","controller@v1","metadata@v1","color@v1","artwork@v1",)"
@@ -627,7 +683,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     pump_while_not(client, [&] { return server->client_state_count() > states_before_untaken; });
     expect_library_allocations(close_window(), "stream/start for a role the connection lacks",
                                UNTAKEN_STREAM_START_ALLOCATIONS);
-    EXPECT_EQ(player_listener.stream_starts, 0)
+    EXPECT_EQ(player_listener.stream_starts, player_starts_before_untaken)
         << "the player started a stream from a connection that did not own it";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);

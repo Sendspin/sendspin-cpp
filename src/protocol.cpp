@@ -27,6 +27,7 @@
 #include "sendspin/visualizer_role.h"
 #include <ArduinoJson.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -152,12 +153,42 @@ static std::optional<E> read_enum_field(JsonVariantConst var, const char* name,
     return value;
 }
 
-static bool process_player_stream_object(const JsonObject player_object,
-                                         ServerPlayerStreamObject* player_obj,
-                                         bool require_all_fields) {
-    if (player_obj == nullptr) {
+// roles/player/v1.md "Codec framing": a FLAC codec_header carries the fLaC marker followed by the
+// STREAMINFO block, in standard Base64, so it is exactly the bytes FlacCodecHeader holds. With no
+// block after it, STREAMINFO is the last metadata block, and RFC 9639 section 8.1 "Metadata Block
+// Header" requires its block header to say so; one with the flag clear claims blocks the header
+// does not carry (and leaves micro-flac waiting for them).
+static constexpr std::array<uint8_t, 8> FLAC_CODEC_HEADER_PREFIX = {
+    'f',  'L',  'a',  'C',
+    0x80,              // last-metadata-block flag, block type 0 (STREAMINFO)
+    0x00, 0x00, 0x22,  // block length 34, big-endian
+};
+// Four characters per three bytes; 42 bytes need no padding.
+static constexpr size_t FLAC_CODEC_HEADER_BASE64_CHARS = 4 * ((FLAC_CODEC_HEADER_BYTES + 2) / 3);
+
+static bool decode_flac_codec_header(std::string_view encoded, FlacCodecHeader* header) {
+    // Pins the one 56-character encoding, which the host decoder would otherwise loosen by
+    // skipping trailing '=' and whitespace.
+    if (encoded.size() != FLAC_CODEC_HEADER_BASE64_CHARS) {
         return false;
     }
+    size_t decoded = 0;
+    if (platform_base64_decode(header->data(), header->size(), &decoded,
+                               reinterpret_cast<const uint8_t*>(encoded.data()),
+                               encoded.size()) != 0 ||
+        decoded != header->size()) {
+        return false;
+    }
+    return std::equal(FLAC_CODEC_HEADER_PREFIX.begin(), FLAC_CODEC_HEADER_PREFIX.end(),
+                      header->begin());
+}
+
+static bool process_player_stream_object(const JsonObject player_object,
+                                         PlayerStreamPayload* player, bool require_all_fields) {
+    if (player == nullptr) {
+        return false;
+    }
+    ServerPlayerStreamObject* player_obj = &player->params;
 
     if (require_all_fields) {
         if (!player_object["bit_depth"].is<JsonVariant>() ||
@@ -186,14 +217,11 @@ static bool process_player_stream_object(const JsonObject player_object,
         player_obj->bit_depth = v;
     }
 
-    if (player_object["codec_header"].is<JsonVariant>()) {
-        player_obj->codec_header = player_object["codec_header"].as<std::string>();
-    }
-
-    // For FLAC, codec_header is required
-    if (player_obj->codec.has_value() && player_obj->codec.value() == SendspinCodecFormat::FLAC &&
-        !player_obj->codec_header.has_value()) {
-        SS_LOGE(TAG, "Invalid player object: FLAC requires codec_header");
+    // codec_header is required for flac and absent for pcm and opus, so only FLAC's is read.
+    if (player_obj->codec == SendspinCodecFormat::FLAC &&
+        !decode_flac_codec_header(player_object["codec_header"].as<std::string_view>(),
+                                  &player->flac_header.emplace())) {
+        SS_LOGE(TAG, "Invalid player object: FLAC requires a codec_header of fLaC and STREAMINFO");
         return false;
     }
 
@@ -749,15 +777,15 @@ bool process_server_state_controller(JsonObject root, ControllerStatePayload* co
 // frame. Each returns true when its section is absent or valid, and false when it is malformed.
 
 static bool process_stream_start_player(JsonObject payload,
-                                        std::optional<ServerPlayerStreamObject>* player) {
+                                        std::optional<PlayerStreamPayload>* player) {
     if (!payload["player"].is<JsonObject>()) {
         return true;
     }
-    ServerPlayerStreamObject& player_obj = player->emplace();
+    PlayerStreamPayload& player_obj = player->emplace();
     if (!process_player_stream_object(payload["player"], &player_obj, true)) {
         return false;
     }
-    if (!player_obj.is_complete()) {
+    if (!player_obj.params.is_complete()) {
         SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
         return false;
     }

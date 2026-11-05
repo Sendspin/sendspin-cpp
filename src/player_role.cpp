@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include "audio_types.h"
-#include "platform/base64.h"
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "player_role_impl.h"
@@ -367,7 +366,8 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
                                generation);
 }
 
-void PlayerRole::Impl::handle_stream_start(ServerPlayerStreamObject&& player_obj) {
+void PlayerRole::Impl::handle_stream_start(PlayerStreamPayload&& player) {
+    ServerPlayerStreamObject& player_obj = player.params;
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
     // Numbers the codec header and the STREAM_START, so the sync task starts the stream only on
@@ -407,11 +407,16 @@ void PlayerRole::Impl::handle_stream_start(ServerPlayerStreamObject&& player_obj
                 SS_LOGE(TAG, "Failed to send codec header");
             }
         } else if (codec == SendspinCodecFormat::FLAC) {
-            if (!player_obj.codec_header.has_value()) {
+            if (!player.flac_header.has_value()) {
                 SS_LOGE(TAG, "FLAC codec header missing");
             } else {
-                header_sent =
-                    this->hand_flac_header(player_obj.codec_header.value(), ordinal, generation);
+                header_sent = this->sync_task->inbound().hand_local(
+                    player.flac_header->data(), FLAC_CODEC_HEADER_BYTES,
+                    {.data_len = FLAC_CODEC_HEADER_BYTES,
+                     .serial = ordinal,
+                     .type = CHUNK_TYPE_FLAC_HEADER,
+                     .data_offset = 0},
+                    generation);
                 if (!header_sent) {
                     SS_LOGE(TAG, "Failed to send codec header");
                 }
@@ -717,47 +722,6 @@ void PlayerRole::Impl::complete_teardown() {
 // ============================================================================
 // Impl: Helpers
 // ============================================================================
-
-bool PlayerRole::Impl::hand_flac_header(std::string_view codec_header, uint16_t ordinal,
-                                        uint32_t generation) const {
-    InboundConsumer& inbound = this->sync_task->inbound();
-    InboundRing* ring = inbound.ring();
-    if (ring == nullptr) {
-        return false;
-    }
-    // Decoded straight into the item, saving hand_local()'s second buffer and copy.
-    const auto* input = reinterpret_cast<const unsigned char*>(codec_header.data());
-    size_t decoded_len = 0;
-    platform_base64_decode(nullptr, 0, &decoded_len, input, codec_header.size());
-    if (decoded_len == 0 || decoded_len > INBOUND_MAX_MESSAGE_BYTES) {
-        SS_LOGW(TAG, "FLAC codec header of %zu bytes is out of range", decoded_len);
-        return false;
-    }
-    void* item = ring->acquire_local(decoded_len, INBOUND_ACQUIRE_TIMEOUT_MS);
-    if (item == nullptr) {
-        return false;
-    }
-    size_t written = 0;
-    const int ret = platform_base64_decode(inbound_item_bytes(item), decoded_len, &written, input,
-                                           codec_header.size());
-    if (ret != 0) {
-        SS_LOGW(TAG, "base64 decode failed: %d", ret);
-        written = 0;
-    }
-    ring->complete(item);
-    if (written == 0) {
-        // Completed regardless (every acquired item must be), and handed back unused.
-        ring->return_item(item);
-        return false;
-    }
-    // Exempt, like every codec header.
-    return inbound.hand(item, decoded_len,
-                        {.data_len = static_cast<uint32_t>(written),
-                         .serial = ordinal,
-                         .type = CHUNK_TYPE_FLAC_HEADER,
-                         .data_offset = 0},
-                        generation, /*exempt=*/true);
-}
 
 void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation,
                                             uint16_t ordinal) const {

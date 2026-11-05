@@ -99,11 +99,10 @@ The stream parameters negotiated by the server are available via `get_current_st
 | `sample_rate` | `std::optional<uint32_t>` | Sample rate in Hz |
 | `channels` | `std::optional<uint8_t>` | Number of channels |
 | `bit_depth` | `std::optional<uint8_t>` | Bits per sample |
-| `codec_header` | `std::optional<std::string>` | Codec-specific header data |
 
 Call `is_complete()` on the object to check that `codec`, `sample_rate`, `channels`, and
-`bit_depth` all have values. `codec_header` is not part of that check, so it can still be
-`nullopt` when `is_complete()` returns true.
+`bit_depth` all have values. A FLAC stream's codec header goes to the decoder and is not
+part of the object.
 
 ### Controller Role (Playback Commands)
 
