@@ -366,8 +366,8 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
                                generation);
 }
 
-void PlayerRole::Impl::handle_stream_start(PlayerStreamPayload&& player) {
-    ServerPlayerStreamObject& player_obj = player.params;
+void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {
+    ServerPlayerStreamObject player_obj = player.params;
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
     // Numbers the codec header and the STREAM_START, so the sync task starts the stream only on
@@ -438,7 +438,7 @@ void PlayerRole::Impl::handle_stream_start(PlayerStreamPayload&& player) {
     // high_performance_requested_for_playback main-thread-only. Both carry `generation`, so a
     // teardown that runs before the drain takes them leaves a START the drain discards and params
     // it never applies (see drain_events()).
-    this->event_state->stream_params_slot.write(std::move(player_obj), generation);
+    this->event_state->stream_params_slot.write(ServerPlayerStreamObject{player_obj}, generation);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation, ordinal);
 }
 
@@ -625,7 +625,7 @@ void PlayerRole::Impl::drain_events() {
                     uint32_t params_stamp = 0;
                     if (this->event_state->stream_params_slot.take(stream_params, params_stamp)) {
                         if (params_stamp == generation) {
-                            this->current_stream_params = std::move(stream_params);
+                            this->current_stream_params = stream_params;
                         } else {
                             SS_LOGD(TAG, "Dropping stream params queued before the role was torn "
                                          "down");

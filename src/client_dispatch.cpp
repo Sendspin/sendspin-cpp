@@ -427,7 +427,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             // The parser fills only the sections in `take`.
 #ifdef SENDSPIN_ENABLE_PLAYER
             if (stream_msg.player.has_value()) {
-                this->player_->impl_->handle_stream_start(std::move(stream_msg.player.value()));
+                this->player_->impl_->handle_stream_start(stream_msg.player.value());
             }
 #endif
 
