@@ -32,9 +32,10 @@ class SendspinClient;
 // Visualizer types
 // ============================================================================
 
-/// @brief Visualizer stream parameters sent by the server in stream/start messages
+/// @brief A visualizer stream/start as admitted: what the client will receive, which leaves out
+/// what the server sent beyond the request
 struct ServerVisualizerStreamObject {
-    /// @brief Data types the server will stream, each once, in enumerator order
+    /// @brief Data types the client will receive, each once, in enumerator order
     std::vector<VisualizerDataType> types{};
     /// @brief Periodic frames per second the server will emit
     uint16_t rate_max{};
@@ -83,7 +84,8 @@ public:
     /// @param strength Onset strength 0-255 for scaling flash intensity
     virtual void on_peak(int64_t /*client_timestamp*/, uint8_t /*strength*/) {}
 
-    /// @brief Called when a visualizer stream starts or its configuration changes
+    /// @brief Called when a visualizer stream starts or its configuration changes, with the
+    /// stream as admitted: types the client did not request, or a mismatched spectrum, left out
     virtual void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) {}
 
     /// @brief Called when a visualizer stream ends

@@ -432,19 +432,41 @@ public:
 /// Closes the open window in on_stream_start() when asked to. The main loop calls it before it
 /// signals the sync task to start the stream, and the sync task decodes nothing before that
 /// signal, so the window holds the protocol task's and the main loop's work on a stream/start and
-/// none of the sync task's.
+/// none of the sync task's. Asked instead to measure the sync task, it opens a window there and
+/// closes it on the stream's first on_audio_write(), the priming silence the sync task writes once
+/// it has processed the codec header.
 class WindowClosingPlayerListener : public CountingPlayerListener {
 public:
+    size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
+        if (this->close_on_audio_write.exchange(false)) {
+            this->sync_window = close_window();
+            this->sync_window_closed.store(true);
+        }
+        return CountingPlayerListener::on_audio_write(data, length, timeout_ms);
+    }
+
     void on_stream_start() override {
         CountingPlayerListener::on_stream_start();
         if (this->close_on_start) {
             this->close_on_start = false;
             this->window = close_window();
         }
+        if (this->open_on_start) {
+            this->open_on_start = false;
+            open_window();
+            this->close_on_audio_write.store(true);
+        }
     }
 
     bool close_on_start{false};
+    bool open_on_start{false};
     Window window;
+    /// Written on the sync task, then published by sync_window_closed.
+    Window sync_window;
+    std::atomic<bool> sync_window_closed{false};
+
+private:
+    std::atomic<bool> close_on_audio_write{false};
 };
 
 void expect_library_allocations(const Window& window, const char* title, size_t expected) {
@@ -506,6 +528,7 @@ constexpr size_t TIME_BURST_ALLOCATIONS = 0;
 constexpr size_t CONTROLLER_STATE_ALLOCATIONS = 0;
 constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 0;
 constexpr size_t PLAYER_FLAC_STREAM_START_ALLOCATIONS = 0;
+constexpr size_t SYNC_TASK_FIRST_FLAC_HEADER_ALLOCATIONS = 0;
 constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 
 // One paired connection with a player, a controller, metadata, two artwork channels, a visualizer
@@ -514,8 +537,9 @@ constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 // the fake server's connect through admission and the first client/state, then one client/state
 // publish, then one full burst of client/time and server/time exchanges, then the first
 // controller server/state, then an artwork and visualizer stream/start and a stream/end and a
-// stream/clear that name their roles, then a FLAC stream/start the player takes, then a
-// stream/start whose player section the connection, no longer owning the player, does not take.
+// stream/clear that name their roles, then the sync task's first FLAC codec header, then a FLAC
+// stream/start the player takes, then a stream/start whose player section the connection, no
+// longer owning the player, does not take.
 // The roles' public command and type lists are reserved when the roles are built, so even the
 // first fill on the main loop allocates nothing.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
@@ -646,22 +670,30 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
         R"("codec_header":"ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA"}}})";
     constexpr const char* PLAYER_STREAM_END =
         R"({"type":"stream/end","payload":{"roles":["player"]}})";
-    const auto play_flac_stream = [&](bool measured) {
+    enum class Measure { STREAM_START, SYNC_TASK_HEADER };
+    const auto play_flac_stream = [&](Measure measure) {
         const int starts_before = player_listener.stream_starts;
         const int ends_before = player_listener.stream_ends;
-        if (measured) {
+        if (measure == Measure::STREAM_START) {
             player_listener.close_on_start = true;
             open_window();
+        } else {
+            player_listener.open_on_start = true;
         }
         {
             TestOwned test_owned;
             ASSERT_TRUE(server->send_app_json(FLAC_STREAM_START));
         }
         pump_while_not(client, [&] { return player_listener.stream_starts > starts_before; });
-        if (measured) {
+        if (measure == Measure::STREAM_START) {
             expect_library_allocations(player_listener.window,
                                        "FLAC stream/start the player takes",
                                        PLAYER_FLAC_STREAM_START_ALLOCATIONS);
+        } else {
+            pump_while_not(client, [&] { return player_listener.sync_window_closed.load(); });
+            expect_library_allocations(player_listener.sync_window,
+                                       "the sync task's first FLAC codec header",
+                                       SYNC_TASK_FIRST_FLAC_HEADER_ALLOCATIONS);
         }
         {
             TestOwned test_owned;
@@ -669,11 +701,12 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
         }
         pump_while_not(client, [&] { return player_listener.stream_ends > ends_before; });
     };
-    // The first, outside any window, grows the main loop's held stream event list, which keeps
-    // its capacity for later streams.
-    play_flac_stream(false);
+    // The first grows the main loop's held stream event list, which keeps its capacity for later
+    // streams, outside its window: that opens as the main loop reports the stream started and
+    // holds the sync task's first codec header, which sets up the decode buffer and FLAC decoder.
+    play_flac_stream(Measure::SYNC_TASK_HEADER);
     // The second closes as the main loop reports the stream started.
-    play_flac_stream(true);
+    play_flac_stream(Measure::STREAM_START);
 
     // An activation that leaves the player out takes the role from the connection, outside any
     // window. The window holds a FLAC stream/start whose player section a parse would validate
@@ -768,6 +801,84 @@ TEST(Allocations, ConnectToThroughAdmission) {
     pump_while_not(client, [&] { return client.is_connected(); });
     expect_library_allocations(close_window(), "connect_to() through admission",
                                OUTBOUND_ADMISSION_ALLOCATIONS);
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+constexpr uint16_t SPECTRUM_TEST_PORT = 19306;
+
+constexpr size_t FIRST_SPECTRUM_FRAME_ALLOCATIONS = 0;
+
+/// Closes the open window in the first on_spectrum(), on the visualizer's drain thread, and keeps
+/// how many bins that frame carried.
+class WindowClosingSpectrumListener : public VisualizerRoleListener {
+public:
+    void on_spectrum(int64_t /*client_timestamp*/, const std::vector<uint16_t>& bins) override {
+        if (!this->window_closed.load()) {
+            this->window = close_window();
+            this->delivered_bins = bins.size();
+            this->window_closed.store(true);
+        }
+    }
+    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) override {
+        ++this->stream_starts;
+    }
+
+    /// Written on the drain thread, then published by window_closed.
+    Window window;
+    size_t delivered_bins{0};
+    std::atomic<bool> window_closed{false};
+    /// Main loop (the test thread) only.
+    int stream_starts{0};
+};
+
+// A four-bin spectrum stream's first frame, from the server's send through on_spectrum() on the
+// drain thread, which delivers it in the bins the role reserved at start(). Frames are sent until
+// one is delivered, each stamped ahead of now so a slow host only takes longer.
+TEST(Allocations, FirstSpectrumFrame) {
+    SendspinClientConfig config;
+    config.name = "Allocation Test Spectrum Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.server_port = SPECTRUM_TEST_PORT;
+    config.time_burst_interval_ms = 100;  // Sync promptly: the drain thread needs client time
+    WindowClosingSpectrumListener listener;  // Outlives the client
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    VisualizerRoleConfig visualizer = make_visualizer_config();
+    visualizer.stream.types = {VisualizerDataType::SPECTRUM};
+    visualizer.stream.spectrum = VisualizerSpectrumConfig{
+        .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
+    client.add_visualizer(std::move(visualizer)).set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    std::unique_ptr<FakeEncryptedServer> server =
+        connect_paired_server(bundle.peer, SPECTRUM_TEST_PORT, options);
+    pump_while_not(client, [&] { return client.is_time_synced(); });
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],"rate_max":30,)"
+        R"("spectrum":{"n_disp_bins":4,"scale":"mel","f_min":40,"f_max":16000}}}})"));
+    pump_while_not(client, [&] { return listener.stream_starts > 0; });
+
+    const std::string four_bins("\x00\x0A\x00\x14\x00\x1E\x00\x28", 8);
+    constexpr int64_t LEAD_US = 50 * 1000;
+    open_window();
+    while (!listener.window_closed.load()) {
+        {
+            TestOwned test_owned;
+            ASSERT_TRUE(server->send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+                                            platform_time_us() + LEAD_US, four_bins));
+        }
+        for (int i = 0; i < 20 && !listener.window_closed.load(); ++i) {
+            client.loop();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    expect_library_allocations(listener.window, "the first spectrum frame",
+                               FIRST_SPECTRUM_FRAME_ALLOCATIONS);
+    EXPECT_EQ(listener.delivered_bins, 4U);
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

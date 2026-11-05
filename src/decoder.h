@@ -26,8 +26,6 @@
 #include <opus.h>
 #endif
 
-#include <memory>
-
 namespace sendspin {
 
 /// @brief Longest audio chunk a server may send (roles/player/v1.md "Server Audio Send
@@ -71,9 +69,10 @@ static constexpr uint8_t OPUS_DECODED_BITS_PER_SAMPLE = 16U;
  */
 class SendspinDecoder {
 public:
-    ~SendspinDecoder() {
-        this->reset_decoders();
-    }
+    SendspinDecoder() = default;
+    ~SendspinDecoder();
+    SendspinDecoder(const SendspinDecoder&) = delete;
+    SendspinDecoder& operator=(const SendspinDecoder&) = delete;
 
     /// @brief Resets the state of the FLAC and Opus decoders; the FLAC decoder object is kept for
     /// the next FLAC stream, so call it before each stream's process_header()
@@ -128,14 +127,19 @@ protected:
     /// @return True if the header was valid and stream_info was populated, false otherwise.
     bool decode_dummy_header(const uint8_t* data, size_t data_size, AudioStreamInfo* stream_info);
 
+    /// @brief The FLAC decoder constructed in flac_decoder_buf_, or nullptr before the first FLAC
+    /// header
+    micro_flac::FLACDecoder* flac_decoder() {
+        return this->flac_decoder_buf_ ? this->flac_decoder_buf_.as<micro_flac::FLACDecoder>()
+                                       : nullptr;
+    }
+
     // Struct fields
     AudioStreamInfo current_stream_info_;
+    PlatformBuffer flac_decoder_buf_;  // Holds the FLACDecoder object while allocated
 #ifdef SENDSPIN_ENABLE_OPUS
     PlatformBuffer opus_decoder_buf_;
 #endif
-
-    // Pointer fields
-    std::unique_ptr<micro_flac::FLACDecoder> flac_decoder_;
 
     // size_t fields
     size_t decode_buffer_size_{0};

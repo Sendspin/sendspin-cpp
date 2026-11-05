@@ -194,6 +194,10 @@ bool VisualizerRole::Impl::start(InboundRing* ring) {
     // So a restart inherits no command from the previous run.
     this->drain_task->inbound.items().clear_signals();
 
+    // Reserved here rather than as the first spectrum frame arrives, where operator new would
+    // abort on failure; a consumer that requests no spectrum reserves nothing.
+    this->drain_task->spectrum_bins.reserve(this->configured_spectrum_bins());
+
     platform_configure_thread("SsVis", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
     this->drain_task->drain_thread = std::thread(drain_thread_func, this);
@@ -315,44 +319,65 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
 
 void VisualizerRole::Impl::handle_stream_start(const VisualizerStreamPayload& stream) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
-    // Cache stream config for handle_binary (same thread) and the drain thread
+    // Cache stream config for handle_binary (same thread) and the drain thread.
+    // roles/visualizer/v1.md "Server -> Client: stream/start": `types` "MUST be a subset of the
+    // types the client requested", and the spectrum object "MUST match the client's current
+    // requested configuration". A served type outside the request is dropped, and so is spectrum
+    // with no object or one that does not match; the rest of the stream flows.
+    const auto type_bit = [](VisualizerDataType type) -> uint8_t {
+        return static_cast<uint8_t>(1U << (wire_type_for(type) - SENDSPIN_BINARY_VISUALIZER_FIRST));
+    };
+    uint8_t requested_mask = 0;
+    for (const VisualizerDataType type : this->config.stream.types) {
+        requested_mask |= type_bit(type);
+    }
+    uint8_t served_mask = 0;
+    stream.types.for_each([&](VisualizerDataType type) { served_mask |= type_bit(type); });
+    uint8_t types_mask = served_mask & requested_mask;
+
     uint8_t bin_count = 0;
-    uint8_t types_mask = 0;
-    const bool has_spectrum = stream.types.contains(VisualizerDataType::SPECTRUM);
-    stream.types.for_each([&types_mask](VisualizerDataType type) {
-        types_mask |= 1U << (wire_type_for(type) - SENDSPIN_BINARY_VISUALIZER_FIRST);
-    });
-    if (has_spectrum) {
-        // roles/visualizer/v1.md "Server -> Client: stream/start": the spectrum object is sent
-        // "only if `types` includes 'spectrum'" and MUST match the requested configuration. The
-        // object is reported to the listener as the server sent it, so a mismatch is logged, not
-        // rejected.
+    const uint8_t spectrum_bit = type_bit(VisualizerDataType::SPECTRUM);
+    if ((types_mask & spectrum_bit) != 0) {
         const std::optional<VisualizerSpectrumConfig>& requested = this->config.stream.spectrum;
-        if (!stream.spectrum.has_value()) {
-            SS_LOGW(TAG, "Visualizer stream/start requests the spectrum type with no spectrum "
-                         "object; spectrum frames will be dropped");
-        } else if (requested.has_value()) {
-            const VisualizerSpectrumConfig& srv = stream.spectrum.value();
-            if (srv.n_disp_bins != requested->n_disp_bins) {
-                SS_LOGW(TAG, "Spectrum bin count mismatch: server %" PRIu8 ", expected %" PRIu8,
-                        srv.n_disp_bins, requested->n_disp_bins);
-            }
-            if (srv.scale != requested->scale) {
-                SS_LOGW(TAG, "Spectrum scale mismatch");
-            }
-            if (srv.f_min != requested->f_min || srv.f_max != requested->f_max) {
-                SS_LOGW(TAG,
-                        "Spectrum frequency range mismatch: server %" PRIu16 "-%" PRIu16
-                        ", expected %" PRIu16 "-%" PRIu16,
-                        srv.f_min, srv.f_max, requested->f_min, requested->f_max);
-            }
+        // Fewer bins than requested match: "Servers MAY impose an implementation-defined upper
+        // bound on n_disp_bins". More would also outgrow the bins start() reserved.
+        if (stream.spectrum.has_value() && requested.has_value() &&
+            stream.spectrum->n_disp_bins <= this->configured_spectrum_bins() &&
+            stream.spectrum->scale == requested->scale &&
+            stream.spectrum->f_min == requested->f_min &&
+            stream.spectrum->f_max == requested->f_max) {
+            bin_count = stream.spectrum->n_disp_bins;
+        } else {
+            types_mask &= static_cast<uint8_t>(~spectrum_bit);
         }
     }
-    if (has_spectrum && stream.spectrum.has_value()) {
-        bin_count = stream.spectrum->n_disp_bins;
+
+    // The main loop reports the admitted stream: only the types kept, and the spectrum object
+    // only while spectrum is.
+    VisualizerStreamPayload admitted = stream;
+    admitted.types = {};
+    stream.types.for_each([&](VisualizerDataType type) {
+        if ((types_mask & type_bit(type)) != 0) {
+            admitted.types.insert(type);
+        }
+    });
+    if ((types_mask & spectrum_bit) == 0) {
+        admitted.spectrum.reset();
+    }
+    // tracks_downbeats describes beat frames, so it goes with them
+    if ((types_mask & type_bit(VisualizerDataType::BEAT)) == 0) {
+        admitted.tracks_downbeats = false;
+    }
+    if (served_mask != types_mask) {
+        SS_LOGW(TAG,
+                "Visualizer stream/start breaks roles/visualizer/v1.md (types MUST be a subset of "
+                "the request, spectrum MUST match it); dropping types mask 0x%02x (bit N: wire "
+                "type %u + N)",
+                static_cast<unsigned>(served_mask & ~types_mask),
+                static_cast<unsigned>(SENDSPIN_BINARY_VISUALIZER_FIRST));
     }
     this->spectrum_bin_count = bin_count;
-    this->tracks_downbeats = stream.tracks_downbeats;
+    this->tracks_downbeats = admitted.tracks_downbeats;
     this->negotiated_types_mask = types_mask;
     this->stream_active = true;
 
@@ -363,7 +388,7 @@ void VisualizerRole::Impl::handle_stream_start(const VisualizerStreamPayload& st
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
     // guaranteed to observe this config (see config_slot.take() in handle_stream_ring_event()).
     // Both carry `generation`, so a config left over from a torn-down stream is never applied.
-    this->event_state->config_slot.write(VisualizerStreamPayload{stream}, generation);
+    this->event_state->config_slot.write(VisualizerStreamPayload{admitted}, generation);
     this->enqueue_stream_event(VisualizerEventType::STREAM_START, generation);
 }
 
@@ -556,6 +581,16 @@ void VisualizerRole::Impl::signal_boundary() {
     }
 }
 
+uint8_t VisualizerRole::Impl::configured_spectrum_bins() const {
+    const VisualizerStreamConfig& stream = this->config.stream;
+    if (!stream.spectrum.has_value() ||
+        std::find(stream.types.begin(), stream.types.end(), VisualizerDataType::SPECTRUM) ==
+            stream.types.end()) {
+        return 0;
+    }
+    return stream.spectrum->n_disp_bins;
+}
+
 bool VisualizerRole::Impl::is_stale(void* item) const {
     return inbound_item_header(item)->serial !=
            this->boundary_sequence.load(std::memory_order_acquire);
@@ -569,9 +604,9 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     InboundItemList& items = self->drain_task->inbound.items();
     const int32_t offset_ms = self->config.display_offset_ms;
 
-    // Reused across iterations to avoid a heap alloc/free per frame. The vector's capacity
-    // grows to the largest bin count seen and is resized (not reallocated) after that.
-    std::vector<uint16_t> spectrum_bins;
+    // Resized within the capacity start() reserved: handle_stream_start() admits spectrum only
+    // within it.
+    std::vector<uint16_t>& spectrum_bins = self->drain_task->spectrum_bins;
 
     // Returns the ring item exactly once: a skip leaves it to the destructor, and delivery
     // releases it before the listener callback so a slow callback never holds ring space.

@@ -1112,11 +1112,11 @@ TEST(PlayerHardSync, AfterAnUnderrunTheGapIsMeasuredFromNow) {
     context.current_stream_info = AudioStreamInfo(16, 2, 44100);
     context.bytes_per_frame = context.current_stream_info.frames_to_bytes(1);
     const size_t chunk_bytes = context.current_stream_info.frames_to_bytes(CHUNK_FRAMES);
-    context.decode_buffer = TransferBuffer::create(chunk_bytes + context.bytes_per_frame,
-                                                   MemoryLocation::PREFER_INTERNAL);
-    context.decode_buffer->set_listener(&sink);
-    std::memset(context.decode_buffer->get_buffer_end(), CHUNK_SAMPLE, chunk_bytes);
-    context.decode_buffer->increase_buffer_length(chunk_bytes);
+    ASSERT_TRUE(context.decode_buffer.allocate(chunk_bytes + context.bytes_per_frame,
+                                               MemoryLocation::PREFER_INTERNAL));
+    context.decode_buffer.set_listener(&sink);
+    std::memset(context.decode_buffer.get_buffer_end(), CHUNK_SAMPLE, chunk_bytes);
+    context.decode_buffer.increase_buffer_length(chunk_bytes);
     const int64_t now = platform_time_us();
     context.new_audio_client_playtime = now - 20'000'000;
     context.decoded_timestamp = now + 1'000'000;

@@ -23,7 +23,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 
 namespace sendspin {
 
@@ -35,32 +34,46 @@ class PlayerRoleListener;
  *
  * Manages a flat byte array with read/write cursors for audio data transfer. Data is written at
  * get_buffer_end() and read from get_buffer_start(). Supports dynamic reallocation and flushing
- * accumulated data to a PlayerRoleListener sink.
+ * accumulated data to a PlayerRoleListener sink. Held by value: only the backing array comes from
+ * the platform heap, so an owner can allocate it on first use and turn a failure into a refusal.
  *
  * Usage:
- *   1. Call create() to allocate the backing buffer.
+ *   1. Call allocate() to allocate the backing buffer.
  *   2. Call set_listener() to register the audio sink.
  *   3. Write decoded audio to the buffer via the internal methods.
  *   4. Call transfer_data_to_sink() to flush buffered data to the listener.
  *
  * @code
- * auto buf = TransferBuffer::create(4096, MemoryLocation::PREFER_EXTERNAL);
- * buf->set_listener(&my_player_listener);
- * // ... write decoded audio into buf->get_buffer_end() ...
- * buf->increase_buffer_length(bytes_written);
- * buf->transfer_data_to_sink(100);
+ * TransferBuffer buf;
+ * if (!buf.allocate(4096, MemoryLocation::PREFER_EXTERNAL)) {
+ *     return false;
+ * }
+ * buf.set_listener(&my_player_listener);
+ * // ... write decoded audio into buf.get_buffer_end() ...
+ * buf.increase_buffer_length(bytes_written);
+ * buf.transfer_data_to_sink(100);
  * @endcode
  */
 class TransferBuffer {
 public:
+    TransferBuffer() = default;
     ~TransferBuffer();
 
-    /// @brief Creates a new transfer buffer.
+    /// @brief Allocates the backing buffer, freeing any held one, and empties the buffer.
     /// @param buffer_size Size of the buffer in bytes.
     /// @param location Memory placement preference for the backing allocation. Subsequent
     /// reallocate() calls reuse this preference.
-    /// @return unique_ptr if successfully allocated, nullptr otherwise.
-    static std::unique_ptr<TransferBuffer> create(size_t buffer_size, MemoryLocation location);
+    /// @return True if allocation succeeded, false otherwise (the buffer is left unallocated).
+    bool allocate(size_t buffer_size, MemoryLocation location);
+
+    /// @brief Releases the backing buffer and resets all tracking state.
+    void deallocate();
+
+    /// @brief Whether a backing buffer is held.
+    /// @return True after a successful allocate() until deallocate().
+    bool is_allocated() const {
+        return static_cast<bool>(this->buffer_);
+    }
 
     /// @brief Writes buffered data to the sink.
     /// @param timeout_ms Milliseconds to block while waiting for the sink (UINT32_MAX = wait
@@ -116,14 +129,6 @@ public:
     bool reallocate(size_t new_buffer_size);
 
 protected:
-    TransferBuffer() = default;
-
-    /// @brief Allocates the backing buffer and resets tracking state.
-    /// @return True if allocation succeeded, false otherwise.
-    bool allocate_buffer(size_t buffer_size, MemoryLocation location);
-    /// @brief Releases the backing buffer and resets all tracking state.
-    void deallocate_buffer();
-
     // Struct fields
     PlatformBuffer buffer_;
 
