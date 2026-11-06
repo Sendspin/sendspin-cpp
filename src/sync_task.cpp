@@ -661,7 +661,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
         sync_context.last_chunk_duration_us =
             sync_context.current_stream_info.frames_to_microseconds(
                 sync_context.current_stream_info.bytes_to_frames(
-                    sync_context.decode_buffer->available()));
+                    sync_context.decode_buffer.available()));
     }
 
     // Return the encoded item to the ring
