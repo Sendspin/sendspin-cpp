@@ -1082,6 +1082,46 @@ TEST(PlayerHardSync, AStarvedEstimateIsFlooredAtNow) {
     }
 }
 
+// A chunk is discarded undecoded only when it is later than its own length, predicted from the
+// previous chunk of the stream. Below that bar handle_synchronize_audio() drops only the late
+// prefix and plays the rest, so a few milliseconds of lateness must not cost the whole chunk;
+// above it, every decoded frame would be dropped, so the decode must not be spent at all. Until
+// one chunk of the stream has decoded there is no prediction, and the longest a chunk may be
+// stands in.
+TEST(PlayerHardSync, OnlyAChunkLaterThanItsOwnLengthIsSkipped) {
+    constexpr int64_t PLAYTIME = 1'000'000'000;
+    constexpr int64_t TYPICAL_CHUNK_US = 25'000;
+    constexpr int64_t NO_ESTIMATE = 0;  // No chunk of the stream has decoded yet
+    struct Row {
+        const char* name;
+        int64_t client_timestamp;
+        int64_t expected_duration_us;
+        bool expected;
+    };
+    const Row rows[] = {
+        {"Control: due after the estimate", PLAYTIME + 50'000, TYPICAL_CHUNK_US, false},
+        {"Control: due exactly at the estimate", PLAYTIME, TYPICAL_CHUNK_US, false},
+        {"behind by the hard-sync threshold", PLAYTIME - 5'000, TYPICAL_CHUNK_US, false},
+        {"behind by just under its own length", PLAYTIME - 24'000, TYPICAL_CHUNK_US, false},
+        {"behind by exactly its own length", PLAYTIME - 25'000, TYPICAL_CHUNK_US, false},
+        {"behind by just over its own length", PLAYTIME - 26'000, TYPICAL_CHUNK_US, true},
+        {"behind by a long underrun", PLAYTIME - 20'000'000, TYPICAL_CHUNK_US, true},
+        {"No estimate yet: behind by more than a typical chunk", PLAYTIME - 100'000, NO_ESTIMATE,
+         false},
+        {"No estimate yet: behind by exactly the longest chunk", PLAYTIME - 150'000, NO_ESTIMATE,
+         false},
+        {"No estimate yet: behind by just over the longest chunk", PLAYTIME - 150'001, NO_ESTIMATE,
+         true},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(SyncTask::chunk_is_unplayably_late(row.client_timestamp,
+                                                     row.expected_duration_us, PLAYTIME),
+                  row.expected);
+    }
+}
+
 namespace {
 
 // A sink that accepts every write and records the bytes in order.
