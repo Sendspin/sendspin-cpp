@@ -40,13 +40,6 @@ static constexpr int64_t HARD_SYNC_SETTLE_THRESHOLD_US =
     500;  // Tighter threshold used while settling after a hard sync
 static constexpr int64_t SOFT_SYNC_THRESHOLD_US = 100;
 
-/// @brief How far behind the playtime estimate a chunk must fall before decoding it is pointless.
-/// Distinct from HARD_SYNC_THRESHOLD_US, which only says that an error is too large to correct
-/// gradually: a chunk that is merely a few milliseconds late still has a playable remainder, and
-/// handle_synchronize_audio() drops just its late prefix. Only a chunk later than the longest
-/// audio a chunk can decode to is certain to lose every frame that way, so that is the bar.
-static constexpr int64_t LATE_CHUNK_SKIP_US = static_cast<int64_t>(MAX_AUDIO_CHUNK_MS) * US_PER_MS;
-
 static constexpr size_t SYNC_TASK_STACK_SIZE = 6192;  // Opus uses more stack than FLAC
 
 /// @brief Wait time (ms) between retries when time sync is not yet available
@@ -325,10 +318,11 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
                 silence_frames, raw_error);
     } else if (raw_error < -active_threshold) {
         // Chunk should have started playing already - drop only the late prefix from the front of
-        // the buffer and play the remainder. By the time we get here, silence has already been
-        // inserted to fill the gap (one audible discontinuity); a partial drop keeps the
-        // follow-up disturbance smaller than discarding the whole chunk would. Any sub-threshold
-        // residual is left for the next chunk's soft sync to absorb.
+        // the buffer and play the remainder. Usually the chunk is a few milliseconds late and
+        // nothing was inserted ahead of it; after an underrun, silence has already filled the gap
+        // (one audible discontinuity). Either way a partial drop keeps the disturbance smaller
+        // than discarding the whole chunk would. Any sub-threshold residual is left for the next
+        // chunk's soft sync to absorb.
         sync_context.hard_syncing = true;
 
         uint32_t late_frames = static_cast<uint32_t>(
@@ -404,8 +398,12 @@ int64_t SyncTask::starved_playtime_floor(int64_t playtime_us, int64_t now_us) {
     return playtime_us;
 }
 
-bool SyncTask::chunk_is_unplayably_late(int64_t client_timestamp, int64_t playtime_us) {
-    return client_timestamp < playtime_us - LATE_CHUNK_SKIP_US;
+bool SyncTask::chunk_is_unplayably_late(int64_t client_timestamp, int64_t expected_duration_us,
+                                        int64_t playtime_us) {
+    const int64_t duration_us = expected_duration_us > 0
+                                    ? expected_duration_us
+                                    : static_cast<int64_t>(MAX_AUDIO_CHUNK_MS) * US_PER_MS;
+    return client_timestamp + duration_us < playtime_us;
 }
 
 void SyncTask::send_pending_silence(SyncContext& sync_context) {
@@ -645,8 +643,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             static_cast<int64_t>(this->player_impl_->get_effective_output_delay_ms()) * US_PER_MS -
             this->player_impl_->config.fixed_delay_us;
 
-        if (chunk_is_unplayably_late(client_timestamp, sync_context.new_audio_client_playtime)) {
-            // Later than any chunk is long: every decoded frame would be dropped, so skip it
+        if (chunk_is_unplayably_late(client_timestamp, sync_context.last_chunk_duration_us,
+                                     sync_context.new_audio_client_playtime)) {
             this->inbound_.return_item(sync_context.encoded_item);
             sync_context.encoded_item = nullptr;
             return DecodeResult::SKIPPED;
@@ -659,6 +657,12 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             return decoded;
         }
         sync_context.decoded_timestamp = client_timestamp;
+        // The buffer was empty on entry, so this is exactly this chunk's output, already capped at
+        // MAX_AUDIO_CHUNK_MS by decode_whole_chunk().
+        sync_context.last_chunk_duration_us =
+            sync_context.current_stream_info.frames_to_microseconds(
+                sync_context.current_stream_info.bytes_to_frames(
+                    sync_context.decode_buffer->available()));
     }
 
     // Return the encoded item to the ring
@@ -875,6 +879,7 @@ void SyncTask::reset_context(SyncContext& sync_context) {
     sync_context.encoded_item = nullptr;
     sync_context.decoded_timestamp = 0;
     sync_context.new_audio_client_playtime = 0;
+    sync_context.last_chunk_duration_us = 0;
     sync_context.buffered_frames = 0;
     sync_context.current_stream_info = AudioStreamInfo{};
     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
