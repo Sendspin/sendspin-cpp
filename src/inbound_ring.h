@@ -720,24 +720,6 @@ public:
         this->ring()->return_item(item);
     }
 
-    /// @brief Fills `item`'s consumer fields, stamps it with `generation`, charges it to the
-    /// holder's quota and appends it. Over quota the item is returned to the ring with a
-    /// throttled warning: the server overran the buffer_capacity the role advertises, which the
-    /// quota covers at the role's smallest message. Protocol task, inside a run. Called directly
-    /// only for an item the caller acquired itself (a FLAC codec header decoded into its item).
-    /// @param item_len The item's message length (InboundMessage::item_len, or the length the
-    ///        item was acquired for).
-    /// @param exempt Hands the item over without charging the quota: a codec header, an artwork
-    ///        announce or a stream boundary marker the protocol task writes itself, one per
-    ///        stream/start, stream/clear or image, so refusing it would end or blur a stream over
-    ///        a quota the server's data overran. Under ring-order reclamation a clear pins both its
-    ///        JSON item and its marker until the consumer returns the marker; that is no more than
-    ///        a JSON flood from an authenticated server already holds, inside the pass-through
-    ///        budget derive_inbound_ring_bytes() holds.
-    /// @return false when the item was returned instead of handed over.
-    bool hand(void* item, size_t item_len, InboundItemFields fields, uint32_t generation,
-              bool exempt);
-
     /// @brief Hands a received message over, charged to the quota: its ring item in place
     /// (clearing message.item), or else a LOCAL copy of the whole message keeping its receive
     /// stamp. The copy does not wait; a message with no ring space, or longer than the ring's
@@ -780,6 +762,23 @@ public:
     void note_drop(DropReason reason);
 
 private:
+    /// @brief Fills `item`'s consumer fields, stamps it with `generation`, charges it to the
+    /// holder's quota and appends it. Over quota the item is returned to the ring with a
+    /// throttled warning: the server overran the buffer_capacity the role advertises, which the
+    /// quota covers at the role's smallest message. Protocol task, inside a run.
+    /// @param item_len The item's message length (InboundMessage::item_len, or the length the
+    ///        item was acquired for).
+    /// @param exempt Hands the item over without charging the quota: a codec header, an artwork
+    ///        announce or a stream boundary marker the protocol task writes itself, one per
+    ///        stream/start, stream/clear or image, so refusing it would end or blur a stream over
+    ///        a quota the server's data overran. Under ring-order reclamation a clear pins both its
+    ///        JSON item and its marker until the consumer returns the marker; that is no more than
+    ///        a JSON flood from an authenticated server already holds, inside the pass-through
+    ///        budget derive_inbound_ring_bytes() holds.
+    /// @return false when the item was returned instead of handed over.
+    bool hand(void* item, size_t item_len, InboundItemFields fields, uint32_t generation,
+              bool exempt);
+
     /// @brief Acquires a LOCAL item (InboundRing::acquire_local()), copies `len` bytes into it
     /// and completes it. Protocol task, inside a run.
     /// @return The item, ready for hand(), or nullptr when the ring had no room in time.

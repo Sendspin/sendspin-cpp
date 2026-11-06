@@ -191,6 +191,10 @@ std::unique_ptr<VisualizerRole::Impl> make_impl() {
 
     VisualizerRoleConfig config;
     config.support.buffer_capacity = 4096;
+    // Every type but spectrum, which needs a spectrum object, so a served type is not dropped as
+    // unrequested.
+    config.stream.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
+                           VisualizerDataType::F_PEAK, VisualizerDataType::PEAK};
     auto impl = std::make_unique<VisualizerRole::Impl>(std::move(config), nullptr);
     inboxes.emplace_back();
     impl->attach_inbox(inboxes.back());
@@ -370,13 +374,15 @@ TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
     EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
 }
 
-/// Counts on_visualizer_stream_start() calls.
+/// Counts on_visualizer_stream_start() calls and keeps a copy of the latest stream reported.
 class StreamStartCounter : public VisualizerRoleListener {
 public:
-    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*config*/) override {
+    void on_visualizer_stream_start(const ServerVisualizerStreamObject& stream) override {
         ++this->starts;
+        this->last = stream;
     }
     int starts{0};
+    ServerVisualizerStreamObject last;
 };
 
 // A STREAM_START applies only the config written with its own stamp: a config left in the slot by
@@ -398,10 +404,11 @@ TEST(VisualizerStreamEvents, AStreamStartAppliesOnlyTheConfigOfItsOwnGeneration)
         impl->listener = &listener;
         const uint32_t before = impl->cleanup_generation.load();
         impl->cleanup();
-        ServerVisualizerStreamObject config;
+        VisualizerStreamPayload config;
         config.types = {VisualizerDataType::BEAT};
         const uint32_t current = impl->cleanup_generation.load();
-        impl->event_state->config_slot.write(config, row.stale ? before : current);
+        impl->event_state->config_slot.write(VisualizerStreamPayload{config},
+                                             row.stale ? before : current);
 
         impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, current);
 
@@ -409,47 +416,152 @@ TEST(VisualizerStreamEvents, AStreamStartAppliesOnlyTheConfigOfItsOwnGeneration)
     }
 }
 
-// roles/visualizer/v1.md "Server -> Client: stream/start": a stream that names the spectrum type
-// without a spectrum object has no bin count, so its frames are not deliverable. No wire input
-// reaches this: parse_server_message() drops a visualizer object that advertises spectrum with no
-// valid spectrum config, so the cached count is read out of the Impl and run through the decode
-// the drain thread runs. That the served object governs the count is asserted where a consumer
-// sees it, in ClientLifecycle.TheServedSpectrumBinCountGovernsTheDeliveredFrame.
-TEST(VisualizerSpectrumWiring, TheSpectrumTypeWithNoSpectrumObjectDeliversNothing) {
+// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object" makes the types a
+// subset of the requested ones, so the stream the listener hears lists each once, in enumerator
+// order, beside every other field the parsed stream carries; a later stream's list replaces the
+// one before it.
+TEST(VisualizerStreamEvents, AStartedStreamReportsEveryFieldOfItsConfig) {
+    auto impl = make_impl();
+    StreamStartCounter listener;
+    impl->listener = &listener;
+    const uint32_t generation = impl->cleanup_generation.load();
+    const auto start = [&impl, generation](const VisualizerStreamPayload& stream) {
+        impl->event_state->config_slot.write(VisualizerStreamPayload{stream}, generation);
+        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, generation);
+    };
+    const ServerVisualizerStreamObject& heard = listener.last;
+
+    const VisualizerSpectrumConfig spectrum{
+        .n_disp_bins = 16, .scale = VisualizerSpectrumScale::LOG, .f_min = 30, .f_max = 12000};
+    start({.types = {VisualizerDataType::PEAK, VisualizerDataType::SPECTRUM,
+                     VisualizerDataType::BEAT},
+           .rate_max = 24,
+           .tracks_downbeats = true,
+           .spectrum = spectrum});
+    EXPECT_EQ(heard.types, (std::vector{VisualizerDataType::BEAT, VisualizerDataType::SPECTRUM,
+                                        VisualizerDataType::PEAK}));
+    EXPECT_EQ(heard.rate_max, 24);
+    EXPECT_TRUE(heard.tracks_downbeats);
+    ASSERT_TRUE(heard.spectrum.has_value());
+    EXPECT_EQ(heard.spectrum->n_disp_bins, 16);
+    EXPECT_EQ(heard.spectrum->scale, VisualizerSpectrumScale::LOG);
+    EXPECT_EQ(heard.spectrum->f_min, 30);
+    EXPECT_EQ(heard.spectrum->f_max, 12000);
+
+    // A later stream replaces every field, the ones it leaves at their defaults included.
+    start({.types = {VisualizerDataType::LOUDNESS}});
+    EXPECT_EQ(heard.types, std::vector{VisualizerDataType::LOUDNESS});
+    EXPECT_EQ(heard.rate_max, 0);
+    EXPECT_FALSE(heard.tracks_downbeats);
+    EXPECT_FALSE(heard.spectrum.has_value());
+}
+
+// roles/visualizer/v1.md "Server -> Client: stream/start": `types` "MUST be a subset of the types
+// the client requested", and the spectrum object "MUST match the client's current requested
+// configuration", though "Servers MAY impose an implementation-defined upper bound on
+// n_disp_bins". A served type outside the request is neither admitted nor reported to the main
+// loop, nor is spectrum served with no object, more bins, or another scale or range, while the
+// rest of the stream is. No wire input reaches the missing object:
+// process_stream_start_message() rejects a stream/start whose visualizer object advertises
+// spectrum with no valid spectrum config. That the served bin count governs the delivered frame
+// is asserted where a consumer sees it, in
+// ClientLifecycle.TheServedSpectrumBinCountGovernsTheDeliveredFrame.
+TEST(VisualizerSpectrumWiring, OnlyRequestedTypesAndAMatchingSpectrumAreAdmitted) {
+    const VisualizerSpectrumConfig four_bins{
+        .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
+    const auto with = [&four_bins](auto change) {
+        VisualizerSpectrumConfig served = four_bins;
+        change(served);
+        return served;
+    };
+    const std::vector<VisualizerDataType> spectrum_and_loudness = {VisualizerDataType::SPECTRUM,
+                                                                   VisualizerDataType::LOUDNESS};
+
     struct Row {
         const char* name;
-        bool has_object;
-        VisualizerDelivery::Kind expected_kind;
+        std::vector<VisualizerDataType> requested;
+        std::optional<VisualizerSpectrumConfig> served_spectrum;
+        VisualizerDataType handed;
+        bool expected_admitted;
+        uint8_t expected_bins;
+        bool expected_downbeats{false};
     };
-    const Row rows[] = {
-        {"Control: a stream carrying the spectrum object delivers its frames", true,
-         VisualizerDelivery::Kind::SPECTRUM},
-        {"the spectrum type with no spectrum object drops every frame", false,
-         VisualizerDelivery::Kind::NONE},
+    const std::vector<Row> rows = {
+        {"Control: spectrum matching the request is admitted", spectrum_and_loudness, four_bins,
+         VisualizerDataType::SPECTRUM, true, 4},
+        {"Control: spectrum under the requested bin count is admitted", spectrum_and_loudness,
+         with([](auto& s) { s.n_disp_bins = 3; }), VisualizerDataType::SPECTRUM, true, 3},
+        {"spectrum with no spectrum object is dropped", spectrum_and_loudness, std::nullopt,
+         VisualizerDataType::SPECTRUM, false, 0},
+        {"spectrum serving more bins than requested is dropped", spectrum_and_loudness,
+         with([](auto& s) { s.n_disp_bins = 5; }), VisualizerDataType::SPECTRUM, false, 0},
+        {"spectrum on another scale is dropped", spectrum_and_loudness,
+         with([](auto& s) { s.scale = VisualizerSpectrumScale::LOG; }),
+         VisualizerDataType::SPECTRUM, false, 0},
+        {"spectrum over another frequency range is dropped", spectrum_and_loudness,
+         with([](auto& s) { s.f_max = 8000; }), VisualizerDataType::SPECTRUM, false, 0},
+        {"Control: a requested type flows beside a dropped spectrum", spectrum_and_loudness,
+         with([](auto& s) { s.n_disp_bins = 5; }), VisualizerDataType::LOUDNESS, true, 0},
+        {"spectrum the configuration does not request is dropped", {VisualizerDataType::LOUDNESS},
+         four_bins, VisualizerDataType::SPECTRUM, false, 0},
+        {"loudness the configuration does not request is dropped", {VisualizerDataType::SPECTRUM},
+         four_bins, VisualizerDataType::LOUDNESS, false, 4},
+        {"beat the configuration does not request is dropped with its downbeats",
+         spectrum_and_loudness, four_bins, VisualizerDataType::BEAT, false, 4, false},
+        {"Control: requested beat keeps its downbeats",
+         {VisualizerDataType::SPECTRUM, VisualizerDataType::LOUDNESS, VisualizerDataType::BEAT},
+         four_bins, VisualizerDataType::BEAT, true, 4, true},
+    };
+    const auto wire_type = [](VisualizerDataType type) -> uint8_t {
+        switch (type) {
+            case VisualizerDataType::SPECTRUM:
+                return SENDSPIN_BINARY_VISUALIZER_SPECTRUM;
+            case VisualizerDataType::BEAT:
+                return SENDSPIN_BINARY_VISUALIZER_BEAT;
+            default:
+                return SENDSPIN_BINARY_VISUALIZER_LOUDNESS;
+        }
     };
 
-    // Four bins on the wire, the requested count.
-    const std::vector<uint8_t> payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E, 0x00, 0x28};
+    // A timestamp, then five bins, one more than requested.
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    for (uint16_t bin : {10, 20, 30, 40, 50}) {
+        put_be16(data, bin);
+    }
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        impl->config.stream.spectrum = VisualizerSpectrumConfig{
-            .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
+        StreamStartCounter listener;
+        impl->listener = &listener;
+        impl->config.stream.types = row.requested;
+        impl->config.stream.spectrum = four_bins;
 
-        ServerVisualizerStreamObject stream;
-        stream.types = {VisualizerDataType::SPECTRUM};
-        if (row.has_object) {
-            stream.spectrum = impl->config.stream.spectrum;
-        }
+        // The server serves all three types, tracking downbeats, whatever was requested.
+        VisualizerStreamPayload stream;
+        stream.types = {VisualizerDataType::SPECTRUM, VisualizerDataType::LOUDNESS,
+                        VisualizerDataType::BEAT};
+        stream.tracks_downbeats = true;
+        stream.spectrum = row.served_spectrum;
         impl->handle_stream_start(stream);
         take_in_ring_order(*impl->drain_task->inbound.ring());
 
-        std::vector<uint16_t> bins;
-        auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, payload.data(),
-                                             payload.size(), impl->spectrum_bin_count,
-                                             impl->tracks_downbeats, bins);
-        EXPECT_EQ(out.kind, row.expected_kind);
+        hand(*impl, wire_type(row.handed), data);
+        Entry entry;
+        EXPECT_EQ(pop_entry(*impl, entry), row.expected_admitted);
+        EXPECT_EQ(impl->spectrum_bin_count, row.expected_bins);
+
+        // The stream the main loop reports is the admitted one.
+        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START,
+                                       impl->cleanup_generation.load());
+        ASSERT_EQ(listener.starts, 1);
+        const ServerVisualizerStreamObject& heard = listener.last;
+        EXPECT_EQ(std::find(heard.types.begin(), heard.types.end(), row.handed) !=
+                      heard.types.end(),
+                  row.expected_admitted);
+        EXPECT_EQ(heard.spectrum.has_value(), row.expected_bins != 0);
+        EXPECT_EQ(heard.tracks_downbeats, row.expected_downbeats);
     }
 }
 
@@ -458,7 +570,7 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
     auto impl = make_impl();
     impl->negotiated_types_mask = 0;
 
-    ServerVisualizerStreamObject stream;
+    VisualizerStreamPayload stream;
     stream.types = {VisualizerDataType::BEAT};
     impl->handle_stream_start(stream);
     take_in_ring_order(*impl->drain_task->inbound.ring());
@@ -513,7 +625,7 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
          {0x02}},
     };
 
-    ServerVisualizerStreamObject stream;
+    VisualizerStreamPayload stream;
     stream.types = {VisualizerDataType::LOUDNESS};
     auto loudness = [](uint8_t value) {
         std::vector<uint8_t> data;
@@ -665,6 +777,7 @@ TEST(VisualizerConfigReporting, HelloAdvertisesCapacityAndStateCarriesTheStreamC
     // Control: a role that asks for no data still reports the object, so the server knows the
     // role is configured and streams nothing rather than waiting for a state that never comes.
     auto quiet = make_impl();
+    quiet->config.stream.types.clear();
     ClientStateMessage quiet_state;
     quiet->build_state_fields(quiet_state);
     ASSERT_TRUE(quiet_state.visualizer.has_value());
@@ -731,6 +844,52 @@ TEST(VisualizerStartValidation, SpecInvalidStreamConfigRefusesToStart) {
         EXPECT_EQ(impl->start(&ring), row.expected_start);
         if (row.expected_start) {
             impl->stop();
+        }
+    }
+}
+
+// The drain thread delivers spectrum frames into bins start() reserves, so a first frame never
+// allocates on it; only a configuration that requests the spectrum type pays for them.
+TEST(VisualizerStartReservation, StartReservesTheSpectrumBinsOnlyWhenSpectrumIsRequested) {
+    const VisualizerSpectrumConfig spectrum{
+        .n_disp_bins = 16,
+        .scale = VisualizerSpectrumScale::LOG,
+        .f_min = 20,
+        .f_max = 20000,
+    };
+
+    struct Row {
+        const char* name;
+        VisualizerStreamConfig stream;
+        bool reserves;
+    };
+    const std::vector<Row> rows = {
+        {"Control: the spectrum type reserves the configured bins",
+         VisualizerStreamConfig{.types = {VisualizerDataType::LOUDNESS,
+                                          VisualizerDataType::SPECTRUM},
+                                .rate_max = 25,
+                                .spectrum = spectrum},
+         true},
+        {"a spectrum object without the spectrum type reserves nothing",
+         VisualizerStreamConfig{
+             .types = {VisualizerDataType::LOUDNESS}, .rate_max = 25, .spectrum = spectrum},
+         false},
+        {"no spectrum at all reserves nothing",
+         VisualizerStreamConfig{.types = {VisualizerDataType::LOUDNESS}, .rate_max = 25}, false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundRing ring;  // outlives the role, whose drain list links it
+        create_test_ring(ring);
+        auto impl = make_impl_with_stream(row.stream);
+        ASSERT_TRUE(impl->start(&ring));
+        const size_t capacity = impl->drain_task->spectrum_bins.capacity();
+        impl->stop();
+        if (row.reserves) {
+            EXPECT_GE(capacity, spectrum.n_disp_bins);
+        } else {
+            EXPECT_EQ(capacity, 0U);
         }
     }
 }

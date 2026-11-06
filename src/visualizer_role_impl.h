@@ -19,6 +19,7 @@
 
 #include "inbound_ring.h"
 #include "inbox.h"
+#include "protocol_messages.h"
 #include "sendspin/visualizer_role.h"
 #include "teardown_tracker.h"
 
@@ -61,7 +62,8 @@ struct VisualizerDelivery {
 /// @param payload          Bytes following the entry's wire-type byte and 8-byte timestamp.
 /// @param configured_bins  Negotiated spectrum n_disp_bins (0 if SPECTRUM was not negotiated).
 /// @param tracks_downbeats Whether the active stream reports downbeats.
-/// @param spectrum_out     Scratch vector reused for SPECTRUM bins; resized to configured_bins.
+/// @param spectrum_out     Scratch vector reused for SPECTRUM bins; resized to configured_bins,
+///                         which the drain thread keeps within its capacity.
 /// @return What to deliver; Kind::None if the entry is malformed, short, or non-deliverable.
 VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* payload,
                                              size_t payload_len, uint8_t configured_bins,
@@ -101,12 +103,16 @@ struct VisualizerRole::Impl : RoleTeardown {
         /// Its item list's flags also carry the drain thread's command bits.
         InboundConsumer inbound;
         std::thread drain_thread;
+        /// The bins on_spectrum() receives, reserved by start() for configured_spectrum_bins(),
+        /// beyond which no spectrum is admitted, so the drain thread never grows it. Main loop in
+        /// start() before the thread is spawned, then the drain thread.
+        std::vector<uint16_t> spectrum_bins;
     };
 
     /// @brief Deferred event state for the visualizer stream config, delivered to the main thread
     /// via the shared Inbox
     struct EventState {
-        GenerationSlot<ServerVisualizerStreamObject> config_slot;
+        GenerationSlot<VisualizerStreamPayload> config_slot;
     };
 
     // ========================================
@@ -133,16 +139,16 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted frame; `data` points at its message type byte.
     void handle_binary(uint8_t binary_type, InboundMessage& message);
-    void handle_stream_start(const ServerVisualizerStreamObject& stream);
+    void handle_stream_start(const VisualizerStreamPayload& stream);
     void handle_stream_end();
     void handle_stream_clear();
     /// @brief Fires the listener callback for a current stream event. Main loop.
     /// @param generation The event's stamp: a STREAM_START applies only the config written with
-    ///        the same stamp.
-    void handle_stream_ring_event(VisualizerEventType event, uint32_t generation) const;
+    ///        the same stamp, filled into stream_object before the listener hears it.
+    void handle_stream_ring_event(VisualizerEventType event, uint32_t generation);
     /// @brief The main-loop teardown half: delivers the stream end the teardown owes the
-    /// listener (on_visualizer_stream_end()). The visualizer keeps no other main-loop state: its
-    /// stream events carry everything the listener hears. Main loop only, through
+    /// listener (on_visualizer_stream_end()). Its only other main-loop state, stream_object, is
+    /// refilled by each STREAM_START, so teardown leaves it. Main loop only, through
     /// catch_up_teardown().
     void complete_teardown() const;
 
@@ -170,6 +176,9 @@ struct VisualizerRole::Impl : RoleTeardown {
     void signal_boundary();
     /// @brief Whether a boundary has passed since `item` was listed. Drain thread.
     bool is_stale(void* item) const;
+    /// @brief The spectrum bins the configuration requests: n_disp_bins when its types include
+    /// SPECTRUM, otherwise none.
+    uint8_t configured_spectrum_bins() const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
     void enqueue_stream_event(VisualizerEventType event, uint32_t generation) const;
@@ -185,6 +194,10 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// (ClientVisualizerStateObject::types).
     VisualizerRoleConfig config;
     VisualizerSupportObject visualizer_support;
+    /// The stream on_visualizer_stream_start() reports, filled in place from each applied config
+    /// into the types capacity the constructor reserves for every type, so a fill never
+    /// allocates. Main loop.
+    ServerVisualizerStreamObject stream_object{};
 
     // Pointer fields
     SendspinClient* client;

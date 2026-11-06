@@ -32,7 +32,6 @@
 #include <optional>
 #include <thread>
 #include <type_traits>
-#include <vector>
 
 namespace sendspin {
 
@@ -379,7 +378,7 @@ struct ArtworkRole::Impl : RoleTeardown {
     // Struct fields
     ArtworkRoleConfig config;
     /// Fixed at construction: client/state snapshots view it (ClientArtworkStateObject::channels).
-    std::vector<ArtworkChannelFormatObject> artwork_channels;
+    InlineVector<ArtworkChannelFormatObject, ARTWORK_MAX_SLOTS> artwork_channels;
     // Protocol task only (or the main loop in stop() once it is joined); see ArtworkTransfer.
     ArtworkTransfer transfer;
     // The channel array of the stream/start in force, kept so the next one can be compared

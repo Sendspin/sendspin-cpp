@@ -265,7 +265,7 @@ SyncTaskState SyncTask::handle_load_chunk(SyncContext& sync_context) {
         this->abandon_stream(sync_context);
         return SyncTaskState::LOAD_CHUNK;
     }
-    if (sync_context.decode_buffer == nullptr || sync_context.decode_buffer->available() == 0) {
+    if (sync_context.decode_buffer.available() == 0) {
         // No decoded audio available yet, try again (probably just processed a header)
         return SyncTaskState::LOAD_CHUNK;
     }
@@ -330,8 +330,8 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
              static_cast<uint64_t>(sync_context.current_stream_info.get_sample_rate())) /
             static_cast<uint64_t>(US_PER_SECOND));
         size_t late_bytes = sync_context.current_stream_info.frames_to_bytes(late_frames);
-        size_t actual_drop = std::min(late_bytes, sync_context.decode_buffer->available());
-        sync_context.decode_buffer->decrease_buffer_length(actual_drop);
+        size_t actual_drop = std::min(late_bytes, sync_context.decode_buffer.available());
+        sync_context.decode_buffer.decrease_buffer_length(actual_drop);
         uint32_t dropped_frames = sync_context.current_stream_info.bytes_to_frames(actual_drop);
         sync_context.decoded_timestamp +=
             sync_context.current_stream_info.frames_to_microseconds(dropped_frames);
@@ -340,7 +340,7 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
                 "Hard sync: dropping %" PRIu32 " frames from start of chunk, %" PRId64 "us behind",
                 dropped_frames, -raw_error);
 
-        if (sync_context.decode_buffer->available() == 0) {
+        if (sync_context.decode_buffer.available() == 0) {
             // Entire chunk was late
             return SyncTaskState::LOAD_CHUNK;
         }
@@ -377,7 +377,7 @@ SyncTaskState SyncTask::handle_transfer_audio(SyncContext& sync_context) {
     if (!this->transfer_audio(sync_context)) {
         return SyncTaskState::TRANSFER_AUDIO;  // Not done transferring yet
     }
-    if (sync_context.decode_buffer != nullptr && sync_context.decode_buffer->available() > 0) {
+    if (sync_context.decode_buffer.available() > 0) {
         // Decoded audio still waiting (was held back while silence was sent) - re-sync it
         return SyncTaskState::SYNCHRONIZE_AUDIO;
     }
@@ -466,12 +466,12 @@ bool SyncTask::transfer_audio(SyncContext& sync_context) {
 
     if (sync_context.silence_remaining == 0 && sync_context.release_chunk) {
         size_t decode_bytes_written =
-            sync_context.decode_buffer->transfer_data_to_sink(AUDIO_WRITE_TIMEOUT_MS);
+            sync_context.decode_buffer.transfer_data_to_sink(AUDIO_WRITE_TIMEOUT_MS);
         this->track_sent_audio(sync_context, decode_bytes_written);
     }
 
     // When decode buffer fully consumed and released, mark done
-    if (sync_context.decode_buffer->available() == 0 && sync_context.release_chunk) {
+    if (sync_context.decode_buffer.available() == 0 && sync_context.release_chunk) {
         sync_context.release_chunk = false;
     }
 
@@ -479,7 +479,7 @@ bool SyncTask::transfer_audio(SyncContext& sync_context) {
     if (sync_context.silence_remaining > 0) {
         return false;
     }
-    if (sync_context.release_chunk && sync_context.decode_buffer->available() > 0) {
+    if (sync_context.release_chunk && sync_context.decode_buffer.available() > 0) {
         return false;
     }
 
@@ -516,8 +516,8 @@ int32_t SyncTask::soft_sync_drop_frame(SyncContext& sync_context) {
     const uint32_t num_channels = sync_context.current_stream_info.get_channels();
     const uint32_t bytes_per_sample = sync_context.bytes_per_frame / num_channels;
 
-    if (sync_context.decode_buffer->available() >= 2 * sync_context.bytes_per_frame) {
-        uint8_t* first_frame = sync_context.decode_buffer->get_buffer_start();
+    if (sync_context.decode_buffer.available() >= 2 * sync_context.bytes_per_frame) {
+        uint8_t* first_frame = sync_context.decode_buffer.get_buffer_start();
         uint8_t* second_frame = first_frame + sync_context.bytes_per_frame;
         for (uint32_t chan = 0; chan < num_channels; ++chan) {
             const size_t chan_offset =
@@ -530,7 +530,7 @@ int32_t SyncTask::soft_sync_drop_frame(SyncContext& sync_context) {
             pack_q31_as_audio_sample(blended_sample, second_frame + chan_offset, bytes_per_sample);
         }
 
-        sync_context.decode_buffer->decrease_buffer_length(sync_context.bytes_per_frame);
+        sync_context.decode_buffer.decrease_buffer_length(sync_context.bytes_per_frame);
         return -1;
     }
     return 0;
@@ -543,8 +543,8 @@ int32_t SyncTask::soft_sync_insert_frame(SyncContext& sync_context) {
     // original last frame is moved into the spare frame the decode buffer reserves past the decoded
     // data, so no second buffer is needed.
 
-    if ((sync_context.decode_buffer->available() < 2 * sync_context.bytes_per_frame) ||
-        (sync_context.decode_buffer->free() < sync_context.bytes_per_frame)) {
+    if ((sync_context.decode_buffer.available() < 2 * sync_context.bytes_per_frame) ||
+        (sync_context.decode_buffer.free() < sync_context.bytes_per_frame)) {
         return 0;
     }
 
@@ -552,9 +552,9 @@ int32_t SyncTask::soft_sync_insert_frame(SyncContext& sync_context) {
     const uint32_t bytes_per_sample = sync_context.bytes_per_frame / num_channels;
 
     uint8_t* last_frame =
-        sync_context.decode_buffer->get_buffer_end() - sync_context.bytes_per_frame;
+        sync_context.decode_buffer.get_buffer_end() - sync_context.bytes_per_frame;
     uint8_t* second_last_frame = last_frame - sync_context.bytes_per_frame;
-    uint8_t* spare_frame = sync_context.decode_buffer->get_buffer_end();
+    uint8_t* spare_frame = sync_context.decode_buffer.get_buffer_end();
 
     // Move the original last frame into the spare slot, then blend the new frame into its old slot.
     std::memcpy(spare_frame, last_frame, sync_context.bytes_per_frame);
@@ -568,7 +568,7 @@ int32_t SyncTask::soft_sync_insert_frame(SyncContext& sync_context) {
         const int32_t blended_sample = second_last_sample / 2 + last_sample / 2;
         pack_q31_as_audio_sample(blended_sample, last_frame + chan_offset, bytes_per_sample);
     }
-    sync_context.decode_buffer->increase_buffer_length(sync_context.bytes_per_frame);
+    sync_context.decode_buffer.increase_buffer_length(sync_context.bytes_per_frame);
     return 1;
 }
 
@@ -583,7 +583,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
         return DecodeResult::SKIPPED;
     }
 
-    if (sync_context.decode_buffer != nullptr && sync_context.decode_buffer->available() > 0) {
+    if (sync_context.decode_buffer.available() > 0) {
         // Already have decoded audio
         return DecodeResult::SUCCESS;
     }
@@ -613,20 +613,19 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             // frame is reserved past the decoded data for soft-sync frame insertion.
             size_t needed =
                 sync_context.decoder->get_decode_buffer_size() + sync_context.bytes_per_frame;
-            if (sync_context.decode_buffer == nullptr) {
-                sync_context.decode_buffer = TransferBuffer::create(
-                    needed, this->player_impl_->config.decode_buffer_location);
-                if (sync_context.decode_buffer == nullptr) {
+            if (!sync_context.decode_buffer.is_allocated()) {
+                if (!sync_context.decode_buffer.allocate(
+                        needed, this->player_impl_->config.decode_buffer_location)) {
                     SS_LOGE(TAG, "Failed to allocate decode buffer; dropping the stream");
                     this->inbound_.return_item(sync_context.encoded_item);
                     sync_context.encoded_item = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
                 }
                 if (this->player_impl_->listener) {
-                    sync_context.decode_buffer->set_listener(this->player_impl_->listener);
+                    sync_context.decode_buffer.set_listener(this->player_impl_->listener);
                 }
-            } else if (needed > sync_context.decode_buffer->capacity()) {
-                if (!sync_context.decode_buffer->reallocate(needed)) {
+            } else if (needed > sync_context.decode_buffer.capacity()) {
+                if (!sync_context.decode_buffer.reallocate(needed)) {
                     SS_LOGE(TAG, "Failed to reallocate decode buffer; dropping the stream");
                     this->inbound_.return_item(sync_context.encoded_item);
                     sync_context.encoded_item = nullptr;
@@ -685,9 +684,9 @@ DecodeResult SyncTask::decode_whole_chunk(SyncContext& sync_context) {
         // Room for the decoder's next unit, plus the spare frame soft sync inserts into.
         const size_t unit_size = sync_context.decoder->get_decode_buffer_size();
         const size_t needed_free = unit_size + sync_context.bytes_per_frame;
-        if (sync_context.decode_buffer->free() < needed_free &&
-            !sync_context.decode_buffer->reallocate(sync_context.decode_buffer->available() +
-                                                    needed_free)) {
+        if (sync_context.decode_buffer.free() < needed_free &&
+            !sync_context.decode_buffer.reallocate(sync_context.decode_buffer.available() +
+                                                   needed_free)) {
             SS_LOGE(TAG, "Failed to grow decode buffer; dropping the stream");
             grow_failed = true;
             break;
@@ -696,12 +695,12 @@ DecodeResult SyncTask::decode_whole_chunk(SyncContext& sync_context) {
         size_t consumed = 0;
         size_t decoded_size = 0;
         if (!sync_context.decoder->decode_audio_chunk(
-                input, remaining, sync_context.decode_buffer->get_buffer_end(),
-                sync_context.decode_buffer->free() - sync_context.bytes_per_frame, &consumed,
+                input, remaining, sync_context.decode_buffer.get_buffer_end(),
+                sync_context.decode_buffer.free() - sync_context.bytes_per_frame, &consumed,
                 &decoded_size)) {
             break;
         }
-        sync_context.decode_buffer->increase_buffer_length(decoded_size);
+        sync_context.decode_buffer.increase_buffer_length(decoded_size);
         produced += decoded_size;
         input += consumed;
         remaining -= consumed;
@@ -717,7 +716,7 @@ DecodeResult SyncTask::decode_whole_chunk(SyncContext& sync_context) {
         return DecodeResult::SUCCESS;
     }
     // All or nothing. The buffer was empty on entry, so this drops just this chunk's output.
-    sync_context.decode_buffer->decrease_buffer_length(produced);
+    sync_context.decode_buffer.decrease_buffer_length(produced);
     if (grow_failed) {
         return DecodeResult::ALLOCATION_FAILED;
     }
@@ -821,9 +820,7 @@ void SyncTask::apply_stream_clear(SyncContext& sync_context) {
     // Post-seek re-alignment hard syncs are expected, not a loss of sync. Leave sync_lost as-is
     // so a pre-seek loss of sync still logs its recovery once we re-align.
     sync_context.aligning = true;
-    if (sync_context.decode_buffer != nullptr) {
-        sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
-    }
+    sync_context.decode_buffer.decrease_buffer_length(sync_context.decode_buffer.available());
     this->event_flags_.clear(EventGroupBits::COMMAND_STREAM_CLEAR);
 }
 
@@ -856,7 +853,7 @@ void SyncTask::discard_to_clear_marker(SyncContext& sync_context) {
 }
 
 void SyncTask::abandon_stream(SyncContext& sync_context) {
-    sync_context.decode_buffer.reset();
+    sync_context.decode_buffer.deallocate();
     sync_context.decoder->reset_decoders();
     sync_context.abandoned = true;
 }
@@ -892,9 +889,7 @@ void SyncTask::reset_context(SyncContext& sync_context) {
     sync_context.silence_remaining = 0;
 
     // Empty the decode buffer without deallocating
-    if (sync_context.decode_buffer) {
-        sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
-    }
+    sync_context.decode_buffer.decrease_buffer_length(sync_context.decode_buffer.available());
     if (sync_context.decoder) {
         sync_context.decoder->reset_decoders();
     }
@@ -961,8 +956,8 @@ void SyncTask::stop() {
 void SyncTask::thread_entry(void* params) {
     SyncTask* this_task = static_cast<SyncTask*>(params);
 
-    // Allocate SyncContext once on the task stack, reused across streams. The decode buffer is
-    // created lazily once the first codec header arrives.
+    // Allocate SyncContext once on the task stack, reused across streams. The decode buffer's
+    // storage is allocated lazily once the first codec header arrives.
     SyncContext sync_context;
     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
     sync_context.decoder = std::make_unique<SendspinDecoder>();

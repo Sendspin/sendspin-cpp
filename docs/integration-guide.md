@@ -99,11 +99,10 @@ The stream parameters negotiated by the server are available via `get_current_st
 | `sample_rate` | `std::optional<uint32_t>` | Sample rate in Hz |
 | `channels` | `std::optional<uint8_t>` | Number of channels |
 | `bit_depth` | `std::optional<uint8_t>` | Bits per sample |
-| `codec_header` | `std::optional<std::string>` | Codec-specific header data |
 
 Call `is_complete()` on the object to check that `codec`, `sample_rate`, `channels`, and
-`bit_depth` all have values. `codec_header` is not part of that check, so it can still be
-`nullopt` when `is_complete()` returns true.
+`bit_depth` all have values. A FLAC stream's codec header goes to the decoder and is not
+part of the object.
 
 ### Controller Role (Playback Commands)
 
@@ -210,6 +209,19 @@ source.set_signal(SourceSignal::PRESENT);  // or ABSENT
 Detecting the signal is up to the application (a jack-detect pin, a link state, or a level meter on the input); call `set_signal()` on each change. The server decides what to do with it (roles/source/v1.md "Default streaming behavior").
 
 `examples/source_client/` is a working reference: it captures the default PortAudio input device and feeds `write_audio()` from the capture callback with each buffer's capture time on the client's clock. With `-s` it also reports line sense from the input's level.
+
+### Application-Specific Roles
+
+An application can advertise roles of its own, outside the specification (README.md "Application-Specific Roles"), through `SendspinClientConfig::application_roles`. Each is listed in `client/hello` `supported_roles` after the library's roles, and its support object, if any, is sent as `"<role>_support"`:
+
+```cpp
+config.application_roles.push_back({"_acme_display@v1", std::string(R"({"port":8930})")});
+config.application_roles.push_back({"_acme_lights@v1", std::nullopt});  // no support object
+```
+
+A role name is a leading `_`, a name, `@` and a version, in visible ASCII other than `"` and `\`, and at most 64 bytes, a library limit the specification does not set; include a vendor prefix to avoid collisions. `support_json` is serialized JSON and must be exactly one object, nested at most 8 levels deep (the object itself is level 1) so the hello stays within the 10 levels messaging.md "client/hello" allows; `start()` parses it and sends the parser's own serialization, so lenient input such as an unquoted key goes out as standard JSON. A string that is not UTF-8, or holds a control character the serializer would write back unescaped (a raw one, or an escape such as `\u0001`), is refused. An escaped surrogate outside a valid pair is dropped or replaced by another character, and a number beyond `double` range goes out as `null`, so keep to plain values. The whole `client/hello`, support objects included, must also fit the 16384 bytes messaging.md "client/hello" allows; `start()` builds one to check, counting a MAC address the platform may detect only later. `client.start()` logs an error and returns false on a malformed name, a name listed twice, a support object that does not meet those rules, or a hello over that size. The library only announces these roles: the server may list one in `active_roles`, and what that means, and any messages it carries, is up to the application.
+
+The library does not report which application roles the server activates: it reads `active_roles` into the set of its own roles plus whether the list has any entry, so an application that needs to know learns it through its own channel. An activated application role still makes `active_roles` non-empty, so on a connection that is not playback-capable (messaging.md "server/activate", "Playback-capable connections") the client closes with `unauthorized`, or with `pairing_required` when enabling unpaired access would have admitted it, just as it does for one of its own roles.
 
 ## Step 3: Implement Listener Interfaces
 
@@ -772,7 +784,8 @@ if (!client.start()) {
 
 // Optionally initiate a client-side connection to a known server URL.
 // Without this, the client waits for incoming server connections. With
-// accept_inbound_connections off, this is the only way a server reaches it.
+// accept_inbound_connections off, this is the only way a server reaches it. The URL is taken by
+// value: pass a temporary, or std::move() a string you no longer need, to avoid a copy.
 client.connect_to("ws://192.168.1.10:8928/sendspin");
 
 // Main loop: call loop() periodically to deliver callbacks. Connection work runs on the library's
@@ -1353,7 +1366,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
 | `pairing_code_out_channels` | `std::vector<SendspinPairingCodeChannel>` | `{}` | Where the device can emit a dynamic pairing code: `DISPLAY`, `SPEAKER`. Advertised as the descriptor's `out_channels`. Empty (or an empty `pairing_code_formats`) means the device cannot emit one, so `dynamic_pairing_code` is not advertised. |
 | `pairing_code_formats` | `std::vector<SendspinPairingCodeFormat>` | `{}` | How the device can render a dynamic pairing code: `DIGITS` (six decimal digits), `QR_CODE` (a pairing token to render). Advertised as the descriptor's `formats`; the server picks one from this list. |
-| `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains. See [Record capacity](#record-capacity). |
+| `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains, each costing about 123 B of internal RAM reserved at `start()`. See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `httpd_stack_size` | `size_t` | `4608` | HTTP server task stack size in bytes (ESP-IDF only). The task runs esp_http_server, receives frames into the inbound ring and runs queued sends. Like every task stack default here, it is derived in `tools/stack_usage/README.md`. Values below the default are clamped up to it with a warning. Raising it is allowed. |
@@ -1364,7 +1377,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `protocol_task_stack_size` | `size_t` | `7168` | Protocol task stack size in bytes (ESP-IDF only). Every Noise handshake (including the in-band re-handshake after pairing, with its X25519 crypto), the pairing exchange (CPace and SHA-512), the JSON parse, the role handlers and every send run on this task. Derived as for `httpd_stack_size`. Values below the default are clamped up to it with a warning. |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
 | `accept_inbound_connections` | `bool` | `true` | Whether to run the WebSocket server that servers connect to. `false` leaves `connect_to()` as the only way a server reaches the client, for a client that dials one configured server and must not be reachable by any other; `server_port` is then unused. |
-| `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye) |
+| `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye); at most 7 on ESP, where a larger value is clamped |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |
 | `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
@@ -1376,7 +1389,8 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `static_pairing_code` | `std::optional<std::string>` | unset | The device's static pairing code, exactly 8 decimal digits. The `static_pairing_code` method is advertised only when this is set and `dynamic_pairing_code` is not advertised. An invalid value makes `start()` fail. |
 | `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
 | `static_pairing_code_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static pairing code the device shipped with, same values as above. Advertised on the `static_pairing_code` descriptor in `client/hello`; empty omits the hint. |
-| `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer that backs every JSON document the protocol task works with: the parse of each incoming protocol message and every message it builds, instead of PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the protocol task on every message. The arena holds one document at a time: a parsed message is released before the reply it triggers (the `client/state` after a `server/activate`, a pairing reply, a re-handshake's second message) is built. The default covers one steady-state protocol message, including the FLAC stream-start header; a document larger than the budget on its own, such as a large track-metadata message, falls back to PSRAM (those arrive only once per song). That holds on a 32-bit target, where ArduinoJson allocates each variant pool as one 1,024-byte block. Every freed block is wiped, so a document that held key material leaves none behind. Set to `0` to send every document to PSRAM. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer, and since a variant pool alone is 4 KB there, the default fits no document's pool on host. |
+| `application_roles` | `std::vector<SendspinApplicationRole>` | `{}` | Application-specific roles listed in `client/hello` `supported_roles` after the library's own, each with an optional support object sent as `"<role>_support"`. A malformed name, a repeated name, a support object that is not one JSON object meeting the rules in [Application-Specific Roles](#application-specific-roles), or a `client/hello` over 16384 bytes makes `start()` fail. |
+| `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer that backs every JSON document the protocol task works with: the parse of each incoming protocol message and every message it builds, instead of PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the protocol task on every message. The arena holds one document at a time: a parsed message is released before the reply it triggers (the `client/state` after a `server/activate`, a pairing reply, a re-handshake's second message) is built. The default covers one steady-state protocol message, including the FLAC stream-start header; a document larger than the budget on its own, such as a large track-metadata message or a `client/hello` carrying large [application support objects](#application-specific-roles), falls back to the platform heap, PSRAM where present (a metadata message arrives once per song, a hello once per connection). That holds on a 32-bit target, where ArduinoJson allocates each variant pool as one 1,024-byte block. Every freed block is wiped, so a document that held key material leaves none behind. Set to `0` to send every document to PSRAM. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer, and since a variant pool alone is 4 KB there, the default fits no document's pool on host. |
 | `message_trace` | `SendspinMessageTraceFn` | empty | Only in a build with `SENDSPIN_ENABLE_MESSAGE_TRACE` (host only): called with every protocol message's plaintext, on the protocol task. See [Message trace (host only)](#message-trace-host-only). |
 
 ---
@@ -1455,7 +1469,7 @@ Configuration passed to `client.add_visualizer()`.
 
 | Field | Type | Description |
 |---|---|---|
-| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`); may be empty to request none |
+| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`); may be empty to request none. A type a stream serves outside them is dropped |
 | `rate_max` | `uint16_t` | Maximum periodic frames per second; set to the display refresh rate. Must be positive when `types` is non-empty, or `SendspinClient::start()` fails |
 | `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types`, or `SendspinClient::start()` fails |
 
@@ -1463,7 +1477,7 @@ Configuration passed to `client.add_visualizer()`.
 
 | Field | Type | Description |
 |---|---|---|
-| `n_disp_bins` | `uint8_t` | Number of frequency bins to receive |
+| `n_disp_bins` | `uint8_t` | Number of frequency bins to receive; `start()` reserves this many for `on_spectrum()`. A stream may serve fewer; one that serves more, or another `scale` or frequency range, drops its spectrum frames |
 | `scale` | `VisualizerSpectrumScale` | Frequency scale (`MEL`, `LOG`, or `LIN`) |
 | `f_min` | `uint16_t` | Minimum frequency in Hz |
 | `f_max` | `uint16_t` | Maximum frequency in Hz |

@@ -240,7 +240,7 @@ inline std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     rec.psk_id = psk_id;
     rec.psk = psk;
     rec.server_id = server_id.peer_id();
-    rs.store_record_superseding(std::move(rec), {});
+    rs.store_record_superseding(PairingRecord(rec), {});
 
     // -----------------------------------------------------------------
     // Create the NoiseHandshake (our responder driver)

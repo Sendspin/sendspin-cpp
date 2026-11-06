@@ -14,6 +14,7 @@
 
 #include "sendspin/client.h"
 
+#include "application_role.h"
 #include "connection.h"
 #include "connection_manager.h"
 #include "crypto/keys.h"
@@ -101,6 +102,18 @@ struct PairingNote {
 static_assert(PAIRING_CODE_TOKEN_LENGTH <= PEER_ID_SIZE &&
                   static_cast<size_t>(DYNAMIC_PAIRING_CODE_DIGITS) <= PEER_ID_SIZE,
               "every emitted pairing code fits PairingNote::text");
+
+/// @brief Pairing notes the slot and the drain each keep room for, the most one attempt queues:
+/// the two dismissals of the attempt before it, its start, its window and code prompts, their two
+/// dismissals and its outcome. A larger batch grows the room, which both buffers then keep.
+constexpr size_t PAIRING_NOTE_CAPACITY = 8;
+
+/// @brief An empty note list with room for PAIRING_NOTE_CAPACITY notes
+std::vector<PairingNote> reserved_pairing_notes() {
+    std::vector<PairingNote> notes;
+    notes.reserve(PAIRING_NOTE_CAPACITY);
+    return notes;
+}
 
 /// @brief Builds a note carrying `text`, a server_id or an emitted pairing code
 PairingNote make_text_note(PairingNoteType type, std::string_view text) {
@@ -206,8 +219,12 @@ struct SendspinClient::EventState {
     /// grants each acquire (SendspinClient::high_performance_granted_).
     InboxSlot<HighPerformanceRequests> high_performance_slot{inbox, INBOX_TOPIC_HIGH_PERFORMANCE};
     /// Pairing listener notifications, appended on the protocol task in the order they happen and
-    /// dispatched by the drain.
-    InboxSlot<std::vector<PairingNote>> pairing_slot{inbox, INBOX_TOPIC_PAIRING};
+    /// dispatched by the drain, which trades buffers with it (InboxSlot::exchange()) so neither
+    /// side's reserved room leaves with a batch.
+    InboxSlot<std::vector<PairingNote>> pairing_slot{inbox, INBOX_TOPIC_PAIRING,
+                                                     reserved_pairing_notes()};
+    /// The drain's buffer for the pairing notes, empty between drains. Main loop only.
+    std::vector<PairingNote> drained_pairing_notes{reserved_pairing_notes()};
     /// Bumped by stop() before its teardown so a drain frame already on the stack (a listener
     /// callback that called stop()) abandons what it has not delivered yet: the events it copied
     /// out, the rest of the pairing notes, the role drains and the group update. Main loop only.
@@ -346,6 +363,36 @@ bool SendspinClient::start() {
                 STATIC_PAIRING_CODE_DIGITS);
         return false;
     }
+    for (size_t i = 0; i < this->config_.application_roles.size(); ++i) {
+        SendspinApplicationRole& app_role = this->config_.application_roles[i];
+        if (!is_valid_application_role_name(app_role.role)) {
+            SS_LOGE(TAG,
+                    "Application role \"%s\" is not a _<name>@<version> of at most %zu bytes; "
+                    "cannot start",
+                    app_role.role.c_str(), MAX_APPLICATION_ROLE_NAME_BYTES);
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (this->config_.application_roles[j].role == app_role.role) {
+                SS_LOGE(TAG, "Application role \"%s\" is listed twice; cannot start",
+                        app_role.role.c_str());
+                return false;
+            }
+        }
+        if (app_role.support_json.has_value()) {
+            // Replaced by the parser's own output, which is what client/hello embeds
+            std::optional<std::string> normalized =
+                normalize_support_object_json(app_role.support_json.value());
+            if (!normalized.has_value()) {
+                SS_LOGE(TAG,
+                        "Support object for application role \"%s\" is not a JSON object; "
+                        "cannot start",
+                        app_role.role.c_str());
+                return false;
+            }
+            app_role.support_json = std::move(normalized);
+        }
+    }
 
     // lifecycle_ stays STOPPED until every step below has succeeded. Marking the client running
     // up front would report it started even when this function returns false (e.g. identity
@@ -415,6 +462,16 @@ bool SendspinClient::start() {
     }
 #endif
     if (!roles_started) {
+        this->stop_role_threads();
+        this->release_inbound_ring();
+        return false;
+    }
+
+    // messaging.md "client/hello": a server may close a connection whose hello is over the size
+    // cap, and every connection sends the same one, so a configuration (large application support
+    // objects, mostly) that would put it over fails closed here. Checked once the roles have
+    // started, which fixes the capacities they advertise.
+    if (!this->hello_within_cap()) {
         this->stop_role_threads();
         this->release_inbound_ring();
         return false;
@@ -640,7 +697,7 @@ void SendspinClient::release_inbound_ring() {
     this->inbound_ring_.reset();
 }
 
-void SendspinClient::connect_to(const std::string& url) {
+void SendspinClient::connect_to(std::string url) {
     // Running implies start() succeeded, so identity_ and record_store_ exist for the protocol
     // task to hand to init_noise_handshake() once the WebSocket upgrade completes; a connection
     // built before that would dereference null there.
@@ -648,7 +705,7 @@ void SendspinClient::connect_to(const std::string& url) {
         SS_LOGW(TAG, "connect_to() ignored: client is not running");
         return;
     }
-    this->protocol_task_->post_requests({.connect_to = url});
+    this->protocol_task_->post_requests({.connect_to = std::move(url)});
 }
 
 void SendspinClient::disconnect(SendspinGoodbyeReason reason) {
@@ -977,9 +1034,19 @@ void SendspinClient::drain_inbox() {
     // the protocol task requests the write before it queues the PAIRING_SUCCEEDED note, so the
     // flush (which polls for itself) runs after the notes are taken and before they are
     // dispatched, and every note taken finds its write performed.
-    std::vector<PairingNote> notes;
-    const bool notes_taken = (slot_bits & INBOX_TOPIC_PAIRING) != 0 &&
-                             es.drain_generation == drain_generation && es.pairing_slot.take(notes);
+    // Moved out for the dispatch and back after it, so a listener callback that re-enters the
+    // drain (a stop() whose dismissals it drains) cannot touch the batch this frame is delivering.
+    // That nested drain finds the buffer gone and, only when it has notes to take, reserves
+    // another before trading it to the slot, which therefore keeps its room; the one this frame
+    // moves back, emptied, replaces the nested drain's.
+    std::vector<PairingNote> notes = std::move(es.drained_pairing_notes);
+    bool notes_taken = false;
+    if ((slot_bits & INBOX_TOPIC_PAIRING) != 0 && es.drain_generation == drain_generation) {
+        if (notes.capacity() < PAIRING_NOTE_CAPACITY) {
+            notes.reserve(PAIRING_NOTE_CAPACITY);
+        }
+        notes_taken = es.pairing_slot.exchange(notes);
+    }
     this->flush_pending_persistence();
     if (notes_taken && es.drain_generation == drain_generation) {
         if (this->listener_ != nullptr) {
@@ -1030,6 +1097,8 @@ void SendspinClient::drain_inbox() {
             }
         }
     }
+    notes.clear();
+    es.drained_pairing_notes = std::move(notes);
 
     // --- Role events: bit-gated so an idle tick performs zero inbox mutex acquisitions here ---
     // Each role drain takes its slot first and catches the role up on its teardowns before
@@ -1076,11 +1145,16 @@ void SendspinClient::drain_inbox() {
                 this->listener_->on_group_update(group_delta);
             }
 
-            SS_LOGD(TAG, "Group update - state: %s, id: %s, name: %s",
+            // group_name is cut to MAX_FRIENDLY_NAME_BYTES at parse, group_id only here.
+            const std::string_view id =
+                peer_text_for_log(this->group_state_.group_id.has_value()
+                                      ? std::string_view(*this->group_state_.group_id)
+                                      : std::string_view(""));
+            SS_LOGD(TAG, "Group update - state: %s, id: %.*s, name: %s",
                     this->group_state_.playback_state.has_value()
                         ? to_cstr(this->group_state_.playback_state.value())
                         : "unchanged",
-                    this->group_state_.group_id.value_or("").c_str(),
+                    static_cast<int>(id.size()), id.data(),
                     this->group_state_.group_name.value_or("").c_str());
         }
     }
@@ -1182,7 +1256,8 @@ std::optional<std::string> SendspinClient::format_pairing_token(
     if (this->identity_ == nullptr) {
         return std::nullopt;
     }
-    return sendspin::format_pairing_token(this->identity_->public_bytes, pairing_psk);
+    return std::string(
+        sendspin::format_pairing_token(this->identity_->public_bytes, pairing_psk).view());
 }
 
 std::optional<std::string> SendspinClient::pairing_token() const {
@@ -1395,9 +1470,15 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
 #endif
 }
 
+bool SendspinClient::hello_within_cap() {
+    ClientHelloMessage hello;
+    this->build_client_hello(hello);
+    return client_hello_fits(hello);
+}
+
 void SendspinClient::build_client_hello(ClientHelloMessage& msg) {
-    // Reached only from ConnectionManager::send_hello_message(), so only for a connection, so
-    // only after a successful start(): record_store_ exists and is dereferenced unguarded below.
+    // Reached from start(), once the roles have started and before the protocol task runs, and
+    // from ConnectionManager::send_hello_message() for each connection.
     msg.name = this->config_.name;
 
     const auto view = [](const std::optional<std::string>& value) {
@@ -1447,6 +1528,8 @@ void SendspinClient::build_client_hello(ClientHelloMessage& msg) {
     }
 
     msg.unpaired_access_enabled = this->unpaired_access_enabled_.load(std::memory_order_acquire);
+    // Validated and normalized by start(), and fixed until stop()
+    msg.application_roles = this->config_.application_roles;
 
     // Let each role add its fields to the hello message
 #ifdef SENDSPIN_ENABLE_PLAYER

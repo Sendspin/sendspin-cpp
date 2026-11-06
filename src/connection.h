@@ -20,6 +20,7 @@
 
 #include "crypto/cpace.h"
 #include "crypto/keys.h"
+#include "crypto/pairing_code.h"
 #include "inbound_ring.h"
 #ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
 #include "message_trace.h"
@@ -36,8 +37,10 @@
 #include "time_burst.h"
 #include "time_filter.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -360,7 +363,7 @@ public:
     /// object"). False for every codec before server/hello, or when it carried no valid object.
     /// Protocol task only.
     bool server_accepts_source_codec(SendspinCodecFormat codec) const {
-        return (this->server_source_codecs_ & source_codec_bit(codec)) != 0;
+        return this->server_source_codecs_.contains(codec);
     }
 
     // ========================================
@@ -463,8 +466,8 @@ public:
         std::array<uint8_t, 32> nonce_a{};
         std::array<uint8_t, 32> handshake_hash{};
         /// The pairing code as CPace consumes it (PRS, pairing.md "PAKE"): the six or eight ASCII
-        /// digits, or the 24 raw bytes of the qr_code emission format.
-        std::vector<uint8_t> prs;
+        /// digits, or the 24 raw bytes of the qr_code emission format. Set through set_prs().
+        std::array<uint8_t, PAIRING_PRS_MAX_SIZE> prs{};
         /// platform_time_us() deadline for the whole attempt; the Pairing PSK Flow arms it too.
         int64_t attempt_deadline_us{0};
         /// pairing_index captured when this attempt entered pairing (see
@@ -480,19 +483,29 @@ public:
         /// Emission format the server selected; meaningful for DYNAMIC_PAIRING_CODE only.
         SendspinPairingCodeFormat format{SendspinPairingCodeFormat::DIGITS};
         PairingStep step{PairingStep::IDLE};
+        uint8_t prs_size{0};       ///< Bytes of `prs` that hold the code; 0 until set_prs().
         bool code_emitted{false};  ///< True once a code was surfaced via on_display_pairing_code.
         bool window_shown{false};  ///< True once on_open_pairing_window was surfaced.
 
         PairingSession() = default;
 
-        /// @brief Wipes the pairing code and both binding nonces on destruction. `prs` lives on
-        /// the heap, so releasing it unwiped would leave the code in freed memory.
+        /// @brief Wipes the pairing code and both binding nonces on destruction.
         ~PairingSession() {
             secure_zero_container(this->nonce_b);
             secure_zero_container(this->nonce_a);
-            if (!this->prs.empty()) {
-                secure_zero(this->prs.data(), this->prs.size());
-            }
+            secure_zero_container(this->prs);
+        }
+
+        /// @brief Holds `code` as the attempt's PRS; at most PAIRING_PRS_MAX_SIZE bytes.
+        void set_prs(std::span<const uint8_t> code) {
+            assert(code.size() <= this->prs.size());
+            std::copy(code.begin(), code.end(), this->prs.begin());
+            this->prs_size = static_cast<uint8_t>(code.size());
+        }
+
+        /// @brief The PRS set_prs() holds; empty before it is set.
+        std::span<const uint8_t> prs_view() const {
+            return {this->prs.data(), this->prs_size};
         }
 
         /// Reached only by reference (pairing_session()); a copy would carry the code and the
@@ -542,13 +555,13 @@ public:
     /// server/pair-finalize (the commit happens in that handler, before the server's re-handshake
     /// msg1, the next message, resolves the new PSK against the RecordStore). Latest wins.
     /// Protocol task only.
-    void set_pending_pairing_record(SendspinPairingRecord record) {
-        this->pending_pairing_record_ = std::move(record);
+    void set_pending_pairing_record(const PairingRecord& record) {
+        this->pending_pairing_record_ = record;
     }
 
     /// @brief Returns and clears the pending pairing record. A returned value is a record to
     /// store; nullopt means there was no pending pairing. Protocol task only.
-    std::optional<SendspinPairingRecord> take_pending_pairing_record() {
+    std::optional<PairingRecord> take_pending_pairing_record() {
         return std::exchange(this->pending_pairing_record_, std::nullopt);
     }
 
@@ -704,8 +717,8 @@ public:
     /// @brief Records the codecs server/hello's source@v1 support object lists
     /// (ServerHelloMessage::source_codecs); nullopt for a hello without a valid object. Protocol
     /// task only, from the server/hello dispatch.
-    void set_server_source_codecs(std::optional<uint8_t> codecs) {
-        this->server_source_codecs_ = codecs.value_or(0);
+    void set_server_source_codecs(std::optional<EnumSet<SendspinCodecFormat>> codecs) {
+        this->server_source_codecs_ = codecs.value_or(EnumSet<SendspinCodecFormat>{});
     }
 
     /// @brief Sets the server's friendly name from server/hello; the server_id the handshake
@@ -1012,7 +1025,7 @@ protected:
 
     /// The pairing record staged by the attempt in flight, committed by the
     /// server/pair-finalize handler (nullopt = nothing to store). Protocol task only.
-    std::optional<SendspinPairingRecord> pending_pairing_record_{};
+    std::optional<PairingRecord> pending_pairing_record_{};
 
     /// Sends this connection's client/time bursts and feeds its time filter. Protocol task only.
     SendspinTimeBurst time_burst_{};
@@ -1212,9 +1225,9 @@ protected:
     /// not reused. Protocol task only.
     bool server_hello_received_{false};
 
-    /// The codecs server/hello's source@v1 support object lists, one source_codec_bit() each (see
-    /// server_accepts_source_codec()). Protocol task only.
-    uint8_t server_source_codecs_{0};
+    /// The codecs server/hello's source@v1 support object lists (server_accepts_source_codec()).
+    /// Protocol task only.
+    EnumSet<SendspinCodecFormat> server_source_codecs_{};
 
     /// True after the first server/activate message has been received and applied, until a
     /// re-handshake or a pairing-finalize ack rewinds it. Protocol task only.

@@ -30,11 +30,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <initializer_list>
 #include <optional>
+#include <span>
 #include <string_view>
-#include <utility>
-#include <vector>
 
 namespace sendspin {
 
@@ -68,6 +66,21 @@ static constexpr size_t CPACE_TAG_SIZE = 64;
 /// label per wrapped field.
 static constexpr size_t CPACE_ISK_SIZE = 64;
 
+/// @brief Longest sid CPace::start() takes, in bytes. Sendspin's is 61 (pairing.md "PAKE": a
+/// 21-byte label, the 32-byte handshake hash and two 4-byte counters), and the draft's test vectors
+/// use 16.
+static constexpr size_t CPACE_MAX_SID_SIZE = 64;
+
+/// @brief Longest associated data CPace::start() takes for either side, in bytes. Sendspin's ADa
+/// and ADb are 6 (pairing.md "PAKE"), and the draft's test vectors use 3.
+static constexpr size_t CPACE_MAX_AD_SIZE = 16;
+static_assert(CPACE_MAX_SID_SIZE <= UINT8_MAX && CPACE_MAX_AD_SIZE <= UINT8_MAX,
+              "CPace holds the sid's and each AD's size in a uint8_t");
+
+/// @brief Most bytes the draft-irtf-cfrg-cpace-21 `prepend_len` prefix of a size_t length takes:
+/// seven bits per byte.
+static constexpr size_t CPACE_MAX_LENGTH_PREFIX = (sizeof(size_t) * 8 + 6) / 7;
+
 // ============================================================================
 // CPaceRole
 // ============================================================================
@@ -97,14 +110,17 @@ public:
     ///
     /// @param role     INITIATOR (A) or RESPONDER (B)
     /// @param prs      Password-related string (the pairing code's bytes for Sendspin)
-    /// @param sid      Session identifier
+    /// @param sid      Session identifier, at most CPACE_MAX_SID_SIZE bytes
     /// @param ci       Channel identifier (empty for Sendspin)
-    /// @param ad       This side's associated data (ADb = "client" for the Sendspin client)
-    /// @param peer_ad  Peer's associated data (ADa = "server" for the Sendspin client)
-    /// @return false if the random scalar or generator computation fails
-    bool start(CPaceRole role, const std::vector<uint8_t>& prs, const std::vector<uint8_t>& sid,
-               const std::vector<uint8_t>& ci, const std::vector<uint8_t>& ad,
-               const std::vector<uint8_t>& peer_ad);
+    /// @param ad       This side's associated data (ADb = "client" for the Sendspin client), at
+    ///                 most CPACE_MAX_AD_SIZE bytes
+    /// @param peer_ad  Peer's associated data (ADa = "server" for the Sendspin client), at most
+    ///                 CPACE_MAX_AD_SIZE bytes
+    /// @return false if sid or either AD is too long, or the random scalar or generator
+    ///         computation fails
+    bool start(CPaceRole role, std::span<const uint8_t> prs, std::span<const uint8_t> sid,
+               std::span<const uint8_t> ci, std::span<const uint8_t> ad,
+               std::span<const uint8_t> peer_ad);
 
     /// @brief Return this side's public share (Ya for A, Yb for B).
     /// Valid only after a successful start().
@@ -132,28 +148,32 @@ public:
 
     /// @brief Return this side's session id (sid), as passed to start(). Needed alongside isk()
     /// to derive K_wrap (pairing.md "Wrapping").
-    [[nodiscard]] const std::vector<uint8_t>& sid() const {
-        return this->sid_;
+    [[nodiscard]] std::span<const uint8_t> sid() const {
+        return {this->sid_.data(), this->sid_size_};
     }
 
 private:
     // Struct fields
-    std::vector<uint8_t> ad_{};
-    std::vector<uint8_t> initiator_ad_{};                      // Set by derive()
+    std::array<uint8_t, CPACE_MAX_AD_SIZE> ad_{};
     std::array<uint8_t, CPACE_SHARE_SIZE> initiator_share_{};  // Set by derive()
     std::array<uint8_t, CPACE_ISK_SIZE> isk_{};                // Set by derive()
     std::array<uint8_t, CPACE_TAG_SIZE> mac_key_{};            // Set by derive()
-    std::vector<uint8_t> peer_ad_{};
+    std::array<uint8_t, CPACE_MAX_AD_SIZE> peer_ad_{};
     std::array<uint8_t, CPACE_SHARE_SIZE> public_share_{};
-    std::vector<uint8_t> responder_ad_{};                      // Set by derive()
     std::array<uint8_t, CPACE_SHARE_SIZE> responder_share_{};  // Set by derive()
     std::array<uint8_t, CPACE_FIELD_BYTES> scalar_{};
-    std::vector<uint8_t> sid_{};
+    std::array<uint8_t, CPACE_MAX_SID_SIZE> sid_{};
 
     // 8-bit fields
+    uint8_t ad_size_{0};
     bool derived_{false};  // Set by derive()
+    uint8_t peer_ad_size_{0};
     CPaceRole role_{CPaceRole::RESPONDER};
+    uint8_t sid_size_{0};
     bool started_{false};
+
+    /// @brief The associated data of the initiator (ADa) or the responder (ADb)
+    std::span<const uint8_t> role_ad(CPaceRole role) const;
 
     /// @brief Compute an LV-encoded (variable-length-prefix) HMAC-SHA-512 tag
     /// over (share, ad) with mac_key_.  If own is true, uses our share/ad;
@@ -165,18 +185,39 @@ private:
 // Low-level CPace building blocks
 // ============================================================================
 
-/// @brief Encode a length in CPace's variable-length prefix format.
-/// Mirrors draft-irtf-cfrg-cpace-21 `prepend_len`.
-std::vector<uint8_t> cpace_prepend_len(const uint8_t* data, size_t len);
+/// @brief Write the draft-irtf-cfrg-cpace-21 `prepend_len` prefix of a `len`-byte value: the
+/// length as a little-endian base-128 varint.
+/// @return The number of prefix bytes written to the front of `out`.
+size_t cpace_length_prefix(size_t len, std::array<uint8_t, CPACE_MAX_LENGTH_PREFIX>& out);
 
-/// @brief Concatenate LV-encoded parts.  Mirrors draft-irtf-cfrg-cpace-21 `lv_cat`.
-/// Each element of parts is (data_ptr, data_len).
-std::vector<uint8_t> cpace_lv_cat(std::initializer_list<std::pair<const uint8_t*, size_t>> parts);
+/// @brief Feed `data` to `sink` LV-encoded, as draft-irtf-cfrg-cpace-21 `prepend_len` builds it:
+/// its length prefix, then its bytes. Successive calls make the draft's `lv_cat`.
+/// @param sink Any object with update(const uint8_t*, size_t), such as a Sha512 that hashes the
+///             encoding as it is produced.
+template <typename Sink>
+void cpace_prepend_len(Sink& sink, const uint8_t* data, size_t len) {
+    std::array<uint8_t, CPACE_MAX_LENGTH_PREFIX> prefix{};
+    sink.update(prefix.data(), cpace_length_prefix(len, prefix));
+    sink.update(data, len);
+}
 
-/// @brief Compute the CPace generator string.  Mirrors draft-irtf-cfrg-cpace-21
-/// `generator_string`.
-std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, const uint8_t* ci,
-                                            size_t ci_len, const uint8_t* sid, size_t sid_len);
+/// @brief Zero bytes draft-irtf-cfrg-cpace-21 `generator_string` pads with for a `prs_len`-byte
+/// PRS: whatever fills the first SHA-512 block after the LV-encoded DSI and PRS and the pad's own
+/// one-byte length, or none when they already overflow it.
+size_t cpace_generator_zero_pad(size_t prs_len);
+
+/// @brief Feed `sink` the CPace generator string. Mirrors draft-irtf-cfrg-cpace-21
+/// `generator_string`: lv_cat(DSI, PRS, zero_pad, CI, sid).
+template <typename Sink>
+void cpace_generator_string(Sink& sink, const uint8_t* prs, size_t prs_len, const uint8_t* ci,
+                            size_t ci_len, const uint8_t* sid, size_t sid_len) {
+    static constexpr std::array<uint8_t, CPACE_SHA512_BLOCK> ZEROS{};
+    cpace_prepend_len(sink, reinterpret_cast<const uint8_t*>(CPACE_DSI.data()), CPACE_DSI.size());
+    cpace_prepend_len(sink, prs, prs_len);
+    cpace_prepend_len(sink, ZEROS.data(), cpace_generator_zero_pad(prs_len));
+    cpace_prepend_len(sink, ci, ci_len);
+    cpace_prepend_len(sink, sid, sid_len);
+}
 
 /// @brief Elligator2 map: r -> x-coordinate on Curve25519 (draft-irtf-cfrg-cpace-21).
 /// Input r is an integer value (already reduced mod p).  Returns 32 bytes (little-endian).

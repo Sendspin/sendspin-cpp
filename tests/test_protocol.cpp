@@ -17,6 +17,8 @@
 // malformed-input handling) where a bug is silent rather than a crash, plus a hand-rolled int64
 // formatter that we can check against snprintf as a free correctness oracle.
 
+#include "application_role.h"
+#include "log_capture.h"
 #include "platform/base64.h"
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
@@ -37,6 +39,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -53,6 +56,10 @@ bool parse(const std::string& json, JsonDocument& doc, JsonObject& root) {
     root = doc.as<JsonObject>();
     return true;
 }
+
+// Every stream/start section, as a connection that owns all three stream roles takes them.
+const EnumSet<SendspinRole> STREAM_START_ROLES{SendspinRole::PLAYER, SendspinRole::ARTWORK,
+                                               SendspinRole::VISUALIZER};
 
 }  // namespace
 
@@ -189,6 +196,10 @@ TEST(Protocol, DetermineMessageType) {
     EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::UNKNOWN);
 
     ASSERT_TRUE(parse(R"({})", doc, root));  // missing type field
+    EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::UNKNOWN);
+
+    // The whole type is compared, so an escaped NUL does not cut it short to a known one.
+    ASSERT_TRUE(parse(R"({"type":"server/hello\u0000x"})", doc, root));
     EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::UNKNOWN);
 }
 
@@ -494,7 +505,7 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
                       R"("sample_rate":44100,"channels":300,"bit_depth":16}}}})",
                       doc, root));
     StreamStartMessage msg;
-    EXPECT_FALSE(process_stream_start_message(root, &msg));
+    EXPECT_FALSE(process_stream_start_message(root, STREAM_START_ROLES, &msg));
     // The rejected section is reset, so the codec, sample rate and bit depth that did parse do
     // not survive into the caller's message beside the dropped channel count.
     EXPECT_FALSE(msg.player.has_value());
@@ -506,10 +517,70 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
                       R"("sample_rate":44100,"channels":2,"bit_depth":16}}}})",
                       doc_ok, root_ok));
     StreamStartMessage ok;
-    EXPECT_TRUE(process_stream_start_message(root_ok, &ok));
+    EXPECT_TRUE(process_stream_start_message(root_ok, STREAM_START_ROLES, &ok));
     ASSERT_TRUE(ok.player.has_value());
-    ASSERT_TRUE(ok.player->channels.has_value());
-    EXPECT_EQ(ok.player->channels.value(), 2);
+    ASSERT_TRUE(ok.player->params.channels.has_value());
+    EXPECT_EQ(ok.player->params.channels.value(), 2);
+}
+
+// roles/player/v1.md "Codec framing": a FLAC codec_header is required and carries the fLaC marker
+// followed by the STREAMINFO block, in standard Base64, so the parse accepts exactly that
+// (with STREAMINFO marked as the last metadata block) and decodes it. pcm carries none, and a
+// header beside it is not read.
+TEST(Protocol, StreamStartFlacCodecHeaderMustBeMarkerAndStreamInfo) {
+    // What the control row's header decodes to: fLaC, a last STREAMINFO block header of length
+    // 34, and a 48 kHz stereo 16-bit STREAMINFO.
+    constexpr FlacCodecHeader DECODED = {'f',  'L',  'a',  'C',  0x80, 0x00, 0x00, 0x22, 0x10,
+                                         0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                         0x0b, 0xb8, 0x02, 0xf0};
+    struct Row {
+        const char* name;
+        const char* codec;
+        const char* header;  // The codec_header member, or nullptr to omit it
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: the marker and a last STREAMINFO", "flac",
+         R"("ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", true},
+        {"no header", "flac", nullptr, false},
+        {"bad Base64", "flac", R"("ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAA*")", false},
+        {"a space in place of a character", "flac",
+         R"("ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAA ")", false},
+        {"an extra padding character", "flac",
+         R"("ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA=")", false},
+        {"the marker misspelled", "flac",
+         R"("ZkxBQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", false},
+        {"STREAMINFO not marked last", "flac",
+         R"("ZkxhQwAAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", false},
+        {"a block type other than STREAMINFO", "flac",
+         R"("ZkxhQ4EAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", false},
+        {"a block length other than 34", "flac",
+         R"("ZkxhQ4AAACEQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA")", false},
+        {"pcm without a header", "pcm", nullptr, true},
+        {"pcm beside a header it does not read", "pcm", R"("not base64")", true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        std::string player = std::string(R"({"codec":")") + row.codec +
+                             R"(","sample_rate":48000,"channels":2,"bit_depth":16)";
+        if (row.header != nullptr) {
+            player += std::string(R"(,"codec_header":)") + row.header;
+        }
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":)" + player + "}}}", doc,
+                          root));
+        StreamStartMessage msg;
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), row.accepted);
+        ASSERT_EQ(msg.player.has_value(), row.accepted);
+        if (row.accepted) {
+            const bool flac = std::string_view(row.codec) == "flac";
+            ASSERT_EQ(msg.player->flac_header.has_value(), flac);
+            if (flac) {
+                EXPECT_EQ(*msg.player->flac_header, DECODED);
+            }
+        }
+    }
 }
 
 // A stream/start carrying a malformed section is rejected whole, so a well-formed section beside
@@ -524,7 +595,7 @@ TEST(Protocol, StreamStartWithAMalformedPlayerDropsAValidArtworkSection) {
                       R"("width":100,"height":100}]}}})",
                       doc, root));
     StreamStartMessage msg;
-    EXPECT_FALSE(process_stream_start_message(root, &msg));
+    EXPECT_FALSE(process_stream_start_message(root, STREAM_START_ROLES, &msg));
     EXPECT_FALSE(msg.player.has_value());
     EXPECT_FALSE(msg.artwork.has_value())
         << "the artwork section survived a message the parser rejected";
@@ -536,10 +607,43 @@ TEST(Protocol, StreamStartWithAMalformedPlayerDropsAValidArtworkSection) {
                       R"([{"source":"album","format":"jpeg","width":100,"height":100}]}}})",
                       doc_ok, root_ok));
     StreamStartMessage ok;
-    EXPECT_TRUE(process_stream_start_message(root_ok, &ok));
+    EXPECT_TRUE(process_stream_start_message(root_ok, STREAM_START_ROLES, &ok));
     ASSERT_TRUE(ok.artwork.has_value());
     ASSERT_TRUE(ok.artwork->channels.has_value());
     EXPECT_EQ(ok.artwork->channels->size(), 1u);
+}
+
+// As with server/state, only the sections of the roles the parser is given are parsed, so a section
+// no role takes is not validated either: the malformed player section that rejects the message for
+// a connection owning the player is skipped for one owning only artwork.
+TEST(Protocol, StreamStartParsesOnlyTheTakenSections) {
+    struct Row {
+        const char* name;
+        EnumSet<SendspinRole> roles;
+        bool accepted;
+        bool has_artwork;
+    };
+    const Row rows[] = {
+        {"Control: the player section is taken, so its malformed channels reject the message",
+         STREAM_START_ROLES, false, false},
+        {"the player section is skipped and the artwork section taken",
+         EnumSet<SendspinRole>{SendspinRole::ARTWORK}, true, true},
+        {"no section is taken", EnumSet<SendspinRole>{}, true, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":{"codec":"pcm",)"
+                          R"("sample_rate":44100,"channels":300,"bit_depth":16},)"
+                          R"("artwork":{"channels":[{"source":"album","format":"jpeg",)"
+                          R"("width":100,"height":100}]}}})",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_EQ(process_stream_start_message(root, row.roles, &msg), row.accepted);
+        EXPECT_FALSE(msg.player.has_value());
+        EXPECT_EQ(msg.artwork.has_value(), row.has_artwork);
+    }
 }
 
 // Spec "stream/start artwork object": format, width and height are required unless source is
@@ -565,7 +669,8 @@ TEST(Protocol, StreamStartArtworkFieldsRequiredUnlessSourceNone) {
                            c.channels + "}}}";
         ASSERT_TRUE(parse(json.c_str(), doc, root));
         StreamStartMessage msg;
-        EXPECT_EQ(process_stream_start_message(root, &msg), c.accepted) << c.channels;
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), c.accepted)
+            << c.channels;
         EXPECT_EQ(msg.artwork.has_value(), c.accepted) << c.channels;
         if (c.accepted) {
             ASSERT_EQ(msg.artwork->channels->size(), 2u);
@@ -594,11 +699,42 @@ TEST(Protocol, StreamStartArtworkChannelsAtMostFour) {
         StreamStartMessage msg;
         // Control: four channels, every slot, are accepted.
         const bool accepted = count <= 4;
-        EXPECT_EQ(process_stream_start_message(root, &msg), accepted);
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), accepted);
         if (accepted) {
             ASSERT_TRUE(msg.artwork.has_value());
             EXPECT_EQ(msg.artwork->channels->size(), count);
         }
+    }
+}
+
+// roles/artwork/v1.md "stream/start artwork object": the channels array is required, so an artwork
+// object without one rejects the whole message and the valid player section beside it does not
+// start a stream.
+TEST(Protocol, StreamStartRejectsAnArtworkSectionWithoutChannels) {
+    struct Row {
+        const char* name;
+        const char* artwork;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: a channels array", R"({"channels":[{"source":"none"}]})", true},
+        {"no channels", R"({})", false},
+        {"channels that is not an array", R"({"channels":5})", false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"stream/start","payload":{)"
+                                      R"("player":{"codec":"pcm","sample_rate":48000,)"
+                                      R"("channels":2,"bit_depth":16},"artwork":)") +
+                              row.artwork + "}}",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), row.accepted);
+        EXPECT_EQ(msg.player.has_value(), row.accepted)
+            << "the player section survived a message the parser rejected";
+        EXPECT_EQ(msg.artwork.has_value(), row.accepted);
     }
 }
 
@@ -730,16 +866,16 @@ TEST(Protocol, FriendlyNamesAreTruncatedToTheirCap) {
 // client-stream/start, which must include pcm and flac, with unrecognized identifiers ignored. A
 // malformed object rejects only itself, never the hello.
 TEST(Protocol, ServerHelloSourceSupportListsAcceptedCodecs) {
-    constexpr uint8_t PCM_FLAC =
-        source_codec_bit(SendspinCodecFormat::PCM) | source_codec_bit(SendspinCodecFormat::FLAC);
+    using Codecs = EnumSet<SendspinCodecFormat>;
+    const Codecs PCM_FLAC{SendspinCodecFormat::PCM, SendspinCodecFormat::FLAC};
     struct Row {
         const char* payload;
-        std::optional<uint8_t> codecs;
+        std::optional<Codecs> codecs;
     };
     const Row rows[] = {
         // Control: a listed codec set parses.
         {R"("source@v1_support":{"supported_codecs":["pcm","flac","opus"]})",
-         PCM_FLAC | source_codec_bit(SendspinCodecFormat::OPUS)},
+         Codecs{SendspinCodecFormat::PCM, SendspinCodecFormat::FLAC, SendspinCodecFormat::OPUS}},
         // An unrecognized identifier is dropped, the rest kept.
         {R"("source@v1_support":{"supported_codecs":["pcm","mp3","flac"]})", PCM_FLAC},
         // A repeated identifier names its codec once.
@@ -771,100 +907,103 @@ TEST(Protocol, ServerHelloSourceSupportListsAcceptedCodecs) {
     }
 }
 
-// If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a
-// non-zero bin count must be present. Otherwise the expected size of binary spectrum messages
-// would be indeterminate, so the visualizer object is dropped, but only that object: the message
-// itself still parses so a well-formed player/artwork start alongside it is not lost.
-TEST(Protocol, StreamStartDropsSpectrumWithoutValidConfig) {
-    // (a) SPECTRUM advertised but no spectrum object at all.
-    {
+// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": types (a string[]) and
+// rate_max are required, tracks_downbeats is required if types includes 'beat', and a stream that
+// advertises SPECTRUM carries a valid spectrum config with a non-zero bin count, without which the
+// expected size of binary spectrum messages is indeterminate. Like any malformed section, a
+// visualizer object missing one rejects the whole message, so the valid player section beside it
+// does not start a stream. An unrecognized type string is skipped, and the types are a subset, so
+// a repeat is held once.
+TEST(Protocol, StreamStartRejectsAnIncompleteVisualizerSection) {
+    struct Row {
+        const char* name;
+        const char* visualizer;
+        bool accepted;
+        bool tracks_downbeats;
+        uint8_t spectrum_bins;  // 0: no spectrum config
+        EnumSet<VisualizerDataType> types{};
+    };
+    const Row rows[] = {
+        {"Control: SPECTRUM with a valid config",
+         R"({"types":["spectrum"],"rate_max":30,)"
+         R"("spectrum":{"n_disp_bins":32,"scale":"log","f_min":20,"f_max":20000}})",
+         true, false, 32, {VisualizerDataType::SPECTRUM}},
+        {"Control: beat with tracks_downbeats",
+         R"({"types":["beat"],"rate_max":30,"tracks_downbeats":true})", true, true, 0,
+         {VisualizerDataType::BEAT}},
+        {"Control: an unrecognized type is skipped and a repeated one counted once",
+         R"({"types":["peak","bogus","loudness","peak"],"rate_max":30})", true, false, 0,
+         {VisualizerDataType::LOUDNESS, VisualizerDataType::PEAK}},
+        {"no types", R"({"rate_max":30})", false, false, 0},
+        {"types that is not an array", R"({"types":"loudness","rate_max":30})", false, false, 0},
+        {"a types entry that is not a string", R"({"types":["loudness",42],"rate_max":30})", false,
+         false, 0},
+        {"no rate_max", R"({"types":["loudness"]})", false, false, 0},
+        {"a rate_max that is not an integer", R"({"types":["loudness"],"rate_max":"30"})", false,
+         false, 0},
+        {"beat without tracks_downbeats", R"({"types":["beat"],"rate_max":30})", false, false, 0},
+        {"a tracks_downbeats that is not a boolean",
+         R"({"types":["beat"],"rate_max":30,"tracks_downbeats":1})", false, false, 0},
+        {"SPECTRUM with no spectrum object", R"({"types":["spectrum"],"rate_max":30})", false,
+         false, 0},
+        {"a zero bin count",
+         R"({"types":["spectrum"],"rate_max":30,"spectrum":{"n_disp_bins":0,"scale":"log",)"
+         R"("f_min":20,"f_max":20000}})",
+         false, false, 0},
+        {"a bin count that is not an integer",
+         R"({"types":["spectrum"],"rate_max":30,"spectrum":{"n_disp_bins":"32","scale":"log",)"
+         R"("f_min":20,"f_max":20000}})",
+         false, false, 0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
         JsonDocument doc;
         JsonObject root;
-        ASSERT_TRUE(parse(
-            R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"]}}})", doc,
-            root));
-        StreamStartMessage msg;
-        EXPECT_TRUE(process_stream_start_message(root, &msg));
-        EXPECT_FALSE(msg.visualizer.has_value());
-    }
-    // (b) spectrum object present but n_disp_bins is zero.
-    {
-        JsonDocument doc;
-        JsonObject root;
-        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
-                          R"("spectrum":{"n_disp_bins":0}}}})",
+        ASSERT_TRUE(parse(std::string(R"({"type":"stream/start","payload":{)"
+                                      R"("player":{"codec":"pcm","sample_rate":48000,)"
+                                      R"("channels":2,"bit_depth":16},"visualizer":)") +
+                              row.visualizer + "}}",
                           doc, root));
         StreamStartMessage msg;
-        EXPECT_TRUE(process_stream_start_message(root, &msg));
-        EXPECT_FALSE(msg.visualizer.has_value());
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), row.accepted);
+        EXPECT_EQ(msg.player.has_value(), row.accepted)
+            << "the player section survived a message the parser rejected";
+        ASSERT_EQ(msg.visualizer.has_value(), row.accepted);
+        if (row.accepted) {
+            EXPECT_EQ(msg.visualizer->rate_max, 30);
+            EXPECT_EQ(msg.visualizer->types, row.types);
+            EXPECT_EQ(msg.visualizer->tracks_downbeats, row.tracks_downbeats);
+            ASSERT_EQ(msg.visualizer->spectrum.has_value(), row.spectrum_bins != 0);
+            if (row.spectrum_bins != 0) {
+                EXPECT_EQ(msg.visualizer->spectrum->n_disp_bins, row.spectrum_bins);
+            }
+        }
     }
-    // (c) n_disp_bins present but not an integer.
-    {
-        JsonDocument doc;
-        JsonObject root;
-        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
-                          R"("spectrum":{"n_disp_bins":"32"}}}})",
-                          doc, root));
-        StreamStartMessage msg;
-        EXPECT_TRUE(process_stream_start_message(root, &msg));
-        EXPECT_FALSE(msg.visualizer.has_value());
-    }
-    // (d) a valid player start in the same message survives the malformed visualizer object.
-    {
-        JsonDocument doc;
-        JsonObject root;
-        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{)"
-                          R"("player":{"codec":"pcm","sample_rate":48000,"channels":2,)"
-                          R"("bit_depth":16},)"
-                          R"("visualizer":{"types":["spectrum"]}}})",
-                          doc, root));
-        StreamStartMessage msg;
-        EXPECT_TRUE(process_stream_start_message(root, &msg));
-        EXPECT_FALSE(msg.visualizer.has_value());
-        ASSERT_TRUE(msg.player.has_value());
-        EXPECT_EQ(msg.player->sample_rate, 48000U);
-    }
-
-    // Control: SPECTRUM advertised with a valid config is accepted.
-    JsonDocument doc_ok;
-    JsonObject root_ok;
-    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
-                      R"("rate_max":30,)"
-                      R"("spectrum":{"n_disp_bins":32,"scale":"log","f_min":20,"f_max":20000}}}})",
-                      doc_ok, root_ok));
-    StreamStartMessage ok;
-    ASSERT_TRUE(process_stream_start_message(root_ok, &ok));
-    ASSERT_TRUE(ok.visualizer.has_value());
-    EXPECT_EQ(ok.visualizer->rate_max, 30);
-    EXPECT_FALSE(ok.visualizer->tracks_downbeats);
-    ASSERT_TRUE(ok.visualizer->spectrum.has_value());
-    EXPECT_EQ(ok.visualizer->spectrum->n_disp_bins, 32);
 }
 
-// The color parser reads each component as a uint8, so a non-integer (or out-of-range) component
-// fails the type check and the whole color is left without a value.
 // supported_commands is validated element-by-element. The controller role is frozen at v1, so an
 // unrecognized command is a non-compliant value that is dropped (and logged), while the valid
-// commands around it are kept in order.
+// commands around it are kept. roles/controller/v1.md "server/state controller object" makes them
+// a subset, so a repeated command is held once.
 TEST(Protocol, ControllerSupportedCommandsValidation) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
-                      R"({"supported_commands":["play","bogus","mute"]}}})",
+                      R"({"supported_commands":["mute","bogus","play","mute"]}}})",
                       doc, root));
-    ServerStateControllerObject controller;
+    ControllerStatePayload controller;
     ASSERT_TRUE(process_server_state_controller(root, &controller));
 
-    const auto& commands = controller.supported_commands;
-    ASSERT_EQ(commands.size(), 2u);  // "bogus" dropped
-    EXPECT_EQ(commands[0], SendspinControllerCommand::PLAY);
-    EXPECT_EQ(commands[1], SendspinControllerCommand::MUTE);
+    EXPECT_EQ(controller.supported_commands,
+              (ControllerCommandSet{SendspinControllerCommand::PLAY, SendspinControllerCommand::MUTE}))
+        << "\"bogus\" kept or a valid command dropped";
 }
 
 // A field the object omits goes back to its default, whatever the target struct held before, the
 // same way the metadata and color objects replace what they omit.
 TEST(Protocol, ControllerObjectReplacesEveryFieldItOmits) {
-    ServerStateControllerObject controller;
+    ControllerStatePayload controller;
+    controller.supported_commands = {SendspinControllerCommand::PAUSE};
     controller.volume = 50;
     controller.muted = true;
     controller.repeat = SendspinRepeatMode::ALL;
@@ -878,8 +1017,7 @@ TEST(Protocol, ControllerObjectReplacesEveryFieldItOmits) {
                       doc, root));
     ASSERT_TRUE(process_server_state_controller(root, &controller));
 
-    ASSERT_EQ(controller.supported_commands.size(), 1u);
-    EXPECT_EQ(controller.supported_commands[0], SendspinControllerCommand::PLAY);
+    EXPECT_EQ(controller.supported_commands, ControllerCommandSet{SendspinControllerCommand::PLAY});
     EXPECT_EQ(controller.volume, 0);
     EXPECT_FALSE(controller.muted);
     EXPECT_EQ(controller.repeat, SendspinRepeatMode::OFF);
@@ -907,7 +1045,7 @@ TEST(Protocol, ControllerSeekMaxIsParsedOnlyWhenServed) {
         ASSERT_TRUE(parse(std::string(R"({"type":"server/state","payload":{"controller":)") +
                               row.controller_json + "}}",
                           doc, root));
-        ServerStateControllerObject controller;
+        ControllerStatePayload controller;
         ASSERT_TRUE(process_server_state_controller(root, &controller));
         EXPECT_EQ(controller.seek_max_ms, row.expected);
     }
@@ -1173,6 +1311,180 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
     EXPECT_FALSE(doc["payload"]["device_info"]["manufacturer"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["software_version"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["mac_address"].is<const char*>());
+}
+
+// ============================================================================
+// Application-specific roles in client/hello
+// ============================================================================
+
+// messaging.md "client/hello": application-specific roles follow the library's own roles in
+// supported_roles, and a support object is keyed "<role>_support", for a name as long as start()
+// admits too. The role without one sends no key, and the defined role keeps its place and its
+// support object.
+TEST(Protocol, FormatClientHelloApplicationRoles) {
+    ClientHelloMessage msg;
+    msg.name = "Speaker";
+    msg.supported_roles.push_back(SendspinRole::VISUALIZER);
+    VisualizerSupportObject vis{};
+    vis.buffer_capacity = 4096;
+    msg.visualizer_support = vis;
+    const std::string longest =
+        "_" + std::string(MAX_APPLICATION_ROLE_NAME_BYTES - 4, 'a') + "@v1";
+    const SendspinApplicationRole app_roles[] = {
+        {"_acme_pairing@v1", std::string(R"({"port":8930})")},
+        {"_acme_display@v2", std::nullopt},
+        {longest, std::string(R"({"b":true})")},
+    };
+    msg.application_roles = app_roles;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, built_text([&](JsonDocument& message) {
+                                     build_client_hello_message(&msg, message);
+                                 })));
+    JsonArrayConst roles = doc["payload"]["supported_roles"];
+    ASSERT_EQ(roles.size(), 4U);
+    EXPECT_STREQ(roles[0], "visualizer@v1");
+    EXPECT_STREQ(roles[1], "_acme_pairing@v1");
+    EXPECT_STREQ(roles[2], "_acme_display@v2");
+    EXPECT_EQ(roles[3].as<std::string>(), longest);
+
+    JsonObjectConst support = doc["payload"]["_acme_pairing@v1_support"];
+    ASSERT_FALSE(support.isNull());
+    EXPECT_EQ(support.size(), 1U);
+    EXPECT_EQ(support["port"].as<int>(), 8930);
+    EXPECT_TRUE(doc["payload"]["_acme_display@v2_support"].isUnbound());
+    EXPECT_TRUE(doc["payload"][longest + "_support"]["b"].as<bool>());
+    EXPECT_EQ(doc["payload"]["visualizer@v1_support"]["buffer_capacity"].as<int>(), 4096);
+}
+
+// README.md "Application-Specific Roles": a leading `_` and an explicit `@version`.
+TEST(ApplicationRole, NameNeedsLeadingUnderscoreAndVersion) {
+    struct Row {
+        const char* name;
+        std::string role;
+        bool expect_ok;
+    };
+    // MAX_APPLICATION_ROLE_NAME_BYTES bytes with "_" and "@v1"
+    const std::string longest =
+        "_" + std::string(MAX_APPLICATION_ROLE_NAME_BYTES - 4, 'a') + "@v1";
+    const Row rows[] = {
+        {"defined role", "player@v1", false},
+        {"no version", "_acme_display", false},
+        {"empty version", "_acme_display@", false},
+        {"no name", "_@v1", false},
+        {"two @", "_acme@v1@v2", false},
+        {"space", "_acme display@v1", false},
+        {"quote, which JSON escapes", "_acme\"display@v1", false},
+        {"backslash, which JSON escapes", "_acme\\display@v1", false},
+        {"DEL", "_acme\x7f" "display@v1", false},
+        {"non-ASCII", "_acme\xc3\xa9@v1", false},
+        {"empty", "", false},
+        {"one byte too long", "_a" + longest.substr(1), false},
+        // Control: well-formed names, the shortest and the longest included.
+        {"vendor-prefixed", "_acme_display@v1", true},
+        {"shortest", "_a@1", true},
+        {"longest", longest, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(is_valid_application_role_name(row.role), row.expect_ok);
+    }
+}
+
+// The support object is embedded without a second parse, so start() sends ArduinoJson's own
+// serialization: anything but one JSON object, an object nested deeper than client/hello's 10
+// levels leave room for under its root and payload (messaging.md "client/hello"), or strings that
+// are not UTF-8 or hold a control byte (which the serializer would emit raw), is refused, and
+// lenient input the parser accepts goes out as standard JSON.
+TEST(ApplicationRole, SupportJsonIsNormalizedToOneObject) {
+    struct Row {
+        const char* name;
+        std::string json;
+        std::optional<std::string> expect;
+    };
+    // An object nested `levels` deep, itself level 1
+    const auto nested = [](size_t levels) {
+        std::string json = "{}";
+        for (size_t i = 1; i < levels; ++i) {
+            json = R"({"a":)" + json + "}";
+        }
+        return json;
+    };
+    const Row rows[] = {
+        {"nested 9 levels", nested(9), std::nullopt},
+        {"array", "[1]", std::nullopt},
+        {"number", "8930", std::nullopt},
+        {"truncated", R"({"port":)", std::nullopt},
+        {"trailing value", R"({"port":1}{})", std::nullopt},
+        {"trailing junk", R"({"port":1} x)", std::nullopt},
+        {"invalid UTF-8", "{\"a\":\"\xc3\x28\"}", std::nullopt},
+        {"surrogate in UTF-8", "{\"a\":\"\xed\xa0\x80\"}", std::nullopt},
+        {"empty", "", std::nullopt},
+        {"unquoted key", "{port:1}", R"({"port":1})"},
+        {"single quotes", "{'a':'b'}", R"({"a":"b"})"},
+        {"raw control byte", "{\"a\":\"x\x01\"}", std::nullopt},
+        {"escaped control byte", R"({"a":"x\u0001"})", std::nullopt},
+        // Control: objects, with surrounding whitespace, nesting and multi-byte UTF-8.
+        {"object", R"({"port":8930})", R"({"port":8930})"},
+        {"empty object", "{}", "{}"},
+        {"padded", " { \"a\" : {\"b\":[1,2]}}\n", R"({"a":{"b":[1,2]}})"},
+        {"nested 8 levels", nested(8), nested(8)},
+        {"UTF-8", "{\"a\":\"\xc3\xa9\xf0\x9f\x8e\xb5\"}", "{\"a\":\"\xc3\xa9\xf0\x9f\x8e\xb5\"}"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(normalize_support_object_json(row.json), row.expect);
+    }
+}
+
+// messaging.md "client/hello": at most 16384 bytes. client_hello_fits() measures the longest hello
+// a connection could send from the one start() builds: unpaired access off ("false" is longer than
+// "true") and a MAC address where none was detected yet.
+TEST(Protocol, ClientHelloFitsMeasuresTheLongestHello) {
+    constexpr size_t CAP = 16384;
+    const auto wire_size = [](const ClientHelloMessage& msg) {
+        return built_text([&](JsonDocument& message) { build_client_hello_message(&msg, message); })
+            .size();
+    };
+    // What a detected MAC adds to the hello
+    size_t mac_bytes = 0;
+    {
+        ClientHelloMessage msg;
+        msg.device_info.emplace();
+        const size_t without = wire_size(msg);
+        msg.device_info->mac_address = "aa:bb:cc:dd:ee:ff";
+        mac_bytes = wire_size(msg) - without;
+    }
+
+    struct Row {
+        const char* name;
+        bool unpaired_access;
+        bool has_mac;
+        size_t size;  // the hello's size as given, set by padding its name
+        bool expect_fits;
+    };
+    const Row rows[] = {
+        {"one byte over", false, true, CAP + 1, false},
+        {"a MAC detected later puts it over", false, false, CAP - mac_bytes + 1, false},
+        {"unpaired access turned off puts it over", true, true, CAP, false},
+        // Control: the longest hello exactly at the cap.
+        {"exactly the cap", false, true, CAP, true},
+        {"room left for a MAC detected later", false, false, CAP - mac_bytes, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        ClientHelloMessage msg;
+        msg.device_info.emplace();
+        if (row.has_mac) {
+            msg.device_info->mac_address = "aa:bb:cc:dd:ee:ff";
+        }
+        msg.unpaired_access_enabled = row.unpaired_access;
+        msg.name = "";  // a default string_view, with no data, goes out as null
+        const std::string name(row.size - wire_size(msg), 'n');
+        msg.name = name;
+        ASSERT_EQ(wire_size(msg), row.size);
+        EXPECT_EQ(client_hello_fits(msg), row.expect_fits);
+    }
 }
 
 // messaging.md "client/leave": the message carries no payload fields, but the envelope shape is
@@ -1534,22 +1846,29 @@ TEST(Protocol, ServerActivateParsesTheActivitiesList) {
 
 // messaging.md "server/activate": a present active_roles is the new set, read as the roles this
 // library implements plus whether it names any role at all. A version this library does not
-// implement sets no bit but still makes the set non-empty, which admission reads.
+// implement sets no bit but still makes the set non-empty, which admission reads, and so does an
+// entry that is not a string. A null active_roles keeps the prior set, and one that is not an array
+// rejects the activate.
 TEST(Protocol, ServerActivateReadsActiveRoles) {
     struct Row {
         const char* name;
         const char* roles_json;
+        bool accepted;
+        bool has_roles;
         uint16_t mask;
         bool empty;
     };
     const Row rows[] = {
-        {"Control: implemented roles", R"(["player@v1","metadata@v1"])",
+        {"Control: implemented roles", R"(["player@v1","metadata@v1"])", true, true,
          static_cast<uint16_t>(role_mask_bit(SendspinRole::PLAYER) |
                                role_mask_bit(SendspinRole::METADATA)),
          false},
-        {"a version this library does not implement", R"(["player@v2"])", 0, false},
-        {"an explicit empty set", "[]", 0, true},
-        {"no string element", "[7]", 0, true},
+        {"a version this library does not implement", R"(["player@v2"])", true, true, 0, false},
+        {"an explicit empty set", "[]", true, true, 0, true},
+        {"an entry that is not a string", "[7]", true, true, 0, false},
+        {"null keeps the prior set", "null", true, false, 0, false},
+        {"a string", R"("player@v1")", false, false, 0, false},
+        {"an object", R"({"player@v1":true})", false, false, 0, false},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -1560,10 +1879,16 @@ TEST(Protocol, ServerActivateReadsActiveRoles) {
                               row.roles_json + "}}",
                           doc, root));
         ServerActivateMessage msg;
-        ASSERT_TRUE(process_server_activate_message(root, &msg));
-        ASSERT_TRUE(msg.active_roles.has_value());
-        EXPECT_EQ(msg.active_roles->mask(), row.mask);
-        EXPECT_EQ(msg.active_roles->empty(), row.empty);
+        const bool accepted = process_server_activate_message(root, &msg);
+        EXPECT_EQ(accepted, row.accepted);
+        if (!accepted || !row.accepted) {
+            continue;
+        }
+        EXPECT_EQ(msg.active_roles.has_value(), row.has_roles);
+        if (row.has_roles && msg.active_roles.has_value()) {
+            EXPECT_EQ(msg.active_roles->mask(), row.mask);
+            EXPECT_EQ(msg.active_roles->empty(), row.empty);
+        }
     }
 }
 
@@ -1746,6 +2071,44 @@ TEST(Protocol, FormatClientPairRetryWireShape) {
     ASSERT_TRUE(doc["payload"].is<JsonObject>());
     EXPECT_EQ(doc["payload"].as<JsonObjectConst>().size(), 0u);
     EXPECT_EQ(doc.as<JsonObjectConst>().size(), 2u);
+}
+
+// docs/conventions.md "Embedded resource discipline": a log line prints at most
+// PEER_TEXT_LOG_BYTES of a peer's unrecognized value, however long the value is.
+TEST(Protocol, UnrecognizedPeerTextIsLoggedOnlyUpToTheBound) {
+    const std::string value(4 * PEER_TEXT_LOG_BYTES, 'x');
+    struct Row {
+        const char* name;
+        std::string json;
+        bool (*process)(JsonObject);
+    };
+    const Row rows[] = {
+        {"server/activate pairing.method",
+         R"({"type":"server/activate","payload":{"activities":["pairing"],)"
+         R"("pairing":{"method":")" +
+             value + R"("}}})",
+         [](JsonObject root) {
+             ServerActivateMessage msg;
+             return process_server_activate_message(root, &msg);
+         }},
+        {"pair/abort reason", R"({"type":"pair/abort","payload":{"reason":")" + value + R"("}})",
+         [](JsonObject root) {
+             PairAbortMessage msg;
+             return process_pair_abort_message(root, &msg);
+         }},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(row.json, doc, root));
+        StderrCapture capture;
+        (void)row.process(root);
+        const std::string log = capture.release();
+        EXPECT_NE(log.find(value.substr(0, PEER_TEXT_LOG_BYTES)), std::string::npos)
+            << "Control: the value is logged at all: " << log;
+        EXPECT_EQ(log.find(value.substr(0, PEER_TEXT_LOG_BYTES + 1)), std::string::npos) << log;
+    }
 }
 
 TEST(Protocol, FormatPairAbortWireShape) {

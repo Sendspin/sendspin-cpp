@@ -36,7 +36,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace sendspin {
 
@@ -428,10 +427,11 @@ public:
     void accept(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Initiates an outbound connection to a Sendspin server (SendspinClient::connect_to()).
-    /// Logs an error and connects nothing when the connection's inbound gate has no event group
+    /// Logs an error and connects nothing when the connection's block cannot be allocated
+    /// (make_connection_in_block()) or its inbound gate has no event group
     /// (InboundGate::is_created()).
     /// @param url WebSocket URL of the server to connect to.
-    void connect_to(const std::string& url);
+    void connect_to(std::string url);
 
     /// @brief Goodbyes and drops every connected managed connection (SendspinClient::disconnect())
     /// through drop_connection(), so the goodbye is the last thing on the wire (the pairing
@@ -494,7 +494,9 @@ public:
 
     /// @brief psk_ids backing a currently-open connection, admitted or in the nursery. These are
     /// the records a completed pairing must not evict (pairing.md "Pairing Records").
-    [[nodiscard]] std::vector<std::string> open_connection_psk_ids() const;
+    /// Each points into its connection, so it is valid only within the protocol-task step that
+    /// called this, which owns every connection.
+    [[nodiscard]] InlineVector<const IdText*, MAX_OPEN_CONNECTIONS> open_connection_psk_ids() const;
 
     // ========================================
     // Protocol task: tick
@@ -683,7 +685,7 @@ private:
                                         std::optional<SendspinGoodbyeReason> reason);
 
     /// @brief Refuses an accept queued before admission closed and taken after: goodbye with
-    /// reason shutdown and a close, and the connection kept for finish_stop().
+    /// reason shutdown and a close, and the connection released.
     void refuse_accept(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Goodbyes and closes `conn` with reason shutdown, and keeps it for finish_stop(). Its
@@ -940,10 +942,10 @@ private:
     // Released outbound connections waiting for their transports to finish (see ReapEntry).
     // Protocol task, then the main loop while the client is stopped.
     InlineVector<ReapEntry, REAPING_CAPACITY + 1> reaping_;
-    // Connections the shutdown pass took out of the slots, and accepts it refused, closed by
-    // their disconnect() and kept for finish_stop() to release. Written by the protocol task's
-    // shutdown pass, read on the main loop once the task is joined.
-    std::vector<std::shared_ptr<SendspinConnection>> closing_;
+    // Connections the shutdown pass took out of the slots, closed by their disconnect() and kept
+    // for finish_stop() to release: at most the admitted and nursery ones. Written by the
+    // protocol task's shutdown pass, read on the main loop once the task is joined.
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> closing_;
 
     // Pointer fields
     SendspinClient* client_;

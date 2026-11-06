@@ -37,6 +37,8 @@ add_executable(sendspin_tests
     test_protocol_task.cpp
     test_inbox.cpp
     test_player_role.cpp
+    test_controller_role.cpp
+    test_enum_set.cpp
     test_inline_text.cpp
     test_inline_vector.cpp
     test_fixed_block_pool.cpp
@@ -68,7 +70,7 @@ add_executable(sendspin_tests
 # test_decoder.cpp calls SyncTask::decode_whole_chunk(), the sync task's chunk-resume loop, which
 # is a protected static member: it grows the decode buffer, resumes the decoder and rolls a failed
 # chunk back, and nothing on the public surface reaches it without the sync thread. It also reads
-# SendspinDecoder::flac_decoder_, since a decoder object kept across streams shows nowhere else.
+# SendspinDecoder::flac_decoder(), since a decoder object kept across streams shows nowhere else.
 set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Built only with the trace it tests.
@@ -84,12 +86,15 @@ endif()
 # player_ and each role's impl_ (the sync task, which a feeder thread hands chunks to directly, and
 # the visualizer's drain list, whose links it reads under the list's lock); ProtocolTask's
 # command_mutex_ and command_count_ (how many commands wait); ConnectionManager's admitted_,
-# nursery_, install_admitted(), refresh_published_state(), scan_nursery(), close_admission() and
-# drop_connection() (to install, swap out, and drop a stand-in connection, and to run one scan);
+# nursery_, closing_ (an accept refused at stop() is released at once rather than held until
+# finish_stop(), which the peer cannot tell apart), install_admitted(), refresh_published_state(),
+# scan_nursery(), close_admission() and drop_connection() (to install, swap out, and drop a
+# stand-in connection, and to run one scan);
 # and SendspinConnection's noise_handshake_complete_ (a stand-in's finished handshake) and its
 # transport side, begin_inbound_message() and end_inbound_message() (a stand-in's transport writing
 # a ring item and a fallback message). The ring-size tables read SendspinClient::inbound_ring_ and
-# InboundRing::storage_, the ring a start() created, whose size no public call reports, and build
+# InboundRing::storage_, the ring a start() created, whose size no public call reports (and the
+# oversized-hello rollback reads inbound_ring_ to see a refused start() released it), and build
 # the player_'s and visualizer_'s client/hello fields through their impl_, the buffer_capacity a
 # hello advertises, which no public call returns. The returned-LOCAL-item destruction test reads
 # InboundRing::ring_'s host items_waiting_ under its mtx_ (the chunk was copied into the ring) and
@@ -146,7 +151,12 @@ endif()
 # frame written without a Noise session that another thread may read; the wake test restarts the
 # protocol task (protocol_task_->start()) with liveness off (liveness_timeout_us_) so the grant is
 # the only wake, and polls the client's Inbox through a role's impl_->inbox, which also lets the
-# reorder table fill the event ring. The stream-events table drives the player's
+# reorder table fill the event ring. The re-entrant pairing table queues pairing notes as the
+# protocol task's handlers do (SendspinClient's note_open_pairing_window(),
+# note_display_pairing_code() and note_clear_pairing_code()), since no public call shows a prompt,
+# and from inside its listener runs the final tick stop() would join (close_admission(),
+# protocol_tick()), so the shutdown pass takes the prompt flags it set on its stand-in's
+# pairing_session() (window_shown and code_emitted). The stream-events table drives the player's
 # handle_stream_start() and handle_stream_end() as the task would, and stages one interleaving by
 # waiting on the sync task's item list and the player's sync-idle topic bit, and its clear row calls
 # handle_stream_clear() the same way. The next-stream header table plays the sync task itself on
@@ -226,7 +236,8 @@ set_source_files_properties(test_inbound_ring.cpp PROPERTIES COMPILE_OPTIONS -fn
 
 # test_record_store.cpp reads records_ directly and calls the store's private locked-context
 # lookups (record_by_psk_id, record_by_server_id); the store deliberately exposes no copying
-# accessor for them, since nothing in the library needs one.
+# accessor for them, since nothing in the library needs one. It also reads the address of
+# records_'s block, the only sign of whether a change after construction reallocated it.
 set_source_files_properties(test_record_store.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and

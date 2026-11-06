@@ -33,6 +33,7 @@
 #include "inbound_ring.h"
 #include "inbox.h"
 #include "lifecycle_test_fixtures.h"
+#include "log_capture.h"
 #include "platform/crypto.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
@@ -126,6 +127,7 @@ constexpr uint16_t UNPAIRED_TOGGLE_OUTBOUND_TEST_PORT = 19095;
 constexpr uint16_t UNPAIRED_TOGGLE_REKEY_TEST_PORT = 19096;
 constexpr uint16_t UNPAIRED_TOGGLE_STOPPED_TEST_PORT = 19097;
 constexpr uint16_t UNPAIRED_TOGGLE_NURSERY_PAIRING_TEST_PORT = 19098;
+constexpr uint16_t UNPAIRED_BAD_METHOD_TEST_PORT = 19204;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob() to a record slot key, so the pairing-flow test below
@@ -468,6 +470,44 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
            "told pairing is what is missing";
 
     pump_for(client, 100);
+}
+
+// messaging.md "server/activate", first rejection rule: pairing_required only when enabling
+// unpaired access would make the whole activation admissible, pairing method included. A
+// Sentinel session declaring playback alongside pairing_psk stays inadmissible with unpaired
+// access on, so it is unauthorized; the same activation naming an offered method is the control.
+TEST(EncryptedLifecycle, UnpairedPlaybackWithUnusablePairingMethodIsUnauthorized) {
+    TestNetworkProvider network;
+    InMemoryPersistenceProvider persistence;
+    SendspinClientConfig config;
+    config.name = "Unpaired Bad Method Test Client";
+    config.server_port = UNPAIRED_BAD_METHOD_TEST_PORT;
+    config.static_pairing_code = "13572468";
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    struct Row {
+        const char* method;
+        const char* expected;
+    };
+    for (const Row& row : {Row{"pairing_psk", "unauthorized"},
+                           // Control: an offered method keeps pairing_required.
+                           Row{"static_pairing_code", "pairing_required"}}) {
+        SCOPED_TRACE(row.method);
+        FakeEncryptedServerOptions options;
+        options.first_activities_json = R"(["playback","pairing"])";
+        options.first_roles_json = R"([])";
+        options.first_pairing_method = row.method;
+        FakeEncryptedServer server(server_url(UNPAIRED_BAD_METHOD_TEST_PORT),
+                                   std::string(NOISE_SUITE_CHACHAPOLY), Identity::generate().value(),
+                                   std::string(SENTINEL_PSK_ID), SENTINEL_PSK, options);
+        pump_until(client, [&] { return server.closed(); });
+        EXPECT_EQ(server.goodbye_reason(), std::optional<std::string>(row.expected));
+    }
+
+    client.stop();
 }
 
 // The hello must advertise a pairing method the server can actually start. pairing_psk is the
@@ -2090,6 +2130,21 @@ TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
     client.stop();
 }
 
+// Any connection keyed with the published Sentinel PSK can send a message of a type no handler
+// takes; its warning prints at most PEER_TEXT_LOG_BYTES of that type.
+TEST(EncryptedLifecycle, AnUnhandledTypeIsLoggedOnlyUpToTheBound) {
+    DispatchTestClient bundle("Unhandled Type Log Test Client");
+    DispatchTestConnection& conn = bundle.connection();
+
+    const std::string type(4 * PEER_TEXT_LOG_BYTES, 'x');
+    StderrCapture capture;
+    bundle.deliver(conn, R"({"type":")" + type + R"("})");
+    const std::string log = capture.release();
+    EXPECT_NE(log.find(type.substr(0, PEER_TEXT_LOG_BYTES)), std::string::npos)
+        << "Control: the type is logged at all: " << log;
+    EXPECT_EQ(log.find(type.substr(0, PEER_TEXT_LOG_BYTES + 1)), std::string::npos) << log;
+}
+
 // messaging.md "server/state": each metadata object carries the role's full state, so what a
 // later object leaves out is gone rather than carried forward from the object before it.
 TEST(EncryptedLifecycle, MetadataStateReplacesRatherThanMerges) {
@@ -2973,7 +3028,7 @@ TEST(EncryptedLifecycle, AnEvictionBeforeTheFlushSparesTheRecordJustPlayed) {
 
     // What a protocol-task pair-finalize at capacity does, landing before the flush.
     SendspinPairingRecord incoming = make_record_for(Identity::generate().value());
-    ASSERT_TRUE(client.record_store_->store_record_superseding(incoming,
+    ASSERT_TRUE(client.record_store_->store_record_superseding(PairingRecord(incoming),
                                                                manager.open_connection_psk_ids()));
 
     EXPECT_TRUE(
@@ -3320,7 +3375,7 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     record.psk.fill(0x3C);
     record.psk_id = psk_id_for(record.psk);
     record.server_id = test_peer_id("unpair-window-server");
-    ASSERT_TRUE(client.record_store_->store_record_superseding(record, {}));
+    ASSERT_TRUE(client.record_store_->store_record_superseding(PairingRecord(record), {}));
 
     DispatchTestConnection conn;
     conn.set_noise_handshake_result(id_text(record.server_id), PskCategory::LONG_TERM,

@@ -71,10 +71,10 @@ namespace {
 ///
 /// messaging.md "Communication" keeps a message the client implements *recognized* while its role
 /// is inactive ("An ID the receiver implements is still recognized when its role is inactive"), so
-/// this is not the unknown-message rule: the message is parsed and validated as usual, the
-/// connection is never closed for it, and only the role's own handling is skipped. messaging.md
-/// "server/activate" requires the mirror of this of servers, so a role removal the peer has not
-/// yet seen never costs the connection.
+/// this is not the unknown-message rule: the message stays recognized and the connection is never
+/// closed for it, while what it carries for a role the connection does not take is skipped
+/// unparsed. messaging.md "server/activate" requires the mirror of this of servers, so a role
+/// removal the peer has not yet seen never costs the connection.
 ///
 /// The handler a true verdict admits loads the role's teardown generation itself and stamps what
 /// it queues with it for the drains to check (RoleTeardown). Protocol task only.
@@ -105,7 +105,7 @@ uint32_t SendspinClient::protocol_tick() {
     {
         LifecycleRequests requests;
         if (this->protocol_task_->take_requests(requests)) {
-            this->apply_lifecycle_requests(requests);
+            this->apply_lifecycle_requests(std::move(requests));
         }
         ProtocolCommand command;
         while (this->protocol_task_->take_command(command)) {
@@ -244,7 +244,7 @@ uint32_t SendspinClient::protocol_tick() {
     return next_deadline;
 }
 
-void SendspinClient::apply_lifecycle_requests(const LifecycleRequests& requests) {
+void SendspinClient::apply_lifecycle_requests(LifecycleRequests&& requests) {
     ConnectionManager& manager = *this->connection_manager_;
     // The gate handle_command() applies to every consumer command, for the same reason.
     if (!manager.is_accepting()) {
@@ -277,7 +277,7 @@ void SendspinClient::apply_lifecycle_requests(const LifecycleRequests& requests)
         manager.disconnect(requests.disconnect.value());
     }
     if (requests.connect_to.has_value()) {
-        manager.connect_to(requests.connect_to.value());
+        manager.connect_to(std::move(requests.connect_to.value()));
     }
 }
 
@@ -394,29 +394,51 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::STREAM_START: {
             SS_LOGD(TAG, "Stream Started");
 
+            // As with server/state, each section's role gate is decided before the parse (see
+            // process_stream_start_message()).
+            EnumSet<SendspinRole> take;
+#ifdef SENDSPIN_ENABLE_PLAYER
+            if (this->player_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
+                take.insert(SendspinRole::PLAYER);
+            }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+            if (this->artwork_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
+                take.insert(SendspinRole::ARTWORK);
+            }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+            if (this->visualizer_ &&
+                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
+                take.insert(SendspinRole::VISUALIZER);
+            }
+#endif
+
             StreamStartMessage stream_msg;
-            if (!parsed.extract<process_stream_start_message>(&stream_msg)) {
+            if (!parsed.extract([take, &stream_msg](JsonObject root) {
+                    return process_stream_start_message(root, take, &stream_msg);
+                })) {
                 SS_LOGE(TAG, "Failed to parse stream/start message");
                 break;
             }
 
+            // The parser fills only the sections in `take`.
 #ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_ && stream_msg.player.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
+            if (stream_msg.player.has_value()) {
                 this->player_->impl_->handle_stream_start(stream_msg.player.value());
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
-            if (this->artwork_ && stream_msg.artwork.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
+            if (stream_msg.artwork.has_value()) {
                 this->artwork_->impl_->handle_stream_start(stream_msg.artwork.value());
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-            if (this->visualizer_ && stream_msg.visualizer.has_value() &&
-                role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
+            if (stream_msg.visualizer.has_value()) {
                 this->visualizer_->impl_->handle_stream_start(stream_msg.visualizer.value());
             }
 #endif
@@ -573,7 +595,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             const bool take_controller =
                 this->controller_ &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::CONTROLLER);
-            ServerStateControllerObject controller_state;
+            ControllerStatePayload controller_state;
             bool controller_valid = false;
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
@@ -605,7 +627,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 
 #ifdef SENDSPIN_ENABLE_CONTROLLER
             if (controller_valid) {
-                this->controller_->impl_->handle_server_state(std::move(controller_state));
+                this->controller_->impl_->handle_server_state(controller_state);
             }
 #endif
 
@@ -691,8 +713,8 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             auto record = conn->take_pending_pairing_record();
             bool stored_record = false;
             if (record.has_value() && this->record_store_ != nullptr) {
-                // Logged before the store takes ownership of the record; a rejection warns
-                // from inside store_record_superseding().
+                // Logged before the store is asked; a rejection warns from inside
+                // store_record_superseding().
                 SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
                         record->psk_id.c_str());
                 // store_record_superseding() mutates RAM only. At capacity it evicts the
@@ -707,8 +729,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 // whatever this server held before, so the prior record for the same
                 // server_id must be retired or the old PSK stays valid forever.
                 if (this->record_store_->store_record_superseding(
-                        std::move(record.value()),
-                        this->connection_manager_->open_connection_psk_ids())) {
+                        record.value(), this->connection_manager_->open_connection_psk_ids())) {
                     stored_record = true;
                 }
             } else {
@@ -789,10 +810,11 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         }
         default: {
             // Nothing acts on an unhandled message, so its type is read in place.
-            const char* type = parsed.read([](JsonObject root) {
-                return root["type"].is<const char*>() ? root["type"].as<const char*>() : "unknown";
+            const std::string_view type = parsed.read([](JsonObject root) {
+                return peer_text_for_log(root["type"] | std::string_view("unknown"));
             });
-            SS_LOGW(TAG, "Unhandled server message type: %s", type);
+            SS_LOGW(TAG, "Unhandled server message type: %.*s", static_cast<int>(type.size()),
+                    type.data());
         }
     }
 }

@@ -103,7 +103,8 @@ constexpr uint16_t STREAM_ROLES_TEST_PORT = 19105;
 constexpr uint16_t HELLO_TEST_PORT = 19090;
 constexpr uint16_t OUTBOUND_GOODBYE_TEST_PORT = 19069;
 constexpr uint16_t NETWORK_PROVIDER_TEST_PORT = 19086;
-constexpr uint16_t INBOUND_OFF_TEST_PORT = 19105;
+constexpr uint16_t INBOUND_OFF_TEST_PORT = 19106;
+constexpr uint16_t HELLO_CAP_ROLLBACK_TEST_PORT = 19107;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -486,6 +487,29 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     EXPECT_EQ(listener.stream_ends, 1);
 }
 
+// start() measures client/hello once the roles have started, so a hello over the 16384 bytes
+// messaging.md "client/hello" allows rolls them back as a failed role start does: the player's
+// sync task is stopped and the inbound ring released, and a second start() is refused the same
+// way rather than finding them still running. Whether the sync task was stopped (its consumer
+// unbound) and the ring released is read directly: nothing public reports either.
+TEST(ClientLifecycle, OversizedHelloRollsBackStartedRoles) {
+    CountingPlayerListener listener;
+    SendspinClientConfig config = make_config(HELLO_CAP_ROLLBACK_TEST_PORT);
+    config.application_roles = {
+        {"_acme_display@v1", R"({"a":")" + std::string(16384, 'x') + R"("})"}};
+    PairedClientBundle bundle(std::move(config));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        SCOPED_TRACE(attempt);
+        EXPECT_FALSE(bundle.start());
+        EXPECT_FALSE(client.is_started());
+        EXPECT_EQ(client.player_->impl_->sync_task->inbound().ring(), nullptr);
+        EXPECT_EQ(client.inbound_ring_, nullptr);
+    }
+}
+
 /// How far ahead of now a visualizer frame is stamped so it is still in the future when the drain
 /// thread takes it, clear of the time filter's error on the same host.
 constexpr int64_t VISUALIZER_LEAD_US = 50 * 1000;
@@ -751,9 +775,10 @@ void send_spectrum_until(SendspinClient& client, FakeEncryptedServer& server,
 }
 
 // roles/visualizer/v1.md "Server -> Client: stream/start": the served spectrum object, not the
-// requested one, governs how many bins each frame carries. The negotiated count is what the
-// drain thread decodes with, so it is pinned where a consumer sees it: a stream that serves two
-// bins to a client that asked for four hands on_spectrum the first two of each wire frame.
+// requested one, governs how many bins each frame carries, up to the requested count (a served
+// count above it drops the spectrum frames). The negotiated count is what the drain thread
+// decodes with, so it is pinned where a consumer sees it: a stream that serves two bins to a
+// client that asked for four hands on_spectrum the first two of each wire frame.
 TEST(ClientLifecycle, TheServedSpectrumBinCountGovernsTheDeliveredFrame) {
     RecordingSpectrumListener listener;
     auto config = make_config(VISUALIZER_SPECTRUM_TEST_PORT);
@@ -1030,7 +1055,9 @@ size_t queued_commands(ProtocolTask& task) {
 // its push (ProtocolTask::close_accepts(), which ConnectionManager::close_admission() calls), so
 // its transport closes it without a goodbye and nothing is left queued for stop() to refuse. The
 // test thread plays the protocol task, so the accept provably sits in the queue when admission
-// closes. The open row is the control: the same queued accept is admitted and owed no goodbye.
+// closes, and the final tick releases the refused connection rather than keeping it beside the
+// shutdown pass's. The open row is the control: the same queued accept is admitted and owed no
+// goodbye.
 // The nursery-full rejection is covered by ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer.
 // Each row connects a real peer, and the Control row watches 200 ms for a goodbye that must not
 // come, so the table takes most of a second.
@@ -1072,6 +1099,9 @@ TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
                 wait_until([&] { return peer->goodbye_reason().has_value(); });
                 EXPECT_EQ(peer->goodbye_reason().value_or(""), "shutdown")
                     << "a newcomer refused at stop() must be told why";
+                // closing_ holds only the shutdown pass's connections, which bounds it.
+                EXPECT_TRUE(client.connection_manager_->closing_.empty())
+                    << "a refused accept was kept for finish_stop()";
                 break;
             case Taker::AFTER_CLOSE:
                 // No timeout: a delivery the queue took instead would never be closed here, since
@@ -2411,8 +2441,8 @@ struct StateRoleAccess {
     bool keeps_state;
 };
 
-ServerStateControllerObject controller_state_with(uint8_t value) {
-    ServerStateControllerObject state;
+ControllerStatePayload controller_state_with(uint8_t value) {
+    ControllerStatePayload state;
     state.volume = value;
     return state;
 }
@@ -2448,8 +2478,8 @@ ServerCommandMessage player_volume_with(uint8_t value) {
     return cmd;
 }
 
-ServerVisualizerStreamObject visualizer_stream_with(uint8_t value) {
-    ServerVisualizerStreamObject stream;
+VisualizerStreamPayload visualizer_stream_with(uint8_t value) {
+    VisualizerStreamPayload stream;
     stream.types = {VisualizerDataType::LOUDNESS};
     stream.rate_max = value;
     return stream;
@@ -2513,7 +2543,7 @@ const StateRoleAccess STATE_ROLES[] = {
      true, false},
     {"player stream params",
      [](SendspinClient& c, uint8_t v) {
-         c.player_->impl_->handle_stream_start(player_stream_with(v));
+         c.player_->impl_->handle_stream_start({player_stream_with(v)});
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          PlayerRole::Impl& impl = *c.player_->impl_;
@@ -2795,7 +2825,7 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
             params.sample_rate = 48000;
             params.channels = 2;
             params.bit_depth = 16;
-            impl.handle_stream_start(params);
+            impl.handle_stream_start({params});
             pump_until(client, [&] { return impl.sync_task->is_running(); });
             impl.handle_stream_end();
             pump_until(client, [&] { return !client.is_started(); });
@@ -2906,6 +2936,108 @@ TEST(ClientLifecycle, AFullTeardownKeepsTheDismissalsOfShownPrompts) {
         EXPECT_EQ(log.opens, row.expected_prompts);
         EXPECT_EQ(log.clears, row.expected_dismissals);
         EXPECT_EQ(log.closes, row.expected_dismissals);
+        client.stop();
+    }
+}
+
+/// Calls stop(), and then start() when `restart` is set, from inside the first
+/// on_display_pairing_code(). The test thread plays the protocol task, so the listener runs the
+/// final tick stop() would join first: admission closes, then the shutdown pass takes the
+/// admitted connection's prompt flags.
+class StopFromPairingPromptListener : public PairingPromptLog {
+public:
+    StopFromPairingPromptListener(SendspinClient*& client, bool reenter, bool restart)
+        : client_(client), reenter_(reenter), restart_(restart) {}
+
+    void on_display_pairing_code(const std::string& code,
+                                 SendspinPairingCodeFormat format) override {
+        PairingPromptLog::on_display_pairing_code(code, format);
+        if (this->reenter_ && !this->reentered_) {
+            this->reentered_ = true;
+            this->client_->connection_manager_->close_admission();
+            (void) this->client_->protocol_tick();
+            this->client_->stop();
+            if (this->restart_) {
+                this->restart_result = this->client_->start();
+            }
+        }
+    }
+
+    bool restart_result{false};
+
+private:
+    SendspinClient*& client_;
+    bool reenter_;
+    bool restart_;
+    bool reentered_{false};
+};
+
+// A pairing listener may call stop(), and start() after it, from inside the callback that shows a
+// code. stop() dismisses the code and the pairing window it was shown under exactly once, from its
+// own drain; the drain that showed the code abandons the rest of its batch, so the next round's
+// code queued behind it is never shown. After a restart the next batch drains as any other.
+// Control: without the re-entry both codes are shown and nothing is dismissed.
+TEST(ClientLifecycle, StopFromInsideAPairingCallbackDismissesThePromptOnce) {
+    struct Row {
+        const char* name;
+        bool reenter;
+        bool restart;
+        int expected_displays;
+        int expected_dismissals;
+    };
+    const Row rows[] = {
+        {"Control: no re-entry", false, false, 2, 0},
+        {"stop() with the next round's code queued behind", true, false, 1, 1},
+        {"stop() then start()", true, true, 1, 1},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SendspinClient* client_ref = nullptr;
+        StopFromPairingPromptListener log(client_ref, row.reenter, row.restart);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client_ref = &client;
+        client.set_network_provider(&network);
+        client.set_listener(&log);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+
+        // An attempt under a pairing window the operator was shown, with its code emitted.
+        auto conn = std::make_shared<StubConnection>();
+        conn->pairing_session().window_shown = true;
+        conn->pairing_session().code_emitted = true;
+        client.connection_manager_->install_admitted(conn, 0);
+        client.note_open_pairing_window();
+        client.loop();
+        ASSERT_EQ(log.opens, 1);
+
+        client.note_display_pairing_code("111111", SendspinPairingCodeFormat::DIGITS);
+        client.note_display_pairing_code("222222", SendspinPairingCodeFormat::DIGITS);
+        client.loop();
+        if (row.restart) {
+            ASSERT_TRUE(log.restart_result) << "start() from inside the callback was refused";
+            client.protocol_task_->stop();
+        }
+
+        EXPECT_EQ(log.displays, row.expected_displays);
+        EXPECT_EQ(log.clears, row.expected_dismissals);
+        EXPECT_EQ(log.closes, row.expected_dismissals);
+        client.loop();  // A later loop() delivers nothing the re-entry abandoned.
+        EXPECT_EQ(log.displays, row.expected_displays);
+        EXPECT_EQ(log.clears, row.expected_dismissals);
+
+        if (row.restart) {
+            client.note_display_pairing_code("333333", SendspinPairingCodeFormat::DIGITS);
+            client.note_clear_pairing_code();
+            client.loop();
+            EXPECT_EQ(log.displays, row.expected_displays + 1);
+            EXPECT_EQ(log.clears, row.expected_dismissals + 1);
+        }
+        // stop()'s order with the task played here, for a run the re-entry did not end.
+        if (client.is_started()) {
+            client.connection_manager_->close_admission();
+            (void) client.protocol_tick();
+        }
         client.stop();
     }
 }
@@ -3192,7 +3324,7 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params);
+            player.handle_stream_start({params});
         };
         const auto end = [&] { player.handle_stream_end(); };
 
@@ -3282,7 +3414,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         params.channels = 2;
         params.bit_depth = 16;
         const auto start = [&] {
-            player.handle_stream_start(params);
+            player.handle_stream_start({params});
         };
 
         start();
@@ -3403,14 +3535,13 @@ void drain_ring_as_protocol_task(InboundRing& ring, const ConnectionList& connec
 }
 
 /// Hands `count` marked 20 ms chunks straight to the sync task, stamped in the server's clock from
-/// `first_timestamp` onward, each in an item acquired from the inbound ring the way the protocol
-/// task writes a chunk it copies. Bypasses the server so a test can feed audio while it holds a
+/// `first_timestamp` onward, each copied into an item the way the protocol task hands over a chunk
+/// that arrived outside the ring. Bypasses the server so a test can feed audio while it holds a
 /// lock the client's own loop needs. Protocol-task work: the caller plays the task
-/// (play_protocol_task()). A batch that finds the ring full stops early; the caller's next batch
-/// retries.
+/// (play_protocol_task()). A batch that finds the ring full or the quota spent stops early; the
+/// caller's next batch retries.
 void feed_marked_chunks(PlayerRole::Impl& impl, int64_t first_timestamp, int count) {
     SyncTask& sync_task = *impl.sync_task;
-    InboundRing* ring = sync_task.inbound().ring();
     constexpr size_t FRAME_OFFSET = 13;  // type byte, server timestamp, send_ahead
     std::vector<uint8_t> message(FRAME_OFFSET + SINK_CHUNK_BYTES, SINK_AUDIO_MARK);
     message[0] = SENDSPIN_BINARY_PLAYER_AUDIO;
@@ -3421,20 +3552,16 @@ void feed_marked_chunks(PlayerRole::Impl& impl, int64_t first_timestamp, int cou
             message[1 + byte] = static_cast<uint8_t>(static_cast<uint64_t>(timestamp) >>
                                                      (56 - 8 * byte));
         }
-        void* item = ring->acquire_local(message.size(), 0);
-        if (item == nullptr) {
+        InboundMessage chunk{.data = message.data(), .len = message.size()};
+        if (!sync_task.inbound().hand_message(
+                chunk,
+                {.data_len = static_cast<uint32_t>(SINK_CHUNK_BYTES),
+                 .serial = 0,
+                 .type = CHUNK_TYPE_ENCODED_AUDIO,
+                 .data_offset = FRAME_OFFSET},
+                impl.cleanup_generation.load(std::memory_order_acquire))) {
             return;
         }
-        std::memcpy(inbound_item_bytes(item), message.data(), message.size());
-        ring->complete(item);
-        // Over quota, hand() returns the item itself.
-        (void)sync_task.inbound().hand(item, message.size(),
-                                       {.data_len = static_cast<uint32_t>(SINK_CHUNK_BYTES),
-                                        .serial = 0,
-                                        .type = CHUNK_TYPE_ENCODED_AUDIO,
-                                        .data_offset = FRAME_OFFSET},
-                                       impl.cleanup_generation.load(std::memory_order_acquire),
-                                       /*exempt=*/false);
         timestamp += 20 * 1000;
     }
 }
@@ -3586,7 +3713,7 @@ void start_stream_on(SendspinClient& client, std::shared_ptr<ObservedConnection>
     play_protocol_task(client);
     (void) replace_admitted(*client.connection_manager_, std::move(conn));
     PlayerRole::Impl& impl = *client.player_->impl_;
-    impl.handle_stream_start(pcm_stream_params());
+    impl.handle_stream_start({pcm_stream_params()});
     SyncTask& sync_task = *impl.sync_task;
     pump_until(client, [&] { return sync_task.is_running(); });
 }

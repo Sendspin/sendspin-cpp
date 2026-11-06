@@ -375,7 +375,8 @@ public:
     /// Ignored (with a warning) unless the client is running, including from a callback fired
     /// inside stop(). start() is where the identity and record store the Noise handshake needs
     /// are created. Any thread: the request is posted to the library's protocol task, which
-    /// replaces any earlier outbound attempt. It is never refused, and a second call before the
+    /// replaces any earlier outbound attempt, or skips the connect, keeping that attempt, when it
+    /// cannot allocate the connection. The post is never refused, and a second call before the
     /// task takes it replaces the URL. With disconnect(), the pair resolves by call order: a
     /// connect_to() after a disconnect() opens the new attempt once the goodbyes are sent, and a
     /// disconnect() after a connect_to() the task has not taken cancels it, so nothing opens. The
@@ -385,7 +386,7 @@ public:
     /// has passed (30 s on host; on ESP-IDF three connect steps of 10 s each, plus whatever a DNS
     /// lookup, which has no bound of its own, takes).
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
-    void connect_to(const std::string& url);
+    void connect_to(std::string url);
 
     /// @brief Disconnects from the current server with the given reason
     ///
@@ -849,7 +850,7 @@ private:
 
     /// @brief Acts on the lifecycle requests taken from the protocol task's request slot.
     /// Protocol task only.
-    void apply_lifecycle_requests(const LifecycleRequests& requests);
+    void apply_lifecycle_requests(LifecycleRequests&& requests);
 
     /// @brief Acts on one command from the queue. Protocol task only.
     void handle_command(ProtocolCommand& command);
@@ -861,8 +862,12 @@ private:
     void process_inbound(SendspinConnection& conn, InboundMessage& message);
 
     /// @brief Fills `msg` with the client/hello fields from config and every role, viewing them.
-    /// Protocol task.
+    /// Protocol task, or start() before the task runs.
     void build_client_hello(ClientHelloMessage& msg);
+
+    /// @brief Whether the longest client/hello a connection could send fits messaging.md's cap
+    /// (client_hello_fits()). start() only, once the roles have started.
+    bool hello_within_cap();
 
     /// @brief Builds the client/state snapshot publish_state() hands the protocol task: the
     /// availability and every role's state object. Main loop only, where that state lives.

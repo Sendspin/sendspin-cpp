@@ -59,11 +59,11 @@ enum class DecodeResult : uint8_t {
 struct SyncContext {
     // Struct fields
     AudioStreamInfo current_stream_info;  // Contains uint32_t and smaller members
+    TransferBuffer decode_buffer;  // Reusable decode + output buffer, allocated at the first codec
+                                   // header; reserves one spare frame past the decoded data for
+                                   // soft-sync frame insertion
 
     // Pointer fields
-    std::unique_ptr<TransferBuffer> decode_buffer;  // Reusable decode + output buffer; reserves one
-                                                    // spare frame past the decoded data for
-                                                    // soft-sync frame insertion
     std::unique_ptr<SendspinDecoder> decoder;
     /// The inbound ring item being decoded: an audio chunk, decoded straight from the ring
     /// storage it was received and decrypted into, or a codec header or stream/clear marker the

@@ -716,9 +716,10 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeAKeepingActivateStillStarts) {
 // messaging.md "Communication" keeps a message the client implements recognized while its role is
 // inactive, and messaging.md "server/activate" expects each side to tolerate the other's
 // inactive-role traffic rather than close on it, "since the client may not yet have received the
-// role removal". So role traffic that arrives after a removal is parsed as usual and then not
-// acted on: without that gate the first message after a removal would put the role straight back
-// in service and the teardown would be a one-shot with nothing holding it.
+// role removal". So role traffic that arrives after a removal stays recognized and is not acted
+// on, with a section for the removed role skipped unparsed: without that gate the first message
+// after a removal would put the role straight back in service and the teardown would be a one-shot
+// with nothing holding it.
 //
 // Every receive path is driven. The controls are the first half of the test, where the same
 // traffic is applied while the roles are active.

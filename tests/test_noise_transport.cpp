@@ -30,6 +30,7 @@
 #include "inbound_ring.h"
 #include "inbound_test_helpers.h"
 #include "lifecycle_test_fixtures.h"
+#include "log_capture.h"
 #include "loopback_connection.h"
 #include "crypto/keys.h"
 #include "noise_handshake.h"
@@ -246,7 +247,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     rec.psk_id = psk_id_val;
     rec.psk = psk;
     rec.server_id = other_server.peer_id();  // bound to other_server
-    rs.store_record_superseding(std::move(rec), {});
+    rs.store_record_superseding(PairingRecord(rec), {});
 
     TestArena arena;
     NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
@@ -311,7 +312,7 @@ Msg1Outcome run_msg1_with_payload(
         rec.psk_id = psk_id;
         rec.psk = psk;
         rec.server_id = server_id.peer_id();
-        rs.store_record_superseding(std::move(rec), {});
+        rs.store_record_superseding(PairingRecord(rec), {});
     }
 
     TestArena arena;
@@ -497,6 +498,38 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingServerInitAborts) {
         auto r = nh.on_text_frame(row.frame, [](const JsonDocument&) { return true; }, completed);
         EXPECT_EQ(r, HandshakeFrameResult::ABORT);
         EXPECT_EQ(nh.server_error_reason(), row.expected);
+    }
+}
+
+// The handshake's frames are unauthenticated, so the text it logs from them, an unexpected type
+// or a server/error reason, is cut to PEER_TEXT_LOG_BYTES.
+TEST(NoiseHandshakeDriver, UnexpectedPeerTextIsLoggedOnlyUpToTheBound) {
+    const std::string text(4 * PEER_TEXT_LOG_BYTES, 'x');
+    struct Row {
+        const char* name;
+        std::string frame;
+    };
+    const Row rows[] = {
+        {"an unexpected type", R"({"type":")" + text + R"(","payload":{}})"},
+        {"a server/error reason",
+         R"({"type":"server/error","payload":{"reason":")" + text + R"("}})"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Identity client_id = Identity::generate().value();
+        RecordStore rs(nullptr);
+        TestArena arena;
+        NoiseHandshake nh(client_id, rs, NOISE_SUITE_CHACHAPOLY, arena);
+        std::optional<NoiseHandshakeResult> completed;
+        nh.build_client_init();
+
+        StderrCapture capture;
+        EXPECT_EQ(nh.on_text_frame(row.frame, [](const JsonDocument&) { return true; }, completed),
+                  HandshakeFrameResult::ABORT);
+        const std::string log = capture.release();
+        EXPECT_NE(log.find(text.substr(0, PEER_TEXT_LOG_BYTES)), std::string::npos)
+            << "Control: the text is logged at all: " << log;
+        EXPECT_EQ(log.find(text.substr(0, PEER_TEXT_LOG_BYTES + 1)), std::string::npos) << log;
     }
 }
 

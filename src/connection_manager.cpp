@@ -17,9 +17,9 @@
 #include "admission.h"
 #include "client_connection.h"
 #include "connection.h"
+#include "connection_block.h"
 #include "constants.h"
 #include "crypto/constants.h"
-#include "pairing_offers.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/time.h"
@@ -288,7 +288,7 @@ PairingUiSnapshot ConnectionManager::finish_stop() {
     }
     // Released here, after the server stop: an outbound connection's destructor stops its
     // transport synchronously, and every outbound one of these had opened.
-    std::vector<std::shared_ptr<SendspinConnection>> releasing;
+    InlineVector<std::shared_ptr<SendspinConnection>, MAX_OPEN_CONNECTIONS> releasing;
     releasing.swap(this->closing_);
     releasing.clear();
     this->reap_finished(false);
@@ -416,11 +416,10 @@ void ConnectionManager::accept(std::shared_ptr<SendspinConnection> conn) {
 
 void ConnectionManager::refuse_accept(std::shared_ptr<SendspinConnection> conn) {
     // Queued before admission closed and taken after (a stop() under way): the slots are being
-    // emptied, so the newcomer gets a goodbye and a close instead of one, and is kept for
-    // finish_stop().
+    // emptied, so the newcomer gets a goodbye and a close instead of one. It is inbound, so its
+    // destructor joins nothing and it is released here, leaving closing_ to the shutdown pass.
     SS_LOGD(TAG, "Not accepting connections, rejecting new connection");
-    conn->detach_inbound();
-    this->goodbye_for_shutdown(std::move(conn));
+    this->release_connection(std::move(conn), SendspinGoodbyeReason::SHUTDOWN);
 }
 
 void ConnectionManager::goodbye_for_shutdown(std::shared_ptr<SendspinConnection> conn) {
@@ -428,10 +427,14 @@ void ConnectionManager::goodbye_for_shutdown(std::shared_ptr<SendspinConnection>
     this->closing_.push_back(std::move(conn));
 }
 
-void ConnectionManager::connect_to(const std::string& url) {
+void ConnectionManager::connect_to(std::string url) {
     SS_LOGI(TAG, "Initiating client connection to: %s", url.c_str());
 
-    auto client_conn = std::make_shared<SendspinClientConnection>(url);
+    auto client_conn = make_connection_in_block<SendspinClientConnection>(std::move(url));
+    if (client_conn == nullptr) {
+        SS_LOGE(TAG, "No memory for the connection; not connecting");
+        return;
+    }
     if (!client_conn->inbound_gate().is_created()) {
         SS_LOGE(TAG, "No event group for the connection's inbound gate; not connecting");
         return;
@@ -658,9 +661,13 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn,
     const bool activation_admissible =
         admissible(conn->get_psk_category(), msg.activities, has_roles, unpaired_access);
 
+    const char* pairing_refusal =
+        pairing_method_refusal(conn->get_psk_category(), msg, this->client_->config_);
+
     if (!activation_admissible) {
-        const SendspinGoodbyeReason reject_reason = inadmissible_reject_reason(
-            conn->get_psk_category(), msg.activities, has_roles, unpaired_access);
+        const SendspinGoodbyeReason reject_reason =
+            inadmissible_reject_reason(conn->get_psk_category(), msg.activities, has_roles,
+                                       unpaired_access, pairing_refusal == nullptr);
         SS_LOGW(TAG, "server/activate inadmissible (psk_category=%s): closing with %s",
                 to_cstr(conn->get_psk_category()),
                 reject_reason == SendspinGoodbyeReason::PAIRING_REQUIRED ? "pairing_required"
@@ -673,62 +680,24 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn,
     // not of accepted attempts, so the server counts every pairing activate it sends, including
     // ones the client goes on to reject (e.g. method_not_supported below). Bump here, at the
     // single point every pairing server/activate is received, so a rejected activate does not
-    // leave the client permanently behind the server's count. handle_enter_pairing() reads this
-    // value; it must not bump again.
+    // leave the client permanently behind the server's count. A server/activate the parser
+    // rejects never arrives here and is not counted, so a server that counted it stays one ahead
+    // until the next Noise handshake. handle_enter_pairing() reads this value; it must not bump
+    // again.
     const bool is_pairing_activate = msg.activities.contains(SendspinActivity::PAIRING);
     if (is_pairing_activate) {
         conn->bump_pairing_index();
     }
 
-    // Structurally admissible already (the activity set passed the table above),
-    // but a pairing activate additionally carries a pairing object whose method must
-    // (a) match the matched PSK's category (pairing_psk iff the matched PSK IS the
-    // Pairing PSK) and (b) be one the client/hello advertised in supported_pair_methods.
-    // When it is not, reply pair/abort(method_not_supported) and leave the connection open
-    // (unlike the reasons above, this does not close the connection).
-    // A pairing activate that names no usable method (pairing object absent, or a
-    // method string this client does not recognize; process_server_activate_message
-    // logs the raw value) cannot start any flow.
-    if (is_pairing_activate && !msg.pairing_method.has_value()) {
-        refuse_activate(conn, "declares pairing with no usable pairing.method",
-                        "absent or unrecognized", this->json_arena());
+    // A pairing object the client cannot act on gets pair/abort(method_not_supported) with the
+    // connection left open (messaging.md "server/activate", third rejection rule), so the
+    // activation is never applied.
+    if (pairing_refusal != nullptr) {
+        refuse_activate(conn, pairing_refusal,
+                        msg.pairing_method.has_value() ? to_cstr(msg.pairing_method.value())
+                                                       : "absent or unrecognized",
+                        this->json_arena());
         return;
-    }
-
-    if (is_pairing_activate && msg.pairing_method.has_value()) {
-        const SendspinPairMethod method = msg.pairing_method.value();
-        const bool category_ok = (method == SendspinPairMethod::PAIRING_PSK) ==
-                                 (conn->get_psk_category() == PskCategory::PAIRING);
-        // The same predicates build_client_hello() advertises from (pairing_offers.h).
-        const auto& cfg = this->client_->config_;
-        bool offered = true;
-        switch (method) {
-            case SendspinPairMethod::PAIRING_PSK:
-                offered = true;  // Always advertised; see pairing_offers.h.
-                break;
-            case SendspinPairMethod::DYNAMIC_PAIRING_CODE:
-                offered = offers_dynamic_pairing_code(cfg);
-                break;
-            case SendspinPairMethod::STATIC_PAIRING_CODE:
-                offered = offers_static_pairing_code(cfg);
-                break;
-        }
-        if (!category_ok || !offered) {
-            refuse_activate(conn, "selects an unsupported pairing method", to_cstr(method),
-                            this->json_arena());
-            return;
-        }
-
-        // messaging.md "server/activate" requires `format` on a dynamic_pairing_code
-        // activation, drawn from the client's own `formats`; a missing, unrecognized,
-        // or unoffered one is pair/abort(method_not_supported) with the connection left
-        // open (pairing.md "Client <-> Server: pair/abort").
-        if (method == SendspinPairMethod::DYNAMIC_PAIRING_CODE &&
-            !offers_pairing_code_format(this->client_->config_, msg.pairing_format)) {
-            refuse_activate(conn, "names no usable pairing.format", to_cstr(method),
-                            this->json_arena());
-            return;
-        }
     }
 
     const bool is_first = !conn->first_activate_received();
@@ -920,17 +889,17 @@ void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
     this->drop_connection(conn, std::nullopt);
 }
 
-std::vector<std::string> ConnectionManager::open_connection_psk_ids() const {
-    std::vector<std::string> psk_ids;
-    psk_ids.reserve(MAX_OPEN_CONNECTIONS);
+InlineVector<const IdText*, ConnectionManager::MAX_OPEN_CONNECTIONS>
+ConnectionManager::open_connection_psk_ids() const {
+    InlineVector<const IdText*, MAX_OPEN_CONNECTIONS> psk_ids;
     for (const auto& entry : this->admitted_) {
         if (entry.conn != nullptr && !entry.conn->get_psk_id().empty()) {
-            psk_ids.emplace_back(entry.conn->get_psk_id().view());
+            psk_ids.push_back(&entry.conn->get_psk_id());
         }
     }
     for (const auto& entry : this->nursery_) {
         if (!entry.conn->get_psk_id().empty()) {
-            psk_ids.emplace_back(entry.conn->get_psk_id().view());
+            psk_ids.push_back(&entry.conn->get_psk_id());
         }
     }
     return psk_ids;

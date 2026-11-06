@@ -193,7 +193,8 @@ TEST(JsonArena, ParsedMessageIsReleasedBeforeItsReplyIsBuilt) {
     constexpr size_t FIRST_KEY_BOUND = 64;
     const std::string stream_start =
         R"({"type":"stream/start","payload":{"player":{"codec":"flac","sample_rate":48000,)"
-        R"("channels":2,"bit_depth":16,"codec_header":"ZkxhQwAAACIQABAAAAANAAAN"}}})";
+        R"("channels":2,"bit_depth":16,"codec_header":)"
+        R"("ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA"}}})";
     ClientStateMessage state;
     state.available = true;
     state.player = ClientPlayerStateObject{};
@@ -219,9 +220,13 @@ TEST(JsonArena, ParsedMessageIsReleasedBeforeItsReplyIsBuilt) {
     ParsedJsonMessage parsed(arena);
     ASSERT_TRUE(parsed.parse(stream_start.data(), stream_start.size()));
     StreamStartMessage stream_msg;
-    ASSERT_TRUE(parsed.extract<process_stream_start_message>(&stream_msg));
+    ASSERT_TRUE(parsed.extract([&stream_msg](JsonObject root) {
+        return process_stream_start_message(root, EnumSet<SendspinRole>{SendspinRole::PLAYER},
+                                            &stream_msg);
+    }));
     ASSERT_TRUE(stream_msg.player.has_value());
-    EXPECT_EQ(stream_msg.player->sample_rate.value_or(0), 48000U) << "the fields outlive the release";
+    EXPECT_EQ(stream_msg.player->params.sample_rate.value_or(0), 48000U)
+        << "the fields outlive the release";
 
     const size_t after_release = arena.offset_;
     EXPECT_LE(after_release, FIRST_KEY_BOUND)

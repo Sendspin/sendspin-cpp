@@ -19,6 +19,7 @@
 #pragma once
 
 #include "crypto/psk_wrap.h"
+#include "enum_set.h"
 #include "inline_text.h"
 #include "inline_vector.h"
 #include "platform/network_info.h"
@@ -33,7 +34,6 @@
 #include <ArduinoJson.h>
 
 #include <array>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -197,7 +197,7 @@ inline std::optional<SendspinRole> role_from_string(std::string_view name) {
 }
 
 /// @brief A server/activate active_roles set, as the client acts on it: the roles this library
-/// implements that it names, and whether it names any role at all
+/// implements that it names, and whether it has any entry at all
 ///
 /// The mask is what the receive and send gates, the client/state role objects and role removal
 /// all read, so none of them can disagree. A role this library does not implement still makes
@@ -212,7 +212,8 @@ public:
         }
     }
 
-    /// @brief Adds one versioned role name to the set.
+    /// @brief Adds one active_roles entry: its versioned role name, or an empty name for an entry
+    /// that is not a string.
     void add(std::string_view name) {
         this->names_any_ = true;
         if (const std::optional<SendspinRole> role = role_from_string(name)) {
@@ -225,7 +226,7 @@ public:
         return this->mask_;
     }
 
-    /// @brief Whether no role was named, implemented here or not.
+    /// @brief Whether the list had no entries, whatever they named.
     bool empty() const {
         return !this->names_any_;
     }
@@ -267,50 +268,6 @@ inline std::optional<SendspinActivity> activity_from_string(std::string_view str
     }
     return std::nullopt;
 }
-
-/// @brief A set of the enumerators 0-7 of `E`, one bit each, visited in enumerator order
-template <typename E>
-class EnumSet {
-    static_assert(std::is_enum_v<E> && sizeof(E) == 1, "EnumSet holds a one-byte enum");
-
-public:
-    EnumSet() = default;
-    EnumSet(std::initializer_list<E> members) {
-        for (const E member : members) {
-            this->insert(member);
-        }
-    }
-
-    void insert(E member) {
-        this->bits_ |= bit(member);
-    }
-
-    bool contains(E member) const {
-        return (this->bits_ & bit(member)) != 0;
-    }
-
-    /// @brief Calls fn(member) for each member, in enumerator order.
-    template <typename Fn>
-    void for_each(Fn&& fn) const {
-        for (uint8_t value = 0; value < CAPACITY; ++value) {
-            if ((this->bits_ & (1U << value)) != 0) {
-                fn(static_cast<E>(value));
-            }
-        }
-    }
-
-    bool operator==(const EnumSet&) const = default;
-
-private:
-    static constexpr uint8_t CAPACITY = 8;
-
-    static uint8_t bit(E member) {
-        assert(static_cast<uint8_t>(member) < CAPACITY && "EnumSet holds enumerators 0-7");
-        return static_cast<uint8_t>(1U << static_cast<uint8_t>(member));
-    }
-
-    uint8_t bits_{0};
-};
 
 /// @brief The activities a server/activate declares: a set, its members unordered and unique
 using ActivitySet = EnumSet<SendspinActivity>;
@@ -572,6 +529,21 @@ struct PlayerSupportObject {
     size_t buffer_capacity{};
 };
 
+/// @brief A decoded FLAC codec_header: the `fLaC` marker, the STREAMINFO metadata block header
+/// and its 34-byte body (roles/player/v1.md "Codec framing").
+inline constexpr size_t FLAC_CODEC_HEADER_BYTES = 42;
+using FlacCodecHeader = std::array<uint8_t, FLAC_CODEC_HEADER_BYTES>;
+
+/// @brief A parsed stream/start player object: the public ServerPlayerStreamObject, plus the
+/// decoded codec header the sync task's decoder takes, which only a FLAC stream carries
+struct PlayerStreamPayload {
+    ServerPlayerStreamObject params{};
+    std::optional<FlacCodecHeader> flac_header{};
+};
+
+static_assert(std::is_trivially_copyable_v<PlayerStreamPayload>,
+              "parsed on the protocol task with nothing on the heap");
+
 /// @brief Protocol maximum for every volume field: volume is 0-100 on the wire.
 static constexpr uint8_t VOLUME_MAX = 100;
 
@@ -699,6 +671,30 @@ inline std::optional<SendspinRepeatMode> repeat_mode_from_string(std::string_vie
     }
     return std::nullopt;
 }
+
+// Every controller command, SEEK_RELATIVE (the last) included, is a ControllerCommandSet member
+static_assert(static_cast<uint8_t>(SendspinControllerCommand::SEEK_RELATIVE) < 16,
+              "ControllerCommandSet needs 16 bits");
+
+using ControllerCommandSet = EnumSet<SendspinControllerCommand, 16>;
+
+/// @brief How many controller commands exist, the most a server can list
+inline constexpr size_t CONTROLLER_COMMAND_COUNT =
+    static_cast<size_t>(SendspinControllerCommand::SEEK_RELATIVE) + 1;
+
+/// @brief A parsed server/state controller object: ServerStateControllerObject with its
+/// supported_commands held as a set, which the main loop lists into the public object
+struct ControllerStatePayload {
+    ControllerCommandSet supported_commands{};
+    uint8_t volume{};
+    bool muted{};
+    SendspinRepeatMode repeat{SendspinRepeatMode::OFF};
+    bool shuffle{};
+    std::optional<uint32_t> seek_max_ms{};
+};
+
+static_assert(std::is_trivially_copyable_v<ControllerStatePayload>,
+              "parsed on the protocol task and carried to the main loop with nothing on the heap");
 
 // --- artwork_role.h ---
 
@@ -862,6 +858,26 @@ inline std::optional<VisualizerSpectrumScale> visualizer_spectrum_scale_from_str
     return std::nullopt;
 }
 
+// Every visualizer type, PEAK (the last) included, is an EnumSet<VisualizerDataType> member
+static_assert(static_cast<uint8_t>(VisualizerDataType::PEAK) < 8,
+              "EnumSet<VisualizerDataType> needs 8 bits");
+
+/// @brief How many visualizer types exist, the most a stream can list
+inline constexpr size_t VISUALIZER_DATA_TYPE_COUNT =
+    static_cast<size_t>(VisualizerDataType::PEAK) + 1;
+
+/// @brief A parsed stream/start visualizer object: ServerVisualizerStreamObject with its types
+/// held as a set, which the main loop lists into the public object
+struct VisualizerStreamPayload {
+    EnumSet<VisualizerDataType> types{};
+    uint16_t rate_max{};
+    bool tracks_downbeats{false};
+    std::optional<VisualizerSpectrumConfig> spectrum;
+};
+
+static_assert(std::is_trivially_copyable_v<VisualizerStreamPayload>,
+              "parsed on the protocol task and carried to the main loop with nothing on the heap");
+
 // --- source_role.h ---
 
 inline const char* to_cstr(SourceSignal signal) {
@@ -930,6 +946,14 @@ struct PairMethodDescriptor {
 /// (messaging.md "client/hello").
 static constexpr size_t MAX_HELLO_PAIR_METHODS = 2;
 
+/// @brief Most bytes of UTF-8 JSON a client/hello may take (messaging.md "client/hello"). A server
+/// may close a connection whose hello is longer.
+constexpr size_t MAX_CLIENT_HELLO_BYTES = 16384;
+
+/// @brief Most nesting levels a client/hello may take, the root object being level 1
+/// (messaging.md "client/hello").
+constexpr size_t MAX_CLIENT_HELLO_NESTING = 10;
+
 /// @brief Outgoing client/hello handshake message sent at connection startup.
 /// Under encryption, client_id and version are carried in client/init (the cleartext Noise
 /// handshake frame), not repeated here. Its strings and lists view the client's config and roles,
@@ -944,6 +968,9 @@ struct ClientHelloMessage {
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
     std::optional<SourceSupportObject> source_v1_support{};
+    /// @brief The configured application-specific roles, listed after supported_roles; each
+    /// support_json is start()'s re-serialized object, sent as is.
+    std::span<const SendspinApplicationRole> application_roles{};
     bool unpaired_access_enabled{false};
     InlineVector<PairMethodDescriptor, MAX_HELLO_PAIR_METHODS> supported_pair_methods{};
 
@@ -1009,14 +1036,9 @@ struct ClientStreamStartMessage {
     std::optional<std::string_view> codec_header{};
 };
 
-/// @brief Bit that represents `codec` in a codec mask
-constexpr uint8_t source_codec_bit(SendspinCodecFormat codec) {
-    return static_cast<uint8_t>(1U << static_cast<uint8_t>(codec));
-}
-
-// Every codec, UNSUPPORTED included, has a bit in a uint8_t mask
+// Every codec, UNSUPPORTED (the last) included, is an EnumSet<SendspinCodecFormat> member
 static_assert(static_cast<uint8_t>(SendspinCodecFormat::UNSUPPORTED) < 8,
-              "codec mask is a uint8_t");
+              "EnumSet<SendspinCodecFormat> needs 8 bits");
 
 /// @brief Longest friendly name the server sends, in UTF-8 bytes: messaging.md "server/hello"
 /// caps `name` and "group/update" caps `group_name` at 64 bytes, and a client truncates a longer
@@ -1031,10 +1053,10 @@ using ServerName = InlineText<MAX_FRIENDLY_NAME_BYTES>;
 /// activities/active_roles come from the server/activate message that follows.
 struct ServerHelloMessage {
     ServerName name{};
-    /// Codecs the server accepts in client-stream/start, as source_codec_bit() bits; a set value
-    /// always carries the PCM and FLAC bits, nullopt when server/hello carried no valid
-    /// source@v1_support object (roles/source/v1.md "server/hello source@v1 support object").
-    std::optional<uint8_t> source_codecs{};
+    /// Codecs the server accepts in client-stream/start; a set value always holds PCM and FLAC,
+    /// nullopt when server/hello carried no valid source@v1_support object (roles/source/v1.md
+    /// "server/hello source@v1 support object").
+    std::optional<EnumSet<SendspinCodecFormat>> source_codecs{};
 };
 
 /// @brief Parsed server/activate message that follows server/hello.
@@ -1059,9 +1081,9 @@ struct GroupUpdateMessage {
 
 /// @brief Parsed stream/start message with per-role stream parameters
 struct StreamStartMessage {
-    std::optional<ServerPlayerStreamObject> player;
+    std::optional<PlayerStreamPayload> player;
     std::optional<ServerArtworkStreamObject> artwork;
-    std::optional<ServerVisualizerStreamObject> visualizer;
+    std::optional<VisualizerStreamPayload> visualizer;
 };
 
 static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 8, "EnumSet<SendspinRole> needs 8 bits");
@@ -1182,11 +1204,15 @@ bool process_server_state_color(JsonObject root, ServerColorStateObject* color);
 
 /// @brief Parses the controller section of a server/state JSON message; true if the section was
 /// present and parsed
-bool process_server_state_controller(JsonObject root,
-                                     ServerStateControllerObject* controller_state);
+bool process_server_state_controller(JsonObject root, ControllerStatePayload* controller_state);
 
-/// @brief Parses a stream/start JSON message into the provided struct
-bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg);
+/// @brief Parses the sections of a stream/start JSON message that `roles` names into the provided
+/// struct
+/// @param roles The roles whose sections are parsed; any other section is skipped unvalidated.
+/// @return false (logged, every section reset) when a parsed section is malformed, which rejects
+/// the message.
+bool process_stream_start_message(JsonObject root, EnumSet<SendspinRole> roles,
+                                  StreamStartMessage* stream_msg);
 
 /// @brief Parses a stream/end JSON message into the provided struct
 /// @return false (logged) when `roles` is present but not an array, which rejects the message.
@@ -1198,6 +1224,16 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
 
 /// @brief Builds a client/hello message
 void build_client_hello_message(const ClientHelloMessage* msg, JsonDocument& doc);
+
+/// @brief Whether every client/hello a connection could send from `msg` fits
+/// MAX_CLIENT_HELLO_BYTES
+///
+/// Two fields can differ between connections: the unpaired-access flag, which can change while
+/// running, and a MAC address the platform detects only once the network is up. `msg` is set to
+/// the longer value of each ("false", and a MAC address where device_info has none) before it is
+/// measured.
+/// @return false (logged) when that hello is over the cap or cannot be built.
+bool client_hello_fits(ClientHelloMessage& msg);
 
 /// @brief Builds a client/state message
 void build_client_state_message(const ClientStateMessage* msg, JsonDocument& doc);

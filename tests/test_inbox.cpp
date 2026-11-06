@@ -13,9 +13,9 @@
 // limitations under the License.
 
 /// @file test_inbox.cpp
-/// @brief Tests for the Inbox/InboxSlot primitives: slot write/take/merge semantics, the
-/// generation-stamped slot and the teardown tracker, event ring FIFO and overflow behavior, and
-/// a concurrent producer/consumer smoke test
+/// @brief Tests for the Inbox/InboxSlot primitives: slot write/take/merge/exchange/edit
+/// semantics, the generation-stamped slot and the teardown tracker, event ring FIFO and overflow
+/// behavior, and a concurrent producer/consumer smoke test
 
 #include "inbox.h"
 #include "teardown_tracker.h"
@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cstdint>
 #include <thread>
+#include <vector>
 
 namespace sendspin {
 namespace {
@@ -60,6 +61,56 @@ TEST(InboxSlot, SlotLifecycle) {
     slot.reset();
     EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
     EXPECT_FALSE(slot.take(value)) << "reset left content behind";
+}
+
+// A slot built around a reserved vector trades buffers with its drain instead of handing its
+// storage away: a clean exchange hands out nothing and leaves the caller's buffer alone, a dirty
+// one gives the caller the slot's content and keeps the caller's buffer, clearing only this slot's
+// topic bit, and an edit that empties the slot keeps that storage and clears the bit, so the next
+// update fills the same storage. Storage is told apart by data(), which an emptied vector keeps.
+TEST(InboxSlot, ExchangeAndEditKeepTheSlotsStorage) {
+    Inbox inbox;
+    std::vector<int> reserved;
+    reserved.reserve(8);
+    const int* slot_storage = reserved.data();
+    InboxSlot<std::vector<int>> slot(inbox, INBOX_TOPIC_PAIRING, std::move(reserved));
+    InboxSlot<int> other(inbox, INBOX_TOPIC_CONTROLLER);
+
+    std::vector<int> out;
+    out.reserve(4);
+    out.push_back(-1);
+    const int* out_storage = out.data();
+    EXPECT_FALSE(slot.exchange(out)) << "a clean slot handed out content";
+    EXPECT_EQ(out, std::vector<int>{-1});
+    EXPECT_EQ(out.data(), out_storage);
+
+    slot.update([](std::vector<int>& current) {
+        current.push_back(1);
+        current.push_back(2);
+    });
+    other.write(7);
+    out.clear();
+    ASSERT_TRUE(slot.exchange(out));
+    EXPECT_EQ(out, (std::vector<int>{1, 2}));
+    EXPECT_EQ(out.data(), slot_storage) << "the caller did not get the slot's buffer";
+    EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_PAIRING));
+    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_CONTROLLER));
+
+    slot.update([](std::vector<int>& current) { current.push_back(3); });
+    const int* edited_storage = nullptr;
+    slot.edit([&edited_storage](std::vector<int>& current) {
+        edited_storage = current.data();
+        current.clear();
+        return false;
+    });
+    EXPECT_EQ(edited_storage, out_storage) << "the slot did not keep the caller's buffer";
+    EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_PAIRING)) << "an emptied slot kept its bit";
+
+    slot.update([](std::vector<int>& current) { current.push_back(4); });
+    std::vector<int> drained;
+    ASSERT_TRUE(slot.exchange(drained));
+    EXPECT_EQ(drained, std::vector<int>{4});
+    EXPECT_EQ(drained.data(), out_storage) << "the update after the edit did not reuse its storage";
 }
 
 TEST(Inbox, RingPreservesFifoOrder) {

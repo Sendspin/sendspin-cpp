@@ -123,10 +123,9 @@ enum class HandshakeFrameResult : uint8_t {
 // noise/handshake envelope
 // ============================================================================
 
-/// @brief Builds a noise/handshake envelope carrying `noise_bytes` base64url-encoded, into the
+/// @brief Builds a noise/handshake envelope carrying `msg2` base64url-encoded, into the
 /// caller-owned `doc`: {"type":"noise/handshake","payload":{"data":"..."}}
-/// @return false (logged) when the encoding's scratch buffer cannot be allocated.
-bool build_noise_handshake_message(std::span<const uint8_t> noise_bytes, JsonDocument& doc);
+void build_noise_handshake_message(const NoiseMsg2& msg2, JsonDocument& doc);
 
 /// @brief Reads the Noise message bytes a noise/handshake envelope carries: its payload.data,
 /// base64url-decoded.

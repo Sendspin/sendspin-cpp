@@ -16,13 +16,16 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "pairing_record.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
 
 #include <array>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -45,6 +48,21 @@ bool read_psk(const uint8_t* data, std::array<uint8_t, NOISE_PSK_SIZE>& out) {
     return !constant_time_equal(out.data(), zero.data(), out.size());
 }
 
+/// @brief Writes a record's PSK and the public key its server_id encodes into `out`, the one
+/// layout both record encoders share.
+/// @return false, leaving `out` unwritten, when server_id is not a canonical peer_id.
+bool encode_record_fields(const std::array<uint8_t, NOISE_PSK_SIZE>& psk,
+                          std::string_view server_id,
+                          std::span<uint8_t, persistence_keys::RECORD_SLOT_SIZE> out) {
+    auto server_key = public_key_from_peer_id(server_id);
+    if (!server_key.has_value()) {
+        return false;
+    }
+    std::memcpy(out.data() + RECORD_PSK_OFFSET, psk.data(), psk.size());
+    std::memcpy(out.data() + RECORD_SERVER_KEY_OFFSET, server_key->data(), server_key->size());
+    return true;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -53,14 +71,16 @@ bool read_psk(const uint8_t* data, std::array<uint8_t, NOISE_PSK_SIZE>& out) {
 
 std::optional<std::array<uint8_t, persistence_keys::RECORD_SLOT_SIZE>> encode_pairing_record(
     const SendspinPairingRecord& r) {
-    auto server_key = public_key_from_peer_id(r.server_id);
-    if (!server_key.has_value()) {
+    std::array<uint8_t, persistence_keys::RECORD_SLOT_SIZE> out{};
+    if (!encode_record_fields(r.psk, r.server_id, out)) {
         return std::nullopt;
     }
-    std::array<uint8_t, persistence_keys::RECORD_SLOT_SIZE> out{};
-    std::memcpy(out.data() + RECORD_PSK_OFFSET, r.psk.data(), r.psk.size());
-    std::memcpy(out.data() + RECORD_SERVER_KEY_OFFSET, server_key->data(), server_key->size());
     return out;
+}
+
+bool encode_pairing_record_into(const PairingRecord& record,
+                                std::span<uint8_t, persistence_keys::RECORD_SLOT_SIZE> out) {
+    return encode_record_fields(record.psk, record.server_id.view(), out);
 }
 
 std::optional<SendspinPairingRecord> decode_pairing_record(const uint8_t* data, size_t len) {

@@ -149,6 +149,22 @@ struct SendspinTracedMessage {
 using SendspinMessageTraceFn = std::function<void(const SendspinTracedMessage& message)>;
 #endif
 
+/// @brief An application-specific role this client advertises in client/hello, beside the roles
+/// the library implements (README.md "Application-Specific Roles"). The library only announces
+/// it: the server may list it in active_roles, and the application defines what that means.
+struct SendspinApplicationRole {
+    /// @brief Versioned role name: a leading `_`, a name, `@`, and a version, in visible ASCII
+    /// other than `"` and `\`, at most 64 bytes, a library limit the specification does not set
+    /// (e.g. "_myapp_display@v1"). Include a vendor prefix to avoid collisions.
+    std::string role;
+
+    /// @brief The role's support object as serialized JSON (e.g. `{"port":8930}`), sent as
+    /// "<role>_support" as the library re-serializes it; unset sends none. It must be one JSON
+    /// object meeting the integration guide's rules, and the hello it is sent in must fit the
+    /// 16384 bytes messaging.md "client/hello" allows.
+    std::optional<std::string> support_json{};
+};
+
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start()
 struct SendspinClientConfig {
@@ -212,6 +228,12 @@ struct SendspinClientConfig {
     /// static_pairing_code descriptor in client/hello; empty = omit the hint.
     std::vector<std::string> static_pairing_code_locations{};
 
+    /// @brief Application-specific roles listed in client/hello `supported_roles` after the
+    /// library's own, in this order. A name SendspinApplicationRole::role does not admit, a
+    /// repeated name, or a support object SendspinApplicationRole::support_json does not admit is
+    /// rejected: start() logs an error and returns false.
+    std::vector<SendspinApplicationRole> application_roles{};
+
     /// @brief Default maximum number of long-term pairing records the store retains. Each record
     /// occupies its own persistence key of `persistence_keys::RECORD_SLOT_SIZE` bytes, so the cap
     /// sets how many keys the store may use rather than the size of any one of them (see
@@ -224,7 +246,8 @@ struct SendspinClientConfig {
     /// requires room for at least 5, so a smaller value is raised to that floor; a value above
     /// 255 is lowered to that ceiling, so the highest slot is 254 and the record-order blob
     /// (`persistence_keys::RECORD_ORDER` in sendspin/persistence_keys.h) keeps byte value 255
-    /// free as its padding.
+    /// free as its padding. Each record of the clamped cap reserves about 123 B of internal RAM
+    /// at start().
     size_t max_pairing_records{DEFAULT_MAX_PAIRING_RECORDS};
 
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
@@ -295,8 +318,8 @@ struct SendspinClientConfig {
     /// accept (on ESP the surplus peer waits unanswered in the TCP backlog instead).
     static constexpr uint8_t DEFAULT_SERVER_MAX_CONNECTIONS = 4U;
 
-    uint8_t server_max_connections{
-        DEFAULT_SERVER_MAX_CONNECTIONS};  ///< Maximum simultaneous connections
+    /// @brief Maximum simultaneous inbound connections, clamped to 7 on ESP
+    uint8_t server_max_connections{DEFAULT_SERVER_MAX_CONNECTIONS};
 
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
     static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
@@ -605,12 +628,15 @@ struct VisualizerSupportObject {
 
 /// @brief Visualization data the client asks the server to stream, reported in client/state
 struct VisualizerStreamConfig {
-    /// @brief Data types the client wants to receive. May be empty to request no data
+    /// @brief Data types the client wants to receive. May be empty to request no data. A type a
+    /// stream serves outside them is dropped (docs/integration-guide.md, VisualizerStreamConfig)
     std::vector<VisualizerDataType> types{};
     /// @brief Maximum periodic visualization frames per second (applies to LOUDNESS, F_PEAK,
     /// SPECTRUM). Event types (BEAT, PEAK) are not throttled. Set to the display refresh rate
     uint16_t rate_max{};
-    /// @brief Spectrum configuration, required if types includes SPECTRUM
+    /// @brief Spectrum configuration, required if types includes SPECTRUM. A served spectrum that
+    /// does not match it (fewer bins allowed) is dropped (docs/integration-guide.md,
+    /// VisualizerStreamConfig)
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 

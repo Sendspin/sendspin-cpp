@@ -23,9 +23,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -334,10 +334,13 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> sha512_oneshot(const uint8_t* dat
 // HMAC-SHA-512
 // ============================================================================
 
-/// @brief Compute HMAC-SHA-512(key, data) via the standard ipad/opad construction.
+/// @brief Compute HMAC-SHA-512(key, data) via the standard ipad/opad construction, with the
+/// message streamed: `feed(Sha512& inner)` updates the inner hash with it, piece by piece, so a
+/// message built from parts needs no buffer of its own.
 /// A key longer than the 128-byte SHA-512 block is first hashed down to 64 bytes.
-inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, size_t key_len,
-                                                           const uint8_t* data, size_t data_len) {
+template <typename Feed>
+std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512_streamed(const uint8_t* key, size_t key_len,
+                                                             Feed&& feed) {
     static constexpr size_t BLOCK = 128;  // SHA-512 block size
     static constexpr uint8_t IPAD = 0x36;
     static constexpr uint8_t OPAD = 0x5C;
@@ -348,6 +351,7 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
         // Hash the key down to 64 bytes then zero-pad to BLOCK.
         auto hk = sha512_oneshot(key, key_len);
         std::copy(hk.begin(), hk.end(), k.begin());
+        secure_zero(hk.data(), hk.size());
     } else {
         // key_len <= BLOCK here (the `if` above handles key_len > BLOCK); key+key_len is the
         // standard one-past-the-end pointer for the caller-supplied (key, key_len) buffer, valid
@@ -360,7 +364,7 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
 
     // One pad buffer serves both passes, and scoping the inner Sha512 lets the compiler reuse
     // its slot for the outer one: together they keep ~336 bytes off this frame, which sits on
-    // the loop thread under the pairing exchange.
+    // the protocol task under the pairing exchange.
     std::array<uint8_t, BLOCK> pad{};
     std::array<uint8_t, SHA512_DIGEST_SIZE> inner_hash{};
     {
@@ -370,7 +374,7 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
         }
         Sha512 inner;
         inner.update(pad.data(), BLOCK);
-        inner.update(data, data_len);
+        feed(inner);
         inner_hash = inner.finalize();
     }
 
@@ -381,7 +385,19 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
     Sha512 outer;
     outer.update(pad.data(), BLOCK);
     outer.update(inner_hash.data(), SHA512_DIGEST_SIZE);
-    return outer.finalize();
+    std::array<uint8_t, SHA512_DIGEST_SIZE> mac = outer.finalize();
+    // Each of these holds the key or a value derived from it
+    secure_zero(k.data(), k.size());
+    secure_zero(pad.data(), pad.size());
+    secure_zero(inner_hash.data(), inner_hash.size());
+    return mac;
+}
+
+/// @brief Compute HMAC-SHA-512(key, data); see hmac_sha512_streamed().
+inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, size_t key_len,
+                                                           const uint8_t* data, size_t data_len) {
+    return hmac_sha512_streamed(key, key_len,
+                                [data, data_len](Sha512& inner) { inner.update(data, data_len); });
 }
 
 // ============================================================================
@@ -389,26 +405,13 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
 // ============================================================================
 
 /// @brief Fill a buffer with cryptographically secure random bytes.
-/// Routes through noise-c's `noise_randstate_*` abstraction which uses the OS
-/// entropy source on host (/dev/urandom) and the ESP32 hardware RNG on ESP.
+/// Runs noise-c's ChaCha20 generator with its state on the stack, seeded from the OS
+/// entropy source on host and the ESP32 hardware RNG on ESP. Nothing is allocated, so on ESP
+/// it cannot fail for a non-null `out`; on host noise-c exits the process when the OS source
+/// cannot be read.
 inline void platform_random_bytes(uint8_t* out, size_t len) {
-    NoiseRandState* rng = nullptr;
-    int err = noise_randstate_new(&rng);
-    if (err != NOISE_ERROR_NONE || rng == nullptr) {
-        // Fail closed: there is no safe fallback for a CSPRNG failure. Returning without
-        // writing `out` would leave a predictable (often all-zero) value, which is fatal for
-        // key/nonce generation (e.g. a CPace scalar or a pairing-code nonce). Abort instead.
-        abort();
-    }
-    noise_randstate_generate(rng, out, len);
-    noise_randstate_free(rng);
-}
-
-/// @brief Generate `len` cryptographically secure random bytes.
-inline std::vector<uint8_t> platform_random_bytes(size_t len) {
-    std::vector<uint8_t> out(len);
-    platform_random_bytes(out.data(), len);
-    return out;
+    [[maybe_unused]] const int err = noise_randstate_generate_simple(out, len);
+    assert(err == NOISE_ERROR_NONE && "platform_random_bytes() needs a buffer");
 }
 
 // ============================================================================
@@ -487,47 +490,42 @@ inline const char* aead_cipher_name_from_noise_suite(const char* noise_suite_nam
 }
 
 /// @brief Encrypt `plaintext` with the named AEAD cipher ("ChaChaPoly"), key `key`, an all-zero
-/// 12-byte nonce, and empty associated data. Returns ciphertext || tag (plaintext_len +
-/// AEAD_TAG_SIZE bytes), or nullopt on any cipher-allocation or key-length failure.
+/// 12-byte nonce, and empty associated data, writing ciphertext || tag into `out`.
 ///
 /// The all-zero nonce is safe here because the Noise per-message counter n=0 encodes to an
 /// all-zero 96-bit nonce regardless of ChaChaPoly's internal counter byte-order, and K_wrap is
 /// a single-use key (see PSK Wrapping above).
-inline std::optional<std::vector<uint8_t>> aead_oneshot_encrypt(const char* cipher_name,
-                                                                const uint8_t* key, size_t key_len,
-                                                                const uint8_t* plaintext,
-                                                                size_t plaintext_len) {
+/// @param out     Receives ciphertext || tag; must not overlap `plaintext`, which is copied in
+///                before it is encrypted in place.
+/// @param out_len Size of `out`, which must be plaintext_len plus the cipher's tag length.
+/// @return false, with `out` wiped, on any cipher-allocation, key-length or size failure.
+inline bool aead_oneshot_encrypt(const char* cipher_name, const uint8_t* key, size_t key_len,
+                                 const uint8_t* plaintext, size_t plaintext_len, uint8_t* out,
+                                 size_t out_len) {
     NoiseCipherState* cipher = nullptr;
     int err = noise_cipherstate_new_by_name(&cipher, cipher_name);
     if (err != NOISE_ERROR_NONE || cipher == nullptr) {
-        return std::nullopt;
+        secure_zero(out, out_len);
+        return false;
     }
-    err = noise_cipherstate_init_key(cipher, key, key_len);
-    if (err != NOISE_ERROR_NONE) {
-        noise_cipherstate_free(cipher);
-        return std::nullopt;
+    bool sealed = noise_cipherstate_init_key(cipher, key, key_len) == NOISE_ERROR_NONE &&
+                  noise_cipherstate_set_nonce(cipher, 0) == NOISE_ERROR_NONE &&
+                  plaintext_len + noise_cipherstate_get_mac_length(cipher) == out_len;
+    if (sealed) {
+        if (plaintext_len > 0) {
+            std::memcpy(out, plaintext, plaintext_len);
+        }
+        NoiseBuffer nbuf;
+        noise_buffer_set_inout(nbuf, out, plaintext_len, out_len);
+        sealed = noise_cipherstate_encrypt_with_ad(cipher, nullptr, 0, &nbuf) == NOISE_ERROR_NONE &&
+                 nbuf.size == out_len;
     }
-    err = noise_cipherstate_set_nonce(cipher, 0);
-    if (err != NOISE_ERROR_NONE) {
-        noise_cipherstate_free(cipher);
-        return std::nullopt;
-    }
-
-    const size_t mac_len = noise_cipherstate_get_mac_length(cipher);
-    std::vector<uint8_t> buf(plaintext_len + mac_len);
-    if (plaintext_len > 0) {
-        std::memcpy(buf.data(), plaintext, plaintext_len);
-    }
-
-    NoiseBuffer nbuf;
-    noise_buffer_set_inout(nbuf, buf.data(), plaintext_len, buf.size());
-    err = noise_cipherstate_encrypt_with_ad(cipher, nullptr, 0, &nbuf);
     noise_cipherstate_free(cipher);
-    if (err != NOISE_ERROR_NONE) {
-        return std::nullopt;
+    if (!sealed) {
+        // A failed encryption can leave the plaintext in place.
+        secure_zero(out, out_len);
     }
-    buf.resize(nbuf.size);
-    return buf;
+    return sealed;
 }
 
 /// @brief Decrypt `ciphertext` (ciphertext || tag) with the named AEAD cipher, key `key`, an

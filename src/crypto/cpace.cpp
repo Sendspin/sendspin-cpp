@@ -17,6 +17,7 @@
 #include "field25519.h"
 #include "platform/crypto.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 
@@ -31,66 +32,39 @@ namespace sendspin {
 // psk_wrap) can share one implementation.
 
 // ============================================================================
-// LV encoding: draft-irtf-cfrg-cpace-21 prepend_len / lv_cat
+// LV encoding: draft-irtf-cfrg-cpace-21 prepend_len
 // ============================================================================
 
 /// @brief The seven value bits each byte of the base-128 length prefix carries.
 static constexpr size_t LENGTH_PREFIX_DIGIT_MASK = 0x7F;
 
-std::vector<uint8_t> cpace_prepend_len(const uint8_t* data, size_t len) {
-    std::vector<uint8_t> out;
+size_t cpace_length_prefix(size_t len, std::array<uint8_t, CPACE_MAX_LENGTH_PREFIX>& out) {
     // Variable-length little-endian base-128 length prefix.
+    size_t count = 0;
     size_t length = len;
     do {
         if (length < 128) {
-            out.push_back(static_cast<uint8_t>(length));
+            out[count++] = static_cast<uint8_t>(length);
         } else {
-            out.push_back(static_cast<uint8_t>((length & LENGTH_PREFIX_DIGIT_MASK) | 0x80));
+            out[count++] = static_cast<uint8_t>((length & LENGTH_PREFIX_DIGIT_MASK) | 0x80);
         }
         length >>= 7;
     } while (length > 0);
-    out.insert(out.end(), data, data + len);
-    return out;
-}
-
-std::vector<uint8_t> cpace_lv_cat(std::initializer_list<std::pair<const uint8_t*, size_t>> parts) {
-    std::vector<uint8_t> out;
-    for (auto& [data, len] : parts) {
-        auto lv = cpace_prepend_len(data, len);
-        out.insert(out.end(), lv.begin(), lv.end());
-    }
-    return out;
+    return count;
 }
 
 // ============================================================================
 // Generator string: draft-irtf-cfrg-cpace-21 generator_string
 // ============================================================================
 
-std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, const uint8_t* ci,
-                                            size_t ci_len, const uint8_t* sid, size_t sid_len) {
-    const auto* dsi = reinterpret_cast<const uint8_t*>(CPACE_DSI.data());
-    size_t dsi_len = CPACE_DSI.size();
-
-    auto lv_dsi = cpace_prepend_len(dsi, dsi_len);
-    auto lv_prs = cpace_prepend_len(prs, prs_len);
+size_t cpace_generator_zero_pad(size_t prs_len) {
+    std::array<uint8_t, CPACE_MAX_LENGTH_PREFIX> prefix{};
+    const size_t lv_dsi = cpace_length_prefix(CPACE_DSI.size(), prefix) + CPACE_DSI.size();
+    const size_t lv_prs = cpace_length_prefix(prs_len, prefix) + prs_len;
 
     // len_zpad = max(0, BLOCK - 1 - len(lv_prs) - len(lv_dsi))
-    size_t used = lv_dsi.size() + lv_prs.size() + 1;  // +1 for the leading 0x00 pad length byte
-    size_t len_zpad = 0;
-    if (CPACE_SHA512_BLOCK > used) {
-        len_zpad = CPACE_SHA512_BLOCK - used;
-    }
-
-    // Build: lv_cat(DSI, prs, zeros, ci, sid)
-    // But zeros is a single chunk of len_zpad zero bytes.
-    std::vector<uint8_t> zeros(len_zpad, 0);
-    return cpace_lv_cat({
-        {dsi, dsi_len},
-        {prs, prs_len},
-        {zeros.data(), zeros.size()},
-        {ci, ci_len},
-        {sid, sid_len},
-    });
+    const size_t used = lv_dsi + lv_prs + 1;  // +1 for the zero pad's one-byte length prefix
+    return CPACE_SHA512_BLOCK > used ? CPACE_SHA512_BLOCK - used : 0;
 }
 
 // ============================================================================
@@ -203,8 +177,9 @@ std::array<uint8_t, CPACE_FIELD_BYTES> cpace_calculate_generator(const uint8_t* 
                                                                  const uint8_t* ci, size_t ci_len,
                                                                  const uint8_t* sid,
                                                                  size_t sid_len) {
-    auto gen_str = cpace_generator_string(prs, prs_len, ci, ci_len, sid, sid_len);
-    auto hash = sha512_oneshot(gen_str.data(), gen_str.size());
+    Sha512 gen_str_hash;
+    cpace_generator_string(gen_str_hash, prs, prs_len, ci, ci_len, sid, sid_len);
+    auto hash = gen_str_hash.finalize();
     // Take first 32 bytes as the Elligator2 input.
     auto u = cpace_decode_u(hash.data(), CPACE_FIELD_BYTES);
     return cpace_elligator2(u);
@@ -245,29 +220,25 @@ bool x25519_scalar_mult(const uint8_t scalar[X25519_KEY_SIZE], const uint8_t poi
 }
 
 // ============================================================================
-// Helper: build lv_cat over two (share, ad) pairs; used in derive() and tags
-// ============================================================================
-
-static std::vector<uint8_t> lv_pair(const uint8_t* share, const std::vector<uint8_t>& ad) {
-    return cpace_lv_cat({
-        {share, CPACE_SHARE_SIZE},
-        {ad.data(), ad.size()},
-    });
-}
-
-// ============================================================================
 // CPace::start
 // ============================================================================
 
-bool CPace::start(CPaceRole role, const std::vector<uint8_t>& prs, const std::vector<uint8_t>& sid,
-                  const std::vector<uint8_t>& ci, const std::vector<uint8_t>& ad,
-                  const std::vector<uint8_t>& peer_ad) {
-    this->role_ = role;
-    this->sid_ = sid;
-    this->ad_ = ad;
-    this->peer_ad_ = peer_ad;
+bool CPace::start(CPaceRole role, std::span<const uint8_t> prs, std::span<const uint8_t> sid,
+                  std::span<const uint8_t> ci, std::span<const uint8_t> ad,
+                  std::span<const uint8_t> peer_ad) {
     this->started_ = false;
     this->derived_ = false;
+    if (sid.size() > this->sid_.size() || ad.size() > this->ad_.size() ||
+        peer_ad.size() > this->peer_ad_.size()) {
+        return false;
+    }
+    this->role_ = role;
+    std::copy(sid.begin(), sid.end(), this->sid_.begin());
+    this->sid_size_ = static_cast<uint8_t>(sid.size());
+    std::copy(ad.begin(), ad.end(), this->ad_.begin());
+    this->ad_size_ = static_cast<uint8_t>(ad.size());
+    std::copy(peer_ad.begin(), peer_ad.end(), this->peer_ad_.begin());
+    this->peer_ad_size_ = static_cast<uint8_t>(peer_ad.size());
 
     // Sample a fresh 32-byte scalar.
     platform_random_bytes(this->scalar_.data(), this->scalar_.size());
@@ -283,6 +254,13 @@ bool CPace::start(CPaceRole role, const std::vector<uint8_t>& prs, const std::ve
 
     this->started_ = true;
     return true;
+}
+
+std::span<const uint8_t> CPace::role_ad(CPaceRole role) const {
+    if (role == this->role_) {
+        return {this->ad_.data(), this->ad_size_};
+    }
+    return {this->peer_ad_.data(), this->peer_ad_size_};
 }
 
 // ============================================================================
@@ -322,35 +300,26 @@ bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
     // Assign initiator/responder shares based on role.
     if (this->role_ == CPaceRole::INITIATOR) {
         this->initiator_share_ = this->public_share_;
-        this->initiator_ad_ = this->ad_;
         std::memcpy(this->responder_share_.data(), peer_share, CPACE_SHARE_SIZE);
-        this->responder_ad_ = this->peer_ad_;
     } else {
         std::memcpy(this->initiator_share_.data(), peer_share, CPACE_SHARE_SIZE);
-        this->initiator_ad_ = this->peer_ad_;
         this->responder_share_ = this->public_share_;
-        this->responder_ad_ = this->ad_;
     }
+    const std::span<const uint8_t> initiator_ad = this->role_ad(CPaceRole::INITIATOR);
+    const std::span<const uint8_t> responder_ad = this->role_ad(CPaceRole::RESPONDER);
 
-    // transcript = lv_cat(init_share, init_ad) + lv_cat(resp_share, resp_ad)
-    auto t_init = lv_pair(this->initiator_share_.data(), this->initiator_ad_);
-    auto t_resp = lv_pair(this->responder_share_.data(), this->responder_ad_);
-
-    // ISK input: lv_cat(DSI_ISK, sid, shared) + transcript
-    const auto* dsi_isk = reinterpret_cast<const uint8_t*>(CPACE_DSI_ISK.data());
-    size_t dsi_isk_len = CPACE_DSI_ISK.size();
-
-    auto lv_prefix = cpace_lv_cat({
-        {dsi_isk, dsi_isk_len},
-        {this->sid_.data(), this->sid_.size()},
-        {shared.data(), shared.size()},
-    });
-
-    // ISK = SHA512(lv_prefix + transcript)
+    // ISK = SHA512(lv_cat(DSI_ISK, sid, shared) || transcript), where
+    // transcript = lv_cat(init_share, init_ad) || lv_cat(resp_share, resp_ad). Each LV piece is
+    // hashed as it is encoded.
     Sha512 h_isk;
-    h_isk.update(lv_prefix.data(), lv_prefix.size());
-    h_isk.update(t_init.data(), t_init.size());
-    h_isk.update(t_resp.data(), t_resp.size());
+    cpace_prepend_len(h_isk, reinterpret_cast<const uint8_t*>(CPACE_DSI_ISK.data()),
+                      CPACE_DSI_ISK.size());
+    cpace_prepend_len(h_isk, this->sid_.data(), this->sid_size_);
+    cpace_prepend_len(h_isk, shared.data(), shared.size());
+    cpace_prepend_len(h_isk, this->initiator_share_.data(), CPACE_SHARE_SIZE);
+    cpace_prepend_len(h_isk, initiator_ad.data(), initiator_ad.size());
+    cpace_prepend_len(h_isk, this->responder_share_.data(), CPACE_SHARE_SIZE);
+    cpace_prepend_len(h_isk, responder_ad.data(), responder_ad.size());
     // ISK is retained (not wiped) on this->isk_: PSK Wrapping derives K_wrap from it
     // after key confirmation succeeds. Zeroized in the destructor along with mac_key_.
     this->isk_ = h_isk.finalize();
@@ -361,7 +330,7 @@ bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
 
     Sha512 h_mac;
     h_mac.update(mac_label, mac_label_len);
-    h_mac.update(this->sid_.data(), this->sid_.size());
+    h_mac.update(this->sid_.data(), this->sid_size_);
     h_mac.update(this->isk_.data(), this->isk_.size());
     this->mac_key_ = h_mac.finalize();
 
@@ -384,10 +353,15 @@ std::array<uint8_t, CPACE_TAG_SIZE> CPace::compute_mac(bool own) const {
     bool use_initiator = (own == (this->role_ == CPaceRole::INITIATOR));
     const uint8_t* share =
         use_initiator ? this->initiator_share_.data() : this->responder_share_.data();
-    const std::vector<uint8_t>& ad = use_initiator ? this->initiator_ad_ : this->responder_ad_;
+    const std::span<const uint8_t> ad =
+        this->role_ad(use_initiator ? CPaceRole::INITIATOR : CPaceRole::RESPONDER);
 
-    auto lv = lv_pair(share, ad);
-    return hmac_sha512(this->mac_key_.data(), this->mac_key_.size(), lv.data(), lv.size());
+    // The message is lv_cat(share, ad), each LV piece fed to the inner hash as it is encoded.
+    return hmac_sha512_streamed(this->mac_key_.data(), this->mac_key_.size(),
+                                [share, ad](Sha512& inner) {
+                                    cpace_prepend_len(inner, share, CPACE_SHARE_SIZE);
+                                    cpace_prepend_len(inner, ad.data(), ad.size());
+                                });
 }
 
 CPace::~CPace() {

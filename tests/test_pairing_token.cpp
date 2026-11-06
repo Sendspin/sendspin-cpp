@@ -59,7 +59,7 @@ TEST(PairingToken, PskSpecReferenceVector) {
     const auto client_key = make_client_key();
     const auto pairing_psk = make_pairing_psk();
 
-    const std::string token = format_pairing_token(client_key, pairing_psk);
+    const std::string token(format_pairing_token(client_key, pairing_psk).view());
 
     // From pairing.md "Pairing PSK Flow", verbatim.
     const std::string expected =
@@ -101,10 +101,10 @@ TEST(PairingToken, WellFormedAcrossVariedInputs) {
     std::array<uint8_t, 32> zero{};
     std::array<uint8_t, 32> ones{};
     ones.fill(0xFF);
-    expect_well_formed_token(format_pairing_token(zero, zero));
-    expect_well_formed_token(format_pairing_token(ones, ones));
-    expect_well_formed_token(format_pairing_token(zero, ones));
-    expect_well_formed_token(format_pairing_token(make_client_key(), ones));
+    expect_well_formed_token(std::string(format_pairing_token(zero, zero).view()));
+    expect_well_formed_token(std::string(format_pairing_token(ones, ones).view()));
+    expect_well_formed_token(std::string(format_pairing_token(zero, ones).view()));
+    expect_well_formed_token(std::string(format_pairing_token(make_client_key(), ones).view()));
 }
 
 TEST(PairingToken, DifferentKeysProduceDifferentTokens) {
@@ -113,8 +113,8 @@ TEST(PairingToken, DifferentKeysProduceDifferentTokens) {
     client_key_b[0] ^= 0xFF;
     const auto pairing_psk = make_pairing_psk();
 
-    const std::string token_a = format_pairing_token(client_key_a, pairing_psk);
-    const std::string token_b = format_pairing_token(client_key_b, pairing_psk);
+    const std::string token_a(format_pairing_token(client_key_a, pairing_psk).view());
+    const std::string token_b(format_pairing_token(client_key_b, pairing_psk).view());
     EXPECT_NE(token_a, token_b);
 }
 
@@ -136,7 +136,7 @@ std::array<uint8_t, QR_PAIRING_CODE_SIZE> make_qr_code() {
 
 TEST(PairingCodeToken, SpecReferenceVector) {
     // From pairing.md "QR-code emission", verbatim.
-    EXPECT_EQ(format_pairing_code_token(make_qr_code()),
+    EXPECT_EQ(format_pairing_code_token(make_qr_code()).view(),
               "SP:14DQ6FY7E4XTOP9HJ5LV6Z3PO57YPD4XT6T97N5Y");
 }
 
@@ -146,7 +146,7 @@ TEST(PairingCodeToken, WellFormedAcrossVariedInputs) {
     std::array<uint8_t, QR_PAIRING_CODE_SIZE> ones{};
     ones.fill(0xFF);
     for (const auto& code : {zero, ones}) {
-        const std::string token = format_pairing_code_token(code);
+        const std::string token(format_pairing_code_token(code).view());
         EXPECT_EQ(token.size(), PAIRING_CODE_TOKEN_LENGTH);
         EXPECT_EQ(token.size(), 43u);
         ASSERT_GE(token.size(), 4u);
@@ -165,7 +165,7 @@ TEST(PairingCodeToken, DifferentCodesProduceDifferentTokens) {
     auto code_a = make_qr_code();
     auto code_b = code_a;
     code_b[0] ^= 0xFF;
-    EXPECT_NE(format_pairing_code_token(code_a), format_pairing_code_token(code_b));
+    EXPECT_NE(format_pairing_code_token(code_a).view(), format_pairing_code_token(code_b).view());
 }
 
 TEST(PairingCodeToken, CarriesADifferentVersionThanThePskToken) {
@@ -174,6 +174,6 @@ TEST(PairingCodeToken, CarriesADifferentVersionThanThePskToken) {
     EXPECT_NE(PAIRING_PSK_TOKEN_VERSION, PAIRING_CODE_TOKEN_VERSION);
     std::array<uint8_t, 32> zero{};
     std::array<uint8_t, QR_PAIRING_CODE_SIZE> zero_code{};
-    EXPECT_EQ(format_pairing_token(zero, zero).substr(0, 4), "SP:0");
-    EXPECT_EQ(format_pairing_code_token(zero_code).substr(0, 4), "SP:1");
+    EXPECT_EQ(format_pairing_token(zero, zero).view().substr(0, 4), "SP:0");
+    EXPECT_EQ(format_pairing_code_token(zero_code).view().substr(0, 4), "SP:1");
 }

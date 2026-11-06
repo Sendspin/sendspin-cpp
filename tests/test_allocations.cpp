@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Counts the library's operator new calls while a connection is accepted, handshakes and is
-// admitted, and on the per-message paths after it. On ESPHome builds operator new draws only on
-// internal RAM and aborts when it fails, so each allocation in these windows is one that internal
-// heap exhaustion turns into a crash instead of a refused connection.
+// Counts the library's operator new calls while a connection is accepted or opened by
+// connect_to(), handshakes and is admitted, on the per-message paths after it, and through the
+// record store's flushes. On ESPHome builds operator new draws only on internal RAM and aborts when
+// it fails, so each allocation in these windows is one that internal heap exhaustion turns into a
+// crash instead of a refused connection.
 //
 // This file replaces the global allocation functions, so it builds into its own binary
 // (sendspin_alloc_tests): in sendspin_tests the replacement would take the place of the
@@ -23,14 +24,24 @@
 //
 // Every allocation inside a window records its size and stack, and the stack decides whose it is:
 // the fake server's handlers and its IXWebSocket client thread are the test's own; IXWebSocket's
-// server threads and the host transport classes are the host transport, which ESP replaces with
-// esp_http_server; everything else is the library's. Only the library's count is asserted. Run
-// with SENDSPIN_ALLOC_REPORT=1 to print each window's allocations grouped by call site, with each
-// frame's offset into the binary for atos or addr2line; a count that differs prints its window.
+// server threads, the host server connection and the host client connection's start() and
+// send_ws_frame() are the host transport, which ESP replaces with esp_http_server and
+// esp_websocket_client; everything else is the library's. The labels follow the inbound windows:
+// in the connect_to() window the fake server's ix::WebSocketServer threads print as host transport
+// and the library's IXWebSocket client threads as the test's. Neither is the library's, so the
+// count is unaffected. Only the library's count is asserted. Run with SENDSPIN_ALLOC_REPORT=1 to
+// print each window's allocations grouped by call site, with each frame's offset into the binary
+// for atos or addr2line; a count that differs prints its window.
 
+#include "crypto/cpace.h"
+#include "crypto/pairing_code.h"
+#include "crypto/psk_wrap.h"
+#include "fake_persistence.h"
 #include "lifecycle_test_fixtures.h"
+#include "platform/base64.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "wrap_test_helpers.h"
 #include <cxxabi.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -48,6 +59,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -262,7 +274,8 @@ Allocation classify(const AllocationRecord& record) {
     bool host_transport = false;
     for (int i = 0; i < record.frame_count; ++i) {
         Frame frame = resolve(record.frames[i]);
-        if (names_any(frame.name, {"FakeEncryptedServer", "NoiseInitiatorFixtureBase"})) {
+        if (names_any(frame.name, {"FakeEncryptedServer", "FakeOutboundEncryptedServer",
+                                   "NoiseInitiatorFixtureBase"})) {
             fixture = true;
         }
         if (names_any(frame.name, {"ix::WebSocketServer", "ix::SocketServer"})) {
@@ -275,7 +288,9 @@ Allocation classify(const AllocationRecord& record) {
         if (in_namespace(frame, "sendspin::")) {
             if (allocation.chain.empty() &&
                 names_any(function_name(frame.name),
-                          {"SendspinServerConnection", "SendspinWsServer"})) {
+                          {"SendspinServerConnection", "SendspinWsServer",
+                           "SendspinClientConnection::start",
+                           "SendspinClientConnection::send_ws_frame"})) {
                 host_transport = true;
             }
             allocation.chain.push_back(std::move(frame));
@@ -414,6 +429,46 @@ public:
     int bursts{0};
 };
 
+/// Closes the open window in on_stream_start() when asked to. The main loop calls it before it
+/// signals the sync task to start the stream, and the sync task decodes nothing before that
+/// signal, so the window holds the protocol task's and the main loop's work on a stream/start and
+/// none of the sync task's. Asked instead to measure the sync task, it opens a window there and
+/// closes it on the stream's first on_audio_write(), the priming silence the sync task writes once
+/// it has processed the codec header.
+class WindowClosingPlayerListener : public CountingPlayerListener {
+public:
+    size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
+        if (this->close_on_audio_write.exchange(false)) {
+            this->sync_window = close_window();
+            this->sync_window_closed.store(true);
+        }
+        return CountingPlayerListener::on_audio_write(data, length, timeout_ms);
+    }
+
+    void on_stream_start() override {
+        CountingPlayerListener::on_stream_start();
+        if (this->close_on_start) {
+            this->close_on_start = false;
+            this->window = close_window();
+        }
+        if (this->open_on_start) {
+            this->open_on_start = false;
+            open_window();
+            this->close_on_audio_write.store(true);
+        }
+    }
+
+    bool close_on_start{false};
+    bool open_on_start{false};
+    Window window;
+    /// Written on the sync task, then published by sync_window_closed.
+    Window sync_window;
+    std::atomic<bool> sync_window_closed{false};
+
+private:
+    std::atomic<bool> close_on_audio_write{false};
+};
+
 void expect_library_allocations(const Window& window, const char* title, size_t expected) {
     EXPECT_FALSE(window.overflowed) << title;
     EXPECT_EQ(window.count(Owner::LIBRARY), expected) << title;
@@ -439,19 +494,54 @@ void expect_role_objects(const FakeEncryptedServer& server, size_t index) {
     EXPECT_STREQ(doc["payload"]["visualizer"]["types"][0], "loudness");
 }
 
+/// Checks that the client/hello `server` received lists both configured application roles and
+/// carries the one support object as start() normalized it, so the admission window measured
+/// their build. Read after the window closes, outside the count.
+void expect_application_roles(const FakeEncryptedServer& server) {
+    const std::vector<FakeEncryptedServer::WireMessage> messages = server.messages();
+    const auto hello = std::find_if(messages.begin(), messages.end(), [](const auto& message) {
+        return message.type == "client/hello";
+    });
+    ASSERT_NE(hello, messages.end());
+    const std::string text(hello->body.begin(), hello->body.end());
+    // The configured text has an unquoted key, which only the wire text can show was quoted
+    EXPECT_NE(
+        text.find(R"("_allocation_test_local_pairing@v1_support":{"port":8930,)"
+                  R"("path":"/allocation-test-endpoint"})"),
+        std::string::npos)
+        << text;
+    JsonDocument doc;
+    ASSERT_EQ(deserializeJson(doc, text), DeserializationError::Ok);
+    JsonArrayConst roles = doc["payload"]["supported_roles"];
+    ASSERT_GE(roles.size(), 2U);
+    EXPECT_STREQ(roles[roles.size() - 2], "_allocation_test_local_pairing@v1");
+    EXPECT_STREQ(roles[roles.size() - 1], "_allocation_test_display@v1");
+    EXPECT_TRUE(doc["payload"]["_allocation_test_display@v1_support"].isUnbound());
+}
+
 constexpr uint16_t ALLOCATION_TEST_PORT = 19300;
 constexpr int TIME_BURST_SIZE = 8;
 
 constexpr size_t ADMISSION_ALLOCATIONS = 0;
 constexpr size_t CLIENT_STATE_ALLOCATIONS = 0;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;
-constexpr size_t STREAM_ROLES_ALLOCATIONS = 0;
+constexpr size_t CONTROLLER_STATE_ALLOCATIONS = 0;
+constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 0;
+constexpr size_t PLAYER_FLAC_STREAM_START_ALLOCATIONS = 0;
+constexpr size_t SYNC_TASK_FIRST_FLAC_HEADER_ALLOCATIONS = 0;
+constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 
-// One paired connection with a player, a controller, metadata, two artwork channels and a
-// visualizer, so the player, artwork and visualizer objects of client/state are built: from the
-// fake server's connect through admission and the first client/state, then one client/state
-// publish, then one full burst of client/time and server/time exchanges, then a stream/end and a
-// stream/clear that name their roles.
+// One paired connection with a player, a controller, metadata, two artwork channels, a visualizer
+// and two application-specific roles, one with a support object, so client/hello lists the
+// application roles and the player, artwork and visualizer objects of client/state are built: from
+// the fake server's connect through admission and the first client/state, then one client/state
+// publish, then one full burst of client/time and server/time exchanges, then the first
+// controller server/state, then an artwork and visualizer stream/start and a stream/end and a
+// stream/clear that name their roles, then the sync task's first FLAC codec header, then a FLAC
+// stream/start the player takes, then a stream/start whose player section the connection, no
+// longer owning the player, does not take.
+// The roles' public command and type lists are reserved when the roles are built, so even the
+// first fill on the main loop allocates nothing.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -464,14 +554,22 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     config.server_port = ALLOCATION_TEST_PORT;
     config.time_burst_size = static_cast<uint8_t>(TIME_BURST_SIZE);
     config.time_burst_interval_ms = 100;
+    config.application_roles = {
+        {"_allocation_test_local_pairing@v1",
+         std::string(R"({port:8930,"path":"/allocation-test-endpoint"})")},
+        {"_allocation_test_display@v1", std::nullopt},
+    };
 
     BurstCountingListener burst_listener;  // Outlives the client
     PairedClientBundle bundle(config);
     SendspinClient& client = bundle.client();
     client.set_listener(&burst_listener);
-    CountingPlayerListener player_listener;
-    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
-    client.add_controller();
+    WindowClosingPlayerListener player_listener;
+    // Lists FLAC for the streams below (roles/player/v1.md "stream/start player object")
+    PlayerRoleConfig player_config = make_pcm_player_config();
+    player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, 48000, 16});
+    client.add_player(std::move(player_config)).set_listener(&player_listener);
+    ControllerRole& controller = client.add_controller();
     client.add_metadata();
     ArtworkRoleConfig artwork_config;
     artwork_config.preferred_formats = {
@@ -479,7 +577,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
         {SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 64},
     };
     client.add_artwork(std::move(artwork_config));
-    client.add_visualizer(make_visualizer_config());
+    CountingVisualizerListener visualizer_listener;
+    client.add_visualizer(make_visualizer_config()).set_listener(&visualizer_listener);
     ASSERT_TRUE(bundle.start());
 
     FakeEncryptedServerOptions options;
@@ -496,6 +595,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     expect_library_allocations(close_window(), "accept to admission and the first client/state",
                                ADMISSION_ALLOCATIONS);
     expect_role_objects(*server, 0);
+    expect_application_roles(*server);
 
     pump_while_not(client, [&] { return client.is_time_synced(); });
 
@@ -516,12 +616,37 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     expect_library_allocations(close_window(), "client/time and server/time burst",
                                TIME_BURST_ALLOCATIONS);
 
+    // Every command, so a reservation short of the full set fails the window. The main loop has
+    // applied the state once get_controller_state() reports its volume.
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"server/state","payload":{"controller":{"supported_commands":)"
+            R"(["play","pause","stop","next","previous","volume","mute","repeat_off",)"
+            R"("repeat_one","repeat_all","shuffle","unshuffle","switch","seek",)"
+            R"("seek_relative"],"volume":20,"muted":false,"repeat":"off","shuffle":false,)"
+            R"("seek_max_ms":1000}}})"));
+    }
+    pump_while_not(client, [&] { return controller.get_controller_state().volume == 20; });
+    expect_library_allocations(close_window(), "controller server/state",
+                               CONTROLLER_STATE_ALLOCATIONS);
+    EXPECT_EQ(controller.get_controller_state().supported_commands.size(),
+              CONTROLLER_COMMAND_COUNT);
+
+    const int starts_before_streams = visualizer_listener.stream_starts;
+
     // Closes on the client/state the trailing volume command publishes, which the protocol task
-    // sends only after handling the two stream messages ahead of it.
+    // sends only after handling the three stream messages ahead of it.
     const int states_before_streams = server->client_state_count();
     open_window();
     {
         TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"stream/start","payload":{"artwork":{"channels":[)"
+            R"({"source":"album","format":"jpeg","width":320,"height":320},)"
+            R"({"source":"artist","format":"png","width":64,"height":64}]},)"
+            R"("visualizer":{"types":["loudness"],"rate_max":30}}})"));
         ASSERT_TRUE(server->send_app_json(
             R"({"type":"stream/end","payload":{"roles":["artwork","visualizer"]}})"));
         ASSERT_TRUE(server->send_app_json(
@@ -530,11 +655,572 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
             R"({"type":"server/command","payload":{"player":{"command":"volume","volume":17}}})"));
     }
     pump_while_not(client, [&] { return server->client_state_count() > states_before_streams; });
-    expect_library_allocations(close_window(), "stream/end and stream/clear with roles",
-                               STREAM_ROLES_ALLOCATIONS);
+    expect_library_allocations(close_window(),
+                               "stream/start, stream/end and stream/clear with roles",
+                               STREAM_MESSAGES_ALLOCATIONS);
+    EXPECT_EQ(visualizer_listener.stream_starts, starts_before_streams + 1)
+        << "the window closed before the main loop reported the visualizer stream";
+
+    // A FLAC stream/start the player takes, its codec header the fLaC marker and STREAMINFO of a
+    // 48 kHz stereo 16-bit stream: the parse decodes it into fixed storage and the player copies
+    // it into the sync task's ring item.
+    constexpr const char* FLAC_STREAM_START =
+        R"({"type":"stream/start","payload":{"player":{"codec":"flac","sample_rate":48000,)"
+        R"("channels":2,"bit_depth":16,)"
+        R"("codec_header":"ZkxhQ4AAACIQABAAAAAAAAAAC7gC8AAAAAAAAAAAAAAAAAAAAAAAAAAA"}}})";
+    constexpr const char* PLAYER_STREAM_END =
+        R"({"type":"stream/end","payload":{"roles":["player"]}})";
+    enum class Measure { STREAM_START, SYNC_TASK_HEADER };
+    const auto play_flac_stream = [&](Measure measure) {
+        const int starts_before = player_listener.stream_starts;
+        const int ends_before = player_listener.stream_ends;
+        if (measure == Measure::STREAM_START) {
+            player_listener.close_on_start = true;
+            open_window();
+        } else {
+            player_listener.open_on_start = true;
+        }
+        {
+            TestOwned test_owned;
+            ASSERT_TRUE(server->send_app_json(FLAC_STREAM_START));
+        }
+        pump_while_not(client, [&] { return player_listener.stream_starts > starts_before; });
+        if (measure == Measure::STREAM_START) {
+            expect_library_allocations(player_listener.window,
+                                       "FLAC stream/start the player takes",
+                                       PLAYER_FLAC_STREAM_START_ALLOCATIONS);
+        } else {
+            pump_while_not(client, [&] { return player_listener.sync_window_closed.load(); });
+            expect_library_allocations(player_listener.sync_window,
+                                       "the sync task's first FLAC codec header",
+                                       SYNC_TASK_FIRST_FLAC_HEADER_ALLOCATIONS);
+        }
+        {
+            TestOwned test_owned;
+            ASSERT_TRUE(server->send_app_json(PLAYER_STREAM_END));
+        }
+        pump_while_not(client, [&] { return player_listener.stream_ends > ends_before; });
+    };
+    // The first grows the main loop's held stream event list, which keeps its capacity for later
+    // streams, outside its window: that opens as the main loop reports the stream started and
+    // holds the sync task's first codec header, which sets up the decode buffer and FLAC decoder.
+    play_flac_stream(Measure::SYNC_TASK_HEADER);
+    // The second closes as the main loop reports the stream started.
+    play_flac_stream(Measure::STREAM_START);
+
+    // An activation that leaves the player out takes the role from the connection, outside any
+    // window. The window holds a FLAC stream/start whose player section a parse would validate
+    // and decode, and closes on the client/state of the activation behind it that hands the
+    // player back.
+    const int states_before_removal = server->client_state_count();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"server/activate","payload":{"activities":["playback"],"active_roles":)"
+            R"(["controller@v1","metadata@v1","color@v1","artwork@v1","visualizer@v1"]}})"));
+    }
+    pump_while_not(client, [&] { return server->client_state_count() > states_before_removal; });
+    const int states_before_untaken = server->client_state_count();
+    const int player_starts_before_untaken = player_listener.stream_starts;
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(FLAC_STREAM_START));
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"server/activate","payload":{"activities":["playback"],"active_roles":)"
+            R"(["player@v1","controller@v1","metadata@v1","color@v1","artwork@v1",)"
+            R"("visualizer@v1"]}})"));
+    }
+    pump_while_not(client, [&] { return server->client_state_count() > states_before_untaken; });
+    expect_library_allocations(close_window(), "stream/start for a role the connection lacks",
+                               UNTAKEN_STREAM_START_ALLOCATIONS);
+    EXPECT_EQ(player_listener.stream_starts, player_starts_before_untaken)
+        << "the player started a stream from a connection that did not own it";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+/// A blob store whose own bookkeeping is the test's: the main loop calls it inside the record
+/// flushes the windows below measure.
+class TestOwnedPersistence : public InMemoryPersistenceProvider {
+public:
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        TestOwned test_owned;
+        return InMemoryPersistenceProvider::save_blob(key, data, len);
+    }
+
+    bool commit() override {
+        TestOwned test_owned;
+        return InMemoryPersistenceProvider::commit();
+    }
+
+    /// save_attempts() without the test's own allocations, for a pump predicate.
+    int writes(const std::string& key) const {
+        TestOwned test_owned;
+        return this->save_attempts(key);
+    }
+};
+
+/// Counts on_pairing_succeeded() on the main loop (the test thread).
+class PairingCountingListener : public SendspinClientListener {
+public:
+    void on_pairing_succeeded(const std::string& /*server_id*/) override {
+        ++this->succeeded;
+    }
+
+    int succeeded{0};
+};
+
+constexpr uint16_t OUTBOUND_TEST_PORT = 19305;
+
+constexpr size_t OUTBOUND_ADMISSION_ALLOCATIONS = 0;
+
+// A connect_to() to a paired server listening for it, from the call through admission. The URL,
+// built before the window, is moved in. The refusal when the connection's block cannot be
+// allocated is untested: reaching it would need a fault-injection seam in the platform heap.
+TEST(Allocations, ConnectToThroughAdmission) {
+    SendspinClientConfig config;
+    config.name = "Allocation Test Outbound Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.accept_inbound_connections = false;
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    FakeOutboundEncryptedServer server(OUTBOUND_TEST_PORT, std::string(NOISE_SUITE_CHACHAPOLY),
+                                       bundle.peer.server_identity, bundle.peer.record.psk_id,
+                                       bundle.peer.psk);
+    ASSERT_TRUE(server.listen());
+    server.start();
+    // Longer than libc++'s 22-character inline capacity, so a copy in the library is counted.
+    std::string url = server_url(OUTBOUND_TEST_PORT);
+
+    open_window();
+    client.connect_to(std::move(url));
+    pump_while_not(client, [&] { return client.is_connected(); });
+    expect_library_allocations(close_window(), "connect_to() through admission",
+                               OUTBOUND_ADMISSION_ALLOCATIONS);
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+constexpr uint16_t SPECTRUM_TEST_PORT = 19306;
+
+constexpr size_t FIRST_SPECTRUM_FRAME_ALLOCATIONS = 0;
+
+/// Closes the open window in the first on_spectrum(), on the visualizer's drain thread, and keeps
+/// how many bins that frame carried.
+class WindowClosingSpectrumListener : public VisualizerRoleListener {
+public:
+    void on_spectrum(int64_t /*client_timestamp*/, const std::vector<uint16_t>& bins) override {
+        if (!this->window_closed.load()) {
+            this->window = close_window();
+            this->delivered_bins = bins.size();
+            this->window_closed.store(true);
+        }
+    }
+    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) override {
+        ++this->stream_starts;
+    }
+
+    /// Written on the drain thread, then published by window_closed.
+    Window window;
+    size_t delivered_bins{0};
+    std::atomic<bool> window_closed{false};
+    /// Main loop (the test thread) only.
+    int stream_starts{0};
+};
+
+// A four-bin spectrum stream's first frame, from the server's send through on_spectrum() on the
+// drain thread, which delivers it in the bins the role reserved at start(). Frames are sent until
+// one is delivered, each stamped ahead of now so a slow host only takes longer.
+TEST(Allocations, FirstSpectrumFrame) {
+    SendspinClientConfig config;
+    config.name = "Allocation Test Spectrum Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.server_port = SPECTRUM_TEST_PORT;
+    config.time_burst_interval_ms = 100;  // Sync promptly: the drain thread needs client time
+    WindowClosingSpectrumListener listener;  // Outlives the client
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    VisualizerRoleConfig visualizer = make_visualizer_config();
+    visualizer.stream.types = {VisualizerDataType::SPECTRUM};
+    visualizer.stream.spectrum = VisualizerSpectrumConfig{
+        .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
+    client.add_visualizer(std::move(visualizer)).set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    std::unique_ptr<FakeEncryptedServer> server =
+        connect_paired_server(bundle.peer, SPECTRUM_TEST_PORT, options);
+    pump_while_not(client, [&] { return client.is_time_synced(); });
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],"rate_max":30,)"
+        R"("spectrum":{"n_disp_bins":4,"scale":"mel","f_min":40,"f_max":16000}}}})"));
+    pump_while_not(client, [&] { return listener.stream_starts > 0; });
+
+    const std::string four_bins("\x00\x0A\x00\x14\x00\x1E\x00\x28", 8);
+    constexpr int64_t LEAD_US = 50 * 1000;
+    open_window();
+    while (!listener.window_closed.load()) {
+        {
+            TestOwned test_owned;
+            ASSERT_TRUE(server->send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+                                            platform_time_us() + LEAD_US, four_bins));
+        }
+        for (int i = 0; i < 20 && !listener.window_closed.load(); ++i) {
+            client.loop();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    expect_library_allocations(listener.window, "the first spectrum frame",
+                               FIRST_SPECTRUM_FRAME_ALLOCATIONS);
+    EXPECT_EQ(listener.delivered_bins, 4U);
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+constexpr uint16_t RECORD_FLUSH_TEST_PORT = 19301;
+constexpr uint16_t PAIRING_TEST_PORT = 19302;
+
+constexpr size_t PLAYBACK_HANDOFF_ALLOCATIONS = 0;
+constexpr size_t UNPAIR_ALLOCATIONS = 0;
+// The std::string server_id on_pairing_started() and on_pairing_succeeded() each take on the main
+// loop: a public listener signature's cost.
+constexpr size_t PAIRING_ALLOCATIONS = 2;
+
+// Two paired servers, the incoming one's record the least recently used: from the incoming
+// server's connect, through the playback activate that displaces the incumbent and the main
+// loop's flush of the record order it moved, then a server/unpair of the incoming server's record
+// through the flush that empties its slot.
+TEST(Allocations, RecordFlushesAfterAPlaybackHandoffAndAnUnpair) {
+    PairedPeer incoming = make_paired_peer();
+    PairedPeer incumbent = make_paired_peer();
+    TestOwnedPersistence persistence;
+    seed_records(persistence, {incoming.record, incumbent.record});
+
+    SendspinClientConfig config;
+    config.name = "Allocation Test Record Flush Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.server_port = RECORD_FLUSH_TEST_PORT;
+    TestNetworkProvider network;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = "[]";
+    std::unique_ptr<FakeEncryptedServer> incumbent_server =
+        connect_paired_server(incumbent, RECORD_FLUSH_TEST_PORT, options);
+    pump_while_not(client, [&] {
+        return client.is_connected() && persistence.writes(persistence_keys::LAST_PLAYED) > 0;
+    });
+
+    const int order_writes = persistence.writes(persistence_keys::RECORD_ORDER);
+    std::unique_ptr<FakeEncryptedServer> incoming_server;
+    open_window();
+    {
+        TestOwned test_owned;
+        incoming_server = connect_paired_server(incoming, RECORD_FLUSH_TEST_PORT, options);
+    }
+    pump_while_not(client, [&] {
+        return persistence.writes(persistence_keys::RECORD_ORDER) > order_writes &&
+               persistence.writes(persistence_keys::LAST_PLAYED) > 1;
+    });
+    expect_library_allocations(close_window(), "playback handoff and its record flush",
+                               PLAYBACK_HANDOFF_ALLOCATIONS);
+    EXPECT_EQ(stored_record_order(persistence), (std::vector<uint8_t>{1, 0}))
+        << "the handoff must make the incoming server's record the most recent";
+
+    const int slot_writes = persistence.writes(persistence_keys::record_slot_key(0));
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(incoming_server->send_app_json(R"({"type":"server/unpair","payload":{}})"));
+    }
+    pump_while_not(client, [&] {
+        return persistence.writes(persistence_keys::record_slot_key(0)) > slot_writes;
+    });
+    expect_library_allocations(close_window(), "server/unpair and its record flush",
+                               UNPAIR_ALLOCATIONS);
+    EXPECT_EQ(persisted_psk_ids(persistence), std::vector<std::string>{incumbent.record.psk_id})
+        << "the unpair must empty the incoming server's slot";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A pairing_psk pairing (pairing.md "Pairing PSK Flow") on a connection made on the configured
+// Pairing PSK, from the pairing activate through the main loop's flush of the new record and the
+// on_pairing_succeeded() that follows it.
+TEST(Allocations, PairingThroughItsRecordFlush) {
+    std::array<uint8_t, NOISE_PSK_SIZE> pairing_psk{};
+    platform_random_bytes(pairing_psk.data(), pairing_psk.size());
+    TestOwnedPersistence persistence;
+    PairingCountingListener listener;  // Outlives the client
+
+    SendspinClientConfig config;
+    config.name = "Allocation Test Pairing Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.server_port = PAIRING_TEST_PORT;
+    config.pairing_psk = SendspinPsk(pairing_psk);
+    TestNetworkProvider network;
+    SendspinClient client(config);
+    client.set_listener(&listener);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    // The activate waits for the test, so the window opens after the hello exchange.
+    FakeEncryptedServerOptions options;
+    options.psk_category = "pr";
+    options.suppress_activate = true;
+    FakeEncryptedServer server(server_url(PAIRING_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                               Identity::generate().value(), psk_id_for(pairing_psk), pairing_psk,
+                               options);
+    pump_while_not(client, [&] {
+        TestOwned test_owned;
+        return !server.hello_pair_methods().empty();
+    });
+
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server.send_app_json(
+            R"({"type":"server/activate","payload":{"activities":["pairing"],"active_roles":[],)"
+            R"("pairing":{"method":"pairing_psk"}}})"));
+    }
+    pump_while_not(client, [&] { return listener.succeeded > 0; });
+    expect_library_allocations(close_window(), "pairing through its record flush",
+                               PAIRING_ALLOCATIONS);
+    EXPECT_EQ(persisted_psk_ids(persistence),
+              std::vector<std::string>{server.learned_psk_id().value_or("")})
+        << "the flush must store the record the pairing minted";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+/// Keeps the code a pairing emits, which the test enters into its server as the operator would.
+/// Main loop (the test thread) only.
+class CodePairingListener : public PairingCountingListener {
+public:
+    void on_display_pairing_code(const std::string& code,
+                                 SendspinPairingCodeFormat /*format*/) override {
+        TestOwned test_owned;
+        this->code = code;
+    }
+
+    std::string code;
+};
+
+/// The body of the first message of `type` the client sent `server`, if one arrived.
+std::optional<std::string> client_message(const FakeEncryptedServer& server,
+                                          std::string_view type) {
+    for (const FakeEncryptedServer::WireMessage& message : server.messages()) {
+        if (message.type == type) {
+            return std::string(message.body.begin(), message.body.end());
+        }
+    }
+    return std::nullopt;
+}
+
+/// Whether the client sent `server` a message of `type`, or one that ends the round short of it.
+bool client_sent_or_ended(const FakeEncryptedServer& server, std::string_view type) {
+    return client_message(server, type) || client_message(server, "client/pair-retry") ||
+           client_message(server, "pair/abort") || server.closed();
+}
+
+/// The base64url field `field` of the payload of the client's message of `type`, decoded.
+std::vector<uint8_t> client_field(const FakeEncryptedServer& server, std::string_view type,
+                                  const char* field) {
+    const std::optional<std::string> body = client_message(server, type);
+    if (!body.has_value()) {
+        ADD_FAILURE() << "the client ended the round before " << type;
+        return {};
+    }
+    JsonDocument doc;
+    EXPECT_EQ(deserializeJson(doc, *body), DeserializationError::Ok);
+    return b64url_decode(doc["payload"][field] | "").value_or(std::vector<uint8_t>{});
+}
+
+/// The 24-byte code a version-1 pairing token carries, decoded as a server does (pairing.md
+/// "Pairing Token"): each '9' back to '2', then unpadded RFC 4648 base32.
+std::vector<uint8_t> pairing_token_code(const std::string& token) {
+    std::vector<uint8_t> code;
+    uint32_t bits = 0;
+    int bit_count = 0;
+    for (char c : token.substr(4)) {
+        c = c == '9' ? '2' : c;
+        bits = (bits << 5) | static_cast<uint32_t>(c >= 'A' ? c - 'A' : c - '2' + 26);
+        bit_count += 5;
+        if (bit_count >= 8) {
+            bit_count -= 8;
+            code.push_back(static_cast<uint8_t>(bits >> bit_count));
+        }
+    }
+    return code;
+}
+
+/// The sid of one round of a pairing attempt (pairing.md "PAKE").
+std::vector<uint8_t> pake_sid(const std::array<uint8_t, 32>& handshake_hash,
+                              uint32_t pairing_index, uint32_t round) {
+    const std::string_view label = "sendspin-pair-pake-v1";
+    std::vector<uint8_t> sid(label.begin(), label.end());
+    sid.insert(sid.end(), handshake_hash.begin(), handshake_hash.end());
+    for (uint32_t counter : {pairing_index, round}) {
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            sid.push_back(static_cast<uint8_t>(counter >> shift));
+        }
+    }
+    return sid;
+}
+
+constexpr uint16_t CODE_PAIRING_DIGITS_TEST_PORT = 19303;
+constexpr uint16_t CODE_PAIRING_QR_TEST_PORT = 19304;
+
+// Only the listener's std::string arguments on the main loop: the server_id on_pairing_started()
+// and on_pairing_succeeded() each take, and for a qr_code the 43-character token
+// on_display_pairing_code() takes, past both standard libraries' inline capacity. Six digits fit it.
+constexpr size_t CODE_PAIRING_DIGITS_ALLOCATIONS = 2;
+constexpr size_t CODE_PAIRING_QR_ALLOCATIONS = 3;
+
+struct CodePairingRow {
+    const char* format;
+    uint16_t port;
+    size_t expected;
+};
+
+/// Runs one Dynamic Pairing Code Flow round (pairing.md "Dynamic Pairing Code Flow") in `format`
+/// against a server the test plays with the library's CPace, from the pairing activate through
+/// the main loop's flush of the new record and the on_pairing_succeeded() that follows it.
+void run_code_pairing(const CodePairingRow& row) {
+    TestOwnedPersistence persistence;
+    CodePairingListener listener;  // Outlives the client
+
+    SendspinClientConfig config;
+    config.name = "Allocation Test Code Pairing Client";
+    config.mac_address = "aa:bb:cc:dd:ee:ff";
+    config.server_port = row.port;
+    config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+    config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS,
+                                   SendspinPairingCodeFormat::QR_CODE};
+    TestNetworkProvider network;
+    SendspinClient client(config);
+    client.set_listener(&listener);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+
+    // A pairing-code method is refused on the Pairing PSK (admission.h), so the code flow runs on
+    // the Sentinel PSK.
+    FakeEncryptedServerOptions options;
+    options.suppress_activate = true;
+    FakeEncryptedServer server(server_url(row.port), std::string(NOISE_SUITE_CHACHAPOLY),
+                               Identity::generate().value(), std::string(SENTINEL_PSK_ID),
+                               SENTINEL_PSK, options);
+    pump_while_not(client, [&] {
+        TestOwned test_owned;
+        return !server.hello_pair_methods().empty();
+    });
+
+    // Pumps from this function rather than a helper taking the server: classify() counts a stack
+    // with a frame naming FakeEncryptedServer as the fixture's, and the predicate's type would name
+    // it on every library frame below the pump.
+    const auto await_field = [&](std::string_view type, const char* field) {
+        pump_while_not(client, [&] {
+            TestOwned test_owned;
+            return client_sent_or_ended(server, type);
+        });
+        TestOwned test_owned;
+        return client_field(server, type, field);
+    };
+
+    CPace server_cpace;
+    std::vector<uint8_t> wrapped_psk;
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server.send_app_json(
+            std::string(R"({"type":"server/activate","payload":{"activities":["pairing"],)") +
+            R"("active_roles":[],"pairing":{"method":"dynamic_pairing_code","format":")" +
+            row.format + R"("}}})"));
+    }
+    ASSERT_FALSE(await_field("client/pair-init", "commit_B").empty());
+    {
+        TestOwned test_owned;
+        std::array<uint8_t, PAIRING_NONCE_SIZE> nonce_a{};
+        platform_random_bytes(nonce_a.data(), nonce_a.size());
+        ASSERT_TRUE(server.send_app_json(R"({"type":"server/pair-init","payload":{"nonce_A":")" +
+                                         b64url_encode(nonce_a.data(), nonce_a.size()) + R"("}})"));
+    }
+    pump_while_not(client, [&] { return !listener.code.empty() || server.closed(); });
+    ASSERT_FALSE(listener.code.empty()) << "the client closed before it emitted a code";
+    {
+        TestOwned test_owned;
+        const bool qr = std::string_view(row.format) == "qr_code";
+        const std::vector<uint8_t> prs =
+            qr ? pairing_token_code(listener.code)
+               : std::vector<uint8_t>(listener.code.begin(), listener.code.end());
+        const std::string_view server_ad = "server";
+        const std::string_view client_ad = "client";
+        ASSERT_TRUE(server_cpace.start(
+            CPaceRole::INITIATOR, prs,
+            pake_sid(server.handshake_hash(), server.pair_init().value().pairing_index, 1), {},
+            std::vector<uint8_t>(server_ad.begin(), server_ad.end()),
+            std::vector<uint8_t>(client_ad.begin(), client_ad.end())));
+        const auto& share = server_cpace.public_share();
+        ASSERT_TRUE(server.send_app_json(R"({"type":"server/pair-auth","payload":{"pake_msg_1":")" +
+                                         b64url_encode(share.data(), share.size()) + R"("}})"));
+    }
+    const std::vector<uint8_t> client_share = await_field("client/pair-auth", "pake_msg_2");
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server_cpace.derive(client_share.data(), client_share.size()));
+        const auto server_kc = server_cpace.tag().value();
+        ASSERT_TRUE(server.send_app_json(
+            R"({"type":"server/pair-confirm","payload":{"server_kc":")" +
+            b64url_encode(server_kc.data(), server_kc.size()) + R"("}})"));
+    }
+    wrapped_psk = await_field("client/pair-finalize", "wrapped_psk");
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server.send_app_json(R"({"type":"server/pair-finalize","payload":{}})"));
+    }
+    pump_while_not(client, [&] { return listener.succeeded > 0 || server.closed(); });
+    expect_library_allocations(close_window(), row.format, row.expected);
+
+    // The server can open the PSK the client wrapped (pairing.md "Wrapping"), and it is the one
+    // the flush stored.
+    ASSERT_EQ(wrapped_psk.size(), WRAPPED_VALUE_SIZE);
+    std::array<uint8_t, WRAPPED_VALUE_SIZE> wrapped{};
+    std::copy(wrapped_psk.begin(), wrapped_psk.end(), wrapped.begin());
+    const auto psk = unwrap_value_as_server(PSK_WRAP_LABEL, "ChaChaPoly", server_cpace.sid(),
+                                            server_cpace.isk().value(), wrapped);
+    ASSERT_TRUE(psk.has_value());
+    EXPECT_EQ(persisted_psk_ids(persistence), std::vector<std::string>{psk_id_for(psk.value())})
+        << "the flush must store the record the pairing minted";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A Dynamic Pairing Code Flow pairing in each emission format, the code CPace's PRS and the new
+// PSK wrapped under its ISK, from the pairing activate through the record flush.
+TEST(Allocations, CodePairingThroughItsRecordFlush) {
+    const CodePairingRow rows[] = {
+        {"digits", CODE_PAIRING_DIGITS_TEST_PORT, CODE_PAIRING_DIGITS_ALLOCATIONS},
+        {"qr_code", CODE_PAIRING_QR_TEST_PORT, CODE_PAIRING_QR_ALLOCATIONS},
+    };
+    for (const CodePairingRow& row : rows) {
+        SCOPED_TRACE(row.format);
+        run_code_pairing(row);
+    }
 }
 
 }  // namespace

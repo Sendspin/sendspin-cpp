@@ -14,8 +14,12 @@
 
 #include "pairing_token.h"
 
+#include "platform/secure_zero.h"
+
+#include <algorithm>
+#include <array>
+#include <cassert>
 #include <cstddef>
-#include <vector>
 
 namespace sendspin {
 
@@ -28,85 +32,77 @@ constexpr char BASE32_ALPHABET[32] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I
 
 /// @brief Bits one base32 character encodes, and the mask selecting them.
 constexpr int BASE32_BITS_PER_CHAR = 5;
-constexpr uint64_t BASE32_CHAR_MASK = 0x1F;
+constexpr uint32_t BASE32_CHAR_MASK = 0x1F;
 
-/// @brief RFC 4648 base32-encode `data`, padded to a multiple of 8 characters with '='.
-std::string base32_encode(const uint8_t* data, size_t len) {
-    std::string out;
-    out.reserve(((len + 4) / 5) * 8);
+/// @brief The "SP:" prefix and the version character ahead of every token's body.
+constexpr size_t TOKEN_HEADER_LENGTH = 4;
 
-    size_t i = 0;
-    while (i < len) {
-        uint8_t chunk[5] = {0, 0, 0, 0, 0};
-        size_t chunk_len = (len - i < 5) ? (len - i) : 5;
-        for (size_t j = 0; j < chunk_len; ++j) {
-            chunk[j] = data[i + j];
-        }
-
-        // 5 bytes (40 bits) -> 8 base32 characters (5 bits each).
-        uint64_t buf = (static_cast<uint64_t>(chunk[0]) << 32) |
-                       (static_cast<uint64_t>(chunk[1]) << 24) |
-                       (static_cast<uint64_t>(chunk[2]) << 16) |
-                       (static_cast<uint64_t>(chunk[3]) << 8) | static_cast<uint64_t>(chunk[4]);
-
-        char out_chars[8];
-        for (int k = 0; k < 8; ++k) {
-            int shift = (7 - k) * BASE32_BITS_PER_CHAR;
-            out_chars[k] = BASE32_ALPHABET[(buf >> shift) & BASE32_CHAR_MASK];
-        }
-
-        // Number of meaningful output characters for this (possibly partial) chunk, per
-        // RFC 4648 section 6's padding table, indexed by chunk_len (1..5 input bytes).
-        static constexpr int VALID_CHARS[6] = {0, 2, 4, 5, 7, 8};
-        int valid = VALID_CHARS[chunk_len];
-        for (int k = 0; k < 8; ++k) {
-            out.push_back(k < valid ? out_chars[k] : '=');
-        }
-
-        i += chunk_len;
-    }
-
-    return out;
+/// @brief Characters RFC 4648 base32 encodes `len` bytes in once its '=' padding is stripped.
+constexpr size_t base32_unpadded_length(size_t len) {
+    return (len * 8 + BASE32_BITS_PER_CHAR - 1) / BASE32_BITS_PER_CHAR;
 }
 
-/// @brief Wrap a payload as a pairing token of the given version (pairing.md "Pairing Token").
-/// Shared by both versions so their bodies cannot diverge.
-std::string format_token(char version, const uint8_t* payload, size_t payload_len) {
-    std::string body = base32_encode(payload, payload_len);
+static_assert(PAIRING_PSK_TOKEN_LENGTH ==
+                  TOKEN_HEADER_LENGTH + base32_unpadded_length(X25519_KEY_SIZE + NOISE_PSK_SIZE),
+              "a version-0 token is its header and the base32 of its 64-byte payload");
+static_assert(PAIRING_CODE_TOKEN_LENGTH ==
+                  TOKEN_HEADER_LENGTH + base32_unpadded_length(QR_PAIRING_CODE_SIZE),
+              "a version-1 token is its header and the base32 of its 24-byte payload");
 
-    size_t pad_start = body.find('=');
-    if (pad_start != std::string::npos) {
-        body.resize(pad_start);
-    }
+/// @brief Wrap a payload as a pairing token of the given version (pairing.md "Pairing Token"):
+/// "SP:" and the version, then the payload in RFC 4648 base32 with the '=' padding stripped and
+/// every '2' replaced by '9'. Shared by both versions so their bodies cannot diverge.
+/// @tparam N The token's length, TOKEN_HEADER_LENGTH + base32_unpadded_length(payload_len).
+template <size_t N>
+InlineText<N> format_token(char version, const uint8_t* payload, size_t payload_len) {
+    assert(N == TOKEN_HEADER_LENGTH + base32_unpadded_length(payload_len));
+    std::array<char, N> chars{'S', 'P', ':', version};
+    size_t length = TOKEN_HEADER_LENGTH;
+    const auto emit = [&chars, &length](uint32_t value) {
+        const char c = BASE32_ALPHABET[value & BASE32_CHAR_MASK];
+        chars[length++] = c == '2' ? '9' : c;
+    };
 
-    for (char& c : body) {
-        if (c == '2') {
-            c = '9';
+    // Base32 reads the payload as one big-endian bit string, five bits per character; a final
+    // partial group is padded with zero bits on the right.
+    uint32_t bits = 0;
+    int bit_count = 0;
+    for (size_t i = 0; i < payload_len; ++i) {
+        bits = (bits << 8) | payload[i];
+        bit_count += 8;
+        while (bit_count >= BASE32_BITS_PER_CHAR) {
+            bit_count -= BASE32_BITS_PER_CHAR;
+            emit(bits >> bit_count);
         }
     }
+    if (bit_count > 0) {
+        emit(bits << (BASE32_BITS_PER_CHAR - bit_count));
+    }
 
-    std::string token;
-    token.reserve(3 + 1 + body.size());
-    token += "SP:";
-    token += version;
-    token += body;
+    InlineText<N> token;
+    (void)token.assign({chars.data(), length});  // Exactly N characters
+    // A version-0 body is the Pairing PSK in base32.
+    secure_zero_container(chars);
     return token;
 }
 
 }  // namespace
 
-std::string format_pairing_token(const std::array<uint8_t, X25519_KEY_SIZE>& client_key,
-                                 const std::array<uint8_t, NOISE_PSK_SIZE>& pairing_psk) {
-    std::vector<uint8_t> payload;
-    payload.reserve(64);
-    payload.insert(payload.end(), client_key.begin(), client_key.end());
-    payload.insert(payload.end(), pairing_psk.begin(), pairing_psk.end());
+PairingPskToken format_pairing_token(const std::array<uint8_t, X25519_KEY_SIZE>& client_key,
+                                     const std::array<uint8_t, NOISE_PSK_SIZE>& pairing_psk) {
+    std::array<uint8_t, X25519_KEY_SIZE + NOISE_PSK_SIZE> payload{};
+    std::copy(client_key.begin(), client_key.end(), payload.begin());
+    std::copy(pairing_psk.begin(), pairing_psk.end(), payload.begin() + X25519_KEY_SIZE);
 
-    return format_token(PAIRING_PSK_TOKEN_VERSION, payload.data(), payload.size());
+    PairingPskToken token = format_token<PAIRING_PSK_TOKEN_LENGTH>(PAIRING_PSK_TOKEN_VERSION,
+                                                                   payload.data(), payload.size());
+    secure_zero_container(payload);
+    return token;
 }
 
-std::string format_pairing_code_token(const std::array<uint8_t, QR_PAIRING_CODE_SIZE>& code) {
-    return format_token(PAIRING_CODE_TOKEN_VERSION, code.data(), code.size());
+PairingCodeToken format_pairing_code_token(const std::array<uint8_t, QR_PAIRING_CODE_SIZE>& code) {
+    return format_token<PAIRING_CODE_TOKEN_LENGTH>(PAIRING_CODE_TOKEN_VERSION, code.data(),
+                                                   code.size());
 }
 
 }  // namespace sendspin

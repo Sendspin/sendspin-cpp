@@ -31,13 +31,12 @@
 #include "record_store.h"
 #include "sendspin/types.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <memory>
 #include <optional>
-#include <string>
-#include <utility>
-#include <vector>
+#include <span>
 
 namespace sendspin {
 
@@ -129,13 +128,20 @@ private:
 
 }  // namespace
 
-/// @brief Append `value` to `out` as a big-endian uint32, the encoding pairing.md "PAKE" gives
+/// @brief Size of a CPace sid (pairing.md "PAKE"): LABEL || h (32 bytes) || pairing_index ||
+/// round, each counter a big-endian uint32.
+static constexpr size_t PAKE_SID_SIZE = sizeof(PAKE_SID_LABEL) - 1 + 32 + 4 + 4;
+static_assert(PAKE_SID_SIZE <= CPACE_MAX_SID_SIZE, "the sid fits CPace's");
+
+/// @brief Write `value` at `out` as a big-endian uint32, the encoding pairing.md "PAKE" gives
 /// both of the sid's counters.
-static void append_be32(std::vector<uint8_t>& out, uint32_t value) {
-    out.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
-    out.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
-    out.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
-    out.push_back(static_cast<uint8_t>(value & 0xFF));
+/// @return The byte after it.
+static uint8_t* write_be32(uint8_t* out, uint32_t value) {
+    *out++ = static_cast<uint8_t>((value >> 24) & 0xFF);
+    *out++ = static_cast<uint8_t>((value >> 16) & 0xFF);
+    *out++ = static_cast<uint8_t>((value >> 8) & 0xFF);
+    *out++ = static_cast<uint8_t>(value & 0xFF);
+    return out;
 }
 
 /// @brief Build the CPace sid for one round of a pairing attempt (pairing.md "PAKE"):
@@ -146,25 +152,21 @@ static void append_be32(std::vector<uint8_t>& out, uint32_t value) {
 /// @param pairing_index The pairing_index captured for this attempt
 ///        (SendspinConnection::PairingSession::pairing_index).
 /// @param round The round number within the attempt, 1 for the first.
-static std::vector<uint8_t> build_pake_sid(const std::array<uint8_t, 32>& handshake_hash,
-                                           uint32_t pairing_index, uint32_t round) {
-    std::vector<uint8_t> sid;
-    sid.reserve(sizeof(PAKE_SID_LABEL) - 1 + 32 + 4 + 4);
-    sid.insert(sid.end(), PAKE_SID_LABEL, PAKE_SID_LABEL + sizeof(PAKE_SID_LABEL) - 1);
-    sid.insert(sid.end(), handshake_hash.begin(), handshake_hash.end());
-    append_be32(sid, pairing_index);
-    append_be32(sid, round);
+static std::array<uint8_t, PAKE_SID_SIZE> build_pake_sid(
+    const std::array<uint8_t, 32>& handshake_hash, uint32_t pairing_index, uint32_t round) {
+    std::array<uint8_t, PAKE_SID_SIZE> sid{};
+    uint8_t* out =
+        std::copy(PAKE_SID_LABEL, PAKE_SID_LABEL + sizeof(PAKE_SID_LABEL) - 1, sid.data());
+    out = std::copy(handshake_hash.begin(), handshake_hash.end(), out);
+    out = write_be32(out, pairing_index);
+    write_be32(out, round);
     return sid;
 }
 
-/// @brief The client's own CPace associated data (ADb = "client"), as raw bytes.
-static std::vector<uint8_t> pake_ad_client() {
-    return std::vector<uint8_t>(PAKE_AD_CLIENT, PAKE_AD_CLIENT + sizeof(PAKE_AD_CLIENT) - 1);
-}
-
-/// @brief The peer's (server's) CPace associated data (ADa = "server"), as raw bytes.
-static std::vector<uint8_t> pake_ad_server() {
-    return std::vector<uint8_t>(PAKE_AD_SERVER, PAKE_AD_SERVER + sizeof(PAKE_AD_SERVER) - 1);
+/// @brief `text`'s bytes without its terminating NUL, the form CPace takes ADa and ADb in.
+template <size_t N>
+static std::span<const uint8_t> pake_ad(const char (&text)[N]) {
+    return {reinterpret_cast<const uint8_t*>(text), N - 1};
 }
 
 PairingUiSnapshot snapshot_pairing_ui(SendspinConnection* conn) {
@@ -260,7 +262,7 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
         // CPace consumes the static code as PRS directly, so it is known here; a dynamic code
         // is only known once nonce_A arrives.
         // NOLINTNEXTLINE(bugprone-unchecked-optional-access): checked above for the static method
-        ps.prs = pairing_code_digits_prs(static_code.value());
+        ps.set_prs(pairing_code_digits_prs(static_code.value()));
     }
 
     // Gesture gating: the static pairing code gates every attempt on an operator gesture
@@ -330,7 +332,7 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
 
     // Hold the pending record: committed to the RecordStore by the server/pair-finalize handler
     // on ack.
-    conn->set_pending_pairing_record(std::move(outcome->record));
+    conn->set_pending_pairing_record(outcome->record);
 }
 
 void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortReason reason) {
@@ -523,22 +525,20 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
         // The emission format decides both what the operator receives and what CPace consumes as
         // PRS: the six ASCII digits, or the 24 raw digest bytes the version-1 pairing token
         // carries (pairing.md "Pairing code derivation", "QR-code emission").
-        std::string emitted;
-        if (ps.format == SendspinPairingCodeFormat::QR_CODE) {
-            auto code = pairing_code_qr_bytes(digest.value());
-            ps.prs.assign(code.begin(), code.end());
-            emitted = format_pairing_code_token(code);
-        } else {
-            std::string digits = pairing_code_digits(digest.value());
-            ps.prs = pairing_code_digits_prs(digits);
-            emitted = std::move(digits);
-        }
-
         // Emit the code to the operator (queued for the main loop by note_display_pairing_code).
         // Record that one is being emitted so the abort/cleanup paths know to withdraw it. A
         // later round re-emits nothing: the code has not changed, so an emission that persists
         // (a display) is already showing the right one (pairing.md "Client verification").
-        this->client_->note_display_pairing_code(emitted, ps.format);
+        if (ps.format == SendspinPairingCodeFormat::QR_CODE) {
+            const auto code = pairing_code_qr_bytes(digest.value());
+            ps.set_prs(code);
+            this->client_->note_display_pairing_code(format_pairing_code_token(code).view(),
+                                                     ps.format);
+        } else {
+            const DynamicPairingCodeDigits digits = pairing_code_digits(digest.value());
+            ps.set_prs(pairing_code_digits_prs(digits.view()));
+            this->client_->note_display_pairing_code(digits.view(), ps.format);
+        }
         ps.code_emitted = true;
     }
 
@@ -676,7 +676,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
         conn->send_json(json);
     } else {
         auto wrapped_nonce =
-            wrap_value(NONCE_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), ps.nonce_b);
+            wrap_value(NONCE_WRAP_LABEL, cipher_name, ps.cpace, isk.value(), ps.nonce_b);
         if (!wrapped_nonce.has_value()) {
             SS_LOGE(TAG, "handle_pairing_message: wrapping nonce_B failed for server_id=%s",
                     server_id.c_str());
@@ -708,8 +708,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     // (pairing.md "Wrapping"). K_wrap = SHA-256(PSK_WRAP_LABEL || sid || ISK); the PSK is
     // sealed with the connection's negotiated AEAD, a 12-byte all-zero nonce, and empty AD. The
     // label differs from the one nonce_B was sealed under, so the two fields never share a key.
-    auto wrapped =
-        wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), outcome->psk);
+    auto wrapped = wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace, isk.value(), outcome->psk);
     if (!wrapped.has_value()) {
         SS_LOGE(TAG, "handle_pairing_message: wrapping the long-term PSK failed for server_id=%s",
                 server_id.c_str());
@@ -724,7 +723,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     JsonDocument json = make_json_document(this->json_arena());
     build_client_pair_finalize_wrapped_message(wrapped.value(), json);
     conn->send_json(json);
-    conn->set_pending_pairing_record(std::move(outcome->record));
+    conn->set_pending_pairing_record(outcome->record);
 
     ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_FINALIZE;
 }
@@ -809,7 +808,7 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
 
     // Static pairing code: the PRS handle_enter_pairing_code() set. Empty means it was never set
     // (defensive; that path always sets it for a static attempt).
-    if (ps.prs.empty()) {
+    if (ps.prs_size == 0) {
         SS_LOGE(TAG, "start_pairing_attempt: no static pairing code captured for server_id=%s",
                 server_id.c_str());
         this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
@@ -841,11 +840,11 @@ bool ConnectionManager::start_pake_round(SendspinConnection* conn) {
     // rather than in each caller. The caller has already set ps.round to the number of the round
     // this run belongs to.
     auto& ps = conn->pairing_session();
-    std::vector<uint8_t> sid = build_pake_sid(ps.handshake_hash, ps.pairing_index, ps.round);
+    const auto sid = build_pake_sid(ps.handshake_hash, ps.pairing_index, ps.round);
 
     // ADb = "client" (our own AD), ADa = "server" (peer's AD): pairing.md "PAKE".
-    if (!ps.cpace.start(CPaceRole::RESPONDER, ps.prs, sid, {}, pake_ad_client(),
-                        pake_ad_server())) {
+    if (!ps.cpace.start(CPaceRole::RESPONDER, ps.prs_view(), sid, {}, pake_ad(PAKE_AD_CLIENT),
+                        pake_ad(PAKE_AD_SERVER))) {
         SS_LOGE(TAG, "start_pake_round: CPace::start failed for server_id=%s",
                 conn->get_server_id().c_str());
         this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);

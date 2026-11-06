@@ -118,7 +118,7 @@ std::optional<std::array<uint8_t, 32>> pairing_code_digest(const uint8_t* handsh
 /// @brief The radix of the decimal pairing code.
 static constexpr uint64_t DECIMAL_BASE = 10;
 
-std::string pairing_code_digits(const std::array<uint8_t, 32>& digest) {
+DynamicPairingCodeDigits pairing_code_digits(const std::array<uint8_t, 32>& digest) {
     // The modulus fits in uint64_t: 10^6 = 1_000_000 < 2^20.
     uint64_t modulus = 1;
     for (int i = 0; i < DYNAMIC_PAIRING_CODE_DIGITS; ++i) {
@@ -134,11 +134,13 @@ std::string pairing_code_digits(const std::array<uint8_t, 32>& digest) {
         acc = (acc * 256 + digest[i]) % modulus;
     }
 
-    std::string code(static_cast<size_t>(DYNAMIC_PAIRING_CODE_DIGITS), '0');
+    std::array<char, DYNAMIC_PAIRING_CODE_DIGITS> chars{};
     for (int i = DYNAMIC_PAIRING_CODE_DIGITS - 1; i >= 0; --i) {
-        code[static_cast<size_t>(i)] = static_cast<char>('0' + (acc % DECIMAL_BASE));
+        chars[static_cast<size_t>(i)] = static_cast<char>('0' + (acc % DECIMAL_BASE));
         acc /= DECIMAL_BASE;
     }
+    DynamicPairingCodeDigits code;
+    (void)code.assign({chars.data(), chars.size()});  // Exactly the held length
     return code;
 }
 

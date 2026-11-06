@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include "pairing_offers.h"
 #include "protocol_messages.h"
 #include "record_store.h"
 
@@ -121,6 +122,52 @@ inline bool relies_on_unpaired_access(PskCategory category, ActivitySet activiti
            !admissible(category, activities, has_roles, /*unpaired_access=*/false);
 }
 
+/// @brief Why a pairing activation's pairing object is not acceptable, or nullptr if it is.
+///
+/// messaging.md "server/activate": with 'pairing' in `activities`, `pairing.method` must be
+/// pairing_psk iff the matched PSK is the pairing PSK and must be one the client offers, and a
+/// dynamic_pairing_code activation must name an offered `format`. The same predicates
+/// build_client_hello() advertises from (pairing_offers.h).
+///
+/// @param category  PSK category the Noise handshake matched.
+/// @param msg       The server/activate.
+/// @param config    The client config the offers derive from.
+/// @return nullptr when 'pairing' is not declared or the object is acceptable, else a diagnostic.
+inline const char* pairing_method_refusal(PskCategory category, const ServerActivateMessage& msg,
+                                          const SendspinClientConfig& config) {
+    if (!msg.activities.contains(SendspinActivity::PAIRING)) {
+        return nullptr;
+    }
+    // Pairing object absent, or a method string this client does not recognize
+    // (process_server_activate_message logs the unrecognized value).
+    if (!msg.pairing_method.has_value()) {
+        return "declares pairing with no usable pairing.method";
+    }
+    const SendspinPairMethod method = msg.pairing_method.value();
+    bool offered = true;
+    switch (method) {
+        case SendspinPairMethod::PAIRING_PSK:
+            offered = true;  // Always advertised; see pairing_offers.h.
+            break;
+        case SendspinPairMethod::DYNAMIC_PAIRING_CODE:
+            offered = offers_dynamic_pairing_code(config);
+            break;
+        case SendspinPairMethod::STATIC_PAIRING_CODE:
+            offered = offers_static_pairing_code(config);
+            break;
+    }
+    const bool category_ok =
+        (method == SendspinPairMethod::PAIRING_PSK) == (category == PskCategory::PAIRING);
+    if (!category_ok || !offered) {
+        return "selects an unsupported pairing method";
+    }
+    if (method == SendspinPairMethod::DYNAMIC_PAIRING_CODE &&
+        !offers_pairing_code_format(config, msg.pairing_format)) {
+        return "names no usable pairing.format";
+    }
+    return nullptr;
+}
+
 /// @brief Goodbye reason to close an inadmissible server/activate with.
 ///
 /// Separates "you are not paired yet" from "you may never do this", by the first-rule-wins order
@@ -132,11 +179,15 @@ inline bool relies_on_unpaired_access(PskCategory category, ActivitySet activiti
 /// admissible one the return value is meaningless.
 ///
 /// @param category, activities, has_roles, unpaired_access  Same as admissible().
+/// @param pairing_ok  Whether pairing_method_refusal() accepts the activation's pairing object.
+///                    Unpaired access does not gate it, so enabling unpaired access cannot fix a
+///                    refused one.
 /// @return PAIRING_REQUIRED if enabling unpaired access would have admitted it, else UNAUTHORIZED.
 inline SendspinGoodbyeReason inadmissible_reject_reason(PskCategory category,
                                                         ActivitySet activities, bool has_roles,
-                                                        bool unpaired_access) {
-    if (!unpaired_access && relies_on_unpaired_access(category, activities, has_roles)) {
+                                                        bool unpaired_access, bool pairing_ok) {
+    if (!unpaired_access && pairing_ok &&
+        relies_on_unpaired_access(category, activities, has_roles)) {
         return SendspinGoodbyeReason::PAIRING_REQUIRED;
     }
     return SendspinGoodbyeReason::UNAUTHORIZED;

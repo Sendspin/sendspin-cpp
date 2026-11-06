@@ -14,6 +14,7 @@
 
 #include "ws_server.h"
 
+#include "connection_block.h"
 #include "constants.h"
 #include "lwip/sockets.h"  // for close()
 #include "platform/compiler.h"
@@ -25,8 +26,10 @@
 #include <esp_timer.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <utility>
 
 namespace sendspin {
@@ -77,6 +80,12 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
     }
     config.stack_size = task_stack_size;
     config.server_port = this->server_port_;
+    // The session slots and the pending table hold MAX_SESSIONS sessions (see sessions_).
+    if (this->max_connections_ > MAX_SESSIONS) {
+        SS_LOGW(TAG, "server_max_connections %u above maximum %u; clamping",
+                static_cast<unsigned>(this->max_connections_), static_cast<unsigned>(MAX_SESSIONS));
+        this->max_connections_ = MAX_SESSIONS;
+    }
     config.max_open_sockets = this->max_connections_;
     config.open_fn = SendspinWsServer::open_callback;
     config.close_fn = SendspinWsServer::close_callback;
@@ -146,13 +155,18 @@ void SendspinWsServer::stop() {
     }
 
     // httpd_stop tore down every session, so this is normally already empty; clear defensively
-    // so a restart begins from a clean table. Declared above the lock so its shared_ptr entries
-    // release after pending_mutex_ is dropped.
-    // cppcheck-suppress variableScope
-    std::vector<PendingUpgrade> stale;
-    {
-        std::lock_guard<std::mutex> lock(this->pending_mutex_);
-        stale.swap(this->pending_);
+    // so a restart begins from a clean table. One entry at a time, so each connection releases
+    // after pending_mutex_ is dropped.
+    for (;;) {
+        std::shared_ptr<SendspinServerConnection> stale;
+        {
+            std::lock_guard<std::mutex> lock(this->pending_mutex_);
+            if (this->pending_.empty()) {
+                return;
+            }
+            stale = std::move(this->pending_.begin()->conn);
+            this->pending_.erase(this->pending_.begin());
+        }
     }
 }
 
@@ -172,35 +186,37 @@ uint32_t SendspinWsServer::tick() {
     // Pure age-based reap: any session still undelivered past the deadline is closed. Sparing
     // "upgraded but undelivered" sessions would turn a broken post-handshake callback into a
     // silent wedge of httpd's small socket pool instead of a visible close-and-retry loop. Pop
-    // under the lock, close outside it; the pop also resolves a delivery racing this reap
-    // exactly-once (the loser finds no entry and no-ops).
-    std::vector<std::shared_ptr<SendspinServerConnection>> to_reap;
+    // one expired session under the lock, close it outside the lock, and scan again; the pop also
+    // resolves a delivery racing this reap exactly-once (the loser finds no entry and no-ops). The
+    // scan that finds none has seen every remaining deadline.
     const int64_t now_us = esp_timer_get_time();
-    // The earliest deadline still ahead, for the protocol task's wait.
-    int64_t next_due_us = INT64_MAX;
-    {
-        std::lock_guard<std::mutex> lock(this->pending_mutex_);
-        for (auto it = this->pending_.begin(); it != this->pending_.end();) {
-            // A closing session is skipped, not reaped: close_callback pops its entry.
-            const int64_t due_us = it->accept_time_us + WS_UPGRADE_TIMEOUT_US;
-            if (it->conn->is_connected() && now_us >= due_us) {
-                to_reap.push_back(std::move(it->conn));
-                it = this->pending_.erase(it);
-                continue;
-            }
-            if (it->conn->is_connected()) {
+    for (;;) {
+        std::shared_ptr<SendspinServerConnection> expired;
+        // The earliest deadline still ahead, for the protocol task's wait.
+        int64_t next_due_us = INT64_MAX;
+        {
+            std::lock_guard<std::mutex> lock(this->pending_mutex_);
+            for (auto it = this->pending_.begin(); it != this->pending_.end(); ++it) {
+                // A closing session is skipped, not reaped: close_callback pops its entry.
+                if (!it->conn->is_connected()) {
+                    continue;
+                }
+                const int64_t due_us = it->accept_time_us + WS_UPGRADE_TIMEOUT_US;
+                if (now_us >= due_us) {
+                    expired = std::move(it->conn);
+                    this->pending_.erase(it);
+                    break;
+                }
                 next_due_us = std::min(next_due_us, due_us);
             }
-            ++it;
         }
-    }
-
-    for (auto& conn : to_reap) {
+        if (expired == nullptr) {
+            return next_due_us == INT64_MAX ? UINT32_MAX : ms_until(next_due_us, now_us);
+        }
         SS_LOGW(TAG, "Session did not complete a WebSocket upgrade within %d s, closing",
                 static_cast<int>(WS_UPGRADE_TIMEOUT_US / (1000 * 1000)));
-        conn->trigger_close();
+        expired->trigger_close();
     }
-    return next_due_us == INT64_MAX ? UINT32_MAX : ms_until(next_due_us, now_us);
 }
 
 void SendspinWsServer::deliver_upgraded(int sockfd) {
@@ -256,16 +272,27 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
         return ESP_FAIL;
     }
 
-    // Pin the connection to the httpd session: a heap-allocated shared_ptr is set as the session
-    // context, with a free_fn that drops the refcount when the session is torn down. httpd invokes
-    // the close_fn before the free_fn, so observers (ConnectionManager) get notified first and any
-    // queued workers that have already started look up the same shared_ptr via httpd_sess_get_ctx
-    // and run safely until the session is freed.
-    auto conn = std::make_shared<SendspinServerConnection>(handle, sockfd, server->send_pools_);
-    auto* slot = new std::shared_ptr<SendspinServerConnection>(conn);
-    httpd_sess_set_ctx(handle, sockfd, slot, [](void* p) {
-        delete static_cast<std::shared_ptr<SendspinServerConnection>*>(p);
-    });
+    // A free session slot, found before anything is allocated. One is always free while
+    // max_open_sockets <= MAX_SESSIONS (see sessions_), so this refusal guards that invariant
+    // rather than turning away a session httpd could hold.
+    const auto free_slot = std::find(server->sessions_.begin(), server->sessions_.end(), nullptr);
+    if (free_slot == server->sessions_.end()) {
+        assert(false && "no free session slot under max_open_sockets <= MAX_SESSIONS");
+        return ESP_FAIL;
+    }
+    auto conn =
+        make_connection_in_block<SendspinServerConnection>(handle, sockfd, server->send_pools_);
+    if (conn == nullptr) {
+        SS_LOGE(TAG, "No memory for a connection; refusing the session");
+        return ESP_FAIL;
+    }
+
+    // Pin the connection to the httpd session: the slot is set as the session context, with a
+    // free_fn that resets it when the session is torn down. httpd invokes the close_fn before the
+    // free_fn, so observers (ConnectionManager) get notified first.
+    std::shared_ptr<SendspinServerConnection>* slot = &*free_slot;
+    *slot = conn;
+    httpd_sess_set_ctx(handle, sockfd, slot, SendspinWsServer::release_session_slot);
 
     // Park it as pending rather than delivering: the rest of the library only ever learns about
     // connections whose WebSocket upgrade has been observed (see the delivery contract in
@@ -273,6 +300,7 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
     // knowing it existed.
     {
         std::lock_guard<std::mutex> lock(server->pending_mutex_);
+        // Never full: this session's slot is in use and it has no entry yet (see pending_).
         server->pending_.push_back(PendingUpgrade{std::move(conn), esp_timer_get_time(), sockfd});
     }
     // The protocol task's next tick() then reports this session's upgrade deadline.
@@ -282,14 +310,27 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
     return ESP_OK;
 }
 
+void SendspinWsServer::release_session_slot(void* slot) {
+    // Usually the connection's last reference, so it is destroyed here, on the httpd task.
+    static_cast<std::shared_ptr<SendspinServerConnection>*>(slot)->reset();
+}
+
 void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
     SS_LOGD(TAG, "Client closed connection on socket %d", sockfd);
 
-    // Flip the connection to disconnected immediately: queued async sends check is_connected()
-    // and must not resolve this sockfd once httpd may recycle it for a new session.
     auto* slot =
         static_cast<std::shared_ptr<SendspinServerConnection>*>(httpd_sess_get_ctx(handle, sockfd));
-    if (slot != nullptr && *slot != nullptr) {
+    if (slot == nullptr) {
+        // Only a session open_callback() refused has no context. Its receive side is shut down as
+        // below, but httpd_accept_conn() closes its fd once this returns, so closing it here too
+        // could close a socket another task opened on the same fd in between.
+        shutdown(sockfd, SHUT_RD);
+        return;
+    }
+
+    // Flip the connection to disconnected immediately: queued async sends check is_connected()
+    // and must not resolve this sockfd once httpd may recycle it for a new session.
+    if (*slot != nullptr) {
         (*slot)->mark_closed();
     }
 
@@ -305,9 +346,9 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
     // Tell the protocol task, which drops the connection from ConnectionManager's slots (its
     // observer shared_ptr) once the messages the session delivered before closing are processed.
     // The event is keyed on the connection's identity, never the recyclable sockfd. The session
-    // slot keeps it alive until httpd invokes the free_fn, so in-flight workers still see a
-    // valid object.
-    if (slot != nullptr && *slot != nullptr) {
+    // slot keeps it alive until httpd invokes the free_fn, right after this returns; queued
+    // workers hold a weak_ptr, so a worker that runs later finds it gone or closed.
+    if (*slot != nullptr) {
         (*slot)->notify_transport_closed();
     }
 

@@ -33,7 +33,7 @@ namespace sendspin {
 // PSK-ID derivation
 // ============================================================================
 
-std::optional<std::string> psk_id_for(const uint8_t* psk, size_t len) {
+std::optional<IdText> psk_id_for(const uint8_t* psk, size_t len) {
     if (len != NOISE_PSK_SIZE) {
         return std::nullopt;
     }
@@ -50,7 +50,13 @@ std::optional<std::string> psk_id_for(const uint8_t* psk, size_t len) {
     if (!h.ok()) {
         return std::nullopt;
     }
-    return b64url_encode(digest.data(), digest.size());
+    // A SHA-256 digest is as long as a public key, so it encodes to PEER_ID_SIZE characters like a
+    // peer_id and the assign() fits.
+    static_assert(SHA256_DIGEST_SIZE == X25519_KEY_SIZE);
+    PeerIdText text{};
+    IdText psk_id;
+    (void)psk_id.assign(b64url_encode_into(text.data(), text.size(), digest.data(), digest.size()));
+    return psk_id;
 }
 
 std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
@@ -59,12 +65,12 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
     // failed. This overload's non-optional return type is depended on throughout the tree
     // (record store, tests) as a plain std::string, so there is no safe value to
     // return on failure; fail loudly rather than silently deriving a psk_id from a
-    // zero digest (matching the CSPRNG-failure precedent in platform_random_bytes()).
+    // zero digest.
     auto result = psk_id_for(psk.data(), psk.size());
     if (!result.has_value()) {
         abort();
     }
-    return result.value();
+    return std::string(result->view());
 }
 
 // ============================================================================

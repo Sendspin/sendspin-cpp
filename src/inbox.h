@@ -327,6 +327,12 @@ public:
         this->bind(inbox, topic_bit);
     }
 
+    /// @brief Constructs bound to `inbox`, holding `clean` as the clean value, such as a vector
+    /// reserved ahead so the first update() does not allocate
+    InboxSlot(Inbox& inbox, uint32_t topic_bit, T clean) : slot_(std::move(clean)) {
+        this->bind(inbox, topic_bit);
+    }
+
     ~InboxSlot() {
         // Release the bit claim so a replacement slot (e.g. a role re-added before start) can
         // bind it. Requires the bound Inbox to outlive this slot.
@@ -403,9 +409,10 @@ public:
     }
 
     /// @brief Edits a pending value in place with fn(T& current), which returns whether anything
-    /// is still pending; when it returns false the slot is cleaned and its topic bit cleared, so
-    /// an edit that leaves nothing behind wakes no drain. A clean slot is left untouched. `fn`
-    /// runs under the Inbox mutex: a pure data operation only.
+    /// is still pending; when it returns false it leaves `current` as the slot's clean value (the
+    /// storage of an emptied vector stays with the slot), and the slot is cleaned and its topic
+    /// bit cleared, so an edit that leaves nothing behind wakes no drain. A clean slot is left
+    /// untouched. `fn` runs under the Inbox mutex: a pure data operation only.
     template <typename EditFn>
     void edit(EditFn&& fn) {
         if (!this->check_bound()) {
@@ -415,7 +422,6 @@ public:
         if (!this->dirty_ || fn(this->slot_)) {
             return;
         }
-        this->slot_ = T{};
         this->dirty_ = false;
         this->inbox_->clear_bit_locked(this->topic_bit_);
     }
@@ -432,6 +438,27 @@ public:
         }
         out = std::move(this->slot_);
         this->slot_ = T{};
+        this->dirty_ = false;
+        this->inbox_->clear_bit_locked(this->topic_bit_);
+        return true;
+    }
+
+    /// @brief Swap the accumulated value into `out` if dirty, the slot keeping `out`'s previous
+    /// value as its clean value
+    ///
+    /// For a value whose storage should stay put, such as a reserved vector: the caller passes
+    /// one it has emptied, and the two buffers trade places on every take instead of the slot
+    /// starting over with an empty one.
+    /// @return true if a value was taken, false if the slot was clean or unbound.
+    bool exchange(T& out) {
+        if (!this->check_bound()) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(this->inbox_->mutex_);
+        if (!this->dirty_) {
+            return false;
+        }
+        std::swap(out, this->slot_);
         this->dirty_ = false;
         this->inbox_->clear_bit_locked(this->topic_bit_);
         return true;
@@ -499,9 +526,9 @@ public:
     }
 
     /// @brief Overwrites the pending payload (latest-wins) unless it belongs to a later generation
-    /// @param value The payload.
+    /// @param value The payload, taken by reference for the reason merge() states.
     /// @param generation The producing role's teardown generation the payload was admitted under.
-    void write(T value, uint32_t generation) {
+    void write(T&& value, uint32_t generation) {
         this->merge([](T& current, T&& delta) { current = std::move(delta); }, std::move(value),
                     generation);
     }

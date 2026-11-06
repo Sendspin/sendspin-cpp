@@ -16,6 +16,7 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "inline_text.h"
 #include "noise_session.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
@@ -31,10 +32,6 @@
 static const char* const TAG = "sendspin.noise_handshake";
 
 namespace sendspin {
-
-/// Most bytes of unauthenticated peer text (a frame's type, a server/error reason) one log line
-/// prints. The longest such value messaging.md defines is 19 bytes.
-static constexpr size_t PEER_TEXT_LOG_BYTES = 32;
 
 static_assert(MAX_HANDSHAKE_MSG1_BYTES ==
                   X25519_KEY_SIZE + MAX_HANDSHAKE_MESSAGE_BYTES + AEAD_TAG_SIZE,
@@ -74,17 +71,9 @@ static size_t serialize_client_init(std::string_view client_id, const char* suit
     return serializeJson(doc, out.as<char>(), size + 1);
 }
 
-bool build_noise_handshake_message(std::span<const uint8_t> noise_bytes, JsonDocument& doc) {
-    PlatformBuffer encoded;
-    if (!encoded.allocate(b64url_encode_buffer_size(noise_bytes.size()))) {
-        SS_LOGE(TAG, "noise/handshake: no memory to encode %zu bytes", noise_bytes.size());
-        return false;
-    }
+void build_noise_handshake_message(const NoiseMsg2& msg2, JsonDocument& doc) {
     doc["type"] = "noise/handshake";
-    // Copied into the document, which outlives the scratch buffer.
-    doc["payload"]["data"] = b64url_encode_into(encoded.as<char>(), encoded.size(),
-                                                noise_bytes.data(), noise_bytes.size());
-    return true;
+    b64url_encode_to(doc["payload"]["data"], msg2);
 }
 
 // ============================================================================
@@ -340,7 +329,7 @@ void NoiseHandshake::take_server_error(JsonObjectConst root, const char* log_con
     // place and logged only up to PEER_TEXT_LOG_BYTES, never copied.
     const std::string_view text = root["payload"]["reason"] | std::string_view("");
     this->server_error_reason_ = server_error_reason_from_string(text);
-    const std::string_view logged = text.substr(0, PEER_TEXT_LOG_BYTES);
+    const std::string_view logged = peer_text_for_log(text);
     SS_LOGE(TAG, "%s: server/error, reason='%.*s'; the server refused the connection", log_context,
             static_cast<int>(logged.size()), logged.data());
 }
@@ -381,7 +370,7 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
             return false;
         }
         if (type != expected_type) {
-            const std::string_view logged = type.substr(0, PEER_TEXT_LOG_BYTES);
+            const std::string_view logged = peer_text_for_log(type);
             SS_LOGE(TAG, "%s: unexpected type '%.*s'", log_context, static_cast<int>(logged.size()),
                     logged.data());
             return false;
@@ -473,7 +462,8 @@ bool NoiseHandshake::handle_msg1(std::span<uint8_t> msg1_bytes,
 
     // Send noise/handshake msg2 as a TEXT frame
     JsonDocument msg2 = make_json_document(this->arena_);
-    if (!build_noise_handshake_message(core->msg2_bytes, msg2) || !send_fn(msg2)) {
+    build_noise_handshake_message(core->msg2_bytes, msg2);
+    if (!send_fn(msg2)) {
         SS_LOGE(TAG, "handle_msg1: failed to send noise/handshake msg2");
         return false;
     }
