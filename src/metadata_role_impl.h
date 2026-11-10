@@ -153,9 +153,10 @@ struct MetadataRole::Impl : RoleTeardown {
     /// METADATA_TEXT_BLOCKS blocks of layout.block_bytes, allocated by start(); empty when no
     /// field is kept.
     PlatformBuffer text_blocks;
-    /// The applied state, the one on_metadata() is handed. Main loop only, like the text storage
-    /// below that fills its text fields, reserved for each kept field's cap.
+    /// The applied state, the one on_metadata() is handed. Main loop only.
     ServerMetadataStateObject metadata{};
+    /// Storage for the public state's text fields, reserved for each kept field's cap. Main loop
+    /// only.
     std::array<ReservedText, METADATA_FIELD_COUNT> metadata_text;
     /// The state the last delivery handed over, whose text the public state is filled from. Main
     /// loop only; the slot's commit swaps it, under the Inbox mutex, for the state it delivers.

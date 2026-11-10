@@ -434,8 +434,8 @@ public:
 #endif
 
 #ifdef SENDSPIN_ENABLE_METADATA
-    /// @brief Adds the metadata role, keeping every text field unless `config` lists fewer.
-    /// Returns a reference for setting callbacks
+    /// @brief Adds the metadata role; `config` selects which text fields it keeps. Returns a
+    /// reference for setting callbacks
     MetadataRole& add_metadata(MetadataRoleConfig config = {});
 #endif
 

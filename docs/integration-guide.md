@@ -328,7 +328,7 @@ The `ServerMetadataStateObject` contains these fields (all optional except `time
 
 `MetadataProgressObject` contains `track_progress` (ms), `track_duration` (ms), and `playback_speed`.
 
-The text fields are bounded in UTF-8 bytes as roles/metadata/v1.md "server/state metadata object" caps them. A server that sends a longer one has it cut to the cap at a UTF-8 character boundary, with one warning per connection; a future release closes the connection on such a state instead (messaging.md "Out-of-range values"). A text field turned off in `MetadataRoleConfig` is always `nullopt`.
+The text fields are bounded in UTF-8 bytes as roles/metadata/v1.md "server/state metadata object" caps them. A server that sends a longer one has it cut to the cap at a UTF-8 character boundary, with one warning per connection. A text field turned off in `MetadataRoleConfig` is always `nullopt`.
 
 Every `on_metadata()` call carries the full state of the track being described, not a set of changes: a field the server left out of that update is `nullopt`, whatever an earlier update reported for it, and a state without `progress` means there is no position to show. Listeners that mirror metadata into display state should therefore overwrite every displayed value on each call (using e.g. `value_or("")`) rather than merging into what they already show.
 
@@ -1436,7 +1436,7 @@ Configuration passed to `client.add_metadata()`, which defaults it.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `title`, `artist`, `album_artist`, `album`, `artwork_url` | `bool` | `true` | Whether to keep that text field of `ServerMetadataStateObject`. A field set `false` is dropped as each state is parsed and reaches the listener as `nullopt`; `year`, `track` and `progress` are always kept. Each kept field costs its cap (255 bytes, 2048 for `artwork_url`) in the public state's string, reserved by `add_metadata()` from internal RAM on ESP-IDF, and in each of the three text blocks that carry states from the protocol task to the main loop, allocated by `start()`. With every field kept that is 3,068 bytes of string capacity and 9,204 bytes of blocks; with `{.artwork_url = false}`, 1,020 and 3,060. `start()` fails, logged, when the blocks cannot be allocated. |
+| `title`, `artist`, `album_artist`, `album`, `artwork_url` | `bool` | `true` | Whether to keep that text field of `ServerMetadataStateObject`. A field set `false` is dropped as each state is parsed and reaches the listener as `nullopt`; `year`, `track` and `progress` are always kept. Each kept field costs its cap (255 bytes, 2048 for `artwork_url`) in the public state's string, reserved by `add_metadata()` through `operator new` (internal RAM on ESPHome), and in each of the three text blocks that carry states from the protocol task to the main loop, allocated by `start()`. With every field kept that is 3,068 bytes of string capacity and 9,204 bytes of blocks; with `{.artwork_url = false}`, 1,020 and 3,060. `start()` fails, logged, when the blocks cannot be allocated. |
 | `buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement preference for the text blocks. `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. ESP-IDF only; ignored on host. |
 
 ---

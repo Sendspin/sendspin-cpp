@@ -678,13 +678,6 @@ bool process_server_command_source(JsonObject root, SourceCommand* source_cmd) {
     return true;
 }
 
-// server/state is parsed per section rather than into a single aggregate struct. Each section
-// here is an out-of-line function that fills a caller-owned struct directly, so no section's
-// fields are materialized twice (once in a parser frame, once in the caller's). The caller keeps
-// every section a role takes live together in its own frame for one parse of the document; that
-// combined frame is on the protocol task, whose stack is bounded on ESP-IDF and covers it (see
-// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
-
 MetadataTextOutcome metadata_text_from_wire(JsonVariantConst var, const char* name, size_t cap,
                                             bool strict, std::string_view* out) {
     if (!var.is<const char*>()) {
@@ -782,6 +775,13 @@ MetadataStateOutcome process_server_state_metadata(JsonObject root, EnumSet<Meta
 
     return cut ? MetadataStateOutcome::CUT : MetadataStateOutcome::PARSED;
 }
+
+// server/state is parsed per section rather than into a single aggregate struct. The color and
+// controller sections are out-of-line functions that each fill a caller-owned struct directly, so
+// no section's fields are materialized twice (once in a parser frame, once in the caller's). The
+// caller keeps both live together in its own frame for one parse of the document; that combined
+// frame is on the protocol task, whose stack is bounded on ESP-IDF and covers it (see
+// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
 
 bool process_server_state_color(JsonObject root, ServerColorStateObject* color) {
     if (color == nullptr || !root["payload"]["color"].is<JsonObject>()) {

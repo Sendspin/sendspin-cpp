@@ -118,8 +118,7 @@ class InboxSlot;
  * and nothing locks the Inbox while holding another library lock. So no slot takes a payload
  * conditionally on a server-clock deadline, whose clock read takes a lock of its own: a role whose
  * state waits for one decides with no lock held (ScheduledStateSlot). Every critical section is a
- * short copy of bounded size; the largest is a role's fixed-size text copied into its slot as it
- * arrives, documented at the role that copies it.
+ * short copy of bounded size; the largest is documented at MetadataRole::Impl::fill_place().
  *
  * @code
  * Inbox inbox;

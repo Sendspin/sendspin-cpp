@@ -2174,7 +2174,7 @@ TEST(EncryptedLifecycle, MetadataStateReplacesRatherThanMerges) {
 
 // MetadataRoleConfig: the listener is handed the text fields the role keeps and no value
 // for the others, and a kept field over its cap (roles/metadata/v1.md "server/state metadata
-// object") cut to it at a character boundary, on every state that carries one: the warning the
+// object") is cut to it at a character boundary, on every state that carries one: the warning the
 // connection logs once does not stand in for the value.
 TEST(EncryptedLifecycle, MetadataKeepsTheConfiguredFieldsCutToTheirCaps) {
     struct StateListener : MetadataRoleListener {

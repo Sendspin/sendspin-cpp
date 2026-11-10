@@ -767,7 +767,7 @@ constexpr MetadataTextLayout metadata_text_layout(EnumSet<MetadataField> kept) {
 }
 
 /// @brief A server/state metadata object's state: ServerMetadataStateObject with its text in a
-/// block laid out by a MetadataTextLayout, which the main loop copies into the public object
+/// block laid out by a MetadataTextLayout; the main loop copies the text into the public object
 struct MetadataStatePayload {
     int64_t timestamp{};
     std::optional<uint16_t> year{};
@@ -1342,16 +1342,16 @@ MetadataTextOutcome metadata_text_from_wire(JsonVariantConst var, const char* na
 
 /// @brief Parses the metadata section of a server/state JSON message into `metadata`, viewing
 /// each text field `kept` holds in the document and dropping the others
-///
-/// The server/state sections are parsed per section, each into a caller-owned struct, not into
-/// an aggregate a parser frame would copy out of. The caller holds every section a role takes
-/// live together for one parse, a combined frame on the protocol task, whose stack is bounded on
-/// ESP-IDF (at least SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
 MetadataStateOutcome process_server_state_metadata(JsonObject root, EnumSet<MetadataField> kept,
                                                    MetadataStateView* metadata);
 
 /// @brief Parses the color section of a server/state JSON message; true if the section was
 /// present and parsed
+///
+/// The color and controller sections are parsed each into a caller-owned struct, not into an
+/// aggregate a parser frame would copy out of. The caller holds both live together for one parse,
+/// a combined frame on the protocol task, whose stack is bounded on ESP-IDF (at least
+/// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
 bool process_server_state_color(JsonObject root, ServerColorStateObject* color);
 
 /// @brief Parses the controller section of a server/state JSON message; true if the section was

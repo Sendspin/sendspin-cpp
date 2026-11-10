@@ -497,12 +497,9 @@ struct PlayerRoleConfig {
 // Metadata config types
 // ============================================================================
 
-/// @brief Configuration for the metadata role
-///
-/// Each text field set false is dropped as each state is parsed and reaches the listener without
-/// a value. Each one kept costs its cap (255 bytes, 2048 for artwork_url) in the public state's
-/// string, reserved by SendspinClient::add_metadata(), and in each of the three text blocks that
-/// carry its states to the main loop, allocated by SendspinClient::start().
+/// @brief Configuration for the metadata role: which text fields of ServerMetadataStateObject it
+/// keeps. A field set false reaches the listener without a value and costs no storage
+/// (docs/integration-guide.md, MetadataRoleConfig).
 struct MetadataRoleConfig {
     bool title{true};         ///< Keep ServerMetadataStateObject::title
     bool artist{true};        ///< Keep ServerMetadataStateObject::artist

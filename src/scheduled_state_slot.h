@@ -40,12 +40,12 @@ namespace sendspin {
  * also takes the scheduled one. A third state in the same window replaces the newest, which no
  * observer has seen, and a state that finds the pending one replaces it.
  *
- * The pending state waits here, in the oldest place, rather than with the main loop. A drain
- * (drain_scheduled_state()) peeks at the timestamps under the Inbox mutex, decides with no lock
- * held, since a deadline reads the client clock behind a lock of its own (see Inbox), and commits
- * under the mutex only if nothing arrived or was reset since the peek. So a state is never copied
- * out to be decided on: a commit hands the delivered one over through `deliver`, which for a
- * state whose content lies elsewhere trades storage rather than copying it.
+ * The pending state waits here, in the oldest place. A drain (drain_scheduled_state()) peeks at
+ * the timestamps under the Inbox mutex, decides with no lock held, since a deadline reads the
+ * client clock behind a lock of its own (see Inbox), and commits under the mutex only if nothing
+ * arrived or was reset since the peek. So a state is never copied out to be decided on: a commit
+ * hands the delivered one over through `deliver`, which for a state whose content lies elsewhere
+ * trades storage rather than copying it.
  *
  * Every arrival keeps the newest generation's states, as GenerationSlot does: one stamped with a
  * later generation than the held states discards them, and one stamped with an earlier generation

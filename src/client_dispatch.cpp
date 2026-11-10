@@ -629,9 +629,9 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 #ifdef SENDSPIN_ENABLE_METADATA
             if (metadata_outcome == MetadataStateOutcome::REJECTED) {
                 // messaging.md "Out-of-range values": a text field over its cap is a protocol
-                // error the client MUST close the connection on, rather than apply the rest of the
-                // message, which the metadata role's slot never took. Closed silently, like every
-                // other protocol error the receive path finds (see close_silently()).
+                // error the client MUST close the connection on, so nothing else in the message is
+                // applied. Closed silently, like every other protocol error the receive path finds
+                // (see close_silently()).
                 conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
                 break;
             }
