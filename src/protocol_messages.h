@@ -1074,9 +1074,32 @@ struct ServerActivateMessage {
     std::optional<SendspinPairingCodeFormat> pairing_format;
 };
 
+/// @brief A parsed group/update delta: GroupUpdateObject with its text held inline, which the
+/// main loop copies into the public object. A field the message does not carry is nullopt, and an
+/// empty text clears the field (the wire's null).
+struct GroupUpdatePayload {
+    std::optional<SendspinPlaybackState> playback_state{};
+    std::optional<IdText> group_id{};
+    std::optional<ServerName> group_name{};
+};
+
+static_assert(std::is_trivially_copyable_v<GroupUpdatePayload>,
+              "parsed on the protocol task and carried to the main loop with nothing on the heap");
+
 /// @brief Parsed group/update message containing the group state delta
 struct GroupUpdateMessage {
-    GroupUpdateObject group;
+    GroupUpdatePayload group{};
+    /// The group_id was not 43 base64url characters and was normalized (group_id_from_wire())
+    bool group_id_normalized{false};
+};
+
+/// @brief What group_id_from_wire() made of a wire group_id
+enum class GroupIdOutcome : uint8_t {
+    KEPT,        ///< Conforming, or while not strict empty or null: held as sent (empty clears)
+    NORMALIZED,  ///< Not conforming: held as base64url(SHA-256(the bytes sent)), no padding
+    IGNORED,     ///< Absent, or not a string or null while not strict: left out of the delta
+    REJECTED,    ///< Present and not conforming while strict: a protocol error
+    FAILED,      ///< The digest could not be computed (its hash state was not allocated)
 };
 
 /// @brief Parsed stream/start message with per-role stream parameters
@@ -1175,12 +1198,22 @@ bool process_server_time_message(JsonObject root, ServerTimeMessage* time_msg);
 void compute_time_exchange(const ServerTimeMessage& time_msg, int64_t client_sent,
                            int64_t client_received, int64_t* offset, int64_t* max_error);
 
+/// @brief Makes a group_id the client holds of the `group_id` member the server sent (messaging.md
+/// "group/update": 43 base64url characters, carried by every message). A conforming id is held as
+/// sent. When `strict`, any other value present, null included, is rejected. Otherwise an empty
+/// string or null clears the id, a value that is not a string is ignored, and any other string is
+/// held as base64url of its SHA-256, so an id of any length and alphabet still names its group
+/// with a conforming one.
+/// @param out Receives the id for KEPT and NORMALIZED; left untouched otherwise.
+GroupIdOutcome group_id_from_wire(JsonVariantConst var, bool strict, IdText* out);
+
 /// @brief Parses a group/update JSON message into the provided struct
+/// @return false when the message is a protocol error the client closes the connection on
 bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg);
 
-/// @brief Merges a GroupUpdateObject delta, which carries only the changed fields, into the
-/// current group state
-void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObject& updates);
+/// @brief Merges a GroupUpdatePayload delta, which carries only the changed fields, into the
+/// current one
+void apply_group_update_deltas(GroupUpdatePayload* current, const GroupUpdatePayload& updates);
 
 /// @brief Parses a server/command JSON message into the provided struct
 bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg);

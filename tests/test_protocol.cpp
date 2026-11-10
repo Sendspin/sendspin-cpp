@@ -809,6 +809,54 @@ TEST(Protocol, GroupUpdatePlaybackStateValidation) {
     }
 }
 
+// messaging.md "group/update": a group_id is 43 base64url characters, and every message carries
+// it. One that is not is held as base64url(SHA-256(the bytes sent)) while not strict, and
+// rejected while strict, as is any other value present. While not strict, an empty one and null
+// clear the field and a value that is not a string is ignored. Each normalized id is the
+// independent `openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '='` of the row's id.
+TEST(Protocol, GroupIdIsKeptNormalizedOrRejected) {
+    struct Row {
+        const char* what;
+        std::string member;  // the payload's group_id member as JSON, empty when absent
+        GroupIdOutcome lenient;
+        std::string lenient_id;
+        GroupIdOutcome strict;
+    };
+    const std::string conforming = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN-_0";
+    const auto id = [](const std::string& text) { return R"("group_id":")" + text + R"(")"; };
+    const Row rows[] = {
+        {"Control: 43 base64url characters", id(conforming), GroupIdOutcome::KEPT, conforming,
+         GroupIdOutcome::KEPT},
+        {"a UUID, every character base64url", id("3f2504e0-4f89-41d3-9a0c-0305e82c3301"),
+         GroupIdOutcome::NORMALIZED, "FjYvVmOHs89abpL7Cphsdsog6zoMEsvfvQspUB4MGN8",
+         GroupIdOutcome::REJECTED},
+        {"44 base64url characters", id(std::string(44, 'A')), GroupIdOutcome::NORMALIZED,
+         "sGs_IMJG23ChNuOuR4fQ35bbT2k9IVwhiD08GXAPsnY", GroupIdOutcome::REJECTED},
+        {"43 characters, one the standard alphabet's '+'", id(std::string(42, 'A') + "+"),
+         GroupIdOutcome::NORMALIZED, "C13S2O6t-JcoZkUOBR_ny8n7ZMI_6i5jx3CqkE31o_w",
+         GroupIdOutcome::REJECTED},
+        {"empty", id(""), GroupIdOutcome::KEPT, "", GroupIdOutcome::REJECTED},
+        {"null", R"("group_id":null)", GroupIdOutcome::KEPT, "", GroupIdOutcome::REJECTED},
+        {"a number", R"("group_id":7)", GroupIdOutcome::IGNORED, "", GroupIdOutcome::REJECTED},
+        {"absent", "", GroupIdOutcome::IGNORED, "", GroupIdOutcome::IGNORED},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.what);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse("{" + row.member + "}", doc, root));
+        IdText lenient_id{};
+        ASSERT_EQ(group_id_from_wire(root["group_id"], false, &lenient_id), row.lenient);
+        EXPECT_EQ(lenient_id.view(), row.lenient_id);
+
+        IdText strict_id{};
+        ASSERT_EQ(group_id_from_wire(root["group_id"], true, &strict_id), row.strict);
+        if (row.strict == GroupIdOutcome::KEPT) {
+            EXPECT_EQ(strict_id.view(), row.lenient_id);
+        }
+    }
+}
+
 // messaging.md "server/hello": name is required, so a message without it is rejected; server_id
 // comes from the Noise handshake result.
 TEST(Protocol, ServerHelloRequiresName) {
@@ -858,7 +906,8 @@ TEST(Protocol, FriendlyNamesAreTruncatedToTheirCap) {
                           group_doc, group_root));
         GroupUpdateMessage group;
         ASSERT_TRUE(process_group_update_message(group_root, &group));
-        EXPECT_EQ(group.group.group_name, c.kept);
+        ASSERT_TRUE(group.group.group_name.has_value());
+        EXPECT_EQ(group.group.group_name->view(), c.kept);
     }
 }
 

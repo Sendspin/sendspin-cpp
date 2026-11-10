@@ -191,6 +191,45 @@ struct HighPerformanceRequests {
     uint32_t releases{0};
 };
 
+/// @brief Storage for one optional text field of a public object, reserved once for its bound so
+/// filling the field never allocates: the reserved string is swapped into the field as it is set
+/// and back here as it is cleared, and a swap keeps both buffers.
+class ReservedText {
+public:
+    explicit ReservedText(size_t capacity) {
+        this->spare_.reserve(capacity);
+    }
+
+    /// @brief Sets `field` to `text`, or clears it when `text` is nullopt. `text` must fit the
+    /// capacity reserved at construction.
+    void fill(std::optional<std::string>& field, std::optional<std::string_view> text) {
+        if (!text.has_value()) {
+            if (field.has_value()) {
+                this->spare_.swap(*field);
+                field.reset();
+            }
+            return;
+        }
+        if (!field.has_value()) {
+            field.emplace();
+            field->swap(this->spare_);
+        }
+        field->assign(*text);
+    }
+
+private:
+    std::string spare_;
+};
+
+/// @brief The view of an optional inline text, nullopt when it is
+template <size_t N>
+std::optional<std::string_view> optional_view(const std::optional<InlineText<N>>& text) {
+    if (!text.has_value()) {
+        return std::nullopt;
+    }
+    return text->view();
+}
+
 /// @brief Whether `role` is in `mask`, logging the teardown once per role rather than once per
 /// call site.
 [[maybe_unused]] bool role_removed(uint16_t mask, SendspinRole role) {
@@ -206,7 +245,14 @@ struct HighPerformanceRequests {
 /// @brief The main-loop-bound channels the client itself owns, beside the roles' own slots
 struct SendspinClient::EventState {
     Inbox inbox;
-    InboxSlot<GroupUpdateObject> group_slot{inbox, INBOX_TOPIC_GROUP};
+    InboxSlot<GroupUpdatePayload> group_slot{inbox, INBOX_TOPIC_GROUP};
+    /// The delta on_group_update() is handed, filled in place from each group_slot payload. Main
+    /// loop only, like the text storage below that it and the client's group state fill from.
+    GroupUpdateObject group_delta;
+    ReservedText delta_group_id{PEER_ID_SIZE};
+    ReservedText delta_group_name{MAX_FRIENDLY_NAME_BYTES};
+    ReservedText state_group_id{PEER_ID_SIZE};
+    ReservedText state_group_name{MAX_FRIENDLY_NAME_BYTES};
     /// The filter error of the primary connection's latest completed time burst, for
     /// on_time_sync_updated(). Written by the protocol task, latest-wins.
     InboxSlot<double> time_sync_slot{inbox, INBOX_TOPIC_TIME};
@@ -238,6 +284,31 @@ struct SendspinClient::EventState {
     void push_pairing_note(const PairingNote& note) {
         this->pairing_slot.update(
             [&note](std::vector<PairingNote>& current) { current.push_back(note); });
+    }
+
+    /// @brief Applies `payload` to the client's group state `state` and fills group_delta with
+    /// it, both in place. Main loop only.
+    void apply_group_update(GroupUpdateObject& state, const GroupUpdatePayload& payload) {
+        if (payload.playback_state.has_value()) {
+            state.playback_state = payload.playback_state;
+        }
+        if (payload.group_id.has_value()) {
+            this->state_group_id.fill(state.group_id, payload.group_id->view());
+        }
+        if (payload.group_name.has_value()) {
+            this->state_group_name.fill(state.group_name, payload.group_name->view());
+        }
+        this->group_delta.playback_state = payload.playback_state;
+        this->delta_group_id.fill(this->group_delta.group_id, optional_view(payload.group_id));
+        this->delta_group_name.fill(this->group_delta.group_name,
+                                    optional_view(payload.group_name));
+    }
+
+    /// @brief Clears the client's group state `state`, keeping its text storage. Main loop only.
+    void clear_group_state(GroupUpdateObject& state) {
+        state.playback_state.reset();
+        this->state_group_id.fill(state.group_id, std::nullopt);
+        this->state_group_name.fill(state.group_name, std::nullopt);
     }
 };
 
@@ -553,7 +624,7 @@ void SendspinClient::stop() {
     ++this->event_state_->drain_generation;
     this->cleanup_connection_state(ALL_ROLES_MASK);
     this->task_state_->client_state.reset();
-    this->group_state_ = GroupUpdateObject{};
+    this->event_state_->clear_group_state(this->group_state_);
 
     // A pairing attempt cut short by the stop leaves its code or pairing-window prompt showing.
     // Queue the dismissals now, after cleanup_connection_state() dropped the pending notes, so the
@@ -1137,25 +1208,25 @@ void SendspinClient::drain_inbox() {
 
     // --- Group update events ---
     if (!overtaken() && (slot_bits & INBOX_TOPIC_GROUP) != 0) {
-        GroupUpdateObject group_delta;
-        if (es.group_slot.take(group_delta)) {
-            apply_group_update_deltas(&this->group_state_, group_delta);
+        GroupUpdatePayload payload;
+        if (es.group_slot.take(payload)) {
+            es.apply_group_update(this->group_state_, payload);
 
             if (this->listener_) {
-                this->listener_->on_group_update(group_delta);
+                this->listener_->on_group_update(es.group_delta);
             }
 
-            // group_name is cut to MAX_FRIENDLY_NAME_BYTES at parse, group_id only here.
+            // Both texts are bounded at parse (IdText, ServerName), so they print whole.
+            const GroupUpdateObject& group = this->group_state_;
             const std::string_view id =
-                peer_text_for_log(this->group_state_.group_id.has_value()
-                                      ? std::string_view(*this->group_state_.group_id)
-                                      : std::string_view(""));
-            SS_LOGD(TAG, "Group update - state: %s, id: %.*s, name: %s",
-                    this->group_state_.playback_state.has_value()
-                        ? to_cstr(this->group_state_.playback_state.value())
-                        : "unchanged",
-                    static_cast<int>(id.size()), id.data(),
-                    this->group_state_.group_name.value_or("").c_str());
+                group.group_id.has_value() ? std::string_view(*group.group_id) : "";
+            const std::string_view name =
+                group.group_name.has_value() ? std::string_view(*group.group_name) : "";
+            SS_LOGD(TAG, "Group update - state: %s, id: %.*s, name: %.*s",
+                    group.playback_state.has_value() ? to_cstr(group.playback_state.value())
+                                                     : "unchanged",
+                    static_cast<int>(id.size()), id.data(), static_cast<int>(name.size()),
+                    name.data());
         }
     }
 }
@@ -1631,12 +1702,9 @@ bool SendspinClient::adopted_state_available() const {
     return client_state.has_value() && client_state->available;
 }
 
-void SendspinClient::merge_group_update(GroupUpdateObject&& delta) {
-    this->event_state_->group_slot.merge(
-        [](GroupUpdateObject& current, GroupUpdateObject&& added) {
-            apply_group_update_deltas(&current, added);
-        },
-        std::move(delta));
+void SendspinClient::merge_group_update(const GroupUpdatePayload& delta) {
+    this->event_state_->group_slot.update(
+        [&delta](GroupUpdatePayload& current) { apply_group_update_deltas(&current, delta); });
 }
 
 // ============================================================================

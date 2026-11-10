@@ -583,6 +583,13 @@ public:
     /// an in-flight pairing. Protocol task; defined in connection.cpp.
     void note_pairing_finalize_ack();
 
+    /// @brief Notes that this connection's server sent a group_id group_id_from_wire() normalized.
+    /// @return true the first time, so the group/update dispatch warns once per connection.
+    /// Protocol task only.
+    bool note_group_id_normalized() {
+        return !std::exchange(this->group_id_normalized_, true);
+    }
+
     /// @brief Returns true if `role` is active on this connection, judged on the exact versioned
     /// name this library implements.
     ///
@@ -1232,6 +1239,10 @@ protected:
     /// True after the first server/activate message has been received and applied, until a
     /// re-handshake or a pairing-finalize ack rewinds it. Protocol task only.
     bool first_activate_received_{false};
+
+    /// Whether the server sent a group_id that was normalized (note_group_id_normalized()).
+    /// Protocol task only.
+    bool group_id_normalized_{false};
 
     /// Memory placement preference for fallback_buf_ (ESP-IDF only).
     MemoryLocation fallback_location_{MemoryLocation::PREFER_EXTERNAL};

@@ -681,7 +681,9 @@ Receives client-level events. All callbacks fire on the main loop thread.
 
 ```cpp
 struct MyClientListener : SendspinClientListener {
-    // Called when group state changes (playback state, group name, etc.)
+    // Called when group state changes (playback state, group name, etc.). A server group_id
+    // that is not 43 base64url characters arrives as base64url of its SHA-256, which still
+    // names one group; a future release closes the connection on such an id instead.
     void on_group_update(const GroupUpdateObject& group) override {
         if (group.playback_state) update_playback_indicator(*group.playback_state);
         if (group.group_name) update_group_display(*group.group_name);

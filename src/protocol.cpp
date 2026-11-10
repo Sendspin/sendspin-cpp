@@ -14,6 +14,7 @@
 
 #include "application_role.h"
 #include "platform/base64.h"
+#include "platform/crypto.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "protocol_messages.h"
@@ -42,6 +43,10 @@
 namespace sendspin {
 
 static const char* const TAG = "sendspin.protocol";
+
+/// @brief messaging.md "group/update": a group_id that is not 43 base64url characters is normalized
+/// until servers send that format, then this flips and such a group/update closes the connection.
+static constexpr bool GROUP_ID_STRICT = false;
 
 // ============================================================================
 // Static helpers
@@ -536,6 +541,45 @@ void compute_time_exchange(const ServerTimeMessage& time_msg, int64_t client_sen
     }
 }
 
+GroupIdOutcome group_id_from_wire(JsonVariantConst var, bool strict, IdText* out) {
+    if (var.isUnbound()) {
+        return GroupIdOutcome::IGNORED;
+    }
+    if (!var.is<const char*>()) {
+        if (strict) {
+            return GroupIdOutcome::REJECTED;
+        }
+        if (var.isNull()) {
+            *out = IdText{};
+            return GroupIdOutcome::KEPT;
+        }
+        return GroupIdOutcome::IGNORED;
+    }
+    const auto raw = var.as<std::string_view>();
+    const bool conforming =
+        raw.size() == PEER_ID_SIZE && std::all_of(raw.begin(), raw.end(), [](char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                   c == '-' || c == '_';
+        });
+    if (conforming || (raw.empty() && !strict)) {
+        (void)out->assign(raw);  // at most PEER_ID_SIZE, so it fits
+        return GroupIdOutcome::KEPT;
+    }
+    if (strict) {
+        return GroupIdOutcome::REJECTED;
+    }
+    Sha256 hash;
+    hash.update(reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+    const std::array<uint8_t, SHA256_DIGEST_SIZE> digest = hash.finalize();
+    if (!hash.ok()) {
+        return GroupIdOutcome::FAILED;
+    }
+    std::array<char, b64url_encode_buffer_size(SHA256_DIGEST_SIZE)> text{};
+    // 32 bytes encode to PEER_ID_SIZE characters, so it fits
+    (void)out->assign(b64url_encode_into(text.data(), text.size(), digest.data(), digest.size()));
+    return GroupIdOutcome::NORMALIZED;
+}
+
 bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg) {
     if (group_msg == nullptr) {
         return true;
@@ -551,23 +595,36 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
         group_msg->group.playback_state = state;
     }
 
-    // Parse optional group_id; use empty string to signal clearing
-    JsonVariantConst group_id_var = root["payload"]["group_id"];
-    if (group_id_var.is<const char*>()) {
-        group_msg->group.group_id = group_id_var.as<std::string>();
-    } else if (!group_id_var.isUnbound() && group_id_var.isNull()) {
-        // Field set to null: use empty string to clear
-        group_msg->group.group_id = "";
+    // Parse optional group_id; an empty one signals clearing
+    IdText group_id{};
+    switch (group_id_from_wire(root["payload"]["group_id"], GROUP_ID_STRICT, &group_id)) {
+        case GroupIdOutcome::NORMALIZED:
+            group_msg->group_id_normalized = true;
+            [[fallthrough]];
+        case GroupIdOutcome::KEPT:
+            group_msg->group.group_id = group_id;
+            break;
+        case GroupIdOutcome::IGNORED:
+            break;
+        case GroupIdOutcome::REJECTED:
+            SS_LOGW(TAG, "Invalid group/update: group_id is not 43 base64url characters; closing "
+                         "connection");
+            return false;
+        case GroupIdOutcome::FAILED:
+            SS_LOGW(TAG, "Ignoring group/update group_id: no memory to normalize it");
+            break;
     }
 
     // Parse optional group_name; use empty string to signal clearing
     JsonVariantConst group_name_var = root["payload"]["group_name"];
     if (group_name_var.is<const char*>()) {
-        group_msg->group.group_name =
-            std::string(read_friendly_name(group_name_var, "group/update group_name"));
+        // read_friendly_name() cuts it to MAX_FRIENDLY_NAME_BYTES, so it fits
+        ServerName group_name{};
+        (void)group_name.assign(read_friendly_name(group_name_var, "group/update group_name"));
+        group_msg->group.group_name = group_name;
     } else if (!group_name_var.isUnbound() && group_name_var.isNull()) {
         // Field set to null: use empty string to clear
-        group_msg->group.group_name = "";
+        group_msg->group.group_name = ServerName{};
     }
 
     return true;
@@ -575,7 +632,7 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
 
 // State delta application
 
-void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObject& updates) {
+void apply_group_update_deltas(GroupUpdatePayload* current, const GroupUpdatePayload& updates) {
     if (current == nullptr) {
         return;
     }
