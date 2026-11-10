@@ -31,6 +31,7 @@
 #include "platform/network_info.h"
 #include "platform/time.h"
 #include "record_store.h"
+#include "reserved_text.h"
 #include "teardown_tracker.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
@@ -190,45 +191,6 @@ struct HighPerformanceRequests {
     uint32_t acquires{0};
     uint32_t releases{0};
 };
-
-/// @brief Storage for one optional text field of a public object, reserved once for its bound so
-/// filling the field never allocates: the reserved string is swapped into the field as it is set
-/// and back here as it is cleared, and a swap keeps both buffers.
-class ReservedText {
-public:
-    explicit ReservedText(size_t capacity) {
-        this->spare_.reserve(capacity);
-    }
-
-    /// @brief Sets `field` to `text`, or clears it when `text` is nullopt. `text` must fit the
-    /// capacity reserved at construction.
-    void fill(std::optional<std::string>& field, std::optional<std::string_view> text) {
-        if (!text.has_value()) {
-            if (field.has_value()) {
-                this->spare_.swap(*field);
-                field.reset();
-            }
-            return;
-        }
-        if (!field.has_value()) {
-            field.emplace();
-            field->swap(this->spare_);
-        }
-        field->assign(*text);
-    }
-
-private:
-    std::string spare_;
-};
-
-/// @brief The view of an optional inline text, nullopt when it is
-template <size_t N>
-std::optional<std::string_view> optional_view(const std::optional<InlineText<N>>& text) {
-    if (!text.has_value()) {
-        return std::nullopt;
-    }
-    return text->view();
-}
 
 /// @brief Whether `role` is in `mask`, logging the teardown once per role rather than once per
 /// call site.
