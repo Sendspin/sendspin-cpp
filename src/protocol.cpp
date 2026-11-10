@@ -45,7 +45,8 @@ namespace sendspin {
 static const char* const TAG = "sendspin.protocol";
 
 /// @brief messaging.md "group/update": a group_id that is not 43 base64url characters is normalized
-/// until servers send that format, then this flips and such a group/update closes the connection.
+/// until servers send that format, then this flips and a group/update whose group_id is absent or
+/// not in that format closes the connection.
 static constexpr bool GROUP_ID_STRICT = false;
 
 // ============================================================================
@@ -543,7 +544,7 @@ void compute_time_exchange(const ServerTimeMessage& time_msg, int64_t client_sen
 
 GroupIdOutcome group_id_from_wire(JsonVariantConst var, bool strict, IdText* out) {
     if (var.isUnbound()) {
-        return GroupIdOutcome::IGNORED;
+        return strict ? GroupIdOutcome::REJECTED : GroupIdOutcome::IGNORED;
     }
     if (!var.is<const char*>()) {
         if (strict) {
@@ -607,12 +608,13 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
         case GroupIdOutcome::IGNORED:
             break;
         case GroupIdOutcome::REJECTED:
-            SS_LOGW(TAG, "Invalid group/update: group_id is not 43 base64url characters; closing "
-                         "connection");
+            SS_LOGW(TAG, "Invalid group/update: group_id is absent or not 43 base64url characters; "
+                         "closing connection");
             return false;
         case GroupIdOutcome::FAILED:
-            SS_LOGW(TAG, "Ignoring group/update group_id: no memory to normalize it");
-            break;
+            SS_LOGW(TAG, "Invalid group/update: no memory to normalize its group_id; closing "
+                         "connection");
+            return false;
     }
 
     // Parse optional group_name; use empty string to signal clearing

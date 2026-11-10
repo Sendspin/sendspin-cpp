@@ -811,8 +811,8 @@ TEST(Protocol, GroupUpdatePlaybackStateValidation) {
 
 // messaging.md "group/update": a group_id is 43 base64url characters, and every message carries
 // it. One that is not is held as base64url(SHA-256(the bytes sent)) while not strict, and
-// rejected while strict, as is any other value present. While not strict, an empty one and null
-// clear the field and a value that is not a string is ignored. Each normalized id is the
+// rejected while strict, as is any other value or an absent one. While not strict, an empty one
+// and null clear the field, and an absent one or a value that is not a string is ignored. Each normalized id is the
 // independent `openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '='` of the row's id.
 TEST(Protocol, GroupIdIsKeptNormalizedOrRejected) {
     struct Row {
@@ -838,7 +838,7 @@ TEST(Protocol, GroupIdIsKeptNormalizedOrRejected) {
         {"empty", id(""), GroupIdOutcome::KEPT, "", GroupIdOutcome::REJECTED},
         {"null", R"("group_id":null)", GroupIdOutcome::KEPT, "", GroupIdOutcome::REJECTED},
         {"a number", R"("group_id":7)", GroupIdOutcome::IGNORED, "", GroupIdOutcome::REJECTED},
-        {"absent", "", GroupIdOutcome::IGNORED, "", GroupIdOutcome::IGNORED},
+        {"absent", "", GroupIdOutcome::IGNORED, "", GroupIdOutcome::REJECTED},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.what);

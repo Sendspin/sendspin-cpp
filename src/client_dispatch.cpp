@@ -693,9 +693,12 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             }
             GroupUpdateMessage group_msg;
             if (!parsed.extract<process_group_update_message>(&group_msg)) {
-                // messaging.md "group/update": a group_id that is not 43 base64url characters is
-                // a protocol error the client MUST close the connection on. Closed silently, like
-                // every other protocol error the receive path finds (see close_silently()).
+                // messaging.md "group/update": a group_id that is absent or not 43 base64url
+                // characters is a protocol error the client MUST close the connection on. Closed
+                // silently, like every other protocol error the receive path finds (see
+                // close_silently()). One the client had no memory to normalize closes it too,
+                // rather than applying the rest of the update under the previous group's id; on the
+                // next connection the server sends the group again after its first server/activate.
                 conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
                 break;
             }

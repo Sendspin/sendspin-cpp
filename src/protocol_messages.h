@@ -1097,8 +1097,8 @@ struct GroupUpdateMessage {
 enum class GroupIdOutcome : uint8_t {
     KEPT,        ///< Conforming, or while not strict empty or null: held as sent (empty clears)
     NORMALIZED,  ///< Not conforming: held as base64url(SHA-256(the bytes sent)), no padding
-    IGNORED,     ///< Absent, or not a string or null while not strict: left out of the delta
-    REJECTED,    ///< Present and not conforming while strict: a protocol error
+    IGNORED,     ///< While not strict, absent or not a string or null: left out of the delta
+    REJECTED,    ///< While strict, absent or not conforming: a protocol error
     FAILED,      ///< The digest could not be computed (its hash state was not allocated)
 };
 
@@ -1200,10 +1200,10 @@ void compute_time_exchange(const ServerTimeMessage& time_msg, int64_t client_sen
 
 /// @brief Makes a group_id the client holds of the `group_id` member the server sent (messaging.md
 /// "group/update": 43 base64url characters, carried by every message). A conforming id is held as
-/// sent. When `strict`, any other value present, null included, is rejected. Otherwise an empty
-/// string or null clears the id, a value that is not a string is ignored, and any other string is
-/// held as base64url of its SHA-256, so an id of any length and alphabet still names its group
-/// with a conforming one.
+/// sent. When `strict`, any other value, null or absent included, is rejected. Otherwise an absent
+/// id or a value that is not a string is ignored, an empty string or null clears the id, and any
+/// other string is held as base64url of its SHA-256, so an id of any length and alphabet still
+/// names its group with a conforming one.
 /// @param out Receives the id for KEPT and NORMALIZED; left untouched otherwise.
 GroupIdOutcome group_id_from_wire(JsonVariantConst var, bool strict, IdText* out);
 

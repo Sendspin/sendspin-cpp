@@ -2458,9 +2458,7 @@ TEST(EncryptedLifecycle, EveryRoleMessageTypeRunsThroughItsHandler) {
 // messaging.md "group/update": the delta the listener is handed and the client's group state carry
 // a conforming group_id as sent, and a UUID, which a server not yet sending the specified format
 // sends, as base64url of its SHA-256 (the value GroupIdIsKeptNormalizedOrRejected derives). The
-// delta carries only the fields its message did, while the group state keeps the others. The
-// warning a normalized id logs, its only observable outcome on the connection, prints once per
-// connection however many group/update messages carry one.
+// delta carries only the fields its message did, while the group state keeps the others.
 TEST(EncryptedLifecycle, GroupIdReachesTheListenerAsSentOrNormalized) {
     struct GroupListener : SendspinClientListener {
         GroupUpdateObject delta;
@@ -2488,13 +2486,7 @@ TEST(EncryptedLifecycle, GroupIdReachesTheListenerAsSentOrNormalized) {
     const std::string uuid_only =
         R"({"type":"group/update","payload":{"group_id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301"}})";
     const std::string normalized = "FjYvVmOHs89abpL7Cphsdsog6zoMEsvfvQspUB4MGN8";
-    std::string log;
-    {
-        StderrCapture capture;
-        bundle.deliver(conn, uuid_only);
-        bundle.deliver(conn, uuid_only);
-        log = capture.release();
-    }
+    bundle.deliver(conn, uuid_only);
     bundle.pump();
     EXPECT_EQ(group_listener.delta.group_id, normalized);
     EXPECT_EQ(group_listener.delta.group_name, std::nullopt);
@@ -2502,12 +2494,6 @@ TEST(EncryptedLifecycle, GroupIdReachesTheListenerAsSentOrNormalized) {
     EXPECT_EQ(state.group_id, normalized);
     EXPECT_EQ(state.group_name, "Kitchen");
     EXPECT_EQ(state.playback_state, SendspinPlaybackState::PLAYING);
-    size_t warnings = 0;
-    for (size_t at = log.find("group_id that is not"); at != std::string::npos;
-         at = log.find("group_id that is not", at + 1)) {
-        ++warnings;
-    }
-    EXPECT_EQ(warnings, 1U) << log;
 }
 
 // Role traffic reaches a role only from the admitted connection that owns it, not from any

@@ -165,7 +165,7 @@ private:
     uint8_t size_{0};
 };
 
-/// @brief The view of an optional inline text, nullopt when it is
+/// @brief The view of `text`, or nullopt when it holds no value
 template <size_t N>
 std::optional<std::string_view> optional_view(const std::optional<InlineText<N>>& text) {
     if (!text.has_value()) {
