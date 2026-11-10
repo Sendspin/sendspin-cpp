@@ -55,6 +55,8 @@ enum class SendspinPlaybackState : uint8_t {
 /// @brief Group membership and playback state delta received in group/update messages
 struct GroupUpdateObject {
     std::optional<SendspinPlaybackState> playback_state{};
+    /// 43 base64url characters, or empty when cleared; a server id in another form is reported as
+    /// its SHA-256 in base64url
     std::optional<std::string> group_id{};
     /// At most 64 bytes in UTF-8, cut at a character boundary
     std::optional<std::string> group_name{};

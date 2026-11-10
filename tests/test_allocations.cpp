@@ -526,6 +526,7 @@ constexpr size_t ADMISSION_ALLOCATIONS = 0;
 constexpr size_t CLIENT_STATE_ALLOCATIONS = 0;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;
 constexpr size_t CONTROLLER_STATE_ALLOCATIONS = 0;
+constexpr size_t GROUP_UPDATE_ALLOCATIONS = 0;
 constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 0;
 constexpr size_t PLAYER_FLAC_STREAM_START_ALLOCATIONS = 0;
 constexpr size_t SYNC_TASK_FIRST_FLAC_HEADER_ALLOCATIONS = 0;
@@ -536,12 +537,12 @@ constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 // application roles and the player, artwork and visualizer objects of client/state are built: from
 // the fake server's connect through admission and the first client/state, then one client/state
 // publish, then one full burst of client/time and server/time exchanges, then the first
-// controller server/state, then an artwork and visualizer stream/start and a stream/end and a
-// stream/clear that name their roles, then the sync task's first FLAC codec header, then a FLAC
-// stream/start the player takes, then a stream/start whose player section the connection, no
-// longer owning the player, does not take.
-// The roles' public command and type lists are reserved when the roles are built, so even the
-// first fill on the main loop allocates nothing.
+// controller server/state, then the first group/update messages, then an artwork and visualizer
+// stream/start and a stream/end and a stream/clear that name their roles, then the sync task's
+// first FLAC codec header, then a FLAC stream/start the player takes, then a stream/start whose
+// player section the connection, no longer owning the player, does not take.
+// The roles' public command and type lists and the client's group texts are reserved when they
+// are built, so even the first fill on the main loop allocates nothing.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -633,6 +634,38 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
                                CONTROLLER_STATE_ALLOCATIONS);
     EXPECT_EQ(controller.get_controller_state().supported_commands.size(),
               CONTROLLER_COMMAND_COUNT);
+
+    // A UUID group_id the protocol task normalizes and a group_name, then a conforming id alone,
+    // which clears the delta's name, then the id with another name, each applied by the main loop
+    // before the next is sent.
+    const std::string_view normalized_id = "FjYvVmOHs89abpL7Cphsdsog6zoMEsvfvQspUB4MGN8";
+    const std::string_view conforming_id = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN-_0";
+    const GroupUpdateObject& group = client.get_group_state();
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"group/update","payload":{"playback_state":"playing",)"
+            R"("group_id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301",)"
+            R"("group_name":"Allocation Test Kitchen and Living Room"}})"));
+    }
+    pump_while_not(client, [&] { return group.group_id == normalized_id; });
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"group/update","payload":{"group_id":")" + std::string(conforming_id) +
+            R"("}})"));
+    }
+    pump_while_not(client, [&] { return group.group_id == conforming_id; });
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"group/update","payload":{"group_id":")" + std::string(conforming_id) +
+            R"(","group_name":"Allocation Test Upstairs Bedroom Group"}})"));
+    }
+    pump_while_not(client,
+                   [&] { return group.group_name == "Allocation Test Upstairs Bedroom Group"; });
+    expect_library_allocations(close_window(), "group/update", GROUP_UPDATE_ALLOCATIONS);
 
     const int starts_before_streams = visualizer_listener.stream_starts;
 

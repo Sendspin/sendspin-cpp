@@ -257,6 +257,7 @@ class SendspinArenaAllocator;
 class SendspinConnection;
 struct ClientHelloMessage;
 struct ClientStateMessage;
+struct GroupUpdatePayload;
 struct Identity;
 
 /**
@@ -919,7 +920,7 @@ private:
 
     /// @brief Folds a group/update delta from the primary admitted connection into group_slot
     /// for the main loop. Protocol task only.
-    void merge_group_update(GroupUpdateObject&& delta);
+    void merge_group_update(const GroupUpdatePayload& delta);
 
     // ========================================
     // Persistence & identity

@@ -119,14 +119,14 @@ class InboxSlot;
  *
  * @code
  * Inbox inbox;
- * InboxSlot<GroupUpdateObject> group_slot(inbox, INBOX_TOPIC_GROUP);
+ * InboxSlot<GroupUpdatePayload> group_slot(inbox, INBOX_TOPIC_GROUP);
  *
  * // Producer thread:
  * group_slot.write(update);
  *
  * // Main loop:
  * if (inbox.poll() & INBOX_TOPIC_GROUP) {
- *     GroupUpdateObject update;
+ *     GroupUpdatePayload update;
  *     if (group_slot.take(update)) { ... }
  * }
  * @endcode

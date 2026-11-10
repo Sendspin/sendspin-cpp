@@ -221,7 +221,8 @@ public:
 };
 
 std::string group_update_playing_json() {
-    return R"({"type":"group/update","payload":{"playback_state":"playing"}})";
+    return R"({"type":"group/update","payload":{"playback_state":"playing",)"
+           R"("group_id":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN-_0","group_name":"Kitchen"}})";
 }
 
 // ============================================================================
@@ -261,6 +262,8 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
         EXPECT_FALSE(client.is_connected());
         EXPECT_FALSE(client.get_server_information().has_value());
         EXPECT_FALSE(client.get_group_state().playback_state.has_value());
+        EXPECT_FALSE(client.get_group_state().group_id.has_value());
+        EXPECT_FALSE(client.get_group_state().group_name.has_value());
         // The peer received its goodbye and the close, in that order.
         wait_until([&] { return server->closed(); });
         EXPECT_EQ(server->goodbye_reason().value_or(""), "shutdown");

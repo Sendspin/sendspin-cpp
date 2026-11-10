@@ -21,6 +21,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace sendspin {
@@ -163,5 +164,14 @@ private:
     std::array<char, N + 1> chars_{};
     uint8_t size_{0};
 };
+
+/// @brief The view of `text`, or nullopt when it holds no value
+template <size_t N>
+std::optional<std::string_view> optional_view(const std::optional<InlineText<N>>& text) {
+    if (!text.has_value()) {
+        return std::nullopt;
+    }
+    return text->view();
+}
 
 }  // namespace sendspin

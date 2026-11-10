@@ -2455,6 +2455,47 @@ TEST(EncryptedLifecycle, EveryRoleMessageTypeRunsThroughItsHandler) {
     EXPECT_EQ(*bundle.client_ref().get_group_state().group_name, "Kitchen");
 }
 
+// messaging.md "group/update": the delta the listener is handed and the client's group state carry
+// a conforming group_id as sent, and a UUID, which a server not yet sending the specified format
+// sends, as base64url of its SHA-256 (the value GroupIdIsKeptNormalizedOrRejected derives). The
+// delta carries only the fields its message did, while the group state keeps the others.
+TEST(EncryptedLifecycle, GroupIdReachesTheListenerAsSentOrNormalized) {
+    struct GroupListener : SendspinClientListener {
+        GroupUpdateObject delta;
+        void on_group_update(const GroupUpdateObject& group) override {
+            this->delta = group;
+        }
+    };
+    GroupListener group_listener;  // Outlives the client
+    DispatchTestClient bundle("Group Id Test Client");
+    bundle.client_ref().set_listener(&group_listener);
+    DispatchTestConnection& conn = bundle.connection();
+    bundle.admit(conn);
+    const GroupUpdateObject& state = bundle.client_ref().get_group_state();
+
+    // Control: a conforming id is held as sent.
+    const std::string conforming = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN-_0";
+    bundle.deliver(conn, R"({"type":"group/update","payload":{"playback_state":"playing",)"
+                         R"("group_id":")" +
+                             conforming + R"(","group_name":"Kitchen"}})");
+    bundle.pump();
+    EXPECT_EQ(group_listener.delta.group_id, conforming);
+    EXPECT_EQ(group_listener.delta.group_name, "Kitchen");
+    EXPECT_EQ(state.group_id, conforming);
+
+    const std::string uuid_only =
+        R"({"type":"group/update","payload":{"group_id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301"}})";
+    const std::string normalized = "FjYvVmOHs89abpL7Cphsdsog6zoMEsvfvQspUB4MGN8";
+    bundle.deliver(conn, uuid_only);
+    bundle.pump();
+    EXPECT_EQ(group_listener.delta.group_id, normalized);
+    EXPECT_EQ(group_listener.delta.group_name, std::nullopt);
+    EXPECT_EQ(group_listener.delta.playback_state, std::nullopt);
+    EXPECT_EQ(state.group_id, normalized);
+    EXPECT_EQ(state.group_name, "Kitchen");
+    EXPECT_EQ(state.playback_state, SendspinPlaybackState::PLAYING);
+}
+
 // Role traffic reaches a role only from the admitted connection that owns it, not from any
 // connection that merely has the role active: with more than one admitted connection, each role
 // has one owner, and the others' traffic for it is ignored. Every row's connection has the
