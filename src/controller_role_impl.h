@@ -42,7 +42,7 @@ struct ControllerRole::Impl : RoleTeardown {
     struct EventState {
         // Latest-wins only, unlike metadata and color: messaging.md "server/state" scopes a
         // deferred timestamp to those two objects, so ControllerStatePayload carries none and this
-        // role needs neither their PendingXStates pair nor their held_state deadline poll.
+        // role needs no ScheduledStateSlot.
         GenerationSlot<ControllerStatePayload> slot;
     };
 

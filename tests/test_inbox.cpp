@@ -14,16 +14,20 @@
 
 /// @file test_inbox.cpp
 /// @brief Tests for the Inbox/InboxSlot primitives: slot write/take/merge/exchange/edit
-/// semantics, the generation-stamped slot and the teardown tracker, event ring FIFO and overflow
-/// behavior, and a concurrent producer/consumer smoke test
+/// semantics, the generation-stamped slot, the scheduled-state slot and its drain, and the
+/// teardown tracker, event ring FIFO and overflow behavior, and a concurrent producer/consumer
+/// smoke test
 
 #include "inbox.h"
+#include "scheduled_state_slot.h"
 #include "teardown_tracker.h"
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -238,6 +242,166 @@ TEST(GenerationSlot, KeepsTheNewestGenerationsContent) {
         EXPECT_EQ(generation, row.expected_generation);
         EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_CONTROLLER));
     }
+}
+
+namespace {
+
+/// A ScheduledStateSlot state: only its timestamp
+struct TimedState {
+    int64_t timestamp{0};
+};
+
+int64_t scheduled_time(const TimedState& state) {
+    return state.timestamp;
+}
+
+using TimedSlot = ScheduledStateSlot<TimedState>;
+
+/// Hands `slot` a state applying at `timestamp`, admitted under `generation`.
+void arrive_at(TimedSlot& slot, int64_t timestamp, uint32_t generation) {
+    slot.arrive([timestamp](TimedState& place) { place.timestamp = timestamp; }, generation);
+}
+
+/// A role on a ScheduledStateSlot whose deadline check counts the times it found the Inbox mutex
+/// held, probed from another thread: a real deadline reads the client clock behind a lock of its
+/// own, so it must never run under the Inbox mutex. A state is due when its timestamp is at most
+/// `now`, and the drain records each delivered state's timestamp.
+struct ProbingRole : RoleTeardown {
+    explicit ProbingRole(Inbox& inbox) : inbox(inbox) {
+        this->slot.bind(inbox, INBOX_TOPIC_COLOR);
+    }
+    bool state_is_due(int64_t timestamp) const {
+        bool locked = false;
+        std::thread([this, &locked] {
+            locked = !this->inbox.mutex_.try_lock();
+            if (!locked) {
+                this->inbox.mutex_.unlock();
+            }
+        }).join();
+        this->checks_under_lock += locked ? 1 : 0;
+        return timestamp <= this->now;
+    }
+    void complete_teardown() {
+        this->slot.forget_pending();
+    }
+    void drain() {
+        drain_scheduled_state(
+            *this, this->slot,
+            [this](const TimedState& place) { this->delivered.push_back(place.timestamp); }, [] {},
+            "test", "state");
+    }
+
+    Inbox& inbox;
+    TimedSlot slot;
+    std::vector<int64_t> delivered;
+    int64_t now{0};
+    mutable int checks_under_lock{0};
+};
+
+}  // namespace
+
+// roles/metadata/v1.md "Scheduled metadata updates" and roles/color/v1.md "Scheduled color
+// updates", as ScheduledStateSlot::decide() applies them to the states a drain finds: a due state
+// is applied and a future one waits, replacing any older one, and two due states collapse to the
+// newer, since the older would be superseded within the tick. A state at timestamp 1 is due, one
+// at 2 is not.
+TEST(ScheduledStateSlot, DecidesWhichStateIsAppliedAndWhichWaits) {
+    using Place = TimedSlot::Place;
+    struct Row {
+        const char* name;
+        std::optional<int64_t> oldest;
+        std::optional<int64_t> newest;
+        Place deliver;
+        Place pending;
+    };
+    const Row rows[] = {
+        {"Control: nothing held", std::nullopt, std::nullopt, Place::NONE, Place::NONE},
+        {"Control: a due state is applied", 1, std::nullopt, Place::OLDEST, Place::NONE},
+        {"a future state waits", 2, std::nullopt, Place::NONE, Place::OLDEST},
+        {"a due state is applied and a future one behind it waits", 1, 2, Place::OLDEST,
+         Place::NEWEST},
+        {"two due states collapse to the newer", 1, 1, Place::NEWEST, Place::NONE},
+        {"a due newer state discards a future older one", 2, 1, Place::NEWEST, Place::NONE},
+        {"a future newer state replaces a future older one", 2, 2, Place::NONE, Place::NEWEST},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        const TimedSlot::Peek peek{.oldest = row.oldest, .newest = row.newest};
+        const TimedSlot::Decision decision =
+            TimedSlot::decide(peek, [](int64_t timestamp) { return timestamp == 1; });
+        EXPECT_EQ(decision.deliver, row.deliver);
+        EXPECT_EQ(decision.pending, row.pending);
+    }
+}
+
+// ScheduledStateSlot::arrive() keeps the newest generation's states, as GenerationSlot does: a
+// state from a later generation discards the held ones, one from an earlier generation (a
+// producer that lost a race with a teardown) is dropped, and a state from the same generation is
+// kept beside the one before it.
+TEST(ScheduledStateSlot, KeepsTheNewestGenerationsStates) {
+    struct Row {
+        const char* name;
+        uint32_t first;
+        uint32_t second;
+        std::optional<int64_t> oldest;
+        std::optional<int64_t> newest;
+        uint32_t generation;
+    };
+    const Row rows[] = {
+        {"Control: the same generation keeps both", 3, 3, 1, 2, 3},
+        {"a later generation discards the held state", 3, 4, 2, std::nullopt, 4},
+        {"an earlier generation is dropped", 4, 3, 1, std::nullopt, 4},
+        {"ordered across the counter's wrap", UINT32_MAX, 0, 2, std::nullopt, 0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Inbox inbox;
+        TimedSlot slot;
+        slot.bind(inbox, INBOX_TOPIC_COLOR);
+        arrive_at(slot, 1, row.first);
+        arrive_at(slot, 2, row.second);
+
+        const TimedSlot::Peek peek = slot.peek();
+        EXPECT_EQ(peek.oldest, row.oldest);
+        EXPECT_EQ(peek.newest, row.newest);
+        EXPECT_EQ(peek.generation, row.generation);
+    }
+}
+
+// A drain decides on the states it peeked with no lock held: the deadline check reads the client
+// clock behind a lock of its own, and the Inbox mutex is a leaf (inbox.h), so the drain copies the
+// timestamps out under it and asks each deadline after releasing it. Each step's checks probe the
+// mutex from another thread. A committed drain and a reset each leave the slot clean, so a state
+// left pending waits on pending_at() rather than a topic bit that would drain every tick.
+TEST(ScheduledStateSlot, ADrainDecidesWithTheInboxMutexFree) {
+    Inbox inbox;
+    ProbingRole role(inbox);
+
+    {
+        std::lock_guard<std::mutex> lock(inbox.mutex_);
+        role.state_is_due(0);
+    }
+    ASSERT_EQ(role.checks_under_lock, 1) << "Control: the probe finds a held mutex";
+    role.checks_under_lock = 0;
+
+    role.now = 5;
+    arrive_at(role.slot, 1, 0);
+    arrive_at(role.slot, 10, 0);
+    role.drain();
+    EXPECT_EQ(role.delivered, (std::vector<int64_t>{1}));
+    EXPECT_EQ(role.slot.pending_at(), 10);
+    EXPECT_EQ(inbox.poll() & INBOX_TOPIC_COLOR, 0U) << "the commit left the slot dirty";
+
+    role.now = 10;
+    role.drain();
+    EXPECT_EQ(role.delivered, (std::vector<int64_t>{1, 10}));
+    EXPECT_EQ(role.slot.pending_at(), std::nullopt);
+    EXPECT_EQ(role.checks_under_lock, 0) << "a deadline was checked under the Inbox mutex";
+
+    arrive_at(role.slot, 20, 0);
+    ASSERT_NE(inbox.poll() & INBOX_TOPIC_COLOR, 0U) << "Control: an arrival marks the slot dirty";
+    role.slot.reset();
+    EXPECT_EQ(inbox.poll() & INBOX_TOPIC_COLOR, 0U) << "the reset left the slot dirty";
 }
 
 // TeardownTracker::advance() reports a teardown generation pending exactly once, so a role's

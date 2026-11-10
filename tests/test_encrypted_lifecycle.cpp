@@ -34,6 +34,7 @@
 #include "inbox.h"
 #include "lifecycle_test_fixtures.h"
 #include "log_capture.h"
+#include "metadata_role_impl.h"
 #include "platform/crypto.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
@@ -1924,7 +1925,8 @@ public:
     explicit DispatchTestClient(
         const char* name,
         size_t json_arena_size = SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE,
-        PlayerRoleListener* player_listener = nullptr) {
+        PlayerRoleListener* player_listener = nullptr,
+        MetadataRoleConfig metadata_config = {}) {
         SendspinClientConfig config;
         config.name = name;
         // Port 0: an ephemeral listener nothing connects to; every message is delivered directly.
@@ -1932,7 +1934,7 @@ public:
         config.json_arena_size = json_arena_size;
         this->client_storage = std::make_unique<SendspinClient>(std::move(config));
         this->client_storage->set_network_provider(&this->network);
-        this->client_storage->add_metadata().set_listener(&this->listener);
+        this->client_storage->add_metadata(metadata_config).set_listener(&this->listener);
         // The other roles a delivered message can be dispatched to, so delivery runs their real
         // handlers. Without a player listener the sync task never starts and the player's stream
         // handlers find no item list to hand their codec header to.
@@ -2170,10 +2172,72 @@ TEST(EncryptedLifecycle, MetadataStateReplacesRatherThanMerges) {
     EXPECT_FALSE(bundle.listener.last_had_progress) << "an omitted progress clears the position";
 }
 
+// MetadataRoleConfig: the listener is handed the text fields the role keeps and no value
+// for the others, and a kept field over its cap (roles/metadata/v1.md "server/state metadata
+// object") cut to it at a character boundary, on every state that carries one: the warning the
+// connection logs once does not stand in for the value.
+TEST(EncryptedLifecycle, MetadataKeepsTheConfiguredFieldsCutToTheirCaps) {
+    struct StateListener : MetadataRoleListener {
+        std::vector<ServerMetadataStateObject> states;
+        void on_metadata(const ServerMetadataStateObject& metadata) override {
+            this->states.push_back(metadata);
+        }
+    };
+    StateListener listener;  // Outlives the client
+    DispatchTestClient bundle(
+        "Metadata Fields Test Client", SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE, nullptr,
+        MetadataRoleConfig{.artist = false, .album_artist = false, .album = false});
+    bundle.client_ref().metadata()->set_listener(&listener);
+    DispatchTestConnection& conn = bundle.connection();
+    bundle.admit(conn);
+
+    const auto state = [](int timestamp, const std::string& title, const std::string& url) {
+        return R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
+               std::to_string(timestamp) + R"(,"title":")" + title +
+               R"(","artist":"Band","album_artist":"Various","album":"Record",)"
+               R"("artwork_url":")" +
+               url + R"(","year":1999}}})";
+    };
+    // U+00E9 straddles the title's cap, so the cut lands before it.
+    const std::string straddling = std::string(MAX_METADATA_TEXT_BYTES - 1, 'a') + "\xC3\xA9";
+    const std::string long_url = "http://example.com/" + std::string(MAX_METADATA_URL_BYTES, 'u');
+    // Control: within their caps, the kept fields arrive as sent.
+    bundle.deliver(conn, state(1, "Song", "http://example.com/art.jpg"));
+    bundle.pump();
+    bundle.deliver(conn, state(2, straddling, long_url));
+    bundle.pump();
+    bundle.deliver(conn, state(3, std::string(MAX_METADATA_TEXT_BYTES + 1, 'b'), "http://x"));
+    bundle.pump();
+
+    struct Expected {
+        std::string title;
+        std::string artwork_url;
+    };
+    const Expected expected[] = {
+        {"Song", "http://example.com/art.jpg"},
+        {straddling.substr(0, MAX_METADATA_TEXT_BYTES - 1),
+         long_url.substr(0, MAX_METADATA_URL_BYTES)},
+        {std::string(MAX_METADATA_TEXT_BYTES, 'b'), "http://x"},
+    };
+    ASSERT_EQ(listener.states.size(), std::size(expected));
+    for (size_t i = 0; i < std::size(expected); ++i) {
+        SCOPED_TRACE(i);
+        const ServerMetadataStateObject& got = listener.states[i];
+        EXPECT_EQ(got.title, expected[i].title);
+        EXPECT_EQ(got.artwork_url, expected[i].artwork_url);
+        EXPECT_EQ(got.artist, std::nullopt);
+        EXPECT_EQ(got.album_artist, std::nullopt);
+        EXPECT_EQ(got.album, std::nullopt);
+        EXPECT_EQ(got.year, 1999) << "a field that is not text is always kept";
+    }
+}
+
 // messaging.md "server/state": the first state a server sends for a role carries a past or
 // present timestamp, so the client is brought up to date, and a scheduled update may follow it
 // immediately. Both land before the main loop runs, and the state describing what is playing now
-// must still be applied rather than skipped in favor of the one timed to the next track.
+// must still be applied rather than skipped in favor of the one timed to the next track, which the
+// role holds until its moment. That the pending state is the scheduled one is read from the role's
+// slot: no observable shows it before its deadline, which is kept out of the test's reach.
 TEST(EncryptedLifecycle, ImmediateMetadataSurvivesAScheduledStateInTheSameTick) {
     RecordingMetadataListener listener;
 
@@ -2211,6 +2275,18 @@ TEST(EncryptedLifecycle, ImmediateMetadataSurvivesAScheduledStateInTheSameTick) 
     EXPECT_EQ(listener.updates, 1)
         << "the state describing the current track was dropped for the scheduled one";
     EXPECT_EQ(listener.last_title, "Now Playing");
+
+    // The scheduled one waits in the slot rather than being dropped by the drain that applied the
+    // other. Read under the Inbox mutex, which the protocol task writes the slot under.
+    const MetadataRole::Impl& impl = *client.metadata()->impl_;
+    const std::optional<std::string> pending =
+        impl.event_state->slot.slot_.read([&impl](const auto& places) {
+            return places.pending ? std::optional<std::string>(
+                                        impl.text_of(places.oldest.state, MetadataField::TITLE)
+                                            .value_or("(no title)"))
+                                  : std::nullopt;
+        });
+    EXPECT_EQ(pending, "Next Track");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

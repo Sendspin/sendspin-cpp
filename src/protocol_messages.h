@@ -696,6 +696,116 @@ struct ControllerStatePayload {
 static_assert(std::is_trivially_copyable_v<ControllerStatePayload>,
               "parsed on the protocol task and carried to the main loop with nothing on the heap");
 
+// --- metadata_role.h ---
+
+/// @brief Longest title, artist, album_artist and album a server sends, in UTF-8 bytes
+/// (roles/metadata/v1.md "server/state metadata object")
+constexpr size_t MAX_METADATA_TEXT_BYTES = 255;
+
+/// @brief Longest artwork_url a server sends, in UTF-8 bytes (roles/metadata/v1.md "server/state
+/// metadata object")
+constexpr size_t MAX_METADATA_URL_BYTES = 2048;
+
+/// @brief A text field of a server/state metadata object, in the order a text block lays them out
+/// (MetadataTextLayout)
+enum class MetadataField : uint8_t {
+    TITLE,
+    ARTIST,
+    ALBUM_ARTIST,
+    ALBUM,
+    ARTWORK_URL,
+};
+
+/// @brief How many text fields a metadata state has
+inline constexpr size_t METADATA_FIELD_COUNT = static_cast<size_t>(MetadataField::ARTWORK_URL) + 1;
+
+static_assert(METADATA_FIELD_COUNT <= 8, "EnumSet<MetadataField> needs 8 bits");
+
+/// @brief The field's member name in the server/state metadata object
+inline const char* to_cstr(MetadataField field) {
+    switch (field) {
+        case MetadataField::TITLE:
+            return "title";
+        case MetadataField::ARTIST:
+            return "artist";
+        case MetadataField::ALBUM_ARTIST:
+            return "album_artist";
+        case MetadataField::ALBUM:
+            return "album";
+        case MetadataField::ARTWORK_URL:
+            return "artwork_url";
+    }
+    return "title";
+}
+
+/// @brief The most UTF-8 bytes `field` holds
+constexpr size_t metadata_field_cap(MetadataField field) {
+    return field == MetadataField::ARTWORK_URL ? MAX_METADATA_URL_BYTES : MAX_METADATA_TEXT_BYTES;
+}
+
+/// @brief Where a metadata state keeps each text field the role keeps: one region per kept field
+/// at that field's cap, in field order, in a block of `block_bytes` the state owns
+struct MetadataTextLayout {
+    EnumSet<MetadataField> kept{};
+    std::array<uint16_t, METADATA_FIELD_COUNT> offsets{};
+    uint16_t block_bytes{0};
+};
+
+/// @brief The layout of the fields in `kept`
+constexpr MetadataTextLayout metadata_text_layout(EnumSet<MetadataField> kept) {
+    MetadataTextLayout layout;
+    layout.kept = kept;
+    for (size_t i = 0; i < METADATA_FIELD_COUNT; ++i) {
+        const auto field = static_cast<MetadataField>(i);
+        if (kept.contains(field)) {
+            layout.offsets[i] = layout.block_bytes;
+            layout.block_bytes =
+                static_cast<uint16_t>(layout.block_bytes + metadata_field_cap(field));
+        }
+    }
+    return layout;
+}
+
+/// @brief A server/state metadata object's state: ServerMetadataStateObject with its text in a
+/// block laid out by a MetadataTextLayout, which the main loop copies into the public object
+struct MetadataStatePayload {
+    int64_t timestamp{};
+    std::optional<uint16_t> year{};
+    std::optional<uint16_t> track{};
+    std::optional<MetadataProgressObject> progress{};
+    /// Each text field's size in its block, by MetadataField; nullopt when the state carries no
+    /// value for it, or it is not kept
+    std::array<std::optional<uint16_t>, METADATA_FIELD_COUNT> text_sizes{};
+};
+
+static_assert(std::is_trivially_copyable_v<MetadataStatePayload>,
+              "parsed on the protocol task and carried to the main loop with nothing on the heap");
+
+/// @brief A parsed server/state metadata object whose text still lies in the parsed document, so
+/// it is valid only while the document is (ParsedJsonMessage::extract())
+struct MetadataStateView {
+    /// The state, its text sizes those of the fields kept and carried
+    MetadataStatePayload payload{};
+    /// Each such field's text in the document, payload.text_sizes bytes, by MetadataField
+    std::array<const char*, METADATA_FIELD_COUNT> text{};
+};
+
+/// @brief What metadata_text_from_wire() made of a text field of a server/state metadata object
+enum class MetadataTextOutcome : uint8_t {
+    ABSENT,    ///< Absent, null or not a string (logged): the state carries no value
+    KEPT,      ///< Within its cap: held as sent
+    CUT,       ///< While not strict, over its cap: held cut to it at a UTF-8 character boundary
+    REJECTED,  ///< While strict, over its cap: a protocol error
+};
+
+/// @brief What process_server_state_metadata() made of a server/state metadata object
+enum class MetadataStateOutcome : uint8_t {
+    IGNORED,   ///< Absent, or rejected for its timestamp (logged): nothing to apply
+    PARSED,    ///< Parsed, every text field within its cap
+    CUT,       ///< Parsed, a text field over its cap cut to it (or dropped, when not kept)
+    REJECTED,  ///< A text field over its cap while METADATA_STRICT: a protocol error
+};
+
 // --- artwork_role.h ---
 
 inline const char* to_cstr(SendspinImageFormat format) {
@@ -1222,14 +1332,23 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
 /// is absent or invalid
 bool process_server_command_source(JsonObject root, SourceCommand* source_cmd);
 
-/// @brief Parses the metadata section of a server/state JSON message; true if the section was
-/// present and parsed
+/// @brief Reads a text field of a server/state metadata object, at most `cap` bytes
+/// (roles/metadata/v1.md "server/state metadata object"). While not `strict`, a longer one is cut
+/// to `cap` at a UTF-8 character boundary; while `strict` it is rejected (messaging.md
+/// "Out-of-range values").
+/// @param out Views the text in the document for KEPT and CUT; left untouched otherwise.
+MetadataTextOutcome metadata_text_from_wire(JsonVariantConst var, const char* name, size_t cap,
+                                            bool strict, std::string_view* out);
+
+/// @brief Parses the metadata section of a server/state JSON message into `metadata`, viewing
+/// each text field `kept` holds in the document and dropping the others
 ///
 /// The server/state sections are parsed per section, each into a caller-owned struct, not into
 /// an aggregate a parser frame would copy out of. The caller holds every section a role takes
 /// live together for one parse, a combined frame on the protocol task, whose stack is bounded on
 /// ESP-IDF (at least SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
-bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* metadata);
+MetadataStateOutcome process_server_state_metadata(JsonObject root, EnumSet<MetadataField> kept,
+                                                   MetadataStateView* metadata);
 
 /// @brief Parses the color section of a server/state JSON message; true if the section was
 /// present and parsed

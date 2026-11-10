@@ -17,28 +17,9 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 
-#include <utility>
-
 static const char* const TAG = "sendspin.color";
 
 namespace sendspin {
-
-namespace {
-
-/// @brief Folds a newly arrived palette into the palettes the main loop has not taken yet
-///
-/// `incoming` always carries exactly one palette, in `oldest`. The first one to arrive after a
-/// drain keeps that place; every later one becomes `newest` (see PendingColorStates). Runs under
-/// the Inbox mutex, so it stays a pure data operation.
-void coalesce_color_states(PendingColorStates& current, const PendingColorStates& incoming) {
-    if (!current.oldest.has_value()) {
-        current.oldest = incoming.oldest;
-        return;
-    }
-    current.newest = incoming.oldest;
-}
-
-}  // namespace
 
 // ============================================================================
 // Impl constructor / destructor
@@ -75,11 +56,9 @@ void ColorRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
 void ColorRole::Impl::handle_server_state(const ServerColorStateObject& color) const {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // messaging.md "server/state": each included color object is the role's full palette, never
-    // an overlay on the one before it (see coalesce_color_states).
-    PendingColorStates arrival;
-    arrival.oldest = color;
-    // NOLINTNEXTLINE(performance-move-const-arg): merge() takes the delta as T&&
-    this->event_state->slot.merge(coalesce_color_states, std::move(arrival), generation);
+    // an overlay on the one before it, so it replaces the place's palette whole.
+    this->event_state->slot.arrive([&color](ServerColorStateObject& place) { place = color; },
+                                   generation);
 }
 
 bool ColorRole::Impl::state_is_due(int64_t timestamp) const {
@@ -90,62 +69,16 @@ bool ColorRole::Impl::state_is_due(int64_t timestamp) const {
     return client_ts == 0 || client_ts <= platform_time_us();
 }
 
-void ColorRole::Impl::apply_due_state() {
-    if (!this->held_state.has_value() || !this->state_is_due(this->held_state->timestamp)) {
-        return;
-    }
-
-    this->color = this->held_state.value();
-    this->held_state.reset();
-    if (this->listener) {
-        this->listener->on_color(this->color);
-    }
-}
-
 void ColorRole::Impl::drain_events() {
-    PendingColorStates taken;
-    bool have_taken = false;
-    const uint32_t generation =
-        take_current_payload(*this, this->event_state->slot, taken, have_taken, TAG, "color");
-    // Every check below against `generation` also catches a listener callback that re-entered
-    // teardown (a listener calling stop()): its cleanup() moved the generation on, and its own
-    // drain already reset this role.
-    if (!this->accepts(generation)) {
-        return;
-    }
-
-    // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex;
-    // see inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
-    // moves the pending palettes into held_state, then each deadline is evaluated below with no
-    // lock held at all.
-    //
-    // roles/color/v1.md "Scheduled color updates": a palette whose timestamp is still in the
-    // future is the pending update and a newer one replaces it, while a past or present one is
-    // applied at once and discards the pending update. Both fall out of replacing held_state with
-    // each taken palette in arrival order, applying whatever is due in between.
-    if (have_taken) {
-        const bool collapses =
-            taken.newest.has_value() && this->state_is_due(taken.newest->timestamp);
-        if (taken.oldest.has_value() && !collapses) {
-            // Two palettes that are both due collapse instead: the older would be superseded
-            // within this tick, so no listener could observe it.
-            this->held_state = taken.oldest;
-            this->apply_due_state();
-            if (!this->accepts(generation)) {
-                return;
+    drain_scheduled_state(
+        *this, this->event_state->slot,
+        [this](const ServerColorStateObject& place) { this->color = place; },
+        [this] {
+            if (this->listener) {
+                this->listener->on_color(this->color);
             }
-        }
-        if (taken.newest.has_value()) {
-            this->held_state = taken.newest;
-        }
-    }
-
-    // A future-dated palette is held across ticks without any topic bit set (take() above cleared
-    // it). It is re-evaluated against its deadline on later ticks only because needs_drain() ORs
-    // in held_state.has_value() alongside the INBOX_TOPIC_COLOR bit test, so this
-    // drain_events() keeps running each tick until the deadline fires. Dropping that OR term
-    // would strand the palette until an unrelated new one re-set the topic bit.
-    this->apply_due_state();
+        },
+        TAG, "color");
 }
 
 void ColorRole::Impl::cleanup() {
@@ -160,7 +93,7 @@ void ColorRole::Impl::cleanup() {
 
 void ColorRole::Impl::complete_teardown() {
     this->color = {};
-    this->held_state.reset();
+    this->event_state->slot.forget_pending();
     if (this->listener) {
         this->listener->on_color_clear();
     }

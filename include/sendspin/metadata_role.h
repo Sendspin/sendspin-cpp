@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "sendspin/config.h"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -38,6 +40,9 @@ struct MetadataProgressObject {
 };
 
 /// @brief Track metadata and playback state received from the server
+///
+/// Each text field is at most 255 bytes in UTF-8 (artwork_url 2048), cut at a character boundary,
+/// and has no value when its MetadataRoleConfig flag is false.
 struct ServerMetadataStateObject {
     int64_t timestamp{};
     std::optional<std::string> title;
@@ -81,7 +86,8 @@ public:
  *
  * Usage:
  * 1. Implement MetadataRoleListener to receive metadata updates
- * 2. Add the role to the client via SendspinClient::add_metadata()
+ * 2. Add the role to the client via SendspinClient::add_metadata(), turning off in
+ *    MetadataRoleConfig the text fields not to keep
  * 3. Call set_listener() with your listener implementation
  * 4. Poll get_track_progress_ms() and get_track_duration_ms() as needed for UI updates
  *
@@ -94,7 +100,9 @@ public:
  * };
  *
  * MyMetadataListener listener;
- * auto& metadata = client.add_metadata();
+ * // Only the fields the listener shows: the others are dropped and cost no storage
+ * auto& metadata =
+ *     client.add_metadata({.album_artist = false, .album = false, .artwork_url = false});
  * metadata.set_listener(&listener);
  * uint32_t progress = metadata.get_track_progress_ms();
  * @endcode
@@ -105,7 +113,7 @@ class MetadataRole {
 public:
     struct Impl;
 
-    explicit MetadataRole(SendspinClient* client);
+    MetadataRole(MetadataRoleConfig config, SendspinClient* client);
     ~MetadataRole();
 
     /// @brief Sets the listener for metadata events; it must outlive this role

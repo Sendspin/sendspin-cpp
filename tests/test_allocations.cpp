@@ -33,12 +33,15 @@
 // print each window's allocations grouped by call site, with each frame's offset into the binary
 // for atos or addr2line; a count that differs prints its window.
 
+#include "constants.h"
 #include "crypto/cpace.h"
 #include "crypto/pairing_code.h"
 #include "crypto/psk_wrap.h"
 #include "fake_persistence.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/base64.h"
+#include "platform/time.h"
+#include "protocol_messages.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "wrap_test_helpers.h"
@@ -429,6 +432,32 @@ public:
     int bursts{0};
 };
 
+/// Records what each metadata state carried without allocating: its text fields' sizes, whether
+/// it carried an artist, and the client clock's reading of its timestamp beside the time it was
+/// delivered. Main loop (the test thread) only.
+class TextSizeMetadataListener : public MetadataRoleListener {
+public:
+    explicit TextSizeMetadataListener(const SendspinClient& client) : client(client) {}
+
+    void on_metadata(const ServerMetadataStateObject& metadata) override {
+        this->due_at = this->client.get_client_time(metadata.timestamp);
+        this->delivered_at = platform_time_us();
+        this->title_size = metadata.title.has_value() ? metadata.title->size() : 0;
+        this->artwork_url_size =
+            metadata.artwork_url.has_value() ? metadata.artwork_url->size() : 0;
+        this->has_artist = metadata.artist.has_value();
+        ++this->updates;
+    }
+
+    const SendspinClient& client;
+    int updates{0};
+    int64_t due_at{0};
+    int64_t delivered_at{0};
+    size_t title_size{0};
+    size_t artwork_url_size{0};
+    bool has_artist{false};
+};
+
 /// Closes the open window in on_stream_start() when asked to. The main loop calls it before it
 /// signals the sync task to start the stream, and the sync task decodes nothing before that
 /// signal, so the window holds the protocol task's and the main loop's work on a stream/start and
@@ -527,6 +556,7 @@ constexpr size_t CLIENT_STATE_ALLOCATIONS = 0;
 constexpr size_t TIME_BURST_ALLOCATIONS = 0;
 constexpr size_t CONTROLLER_STATE_ALLOCATIONS = 0;
 constexpr size_t GROUP_UPDATE_ALLOCATIONS = 0;
+constexpr size_t METADATA_STATE_ALLOCATIONS = 0;
 constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 0;
 constexpr size_t PLAYER_FLAC_STREAM_START_ALLOCATIONS = 0;
 constexpr size_t SYNC_TASK_FIRST_FLAC_HEADER_ALLOCATIONS = 0;
@@ -537,12 +567,14 @@ constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 // application roles and the player, artwork and visualizer objects of client/state are built: from
 // the fake server's connect through admission and the first client/state, then one client/state
 // publish, then one full burst of client/time and server/time exchanges, then the first
-// controller server/state, then the first group/update messages, then an artwork and visualizer
-// stream/start and a stream/end and a stream/clear that name their roles, then the sync task's
-// first FLAC codec header, then a FLAC stream/start the player takes, then a stream/start whose
-// player section the connection, no longer owning the player, does not take.
-// The roles' public command and type lists and the client's group texts are reserved when they
-// are built, so even the first fill on the main loop allocates nothing.
+// controller server/state, then the first group/update messages, then the first metadata
+// server/state messages, then an artwork and visualizer stream/start and a stream/end and a
+// stream/clear that name their roles, then the sync task's first FLAC codec header, then a FLAC
+// stream/start the player takes, then a stream/start whose player section the connection, no
+// longer owning the player, does not take.
+// The roles' public command and type lists, the metadata state's texts and the client's group
+// texts are reserved when they are built, so even the first fill on the main loop allocates
+// nothing.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -571,7 +603,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, 48000, 16});
     client.add_player(std::move(player_config)).set_listener(&player_listener);
     ControllerRole& controller = client.add_controller();
-    client.add_metadata();
+    TextSizeMetadataListener metadata_listener(client);
+    client.add_metadata().set_listener(&metadata_listener);
     ArtworkRoleConfig artwork_config;
     artwork_config.preferred_formats = {
         {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 320},
@@ -666,6 +699,54 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     pump_while_not(client,
                    [&] { return group.group_name == "Allocation Test Upstairs Bedroom Group"; });
     expect_library_allocations(close_window(), "group/update", GROUP_UPDATE_ALLOCATIONS);
+
+    // A first state carrying every text field, its title over the cap, then a second without an
+    // artist, then one scheduled a little ahead, which waits in the role's slot as its pending
+    // state until a later tick finds it due, then one with no text at all, each applied by the
+    // main loop before the next is sent. The server clock is the client's, both in this process.
+    const auto metadata_state = [](int64_t timestamp, const std::string& texts) {
+        return R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
+               std::to_string(timestamp) + texts + "}}}";
+    };
+    const std::string url = "http://allocation-test.local/artwork/" + std::string(1900, 'u');
+    const std::string artwork_url = R"(,"artwork_url":")" + url + R"(")";
+    open_window();
+    {
+        TestOwned test_owned;
+        ASSERT_TRUE(server->send_app_json(metadata_state(
+            1, R"(,"title":")" + std::string(MAX_METADATA_TEXT_BYTES + 1, 't') +
+                   R"(","artist":"Allocation Test Artist Name","album_artist":)"
+                   R"("Allocation Test Album Artist","album":"Allocation Test Album Title")" +
+                   artwork_url)));
+    }
+    pump_while_not(client, [&] { return metadata_listener.updates == 1; });
+    {
+        TestOwned test_owned;
+        EXPECT_EQ(metadata_listener.title_size, MAX_METADATA_TEXT_BYTES);
+        EXPECT_EQ(metadata_listener.artwork_url_size, url.size());
+        EXPECT_TRUE(metadata_listener.has_artist);
+        ASSERT_TRUE(server->send_app_json(
+            metadata_state(2, R"(,"title":"Allocation Test Second Track Title")" + artwork_url)));
+    }
+    pump_while_not(client, [&] { return metadata_listener.updates == 2; });
+    {
+        TestOwned test_owned;
+        EXPECT_FALSE(metadata_listener.has_artist) << "the second state carried no artist";
+        ASSERT_TRUE(server->send_app_json(
+            metadata_state(platform_time_us() + 50 * static_cast<int64_t>(US_PER_MS),
+                           R"(,"title":"Allocation Test Scheduled Track Title")")));
+    }
+    pump_while_not(client, [&] { return metadata_listener.updates == 3; });
+    {
+        TestOwned test_owned;
+        // Delivered no earlier than its timestamp on the client clock, so it waited for it.
+        EXPECT_GE(metadata_listener.delivered_at, metadata_listener.due_at);
+        ASSERT_TRUE(server->send_app_json(metadata_state(3, "")));
+    }
+    pump_while_not(client, [&] { return metadata_listener.updates == 4; });
+    expect_library_allocations(close_window(), "metadata server/state",
+                               METADATA_STATE_ALLOCATIONS);
+    EXPECT_EQ(metadata_listener.title_size, 0U) << "the last state cleared the title";
 
     const int starts_before_streams = visualizer_listener.stream_starts;
 

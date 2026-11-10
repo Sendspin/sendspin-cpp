@@ -114,10 +114,12 @@ auto& controller = client.add_controller();
 
 ### Metadata Role (Track Information)
 
-Receives track metadata (title, artist, album, progress, etc.) from the server.
+Receives track metadata (title, artist, album, progress, etc.) from the server. Takes an optional configuration struct with a flag per text field, all kept by default; a field turned off reaches the listener without a value and costs no storage.
 
 ```cpp
-auto& metadata = client.add_metadata();
+auto& metadata = client.add_metadata();  // Every text field
+// Or only what the display shows:
+// auto& metadata = client.add_metadata({.album_artist = false, .album = false, .artwork_url = false});
 ```
 
 ### Artwork Role (Album Art)
@@ -315,16 +317,18 @@ The `ServerMetadataStateObject` contains these fields (all optional except `time
 | Field | Type | Description |
 |---|---|---|
 | `timestamp` | `int64_t` | Server clock µs at which this metadata becomes valid; delivery is held until the synced client clock reaches it |
-| `title` | `std::optional<std::string>` | Track title |
-| `artist` | `std::optional<std::string>` | Track artist |
-| `album_artist` | `std::optional<std::string>` | Album artist |
-| `album` | `std::optional<std::string>` | Album name |
-| `artwork_url` | `std::optional<std::string>` | Artwork URL |
+| `title` | `std::optional<std::string>` | Track title, at most 255 bytes |
+| `artist` | `std::optional<std::string>` | Track artist, at most 255 bytes |
+| `album_artist` | `std::optional<std::string>` | Album artist, at most 255 bytes |
+| `album` | `std::optional<std::string>` | Album name, at most 255 bytes |
+| `artwork_url` | `std::optional<std::string>` | Artwork URL, at most 2048 bytes |
 | `year` | `std::optional<uint16_t>` | Release year |
 | `track` | `std::optional<uint16_t>` | Track number |
 | `progress` | `std::optional<MetadataProgressObject>` | Playback progress (see below) |
 
 `MetadataProgressObject` contains `track_progress` (ms), `track_duration` (ms), and `playback_speed`.
+
+The text fields are bounded in UTF-8 bytes as roles/metadata/v1.md "server/state metadata object" caps them. A server that sends a longer one has it cut to the cap at a UTF-8 character boundary, with one warning per connection; a future release closes the connection on such a state instead (messaging.md "Out-of-range values"). A text field turned off in `MetadataRoleConfig` is always `nullopt`.
 
 Every `on_metadata()` call carries the full state of the track being described, not a set of changes: a field the server left out of that update is `nullopt`, whatever an earlier update reported for it, and a state without `progress` means there is no position to show. Listeners that mirror metadata into display state should therefore overwrite every displayed value on each call (using e.g. `value_or("")`) rather than merging into what they already show.
 
@@ -1426,6 +1430,17 @@ Each entry in `audio_formats` is an `AudioSupportedFormatObject`:
 
 ---
 
+### MetadataRoleConfig
+
+Configuration passed to `client.add_metadata()`, which defaults it.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `title`, `artist`, `album_artist`, `album`, `artwork_url` | `bool` | `true` | Whether to keep that text field of `ServerMetadataStateObject`. A field set `false` is dropped as each state is parsed and reaches the listener as `nullopt`; `year`, `track` and `progress` are always kept. Each kept field costs its cap (255 bytes, 2048 for `artwork_url`) in the public state's string, reserved by `add_metadata()` from internal RAM on ESP-IDF, and in each of the three text blocks that carry states from the protocol task to the main loop, allocated by `start()`. With every field kept that is 3,068 bytes of string capacity and 9,204 bytes of blocks; with `{.artwork_url = false}`, 1,020 and 3,060. `start()` fails, logged, when the blocks cannot be allocated. |
+| `buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement preference for the text blocks. `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. ESP-IDF only; ignored on host. |
+
+---
+
 ### ArtworkRoleConfig
 
 Configuration passed to `client.add_artwork()`.
@@ -1675,4 +1690,4 @@ Set with `SendspinClient::set_log_level()`. Only affects host builds; ESP-IDF bu
 | `PREFER_EXTERNAL` | Prefer SPIRAM, fall back to internal RAM (ESP-IDF only) |
 | `PREFER_INTERNAL` | Prefer internal RAM, fall back to SPIRAM (ESP-IDF only) |
 
-Used by `SendspinClientConfig::inbound_ring_location` to control where the shared inbound ring and the per-connection fallback buffers are allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and send buffers are allocated, by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated, and by `SourceRoleConfig::buffer_location` to control where the source's capture and chunk buffers are allocated. Ignored on host platforms (no internal/external distinction).
+Used by `SendspinClientConfig::inbound_ring_location` to control where the shared inbound ring and the per-connection fallback buffers are allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and send buffers are allocated, by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated, by `MetadataRoleConfig::buffer_location` to control where the metadata role's text blocks are allocated, and by `SourceRoleConfig::buffer_location` to control where the source's capture and chunk buffers are allocated. Ignored on host platforms (no internal/external distinction).

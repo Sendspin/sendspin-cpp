@@ -38,7 +38,8 @@ namespace sendspin {
  * Every main-loop path that is about to act on something stamped with a generation calls
  * catch_up_teardown() with it first: the event drain with a stamped event's generation, and a
  * role drain with the role's current generation right after it has taken its GenerationSlot
- * payload (inbox.h). Several teardowns between two catch-ups collapse into one main-loop half.
+ * payload (inbox.h) or peeked at its ScheduledStateSlot (scheduled_state_slot.h). Several
+ * teardowns between two catch-ups collapse into one main-loop half.
  *
  * Main loop only: written and read on the main loop, so it needs no lock or atomic.
  */
@@ -104,6 +105,24 @@ void catch_up_teardown(RoleImpl& role, uint32_t generation) {
     }
 }
 
+/// @brief The second half of take_current_payload(), for a drain that peeks at its slot rather
+/// than taking it (drain_scheduled_state()): catches the role up to its current teardown
+/// generation, then keeps a payload stamped `stamp` only if it is that generation, dropping an
+/// older one with a debug log
+/// @param[in,out] have Whether there is a payload; false once an older one is dropped.
+/// @return The role's generation the catch-up ran to.
+template <typename RoleImpl>
+uint32_t keep_current_payload(RoleImpl& role, bool& have, uint32_t stamp, const char* tag,
+                              const char* what) {
+    const uint32_t generation = role.cleanup_generation.load(std::memory_order_acquire);
+    catch_up_teardown(role, generation);
+    if (have && stamp != generation) {
+        SS_LOGD(tag, "Dropping %s queued before the role was torn down", what);
+        have = false;
+    }
+    return generation;
+}
+
 /// @brief The head of every slot role's drain: takes the role's GenerationSlot payload, catches
 /// the role up to its current teardown generation (catch_up_teardown()), then keeps the payload
 /// only if it is stamped with that generation, dropping an older one with a debug log
@@ -121,13 +140,7 @@ uint32_t take_current_payload(RoleImpl& role, GenerationSlot<T>& slot, T& out, b
                               const char* tag, const char* what) {
     uint32_t stamp = 0;
     have = slot.take(out, stamp);
-    const uint32_t generation = role.cleanup_generation.load(std::memory_order_acquire);
-    catch_up_teardown(role, generation);
-    if (have && stamp != generation) {
-        SS_LOGD(tag, "Dropping %s queued before the role was torn down", what);
-        have = false;
-    }
-    return generation;
+    return keep_current_payload(role, have, stamp, tag, what);
 }
 
 }  // namespace sendspin

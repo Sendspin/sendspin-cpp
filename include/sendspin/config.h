@@ -494,6 +494,28 @@ struct PlayerRoleConfig {
 };
 
 // ============================================================================
+// Metadata config types
+// ============================================================================
+
+/// @brief Configuration for the metadata role
+///
+/// Each text field set false is dropped as each state is parsed and reaches the listener without
+/// a value. Each one kept costs its cap (255 bytes, 2048 for artwork_url) in the public state's
+/// string, reserved by SendspinClient::add_metadata(), and in each of the three text blocks that
+/// carry its states to the main loop, allocated by SendspinClient::start().
+struct MetadataRoleConfig {
+    bool title{true};         ///< Keep ServerMetadataStateObject::title
+    bool artist{true};        ///< Keep ServerMetadataStateObject::artist
+    bool album_artist{true};  ///< Keep ServerMetadataStateObject::album_artist
+    bool album{true};         ///< Keep ServerMetadataStateObject::album
+    bool artwork_url{true};   ///< Keep ServerMetadataStateObject::artwork_url
+
+    /// @brief Placement of the text blocks of the states in flight (ESP-IDF only). The main loop
+    /// copies each state's text out of them once, so PSRAM-preferring.
+    MemoryLocation buffer_location{MemoryLocation::PREFER_EXTERNAL};
+};
+
+// ============================================================================
 // Artwork config types
 // ============================================================================
 
