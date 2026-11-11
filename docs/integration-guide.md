@@ -1176,7 +1176,9 @@ bool synced = client.is_time_synced();         // Time filter has received at le
 GroupState group = client.group_state();       // Group id, name, playback state (all optional);
                                                // its views hold until control returns to loop(), or stop()
 auto server = client.server_information();     // Active server's id and name as of the last loop(),
-                                               // nullopt with none; views held like group_state()'s
+                                               // nullopt with none; views held like group_state()'s;
+                                               // can trail is_connected() by one loop(), so read it
+                                               // each loop rather than on its rising edge
 
 // Player state
 uint8_t vol = player.get_volume();
@@ -1215,7 +1217,7 @@ The view forms hand the metadata, group, pairing and server text over as `std::s
 | `ServerInformationObject` | `ServerInformation` |
 | `SendspinClient::get_server_information()` | `SendspinClient::server_information()`, main loop only |
 
-The fields and arguments keep their meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` and `server_information()` return until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view, like a pairing token's array, is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. `server_information()` reads a copy `loop()` refreshes as the server changes, so it reads the main loop only; `get_server_information()` reads from any thread, and code off the main loop has no replacement and keeps calling it until the removal. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. A `stop()` from the new callback ends the delivery there.
+The fields and arguments keep their meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` and `server_information()` return until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view, like a pairing token's array, is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. `server_information()` reads a copy `loop()` refreshes as the server changes, so it is main loop only and can read the previous server, or `nullopt`, for one `loop()` after `is_connected()` turns true: read it on each `loop()` rather than only when `is_connected()` rises; `get_server_information()` reads from any thread, and code off the main loop has no replacement and keeps calling it until the removal. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. A `stop()` from the new callback ends the delivery there.
 
 ## Thread Safety Summary
 

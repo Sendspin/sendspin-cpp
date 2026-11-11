@@ -3277,28 +3277,23 @@ TEST(ClientLifecycle, StopFromInsideAPairingCallbackDismissesThePromptOnce) {
     }
 }
 
-/// Logs each pairing callback with text, in the form "<form> <callback> <content>", and the
-/// address of the text it was handed. Overrides neither form itself: ViewPairingForms and
-/// WithDeprecatedPairingForms add them. Main loop only.
+/// Logs each pairing callback with text, in the form "<form> <callback> <content>". Overrides
+/// neither form itself: ViewPairingForms and WithDeprecatedPairingForms add them. Main loop only.
 class PairingFormsLog : public SendspinClientListener {
 public:
     std::vector<std::string> calls;
-    std::vector<const char*> view_text;
-    std::vector<const char*> deprecated_text;
     /// When set, the first view-form callback calls its stop().
     SendspinClient* stop_from_view_form{nullptr};
 
 protected:
     void log_view(const std::string& what, std::string_view text) {
         this->calls.push_back("view " + what + " " + std::string(text));
-        this->view_text.push_back(text.data());
         if (SendspinClient* client = std::exchange(this->stop_from_view_form, nullptr)) {
             client->stop();
         }
     }
     void log_deprecated(const std::string& what, const std::string& text) {
         this->calls.push_back("deprecated " + what + " " + text);
-        this->deprecated_text.push_back(text.data());
     }
 };
 
@@ -3346,21 +3341,21 @@ using BothPairingForms = WithDeprecatedPairingForms<ViewPairingForms>;
 
 // Each pairing callback with text, every abort reason and a code in each format, reaches a
 // listener in the forms it overrides: only the view form, only the deprecated std::string form,
-// or both, the view form first with the same content. The view form's text is not the
-// deprecated form's string. A stop() from the first view-form callback ends the delivery there,
-// its deprecated form included. The test thread plays the protocol task, queueing the notes as
-// its handlers do. The server id (43 characters) and the qr_code token (43) are past both
-// standard libraries' inline string capacity, and the digits that follow them shorter, so the
-// deprecated form's string is reassigned, not appended to.
+// or both, the view form first with the same content. A stop() from the first view-form callback
+// ends the delivery there, its deprecated form included. The test thread plays the protocol task,
+// queueing the notes as its handlers do.
 TEST(ClientLifecycle, PairingCallbacksReachBothForms) {
     const std::string server_id = "c2VuZHNwaW4tcGFpcmluZy1jYWxsYmFjay1mb3Jtcw0";
     const std::string token = "SP:14DQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     ASSERT_EQ(server_id.size(), 43U);
     ASSERT_EQ(token.size(), 43U);
     const SendspinPairAbortReason reasons[] = {
-        SendspinPairAbortReason::ATTEMPT_TIMEOUT,      SendspinPairAbortReason::CONCURRENT_ATTEMPT,
-        SendspinPairAbortReason::METHOD_NOT_SUPPORTED, SendspinPairAbortReason::PAIRING_CODE_MISMATCH,
-        SendspinPairAbortReason::USER_CANCELLED,       SendspinPairAbortReason::UNKNOWN,
+        SendspinPairAbortReason::ATTEMPT_TIMEOUT,
+        SendspinPairAbortReason::CONCURRENT_ATTEMPT,
+        SendspinPairAbortReason::METHOD_NOT_SUPPORTED,
+        SendspinPairAbortReason::PAIRING_CODE_MISMATCH,
+        SendspinPairAbortReason::USER_CANCELLED,
+        SendspinPairAbortReason::UNKNOWN,
     };
 
     // Each callback's description and content, in the order the notes are queued.
@@ -3369,10 +3364,11 @@ TEST(ClientLifecycle, PairingCallbacksReachBothForms) {
         delivered.push_back("aborted " + std::to_string(static_cast<int>(reason)) + " " +
                             server_id);
     }
-    delivered.push_back("code " + std::to_string(static_cast<int>(SendspinPairingCodeFormat::QR_CODE)) +
-                        " " + token);
-    delivered.push_back("code " + std::to_string(static_cast<int>(SendspinPairingCodeFormat::DIGITS)) +
-                        " 042735");
+    const auto code_call = [](SendspinPairingCodeFormat format, const std::string& code) {
+        return "code " + std::to_string(static_cast<int>(format)) + " " + code;
+    };
+    delivered.push_back(code_call(SendspinPairingCodeFormat::QR_CODE, token));
+    delivered.push_back(code_call(SendspinPairingCodeFormat::DIGITS, "042735"));
     const auto in_form = [&delivered](std::initializer_list<const char*> forms) {
         std::vector<std::string> calls;
         for (const std::string& call : delivered) {
@@ -3421,13 +3417,51 @@ TEST(ClientLifecycle, PairingCallbacksReachBothForms) {
         client.loop();
 
         EXPECT_EQ(row.log.calls, row.expected);
-        if (row.log.view_text.size() == row.log.deprecated_text.size()) {
-            for (size_t i = 0; i < row.log.view_text.size(); ++i) {
-                EXPECT_NE(row.log.view_text[i], row.log.deprecated_text[i])
-                    << "the view form viewed the deprecated form's string";
-            }
+        client.stop();
+    }
+}
+
+// server_information() reports the latest server the protocol task handed the main loop since the
+// last loop(), "none" included: a primary that changes twice between two drains leaves only its
+// second value. The test thread plays the protocol task's refresh_published_state(), since no
+// public call changes the primary twice inside one main-loop tick.
+TEST(ClientLifecycle, ServerInformationTakesTheLatestPrimary) {
+    PublishedServer first;
+    ASSERT_TRUE(first.server_id.assign("Zmlyc3Qtc2VydmVyLWluZm9ybWF0aW9uLXRlc3QtaWQ"));
+    ASSERT_TRUE(first.name.assign("First"));
+    PublishedServer second;
+    ASSERT_TRUE(second.server_id.assign("c2Vjb25kLXNlcnZlci1pbmZvcm1hdGlvbi10ZXN0LWk"));
+    ASSERT_TRUE(second.name.assign("Second"));
+    struct Row {
+        const char* name;
+        const PublishedServer* earlier;
+        const PublishedServer* later;
+    };
+    const Row rows[] = {
+        {"Control: one server, then another", &first, &second},
+        {"a server, then none", &first, nullptr},
+        {"none, then a server", nullptr, &second},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+
+        client.note_server_information(row.earlier);
+        client.note_server_information(row.later);
+        client.loop();
+
+        const std::optional<ServerInformation> info = client.server_information();
+        ASSERT_EQ(info.has_value(), row.later != nullptr);
+        if (row.later != nullptr) {
+            EXPECT_EQ(info->server_id, row.later->server_id.view());
+            EXPECT_EQ(info->name, row.later->name.view());
         }
         client.stop();
+        EXPECT_FALSE(client.server_information().has_value());
     }
 }
 

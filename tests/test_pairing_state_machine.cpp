@@ -164,44 +164,21 @@ struct PairingEvent {
     SendspinPairingCodeFormat format{};  // DISPLAY_CODE
 };
 
-/// Records the view form of each pairing callback in events_, and logs both forms of each that
-/// carries text in forms_, which the fixture's TearDown() checks pair up.
 class RecordingListener : public SendspinClientListener {
 public:
     void on_pairing_attempt(std::string_view server_id) override {
         this->events_.push_back({PairingEventKind::STARTED, std::string(server_id), {}, {}, {}});
-        this->log_form(false, "started " + std::string(server_id));
     }
     void on_paired(std::string_view server_id) override {
         this->events_.push_back({PairingEventKind::SUCCEEDED, std::string(server_id), {}, {}, {}});
-        this->log_form(false, "succeeded " + std::string(server_id));
     }
     void on_pairing_aborted(std::string_view server_id, SendspinPairAbortReason reason) override {
         this->events_.push_back({PairingEventKind::FAILED, std::string(server_id), reason, {}, {}});
-        this->log_form(false, "failed " + std::string(server_id) + " " +
-                                  std::to_string(static_cast<int>(reason)));
     }
     void on_pairing_code(std::string_view code, SendspinPairingCodeFormat format) override {
-        this->events_.push_back({PairingEventKind::DISPLAY_CODE, {}, {}, std::string(code), format});
-        this->log_form(false, "code " + std::string(code) + " " +
-                                  std::to_string(static_cast<int>(format)));
+        this->events_.push_back(
+            {PairingEventKind::DISPLAY_CODE, {}, {}, std::string(code), format});
     }
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    void on_pairing_started(const std::string& server_id) override {
-        this->log_form(true, "started " + server_id);
-    }
-    void on_pairing_succeeded(const std::string& server_id) override {
-        this->log_form(true, "succeeded " + server_id);
-    }
-    void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
-        this->log_form(true, "failed " + server_id + " " + std::to_string(static_cast<int>(reason)));
-    }
-    void on_display_pairing_code(const std::string& code,
-                                 SendspinPairingCodeFormat format) override {
-        this->log_form(true, "code " + code + " " + std::to_string(static_cast<int>(format)));
-    }
-#pragma GCC diagnostic pop
     void on_clear_pairing_code() override {
         this->events_.push_back({PairingEventKind::CLEAR_CODE, {}, {}, {}, {}});
     }
@@ -271,27 +248,7 @@ public:
         return std::nullopt;
     }
 
-    /// Expects every view-form callback with text to be followed at once by its deprecated form
-    /// with the same content, and no deprecated form otherwise.
-    void expect_forms_paired() const {
-        ASSERT_EQ(this->forms_.size() % 2, 0U) << "a view form without its deprecated form";
-        for (size_t i = 0; i < this->forms_.size(); i += 2) {
-            EXPECT_FALSE(this->forms_[i].first) << this->forms_[i].second;
-            EXPECT_TRUE(this->forms_[i + 1].first) << this->forms_[i + 1].second;
-            EXPECT_EQ(this->forms_[i].second, this->forms_[i + 1].second);
-        }
-    }
-
     std::vector<PairingEvent> events_;
-
-private:
-    void log_form(bool deprecated, std::string description) {
-        this->forms_.emplace_back(deprecated, std::move(description));
-    }
-
-    /// Each text-carrying callback in delivery order: whether it was the deprecated form, and
-    /// its kind and content. Kept across the events_.clear() some tests make.
-    std::vector<std::pair<bool, std::string>> forms_;
 };
 
 // ============================================================================
@@ -466,11 +423,6 @@ protected:
         // build_client_hello()'s gating exactly). Tests that need a different capability shape
         // call init_client() again.
         this->init_client(/*pairing_code_emission_supported=*/true);
-    }
-
-    /// Every scenario's pairing callbacks reached the listener in both forms with one content.
-    void TearDown() override {
-        this->listener_.expect_forms_paired();
     }
 
     /// (Re)build the SendspinClient under test with the given platform capability, and

@@ -617,12 +617,15 @@ public:
 
     /// @brief Returns true if there is an active connection whose handshake completed and whose
     /// latest server/activate has arrived. Any thread; reflects the protocol task's last tick.
+    /// server_information() can lag it by one loop() (see there).
     bool is_connected() const;
 
     /// @brief Returns the server information from the active connection's hello handshake, as
     /// the protocol task had published it when loop() last ran, or nullopt when no connection was
     /// active then. Main loop only. The views are valid until control next returns to loop()
-    /// (from inside a callback: until the callback returns) or until stop().
+    /// (from inside a callback: until the callback returns) or until stop(). loop() takes the
+    /// copy as it starts, so it can read nullopt, or the previous server, for one loop() after
+    /// is_connected() turns true: read it on each loop() rather than only on that rising edge.
     std::optional<ServerInformation> server_information() const;
 
     /// @brief Returns the server information the protocol task last published, each field copied

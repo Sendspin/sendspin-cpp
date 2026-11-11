@@ -280,7 +280,7 @@ struct SendspinClient::EventState {
     /// note's text and reserved for the longest (PairingNote::text), so no delivery allocates.
     /// Main loop only. A drain nested in a callback (its stop()) delivers only the dismissals,
     /// which carry no text, so it never reassigns the string a callback is reading.
-    std::string deprecated_pairing_text{reserved_string(PEER_ID_SIZE)};
+    std::string deprecated_pairing_text{reserved_string(decltype(PairingNote::text)::capacity())};
     /// The primary connection's server information, written by the protocol task each time the
     /// primary changes (ConnectionManager::refresh_published_state()), latest-wins.
     InboxSlot<std::optional<PublishedServer>> server_slot{inbox, INBOX_TOPIC_SERVER};
@@ -1021,7 +1021,9 @@ void SendspinClient::drain_inbox() {
     const uint32_t inbox_bits = es.inbox.poll();
 
     // --- Server information ---
-    // First, so every callback this drain makes reads the server the protocol task last published.
+    // First, so the callbacks this drain makes read the server as of the drain's start. A later
+    // tick can change it while the drain runs, so a group or metadata update delivered further
+    // down may come from a newer server than server_information() reads until the next loop().
     if (inbox_bits & INBOX_TOPIC_SERVER) {
         (void)es.server_slot.take(es.server_information);
     }
@@ -2018,8 +2020,13 @@ void SendspinClient::on_activation_applied([[maybe_unused]] SendspinConnection* 
 }
 
 void SendspinClient::note_server_information(const PublishedServer* server) {
-    this->event_state_->server_slot.write(
-        server != nullptr ? std::optional<PublishedServer>(*server) : std::nullopt);
+    this->event_state_->server_slot.update([server](std::optional<PublishedServer>& current) {
+        if (server != nullptr) {
+            current = *server;
+        } else {
+            current.reset();
+        }
+    });
 }
 
 void SendspinClient::note_pairing_started(std::string_view server_id) {

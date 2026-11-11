@@ -916,7 +916,8 @@ public:
     }
     void on_pairing_aborted(std::string_view /*server_id*/,
                             SendspinPairAbortReason /*reason*/) override {}
-    void on_pairing_code(std::string_view /*code*/, SendspinPairingCodeFormat /*format*/) override {}
+    void on_pairing_code(std::string_view /*code*/,
+                         SendspinPairingCodeFormat /*format*/) override {}
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     void on_pairing_started(const std::string& /*server_id*/) override {}
@@ -1057,8 +1058,8 @@ constexpr size_t PAIRING_ALLOCATIONS = 0;
 
 // Two paired servers, the incoming one's record the least recently used: from the incoming
 // server's connect, through the playback activate that displaces the incumbent, the main loop's
-// copy of the incoming server's information and its flush of the record order it moved, then a server/unpair of the incoming server's record
-// through the flush that empties its slot.
+// copy of the incoming server's information and its flush of the record order it moved, then a
+// server/unpair of the incoming server's record through the flush that empties its slot.
 TEST(Allocations, RecordFlushesAfterAPlaybackHandoffAndAnUnpair) {
     PairedPeer incoming = make_paired_peer();
     PairedPeer incumbent = make_paired_peer();
