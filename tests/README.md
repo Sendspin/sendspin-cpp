@@ -120,8 +120,8 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   the command queue's refusals and the lifecycle requests it never refuses, the protocol task's
   next deadline, the teardown reorder guarantee for every role with main-loop state, stream
   starts acknowledged by number, the high-performance grant, the time filter slot, the
-  inbound ring's size, and the metadata role's scheduled-state slot, whose three text blocks
-  carry every state to the listener in order.
+  inbound ring's size, the pairing callbacks in each listener form, and the metadata role's
+  scheduled-state slot, whose three text blocks carry every state to the listener in order.
 - `test_client_teardown.cpp`: destroying a running client joins every threaded role.
 - `test_role_deactivation.cpp`: a later `server/activate` that removes a role: output stopped,
   buffers and state dropped, the roles it keeps left alone, and a removed role added back.

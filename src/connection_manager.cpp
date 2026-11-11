@@ -325,17 +325,9 @@ std::optional<TimeTransform> ConnectionManager::clock() const {
     return this->published_.clocks[this->published_.primary_slot];
 }
 
-std::optional<ServerInformationObject> ConnectionManager::server_information() const {
-    std::optional<PublishedServer> server;
-    {
-        std::lock_guard<std::mutex> lock(this->published_mutex_);
-        server = this->published_.server;
-    }
-    if (!server.has_value()) {
-        return std::nullopt;
-    }
-    return ServerInformationObject{.server_id = std::string(server->server_id.view()),
-                                   .name = std::string(server->name.view())};
+std::optional<PublishedServer> ConnectionManager::server_information() const {
+    std::lock_guard<std::mutex> lock(this->published_mutex_);
+    return this->published_.server;
 }
 
 // ============================================================================
@@ -1043,6 +1035,12 @@ void ConnectionManager::refresh_published_state() {
         }
         this->published_.clocks = clocks;
         this->published_.primary_slot = primary_slot;
+    }
+    // After published_mutex_ is released, since both locks are leaves, and ahead of the connected
+    // flag below, so a loop() after a caller reads that flag finds its server.
+    if (primary_changed) {
+        this->client_->note_server_information(
+            this->published_.server.has_value() ? &*this->published_.server : nullptr);
     }
 
     // Only ever lowered here: a loss is reported as soon as the slots stop naming the connection,

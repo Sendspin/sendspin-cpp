@@ -53,6 +53,7 @@ static constexpr uint32_t INBOX_TOPIC_TIME = 1U << 10;                 // Time-s
 static constexpr uint32_t INBOX_TOPIC_PAIRING = 1U << 11;              // Pairing notes slot
 static constexpr uint32_t INBOX_TOPIC_HIGH_PERFORMANCE = 1U << 12;     // High-performance requests
 static constexpr uint32_t INBOX_TOPIC_PLAYER_SYNC_IDLE = 1U << 13;     // Sync task left a stream
+static constexpr uint32_t INBOX_TOPIC_SERVER = 1U << 14;               // Server information slot
 
 // ============================================================================
 // Event ring types

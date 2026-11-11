@@ -180,7 +180,7 @@ void RecordStore::provision_pairing_psk_if_needed() {
     // pairing_psk is the one pairing method every client must implement (messaging.md
     // "client/hello"), so a client with no Pairing PSK would advertise a method it cannot
     // complete. The operator transfers the generated key to a server as a pairing token
-    // (SendspinClient::pairing_token()). It is stable across reboots once persisted; if
+    // (SendspinClient::client_pairing_token()). It is stable across reboots once persisted; if
     // persistence fails it is RAM-only for this boot, so a token printed then will not survive a
     // reboot.
     if (!this->pairing_psk_.has_value()) {

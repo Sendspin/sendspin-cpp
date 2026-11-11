@@ -766,7 +766,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 SS_LOGI(TAG, "server/pair-finalize: no pending pairing record to store");
             }
             if (stored_record) {
-                // Before on_pairing_succeeded, so the drain that fires it flushes the write
+                // Before on_paired, so the drain that fires it flushes the write
                 // first. Not fired for the capacity-rejection case.
                 this->request_persist();
                 this->connection_manager_->on_pairing_succeeded(conn);

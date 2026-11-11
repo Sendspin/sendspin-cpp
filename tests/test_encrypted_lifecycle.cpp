@@ -234,24 +234,24 @@ private:
 // (see EventState's dispatch block), so no locking is needed here.
 class RecordingClientListener : public SendspinClientListener {
 public:
-    void on_pairing_started(const std::string& server_id) override {
-        this->pairing_started_server_id_ = server_id;
+    void on_pairing_attempt(std::string_view server_id) override {
+        this->pairing_started_server_id_ = std::string(server_id);
         this->pairing_started_seq_ = this->next_seq_++;
     }
 
-    void on_pairing_succeeded(const std::string& server_id) override {
-        this->pairing_succeeded_server_id_ = server_id;
+    void on_paired(std::string_view server_id) override {
+        this->pairing_succeeded_server_id_ = std::string(server_id);
         this->pairing_succeeded_seq_ = this->next_seq_++;
-        if (this->on_pairing_succeeded_hook) {
-            this->on_pairing_succeeded_hook();
+        if (this->on_paired_hook) {
+            this->on_paired_hook();
         }
     }
 
-    /// Runs inside on_pairing_succeeded(), for a test that reads state as of the callback.
-    std::function<void()> on_pairing_succeeded_hook;
+    /// Runs inside on_paired(), for a test that reads state as of the callback.
+    std::function<void()> on_paired_hook;
 
-    void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
-        this->pairing_failed_server_id_ = server_id;
+    void on_pairing_aborted(std::string_view server_id, SendspinPairAbortReason reason) override {
+        this->pairing_failed_server_id_ = std::string(server_id);
         this->pairing_failed_reason_ = reason;
     }
 
@@ -337,9 +337,7 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
 
     // Initial handshake + hello + activate must bring the connection operational.
     pump_until(client, [&] { return client.is_connected(); });
-    auto info = client.get_server_information();
-    ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, server_identity.peer_id());
+    EXPECT_EQ(refreshed_server_id(client), server_identity.peer_id());
     EXPECT_EQ(server.client_hello_count(), 1);
 
     // Trigger the in-band re-handshake on the ADMITTED connection (same PSK: this test isolates
@@ -360,9 +358,7 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     EXPECT_EQ(server.client_hello_count(), 1) << "client/hello must not be re-sent";
     EXPECT_EQ(server.activate_count(), 2) << "the server's first message under the new keys";
     // server_id is unchanged (same server, new session keys).
-    auto info2 = client.get_server_information();
-    ASSERT_TRUE(info2.has_value());
-    EXPECT_EQ(info2->server_id, server_identity.peer_id());
+    EXPECT_EQ(refreshed_server_id(client), server_identity.peer_id());
     EXPECT_FALSE(server.closed());
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -581,7 +577,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndPairsTheSession) {
 
     RecordingClientListener listener;
     std::optional<SendspinPairingRecord> committed_at_success;
-    listener.on_pairing_succeeded_hook = [&] {
+    listener.on_paired_hook = [&] {
         committed_at_success = persistence.committed_record();
     };
     SendspinClient client(config);
@@ -620,10 +616,10 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndPairsTheSession) {
     EXPECT_EQ(pair_init->pairing_index, 1U);
     EXPECT_FALSE(pair_init->has_commit_b);
 
-    // handle_enter_pairing must fire on_pairing_started for the Pairing-PSK flow too, so the
+    // handle_enter_pairing must fire on_pairing_attempt for the Pairing-PSK flow too, so the
     // started/succeeded/failed callback trio stays method-agnostic.
     ASSERT_TRUE(listener.pairing_started_server_id().has_value())
-        << "on_pairing_started was never fired for the pairing-token (Pairing-PSK) flow";
+        << "on_pairing_attempt was never fired for the pairing-token (Pairing-PSK) flow";
     EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
 
     // The server's ack commits the record to RAM synchronously on the protocol task (see
@@ -640,7 +636,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndPairsTheSession) {
 
     // An application that acts on the callback (a reboot, say) must find the record durable.
     ASSERT_TRUE(committed_at_success.has_value())
-        << "on_pairing_succeeded fired before the record was committed to the provider";
+        << "on_paired fired before the record was committed to the provider";
     EXPECT_EQ(committed_at_success->psk_id, server.learned_psk_id().value());
 
     // The application must see the exchange begin before it sees it end. The ordering is
@@ -650,7 +646,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndPairsTheSession) {
     ASSERT_TRUE(listener.pairing_started_seq().has_value());
     ASSERT_TRUE(listener.pairing_succeeded_seq().has_value());
     EXPECT_LT(listener.pairing_started_seq().value(), listener.pairing_succeeded_seq().value())
-        << "on_pairing_succeeded was delivered before on_pairing_started";
+        << "on_paired was delivered before on_pairing_attempt";
 
     // Rekey onto the newly paired PSK, exactly like the real server does immediately after
     // acking pair-finalize (see connection.h's note_pairing_finalize_ack()/provisional-timeout
@@ -666,9 +662,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndPairsTheSession) {
     // it, so only is_paired() tells the new session apart, and a session that never becomes paired
     // hangs here for the suite watchdog to name.
     pump_until(client, [&] { return client.is_paired() && client.is_connected(); });
-    auto info = client.get_server_information();
-    ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, server_identity.peer_id());
+    EXPECT_EQ(refreshed_server_id(client), server_identity.peer_id());
     EXPECT_FALSE(server.closed());
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -779,7 +773,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     // this shape happened to be sent): the started/succeeded pairing callbacks must fire, exactly
     // like a fresh pairing-PSK flow.
     ASSERT_TRUE(listener.pairing_started_server_id().has_value())
-        << "on_pairing_started was never fired for the re-pairing activate";
+        << "on_pairing_attempt was never fired for the re-pairing activate";
     EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
 
     pump_until(client, [&] { return listener.pairing_succeeded_server_id().has_value(); });
@@ -4102,8 +4096,12 @@ TEST(EncryptedLifecycle, ASlowRecordWriteDoesNotStallTheProtocolTask) {
                                peer.record.psk_id, peer.psk);
     persistence.wait_until_entered();
 
-    // The provider stays parked until release() below.
+    // The provider stays parked until release() below. Read off the main loop, which only the
+    // any-thread getter supports.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     const auto info = client.get_server_information();
+#pragma GCC diagnostic pop
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, peer.server_identity.peer_id());
     client.disconnect(SendspinGoodbyeReason::USER_REQUEST);

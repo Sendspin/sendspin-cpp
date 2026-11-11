@@ -81,6 +81,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -768,31 +769,31 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        void on_pairing_started(const std::string& /*server_id*/) override {
+        void on_pairing_attempt(std::string_view /*server_id*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.pairing_status = "Pairing...";
         }
 
-        void on_pairing_succeeded(const std::string& /*server_id*/) override {
+        void on_paired(std::string_view /*server_id*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.pairing_status = "Paired";
         }
 
-        void on_pairing_failed(const std::string& /*server_id*/,
-                               SendspinPairAbortReason /*reason*/) override {
+        void on_pairing_aborted(std::string_view /*server_id*/,
+                                SendspinPairAbortReason /*reason*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.pairing_status = "Pairing failed";
         }
 
-        void on_display_pairing_code(const std::string& code,
-                                     SendspinPairingCodeFormat format) override {
+        void on_pairing_code(std::string_view code, SendspinPairingCodeFormat format) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             // Only digits are offered above, so a code that arrives is six digits; pairing.md
             // "Pairing Code Presentation" asks for the 3-3 grouping shown here, which is
             // presentation only and never part of what the operator types.
-            state.pairing_status = format == SendspinPairingCodeFormat::DIGITS
-                                       ? "Code " + code.substr(0, 3) + "-" + code.substr(3)
-                                       : "Token " + code;
+            state.pairing_status =
+                format == SendspinPairingCodeFormat::DIGITS
+                    ? "Code " + std::string(code.substr(0, 3)) + "-" + std::string(code.substr(3))
+                    : "Token " + std::string(code);
         }
 
         void on_clear_pairing_code() override {
@@ -1004,9 +1005,9 @@ int main(int argc, char* argv[]) {
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.client_id = client.client_id();
-        auto token = client.pairing_token();
+        const auto token = client.client_pairing_token();
         if (token.has_value()) {
-            state.pairing_token = std::move(*token);
+            state.pairing_token.assign(token->data(), token->size());
         }
     }
 

@@ -72,6 +72,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
@@ -258,9 +259,7 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
 
         auto server = connect_paired_server(bundle.peer, RESTART_TEST_PORT);
         pump_until(client, [&] { return client.is_connected(); });
-        auto info = client.get_server_information();
-        ASSERT_TRUE(info.has_value());
-        EXPECT_EQ(info->server_id, bundle.peer.server_identity.peer_id());
+        EXPECT_EQ(refreshed_server_id(client), bundle.peer.server_identity.peer_id());
 
         // Some group state for stop() to reset.
         ASSERT_TRUE(server->send_app_json(group_update_playing_json()));
@@ -270,12 +269,13 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
 
         EXPECT_FALSE(client.is_started());
         EXPECT_FALSE(client.is_connected());
-        EXPECT_FALSE(client.get_server_information().has_value());
+        EXPECT_FALSE(client.server_information().has_value());
         EXPECT_FALSE(client.group_state().playback_state.has_value());
         EXPECT_FALSE(client.group_state().group_id.has_value());
         EXPECT_FALSE(client.group_state().group_name.has_value());
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        EXPECT_FALSE(client.get_server_information().has_value());
         const GroupUpdateObject& deprecated_group = client.get_group_state();
         EXPECT_FALSE(deprecated_group.playback_state.has_value());
         EXPECT_FALSE(deprecated_group.group_id.has_value());
@@ -3087,8 +3087,7 @@ TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
 /// Counts the pairing prompts and their dismissals. Main loop only.
 class PairingPromptLog : public SendspinClientListener {
 public:
-    void on_display_pairing_code(const std::string& /*code*/,
-                                 SendspinPairingCodeFormat /*format*/) override {
+    void on_pairing_code(std::string_view /*code*/, SendspinPairingCodeFormat /*format*/) override {
         ++this->displays;
     }
     void on_clear_pairing_code() override {
@@ -3178,7 +3177,7 @@ TEST(ClientLifecycle, AFullTeardownKeepsTheDismissalsOfShownPrompts) {
 }
 
 /// Calls stop(), and then start() when `restart` is set, from inside the first
-/// on_display_pairing_code(). The test thread plays the protocol task, so the listener runs the
+/// on_pairing_code(). The test thread plays the protocol task, so the listener runs the
 /// final tick stop() would join first: admission closes, then the shutdown pass takes the
 /// admitted connection's prompt flags.
 class StopFromPairingPromptListener : public PairingPromptLog {
@@ -3186,9 +3185,8 @@ public:
     StopFromPairingPromptListener(SendspinClient*& client, bool reenter, bool restart)
         : client_(client), reenter_(reenter), restart_(restart) {}
 
-    void on_display_pairing_code(const std::string& code,
-                                 SendspinPairingCodeFormat format) override {
-        PairingPromptLog::on_display_pairing_code(code, format);
+    void on_pairing_code(std::string_view code, SendspinPairingCodeFormat format) override {
+        PairingPromptLog::on_pairing_code(code, format);
         if (this->reenter_ && !this->reentered_) {
             this->reentered_ = true;
             this->client_->connection_manager_->close_admission();
@@ -3274,6 +3272,160 @@ TEST(ClientLifecycle, StopFromInsideAPairingCallbackDismissesThePromptOnce) {
         if (client.is_started()) {
             client.connection_manager_->close_admission();
             (void) client.protocol_tick();
+        }
+        client.stop();
+    }
+}
+
+/// Logs each pairing callback with text, in the form "<form> <callback> <content>", and the
+/// address of the text it was handed. Overrides neither form itself: ViewPairingForms and
+/// WithDeprecatedPairingForms add them. Main loop only.
+class PairingFormsLog : public SendspinClientListener {
+public:
+    std::vector<std::string> calls;
+    std::vector<const char*> view_text;
+    std::vector<const char*> deprecated_text;
+    /// When set, the first view-form callback calls its stop().
+    SendspinClient* stop_from_view_form{nullptr};
+
+protected:
+    void log_view(const std::string& what, std::string_view text) {
+        this->calls.push_back("view " + what + " " + std::string(text));
+        this->view_text.push_back(text.data());
+        if (SendspinClient* client = std::exchange(this->stop_from_view_form, nullptr)) {
+            client->stop();
+        }
+    }
+    void log_deprecated(const std::string& what, const std::string& text) {
+        this->calls.push_back("deprecated " + what + " " + text);
+        this->deprecated_text.push_back(text.data());
+    }
+};
+
+/// Overrides the view form of each pairing callback with text.
+class ViewPairingForms : public PairingFormsLog {
+public:
+    void on_pairing_attempt(std::string_view server_id) override {
+        this->log_view("attempt", server_id);
+    }
+    void on_paired(std::string_view server_id) override {
+        this->log_view("paired", server_id);
+    }
+    void on_pairing_aborted(std::string_view server_id, SendspinPairAbortReason reason) override {
+        this->log_view("aborted " + std::to_string(static_cast<int>(reason)), server_id);
+    }
+    void on_pairing_code(std::string_view code, SendspinPairingCodeFormat format) override {
+        this->log_view("code " + std::to_string(static_cast<int>(format)), code);
+    }
+};
+
+/// Adds the deprecated form of each pairing callback with text to `Base`.
+template <typename Base>
+class WithDeprecatedPairingForms : public Base {
+public:
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    void on_pairing_started(const std::string& server_id) override {
+        this->log_deprecated("attempt", server_id);
+    }
+    void on_pairing_succeeded(const std::string& server_id) override {
+        this->log_deprecated("paired", server_id);
+    }
+    void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
+        this->log_deprecated("aborted " + std::to_string(static_cast<int>(reason)), server_id);
+    }
+    void on_display_pairing_code(const std::string& code,
+                                 SendspinPairingCodeFormat format) override {
+        this->log_deprecated("code " + std::to_string(static_cast<int>(format)), code);
+    }
+#pragma GCC diagnostic pop
+};
+
+using DeprecatedPairingForms = WithDeprecatedPairingForms<PairingFormsLog>;
+using BothPairingForms = WithDeprecatedPairingForms<ViewPairingForms>;
+
+// Each pairing callback with text, every abort reason and a code in each format, reaches a
+// listener in the forms it overrides: only the view form, only the deprecated std::string form,
+// or both, the view form first with the same content. The view form's text is not the
+// deprecated form's string. A stop() from the first view-form callback ends the delivery there,
+// its deprecated form included. The test thread plays the protocol task, queueing the notes as
+// its handlers do. The server id (43 characters) and the qr_code token (43) are past both
+// standard libraries' inline string capacity, and the digits that follow them shorter, so the
+// deprecated form's string is reassigned, not appended to.
+TEST(ClientLifecycle, PairingCallbacksReachBothForms) {
+    const std::string server_id = "c2VuZHNwaW4tcGFpcmluZy1jYWxsYmFjay1mb3Jtcw0";
+    const std::string token = "SP:14DQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    ASSERT_EQ(server_id.size(), 43U);
+    ASSERT_EQ(token.size(), 43U);
+    const SendspinPairAbortReason reasons[] = {
+        SendspinPairAbortReason::ATTEMPT_TIMEOUT,      SendspinPairAbortReason::CONCURRENT_ATTEMPT,
+        SendspinPairAbortReason::METHOD_NOT_SUPPORTED, SendspinPairAbortReason::PAIRING_CODE_MISMATCH,
+        SendspinPairAbortReason::USER_CANCELLED,       SendspinPairAbortReason::UNKNOWN,
+    };
+
+    // Each callback's description and content, in the order the notes are queued.
+    std::vector<std::string> delivered = {"attempt " + server_id, "paired " + server_id};
+    for (SendspinPairAbortReason reason : reasons) {
+        delivered.push_back("aborted " + std::to_string(static_cast<int>(reason)) + " " +
+                            server_id);
+    }
+    delivered.push_back("code " + std::to_string(static_cast<int>(SendspinPairingCodeFormat::QR_CODE)) +
+                        " " + token);
+    delivered.push_back("code " + std::to_string(static_cast<int>(SendspinPairingCodeFormat::DIGITS)) +
+                        " 042735");
+    const auto in_form = [&delivered](std::initializer_list<const char*> forms) {
+        std::vector<std::string> calls;
+        for (const std::string& call : delivered) {
+            for (const char* form : forms) {
+                calls.push_back(std::string(form) + " " + call);
+            }
+        }
+        return calls;
+    };
+
+    ViewPairingForms view_only;
+    DeprecatedPairingForms deprecated_only;
+    BothPairingForms both;
+    BothPairingForms stopping;
+    struct Row {
+        const char* name;
+        PairingFormsLog& log;
+        bool stop;
+        std::vector<std::string> expected;
+    };
+    const Row rows[] = {
+        {"only the view forms", view_only, false, in_form({"view"})},
+        {"only the deprecated forms", deprecated_only, false, in_form({"deprecated"})},
+        {"both, the view form first", both, false, in_form({"view", "deprecated"})},
+        {"stop() from the first view form", stopping, true, {"view " + delivered.front()}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClient client(make_config(0));
+        client.set_network_provider(&network);
+        client.set_listener(&row.log);
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        if (row.stop) {
+            row.log.stop_from_view_form = &client;
+        }
+
+        client.note_pairing_started(server_id);
+        client.note_pairing_succeeded(server_id);
+        for (SendspinPairAbortReason reason : reasons) {
+            client.note_pairing_failed(server_id, reason);
+        }
+        client.note_display_pairing_code(token, SendspinPairingCodeFormat::QR_CODE);
+        client.note_display_pairing_code("042735", SendspinPairingCodeFormat::DIGITS);
+        client.loop();
+
+        EXPECT_EQ(row.log.calls, row.expected);
+        if (row.log.view_text.size() == row.log.deprecated_text.size()) {
+            for (size_t i = 0; i < row.log.view_text.size(); ++i) {
+                EXPECT_NE(row.log.view_text[i], row.log.deprecated_text[i])
+                    << "the view form viewed the deprecated form's string";
+            }
         }
         client.stop();
     }

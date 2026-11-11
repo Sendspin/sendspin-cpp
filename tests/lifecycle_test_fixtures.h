@@ -56,6 +56,7 @@ extern "C" {
 }
 
 #include <ArduinoJson.h>
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
@@ -148,6 +149,28 @@ inline void pump_for(SendspinClient& client, int duration_ms) {
         client.loop();
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+}
+
+/// The server_id server_information() reports, nullopt for none, after one loop(): the protocol
+/// task hands the main loop a changed server before it moves the connected flag a test waited
+/// on, so that loop() takes it. Expects get_server_information() to carry the same id and name,
+/// so it is for a test whose connections have settled.
+inline std::optional<std::string> refreshed_server_id(SendspinClient& client) {
+    client.loop();
+    const std::optional<ServerInformation> info = client.server_information();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    const std::optional<ServerInformationObject> deprecated = client.get_server_information();
+#pragma GCC diagnostic pop
+    EXPECT_EQ(info.has_value(), deprecated.has_value());
+    if (!info.has_value()) {
+        return std::nullopt;
+    }
+    if (deprecated.has_value()) {
+        EXPECT_EQ(info->server_id, deprecated->server_id);
+        EXPECT_EQ(info->name, deprecated->name);
+    }
+    return std::string(info->server_id);
 }
 
 /// Waits for pred() without pumping the client: for observations on a fake peer after the client

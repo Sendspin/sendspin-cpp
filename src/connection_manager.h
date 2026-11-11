@@ -196,6 +196,13 @@ struct ServerPairingMessage {
     std::array<uint8_t, 64> server_kc{};  ///< Server CPace confirmation tag
 };
 
+/// @brief The primary connection's server identity, held inline so the publish and the main
+/// loop's copy (SendspinClient::server_information()) copy it without a heap allocation
+struct PublishedServer {
+    IdText server_id{};
+    ServerName name{};
+};
+
 /// @brief Pairing-UI display flags snapshotted from a connection's PairingSession.
 ///
 /// conn->pairing_session().code_emitted / .window_shown are the sole record of whether a pairing
@@ -267,7 +274,7 @@ public:
     ///   which is keyed on no remaining connection owning one.
     /// - clock() and the server information follow primary() (the player's owner, else the first
     ///   admitted), so a role owned by another connection converts with the wrong clock.
-    /// - group/update, leave(), get_server_information() and is_paired() are singular: they follow
+    /// - group/update, leave(), the server information and is_paired() are singular: they follow
     ///   primary().
     /// - The artwork binary gate (SendspinClient::process_binary_message()) passes any admitted
     ///   connection while none owns the role.
@@ -391,9 +398,8 @@ public:
 
     /// @brief Returns the primary admitted connection's server information, or nullopt when none
     /// is admitted. Any thread: copies the inline id and name out of a slot written at admission
-    /// and cleared on the drop, behind the leaf published_mutex_, and builds the strings on the
-    /// caller's thread.
-    std::optional<ServerInformationObject> server_information() const;
+    /// and cleared on the drop, behind the leaf published_mutex_.
+    std::optional<PublishedServer> server_information() const;
 
     // ========================================
     // Transport threads
@@ -484,8 +490,7 @@ public:
     void on_pairing_message(SendspinConnection* conn, const ServerPairingMessage& message);
 
     /// @brief Records a completed pairing: the server/pair-finalize handler stored the long-term
-    /// record for `conn`. Closes the pairing window the attempt ran under and queues
-    /// on_pairing_succeeded.
+    /// record for `conn`. Closes the pairing window the attempt ran under and queues on_paired.
     void on_pairing_succeeded(SendspinConnection* conn);
 
     /// @brief Drops a lost connection (the transport closed with every message it sent processed,
@@ -824,7 +829,7 @@ private:
     ///
     /// Captures the code-emission / pairing-window flags before clear_pairing_state() resets
     /// them, optionally sends a wire pair/abort, clears the pairing state, optionally drops the
-    /// connection, then queues on_pairing_failed and dismisses any pairing UI left showing (via
+    /// connection, then queues on_pairing_aborted and dismisses any pairing UI left showing (via
     /// SendspinClient::note_pairing_ui_dismissals()). When `drop_action` is not KEEP_OPEN,
     /// drop_connection() -> the admitted-slot cleanup runs before the note_* calls, matching the
     /// ordering every call site needs (the cleanup wipes the queued pairing notes). `conn` must be
@@ -834,7 +839,7 @@ private:
     ///        (best-effort). Leave nullopt when the abort was received from the peer, or when
     ///        pairing.md "Protocol Errors" forbids sending one.
     /// @param drop_action        Disposition for the connection; see PairingDropAction.
-    /// @param public_reason      Reason delivered to the application via on_pairing_failed.
+    /// @param public_reason      Reason delivered to the application via on_pairing_aborted.
     /// @param goodbye_reason     Read only when drop_action is CLOSE_WITH_GOODBYE, so callers for
     ///        the other actions omit it.
     void abort_pairing_attempt(
@@ -1008,13 +1013,6 @@ private:
 
     /// @brief Each admitted slot's clock (admitted_[slot]), nullopt for a free slot
     using ClockSlots = std::array<std::optional<TimeTransform>, MAX_ADMITTED>;
-
-    /// @brief The primary connection's server identity, held inline so the publish copies it
-    /// without a heap allocation
-    struct PublishedServer {
-        IdText server_id{};
-        ServerName name{};
-    };
 
     /// @brief What other threads read of the admitted connections
     struct PublishedState {

@@ -40,8 +40,19 @@ enum class SendspinGoodbyeReason : uint8_t {
     UNPAIRED,            // Server unpaired this device via server/unpair
 };
 
-/// @brief Server identity fields received in server/hello messages
-struct ServerInformationObject {
+/// @brief Server identity fields received in server/hello messages, returned by
+/// SendspinClient::server_information(), whose views' lifetime it documents
+struct ServerInformation {
+    std::string_view server_id{};
+    /// At most 64 bytes in UTF-8, cut at a character boundary
+    std::string_view name{};
+};
+
+/// @brief ServerInformation with each field copied into a std::string
+/// @deprecated Use ServerInformation, returned by SendspinClient::server_information(); removed
+/// in v0.11.0.
+struct [[deprecated("use ServerInformation and server_information(); removed in "
+                    "v0.11.0")]] ServerInformationObject {
     std::string server_id{};
     /// At most 64 bytes in UTF-8, cut at a character boundary
     std::string name{};
@@ -94,7 +105,7 @@ enum class MemoryLocation : uint8_t {
 /// @brief Reason a pairing exchange was aborted.
 ///
 /// Mirrors the wire values in the Sendspin pairing protocol.
-/// Carried by SendspinClientListener::on_pairing_failed().
+/// Carried by SendspinClientListener::on_pairing_aborted().
 enum class SendspinPairAbortReason : uint8_t {
     ATTEMPT_TIMEOUT,        // Server did not complete the exchange in time.
     CONCURRENT_ATTEMPT,     // Another pairing attempt is already in progress.

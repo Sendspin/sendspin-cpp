@@ -65,6 +65,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -545,26 +546,29 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, ">>> High-performance networking released\n");
         }
 
-        void on_pairing_started(const std::string& server_id) override {
-            fprintf(stderr, ">>> Pairing started with server: %s\n", server_id.c_str());
+        void on_pairing_attempt(std::string_view server_id) override {
+            fprintf(stderr, ">>> Pairing started with server: %.*s\n",
+                    static_cast<int>(server_id.size()), server_id.data());
         }
 
-        void on_pairing_succeeded(const std::string& server_id) override {
-            fprintf(stderr, ">>> Pairing succeeded with server: %s\n", server_id.c_str());
+        void on_paired(std::string_view server_id) override {
+            fprintf(stderr, ">>> Pairing succeeded with server: %.*s\n",
+                    static_cast<int>(server_id.size()), server_id.data());
         }
 
-        void on_pairing_failed(const std::string& server_id,
-                               SendspinPairAbortReason reason) override {
-            fprintf(stderr, ">>> Pairing failed with server: %s (reason %d)\n", server_id.c_str(),
-                    static_cast<int>(reason));
+        void on_pairing_aborted(std::string_view server_id,
+                                SendspinPairAbortReason reason) override {
+            fprintf(stderr, ">>> Pairing failed with server: %.*s (reason %d)\n",
+                    static_cast<int>(server_id.size()), server_id.data(), static_cast<int>(reason));
         }
 
-        void on_display_pairing_code(const std::string& code,
-                                     SendspinPairingCodeFormat /*format*/) override {
+        void on_pairing_code(std::string_view code, SendspinPairingCodeFormat /*format*/) override {
             // Only digits are offered. pairing.md "Pairing Code Presentation" asks for a 3-3
             // grouping; the separator is presentation only and never part of the code.
-            fprintf(stderr, "\n>>> Pairing code: %s-%s\n", code.substr(0, 3).c_str(),
-                    code.substr(3).c_str());
+            const std::string_view first = code.substr(0, 3);
+            const std::string_view second = code.substr(3);
+            fprintf(stderr, "\n>>> Pairing code: %.*s-%.*s\n", static_cast<int>(first.size()),
+                    first.data(), static_cast<int>(second.size()), second.data());
             fprintf(stderr, "    Enter this code on the server to finish pairing.\n\n");
         }
 
@@ -602,9 +606,9 @@ int main(int argc, char* argv[]) {
     // The pairing token carries the client_id and the Pairing PSK together. Paste it into a
     // server that asks for one to pair via the pairing_psk method; pairing with a code instead
     // needs nothing from here (the code is printed when the server starts that flow).
-    auto token = client.pairing_token();
+    const auto token = client.client_pairing_token();
     if (token.has_value()) {
-        fprintf(stderr, "Pairing token: %s\n", token->c_str());
+        fprintf(stderr, "Pairing token: %.*s\n", static_cast<int>(token->size()), token->data());
     }
 
 #ifdef SENDSPIN_HAS_MDNS

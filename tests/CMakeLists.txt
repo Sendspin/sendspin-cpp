@@ -161,7 +161,11 @@ endif()
 # note_display_pairing_code() and note_clear_pairing_code()), since no public call shows a prompt,
 # and from inside its listener runs the final tick stop() would join (close_admission(),
 # protocol_tick()), so the shutdown pass takes the prompt flags it set on its stand-in's
-# pairing_session() (window_shown and code_emitted). The stream-events table drives the player's
+# pairing_session() (window_shown and code_emitted). The pairing forms table queues every
+# text-carrying note the same way (note_pairing_started(), note_pairing_succeeded(),
+# note_pairing_failed() and note_display_pairing_code()) with the protocol task stopped
+# (protocol_task_->stop()), since no public call produces each abort reason and code format on
+# demand. The stream-events table drives the player's
 # handle_stream_start() and handle_stream_end() as the task would, and stages one interleaving by
 # waiting on the sync task's item list and the player's sync-idle topic bit, and its clear row calls
 # handle_stream_clear() the same way. The next-stream header table plays the sync task itself on
@@ -252,7 +256,9 @@ set_source_files_properties(test_inbound_ring.cpp PROPERTIES COMPILE_OPTIONS -fn
 # test_record_store.cpp reads records_ directly and calls the store's private locked-context
 # lookups (record_by_psk_id, record_by_server_id); the store deliberately exposes no copying
 # accessor for them, since nothing in the library needs one. It also reads the address of
-# records_'s block, the only sign of whether a change after construction reallocated it.
+# records_'s block, the only sign of whether a change after construction reallocated it. The
+# pairing token test reads SendspinClient::identity_ for the client's public key, so it builds the
+# expected token with the library's encoder rather than through the getters it checks.
 set_source_files_properties(test_record_store.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and

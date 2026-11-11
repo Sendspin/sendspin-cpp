@@ -31,6 +31,7 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "crypto/pairing_token.h"
 #include "fake_persistence.h"
 #include "log_capture.h"
 #include "file_persistence_provider.h"
@@ -1887,8 +1888,24 @@ TEST(SendspinClientStart, RejectsMalformedApplicationRoles) {
     }
 }
 
+namespace {
+
+/// The characters of a token a getter returned, nullopt for none.
+std::optional<std::string> token_text(
+    const std::optional<std::array<char, SendspinClient::PAIRING_TOKEN_LENGTH>>& token) {
+    if (!token.has_value()) {
+        return std::nullopt;
+    }
+    return std::string(token->data(), token->size());
+}
+
+}  // namespace
+
 // start() hands SendspinClientConfig::pairing_psk to the store, so the pairing token the operator
-// is shown carries the configured key rather than the one the provider holds.
+// is shown carries the configured key rather than the one the provider holds. Each getter returns
+// the token the library's builder makes from the client's public key and the PSK the getter
+// names, and the deprecated std::string getters the same characters; before start() every one is
+// nullopt.
 TEST(SendspinClientIdentity, PairingTokenCarriesTheConfiguredPairingPsk) {
     const SendspinPairingPsk stored = make_pairing_psk();
     const std::array<uint8_t, NOISE_PSK_SIZE> configured = make_random_psk();
@@ -1905,11 +1922,25 @@ TEST(SendspinClientIdentity, PairingTokenCarriesTheConfiguredPairingPsk) {
         }
         SendspinClient client(std::move(config));
         client.set_persistence_provider(&provider);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        EXPECT_FALSE(client.client_pairing_token().has_value());
+        EXPECT_FALSE(client.pairing_token_for(configured).has_value());
+        EXPECT_FALSE(client.pairing_token().has_value());
+        EXPECT_FALSE(client.format_pairing_token(configured).has_value());
         ASSERT_TRUE(client.start());
 
-        const auto expected = client.format_pairing_token(configure ? configured : stored.psk);
-        ASSERT_TRUE(expected.has_value());
-        EXPECT_EQ(client.pairing_token(), expected);
+        const auto& client_key = client.identity_->public_bytes;
+        const std::string stored_token(format_pairing_token(client_key, stored.psk).view());
+        const std::string configured_token(format_pairing_token(client_key, configured).view());
+        const std::string& in_use = configure ? configured_token : stored_token;
+        EXPECT_EQ(token_text(client.client_pairing_token()), in_use);
+        EXPECT_EQ(client.pairing_token(), in_use);
+        EXPECT_EQ(token_text(client.pairing_token_for(stored.psk)), stored_token);
+        EXPECT_EQ(client.format_pairing_token(stored.psk), stored_token);
+        EXPECT_EQ(token_text(client.pairing_token_for(configured)), configured_token);
+        EXPECT_EQ(client.format_pairing_token(configured), configured_token);
+#pragma GCC diagnostic pop
         client.stop();
     }
 }

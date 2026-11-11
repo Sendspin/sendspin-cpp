@@ -484,7 +484,7 @@ public:
         SendspinPairingCodeFormat format{SendspinPairingCodeFormat::DIGITS};
         PairingStep step{PairingStep::IDLE};
         uint8_t prs_size{0};       ///< Bytes of `prs` that hold the code; 0 until set_prs().
-        bool code_emitted{false};  ///< True once a code was surfaced via on_display_pairing_code.
+        bool code_emitted{false};  ///< True once a code was surfaced via on_pairing_code.
         bool window_shown{false};  ///< True once on_open_pairing_window was surfaced.
 
         PairingSession() = default;
