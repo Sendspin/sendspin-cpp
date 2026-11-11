@@ -745,7 +745,7 @@ int main(int argc, char* argv[]) {
         TuiState& state;
         explicit TuiMetadataListener(TuiState& s) : state(s) {}
 
-        void on_metadata(const ServerMetadataStateObject& md) override {
+        void on_track_metadata(const TrackMetadata& md) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.title = md.title.value_or("");
             state.artist = md.artist.value_or("");
@@ -758,13 +758,13 @@ int main(int argc, char* argv[]) {
         TuiState& state;
         explicit TuiClientListener(TuiState& s) : state(s) {}
 
-        void on_group_update(const GroupUpdateObject& group) override {
+        void on_group_state(const GroupState& changes) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            if (group.playback_state.has_value()) {
-                state.playback_state = *group.playback_state;
+            if (changes.playback_state.has_value()) {
+                state.playback_state = *changes.playback_state;
             }
-            if (group.group_name.has_value()) {
-                state.group_name = *group.group_name;
+            if (changes.group_name.has_value()) {
+                state.group_name = *changes.group_name;
             }
         }
 

@@ -110,12 +110,14 @@ struct MetadataRole::Impl : RoleTeardown {
     void drain_events();
     /// Whether a state's server-clock deadline has passed on the synchronized client clock.
     bool state_is_due(int64_t timestamp) const;
-    /// @brief Fills the public state from the current state and fires on_metadata(). Main loop,
-    /// with no lock held.
+    /// @brief Hands the current state to on_track_metadata(), then to the deprecated
+    /// on_metadata() unless the first call re-entered teardown. Main loop, with no lock held.
     void apply_current_state();
-    /// @brief Fills the public state from `state`, its text from the block it names; an empty
-    /// state clears every field, keeping the text storage. Main loop.
-    void fill_public_state(const MetadataStateBuffer& state);
+    /// @brief The public view of the current state, its text viewing the current block. Main loop.
+    TrackMetadata track_metadata() const;
+    /// @brief Fills the deprecated public state from the current state, keeping the text storage.
+    /// Main loop.
+    void fill_deprecated_state();
     /// @brief The text `state` carries for `field`, viewing its block; nullopt when it carries
     /// none
     std::optional<std::string_view> text_of(const MetadataStateBuffer& state,
@@ -131,8 +133,9 @@ struct MetadataRole::Impl : RoleTeardown {
     /// (catch_up_teardown()).
     void cleanup();
 
-    /// @brief The main-loop teardown half: resets the state only the main loop touches and fires
-    /// on_metadata_clear(). Main loop only, through catch_up_teardown().
+    /// @brief The main-loop teardown half: empties the current state, keeping its block, and the
+    /// deprecated public state, and fires on_metadata_clear(). Main loop only, through
+    /// catch_up_teardown().
     void complete_teardown();
 
     // ========================================
@@ -153,14 +156,19 @@ struct MetadataRole::Impl : RoleTeardown {
     /// METADATA_TEXT_BLOCKS blocks of layout.block_bytes, allocated by start(); empty when no
     /// field is kept.
     PlatformBuffer text_blocks;
-    /// The applied state, the one on_metadata() is handed. Main loop only.
-    ServerMetadataStateObject metadata{};
-    /// Storage for the public state's text fields, reserved for each kept field's cap. Main loop
-    /// only.
-    std::array<ReservedText, METADATA_FIELD_COUNT> metadata_text;
-    /// The state the last delivery handed over, whose text the public state is filled from. Main
-    /// loop only; the slot's commit swaps it, under the Inbox mutex, for the state it delivers.
+    /// The state the last delivery handed over, which the listener and the progress getters read.
+    /// Main loop only; the slot's commit swaps it, under the Inbox mutex, for the state it
+    /// delivers.
     MetadataStateBuffer current{.block = CURRENT_FIRST_BLOCK};
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    /// The deprecated public state on_metadata() is handed, filled from the current state. Main
+    /// loop only.
+    ServerMetadataStateObject metadata{};
+#pragma GCC diagnostic pop
+    /// Storage for the deprecated public state's text fields, reserved for each kept field's cap.
+    /// Main loop only.
+    std::array<ReservedText, METADATA_FIELD_COUNT> metadata_text;
 
     // Pointer fields
     SendspinClient* client;

@@ -298,7 +298,7 @@ This method is thread-safe and is expected to be called from an audio callback t
 
 ```cpp
 struct MyMetadataListener : MetadataRoleListener {
-    void on_metadata(const ServerMetadataStateObject& md) override {
+    void on_track_metadata(const TrackMetadata& md) override {
         // Overwrite display state on every call so server clears (nullopt) propagate.
         display_title(md.title.value_or(""));
         display_artist(md.artist.value_or(""));
@@ -312,25 +312,25 @@ struct MyMetadataListener : MetadataRoleListener {
 };
 ```
 
-The `ServerMetadataStateObject` contains these fields (all optional except `timestamp`):
+The `TrackMetadata` contains these fields (all optional except `timestamp`):
 
 | Field | Type | Description |
 |---|---|---|
 | `timestamp` | `int64_t` | Server clock µs at which this metadata becomes valid; delivery is held until the synced client clock reaches it |
-| `title` | `std::optional<std::string>` | Track title, at most 255 bytes |
-| `artist` | `std::optional<std::string>` | Track artist, at most 255 bytes |
-| `album_artist` | `std::optional<std::string>` | Album artist, at most 255 bytes |
-| `album` | `std::optional<std::string>` | Album name, at most 255 bytes |
-| `artwork_url` | `std::optional<std::string>` | Artwork URL, at most 2048 bytes |
+| `title` | `std::optional<std::string_view>` | Track title, at most 255 bytes |
+| `artist` | `std::optional<std::string_view>` | Track artist, at most 255 bytes |
+| `album_artist` | `std::optional<std::string_view>` | Album artist, at most 255 bytes |
+| `album` | `std::optional<std::string_view>` | Album name, at most 255 bytes |
+| `artwork_url` | `std::optional<std::string_view>` | Artwork URL, at most 2048 bytes |
 | `year` | `std::optional<uint16_t>` | Release year |
 | `track` | `std::optional<uint16_t>` | Track number |
 | `progress` | `std::optional<MetadataProgressObject>` | Playback progress (see below) |
 
 `MetadataProgressObject` contains `track_progress` (ms), `track_duration` (ms), and `playback_speed`.
 
-The text fields are bounded in UTF-8 bytes as roles/metadata/v1.md "server/state metadata object" caps them. A server that sends a longer one has it cut to the cap at a UTF-8 character boundary, with one warning per connection. A text field turned off in `MetadataRoleConfig` is always `nullopt`.
+The text views are valid for the duration of the callback: copy a field the listener needs after it returns. The text fields are bounded in UTF-8 bytes as roles/metadata/v1.md "server/state metadata object" caps them. A server that sends a longer one has it cut to the cap at a UTF-8 character boundary, with one warning per connection. A text field turned off in `MetadataRoleConfig` is always `nullopt`.
 
-Every `on_metadata()` call carries the full state of the track being described, not a set of changes: a field the server left out of that update is `nullopt`, whatever an earlier update reported for it, and a state without `progress` means there is no position to show. Listeners that mirror metadata into display state should therefore overwrite every displayed value on each call (using e.g. `value_or("")`) rather than merging into what they already show.
+Every `on_track_metadata()` call carries the full state of the track being described, not a set of changes: a field the server left out of that update is `nullopt`, whatever an earlier update reported for it, and a state without `progress` means there is no position to show. Listeners that mirror metadata into display state should therefore overwrite every displayed value on each call (using e.g. `value_or("")`) rather than merging into what they already show.
 
 You can also poll track progress at any time:
 
@@ -685,13 +685,15 @@ Receives client-level events. All callbacks fire on the main loop thread.
 
 ```cpp
 struct MyClientListener : SendspinClientListener {
-    // Called when group state changes (playback state, group name, etc.). An empty group_id
-    // means the group was cleared. A non-empty server group_id that is not 43 base64url
+    // Called when the server's group/update messages are applied, with only the fields changed
+    // by those since the last call (playback state, group id, group name); client.group_state()
+    // returns the merged state. The views are valid for the duration of the callback. An empty
+    // group_id means the group was cleared. A non-empty server group_id that is not 43 base64url
     // characters arrives as base64url of its SHA-256, which still names one group; a future
     // release closes the connection on such an id instead.
-    void on_group_update(const GroupUpdateObject& group) override {
-        if (group.playback_state) update_playback_indicator(*group.playback_state);
-        if (group.group_name) update_group_display(*group.group_name);
+    void on_group_state(const GroupState& changes) override {
+        if (changes.playback_state) update_playback_indicator(*changes.playback_state);
+        if (changes.group_name) update_group_display(*changes.group_name);
     }
 
     // Called after a time sync burst completes.
@@ -1163,7 +1165,8 @@ The client and roles expose query methods for polling state in your main loop or
 bool paired = client.is_paired();              // Active connection is a paired session (read first)
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
-const GroupUpdateObject& group = client.get_group_state();   // Group id, name, playback state (all optional)
+GroupState group = client.group_state();       // Group id, name, playback state (all optional);
+                                               // its views hold until control returns to loop(), or stop()
 
 // Player state
 uint8_t vol = player.get_volume();
@@ -1181,6 +1184,20 @@ uint32_t duration = metadata.get_track_duration_ms();
 // Timestamp conversion
 int64_t client_ts = client.get_client_time(server_timestamp);
 ```
+
+## Deprecated String API
+
+The metadata and group text is now handed over as `std::string_view` into storage the library keeps, rather than copied into `std::string`. The `std::string` forms are deprecated in v0.10.0 and removed in v0.11.0; naming one of them draws a `-Wdeprecated-declarations` warning.
+
+| Deprecated | Replacement |
+|---|---|
+| `ServerMetadataStateObject` | `TrackMetadata` |
+| `MetadataRoleListener::on_metadata()` | `MetadataRoleListener::on_track_metadata()` |
+| `GroupUpdateObject` | `GroupState` |
+| `SendspinClientListener::on_group_update()` | `SendspinClientListener::on_group_state()` |
+| `SendspinClient::get_group_state()` | `SendspinClient::group_state()`, which returns by value |
+
+The fields keep their names and meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` returns until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. A `stop()` from the new callback ends the delivery there.
 
 ## Thread Safety Summary
 
@@ -1438,7 +1455,7 @@ Configuration passed to `client.add_metadata()`, which defaults it.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `title`, `artist`, `album_artist`, `album`, `artwork_url` | `bool` | `true` | Whether to keep that text field of `ServerMetadataStateObject`. A field set `false` is dropped as each state is parsed and reaches the listener as `nullopt`; `year`, `track` and `progress` are always kept. Each kept field costs its cap (255 bytes, 2048 for `artwork_url`) in the public state's string, reserved by `add_metadata()` through `operator new` (internal RAM on ESPHome), and in each of the three text blocks that carry states from the protocol task to the main loop, allocated by `start()`. With every field kept that is 3,068 bytes of string capacity and 9,204 bytes of blocks; with `{.artwork_url = false}`, 1,020 and 3,060. `start()` fails, logged, when the blocks cannot be allocated. |
+| `title`, `artist`, `album_artist`, `album`, `artwork_url` | `bool` | `true` | Whether to keep that text field of `TrackMetadata`. A field set `false` is dropped as each state is parsed and reaches the listener as `nullopt`; `year`, `track` and `progress` are always kept. Each kept field costs its cap (255 bytes, 2048 for `artwork_url`) in the string of the deprecated `ServerMetadataStateObject`, reserved by `add_metadata()` through `operator new` (internal RAM on ESPHome), and in each of the three text blocks that carry states from the protocol task to the main loop, allocated by `start()`. With every field kept that is 3,068 bytes of string capacity and 9,204 bytes of blocks; with `{.artwork_url = false}`, 1,020 and 3,060. `start()` fails, logged, when the blocks cannot be allocated. |
 | `buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement preference for the text blocks. `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. ESP-IDF only; ignored on host. |
 
 ---

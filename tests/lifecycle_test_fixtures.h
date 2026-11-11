@@ -1248,7 +1248,7 @@ public:
 /// Records what each metadata update carried, and counts the clears behind a teardown.
 class RecordingMetadataListener : public MetadataRoleListener {
 public:
-    void on_metadata(const ServerMetadataStateObject& metadata) override {
+    void on_track_metadata(const TrackMetadata& metadata) override {
         this->last_title = metadata.title.value_or("");
         this->last_artist = metadata.artist.value_or("");
         this->last_had_progress = metadata.progress.has_value();

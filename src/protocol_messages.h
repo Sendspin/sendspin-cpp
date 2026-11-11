@@ -766,8 +766,8 @@ constexpr MetadataTextLayout metadata_text_layout(EnumSet<MetadataField> kept) {
     return layout;
 }
 
-/// @brief A server/state metadata object's state: ServerMetadataStateObject with its text in a
-/// block laid out by a MetadataTextLayout; the main loop copies the text into the public object
+/// @brief A server/state metadata object's state: TrackMetadata with its text in a block laid out
+/// by a MetadataTextLayout, which the public object views
 struct MetadataStatePayload {
     int64_t timestamp{};
     std::optional<uint16_t> year{};
@@ -1184,9 +1184,9 @@ struct ServerActivateMessage {
     std::optional<SendspinPairingCodeFormat> pairing_format;
 };
 
-/// @brief A parsed group/update delta: GroupUpdateObject with its text held inline, which the
-/// main loop copies into the public object. A field the message does not carry is nullopt, and an
-/// empty text clears the field (the wire's null).
+/// @brief A parsed group/update delta: GroupState with its text held inline, which the public
+/// object views. A field the message does not carry is nullopt, and an empty text clears the field
+/// (the wire's null).
 struct GroupUpdatePayload {
     std::optional<SendspinPlaybackState> playback_state{};
     std::optional<IdText> group_id{};

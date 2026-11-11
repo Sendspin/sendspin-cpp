@@ -62,6 +62,11 @@ public:
         return true;
     }
 
+    /// @brief The latest teardown generation whose main-loop half has run
+    uint32_t completed() const {
+        return this->completed_;
+    }
+
 private:
     /// The latest teardown generation whose main-loop half has run.
     uint32_t completed_{0};

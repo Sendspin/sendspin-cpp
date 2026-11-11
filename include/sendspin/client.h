@@ -57,17 +57,23 @@ class SourceRole;
 class VisualizerRole;
 #endif
 
-// Forward declarations for listener types
-struct GroupUpdateObject;
-
 /// @brief Listener for SendspinClient events
 /// All methods fire on the main loop thread
 class SendspinClientListener {
 public:
     virtual ~SendspinClientListener() = default;
 
-    /// @brief Called when the group state is updated by the server
-    virtual void on_group_update(const GroupUpdateObject& /*group*/) {}
+    /// @brief Called when the server's group/update messages are applied, with the fields changed
+    /// by those since the last call; SendspinClient::group_state() returns the merged state
+    ///
+    /// The library calls this and then the deprecated on_group_update() with the same changes:
+    /// override one of them. A listener overriding both gets both, this one first.
+    virtual void on_group_state(const GroupState& /*changes*/) {}
+
+    /// @brief Called after on_group_state() with the same changes
+    /// @deprecated Override on_group_state(); removed in v0.11.0.
+    [[deprecated("override on_group_state(); removed in v0.11.0")]] virtual void on_group_update(
+        const GroupUpdateObject& /*group*/) {}
 
     /// @brief Called after a time sync burst completes with the Kalman filter error
     virtual void on_time_sync_updated(float /*error*/) {}
@@ -593,10 +599,16 @@ public:
     /// @return Equivalent client-side timestamp in microseconds, or 0 with no active connection
     int64_t get_client_time(int64_t server_time) const;
 
-    /// @brief Returns the current group state; fields are optional and may be unset
-    const GroupUpdateObject& get_group_state() const {
-        return this->group_state_;
-    }
+    /// @brief Returns the group state merged from every group/update applied since start(); a
+    /// field has no value until an update sets it. Main loop only. The views are valid until
+    /// control next returns to loop() (from inside a callback: until the callback returns) or
+    /// until stop().
+    GroupState group_state() const;
+
+    /// @brief Returns group_state() with each text field copied into a std::string. Main loop only.
+    /// @deprecated Use group_state(); removed in v0.11.0.
+    [[deprecated("use group_state(); removed in v0.11.0")]] const GroupUpdateObject&
+    get_group_state() const;
 
     // ========================================
     // State updates
@@ -1011,7 +1023,6 @@ private:
 
     // Struct fields
     SendspinClientConfig config_;
-    GroupUpdateObject group_state_{};
 
     // String fields
     std::string client_id_;  ///< Derived from the static keypair: base64url(public_key).

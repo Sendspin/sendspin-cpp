@@ -422,32 +422,61 @@ void pump_while_not(SendspinClient& client, Pred pred) {
 
 /// Counts the completed time bursts the main loop reports. on_time_sync_updated() comes only after
 /// a burst's last reply and its completion have run on the protocol task, so the count bounds a
-/// burst on the client's side. Main loop (the test thread) only.
+/// burst on the client's side. Also records, without allocating, the size of the group name each
+/// group listener form was last handed, and counts the updates. Main loop (the test thread) only.
 class BurstCountingListener : public SendspinClientListener {
 public:
     void on_time_sync_updated(float /*error*/) override {
         ++this->bursts;
     }
+    void on_group_state(const GroupState& changes) override {
+        this->view_name_size = changes.group_name.has_value() ? changes.group_name->size() : 0;
+        ++this->group_updates;
+    }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    void on_group_update(const GroupUpdateObject& group) override {
+        this->string_name_size = group.group_name.has_value() ? group.group_name->size() : 0;
+    }
+#pragma GCC diagnostic pop
 
     int bursts{0};
+    int group_updates{0};
+    size_t view_name_size{0};
+    size_t string_name_size{0};
 };
 
-/// Records what each metadata state carried without allocating: its text fields' sizes and
-/// whether it carried an artist. Main loop (the test thread) only.
+/// Records what each metadata state carried without allocating, in both listener forms: its text
+/// fields' sizes and whether it carried an artist. Main loop (the test thread) only.
 class TextSizeMetadataListener : public MetadataRoleListener {
 public:
-    void on_metadata(const ServerMetadataStateObject& metadata) override {
-        this->title_size = metadata.title.has_value() ? metadata.title->size() : 0;
-        this->artwork_url_size =
-            metadata.artwork_url.has_value() ? metadata.artwork_url->size() : 0;
-        this->has_artist = metadata.artist.has_value();
+    struct Sizes {
+        size_t title_size{0};
+        size_t artwork_url_size{0};
+        bool has_artist{false};
+        bool operator==(const Sizes&) const = default;
+    };
+
+    void on_track_metadata(const TrackMetadata& metadata) override {
+        this->sizes = {
+            .title_size = metadata.title.has_value() ? metadata.title->size() : 0,
+            .artwork_url_size = metadata.artwork_url.has_value() ? metadata.artwork_url->size() : 0,
+            .has_artist = metadata.artist.has_value()};
         ++this->updates;
     }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    void on_metadata(const ServerMetadataStateObject& metadata) override {
+        this->deprecated_sizes = {
+            .title_size = metadata.title.has_value() ? metadata.title->size() : 0,
+            .artwork_url_size = metadata.artwork_url.has_value() ? metadata.artwork_url->size() : 0,
+            .has_artist = metadata.artist.has_value()};
+    }
+#pragma GCC diagnostic pop
 
     int updates{0};
-    size_t title_size{0};
-    size_t artwork_url_size{0};
-    bool has_artist{false};
+    Sizes sizes;
+    Sizes deprecated_sizes;
 };
 
 /// Closes the open window in on_stream_start() when asked to. The main loop calls it before it
@@ -564,9 +593,10 @@ constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 // stream/clear that name their roles, then the sync task's first FLAC codec header, then a FLAC
 // stream/start the player takes, then a stream/start whose player section the connection, no
 // longer owning the player, does not take.
-// The roles' public command and type lists, the metadata state's texts and the client's group
-// texts are reserved when they are built, so even the first fill on the main loop allocates
-// nothing.
+// The roles' public command and type lists and the strings of the deprecated metadata and group
+// objects are reserved when they are built, so even the first fill on the main loop allocates
+// nothing; the metadata and group listeners override both forms, so each window counts the views
+// and the strings.
 TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Each string but the MAC address is longer than libc++'s 22-character inline capacity, so the
     // host counts every copy libstdc++ (15 characters) makes of a realistic one.
@@ -665,7 +695,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // before the next is sent.
     const std::string_view normalized_id = "FjYvVmOHs89abpL7Cphsdsog6zoMEsvfvQspUB4MGN8";
     const std::string_view conforming_id = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN-_0";
-    const GroupUpdateObject& group = client.get_group_state();
+    const std::string_view last_name = "Allocation Test Upstairs Bedroom Group";
+    const int group_updates_before = burst_listener.group_updates;
     open_window();
     {
         TestOwned test_owned;
@@ -674,23 +705,25 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
             R"("group_id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301",)"
             R"("group_name":"Allocation Test Kitchen and Living Room"}})"));
     }
-    pump_while_not(client, [&] { return group.group_id == normalized_id; });
+    pump_while_not(client, [&] { return client.group_state().group_id == normalized_id; });
     {
         TestOwned test_owned;
         ASSERT_TRUE(server->send_app_json(
             R"({"type":"group/update","payload":{"group_id":")" + std::string(conforming_id) +
             R"("}})"));
     }
-    pump_while_not(client, [&] { return group.group_id == conforming_id; });
+    pump_while_not(client, [&] { return client.group_state().group_id == conforming_id; });
     {
         TestOwned test_owned;
         ASSERT_TRUE(server->send_app_json(
             R"({"type":"group/update","payload":{"group_id":")" + std::string(conforming_id) +
             R"(","group_name":"Allocation Test Upstairs Bedroom Group"}})"));
     }
-    pump_while_not(client,
-                   [&] { return group.group_name == "Allocation Test Upstairs Bedroom Group"; });
+    pump_while_not(client, [&] { return client.group_state().group_name == last_name; });
     expect_library_allocations(close_window(), "group/update", GROUP_UPDATE_ALLOCATIONS);
+    EXPECT_EQ(burst_listener.group_updates - group_updates_before, 3);
+    EXPECT_EQ(burst_listener.view_name_size, last_name.size());
+    EXPECT_EQ(burst_listener.string_name_size, last_name.size());
 
     // A first state carrying every text field, its title over the cap, then a second without an
     // artist, then one scheduled a little ahead, which normally waits in the role's slot as its
@@ -715,16 +748,18 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     pump_while_not(client, [&] { return metadata_listener.updates == 1; });
     {
         TestOwned test_owned;
-        EXPECT_EQ(metadata_listener.title_size, MAX_METADATA_TEXT_BYTES);
-        EXPECT_EQ(metadata_listener.artwork_url_size, url.size());
-        EXPECT_TRUE(metadata_listener.has_artist);
+        EXPECT_EQ(metadata_listener.sizes.title_size, MAX_METADATA_TEXT_BYTES);
+        EXPECT_EQ(metadata_listener.sizes.artwork_url_size, url.size());
+        EXPECT_TRUE(metadata_listener.sizes.has_artist);
+        EXPECT_TRUE(metadata_listener.deprecated_sizes == metadata_listener.sizes);
         ASSERT_TRUE(server->send_app_json(
             metadata_state(2, R"(,"title":"Allocation Test Second Track Title")" + artwork_url)));
     }
     pump_while_not(client, [&] { return metadata_listener.updates == 2; });
     {
         TestOwned test_owned;
-        EXPECT_FALSE(metadata_listener.has_artist) << "the second state carried no artist";
+        EXPECT_FALSE(metadata_listener.sizes.has_artist) << "the second state carried no artist";
+        EXPECT_TRUE(metadata_listener.deprecated_sizes == metadata_listener.sizes);
         ASSERT_TRUE(server->send_app_json(
             metadata_state(platform_time_us() + 50 * static_cast<int64_t>(US_PER_MS),
                            R"(,"title":"Allocation Test Scheduled Track Title")")));
@@ -737,7 +772,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     pump_while_not(client, [&] { return metadata_listener.updates == 4; });
     expect_library_allocations(close_window(), "metadata server/state",
                                METADATA_STATE_ALLOCATIONS);
-    EXPECT_EQ(metadata_listener.title_size, 0U) << "the last state cleared the title";
+    EXPECT_EQ(metadata_listener.sizes.title_size, 0U) << "the last state cleared the title";
+    EXPECT_TRUE(metadata_listener.deprecated_sizes == metadata_listener.sizes);
 
     const int starts_before_streams = visualizer_listener.stream_starts;
 

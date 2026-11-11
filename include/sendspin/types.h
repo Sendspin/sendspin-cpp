@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace sendspin {
 
@@ -52,13 +53,29 @@ enum class SendspinPlaybackState : uint8_t {
     STOPPED,  // Group playback is stopped
 };
 
-/// @brief Group membership and playback state delta received in group/update messages
-struct GroupUpdateObject {
+/// @brief Group playback state and membership: the fields the group/update messages since the
+/// last call changed, handed to SendspinClientListener::on_group_state(), or the state
+/// SendspinClient::group_state() merges from them
+///
+/// Each field has no value when those messages leave it unchanged, or, in the merged state, until
+/// an update sets it. The views' lifetime is the callback's, or for the merged state the one
+/// group_state() documents.
+struct GroupState {
     std::optional<SendspinPlaybackState> playback_state{};
     /// 43 base64url characters, or empty when cleared; a server id in another form is reported as
     /// its SHA-256 in base64url
-    std::optional<std::string> group_id{};
+    std::optional<std::string_view> group_id{};
     /// At most 64 bytes in UTF-8, cut at a character boundary
+    std::optional<std::string_view> group_name{};
+};
+
+/// @brief GroupState with each text field copied into a std::string
+/// @deprecated Use GroupState, handed to SendspinClientListener::on_group_state() and returned by
+/// SendspinClient::group_state(); removed in v0.11.0.
+struct [[deprecated("use GroupState, on_group_state() and group_state(); removed in "
+                    "v0.11.0")]] GroupUpdateObject {
+    std::optional<SendspinPlaybackState> playback_state{};
+    std::optional<std::string> group_id{};
     std::optional<std::string> group_name{};
 };
 

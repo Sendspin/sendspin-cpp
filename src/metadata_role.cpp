@@ -46,8 +46,8 @@ EnumSet<MetadataField> kept_fields(const MetadataRoleConfig& config) {
     return kept;
 }
 
-/// @brief Text storage for each text field of the public state, reserved for the field's cap when
-/// `layout` keeps it, and for nothing when it does not
+/// @brief Text storage for each text field of the deprecated public state, reserved for the field's
+/// cap when `layout` keeps it, and for nothing when it does not
 std::array<ReservedText, METADATA_FIELD_COUNT> reserve_metadata_text(
     const MetadataTextLayout& layout) {
     const auto room = [&layout](MetadataField field) {
@@ -59,7 +59,9 @@ std::array<ReservedText, METADATA_FIELD_COUNT> reserve_metadata_text(
             ReservedText(room(MetadataField::ARTWORK_URL))};
 }
 
-/// @brief The public state's member for `field`
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+/// @brief The deprecated public state's member for `field`
 std::optional<std::string>& text_field(ServerMetadataStateObject& state, MetadataField field) {
     switch (field) {
         case MetadataField::TITLE:
@@ -75,6 +77,7 @@ std::optional<std::string>& text_field(ServerMetadataStateObject& state, Metadat
     }
     return state.title;
 }
+#pragma GCC diagnostic pop
 
 }  // namespace
 
@@ -115,25 +118,27 @@ uint32_t MetadataRole::get_track_progress_ms() const {
 // ============================================================================
 
 uint32_t MetadataRole::Impl::get_track_duration_ms() const {
-    if (!this->metadata.progress.has_value()) {
+    const MetadataStatePayload& payload = this->current.payload;
+    if (!payload.progress.has_value()) {
         return 0;
     }
-    return this->metadata.progress.value().track_duration;
+    return payload.progress.value().track_duration;
 }
 
 uint32_t MetadataRole::Impl::get_track_progress_ms() const {
-    if (!this->metadata.progress.has_value()) {
+    const MetadataStatePayload& payload = this->current.payload;
+    if (!payload.progress.has_value()) {
         return 0;
     }
 
-    const auto& progress = this->metadata.progress.value();
+    const auto& progress = payload.progress.value();
 
     // If paused (playback_speed == 0), return the snapshot value directly
     if (progress.playback_speed == 0) {
         return progress.track_progress;
     }
 
-    int64_t client_target = this->client->get_client_time(this->metadata.timestamp);
+    int64_t client_target = this->client->get_client_time(payload.timestamp);
     if (client_target == 0) {
         return progress.track_progress;
     }
@@ -225,29 +230,57 @@ std::optional<std::string_view> MetadataRole::Impl::text_of(const MetadataStateB
     return std::string_view(block + this->layout.offsets[i], *size);
 }
 
-void MetadataRole::Impl::fill_public_state(const MetadataStateBuffer& state) {
-    const MetadataStatePayload& payload = state.payload;
+TrackMetadata MetadataRole::Impl::track_metadata() const {
+    const MetadataStatePayload& payload = this->current.payload;
+    return {.timestamp = payload.timestamp,
+            .title = this->text_of(this->current, MetadataField::TITLE),
+            .artist = this->text_of(this->current, MetadataField::ARTIST),
+            .album_artist = this->text_of(this->current, MetadataField::ALBUM_ARTIST),
+            .album = this->text_of(this->current, MetadataField::ALBUM),
+            .artwork_url = this->text_of(this->current, MetadataField::ARTWORK_URL),
+            .year = payload.year,
+            .track = payload.track,
+            .progress = payload.progress};
+}
+
+void MetadataRole::Impl::fill_deprecated_state() {
+    const MetadataStatePayload& payload = this->current.payload;
     this->metadata.timestamp = payload.timestamp;
     this->metadata.year = payload.year;
     this->metadata.track = payload.track;
     this->metadata.progress = payload.progress;
     for (size_t i = 0; i < METADATA_FIELD_COUNT; ++i) {
         const auto field = static_cast<MetadataField>(i);
-        this->metadata_text[i].fill(text_field(this->metadata, field), this->text_of(state, field));
+        this->metadata_text[i].fill(text_field(this->metadata, field),
+                                    this->text_of(this->current, field));
     }
 }
 
 void MetadataRole::Impl::apply_current_state() {
-    this->fill_public_state(this->current);
-    if (this->listener) {
-        this->listener->on_metadata(this->metadata);
+    if (this->listener == nullptr) {
+        return;
     }
+    // Moves only when the main loop runs a teardown's half, which during the callback means the
+    // listener called stop() (a callback never calls loop()). Not accepts(): the protocol task may
+    // bump the generation during the callback, and the deprecated form must still follow then;
+    // the clear that teardown queued comes on a later drain.
+    const uint32_t completed = this->teardown.completed();
+    this->listener->on_track_metadata(this->track_metadata());
+    // The teardown delivered its clear: the deprecated form of the state must not follow it.
+    if (this->teardown.completed() != completed) {
+        return;
+    }
+    this->fill_deprecated_state();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    this->listener->on_metadata(this->metadata);
+#pragma GCC diagnostic pop
 }
 
 void MetadataRole::Impl::drain_events() {
     // A delivery trades blocks rather than copying text: the delivered place takes the current
-    // state's block, which no state still to be delivered names, and the text is copied once, out
-    // of the current block into the public state, with no lock held.
+    // state's block, which no state still to be delivered names, and the listener views the text
+    // in the current block, with no lock held.
     drain_scheduled_state(
         *this, this->event_state->slot,
         [this](MetadataStateBuffer& place) { std::swap(place, this->current); },
@@ -265,7 +298,8 @@ void MetadataRole::Impl::cleanup() {
 }
 
 void MetadataRole::Impl::complete_teardown() {
-    this->fill_public_state(MetadataStateBuffer{});
+    this->current.payload = {};
+    this->fill_deprecated_state();
     this->event_state->slot.forget_pending();
     if (this->listener) {
         this->listener->on_metadata_clear();
