@@ -76,6 +76,9 @@ struct SyncContext {
     // 64-bit fields
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
     int64_t new_audio_client_playtime{0};
+    /// How much audio the previous chunk of this stream decoded to, the predicted length of the
+    /// next one; 0 until one has decoded.
+    int64_t last_chunk_duration_us{0};
 
     // size_t fields
     size_t bytes_per_frame{0};
@@ -237,6 +240,12 @@ protected:
     /// HARD_SYNC_THRESHOLD_US: every frame sent has played, so the sink starved, and the silence
     /// it played on its own went unreported. New audio starts no earlier than now.
     static int64_t starved_playtime_floor(int64_t playtime_us, int64_t now_us);
+
+    /// @brief Whether a chunk is later than its own length, so every frame it decoded to would be
+    /// dropped and the decode is wasted. Takes the length the chunk is expected to decode to,
+    /// falling back to MAX_AUDIO_CHUNK_MS when the stream has none yet.
+    static bool chunk_is_unplayably_late(int64_t client_timestamp, int64_t expected_duration_us,
+                                         int64_t playtime_us);
 
     /// @brief Sends one chunk of pending silence (initial-sync priming or hard-sync gap fill) to
     /// the sink and updates the playtime estimate. No-op when no silence is pending.
