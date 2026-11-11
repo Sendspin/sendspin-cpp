@@ -371,7 +371,10 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
     // copies the message into its plain struct through parsed.extract(), which releases the
     // document before any handler runs, so a reply a handler builds (client/state after
     // server/activate, a pairing reply, a re-handshake's msg2) fits the arena beside nothing. A
-    // case that reads no payload calls parsed.release() before acting.
+    // case that reads no payload calls parsed.release() before acting. The one exception is the
+    // metadata role's handler, which runs inside server/state's extract() to copy its kept text
+    // straight from the document into its slot; it builds no reply and keeps no view of the
+    // document.
     ParsedJsonMessage parsed(*this->json_arena_);
     if (!parsed.parse(data, len)) {
         SS_LOGW(TAG, "Failed to parse JSON message");

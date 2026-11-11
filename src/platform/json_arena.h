@@ -293,11 +293,13 @@ struct RefersIntoDocument<std::optional<T>> : RefersIntoDocument<std::remove_cv_
  * @brief A parsed inbound JSON message, read once and released before anything acts on it
  *
  * Extract, then release, then act: extract() hands the root to a callable that copies what the
- * caller needs into plain values, then destroys the document, so no handler ever receives the
- * JsonObject and a reply the handler builds fits the arena beside nothing (see
- * SendspinArenaAllocator). read() looks at the root without releasing it, for a step that only
- * decides which extraction applies (a message type); release() drops a document whose payload
- * the caller does not read. None of them may be called after the document is released.
+ * caller needs into plain values, then destroys the document, so a reply a handler builds fits the
+ * arena beside nothing (see SendspinArenaAllocator). A callable may copy straight into its
+ * destination rather than a plain value (the metadata role's slot), as long as it builds nothing
+ * in the arena and keeps no view of the document. read() looks at the root without releasing it,
+ * for a step that only decides which extraction applies (a message type); release() drops a
+ * document whose payload the caller does not read. None of them may be called after the document is
+ * released.
  *
  * The document is destroyed rather than clear()ed: JsonDocument::clear() frees the variant pools
  * before the strings above them, which strands the parse's pool in the arena until reset().

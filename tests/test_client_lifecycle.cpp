@@ -2879,7 +2879,7 @@ TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
         void on_metadata(const ServerMetadataStateObject& metadata) override {
             this->titles.push_back(metadata.title.value_or(""));
             if (this->on_title) {
-                this->on_title(this->titles.back());
+                std::exchange(this->on_title, nullptr)(this->titles.back());
             }
         }
         void on_metadata_clear() override {
@@ -3019,16 +3019,14 @@ TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
                 impl.drain_events();
                 break;
             case Step::DRAIN_FALLING_DUE:
-                log.on_title = [&log, &set_clock](const std::string&) {
-                    log.on_title = nullptr;
+                log.on_title = [&set_clock](const std::string&) {
                     set_clock(2.0 * static_cast<double>(hour));
                 };
                 client.loop();
                 set_clock(0.0);
                 break;
             case Step::DRAIN_STOPPING:
-                log.on_title = [&log, &client](const std::string&) {
-                    log.on_title = nullptr;
+                log.on_title = [&client](const std::string&) {
                     client.stop();
                 };
                 client.loop();

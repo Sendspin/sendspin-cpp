@@ -161,9 +161,6 @@ struct MetadataRole::Impl : RoleTeardown {
     /// The state the last delivery handed over, whose text the public state is filled from. Main
     /// loop only; the slot's commit swaps it, under the Inbox mutex, for the state it delivers.
     MetadataStateBuffer current{.block = CURRENT_FIRST_BLOCK};
-    /// Whether a state dropped because the role was added after start() was logged. Protocol
-    /// task only.
-    bool added_after_start_warned{false};
 
     // Pointer fields
     SendspinClient* client;

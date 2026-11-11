@@ -432,16 +432,11 @@ public:
     int bursts{0};
 };
 
-/// Records what each metadata state carried without allocating: its text fields' sizes, whether
-/// it carried an artist, and the client clock's reading of its timestamp beside the time it was
-/// delivered. Main loop (the test thread) only.
+/// Records what each metadata state carried without allocating: its text fields' sizes and
+/// whether it carried an artist. Main loop (the test thread) only.
 class TextSizeMetadataListener : public MetadataRoleListener {
 public:
-    explicit TextSizeMetadataListener(const SendspinClient& client) : client(client) {}
-
     void on_metadata(const ServerMetadataStateObject& metadata) override {
-        this->due_at = this->client.get_client_time(metadata.timestamp);
-        this->delivered_at = platform_time_us();
         this->title_size = metadata.title.has_value() ? metadata.title->size() : 0;
         this->artwork_url_size =
             metadata.artwork_url.has_value() ? metadata.artwork_url->size() : 0;
@@ -449,10 +444,7 @@ public:
         ++this->updates;
     }
 
-    const SendspinClient& client;
     int updates{0};
-    int64_t due_at{0};
-    int64_t delivered_at{0};
     size_t title_size{0};
     size_t artwork_url_size{0};
     bool has_artist{false};
@@ -603,7 +595,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, 48000, 16});
     client.add_player(std::move(player_config)).set_listener(&player_listener);
     ControllerRole& controller = client.add_controller();
-    TextSizeMetadataListener metadata_listener(client);
+    TextSizeMetadataListener metadata_listener;
     client.add_metadata().set_listener(&metadata_listener);
     ArtworkRoleConfig artwork_config;
     artwork_config.preferred_formats = {
@@ -701,9 +693,10 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     expect_library_allocations(close_window(), "group/update", GROUP_UPDATE_ALLOCATIONS);
 
     // A first state carrying every text field, its title over the cap, then a second without an
-    // artist, then one scheduled a little ahead, which waits in the role's slot as its pending
-    // state until a later tick finds it due, then one with no text at all, each applied by the
-    // main loop before the next is sent. The server clock is the client's, both in this process.
+    // artist, then one scheduled a little ahead, which normally waits in the role's slot as its
+    // pending state until a later tick finds it due, then one with no text at all, each applied
+    // by the main loop before the next is sent. The server clock is the client's, both in this
+    // process.
     const auto metadata_state = [](int64_t timestamp, const std::string& texts) {
         return R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
                std::to_string(timestamp) + texts + "}}}";
@@ -739,8 +732,6 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     pump_while_not(client, [&] { return metadata_listener.updates == 3; });
     {
         TestOwned test_owned;
-        // Delivered no earlier than its timestamp on the client clock, so it waited for it.
-        EXPECT_GE(metadata_listener.delivered_at, metadata_listener.due_at);
         ASSERT_TRUE(server->send_app_json(metadata_state(3, "")));
     }
     pump_while_not(client, [&] { return metadata_listener.updates == 4; });

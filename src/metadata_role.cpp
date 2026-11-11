@@ -177,16 +177,6 @@ void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
 }
 
 MetadataStateOutcome MetadataRole::Impl::handle_server_state(JsonObject root) {
-    // Roles are added while the client is stopped (client.h "Role registration"). One added after
-    // start() anyway, which add_metadata() already warned of, has no text blocks yet, so its
-    // states are dropped here rather than written through a null block.
-    if (this->layout.block_bytes > 0 && !this->text_blocks) {
-        if (!this->added_after_start_warned) {
-            this->added_after_start_warned = true;
-            SS_LOGW(TAG, "Ignoring server/state metadata: the role was added after start()");
-        }
-        return MetadataStateOutcome::IGNORED;
-    }
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // Parsed, and rejected or cut (logged), with no lock held; only the copy runs under it.
     MetadataStateView parsed;
