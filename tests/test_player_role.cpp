@@ -1082,12 +1082,8 @@ TEST(PlayerHardSync, AStarvedEstimateIsFlooredAtNow) {
     }
 }
 
-// A chunk is discarded undecoded only when it is later than its own length, predicted from the
-// previous chunk of the stream. Below that bar handle_synchronize_audio() drops only the late
-// prefix and plays the rest, so a few milliseconds of lateness must not cost the whole chunk;
-// above it, every decoded frame would be dropped, so the decode must not be spent at all. Until
-// one chunk of the stream has decoded there is no prediction, and the longest a chunk may be
-// stands in.
+// A chunk is skipped undecoded only when it is later than its own length, predicted from the
+// previous chunk or MAX_AUDIO_CHUNK_MS until one has decoded; a less late chunk is decoded.
 TEST(PlayerHardSync, OnlyAChunkLaterThanItsOwnLengthIsSkipped) {
     constexpr int64_t PLAYTIME = 1'000'000'000;
     constexpr int64_t TYPICAL_CHUNK_US = 25'000;

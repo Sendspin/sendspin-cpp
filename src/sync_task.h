@@ -76,9 +76,8 @@ struct SyncContext {
     // 64-bit fields
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
     int64_t new_audio_client_playtime{0};
-    /// How much audio the previous chunk of this stream decoded to; the predicted length of the
-    /// next one (chunks within a stream are nearly the same length). 0 until one chunk of the
-    /// stream has decoded. Only chunk_is_unplayably_late() reads it.
+    /// How much audio the previous chunk of this stream decoded to, the predicted length of the
+    /// next one; 0 until one has decoded.
     int64_t last_chunk_duration_us{0};
 
     // size_t fields
