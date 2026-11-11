@@ -14,7 +14,7 @@
 
 /// SendspinClient start/stop/restart: stop() goodbyes every peer, leaves every role and slot
 /// reset and its clear callbacks delivered before stop() returns, a restarted client is live
-/// again, and a callback fired from inside stop() cannot recurse into the lifecycle.
+/// again, and a callback fired from inside stop() sees the stopped client.
 ///
 /// The client is driven on loopback ports like test_connection_lifecycle.cpp: a
 /// FakeEncryptedServer plays the Sendspin server over the real Noise transport and the test
@@ -190,17 +190,16 @@ private:
     uint16_t port_{0};
 };
 
-/// Records on_metadata_clear() and, from inside it, tries to drive the lifecycle re-entrantly.
-class ReentrantMetadataListener : public MetadataRoleListener {
+/// Records on_metadata_clear() and, from inside it, reads the client and makes the connection
+/// requests a callback may make.
+class ClearReadingMetadataListener : public MetadataRoleListener {
 public:
-    explicit ReentrantMetadataListener(SendspinClient& client) : client_(client) {}
+    explicit ClearReadingMetadataListener(SendspinClient& client) : client_(client) {}
 
     void on_metadata_clear() override {
         ++this->clears;
         this->started_during_clear = this->client_.is_started();
         this->group_had_state_during_clear = this->client_.group_state().playback_state.has_value();
-        this->start_result_during_clear = this->client_.start();
-        this->client_.stop();                                       // Must be ignored, not recurse
         this->client_.disconnect(SendspinGoodbyeReason::SHUTDOWN);  // Must be ignored
         this->client_.connect_to("ws://127.0.0.1:1/sendspin");      // Must be ignored
     }
@@ -208,7 +207,6 @@ public:
     int clears{0};
     bool started_during_clear{true};
     bool group_had_state_during_clear{true};
-    bool start_result_during_clear{true};
 
 private:
     SendspinClient& client_;
@@ -410,14 +408,13 @@ TEST(ClientLifecycle, OpusStreamStartIsRefusedWithoutTheOpusDecoder) {
 }
 #endif
 
-// A listener callback fired from inside stop() cannot re-enter the lifecycle: start() reports
-// failure and starts nothing, stop()/disconnect()/connect_to() are ignored rather than recursing,
-// and the client (its started flag and its group state) already reads as stopped. Afterwards the
-// client restarts normally.
-TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
+// A listener callback fired from inside stop() sees the client (its started flag and its group
+// state) already stopped, and its disconnect() and connect_to() are ignored rather than reaching
+// a connection. Afterwards the client restarts normally.
+TEST(ClientLifecycle, CallbackDuringStopSeesTheStoppedClient) {
     PairedClientBundle bundle(make_config(CALLBACK_TEST_PORT));
     SendspinClient& client = bundle.client();
-    ReentrantMetadataListener listener(client);
+    ClearReadingMetadataListener listener(client);
     client.add_metadata().set_listener(&listener);
     ASSERT_TRUE(bundle.start());
 
@@ -433,12 +430,15 @@ TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
         EXPECT_EQ(listener.clears, 1);
         EXPECT_FALSE(listener.started_during_clear);
         EXPECT_FALSE(listener.group_had_state_during_clear);
-        EXPECT_FALSE(listener.start_result_during_clear);
         EXPECT_FALSE(client.is_started());
+        // Read from the request slot: the next start() drops whatever waits there, so nothing a
+        // peer sees tells an ignored request from one posted and dropped.
+        LifecycleRequests requests;
+        EXPECT_FALSE(client.protocol_task_->take_requests(requests))
+            << "connect_to() or disconnect() inside stop() posted a request";
         wait_until([&] { return server->closed(); });
     }
 
-    // The refused start() inside the callback left the client stopped; a real start() works.
     ASSERT_TRUE(bundle.start());
     auto server = connect_paired_server(bundle.peer, CALLBACK_TEST_PORT);
     pump_until(client, [&] { return client.is_connected(); });
@@ -2763,112 +2763,60 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
     }
 }
 
-/// Calls stop(), and then start() when `restart` is set, from inside the first controller state
-/// callback; records every state-role callback in `log`.
-class StopFromCallbackListener : public StateRoleLog {
+/// Logs as StateRoleLog does, then runs `during_volume`, once, from inside on_volume_changed().
+class VolumeHookLog : public StateRoleLog {
 public:
-    /// The callback that calls stop(): none, the controller's state or the player's stream end.
-    enum class Reenter : uint8_t { NONE, CONTROLLER_STATE, STREAM_END };
-
-    StopFromCallbackListener(SendspinClient*& client, Reenter reenter, bool restart)
-        : client_(client), reenter_(reenter), restart_(restart) {}
-
-    void on_controller_state(const ServerStateControllerObject& state) override {
-        StateRoleLog::on_controller_state(state);
-        this->reenter_from(Reenter::CONTROLLER_STATE);
-    }
-    void on_stream_end() override {
-        StateRoleLog::on_stream_end();
-        ++this->stream_ends;
-        this->reenter_from(Reenter::STREAM_END);
-    }
-
-    bool restart_result{false};
-    int stream_ends{0};
-
-private:
-    void reenter_from(Reenter callback) {
-        if (this->reenter_ == callback && !this->reentered_) {
-            this->reentered_ = true;
-            this->client_->stop();
-            if (this->restart_) {
-                this->restart_result = this->client_->start();
-            }
+    void on_volume_changed(uint8_t volume) override {
+        StateRoleLog::on_volume_changed(volume);
+        if (this->during_volume) {
+            std::exchange(this->during_volume, nullptr)();
         }
     }
 
-    SendspinClient*& client_;
-    Reenter reenter_;
-    bool restart_;
-    bool reentered_{false};
+    std::function<void()> during_volume;
 };
 
-// A listener may call stop(), and start() after it, from inside a callback a loop() drain fires.
-// stop() tears every role down and delivers each clear exactly once from its own drain; the drain
-// that fired the callback then abandons the rest of its work, so the metadata state queued beside
-// the controller's is never delivered, after its clear or at all. A stop() from on_stream_end()
-// owes no second on_stream_end(): the stream it ends is already closed. Control: without the
-// re-entry both states are delivered.
-TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
-    using Reenter = StopFromCallbackListener::Reenter;
+// A STREAM_START takes only the stream parameters stamped with its own generation. A drain that
+// holds stream A's START runs a server command's callback first, and a teardown the protocol task
+// runs meanwhile, followed by the next connection's stream/start for stream B, writes B's
+// parameters before A's START is processed. A's START leaves them pending (it still fires, with no
+// parameters of its own left to apply, and the teardown's owed end follows), so B's
+// on_stream_start() reads B's sample rate. The test thread plays the protocol task
+// from inside on_volume_changed(), since no public call lands a teardown and a stream/start
+// inside one callback. Control: without the teardown A's START reads A's rate.
+TEST(TeardownReorder, AStreamStartTakesOnlyItsOwnStreamParams) {
     struct Row {
         const char* name;
-        Reenter reenter;
-        bool restart;
+        bool teardown;
         std::vector<std::string> expected_calls;
-        bool expected_started;
-        int expected_stream_ends;
+        uint32_t expected_rate;
     };
     const Row rows[] = {
-        {"Control: no re-entry", Reenter::NONE, false, {"state 11", "state 5"}, true, 0},
-        {"stop()", Reenter::CONTROLLER_STATE, false, {"state 11", "clear", "clear"}, false, 0},
-        {"stop() then start()", Reenter::CONTROLLER_STATE, true, {"state 11", "clear", "clear"},
-         true, 0},
-        {"stop() from on_stream_end()", Reenter::STREAM_END, false,
-         {"state 48", "clear", "clear", "clear"}, false, 1},
+        {"Control: no teardown, A's START reads A's rate", false, {"state 7", "state 48"}, 48000},
+        {"a teardown and B's stream/start during the volume callback",
+         true,
+         {"state 7", "state 0", "clear", "state 44"},
+         44000},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        SendspinClient* client_ref = nullptr;
-        StopFromCallbackListener log(client_ref, row.reenter, row.restart);
-        TestNetworkProvider network;
-        SendspinClient client(make_config(0));
-        client_ref = &client;
-        client.set_network_provider(&network);
-        client.add_controller().set_listener(&log);
-        client.add_metadata().set_listener(&log);
-        PlayerRole& player = client.add_player(make_pcm_player_config());
-        player.set_listener(&log);
-        log.player = &player;
-        ASSERT_TRUE(client.start());
-        client.protocol_task_->stop();
-
-        if (row.reenter == Reenter::STREAM_END) {
-            PlayerRole::Impl& impl = *player.impl_;
-            ServerPlayerStreamObject params;
-            params.codec = SendspinCodecFormat::PCM;
-            params.sample_rate = 48000;
-            params.channels = 2;
-            params.bit_depth = 16;
-            impl.handle_stream_start({params});
-            pump_until(client, [&] { return impl.sync_task->is_running(); });
-            impl.handle_stream_end();
-            pump_until(client, [&] { return !client.is_started(); });
-        } else {
-            client.controller_->impl_->handle_server_state(controller_state_with(11));
-            handle_metadata_state(client, 5);
-            client.loop();
+        VolumeHookLog log;
+        StateRoleClient harness(log);
+        SendspinClient& client = harness.client;
+        PlayerRole::Impl& impl = *client.player_->impl_;
+        impl.handle_stream_start({player_stream_with(48)});
+        impl.handle_server_command(player_volume_with(7));
+        if (row.teardown) {
+            log.during_volume = [&impl] {
+                impl.cleanup();
+                impl.handle_stream_start({player_stream_with(44)});
+            };
         }
+        client.loop();
+        client.loop();
 
         EXPECT_EQ(log.calls, row.expected_calls);
-        EXPECT_EQ(log.stream_ends, row.expected_stream_ends);
-        EXPECT_EQ(client.is_started(), row.expected_started);
-        if (row.restart) {
-            EXPECT_TRUE(log.restart_result) << "start() from inside the callback was refused";
-        }
-        client.loop();  // A later loop() delivers nothing the re-entry abandoned.
-        EXPECT_EQ(log.calls, row.expected_calls);
-        client.stop();
+        EXPECT_EQ(impl.current_stream_params.sample_rate.value_or(0), row.expected_rate);
     }
 }
 
@@ -2882,10 +2830,10 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
 // test thread plays: same-window arrivals (a third replacing the scheduled second), a pending
 // state replaced by an arrival, a teardown with states pending, a state stamped before it, an
 // arrival between a drain's peek and its commit (from the clear its catch-up delivers), a pending
-// state that falls due in the callback of the state before it, stop() from on_track_metadata(),
-// and a restart. Reaches the role's private state because which block each place names and which
-// state waits show nowhere else before a deadline the test never reaches; the primary clock is
-// installed by hand, so a scheduled state waits for its deadline without a server.
+// state that falls due in the callback of the state before it, and a restart. Reaches the role's
+// private state because which block each place names and which state waits show nowhere else
+// before a deadline the test never reaches; the primary clock is installed by hand, so a
+// scheduled state waits for its deadline without a server.
 TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
     struct TitleLog : MetadataRoleListener {
         void on_track_metadata(const TrackMetadata& metadata) override {
@@ -2913,9 +2861,7 @@ TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
         DRAIN_ARRIVING,     // The role's drain, a scheduled state arriving from the clear it
                             // catches up on, between its peek and its commit
         DRAIN_FALLING_DUE,  // A tick whose first callback brings every scheduled state due
-        DRAIN_STOPPING,     // A tick whose first callback stops the client
         CLEANUP,            // The protocol task's teardown
-        START,
         RESTART,
     };
     struct Row {
@@ -2953,16 +2899,11 @@ TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
         {"a scheduled one behind it", Step::SCHEDULED, "O", {}, nullptr, 2},
         {"falling due in the first callback, it follows in the same tick", Step::DRAIN_FALLING_DUE,
          nullptr, {"N", "O"}, nullptr, 2},
-        {"a due state", Step::DUE, "P", {}, nullptr, 2},
-        {"a scheduled one behind it", Step::SCHEDULED, "Q", {}, nullptr, 2},
-        {"stop() from the first callback leaves nothing behind", Step::DRAIN_STOPPING, nullptr,
-         {"P"}, nullptr, 3},
-        {"a start", Step::START, nullptr, {}, nullptr, 3},
-        {"a scheduled state", Step::SCHEDULED, "R", {}, nullptr, 3},
-        {"waits", Step::DRAIN, nullptr, {}, "R", 3},
-        {"a restart drops it", Step::RESTART, nullptr, {}, nullptr, 4},
-        {"a due state after it", Step::DUE, "S", {}, nullptr, 4},
-        {"is applied", Step::DRAIN, nullptr, {"S"}, nullptr, 4},
+        {"a scheduled state", Step::SCHEDULED, "R", {}, nullptr, 2},
+        {"waits", Step::DRAIN, nullptr, {}, "R", 2},
+        {"a restart drops it", Step::RESTART, nullptr, {}, nullptr, 3},
+        {"a due state after it", Step::DUE, "S", {}, nullptr, 3},
+        {"is applied", Step::DRAIN, nullptr, {"S"}, nullptr, 3},
     };
 
     TitleLog log;
@@ -3037,18 +2978,9 @@ TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
                 client.loop();
                 set_clock(0.0);
                 break;
-            case Step::DRAIN_STOPPING:
-                log.on_title = [&client](const std::string&) {
-                    client.stop();
-                };
-                client.loop();
-                break;
             case Step::CLEANUP:
                 before_teardown = impl.cleanup_generation.load();
                 impl.cleanup();
-                break;
-            case Step::START:
-                start();
                 break;
             case Step::RESTART:
                 client.stop();
@@ -3176,121 +3108,15 @@ TEST(ClientLifecycle, AFullTeardownKeepsTheDismissalsOfShownPrompts) {
     }
 }
 
-/// Calls stop(), and then start() when `restart` is set, from inside the first
-/// on_pairing_code(). The test thread plays the protocol task, so the listener runs the
-/// final tick stop() would join first: admission closes, then the shutdown pass takes the
-/// admitted connection's prompt flags.
-class StopFromPairingPromptListener : public PairingPromptLog {
-public:
-    StopFromPairingPromptListener(SendspinClient*& client, bool reenter, bool restart)
-        : client_(client), reenter_(reenter), restart_(restart) {}
-
-    void on_pairing_code(std::string_view code, SendspinPairingCodeFormat format) override {
-        PairingPromptLog::on_pairing_code(code, format);
-        if (this->reenter_ && !this->reentered_) {
-            this->reentered_ = true;
-            this->client_->connection_manager_->close_admission();
-            (void) this->client_->protocol_tick();
-            this->client_->stop();
-            if (this->restart_) {
-                this->restart_result = this->client_->start();
-            }
-        }
-    }
-
-    bool restart_result{false};
-
-private:
-    SendspinClient*& client_;
-    bool reenter_;
-    bool restart_;
-    bool reentered_{false};
-};
-
-// A pairing listener may call stop(), and start() after it, from inside the callback that shows a
-// code. stop() dismisses the code and the pairing window it was shown under exactly once, from its
-// own drain; the drain that showed the code abandons the rest of its batch, so the next round's
-// code queued behind it is never shown. After a restart the next batch drains as any other.
-// Control: without the re-entry both codes are shown and nothing is dismissed.
-TEST(ClientLifecycle, StopFromInsideAPairingCallbackDismissesThePromptOnce) {
-    struct Row {
-        const char* name;
-        bool reenter;
-        bool restart;
-        int expected_displays;
-        int expected_dismissals;
-    };
-    const Row rows[] = {
-        {"Control: no re-entry", false, false, 2, 0},
-        {"stop() with the next round's code queued behind", true, false, 1, 1},
-        {"stop() then start()", true, true, 1, 1},
-    };
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        SendspinClient* client_ref = nullptr;
-        StopFromPairingPromptListener log(client_ref, row.reenter, row.restart);
-        TestNetworkProvider network;
-        SendspinClient client(make_config(0));
-        client_ref = &client;
-        client.set_network_provider(&network);
-        client.set_listener(&log);
-        ASSERT_TRUE(client.start());
-        client.protocol_task_->stop();
-
-        // An attempt under a pairing window the operator was shown, with its code emitted.
-        auto conn = std::make_shared<StubConnection>();
-        conn->pairing_session().window_shown = true;
-        conn->pairing_session().code_emitted = true;
-        client.connection_manager_->install_admitted(conn, 0);
-        client.note_open_pairing_window();
-        client.loop();
-        ASSERT_EQ(log.opens, 1);
-
-        client.note_display_pairing_code("111111", SendspinPairingCodeFormat::DIGITS);
-        client.note_display_pairing_code("222222", SendspinPairingCodeFormat::DIGITS);
-        client.loop();
-        if (row.restart) {
-            ASSERT_TRUE(log.restart_result) << "start() from inside the callback was refused";
-            client.protocol_task_->stop();
-        }
-
-        EXPECT_EQ(log.displays, row.expected_displays);
-        EXPECT_EQ(log.clears, row.expected_dismissals);
-        EXPECT_EQ(log.closes, row.expected_dismissals);
-        client.loop();  // A later loop() delivers nothing the re-entry abandoned.
-        EXPECT_EQ(log.displays, row.expected_displays);
-        EXPECT_EQ(log.clears, row.expected_dismissals);
-
-        if (row.restart) {
-            client.note_display_pairing_code("333333", SendspinPairingCodeFormat::DIGITS);
-            client.note_clear_pairing_code();
-            client.loop();
-            EXPECT_EQ(log.displays, row.expected_displays + 1);
-            EXPECT_EQ(log.clears, row.expected_dismissals + 1);
-        }
-        // stop()'s order with the task played here, for a run the re-entry did not end.
-        if (client.is_started()) {
-            client.connection_manager_->close_admission();
-            (void) client.protocol_tick();
-        }
-        client.stop();
-    }
-}
-
 /// Logs each pairing callback with text, in the form "<form> <callback> <content>". Overrides
 /// neither form itself: ViewPairingForms and WithDeprecatedPairingForms add them. Main loop only.
 class PairingFormsLog : public SendspinClientListener {
 public:
     std::vector<std::string> calls;
-    /// When set, the first view-form callback calls its stop().
-    SendspinClient* stop_from_view_form{nullptr};
 
 protected:
     void log_view(const std::string& what, std::string_view text) {
         this->calls.push_back("view " + what + " " + std::string(text));
-        if (SendspinClient* client = std::exchange(this->stop_from_view_form, nullptr)) {
-            client->stop();
-        }
     }
     void log_deprecated(const std::string& what, const std::string& text) {
         this->calls.push_back("deprecated " + what + " " + text);
@@ -3341,8 +3167,7 @@ using BothPairingForms = WithDeprecatedPairingForms<ViewPairingForms>;
 
 // Each pairing callback with text, every abort reason and a code in each format, reaches a
 // listener in the forms it overrides: only the view form, only the deprecated std::string form,
-// or both, the view form first with the same content. A stop() from the first view-form callback
-// ends the delivery there, its deprecated form included. The test thread plays the protocol task,
+// or both, the view form first with the same content. The test thread plays the protocol task,
 // queueing the notes as its handlers do.
 TEST(ClientLifecycle, PairingCallbacksReachBothForms) {
     const std::string server_id = "c2VuZHNwaW4tcGFpcmluZy1jYWxsYmFjay1mb3Jtcw0";
@@ -3382,18 +3207,15 @@ TEST(ClientLifecycle, PairingCallbacksReachBothForms) {
     ViewPairingForms view_only;
     DeprecatedPairingForms deprecated_only;
     BothPairingForms both;
-    BothPairingForms stopping;
     struct Row {
         const char* name;
         PairingFormsLog& log;
-        bool stop;
         std::vector<std::string> expected;
     };
     const Row rows[] = {
-        {"only the view forms", view_only, false, in_form({"view"})},
-        {"only the deprecated forms", deprecated_only, false, in_form({"deprecated"})},
-        {"both, the view form first", both, false, in_form({"view", "deprecated"})},
-        {"stop() from the first view form", stopping, true, {"view " + delivered.front()}},
+        {"only the view forms", view_only, in_form({"view"})},
+        {"only the deprecated forms", deprecated_only, in_form({"deprecated"})},
+        {"both, the view form first", both, in_form({"view", "deprecated"})},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -3403,9 +3225,6 @@ TEST(ClientLifecycle, PairingCallbacksReachBothForms) {
         client.set_listener(&row.log);
         ASSERT_TRUE(client.start());
         client.protocol_task_->stop();
-        if (row.stop) {
-            row.log.stop_from_view_form = &client;
-        }
 
         client.note_pairing_started(server_id);
         client.note_pairing_succeeded(server_id);

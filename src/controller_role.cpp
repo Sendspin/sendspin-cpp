@@ -129,7 +129,7 @@ void ControllerRole::Impl::drain_events() {
     bool have_state = false;
     const uint32_t generation = take_current_payload(*this, this->event_state->slot, state,
                                                      have_state, TAG, "controller state");
-    if (!have_state || !this->accepts(generation)) {
+    if (!have_state) {
         return;
     }
     this->apply_state(state);

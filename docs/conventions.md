@@ -77,10 +77,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
   than relying on the ring or the slot being reset: a teardown that leaves
   other producers running cannot reset it, and a drain can take a slot on
   either side of a teardown.
-- Callback dispatch must tolerate re-entrant teardown: a listener callback may
-  call back into the client, except `loop()` (see `client.h`). See "Re-entrant
-  Teardown During Callback Dispatch" in `docs/internals.md` for the guard
-  patterns in use.
+- No callback calls `loop()`, `start()` or `stop()` (see `client.h`), so no
+  teardown runs on the main loop beneath the drain that fired a callback, and
+  callback dispatch carries no re-entrancy guard. See "Callbacks During
+  Dispatch" in `docs/internals.md`.
 - A message handler on the protocol task does the connection work the message
   calls for in place (an activation's admissibility check, admission and role
   ownership, a pairing step, a `noise/handshake` re-handshake, the RAM commit

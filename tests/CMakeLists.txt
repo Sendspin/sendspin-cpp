@@ -150,19 +150,22 @@ endif()
 # old stamp, and reads cleanup_generation and the applied state (controller_state, the metadata
 # role's current, color, the player's stream_active, current_stream_params and volume); its player runs with the
 # sync thread stopped and the item list bound by hand (SyncTask's stop() and inbound_), so a
-# STREAM_END never waits for a thread to go idle. The high-performance grant tables
+# STREAM_END never waits for a thread to go idle. The stream-params test runs on the same player,
+# calling its cleanup() and handle_stream_start() from inside a listener callback, the protocol
+# task's work landing while a drain runs. The stop-callback test reads the protocol task's request
+# slot (take_requests()) after stop(), since start() drops what waits there and no peer sees the
+# difference. The high-performance grant tables
 # play the protocol task's run_time_sync() on a stand-in in the admitted slot (find_admitted(),
 # its high_performance_held) and read the stand-in's time_frame_sent_us_, the one trace of a time
 # frame written without a Noise session that another thread may read; the wake test restarts the
 # protocol task (protocol_task_->start()) with liveness off (liveness_timeout_us_) so the grant is
 # the only wake, and polls the client's Inbox through a role's impl_->inbox, which also lets the
-# reorder table fill the event ring. The re-entrant pairing table queues pairing notes as the
-# protocol task's handlers do (SendspinClient's note_open_pairing_window(),
-# note_display_pairing_code() and note_clear_pairing_code()), since no public call shows a prompt,
-# and from inside its listener runs the final tick stop() would join (close_admission(),
-# protocol_tick()), so the shutdown pass takes the prompt flags it set on its stand-in's
-# pairing_session() (window_shown and code_emitted). The pairing forms table queues every
-# text-carrying note the same way (note_pairing_started(), note_pairing_succeeded(),
+# reorder table fill the event ring. The pairing teardown table queues pairing notes as the
+# protocol task's handlers do (SendspinClient's note_display_pairing_code(),
+# note_open_pairing_window(), note_clear_pairing_code() and note_close_pairing_window()), since no
+# public call shows a prompt, and runs the teardown cleanup_connection_state() performs on a
+# connection loss directly, before the main loop drains what was queued. The pairing forms table
+# queues every text-carrying note the same way (note_pairing_started(), note_pairing_succeeded(),
 # note_pairing_failed() and note_display_pairing_code()) with the protocol task stopped
 # (protocol_task_->stop()), since no public call produces each abort reason and code format on
 # demand. The server information table hands the main loop two servers between drains as
@@ -170,13 +173,12 @@ endif()
 # call changes the primary twice inside one main-loop tick. A second test also queues the metadata
 # role's teardown (its cleanup()) beside the server going to none, so its clear callback reads
 # server_information() as the drain delivers it, since no public call stages both in one tick.
-# The stream-events table drives the
-# player's handle_stream_start() and handle_stream_end() as the task would, and stages one
-# interleaving by waiting on the sync task's item list and the player's sync-idle topic bit, and its
-# clear row calls handle_stream_clear() the same way. The next-stream header table plays the sync
-# task itself on the test thread, because no public call holds the task between its ACTIVE load
-# and its next IDLE wait: it calls SyncTask's wait_for_codec_header() and load_next_chunk() and
-# returns items through its inbound_,
+# The stream-events table drives the player's handle_stream_start() and handle_stream_end() as the
+# task would, and stages one interleaving by waiting on the sync task's item list and the player's
+# sync-idle topic bit, and its clear row calls handle_stream_clear() the same way. The next-stream
+# header table plays the sync task itself on the test thread, because no public call holds the
+# task between its ACTIVE load and its next IDLE wait: it calls SyncTask's wait_for_codec_header()
+# and load_next_chunk() and returns items through its inbound_,
 # resets the flags with event_flags_.clear_all() as start() would, sets and reads SyncContext's
 # active_ordinal and next_header, and reads PlayerRole::Impl::stream_ordinal. The metadata slot
 # table plays the protocol task's half of the metadata role (handle_server_state(), and for a

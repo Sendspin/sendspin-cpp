@@ -2848,18 +2848,15 @@ public:
 }  // namespace
 
 // Each state reaches on_track_metadata() and then the deprecated on_metadata(), so a listener
-// overriding either gets it and one overriding both gets both, the new form first. A stop() from
-// on_track_metadata() delivers the clear in the callback, whose views still read the state, and
-// the deprecated form of the state the clear replaced does not follow. A teardown the protocol
-// task runs during on_track_metadata() (the test thread playing it, through the role's cleanup())
-// does not stop the deprecated form: its clear comes on the next drain.
+// overriding either gets it and one overriding both gets both, the new form first. A teardown
+// the protocol task runs during on_track_metadata() (the test thread playing it, through the
+// role's cleanup()) does not stop the deprecated form: its clear comes on the next drain.
 TEST(EncryptedLifecycle, EachMetadataListenerFormGetsTheStateNewFormFirst) {
     NewMetadataForm new_form;
     OldMetadataForm old_form;
     BothMetadataForms both_forms;
-    BothMetadataForms both_forms_stopping;
     BothMetadataForms both_forms_torn_down;
-    enum class Interrupt : uint8_t { NONE, STOP, TEARDOWN };
+    enum class Interrupt : uint8_t { NONE, TEARDOWN };
     struct Row {
         const char* what;
         MetadataRoleListener* listener;
@@ -2877,12 +2874,6 @@ TEST(EncryptedLifecycle, EachMetadataListenerFormGetsTheStateNewFormFirst) {
          Interrupt::NONE,
          {"new Song", "old Song"},
          {}},
-        {"stop() from on_track_metadata()",
-         &both_forms_stopping,
-         &both_forms_stopping,
-         Interrupt::STOP,
-         {"new Song", "clear", "read Song"},
-         {}},
         {"the protocol task's teardown during on_track_metadata()",
          &both_forms_torn_down,
          &both_forms_torn_down,
@@ -2895,9 +2886,7 @@ TEST(EncryptedLifecycle, EachMetadataListenerFormGetsTheStateNewFormFirst) {
         DispatchTestClient bundle("Metadata Form Test Client");
         SendspinClient& client = bundle.client_ref();
         client.metadata()->set_listener(row.listener);
-        if (row.interrupt == Interrupt::STOP) {
-            row.log->interrupt = [&client] { client.stop(); };
-        } else if (row.interrupt == Interrupt::TEARDOWN) {
+        if (row.interrupt == Interrupt::TEARDOWN) {
             row.log->interrupt = [&client] { client.metadata()->impl_->cleanup(); };
         }
         DispatchTestConnection& conn = bundle.connection();
@@ -2914,49 +2903,36 @@ TEST(EncryptedLifecycle, EachMetadataListenerFormGetsTheStateNewFormFirst) {
 }
 
 // The group twin of EachMetadataListenerFormGetsTheStateNewFormFirst: each group/update reaches
-// on_group_state() and then the deprecated on_group_update(), and a stop() from on_group_state()
-// clears the group state with the deprecated form of the update not following.
+// on_group_state() and then the deprecated on_group_update().
 TEST(EncryptedLifecycle, EachGroupListenerFormGetsTheUpdateNewFormFirst) {
     NewGroupForm new_form;
     OldGroupForm old_form;
     BothGroupForms both_forms;
-    BothGroupForms both_forms_stopping;
     struct Row {
         const char* what;
         SendspinClientListener* listener;
         FormLog* log;
-        bool stop;
         std::vector<std::string> calls;
     };
     const Row rows[] = {
-        {"on_group_state() alone", &new_form, &new_form, false, {"new Kitchen"}},
-        {"on_group_update() alone", &old_form, &old_form, false, {"old Kitchen"}},
+        {"on_group_state() alone", &new_form, &new_form, {"new Kitchen"}},
+        {"on_group_update() alone", &old_form, &old_form, {"old Kitchen"}},
         {"Control: both, the new form first",
          &both_forms,
          &both_forms,
-         false,
          {"new Kitchen", "old Kitchen"}},
-        {"stop() from on_group_state()",
-         &both_forms_stopping,
-         &both_forms_stopping,
-         true,
-         {"new Kitchen", "read Kitchen"}},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.what);
         DispatchTestClient bundle("Group Form Test Client");
         SendspinClient& client = bundle.client_ref();
         client.set_listener(row.listener);
-        if (row.stop) {
-            row.log->interrupt = [&client] { client.stop(); };
-        }
         DispatchTestConnection& conn = bundle.connection();
         bundle.admit(conn);
         bundle.deliver(conn, R"({"type":"group/update","payload":{"group_name":"Kitchen"}})");
         bundle.pump();
         EXPECT_EQ(row.log->calls, row.calls);
-        EXPECT_EQ(client.group_state().group_name,
-                  row.stop ? std::nullopt : std::optional<std::string_view>("Kitchen"));
+        EXPECT_EQ(client.group_state().group_name, std::optional<std::string_view>("Kitchen"));
     }
 }
 

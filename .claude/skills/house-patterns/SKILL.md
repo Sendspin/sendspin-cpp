@@ -69,8 +69,9 @@ the descriptions in `docs/internals.md`:
   `InboxSlot`; two non-main-loop threads communicate via `ShadowSlot`.
 - Payload validation and decoding on the consuming thread, never the
   transport thread.
-- Callback dispatch tolerates re-entrant teardown (a listener may call back
-  into the client mid-callback).
+- No callback calls `loop()`, `start()` or `stop()`, so callback dispatch
+  carries no re-entrancy guard; a new guard for a callback that does is a
+  finding.
 - Silent drops on bounded queues are findings; drop sites log a warning.
 
 ## Validation posture
