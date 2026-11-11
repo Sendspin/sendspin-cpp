@@ -69,6 +69,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -165,18 +166,18 @@ struct PairingEvent {
 
 class RecordingListener : public SendspinClientListener {
 public:
-    void on_pairing_started(const std::string& server_id) override {
-        this->events_.push_back({PairingEventKind::STARTED, server_id, {}, {}, {}});
+    void on_pairing_attempt(std::string_view server_id) override {
+        this->events_.push_back({PairingEventKind::STARTED, std::string(server_id), {}, {}, {}});
     }
-    void on_pairing_succeeded(const std::string& server_id) override {
-        this->events_.push_back({PairingEventKind::SUCCEEDED, server_id, {}, {}, {}});
+    void on_paired(std::string_view server_id) override {
+        this->events_.push_back({PairingEventKind::SUCCEEDED, std::string(server_id), {}, {}, {}});
     }
-    void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
-        this->events_.push_back({PairingEventKind::FAILED, server_id, reason, {}, {}});
+    void on_pairing_aborted(std::string_view server_id, SendspinPairAbortReason reason) override {
+        this->events_.push_back({PairingEventKind::FAILED, std::string(server_id), reason, {}, {}});
     }
-    void on_display_pairing_code(const std::string& code,
-                                 SendspinPairingCodeFormat format) override {
-        this->events_.push_back({PairingEventKind::DISPLAY_CODE, {}, {}, code, format});
+    void on_pairing_code(std::string_view code, SendspinPairingCodeFormat format) override {
+        this->events_.push_back(
+            {PairingEventKind::DISPLAY_CODE, {}, {}, std::string(code), format});
     }
     void on_clear_pairing_code() override {
         this->events_.push_back({PairingEventKind::CLEAR_CODE, {}, {}, {}, {}});

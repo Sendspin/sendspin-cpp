@@ -97,19 +97,34 @@ public:
     // Encryption / pairing callbacks
     // ========================================
 
+    // Each callback below that carries text is followed by its deprecated std::string form with
+    // the same content: override one of the two. A listener overriding both gets both, the view
+    // form first. The text views the pairing notification being delivered and is valid for the
+    // duration of the callback.
+
     /// @brief Called when a server begins a pairing exchange
     ///
     /// server_id is the base64url public key of the server entering pairing. Fires once per
-    /// attempt whatever the method; the exchange ends at on_pairing_succeeded or
-    /// on_pairing_failed, or at neither when the server cancels it with a server/activate
-    /// (pairing.md "Entering and leaving pairing").
-    virtual void on_pairing_started(const std::string& /*server_id*/) {}
+    /// attempt whatever the method; the exchange ends at on_paired or on_pairing_aborted, or at
+    /// neither when the server cancels it with a server/activate (pairing.md "Entering and leaving
+    /// pairing").
+    virtual void on_pairing_attempt(std::string_view /*server_id*/) {}
+
+    /// @brief Called after on_pairing_attempt() with the same server_id
+    /// @deprecated Override on_pairing_attempt(); removed in v0.11.0.
+    [[deprecated("override on_pairing_attempt(); removed in v0.11.0")]] virtual void
+    on_pairing_started(const std::string& /*server_id*/) {}
 
     /// @brief Called when a pairing exchange completes and a long-term record is stored
     ///
     /// server_id is the base64url public key of the newly paired server. The server then
     /// re-handshakes on the new long-term PSK, after which is_paired() reads true.
-    virtual void on_pairing_succeeded(const std::string& /*server_id*/) {}
+    virtual void on_paired(std::string_view /*server_id*/) {}
+
+    /// @brief Called after on_paired() with the same server_id
+    /// @deprecated Override on_paired(); removed in v0.11.0.
+    [[deprecated("override on_paired(); removed in v0.11.0")]] virtual void on_pairing_succeeded(
+        const std::string& /*server_id*/) {}
 
     /// @brief Called when a pairing exchange is aborted (by the server or by the protocol)
     ///
@@ -117,8 +132,13 @@ public:
     /// pairing or resume normal operation on it (pairing.md "pair/abort"). It is closed for
     /// CONCURRENT_ATTEMPT, and closed without any further message for the UNKNOWN reported on a
     /// pairing protocol error (a malformed or out-of-sequence pairing message).
-    virtual void on_pairing_failed(const std::string& /*server_id*/,
-                                   SendspinPairAbortReason /*reason*/) {}
+    virtual void on_pairing_aborted(std::string_view /*server_id*/,
+                                    SendspinPairAbortReason /*reason*/) {}
+
+    /// @brief Called after on_pairing_aborted() with the same server_id and reason
+    /// @deprecated Override on_pairing_aborted(); removed in v0.11.0.
+    [[deprecated("override on_pairing_aborted(); removed in v0.11.0")]] virtual void
+    on_pairing_failed(const std::string& /*server_id*/, SendspinPairAbortReason /*reason*/) {}
 
     /// @brief Called when a dynamic pairing code should be emitted to the operator.
     ///
@@ -132,13 +152,16 @@ public:
     /// and is always followed by on_clear_pairing_code.
     /// Only called when SendspinClientConfig::pairing_code_out_channels and
     /// ::pairing_code_formats are both non-empty.
-    virtual void on_display_pairing_code(const std::string& /*code*/,
-                                         SendspinPairingCodeFormat /*format*/) {}
+    virtual void on_pairing_code(std::string_view /*code*/, SendspinPairingCodeFormat /*format*/) {}
+
+    /// @brief Called after on_pairing_code() with the same code and format
+    /// @deprecated Override on_pairing_code(); removed in v0.11.0.
+    [[deprecated("override on_pairing_code(); removed in v0.11.0")]] virtual void
+    on_display_pairing_code(const std::string& /*code*/, SendspinPairingCodeFormat /*format*/) {}
 
     /// @brief Called to withdraw the emitted dynamic pairing code.
     ///
-    /// Fires after every pairing attempt that triggered on_display_pairing_code, whatever its
-    /// outcome.
+    /// Fires after every pairing attempt that triggered on_pairing_code, whatever its outcome.
     virtual void on_clear_pairing_code() {}
 
     /// @brief Called when the operator must perform the device pairing-window gesture to allow a
@@ -265,6 +288,7 @@ struct ClientHelloMessage;
 struct ClientStateMessage;
 struct GroupUpdatePayload;
 struct Identity;
+struct PublishedServer;
 
 /**
  * @brief Main orchestration class for the sendspin-cpp library
@@ -555,34 +579,65 @@ public:
         return this->client_id_;
     }
 
-    /// @brief Builds the pairing token (pairing.md "Pairing Token") for a Sendspin Pairing
-    /// PSK: the single "SP:"-prefixed, base32 string that carries this client's static public key
-    /// alongside `pairing_psk`, for an operator to transfer into a server via copy/paste or QR
-    /// code to begin the Pairing PSK flow. Clients offering `pairing_psk` SHOULD surface this
-    /// token rather than the bare PSK.
-    /// Main loop only.
-    /// @param pairing_psk The 32-byte Sendspin Pairing PSK.
-    /// @return The 107-character token string, or nullopt if no identity has been initialized
-    ///         yet (before start() is called).
-    [[nodiscard]] std::optional<std::string> format_pairing_token(
-        const std::array<uint8_t, 32>& pairing_psk) const;
+    /// @brief Length in characters of a pairing token for a Sendspin Pairing PSK (pairing.md
+    /// "Pairing Token"): "SP:", the version and the base32 body
+    static constexpr size_t PAIRING_TOKEN_LENGTH = 107;
 
-    /// @brief Builds the pairing token for the client's own Sendspin Pairing PSK.
+    /// @brief Builds the pairing token (pairing.md "Pairing Token") for the client's own Sendspin
+    /// Pairing PSK: the single "SP:"-prefixed, base32 string that carries this client's static
+    /// public key alongside the Pairing PSK, for an operator to transfer into a server via
+    /// copy/paste or QR code to begin the Pairing PSK flow. Clients offering `pairing_psk` SHOULD
+    /// surface this token rather than the bare PSK.
     /// The Pairing PSK is SendspinClientConfig::pairing_psk when set, otherwise the stored one,
     /// generated and persisted on first boot when none is stored, so this token is stable for
-    /// the lifetime of that key: display it (or its QR code) for the operator to transfer into a
-    /// server that is setting this client up.
-    /// Main loop only.
-    /// @return The 107-character token string, or nullopt before start().
-    [[nodiscard]] std::optional<std::string> pairing_token() const;
+    /// the lifetime of that key. Main loop only.
+    /// @return The token's PAIRING_TOKEN_LENGTH characters, with no terminating NUL, or nullopt
+    ///         before start().
+    [[nodiscard]] std::optional<std::array<char, PAIRING_TOKEN_LENGTH>> client_pairing_token()
+        const;
+
+    /// @brief Builds the pairing token, as client_pairing_token() does, for any 32-byte Sendspin
+    /// Pairing PSK, such as one a provisioning tool writes into the device. Main loop only.
+    /// @return The token's PAIRING_TOKEN_LENGTH characters, with no terminating NUL, or nullopt
+    ///         before start(), since the token also carries the client's identity.
+    [[nodiscard]] std::optional<std::array<char, PAIRING_TOKEN_LENGTH>> pairing_token_for(
+        const std::array<uint8_t, 32>& pairing_psk) const;
+
+    /// @brief Returns pairing_token_for(`pairing_psk`) copied into a std::string. Main loop only.
+    /// @deprecated Use pairing_token_for(); removed in v0.11.0.
+    [[deprecated("use pairing_token_for(); removed in v0.11.0"),
+      nodiscard]] std::optional<std::string>
+    format_pairing_token(const std::array<uint8_t, 32>& pairing_psk) const;
+
+    /// @brief Returns client_pairing_token() copied into a std::string. Main loop only.
+    /// @deprecated Use client_pairing_token(); removed in v0.11.0.
+    [[deprecated("use client_pairing_token(); removed in v0.11.0"),
+      nodiscard]] std::optional<std::string>
+    pairing_token() const;
 
     /// @brief Returns true if there is an active connection whose handshake completed and whose
     /// latest server/activate has arrived. Any thread; reflects the protocol task's last tick.
+    /// server_information() can lag it by one loop() (see there).
     bool is_connected() const;
 
-    /// @brief Returns the server information from the active connection's hello handshake, or
-    /// nullopt when no connection is active. Any thread.
-    std::optional<ServerInformationObject> get_server_information() const;
+    /// @brief Returns the server information from the active connection's hello handshake, as
+    /// the protocol task had published it when loop() last ran, or nullopt when no connection was
+    /// active then. Main loop only. The views are valid until control next returns to loop()
+    /// (from inside a callback: until the callback returns) or until stop(). loop() takes the
+    /// copy as it starts, so it can read nullopt, or the previous server, for one loop() after
+    /// is_connected() turns true: read it on each loop() rather than only on that rising edge.
+    std::optional<ServerInformation> server_information() const;
+
+    /// @brief Returns the server information the protocol task last published, each field copied
+    /// into a std::string, or nullopt when no connection is active. Any thread.
+    /// @deprecated Use server_information() on the main loop; removed in v0.11.0. Code off the
+    /// main loop has no replacement and keeps calling this until then.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    [[deprecated(
+        "use server_information(); removed in v0.11.0")]] std::optional<ServerInformationObject>
+    get_server_information() const;
+#pragma GCC diagnostic pop
 
     /// @brief Returns true if the active connection is a paired session: one keyed by the
     /// long-term PSK of a pairing record, not the Pairing or Sentinel PSK. Any thread; reflects
@@ -992,19 +1047,24 @@ private:
     /// of its role removals and of anything else it sends. Protocol task only.
     void on_activation_applied(SendspinConnection* conn);
 
+    /// @brief Queues the primary connection's server information, nullptr for none, for the copy
+    /// the main loop's drain_inbox() keeps and server_information() views. Called by
+    /// ConnectionManager::refresh_published_state() as the primary connection changes.
+    void note_server_information(const PublishedServer* server);
+
     // Pairing notifications. Each is called on the protocol task and queues the listener callback
     // for delivery from the main loop's drain_inbox().
 
-    /// @brief Queue an on_pairing_started notification
+    /// @brief Queue an on_pairing_attempt notification
     void note_pairing_started(std::string_view server_id);
 
-    /// @brief Queue an on_pairing_succeeded notification
+    /// @brief Queue an on_paired notification
     void note_pairing_succeeded(std::string_view server_id);
 
-    /// @brief Queue an on_pairing_failed notification
+    /// @brief Queue an on_pairing_aborted notification
     void note_pairing_failed(std::string_view server_id, SendspinPairAbortReason reason);
 
-    /// @brief Queue an on_display_pairing_code notification
+    /// @brief Queue an on_pairing_code notification
     void note_display_pairing_code(std::string_view code, SendspinPairingCodeFormat format);
 
     /// @brief Queue an on_clear_pairing_code notification

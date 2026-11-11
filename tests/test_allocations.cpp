@@ -586,7 +586,8 @@ constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 // One paired connection with a player, a controller, metadata, two artwork channels, a visualizer
 // and two application-specific roles, one with a support object, so client/hello lists the
 // application roles and the player, artwork and visualizer objects of client/state are built: from
-// the fake server's connect through admission and the first client/state, then one client/state
+// the fake server's connect through admission, the first client/state and the main loop's copy of
+// the server's information, then one client/state
 // publish, then one full burst of client/time and server/time exchanges, then the first
 // controller server/state, then the first group/update messages, then the first metadata
 // server/state messages, then an artwork and visualizer stream/start and a stream/end and a
@@ -650,6 +651,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
                    [&] { return client.is_connected() && server->client_state_count() > 0; });
     expect_library_allocations(close_window(), "accept to admission and the first client/state",
                                ADMISSION_ALLOCATIONS);
+    EXPECT_TRUE(client.server_information().has_value())
+        << "the window ended before the main loop took the admitted server's information";
     expect_role_objects(*server, 0);
     expect_application_roles(*server);
 
@@ -903,14 +906,35 @@ public:
     }
 };
 
-/// Counts on_pairing_succeeded() on the main loop (the test thread).
+/// Counts on_paired() on the main loop (the test thread), and overrides both forms of every
+/// pairing callback that carries text, so a window counts the views and the deprecated strings.
 class PairingCountingListener : public SendspinClientListener {
 public:
-    void on_pairing_succeeded(const std::string& /*server_id*/) override {
+    void on_pairing_attempt(std::string_view /*server_id*/) override {}
+    void on_paired(std::string_view /*server_id*/) override {
         ++this->succeeded;
     }
+    void on_pairing_aborted(std::string_view /*server_id*/,
+                            SendspinPairAbortReason /*reason*/) override {}
+    void on_pairing_code(std::string_view /*code*/,
+                         SendspinPairingCodeFormat /*format*/) override {}
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    void on_pairing_started(const std::string& /*server_id*/) override {}
+    void on_pairing_succeeded(const std::string& /*server_id*/) override {
+        ++this->deprecated_succeeded;
+    }
+    void on_pairing_failed(const std::string& /*server_id*/,
+                           SendspinPairAbortReason /*reason*/) override {}
+    void on_display_pairing_code(const std::string& code,
+                                 SendspinPairingCodeFormat /*format*/) override {
+        this->deprecated_code_size = code.size();
+    }
+#pragma GCC diagnostic pop
 
     int succeeded{0};
+    int deprecated_succeeded{0};
+    size_t deprecated_code_size{0};
 };
 
 constexpr uint16_t OUTBOUND_TEST_PORT = 19305;
@@ -1030,14 +1054,12 @@ constexpr uint16_t PAIRING_TEST_PORT = 19302;
 
 constexpr size_t PLAYBACK_HANDOFF_ALLOCATIONS = 0;
 constexpr size_t UNPAIR_ALLOCATIONS = 0;
-// The std::string server_id on_pairing_started() and on_pairing_succeeded() each take on the main
-// loop: a public listener signature's cost.
-constexpr size_t PAIRING_ALLOCATIONS = 2;
+constexpr size_t PAIRING_ALLOCATIONS = 0;
 
 // Two paired servers, the incoming one's record the least recently used: from the incoming
-// server's connect, through the playback activate that displaces the incumbent and the main
-// loop's flush of the record order it moved, then a server/unpair of the incoming server's record
-// through the flush that empties its slot.
+// server's connect, through the playback activate that displaces the incumbent, the main loop's
+// copy of the incoming server's information and its flush of the record order it moved, then a
+// server/unpair of the incoming server's record through the flush that empties its slot.
 TEST(Allocations, RecordFlushesAfterAPlaybackHandoffAndAnUnpair) {
     PairedPeer incoming = make_paired_peer();
     PairedPeer incumbent = make_paired_peer();
@@ -1063,6 +1085,7 @@ TEST(Allocations, RecordFlushesAfterAPlaybackHandoffAndAnUnpair) {
     });
 
     const int order_writes = persistence.writes(persistence_keys::RECORD_ORDER);
+    const std::string incoming_id = incoming.server_identity.peer_id();
     std::unique_ptr<FakeEncryptedServer> incoming_server;
     open_window();
     {
@@ -1075,6 +1098,9 @@ TEST(Allocations, RecordFlushesAfterAPlaybackHandoffAndAnUnpair) {
     });
     expect_library_allocations(close_window(), "playback handoff and its record flush",
                                PLAYBACK_HANDOFF_ALLOCATIONS);
+    const std::optional<ServerInformation> server = client.server_information();
+    EXPECT_EQ(server.has_value() ? server->server_id : "", incoming_id)
+        << "the window ended before the main loop took the incoming server's information";
     EXPECT_EQ(stored_record_order(persistence), (std::vector<uint8_t>{1, 0}))
         << "the handoff must make the incoming server's record the most recent";
 
@@ -1098,7 +1124,7 @@ TEST(Allocations, RecordFlushesAfterAPlaybackHandoffAndAnUnpair) {
 
 // A pairing_psk pairing (pairing.md "Pairing PSK Flow") on a connection made on the configured
 // Pairing PSK, from the pairing activate through the main loop's flush of the new record and the
-// on_pairing_succeeded() that follows it.
+// on_paired() that follows it, in both forms.
 TEST(Allocations, PairingThroughItsRecordFlush) {
     std::array<uint8_t, NOISE_PSK_SIZE> pairing_psk{};
     platform_random_bytes(pairing_psk.data(), pairing_psk.size());
@@ -1139,6 +1165,7 @@ TEST(Allocations, PairingThroughItsRecordFlush) {
     pump_while_not(client, [&] { return listener.succeeded > 0; });
     expect_library_allocations(close_window(), "pairing through its record flush",
                                PAIRING_ALLOCATIONS);
+    EXPECT_EQ(listener.deprecated_succeeded, 1) << "the window missed the deprecated form";
     EXPECT_EQ(persisted_psk_ids(persistence),
               std::vector<std::string>{server.learned_psk_id().value_or("")})
         << "the flush must store the record the pairing minted";
@@ -1151,8 +1178,7 @@ TEST(Allocations, PairingThroughItsRecordFlush) {
 /// Main loop (the test thread) only.
 class CodePairingListener : public PairingCountingListener {
 public:
-    void on_display_pairing_code(const std::string& code,
-                                 SendspinPairingCodeFormat /*format*/) override {
+    void on_pairing_code(std::string_view code, SendspinPairingCodeFormat /*format*/) override {
         TestOwned test_owned;
         this->code = code;
     }
@@ -1225,11 +1251,10 @@ std::vector<uint8_t> pake_sid(const std::array<uint8_t, 32>& handshake_hash,
 constexpr uint16_t CODE_PAIRING_DIGITS_TEST_PORT = 19303;
 constexpr uint16_t CODE_PAIRING_QR_TEST_PORT = 19304;
 
-// Only the listener's std::string arguments on the main loop: the server_id on_pairing_started()
-// and on_pairing_succeeded() each take, and for a qr_code the 43-character token
-// on_display_pairing_code() takes, past both standard libraries' inline capacity. Six digits fit it.
-constexpr size_t CODE_PAIRING_DIGITS_ALLOCATIONS = 2;
-constexpr size_t CODE_PAIRING_QR_ALLOCATIONS = 3;
+// The listener overrides both forms, so the deprecated forms' strings are counted: the server_id
+// is past both standard libraries' inline capacity, and so is a qr_code's 43-character token.
+constexpr size_t CODE_PAIRING_DIGITS_ALLOCATIONS = 0;
+constexpr size_t CODE_PAIRING_QR_ALLOCATIONS = 0;
 
 struct CodePairingRow {
     const char* format;
@@ -1239,7 +1264,7 @@ struct CodePairingRow {
 
 /// Runs one Dynamic Pairing Code Flow round (pairing.md "Dynamic Pairing Code Flow") in `format`
 /// against a server the test plays with the library's CPace, from the pairing activate through
-/// the main loop's flush of the new record and the on_pairing_succeeded() that follows it.
+/// the main loop's flush of the new record and the on_paired() that follows it.
 void run_code_pairing(const CodePairingRow& row) {
     TestOwnedPersistence persistence;
     CodePairingListener listener;  // Outlives the client
@@ -1335,6 +1360,9 @@ void run_code_pairing(const CodePairingRow& row) {
     }
     pump_while_not(client, [&] { return listener.succeeded > 0 || server.closed(); });
     expect_library_allocations(close_window(), row.format, row.expected);
+    EXPECT_EQ(listener.deprecated_succeeded, 1) << "the window missed the deprecated form";
+    EXPECT_EQ(listener.deprecated_code_size, listener.code.size())
+        << "the window missed the deprecated form of the code";
 
     // The server can open the PSK the client wrapped (pairing.md "Wrapping"), and it is the one
     // the flush stored.

@@ -615,7 +615,7 @@ recency writes only the order.
   write the next boot rebuilds by itself (the recency order in `RECORD_ORDER`) reports at debug.
   For a record slot specifically: a rejected
   write of a just-paired record leaves the pairing working for this boot only
-  (`on_pairing_succeeded` still fires; the record is gone after a reboot), and a rejected write
+  (`on_paired` still fires; the record is gone after a reboot), and a rejected write
   of a removal means the store still holds the old record and will hand it back at the next boot,
   silently making the revoked PSK valid again (the revoked record is always dropped from RAM
   regardless of the return value). A supersede and an eviction both write the new record over the
@@ -624,7 +624,7 @@ recency writes only the order.
   already discarded it, which then falls back to unpaired (Sentinel) access.
 - `commit()` makes every accepted write durable. The library calls it once after a batch of
   accepted writes that holds pairing material (`KEYPAIR`, `PAIRING_PSK`, or a record slot) and,
-  for a pairing, does so before `on_pairing_succeeded` fires. Writes to `RECORD_ORDER`,
+  for a pairing, does so before `on_paired` fires. Writes to `RECORD_ORDER`,
   `LAST_PLAYED` and `OUTPUT_DELAY` never trigger it, so a provider that queues its writes may
   batch those on its own schedule. A provider that writes through in `save_blob()` keeps the
   default, which returns `true`. A `false` return is logged like a rejected write and not
@@ -714,30 +714,33 @@ struct MyClientListener : SendspinClientListener {
 
     // Called when a server begins a pairing exchange, once per attempt and whatever
     // the method (Pairing PSK, dynamic pairing code, or static pairing code).
-    // server_id is the base64url public key of the server initiating pairing.
-    void on_pairing_started(const std::string& server_id) override {
-        printf("Pairing started with server %s\n", server_id.c_str());
+    // server_id is the base64url public key of the server initiating pairing. The pairing
+    // callbacks' text views are valid for the duration of the callback.
+    void on_pairing_attempt(std::string_view server_id) override {
+        printf("Pairing started with server %.*s\n", static_cast<int>(server_id.size()),
+               server_id.data());
     }
 
     // Called when pairing completes successfully and the long-term record is stored.
     // Subsequent connections from this server are paired sessions (is_paired()).
-    void on_pairing_succeeded(const std::string& server_id) override {
-        printf("Pairing succeeded with server %s\n", server_id.c_str());
+    void on_paired(std::string_view server_id) override {
+        printf("Pairing succeeded with server %.*s\n", static_cast<int>(server_id.size()),
+               server_id.data());
     }
 
     // Called when a pairing exchange is aborted. Most server-sent abort reasons leave the
     // connection open so the server can retry or resume normal operation; CONCURRENT_ATTEMPT
     // and protocol errors (reported as UNKNOWN) close it.
-    void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
-        printf("Pairing failed with server %s\n", server_id.c_str());
+    void on_pairing_aborted(std::string_view server_id, SendspinPairAbortReason reason) override {
+        printf("Pairing failed with server %.*s\n", static_cast<int>(server_id.size()),
+               server_id.data());
     }
 
     // Dynamic pairing code: emit/withdraw the code the device derived. Only invoked when
     // SendspinClientConfig::pairing_code_out_channels and pairing_code_formats are both
     // non-empty. `format` says what `code` is: six decimal digits, or a pairing token to
     // render as a QR code.
-    void on_display_pairing_code(const std::string& code,
-                                 SendspinPairingCodeFormat format) override {
+    void on_pairing_code(std::string_view code, SendspinPairingCodeFormat format) override {
         show_pairing_code_on_display(code, format);
     }
     void on_clear_pairing_code() override {
@@ -862,10 +865,10 @@ Pairing is server-initiated. The server includes `pairing` in the `activities` o
 `server/activate` message; the library handles the exchange automatically. The application
 observes pairing via `SendspinClientListener` callbacks:
 
-1. `on_pairing_started(server_id)` -- the exchange has begun.
-2. `on_pairing_succeeded(server_id)` -- the record is stored; the server will
+1. `on_pairing_attempt(server_id)` -- the exchange has begun.
+2. `on_paired(server_id)` -- the record is stored; the server will
    re-handshake immediately on the new long-term PSK.
-3. `on_pairing_failed(server_id, reason)` -- the exchange failed. See
+3. `on_pairing_aborted(server_id, reason)` -- the exchange failed. See
    `SendspinPairAbortReason` below for the possible reasons.
 
    Whether the connection survives depends on the reason. Most reasons the server sends in a
@@ -875,7 +878,7 @@ observes pairing via `SendspinClientListener` callbacks:
    `client/goodbye`.
 
    A persistence provider that rejects the durable write does not fail the pairing:
-   `on_pairing_succeeded` fires, the record is authoritative for the rest of this boot, and a
+   `on_paired` fires, the record is authoritative for the rest of this boot, and a
    warning says it will not survive a reboot. Surface that failure from the provider itself if
    the application needs to act on it. The record is dropped outright, with neither callback
    firing, only when the store is at capacity with nothing evictable, which the connection budget
@@ -885,8 +888,8 @@ observes pairing via `SendspinClientListener` callbacks:
    if the application needs to track that.
 
 A server can also end an attempt with a `server/activate` in place of the next pairing message
-(`pairing.md` "Entering and leaving pairing"). Neither `on_pairing_succeeded` nor
-`on_pairing_failed` fires then, but `on_clear_pairing_code` / `on_close_pairing_window` still
+(`pairing.md` "Entering and leaving pairing"). Neither `on_paired` nor
+`on_pairing_aborted` fires then, but `on_clear_pairing_code` / `on_close_pairing_window` still
 withdraw any prompt the attempt showed; a pairing window the operator opened stays open.
 
 #### Pairing PSK
@@ -902,7 +905,10 @@ To pair, the server must learn that PSK out of band. Surface it as a **pairing t
 paste (or scan) into the server:
 
 ```cpp
-auto token = client.pairing_token();  // e.g. "SP:0AAAQ..." (107 chars), nullopt before start()
+// std::array<char, SendspinClient::PAIRING_TOKEN_LENGTH>, e.g. "SP:0AAAQ..." with no
+// terminating NUL; nullopt before start()
+auto token = client.client_pairing_token();
+if (token) printf("%.*s\n", static_cast<int>(token->size()), token->data());
 ```
 
 The token is stable for the lifetime of the PSK, so it can be printed at startup, shown in a UI,
@@ -923,11 +929,11 @@ the library derives its `psk_id`. An all-zero key or the published Sentinel PSK 
 ship a key every peer knows. `SendspinPsk` wipes its bytes when destroyed, and so does every copy
 the client makes; a source buffer such as `factory_psk` above is the application's to wipe.
 
-`client.format_pairing_token(factory_psk)` builds the token for any 32-byte PSK rather than the
+`client.pairing_token_for(factory_psk)` builds the token for any 32-byte PSK rather than the
 one in use, which is what a provisioning tool needs to print the token for a key it provisions.
 It returns `nullopt` before `start()`, since the token also carries the client's identity.
 
-After pairing completes, `on_pairing_succeeded` fires and the long-term record is stored
+After pairing completes, `on_paired` fires and the long-term record is stored
 by the library in the first free record slot. Subsequent boots load that same slot; no further
 provisioning is needed.
 
@@ -935,7 +941,7 @@ provisioning is needed.
 
 The library also supports the two pairing-code methods, gated by
 `SendspinClientConfig::pairing_code_out_channels` / `pairing_code_formats` /
-`static_pairing_code`, and driven by the `SendspinClientListener::on_display_pairing_code` /
+`static_pairing_code`, and driven by the `SendspinClientListener::on_pairing_code` /
 `on_clear_pairing_code` / `on_open_pairing_window` / `on_close_pairing_window` callbacks
 documented in Step 3 above. A method is advertised only when the platform can carry it: a client
 that names no out-channel and no format never offers `dynamic_pairing_code`, and the server is
@@ -946,7 +952,7 @@ code, so a device that means to offer `static_pairing_code` leaves `pairing_code
 empty.
 
 A **dynamic pairing code** is derived per attempt from the Noise handshake hash and both sides'
-nonces, and emitted through `on_display_pairing_code` as either six decimal digits or a pairing
+nonces, and emitted through `on_pairing_code` as either six decimal digits or a pairing
 token to render as a QR code, whichever format the server selected from those advertised. If the
 operator types a code the device did not emit, the client asks for another round
 (`client/pair-retry`) and keeps the same code on screen. After 20 rounds without a successful
@@ -1169,6 +1175,10 @@ bool connected = client.is_connected();       // Active connection with complete
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
 GroupState group = client.group_state();       // Group id, name, playback state (all optional);
                                                // its views hold until control returns to loop(), or stop()
+auto server = client.server_information();     // Active server's id and name as of the last loop(),
+                                               // nullopt with none; views held like group_state()'s;
+                                               // can trail is_connected() by one loop(), so read it
+                                               // each loop rather than on its rising edge
 
 // Player state
 uint8_t vol = player.get_volume();
@@ -1189,7 +1199,7 @@ int64_t client_ts = client.get_client_time(server_timestamp);
 
 ## Deprecated String API
 
-The view forms hand the metadata and group text over as `std::string_view` into storage the library keeps; the deprecated forms copy it into `std::string`. The `std::string` forms are deprecated in v0.10.0 and removed in v0.11.0; naming one of them draws a `-Wdeprecated-declarations` warning.
+The view forms hand the metadata, group, pairing and server text over as `std::string_view` into storage the library keeps, and the pairing token as a `std::array`; the deprecated forms copy it into `std::string`. The `std::string` forms are deprecated in v0.10.0 and removed in v0.11.0. Using a deprecated type or calling a deprecated getter draws a `-Wdeprecated-declarations` warning, but overriding a deprecated callback does not: the metadata and group callbacks warn only because their parameter types are deprecated, and the four pairing callbacks (`on_pairing_started()`, `on_pairing_succeeded()`, `on_pairing_failed()`, `on_display_pairing_code()`) take none, so search for those names. Mark every override `override`, so that a callback removed in v0.11.0 fails to compile rather than silently going uncalled.
 
 | Deprecated | Replacement |
 |---|---|
@@ -1198,8 +1208,16 @@ The view forms hand the metadata and group text over as `std::string_view` into 
 | `GroupUpdateObject` | `GroupState` |
 | `SendspinClientListener::on_group_update()` | `SendspinClientListener::on_group_state()` |
 | `SendspinClient::get_group_state()` | `SendspinClient::group_state()`, which returns by value |
+| `SendspinClientListener::on_pairing_started()` | `SendspinClientListener::on_pairing_attempt()` |
+| `SendspinClientListener::on_pairing_succeeded()` | `SendspinClientListener::on_paired()` |
+| `SendspinClientListener::on_pairing_failed()` | `SendspinClientListener::on_pairing_aborted()` |
+| `SendspinClientListener::on_display_pairing_code()` | `SendspinClientListener::on_pairing_code()` |
+| `SendspinClient::pairing_token()` | `SendspinClient::client_pairing_token()`, a `std::array<char, PAIRING_TOKEN_LENGTH>` |
+| `SendspinClient::format_pairing_token()` | `SendspinClient::pairing_token_for()`, likewise |
+| `ServerInformationObject` | `ServerInformation` |
+| `SendspinClient::get_server_information()` | `SendspinClient::server_information()`, main loop only |
 
-The fields keep their names and meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` returns until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. A `stop()` from the new callback ends the delivery there.
+The fields and arguments keep their meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` and `server_information()` return until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view, like a pairing token's array, is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. `server_information()` reads a copy `loop()` refreshes as the server changes, so it is main loop only and can read the previous server, or `nullopt`, for one `loop()` after `is_connected()` turns true: read it on each `loop()` rather than only when `is_connected()` rises; `get_server_information()` reads from any thread, and code off the main loop has no replacement and keeps calling it until the removal. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. A `stop()` from the new callback ends the delivery there.
 
 ## Thread Safety Summary
 
@@ -1236,7 +1254,7 @@ non-blocking.
 Callable from any thread: `connect_to()`, `disconnect()`, `leave()`,
 `confirm_pairing_window()`, `cancel_pairing_window()`, `set_unpaired_access_enabled()` and the
 getters `is_started()`, `is_connected()`, `is_time_synced()`, `get_client_time()`,
-`get_server_information()`, `is_paired()` and `is_unpaired_access_enabled()`. The
+`get_server_information()` (deprecated), `is_paired()` and `is_unpaired_access_enabled()`. The
 requests take effect on the protocol task's next tick; the getters read what that task last
 published. Controller commands are queued, so a burst of them can fill the
 queue (see [Sending Commands](#sending-commands)); `connect_to()`, `disconnect()`, `leave()`,
@@ -1557,7 +1575,7 @@ The capture buffer and an encoder's chunk scratch are allocated by the first `st
 | `USER_CANCELLED` | The pairing was cancelled by the user: by the server, or locally by `cancel_pairing_window()` while an attempt was waiting for the gesture |
 | `UNKNOWN` | Unrecognized abort reason from the server, or a client-local protocol error (which also closes the connection) |
 
-Delivered via `SendspinClientListener::on_pairing_failed`. An activation naming a pairing
+Delivered via `SendspinClientListener::on_pairing_aborted`. An activation naming a pairing
 method or format the client does not offer is answered with a `pair/abort` carrying
 `method_not_supported` and no listener callback at all; the connection stays open.
 
@@ -1580,7 +1598,7 @@ Listed in `SendspinClientConfig::pairing_code_out_channels` and advertised as th
 
 Listed in `SendspinClientConfig::pairing_code_formats` and advertised as the
 `dynamic_pairing_code` descriptor's `formats`; the server picks one of them and the chosen
-format arrives as the `format` argument of `on_display_pairing_code`.
+format arrives as the `format` argument of `on_pairing_code`.
 
 ### SendspinCodecFormat
 

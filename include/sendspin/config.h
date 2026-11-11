@@ -190,7 +190,7 @@ struct SendspinClientConfig {
     /// @brief Channels through which this device can emit a dynamic pairing code to the operator.
     /// Advertised as `out_channels` on the dynamic_pairing_code descriptor in client/hello
     /// (pairing.md "client/hello pair-method descriptor"). Set this alongside
-    /// `pairing_code_formats` when the application implements the on_display_pairing_code /
+    /// `pairing_code_formats` when the application implements the on_pairing_code /
     /// on_clear_pairing_code callbacks on its SendspinClientListener. Empty leaves
     /// dynamic_pairing_code unadvertised.
     std::vector<SendspinPairingCodeChannel> pairing_code_out_channels{};
@@ -208,7 +208,7 @@ struct SendspinClientConfig {
     /// derives its psk_id. An all-zero key or the published Sentinel PSK is rejected: start()
     /// logs an error and returns false. When unset, the library loads the one stored under
     /// `persistence_keys::PAIRING_PSK`, or generates one on first boot and stores it there.
-    /// SendspinClient::pairing_token() carries whichever is in use.
+    /// SendspinClient::client_pairing_token() carries whichever is in use.
     std::optional<SendspinPsk> pairing_psk{};
 
     /// @brief The static pairing code the device shipped with: exactly 8 decimal digits, drawn

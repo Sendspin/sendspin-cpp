@@ -294,9 +294,9 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                     bundle.peer.record.psk_id, bundle.peer.psk);
     pump_until(client, [&] { return client.is_connected(); });
-    auto info = client.get_server_information();
+    EXPECT_EQ(refreshed_server_id(client), server_identity.peer_id());
+    const std::optional<ServerInformation> info = client.server_information();
     ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, server_identity.peer_id());
     EXPECT_EQ(info->name, FAKE_SERVER_HELLO_NAME);
 
     // The probes never complete a WebSocket handshake, so the transport layer closes them without
@@ -347,9 +347,7 @@ TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
     // tier must ride that out and still establish. Completion is the whole verdict, so the wait
     // carries no bound of its own: a cut outbound clock never establishes and hangs here.
     pump_until(client, [&] { return client.is_connected(); });
-    auto info = client.get_server_information();
-    ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, server_identity.peer_id());
+    EXPECT_EQ(refreshed_server_id(client), server_identity.peer_id());
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -395,9 +393,7 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                     bundle.peer.record.psk_id, bundle.peer.psk);
     pump_until(client, [&] { return client.is_connected(); });
-    auto info = client.get_server_information();
-    ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, server_identity.peer_id());
+    EXPECT_EQ(refreshed_server_id(client), server_identity.peer_id());
     EXPECT_FALSE(real_server.closed())
         << "the real server must be admitted, not rejected while an outbound attempt is in flight";
 
@@ -433,7 +429,7 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
                                  identity_a, peer_a.record.psk_id, peer_a.psk,
                                  rank_zero_peer_options());
     pump_until(client, [&] {
-        auto info = client.get_server_information();
+        auto info = client.server_information();
         return info.has_value() && info->server_id == identity_a.peer_id();
     });
 
@@ -444,9 +440,10 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
                                  identity_b, peer_b.record.psk_id, peer_b.psk,
                                  rank_zero_peer_options());
     pump_until(client, [&] {
-        auto info = client.get_server_information();
+        auto info = client.server_information();
         return info.has_value() && info->server_id == identity_b.peer_id();
     });
+    EXPECT_EQ(refreshed_server_id(client), identity_b.peer_id());
 
     // The displaced incumbent is released with a goodbye, not left dangling.
     pump_until(client, [&] { return server_a.closed(); });
@@ -671,7 +668,7 @@ TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
     pump_until(client, [&] { return silent.closed(); });
     EXPECT_EQ(silent.goodbye_reason().value_or(""), "restart")
         << "a peer dropped for liveness must be told to restart";
-    EXPECT_FALSE(client.get_server_information().has_value())
+    EXPECT_FALSE(refreshed_server_id(client).has_value())
         << "a dropped peer must not be left as the current connection";
 }
 
@@ -779,9 +776,13 @@ TEST(ConnectionLifecycle, TwoPeersAtOnceSettleOnThePreferredOne) {
     EXPECT_TRUE(reason == "another_server" || reason == "concurrent_attempt")
         << "the other server must be told why it was released, not '" << reason << "'";
     // Server information names the winner as soon as it is installed; the connected flag rises
-    // only at the end of that tick, so both are waited on.
+    // only at the end of that tick, so both are waited on. Nothing pumps loop() here, so the
+    // getter that reads the protocol task's published state is the one that shows it.
     wait_until([&] {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         auto info = client.get_server_information();
+#pragma GCC diagnostic pop
         return client.is_connected() && info.has_value() &&
                info->server_id == peer_b.server_identity.peer_id();
     });

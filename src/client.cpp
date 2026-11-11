@@ -60,7 +60,9 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <optional>
+#include <string>
 #include <utility>
 
 static const char* const TAG = "sendspin.client";
@@ -93,7 +95,7 @@ enum class PairingPrompt : uint8_t {
 struct PairingNote {
     PairingNoteType type{};
     /// server_id for PAIRING_STARTED/SUCCEEDED/FAILED; the emitted code for
-    /// DISPLAY_PAIRING_CODE; empty otherwise. The drain builds the listener's std::string.
+    /// DISPLAY_PAIRING_CODE; empty otherwise. The listener's view form views it.
     IdText text{};
     SendspinPairAbortReason reason{};  ///< Valid only for PAIRING_FAILED.
     /// Emission format of `text`; valid only for DISPLAY_PAIRING_CODE.
@@ -114,6 +116,21 @@ std::vector<PairingNote> reserved_pairing_notes() {
     std::vector<PairingNote> notes;
     notes.reserve(PAIRING_NOTE_CAPACITY);
     return notes;
+}
+
+/// @brief Whether `type` carries text, and so has a deprecated std::string callback the drain
+/// calls after the view form
+constexpr bool carries_text(PairingNoteType type) {
+    return type == PairingNoteType::PAIRING_STARTED || type == PairingNoteType::PAIRING_SUCCEEDED ||
+           type == PairingNoteType::PAIRING_FAILED || type == PairingNoteType::DISPLAY_PAIRING_CODE;
+}
+
+/// @brief An empty string with room for `capacity` characters, so assigning up to that many never
+/// allocates
+std::string reserved_string(size_t capacity) {
+    std::string text;
+    text.reserve(capacity);
+    return text;
 }
 
 /// @brief Builds a note carrying `text`, a server_id or an emitted pairing code
@@ -202,6 +219,17 @@ struct HighPerformanceRequests {
     return true;
 }
 
+static_assert(SendspinClient::PAIRING_TOKEN_LENGTH == PAIRING_PSK_TOKEN_LENGTH,
+              "the public pairing token length is the version-0 token's");
+
+/// @brief The characters of `token`, which holds exactly PAIRING_TOKEN_LENGTH of them
+std::array<char, SendspinClient::PAIRING_TOKEN_LENGTH> token_chars(const PairingPskToken& token) {
+    std::array<char, SendspinClient::PAIRING_TOKEN_LENGTH> chars{};
+    const std::string_view text = token.view();
+    std::copy(text.begin(), text.end(), chars.begin());
+    return chars;
+}
+
 /// @brief The public view of `group`, its text viewing the payload's inline storage
 GroupState group_state_of(const GroupUpdatePayload& group) {
     return {.playback_state = group.playback_state,
@@ -248,6 +276,17 @@ struct SendspinClient::EventState {
                                                      reserved_pairing_notes()};
     /// The drain's buffer for the pairing notes, empty between drains. Main loop only.
     std::vector<PairingNote> drained_pairing_notes{reserved_pairing_notes()};
+    /// The std::string the deprecated pairing callbacks are handed, assigned in place from each
+    /// note's text and reserved for the longest (PairingNote::text), so no delivery allocates.
+    /// Main loop only. A drain nested in a callback (its stop()) delivers only the dismissals,
+    /// which carry no text, so it never reassigns the string a callback is reading.
+    std::string deprecated_pairing_text{reserved_string(decltype(PairingNote::text)::capacity())};
+    /// The primary connection's server information, written by the protocol task each time the
+    /// primary changes (ConnectionManager::refresh_published_state()), latest-wins.
+    InboxSlot<std::optional<PublishedServer>> server_slot{inbox, INBOX_TOPIC_SERVER};
+    /// The server information the drain last took from server_slot, which server_information()
+    /// views. Main loop only.
+    std::optional<PublishedServer> server_information;
     /// Bumped by stop() before its teardown so a drain frame already on the stack (a listener
     /// callback that called stop()) abandons what it has not delivered yet: the events it copied
     /// out, the rest of the pairing notes, the role drains and the group update. Main loop only.
@@ -284,6 +323,35 @@ struct SendspinClient::EventState {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         listener.on_group_update(this->group_delta);
+#pragma GCC diagnostic pop
+    }
+
+    /// @brief Assigns `note`'s text into deprecated_pairing_text and hands it to the note's
+    /// deprecated callback. Main loop only.
+    void deliver_deprecated_pairing_note(SendspinClientListener& listener,
+                                         const PairingNote& note) {
+        this->deprecated_pairing_text.assign(note.text.view());
+        const std::string& text = this->deprecated_pairing_text;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        switch (note.type) {
+            case PairingNoteType::PAIRING_STARTED:
+                listener.on_pairing_started(text);
+                break;
+            case PairingNoteType::PAIRING_SUCCEEDED:
+                listener.on_pairing_succeeded(text);
+                break;
+            case PairingNoteType::PAIRING_FAILED:
+                listener.on_pairing_failed(text, note.reason);
+                break;
+            case PairingNoteType::DISPLAY_PAIRING_CODE:
+                listener.on_display_pairing_code(text, note.format);
+                break;
+            case PairingNoteType::CLEAR_PAIRING_CODE:
+            case PairingNoteType::OPEN_PAIRING_WINDOW:
+            case PairingNoteType::CLOSE_PAIRING_WINDOW:
+                break;
+        }
 #pragma GCC diagnostic pop
     }
 
@@ -610,11 +678,14 @@ void SendspinClient::stop() {
     //    leaves behind is the state a restart begins from. The drain generation bump abandons
     //    the events a drain frame further up the stack (a listener that called stop()) copied
     //    out before this teardown. The group slot is reset too, so the drain below cannot
-    //    repopulate the group state from a delta that arrived before the stop.
+    //    repopulate the group state from a delta that arrived before the stop, and the server
+    //    slot with the copy server_information() views.
     ++this->event_state_->drain_generation;
     this->cleanup_connection_state(ALL_ROLES_MASK);
     this->task_state_->client_state.reset();
     this->event_state_->clear_group_state();
+    this->event_state_->server_slot.reset();
+    this->event_state_->server_information.reset();
 
     // A pairing attempt cut short by the stop leaves its code or pairing-window prompt showing.
     // Queue the dismissals now, after cleanup_connection_state() dropped the pending notes, so the
@@ -938,6 +1009,15 @@ void SendspinClient::drain_inbox() {
 #endif
     };
 
+    // --- Server information ---
+    // First, ahead of the teardown catch-up's clear callbacks, so every callback this drain makes
+    // reads the server as of the drain's start. A later tick can change it while the drain runs,
+    // so a group or metadata update delivered further down may come from a newer server than
+    // server_information() reads until the next loop().
+    if ((es.inbox.poll() & INBOX_TOPIC_SERVER) != 0) {
+        (void)es.server_slot.take(es.server_information);
+    }
+
     // Each role catches up on the teardowns the protocol task ran since the last drain: one
     // acquire load per role. Event dispatch and the role drains catch up on their own, at the
     // stamp they act on; this pass covers a teardown whose stamped *_CLEARED event the full event
@@ -1091,7 +1171,7 @@ void SendspinClient::drain_inbox() {
     // --- Pairing notifications, and the deferred provider writes ---
     // After the event ring, so a role's clear can precede a pairing note queued before it. The
     // two never describe the same listener state (role state against the pairing UI).
-    // The one ordering that matters is a record's provider write ahead of on_pairing_succeeded:
+    // The one ordering that matters is a record's provider write ahead of on_paired:
     // the protocol task requests the write before it queues the PAIRING_SUCCEEDED note, so the
     // flush (which polls for itself) runs after the notes are taken and before they are
     // dispatched, and every note taken finds its write performed.
@@ -1126,20 +1206,20 @@ void SendspinClient::drain_inbox() {
                     }
                     last_note = note.type;
                 }
+                // The view form views the note in `notes`, which a drain nested in the callback
+                // cannot reach.
                 switch (note.type) {
                     case PairingNoteType::PAIRING_STARTED:
-                        this->listener_->on_pairing_started(std::string(note.text.view()));
+                        this->listener_->on_pairing_attempt(note.text.view());
                         break;
                     case PairingNoteType::PAIRING_SUCCEEDED:
-                        this->listener_->on_pairing_succeeded(std::string(note.text.view()));
+                        this->listener_->on_paired(note.text.view());
                         break;
                     case PairingNoteType::PAIRING_FAILED:
-                        this->listener_->on_pairing_failed(std::string(note.text.view()),
-                                                           note.reason);
+                        this->listener_->on_pairing_aborted(note.text.view(), note.reason);
                         break;
                     case PairingNoteType::DISPLAY_PAIRING_CODE:
-                        this->listener_->on_display_pairing_code(std::string(note.text.view()),
-                                                                 note.format);
+                        this->listener_->on_pairing_code(note.text.view(), note.format);
                         break;
                     case PairingNoteType::CLEAR_PAIRING_CODE:
                         this->listener_->on_clear_pairing_code();
@@ -1150,6 +1230,11 @@ void SendspinClient::drain_inbox() {
                     case PairingNoteType::CLOSE_PAIRING_WINDOW:
                         this->listener_->on_close_pairing_window();
                         break;
+                }
+                // A stop() from the view form ended the delivery, so the deprecated form of the
+                // note must not follow.
+                if (carries_text(note.type) && es.drain_generation == drain_generation) {
+                    es.deliver_deprecated_pairing_note(*this->listener_, note);
                 }
                 // A re-entrant stop() bumped the generation: abandon the rest of the batch.
                 if (es.drain_generation != drain_generation) {
@@ -1315,16 +1400,16 @@ SourceRole& SendspinClient::add_source(SourceRoleConfig config) {
 // Queries
 // ============================================================================
 
-std::optional<std::string> SendspinClient::format_pairing_token(
-    const std::array<uint8_t, 32>& pairing_psk) const {
+std::optional<std::array<char, SendspinClient::PAIRING_TOKEN_LENGTH>>
+SendspinClient::pairing_token_for(const std::array<uint8_t, 32>& pairing_psk) const {
     if (this->identity_ == nullptr) {
         return std::nullopt;
     }
-    return std::string(
-        sendspin::format_pairing_token(this->identity_->public_bytes, pairing_psk).view());
+    return token_chars(sendspin::format_pairing_token(this->identity_->public_bytes, pairing_psk));
 }
 
-std::optional<std::string> SendspinClient::pairing_token() const {
+std::optional<std::array<char, SendspinClient::PAIRING_TOKEN_LENGTH>>
+SendspinClient::client_pairing_token() const {
     // Main-loop-only, like the other record-store config reads: the Pairing PSK is set when the
     // store is built, inside start().
     if (this->record_store_ == nullptr) {
@@ -1334,7 +1419,24 @@ std::optional<std::string> SendspinClient::pairing_token() const {
     if (!pairing_psk.has_value()) {
         return std::nullopt;
     }
-    return this->format_pairing_token(pairing_psk->psk);
+    return this->pairing_token_for(pairing_psk->psk);
+}
+
+std::optional<std::string> SendspinClient::format_pairing_token(
+    const std::array<uint8_t, 32>& pairing_psk) const {
+    const auto token = this->pairing_token_for(pairing_psk);
+    if (!token.has_value()) {
+        return std::nullopt;
+    }
+    return std::string(token->data(), token->size());
+}
+
+std::optional<std::string> SendspinClient::pairing_token() const {
+    const auto token = this->client_pairing_token();
+    if (!token.has_value()) {
+        return std::nullopt;
+    }
+    return std::string(token->data(), token->size());
 }
 
 bool SendspinClient::is_connected() const {
@@ -1357,9 +1459,26 @@ int64_t SendspinClient::get_client_time(int64_t server_time) const {
     return clock.has_value() ? clock->compute_client_time(server_time) : 0;
 }
 
-std::optional<ServerInformationObject> SendspinClient::get_server_information() const {
-    return this->connection_manager_->server_information();
+std::optional<ServerInformation> SendspinClient::server_information() const {
+    const std::optional<PublishedServer>& server = this->event_state_->server_information;
+    if (!server.has_value()) {
+        return std::nullopt;
+    }
+    return ServerInformation{.server_id = server->server_id.view(), .name = server->name.view()};
 }
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+std::optional<ServerInformationObject> SendspinClient::get_server_information() const {
+    // See ConnectionManager::server_information().
+    const std::optional<PublishedServer> server = this->connection_manager_->server_information();
+    if (!server.has_value()) {
+        return std::nullopt;
+    }
+    return ServerInformationObject{.server_id = std::string(server->server_id.view()),
+                                   .name = std::string(server->name.view())};
+}
+#pragma GCC diagnostic pop
 
 GroupState SendspinClient::group_state() const {
     return group_state_of(this->event_state_->group_state);
@@ -1495,7 +1614,7 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
         // whose prompt was already delivered (see retain_delivered_dismissals()): a teardown
         // queues the dismissals for the connection it drops itself, but one queued by an earlier
         // drop that no drain has delivered yet must survive this one. Callers that need another
-        // notification to survive teardown (e.g. handle_pair_abort's on_pairing_failed) must
+        // notification to survive teardown (e.g. handle_pair_abort's on_pairing_aborted) must
         // call the corresponding note_*() after cleanup_connection_state() returns; see the
         // ConnectionManager pairing handlers.
         // An edit, not a merge: it touches only notes already pending, and one that leaves none
@@ -1899,6 +2018,16 @@ void SendspinClient::on_activation_applied([[maybe_unused]] SendspinConnection* 
         this->source_->impl_->on_activation_applied(*conn);
     }
 #endif
+}
+
+void SendspinClient::note_server_information(const PublishedServer* server) {
+    this->event_state_->server_slot.update([server](std::optional<PublishedServer>& current) {
+        if (server != nullptr) {
+            current = *server;
+        } else {
+            current.reset();
+        }
+    });
 }
 
 void SendspinClient::note_pairing_started(std::string_view server_id) {

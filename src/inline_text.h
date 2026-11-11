@@ -146,6 +146,10 @@ public:
         return this->size_ == 0;
     }
 
+    static constexpr size_t capacity() {
+        return N;
+    }
+
     bool operator==(std::string_view other) const {
         return this->view() == other;
     }
