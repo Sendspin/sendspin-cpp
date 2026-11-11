@@ -431,6 +431,11 @@ TEST(ClientLifecycle, CallbackDuringStopSeesTheStoppedClient) {
         EXPECT_FALSE(listener.started_during_clear);
         EXPECT_FALSE(listener.group_had_state_during_clear);
         EXPECT_FALSE(client.is_started());
+        // Read from the request slot: the next start() drops whatever waits there, so nothing a
+        // peer sees tells an ignored request from one posted and dropped.
+        LifecycleRequests requests;
+        EXPECT_FALSE(client.protocol_task_->take_requests(requests))
+            << "connect_to() or disconnect() inside stop() posted a request";
         wait_until([&] { return server->closed(); });
     }
 
@@ -2755,6 +2760,63 @@ TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
             EXPECT_EQ(log.calls, expected_calls);
             EXPECT_EQ(role.applied(client, log), expected_applied);
         }
+    }
+}
+
+/// Logs as StateRoleLog does, then runs `during_volume`, once, from inside on_volume_changed().
+class VolumeHookLog : public StateRoleLog {
+public:
+    void on_volume_changed(uint8_t volume) override {
+        StateRoleLog::on_volume_changed(volume);
+        if (this->during_volume) {
+            std::exchange(this->during_volume, nullptr)();
+        }
+    }
+
+    std::function<void()> during_volume;
+};
+
+// A STREAM_START takes only the stream parameters stamped with its own generation. A drain that
+// holds stream A's START runs a server command's callback first, and a teardown the protocol task
+// runs meanwhile, followed by the next connection's stream/start for stream B, writes B's
+// parameters before A's START is processed. A's START leaves them pending (it still fires, with no
+// parameters of its own left to apply, and the teardown's owed end follows), so B's
+// on_stream_start() reads B's sample rate. The test thread plays the protocol task
+// from inside on_volume_changed(), since no public call lands a teardown and a stream/start
+// inside one callback. Control: without the teardown A's START reads A's rate.
+TEST(TeardownReorder, AStreamStartTakesOnlyItsOwnStreamParams) {
+    struct Row {
+        const char* name;
+        bool teardown;
+        std::vector<std::string> expected_calls;
+        uint32_t expected_rate;
+    };
+    const Row rows[] = {
+        {"Control: no teardown, A's START reads A's rate", false, {"state 7", "state 48"}, 48000},
+        {"a teardown and B's stream/start during the volume callback",
+         true,
+         {"state 7", "state 0", "clear", "state 44"},
+         44000},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        VolumeHookLog log;
+        StateRoleClient harness(log);
+        SendspinClient& client = harness.client;
+        PlayerRole::Impl& impl = *client.player_->impl_;
+        impl.handle_stream_start({player_stream_with(48)});
+        impl.handle_server_command(player_volume_with(7));
+        if (row.teardown) {
+            log.during_volume = [&impl] {
+                impl.cleanup();
+                impl.handle_stream_start({player_stream_with(44)});
+            };
+        }
+        client.loop();
+        client.loop();
+
+        EXPECT_EQ(log.calls, row.expected_calls);
+        EXPECT_EQ(impl.current_stream_params.sample_rate.value_or(0), row.expected_rate);
     }
 }
 

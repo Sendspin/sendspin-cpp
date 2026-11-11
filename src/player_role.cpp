@@ -518,8 +518,8 @@ void PlayerRole::Impl::drain_events() {
     (void)this->event_state->sync_idle_slot.take(sync_idle_note);
     ServerCommandMessage cmd_msg{};
     bool have_command = false;
-    const uint32_t generation = take_current_payload(*this, this->event_state->command_slot,
-                                                     cmd_msg, have_command, TAG, "server command");
+    take_current_payload(*this, this->event_state->command_slot, cmd_msg, have_command, TAG,
+                         "server command");
 
     // --- Server command events (volume, mute, output delay) ---
     // Check each field independently since multiple command types may have been merged into one
@@ -601,18 +601,13 @@ void PlayerRole::Impl::drain_events() {
                         this->client->acquire_high_performance();
                         this->high_performance_requested_for_playback = true;
                     }
-                    // The params handle_stream_start() wrote with this START. A teardown since
-                    // then was caught up above and removed the START from this vector, so a stamp
-                    // that is not current belongs to an older stream whose START was dropped.
+                    // The params handle_stream_start() wrote with this START, taken under the
+                    // START's own stamp: params a later teardown's next stream wrote while a
+                    // callback above ran stay pending for that stream's START.
                     ServerPlayerStreamObject stream_params;
-                    uint32_t params_stamp = 0;
-                    if (this->event_state->stream_params_slot.take(stream_params, params_stamp)) {
-                        if (params_stamp == generation) {
-                            this->current_stream_params = stream_params;
-                        } else {
-                            SS_LOGD(TAG, "Dropping stream params queued before the role was torn "
-                                         "down");
-                        }
+                    if (this->event_state->stream_params_slot.take_stamped(stream_params,
+                                                                           event.epoch)) {
+                        this->current_stream_params = stream_params;
                     }
                     this->stream_active = true;
                     if (this->listener) {

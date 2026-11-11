@@ -386,8 +386,9 @@ void VisualizerRole::Impl::handle_stream_start(const VisualizerStreamPayload& st
 
     // Write the config to the inbox slot for the main thread, then push the event. Both lock the
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
-    // guaranteed to observe this config (see config_slot.take() in handle_stream_ring_event()).
-    // Both carry `generation`, so a config left over from a torn-down stream is never applied.
+    // guaranteed to observe this config (see config_slot.take_stamped() in
+    // handle_stream_ring_event()). Both carry `generation`, so a config left over from a torn-down
+    // stream is never applied.
     this->event_state->config_slot.write(VisualizerStreamPayload{admitted}, generation);
     this->enqueue_stream_event(VisualizerEventType::STREAM_START, generation);
 }
@@ -433,12 +434,7 @@ void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event,
     switch (event) {
         case VisualizerEventType::STREAM_START: {
             VisualizerStreamPayload config{};
-            uint32_t stamp = 0;
-            if (!this->event_state->config_slot.take(config, stamp)) {
-                break;
-            }
-            if (stamp != generation) {
-                SS_LOGD(TAG, "Dropping a visualizer config queued before the role was torn down");
+            if (!this->event_state->config_slot.take_stamped(config, generation)) {
                 break;
             }
             ServerVisualizerStreamObject& out = this->stream_object;

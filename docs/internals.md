@@ -200,7 +200,7 @@ PLAYER_STREAM ring events → on_stream_ring_event() → awaiting_sync_idle_even
            │    Sync task idle → fire on_stream_end() if a stream is open, continue
            │
            └─ STREAM_START:
-                Take stream_params_slot (applied if its stamp is current)
+                Take stream_params_slot only if stamped with the START's generation
                 Mark stream active, fire on_stream_start()
                 Acknowledge the event's ordinal to the sync task
 ```
@@ -229,7 +229,7 @@ The source's `cleanup()` closes the stream gate without a message and clears the
 
 ### Callbacks During Dispatch
 
-No listener, role or provider callback calls `loop()`, `start()` or `stop()` (`client.h`), and the requests a callback may make (`connect_to()`, `disconnect()`, a controller command, ...) are queued or posted to the protocol task. So no drain runs beneath another, and no role's main-loop half runs while one of its callbacks is on the stack: each drain delivers everything it took, and a role drain re-checks no teardown generation after its callbacks. A teardown the protocol task runs during a callback is caught up by the next drain, through the stamps described under [Cleanup](#cleanup), behind what the current drain delivers.
+No listener, role or provider callback calls `loop()`, `start()` or `stop()` (`client.h`), and the requests a callback may make (`connect_to()`, `disconnect()`, a controller command, ...) are queued or posted to the protocol task. So no drain runs beneath another, and no role's main-loop half runs while one of its callbacks is on the stack: each drain delivers everything it took. A teardown the protocol task runs during a callback is caught up, through the stamps described under [Cleanup](#cleanup), the next time a drain reaches that role, later in the same drain or in the next one, always after the callback returns. A payload a drain takes after one of its callbacks has run is taken only under its own stamp, so one a later teardown's next connection wrote meanwhile stays pending: the player takes its stream parameters with the STREAM_START's stamp (`GenerationSlot::take_stamped()`).
 
 ## Message Flow
 

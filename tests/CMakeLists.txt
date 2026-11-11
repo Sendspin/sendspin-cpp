@@ -150,7 +150,11 @@ endif()
 # old stamp, and reads cleanup_generation and the applied state (controller_state, the metadata
 # role's current, color, the player's stream_active, current_stream_params and volume); its player runs with the
 # sync thread stopped and the item list bound by hand (SyncTask's stop() and inbound_), so a
-# STREAM_END never waits for a thread to go idle. The high-performance grant tables
+# STREAM_END never waits for a thread to go idle. The stream-params test runs on the same player,
+# calling its cleanup() and handle_stream_start() from inside a listener callback, the protocol
+# task's work landing while a drain runs. The stop-callback test reads the protocol task's request
+# slot (take_requests()) after stop(), since start() drops what waits there and no peer sees the
+# difference. The high-performance grant tables
 # play the protocol task's run_time_sync() on a stand-in in the admitted slot (find_admitted(),
 # its high_performance_held) and read the stand-in's time_frame_sent_us_, the one trace of a time
 # frame written without a Noise session that another thread may read; the wake test restarts the

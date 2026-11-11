@@ -551,8 +551,9 @@ private:
  * Every write and merge keeps the newest generation's content: a delta stamped with a later
  * generation than the pending content replaces it, and one stamped with an earlier generation
  * than the pending content is dropped, so a producer that lost a race with a teardown cannot
- * revive the content the teardown discarded. Lives on the shared Inbox mutex like every
- * InboxSlot; no lock of its own.
+ * revive the content the teardown discarded. A drain that takes a payload belonging to an event it
+ * already holds, rather than at its head, takes it with take_stamped() under that event's stamp.
+ * Lives on the shared Inbox mutex like every InboxSlot; no lock of its own.
  */
 template <typename T>
 class GenerationSlot {
@@ -601,6 +602,29 @@ public:
         out = std::move(taken.value);
         generation = taken.generation;
         return true;
+    }
+
+    /// @brief Moves the pending payload out only when it is stamped `generation`, for a payload
+    /// that belongs to something the drain already holds (the player's stream parameters, taken
+    /// with their STREAM_START): one stamped with a later generation stays pending for its own
+    /// taker, and one stamped with an earlier generation is discarded
+    /// @return false when no payload stamped `generation` was pending.
+    bool take_stamped(T& out, uint32_t generation) {
+        bool taken = false;
+        this->slot_.edit([&out, &taken, generation](Stamped& current) {
+            if (current.generation != generation) {
+                if (count_after(current.generation, generation)) {
+                    return true;  // A later generation's: left for its own taker
+                }
+                current = Stamped{};
+                return false;
+            }
+            out = std::move(current.value);
+            current = Stamped{};
+            taken = true;
+            return false;
+        });
+        return taken;
     }
 
     /// @brief Discards the pending payload
