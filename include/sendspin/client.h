@@ -412,6 +412,9 @@ public:
     /// Connection work (handshakes, time sync, sends, watchdogs) runs on the library's protocol
     /// task and does not wait for this call. Each call while running also polls the network
     /// provider, which is what starts a WebSocket server the network kept down at start().
+    ///
+    /// Never call it from a listener, role or provider callback (docs/integration-guide.md, Thread
+    /// Safety Summary).
     void loop();
 
     // ========================================

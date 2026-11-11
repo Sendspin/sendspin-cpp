@@ -1199,6 +1199,8 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 | `SendspinClientConfig::message_trace` (built with `SENDSPIN_ENABLE_MESSAGE_TRACE`) | Protocol task |
 | All other listener methods | Main loop thread |
 
+Never call `loop()` from a listener, role or provider callback. A callback on the main loop already runs inside one of the client's own calls (`loop()`, `start()`, `stop()` or its destructor), and `loop()` does not support being re-entered; a callback the table lists on another thread is off the main loop, where `loop()` never runs.
+
 `PlayerRole::notify_audio_played()` is thread-safe and is designed to be called from an audio output callback thread.
 
 `ControllerRole::send_command()` is callable from any thread.
