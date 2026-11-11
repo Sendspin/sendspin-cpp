@@ -146,7 +146,8 @@ public:
     /// @brief Returns the current controller state from the server
     const ServerStateControllerObject& get_controller_state() const;
 
-    /// @brief Sets the listener for controller events; it must outlive this role
+    /// @brief Sets the listener for controller events; it must outlive this role. Set it before
+    /// SendspinClient::start() and leave it in place while the client runs.
     void set_listener(ControllerRoleListener* listener);
 
     /// @brief Sends a controller command to the server; callable from any thread

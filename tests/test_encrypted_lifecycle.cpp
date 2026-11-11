@@ -1639,7 +1639,7 @@ TEST(EncryptedLifecycle, ActivateThatLosesPlaybackCapabilityRemovesTheRoles) {
     struct ClearRecordingMetadataListener : MetadataRoleListener {
         std::atomic<int> updates{0};
         std::atomic<int> clears{0};
-        void on_metadata(const ServerMetadataStateObject& /*m*/) override {
+        void on_track_metadata(const TrackMetadata& /*m*/) override {
             this->updates.fetch_add(1);
         }
         void on_metadata_clear() override {
@@ -2028,7 +2028,7 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     struct RecordingMetadataListener : MetadataRoleListener {
         std::atomic<int> updates{0};
         std::string last_title;
-        void on_metadata(const ServerMetadataStateObject& m) override {
+        void on_track_metadata(const TrackMetadata& m) override {
             this->last_title = m.title.value_or("");
             this->updates.fetch_add(1);
         }
@@ -2172,18 +2172,91 @@ TEST(EncryptedLifecycle, MetadataStateReplacesRatherThanMerges) {
     EXPECT_FALSE(bundle.listener.last_had_progress) << "an omitted progress clears the position";
 }
 
+namespace {
+
+// One metadata state as a listener form handed it, its text copied, so the two forms compare
+struct MetadataCopy {
+    int64_t timestamp{};
+    std::optional<std::string> title;
+    std::optional<std::string> artist;
+    std::optional<std::string> album_artist;
+    std::optional<std::string> album;
+    std::optional<std::string> artwork_url;
+    std::optional<uint16_t> year;
+    std::optional<uint16_t> track;
+    std::optional<std::array<uint32_t, 3>> progress;
+    bool operator==(const MetadataCopy&) const = default;
+};
+
+std::optional<std::string> copy_text(std::optional<std::string_view> text) {
+    return text.has_value() ? std::optional<std::string>(*text) : std::nullopt;
+}
+
+std::optional<std::array<uint32_t, 3>> copy_progress(
+    const std::optional<MetadataProgressObject>& progress) {
+    if (!progress.has_value()) {
+        return std::nullopt;
+    }
+    return std::array<uint32_t, 3>{progress->track_progress, progress->track_duration,
+                                   progress->playback_speed};
+}
+
+MetadataCopy copy_of(const TrackMetadata& m) {
+    return {.timestamp = m.timestamp,
+            .title = copy_text(m.title),
+            .artist = copy_text(m.artist),
+            .album_artist = copy_text(m.album_artist),
+            .album = copy_text(m.album),
+            .artwork_url = copy_text(m.artwork_url),
+            .year = m.year,
+            .track = m.track,
+            .progress = copy_progress(m.progress)};
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+MetadataCopy copy_of(const ServerMetadataStateObject& m) {
+    return {.timestamp = m.timestamp,
+            .title = m.title,
+            .artist = m.artist,
+            .album_artist = m.album_artist,
+            .album = m.album,
+            .artwork_url = m.artwork_url,
+            .year = m.year,
+            .track = m.track,
+            .progress = copy_progress(m.progress)};
+}
+#pragma GCC diagnostic pop
+
+}  // namespace
+
 // MetadataRoleConfig: the listener is handed the text fields the role keeps and no value
 // for the others, and a kept field over its cap (roles/metadata/v1.md "server/state metadata
 // object") is cut to it at a character boundary, on every state that carries one: the warning the
-// connection logs once does not stand in for the value.
+// connection logs once does not stand in for the value. A state without text has none. Both
+// listener forms are handed the same content, and on_track_metadata()'s text views storage of its
+// own rather than the strings the deprecated on_metadata() is handed, which carry the same text.
 TEST(EncryptedLifecycle, MetadataKeepsTheConfiguredFieldsCutToTheirCaps) {
-    struct StateListener : MetadataRoleListener {
-        std::vector<ServerMetadataStateObject> states;
-        void on_metadata(const ServerMetadataStateObject& metadata) override {
-            this->states.push_back(metadata);
+    struct BothFormsListener : MetadataRoleListener {
+        std::vector<MetadataCopy> views;
+        std::vector<MetadataCopy> strings;
+        std::vector<const char*> view_titles;    // Where each view's title points
+        std::vector<const char*> string_titles;  // Where each deprecated title points
+        void on_track_metadata(const TrackMetadata& metadata) override {
+            this->views.push_back(copy_of(metadata));
+            this->view_titles.push_back(metadata.title.has_value() ? metadata.title->data()
+                                                                   : nullptr);
         }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        void on_metadata(const ServerMetadataStateObject& metadata) override {
+            this->strings.push_back(copy_of(metadata));
+            this->string_titles.push_back(metadata.title.has_value() ? metadata.title->data()
+                                                                     : nullptr);
+        }
+#pragma GCC diagnostic pop
     };
-    StateListener listener;  // Outlives the client
+    BothFormsListener listener;  // Outlives the client
     DispatchTestClient bundle(
         "Metadata Fields Test Client", SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE, nullptr,
         MetadataRoleConfig{.artist = false, .album_artist = false, .album = false});
@@ -2196,7 +2269,9 @@ TEST(EncryptedLifecycle, MetadataKeepsTheConfiguredFieldsCutToTheirCaps) {
                std::to_string(timestamp) + R"(,"title":")" + title +
                R"(","artist":"Band","album_artist":"Various","album":"Record",)"
                R"("artwork_url":")" +
-               url + R"(","year":1999}}})";
+               url +
+               R"(","year":1999,"track":4,"progress":{"track_progress":10,)"
+               R"("track_duration":2000,"playback_speed":1000}}}})";
     };
     // U+00E9 straddles the title's cap, so the cut lands before it.
     const std::string straddling = std::string(MAX_METADATA_TEXT_BYTES - 1, 'a') + "\xC3\xA9";
@@ -2208,27 +2283,77 @@ TEST(EncryptedLifecycle, MetadataKeepsTheConfiguredFieldsCutToTheirCaps) {
     bundle.pump();
     bundle.deliver(conn, state(3, std::string(MAX_METADATA_TEXT_BYTES + 1, 'b'), "http://x"));
     bundle.pump();
+    bundle.deliver(conn, R"({"type":"server/state","payload":{"metadata":{"timestamp":4}}})");
+    bundle.pump();
 
     struct Expected {
-        std::string title;
-        std::string artwork_url;
+        std::optional<std::string> title;
+        std::optional<std::string> artwork_url;
+        std::optional<uint16_t> year;
     };
     const Expected expected[] = {
-        {"Song", "http://example.com/art.jpg"},
+        {"Song", "http://example.com/art.jpg", 1999},
         {straddling.substr(0, MAX_METADATA_TEXT_BYTES - 1),
-         long_url.substr(0, MAX_METADATA_URL_BYTES)},
-        {std::string(MAX_METADATA_TEXT_BYTES, 'b'), "http://x"},
+         long_url.substr(0, MAX_METADATA_URL_BYTES), 1999},
+        {std::string(MAX_METADATA_TEXT_BYTES, 'b'), "http://x", 1999},
+        {std::nullopt, std::nullopt, std::nullopt},
     };
-    ASSERT_EQ(listener.states.size(), std::size(expected));
+    ASSERT_EQ(listener.views.size(), std::size(expected));
+    ASSERT_EQ(listener.strings.size(), std::size(expected));
     for (size_t i = 0; i < std::size(expected); ++i) {
         SCOPED_TRACE(i);
-        const ServerMetadataStateObject& got = listener.states[i];
+        const MetadataCopy& got = listener.views[i];
+        EXPECT_EQ(got.timestamp, static_cast<int64_t>(i + 1));
         EXPECT_EQ(got.title, expected[i].title);
         EXPECT_EQ(got.artwork_url, expected[i].artwork_url);
         EXPECT_EQ(got.artist, std::nullopt);
         EXPECT_EQ(got.album_artist, std::nullopt);
         EXPECT_EQ(got.album, std::nullopt);
-        EXPECT_EQ(got.year, 1999) << "a field that is not text is always kept";
+        EXPECT_EQ(got.year, expected[i].year) << "a field that is not text is always kept";
+        EXPECT_EQ(got.track.has_value(), expected[i].year.has_value());
+        EXPECT_EQ(got.progress.has_value(), expected[i].year.has_value());
+        EXPECT_TRUE(listener.strings[i] == got) << "the deprecated form carried other content";
+        if (expected[i].title.has_value()) {
+            EXPECT_NE(listener.view_titles[i], listener.string_titles[i])
+                << "the view reads the deprecated string";
+        }
+    }
+}
+
+// MetadataRole::get_track_duration_ms() reads the applied state's progress, whether or not a
+// listener is set: a state's track_duration while it is applied, 0 once a state without progress
+// replaces it, and 0 once the role's teardown (its cleanup(), the test thread playing the protocol
+// task) has been caught up on the main loop.
+TEST(EncryptedLifecycle, TrackDurationReadsTheAppliedStateWithOrWithoutAListener) {
+    const std::string with_progress =
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Song",)"
+        R"("progress":{"track_progress":10,"track_duration":2000,"playback_speed":0}}}})";
+    const std::string without_progress =
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":2,"title":"Song"}}})";
+    for (const bool with_listener : {true, false}) {
+        SCOPED_TRACE(with_listener ? "Control: with a listener" : "with no listener");
+        DispatchTestClient bundle("Track Duration Test Client");
+        MetadataRole& metadata = *bundle.client_ref().metadata();
+        if (!with_listener) {
+            metadata.set_listener(nullptr);
+        }
+        DispatchTestConnection& conn = bundle.connection();
+        bundle.admit(conn);
+
+        bundle.deliver(conn, with_progress);
+        bundle.pump();
+        EXPECT_EQ(metadata.get_track_duration_ms(), 2000U);
+        EXPECT_EQ(metadata.get_track_progress_ms(), 10U) << "paused: the snapshot";
+        bundle.deliver(conn, without_progress);
+        bundle.pump();
+        EXPECT_EQ(metadata.get_track_duration_ms(), 0U) << "a state without progress clears it";
+        bundle.deliver(conn, with_progress);
+        bundle.pump();
+        ASSERT_EQ(metadata.get_track_duration_ms(), 2000U);
+        metadata.impl_->cleanup();
+        bundle.pump();
+        EXPECT_EQ(metadata.get_track_duration_ms(), 0U) << "the teardown clears it";
+        EXPECT_EQ(metadata.get_track_progress_ms(), 0U);
     }
 }
 
@@ -2526,50 +2651,319 @@ TEST(EncryptedLifecycle, EveryRoleMessageTypeRunsThroughItsHandler) {
         << "the server/command never reached the player";
     EXPECT_EQ(player_listener.stream_starts, 1) << "the stream/start never reached the player";
     EXPECT_EQ(player_listener.stream_ends, 1);
-    ASSERT_TRUE(bundle.client_ref().get_group_state().group_name.has_value())
+    EXPECT_EQ(bundle.client_ref().group_state().group_name, "Kitchen")
         << "the group/update never reached its handler";
-    EXPECT_EQ(*bundle.client_ref().get_group_state().group_name, "Kitchen");
 }
+
+namespace {
+
+// A group state or delta as a listener form or getter handed it, its text copied, so the forms
+// compare
+struct GroupCopy {
+    std::optional<SendspinPlaybackState> playback_state;
+    std::optional<std::string> group_id;
+    std::optional<std::string> group_name;
+    bool operator==(const GroupCopy&) const = default;
+};
+
+GroupCopy copy_of(const GroupState& group) {
+    return {group.playback_state, copy_text(group.group_id), copy_text(group.group_name)};
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+GroupCopy copy_of(const GroupUpdateObject& group) {
+    return {group.playback_state, group.group_id, group.group_name};
+}
+
+/// The client's group state as the deprecated getter returns it
+GroupCopy deprecated_group_state(const SendspinClient& client) {
+    return copy_of(client.get_group_state());
+}
+#pragma GCC diagnostic pop
+
+}  // namespace
 
 // messaging.md "group/update": the delta the listener is handed and the client's group state carry
 // a conforming group_id as sent, and a UUID, which a server not yet sending the specified format
 // sends, as base64url of its SHA-256 (the value GroupIdIsKeptNormalizedOrRejected derives). The
-// delta carries only the fields its message did, while the group state keeps the others.
-TEST(EncryptedLifecycle, GroupIdReachesTheListenerAsSentOrNormalized) {
-    struct GroupListener : SendspinClientListener {
-        GroupUpdateObject delta;
-        void on_group_update(const GroupUpdateObject& group) override {
-            this->delta = group;
+// delta carries only the fields its message did, while the group state keeps the others; an empty
+// group_id and a null group_name clear their fields to empty, and a group_name over its cap is
+// cut. Both listener forms are handed the same delta and both getters return the same state, and
+// on_group_state() and group_state() view storage of their own rather than the strings of the
+// deprecated forms, which carry the same text.
+TEST(EncryptedLifecycle, GroupUpdateReachesBothFormsAsDeltaAndMergedState) {
+    struct BothFormsListener : SendspinClientListener {
+        std::optional<GroupCopy> view_delta;
+        std::optional<GroupCopy> string_delta;
+        const char* view_id{nullptr};    // Where the view's group_id points
+        const char* string_id{nullptr};  // Where the deprecated group_id points
+        void reset() {
+            this->view_delta.reset();
+            this->string_delta.reset();
         }
+        void on_group_state(const GroupState& changes) override {
+            this->view_delta = copy_of(changes);
+            this->view_id = changes.group_id.has_value() ? changes.group_id->data() : nullptr;
+        }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        void on_group_update(const GroupUpdateObject& group) override {
+            this->string_delta = copy_of(group);
+            this->string_id = group.group_id.has_value() ? group.group_id->data() : nullptr;
+        }
+#pragma GCC diagnostic pop
     };
-    GroupListener group_listener;  // Outlives the client
+    BothFormsListener group_listener;  // Outlives the client
     DispatchTestClient bundle("Group Id Test Client");
-    bundle.client_ref().set_listener(&group_listener);
+    SendspinClient& client = bundle.client_ref();
+    client.set_listener(&group_listener);
     DispatchTestConnection& conn = bundle.connection();
     bundle.admit(conn);
-    const GroupUpdateObject& state = bundle.client_ref().get_group_state();
 
-    // Control: a conforming id is held as sent.
     const std::string conforming = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN-_0";
-    bundle.deliver(conn, R"({"type":"group/update","payload":{"playback_state":"playing",)"
-                         R"("group_id":")" +
-                             conforming + R"(","group_name":"Kitchen"}})");
-    bundle.pump();
-    EXPECT_EQ(group_listener.delta.group_id, conforming);
-    EXPECT_EQ(group_listener.delta.group_name, "Kitchen");
-    EXPECT_EQ(state.group_id, conforming);
-
-    const std::string uuid_only =
-        R"({"type":"group/update","payload":{"group_id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301"}})";
     const std::string normalized = "FjYvVmOHs89abpL7Cphsdsog6zoMEsvfvQspUB4MGN8";
-    bundle.deliver(conn, uuid_only);
-    bundle.pump();
-    EXPECT_EQ(group_listener.delta.group_id, normalized);
-    EXPECT_EQ(group_listener.delta.group_name, std::nullopt);
-    EXPECT_EQ(group_listener.delta.playback_state, std::nullopt);
-    EXPECT_EQ(state.group_id, normalized);
-    EXPECT_EQ(state.group_name, "Kitchen");
-    EXPECT_EQ(state.playback_state, SendspinPlaybackState::PLAYING);
+    const std::string long_name = std::string(MAX_FRIENDLY_NAME_BYTES, 'n') + "tail";
+    const std::string cut_name = long_name.substr(0, MAX_FRIENDLY_NAME_BYTES);
+    constexpr auto PLAYING = SendspinPlaybackState::PLAYING;
+    constexpr auto STOPPED = SendspinPlaybackState::STOPPED;
+    struct Row {
+        const char* what;
+        std::string payload;
+        GroupCopy delta;
+        GroupCopy state;
+    };
+    const Row rows[] = {
+        {"Control: a conforming id is held as sent",
+         R"("playback_state":"playing","group_id":")" + conforming + R"(","group_name":"Kitchen")",
+         {PLAYING, conforming, "Kitchen"},
+         {PLAYING, conforming, "Kitchen"}},
+        {"a UUID is normalized, and the delta carries it alone",
+         R"("group_id":"3f2504e0-4f89-41d3-9a0c-0305e82c3301")",
+         {std::nullopt, normalized, std::nullopt},
+         {PLAYING, normalized, "Kitchen"}},
+        {"an empty id and a null name clear their fields",
+         R"("playback_state":"stopped","group_id":"","group_name":null)",
+         {STOPPED, "", ""},
+         {STOPPED, "", ""}},
+        {"a name over its cap is cut",
+         R"("group_name":")" + long_name + R"(")",
+         {std::nullopt, std::nullopt, cut_name},
+         {STOPPED, "", cut_name}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.what);
+        group_listener.reset();
+        bundle.deliver(conn, R"({"type":"group/update","payload":{)" + row.payload + "}}");
+        bundle.pump();
+        ASSERT_TRUE(group_listener.view_delta.has_value());
+        EXPECT_TRUE(*group_listener.view_delta == row.delta);
+        EXPECT_TRUE(group_listener.string_delta == group_listener.view_delta)
+            << "the deprecated delta carried other content";
+        const GroupState state = client.group_state();
+        EXPECT_TRUE(copy_of(state) == row.state);
+        EXPECT_TRUE(deprecated_group_state(client) == row.state);
+        if (!row.delta.group_id.value_or("").empty()) {
+            EXPECT_NE(group_listener.view_id, group_listener.string_id)
+                << "the delta's view reads the deprecated string";
+        }
+        if (!row.state.group_id.value_or("").empty()) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            EXPECT_NE(state.group_id->data(), client.get_group_state().group_id->data())
+                << "group_state() reads the deprecated string";
+#pragma GCC diagnostic pop
+        }
+    }
+}
+
+namespace {
+
+// Records the state callbacks a listener form overrides, in order: "<form> <text>", then, when
+// `interrupt` is set, runs it from that first callback and logs "read <text>", the callback's
+// argument read again after it. Main loop only.
+class FormLog {
+public:
+    std::vector<std::string> calls;
+    std::function<void()> interrupt;
+
+protected:
+    template <typename ReadFn>
+    void log_state(const char* form, ReadFn read) {
+        this->calls.push_back(std::string(form) + " " + read());
+        if (std::function<void()> run = std::exchange(this->interrupt, nullptr)) {
+            run();
+            this->calls.push_back("read " + read());
+        }
+    }
+};
+
+// The metadata title in each form; a clear logs "clear"
+class NewMetadataForm : public MetadataRoleListener, public FormLog {
+public:
+    void on_track_metadata(const TrackMetadata& m) override {
+        this->log_state("new", [&m] { return std::string(m.title.value_or("")); });
+    }
+    void on_metadata_clear() override {
+        this->calls.emplace_back("clear");
+    }
+};
+
+// The group name in each form
+class NewGroupForm : public SendspinClientListener, public FormLog {
+public:
+    void on_group_state(const GroupState& changes) override {
+        this->log_state("new", [&changes] { return std::string(changes.group_name.value_or("")); });
+    }
+};
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+class OldMetadataForm : public MetadataRoleListener, public FormLog {
+public:
+    void on_metadata(const ServerMetadataStateObject& m) override {
+        this->log_state("old", [&m] { return m.title.value_or(""); });
+    }
+    void on_metadata_clear() override {
+        this->calls.emplace_back("clear");
+    }
+};
+
+class BothMetadataForms : public NewMetadataForm {
+public:
+    void on_metadata(const ServerMetadataStateObject& m) override {
+        this->log_state("old", [&m] { return m.title.value_or(""); });
+    }
+};
+
+class OldGroupForm : public SendspinClientListener, public FormLog {
+public:
+    void on_group_update(const GroupUpdateObject& group) override {
+        this->log_state("old", [&group] { return group.group_name.value_or(""); });
+    }
+};
+
+class BothGroupForms : public NewGroupForm {
+public:
+    void on_group_update(const GroupUpdateObject& group) override {
+        this->log_state("old", [&group] { return group.group_name.value_or(""); });
+    }
+};
+#pragma GCC diagnostic pop
+
+}  // namespace
+
+// Each state reaches on_track_metadata() and then the deprecated on_metadata(), so a listener
+// overriding either gets it and one overriding both gets both, the new form first. A stop() from
+// on_track_metadata() delivers the clear in the callback, whose views still read the state, and
+// the deprecated form of the state the clear replaced does not follow. A teardown the protocol
+// task runs during on_track_metadata() (the test thread playing it, through the role's cleanup())
+// does not stop the deprecated form: its clear comes on the next drain.
+TEST(EncryptedLifecycle, EachMetadataListenerFormGetsTheStateNewFormFirst) {
+    NewMetadataForm new_form;
+    OldMetadataForm old_form;
+    BothMetadataForms both_forms;
+    BothMetadataForms both_forms_stopping;
+    BothMetadataForms both_forms_torn_down;
+    enum class Interrupt : uint8_t { NONE, STOP, TEARDOWN };
+    struct Row {
+        const char* what;
+        MetadataRoleListener* listener;
+        FormLog* log;
+        Interrupt interrupt;
+        std::vector<std::string> calls;       // After the loop() that applies the state
+        std::vector<std::string> next_calls;  // Added by the loop() after it
+    };
+    const Row rows[] = {
+        {"on_track_metadata() alone", &new_form, &new_form, Interrupt::NONE, {"new Song"}, {}},
+        {"on_metadata() alone", &old_form, &old_form, Interrupt::NONE, {"old Song"}, {}},
+        {"Control: both, the new form first",
+         &both_forms,
+         &both_forms,
+         Interrupt::NONE,
+         {"new Song", "old Song"},
+         {}},
+        {"stop() from on_track_metadata()",
+         &both_forms_stopping,
+         &both_forms_stopping,
+         Interrupt::STOP,
+         {"new Song", "clear", "read Song"},
+         {}},
+        {"the protocol task's teardown during on_track_metadata()",
+         &both_forms_torn_down,
+         &both_forms_torn_down,
+         Interrupt::TEARDOWN,
+         {"new Song", "read Song", "old Song"},
+         {"clear"}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.what);
+        DispatchTestClient bundle("Metadata Form Test Client");
+        SendspinClient& client = bundle.client_ref();
+        client.metadata()->set_listener(row.listener);
+        if (row.interrupt == Interrupt::STOP) {
+            row.log->interrupt = [&client] { client.stop(); };
+        } else if (row.interrupt == Interrupt::TEARDOWN) {
+            row.log->interrupt = [&client] { client.metadata()->impl_->cleanup(); };
+        }
+        DispatchTestConnection& conn = bundle.connection();
+        bundle.admit(conn);
+        bundle.deliver(conn, metadata_state_json(1, "Song"));
+        // One drain at a time: a teardown's clear waits for the drain after the one that queued it.
+        client.loop();
+        EXPECT_EQ(row.log->calls, row.calls);
+        std::vector<std::string> after = row.calls;
+        after.insert(after.end(), row.next_calls.begin(), row.next_calls.end());
+        client.loop();
+        EXPECT_EQ(row.log->calls, after);
+    }
+}
+
+// The group twin of EachMetadataListenerFormGetsTheStateNewFormFirst: each group/update reaches
+// on_group_state() and then the deprecated on_group_update(), and a stop() from on_group_state()
+// clears the group state with the deprecated form of the update not following.
+TEST(EncryptedLifecycle, EachGroupListenerFormGetsTheUpdateNewFormFirst) {
+    NewGroupForm new_form;
+    OldGroupForm old_form;
+    BothGroupForms both_forms;
+    BothGroupForms both_forms_stopping;
+    struct Row {
+        const char* what;
+        SendspinClientListener* listener;
+        FormLog* log;
+        bool stop;
+        std::vector<std::string> calls;
+    };
+    const Row rows[] = {
+        {"on_group_state() alone", &new_form, &new_form, false, {"new Kitchen"}},
+        {"on_group_update() alone", &old_form, &old_form, false, {"old Kitchen"}},
+        {"Control: both, the new form first",
+         &both_forms,
+         &both_forms,
+         false,
+         {"new Kitchen", "old Kitchen"}},
+        {"stop() from on_group_state()",
+         &both_forms_stopping,
+         &both_forms_stopping,
+         true,
+         {"new Kitchen", "read Kitchen"}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.what);
+        DispatchTestClient bundle("Group Form Test Client");
+        SendspinClient& client = bundle.client_ref();
+        client.set_listener(row.listener);
+        if (row.stop) {
+            row.log->interrupt = [&client] { client.stop(); };
+        }
+        DispatchTestConnection& conn = bundle.connection();
+        bundle.admit(conn);
+        bundle.deliver(conn, R"({"type":"group/update","payload":{"group_name":"Kitchen"}})");
+        bundle.pump();
+        EXPECT_EQ(row.log->calls, row.calls);
+        EXPECT_EQ(client.group_state().group_name,
+                  row.stop ? std::nullopt : std::optional<std::string_view>("Kitchen"));
+    }
 }
 
 // Role traffic reaches a role only from the admitted connection that owns it, not from any
@@ -3270,7 +3664,7 @@ TEST(EncryptedLifecycle, APlayingGroupDoesNotMakeAnIdleServerTheLastPlaybackOne)
     tick(client);
     tick(client);
 
-    ASSERT_EQ(client.get_group_state().playback_state, SendspinPlaybackState::PLAYING)
+    ASSERT_EQ(client.group_state().playback_state, SendspinPlaybackState::PLAYING)
         << "the group/update never reached the client";
     EXPECT_FALSE(persistence.blob(persistence_keys::LAST_PLAYED).has_value())
         << "a server that never declared 'playback' became the last-playback server";

@@ -89,8 +89,8 @@ public:
     SourceRole(SourceRoleConfig config, SendspinClient* client);
     ~SourceRole();
 
-    /// @brief Sets the listener for source events; it must outlive this role. Main loop, before
-    /// SendspinClient::start().
+    /// @brief Sets the listener for source events; it must outlive this role. Main loop only:
+    /// set it before SendspinClient::start() and leave it in place while the client runs.
     void set_listener(SourceRoleListener* listener);
 
     /// @brief Writes captured audio into the input stream

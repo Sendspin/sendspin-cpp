@@ -202,15 +202,30 @@ struct HighPerformanceRequests {
     return true;
 }
 
+/// @brief The public view of `group`, its text viewing the payload's inline storage
+GroupState group_state_of(const GroupUpdatePayload& group) {
+    return {.playback_state = group.playback_state,
+            .group_id = optional_view(group.group_id),
+            .group_name = optional_view(group.group_name)};
+}
+
 }  // namespace
 
 /// @brief The main-loop-bound channels the client itself owns, beside the roles' own slots
 struct SendspinClient::EventState {
     Inbox inbox;
     InboxSlot<GroupUpdatePayload> group_slot{inbox, INBOX_TOPIC_GROUP};
-    /// The delta on_group_update() is handed, filled in place from each group_slot payload. Main
-    /// loop only, like the text storage below that it and the client's group state fill from.
+    /// The client's group state, every group_slot payload the drain applied merged into it,
+    /// which group_state() views. Main loop only.
+    GroupUpdatePayload group_state;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    /// The deprecated public forms of group_state and of each applied payload: the state
+    /// get_group_state() returns and the delta on_group_update() is handed, filled in place with
+    /// the text storage below. Main loop only.
+    GroupUpdateObject group_state_object;
     GroupUpdateObject group_delta;
+#pragma GCC diagnostic pop
     ReservedText delta_group_id{PEER_ID_SIZE};
     ReservedText delta_group_name{MAX_FRIENDLY_NAME_BYTES};
     ReservedText state_group_id{PEER_ID_SIZE};
@@ -248,29 +263,36 @@ struct SendspinClient::EventState {
             [&note](std::vector<PairingNote>& current) { current.push_back(note); });
     }
 
-    /// @brief Applies `payload` to the client's group state `state` and fills group_delta with
-    /// it, both in place. Main loop only.
-    void apply_group_update(GroupUpdateObject& state, const GroupUpdatePayload& payload) {
-        if (payload.playback_state.has_value()) {
-            state.playback_state = payload.playback_state;
-        }
-        if (payload.group_id.has_value()) {
-            this->state_group_id.fill(state.group_id, payload.group_id->view());
-        }
-        if (payload.group_name.has_value()) {
-            this->state_group_name.fill(state.group_name, payload.group_name->view());
-        }
+    /// @brief Merges `payload` into group_state and refills group_state_object from it. Main loop
+    /// only.
+    void apply_group_update(const GroupUpdatePayload& payload) {
+        apply_group_update_deltas(&this->group_state, payload);
+        this->group_state_object.playback_state = this->group_state.playback_state;
+        this->state_group_id.fill(this->group_state_object.group_id,
+                                  optional_view(this->group_state.group_id));
+        this->state_group_name.fill(this->group_state_object.group_name,
+                                    optional_view(this->group_state.group_name));
+    }
+
+    /// @brief Fills group_delta from `payload` and hands it to the deprecated on_group_update().
+    /// Main loop only.
+    void deliver_group_update(SendspinClientListener& listener, const GroupUpdatePayload& payload) {
         this->group_delta.playback_state = payload.playback_state;
         this->delta_group_id.fill(this->group_delta.group_id, optional_view(payload.group_id));
         this->delta_group_name.fill(this->group_delta.group_name,
                                     optional_view(payload.group_name));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        listener.on_group_update(this->group_delta);
+#pragma GCC diagnostic pop
     }
 
-    /// @brief Clears the client's group state `state`, keeping its text storage. Main loop only.
-    void clear_group_state(GroupUpdateObject& state) {
-        state.playback_state.reset();
-        this->state_group_id.fill(state.group_id, std::nullopt);
-        this->state_group_name.fill(state.group_name, std::nullopt);
+    /// @brief Clears the client's group state, keeping its text storage. Main loop only.
+    void clear_group_state() {
+        this->group_state = {};
+        this->group_state_object.playback_state.reset();
+        this->state_group_id.fill(this->group_state_object.group_id, std::nullopt);
+        this->state_group_name.fill(this->group_state_object.group_name, std::nullopt);
     }
 };
 
@@ -588,11 +610,11 @@ void SendspinClient::stop() {
     //    leaves behind is the state a restart begins from. The drain generation bump abandons
     //    the events a drain frame further up the stack (a listener that called stop()) copied
     //    out before this teardown. The group slot is reset too, so the drain below cannot
-    //    repopulate group_state_ from a delta that arrived before the stop.
+    //    repopulate the group state from a delta that arrived before the stop.
     ++this->event_state_->drain_generation;
     this->cleanup_connection_state(ALL_ROLES_MASK);
     this->task_state_->client_state.reset();
-    this->event_state_->clear_group_state(this->group_state_);
+    this->event_state_->clear_group_state();
 
     // A pairing attempt cut short by the stop leaves its code or pairing-window prompt showing.
     // Queue the dismissals now, after cleanup_connection_state() dropped the pending notes, so the
@@ -1178,23 +1200,26 @@ void SendspinClient::drain_inbox() {
     if (!overtaken() && (slot_bits & INBOX_TOPIC_GROUP) != 0) {
         GroupUpdatePayload payload;
         if (es.group_slot.take(payload)) {
-            es.apply_group_update(this->group_state_, payload);
-
-            if (this->listener_) {
-                this->listener_->on_group_update(es.group_delta);
-            }
+            es.apply_group_update(payload);
 
             // Both texts are bounded at parse (IdText, ServerName), so they print whole.
-            const GroupUpdateObject& group = this->group_state_;
-            const std::string_view id =
-                group.group_id.has_value() ? std::string_view(*group.group_id) : "";
-            const std::string_view name =
-                group.group_name.has_value() ? std::string_view(*group.group_name) : "";
+            const GroupState group = this->group_state();
+            const std::string_view id = group.group_id.value_or("");
+            const std::string_view name = group.group_name.value_or("");
             SS_LOGD(TAG, "Group update - state: %s, id: %.*s, name: %.*s",
                     group.playback_state.has_value() ? to_cstr(group.playback_state.value())
                                                      : "unchanged",
                     static_cast<int>(id.size()), id.data(), static_cast<int>(name.size()),
                     name.data());
+
+            if (this->listener_) {
+                this->listener_->on_group_state(group_state_of(payload));
+                // A stop() from on_group_state() cleared the group state, so the deprecated form
+                // of the update must not follow.
+                if (!overtaken()) {
+                    es.deliver_group_update(*this->listener_, payload);
+                }
+            }
         }
     }
 }
@@ -1335,6 +1360,17 @@ int64_t SendspinClient::get_client_time(int64_t server_time) const {
 std::optional<ServerInformationObject> SendspinClient::get_server_information() const {
     return this->connection_manager_->server_information();
 }
+
+GroupState SendspinClient::group_state() const {
+    return group_state_of(this->event_state_->group_state);
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+const GroupUpdateObject& SendspinClient::get_group_state() const {
+    return this->event_state_->group_state_object;
+}
+#pragma GCC diagnostic pop
 
 // ============================================================================
 // State updates

@@ -197,8 +197,7 @@ public:
     void on_metadata_clear() override {
         ++this->clears;
         this->started_during_clear = this->client_.is_started();
-        this->group_had_state_during_clear =
-            this->client_.get_group_state().playback_state.has_value();
+        this->group_had_state_during_clear = this->client_.group_state().playback_state.has_value();
         this->start_result_during_clear = this->client_.start();
         this->client_.stop();                                       // Must be ignored, not recurse
         this->client_.disconnect(SendspinGoodbyeReason::SHUTDOWN);  // Must be ignored
@@ -217,9 +216,15 @@ private:
 /// A metadata listener that must never be called; every callback aborts the test.
 class ForbiddenMetadataListener : public MetadataRoleListener {
 public:
+    void on_track_metadata(const TrackMetadata& /*metadata*/) override {
+        ADD_FAILURE() << "on_track_metadata() fired on a listener the consumer already released";
+    }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     void on_metadata(const ServerMetadataStateObject& /*metadata*/) override {
         ADD_FAILURE() << "on_metadata() fired on a listener the consumer already released";
     }
+#pragma GCC diagnostic pop
     void on_metadata_clear() override {
         ADD_FAILURE() << "on_metadata_clear() fired on a listener the consumer already released";
     }
@@ -259,16 +264,23 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
 
         // Some group state for stop() to reset.
         ASSERT_TRUE(server->send_app_json(group_update_playing_json()));
-        pump_until(client, [&] { return client.get_group_state().playback_state.has_value(); });
+        pump_until(client, [&] { return client.group_state().playback_state.has_value(); });
 
         client.stop();
 
         EXPECT_FALSE(client.is_started());
         EXPECT_FALSE(client.is_connected());
         EXPECT_FALSE(client.get_server_information().has_value());
-        EXPECT_FALSE(client.get_group_state().playback_state.has_value());
-        EXPECT_FALSE(client.get_group_state().group_id.has_value());
-        EXPECT_FALSE(client.get_group_state().group_name.has_value());
+        EXPECT_FALSE(client.group_state().playback_state.has_value());
+        EXPECT_FALSE(client.group_state().group_id.has_value());
+        EXPECT_FALSE(client.group_state().group_name.has_value());
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        const GroupUpdateObject& deprecated_group = client.get_group_state();
+        EXPECT_FALSE(deprecated_group.playback_state.has_value());
+        EXPECT_FALSE(deprecated_group.group_id.has_value());
+        EXPECT_FALSE(deprecated_group.group_name.has_value());
+#pragma GCC diagnostic pop
         // The peer received its goodbye and the close, in that order.
         wait_until([&] { return server->closed(); });
         EXPECT_EQ(server->goodbye_reason().value_or(""), "shutdown");
@@ -414,7 +426,7 @@ TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
         pump_until(client, [&] { return client.is_connected(); });
         // Group state the callback must already see reset.
         ASSERT_TRUE(server->send_app_json(group_update_playing_json()));
-        pump_until(client, [&] { return client.get_group_state().playback_state.has_value(); });
+        pump_until(client, [&] { return client.group_state().playback_state.has_value(); });
 
         client.stop();
 
@@ -2376,7 +2388,7 @@ public:
     void on_controller_state_clear() override {
         this->calls.push_back("clear");
     }
-    void on_metadata(const ServerMetadataStateObject& metadata) override {
+    void on_track_metadata(const TrackMetadata& metadata) override {
         this->calls.push_back("state " + std::to_string(metadata.year.value_or(0)));
     }
     void on_metadata_clear() override {
@@ -2536,7 +2548,7 @@ const StateRoleAccess STATE_ROLES[] = {
      [](SendspinClient& c) { c.metadata_->impl_->drain_events(); },
      [](SendspinClient& c) { return c.metadata_->impl_->cleanup_generation.load(); },
      [](SendspinClient& c, const StateRoleLog&) {
-         return static_cast<uint8_t>(c.metadata_->impl_->metadata.year.value_or(0));
+         return static_cast<uint8_t>(c.metadata_->impl_->current.payload.year.value_or(0));
      },
      true, false},
     {"color",
@@ -2870,14 +2882,14 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
 // test thread plays: same-window arrivals (a third replacing the scheduled second), a pending
 // state replaced by an arrival, a teardown with states pending, a state stamped before it, an
 // arrival between a drain's peek and its commit (from the clear its catch-up delivers), a pending
-// state that falls due in the callback of the state before it, stop() from on_metadata(), and a
-// restart. Reaches the role's private state because which block each place names and which state
-// waits show nowhere else before a deadline the test never reaches; the primary clock is installed
-// by hand, so a scheduled state waits for its deadline without a server.
+// state that falls due in the callback of the state before it, stop() from on_track_metadata(),
+// and a restart. Reaches the role's private state because which block each place names and which
+// state waits show nowhere else before a deadline the test never reaches; the primary clock is
+// installed by hand, so a scheduled state waits for its deadline without a server.
 TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
     struct TitleLog : MetadataRoleListener {
-        void on_metadata(const ServerMetadataStateObject& metadata) override {
-            this->titles.push_back(metadata.title.value_or(""));
+        void on_track_metadata(const TrackMetadata& metadata) override {
+            this->titles.emplace_back(metadata.title.value_or(""));
             if (this->on_title) {
                 std::exchange(this->on_title, nullptr)(this->titles.back());
             }

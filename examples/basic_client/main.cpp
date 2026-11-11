@@ -77,6 +77,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -418,10 +419,11 @@ int main(int argc, char* argv[]) {
 
 #ifdef SENDSPIN_ENABLE_METADATA
     struct BasicMetadataListener : MetadataRoleListener {
-        void on_metadata(const ServerMetadataStateObject& md) override {
+        void on_track_metadata(const TrackMetadata& md) override {
             if (md.title.has_value()) {
-                fprintf(stderr, ">>> Metadata: %s - %s\n",
-                        md.artist.value_or("Unknown").c_str(), md.title->c_str());
+                const std::string_view artist = md.artist.value_or("Unknown");
+                fprintf(stderr, ">>> Metadata: %.*s - %.*s\n", static_cast<int>(artist.size()),
+                        artist.data(), static_cast<int>(md.title->size()), md.title->data());
             }
         }
     };

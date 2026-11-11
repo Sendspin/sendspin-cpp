@@ -147,8 +147,8 @@ endif()
 # visualizer's handle_stream_start(), each role's cleanup()) and drain step (drain_events(), the
 # visualizer's catch_up_teardown()), writes the generation-stamped slots (event_state, artwork's
 # display_slot under its slot_epochs) and queues a STREAM_START (enqueue_stream_event()) with an
-# old stamp, and reads cleanup_generation and the applied state (controller_state, metadata,
-# color, the player's stream_active, current_stream_params and volume); its player runs with the
+# old stamp, and reads cleanup_generation and the applied state (controller_state, the metadata
+# role's current, color, the player's stream_active, current_stream_params and volume); its player runs with the
 # sync thread stopped and the item list bound by hand (SyncTask's stop() and inbound_), so a
 # STREAM_END never waits for a thread to go idle. The high-performance grant tables
 # play the protocol task's run_time_sync() on a stand-in in the admitted slot (find_admitted(),
@@ -334,6 +334,10 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #   - MetadataRole::impl_'s slot places (ScheduledStateSlot::slot_, read under the Inbox mutex)
 #     and text_of(): which state waits for a deadline the test never reaches shows nowhere else
 #     before that deadline.
+#   - MetadataRole::impl_'s cleanup(), the protocol task's half of a teardown, run on the test
+#     thread as the dispatch fixtures run the protocol task's handlers: from inside a listener
+#     callback, to show the deprecated form still follows a teardown that is not the listener's
+#     own stop(), and to show the progress getters read 0 once a teardown is caught up.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

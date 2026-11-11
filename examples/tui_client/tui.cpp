@@ -1113,7 +1113,7 @@ void update_polled_state(TuiState& state, SendspinClient& client) {
     state.player_volume = client.player() ? client.player()->get_volume() : 0;
     state.player_muted = client.player() ? client.player()->get_muted() : false;
 #endif
-    state.group_name = client.get_group_state().group_name.value_or("");
+    state.group_name = client.group_state().group_name.value_or("");
 
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     if (client.controller()) {

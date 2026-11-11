@@ -105,7 +105,8 @@ public:
     explicit ColorRole(SendspinClient* client);
     ~ColorRole();
 
-    /// @brief Sets the listener for color events; it must outlive this role
+    /// @brief Sets the listener for color events; it must outlive this role. Set it before
+    /// SendspinClient::start() and leave it in place while the client runs.
     void set_listener(ColorRoleListener* listener);
 
 private:

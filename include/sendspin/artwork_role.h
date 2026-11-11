@@ -165,7 +165,8 @@ public:
     ArtworkRole(ArtworkRoleConfig config, SendspinClient* client);
     ~ArtworkRole();
 
-    /// @brief Sets the listener for artwork events; it must outlive this role
+    /// @brief Sets the listener for artwork events; it must outlive this role. Set it before
+    /// SendspinClient::start() and leave it in place while the client runs.
     void set_listener(ArtworkRoleListener* listener);
 
     /// @brief Acknowledges the most recent delivery for an ack-gated slot, releasing the gate

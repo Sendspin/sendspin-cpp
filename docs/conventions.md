@@ -185,11 +185,13 @@ checklists in `.claude/skills/` apply these standards to a diff.
   is bounded where it is parsed: read in place, refused past its cap, or cut to
   its field's size. Peer text a log line prints that no field bounds (a type, a
   reason, an unrecognized value) is cut to `PEER_TEXT_LOG_BYTES`
-  (`peer_text_for_log()`). A public type keeps `std::string` and `std::vector`; where
-  its value has a bound, the library holds it inline and builds the public
-  type on the thread that hands it to the consumer. `docs/internals.md`
-  "Memory" lists the `operator new` allocations that remain after `start()`,
-  and `sendspin_alloc_tests` counts them on the paths it walks.
+  (`peer_text_for_log()`). Bounded text in a public type built for views
+  (`TrackMetadata`, `GroupState`) is a `std::string_view` into storage the
+  library keeps, valid for as long as its declaration says; a public type
+  still holding `std::string` or `std::vector` is built from the inline value
+  on the thread that hands it to the consumer. `docs/internals.md` "Memory"
+  lists the `operator new` allocations that remain after `start()`, and
+  `sendspin_alloc_tests` counts them on the paths it walks.
 - Buffer and queue capacities are justified numbers. Derive related constants
   from each other (`constexpr size_t X = Y / 4;`) so they cannot drift apart,
   and do not grow a budget without recording why.

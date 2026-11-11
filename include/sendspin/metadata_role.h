@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace sendspin {
 
@@ -39,11 +40,29 @@ struct MetadataProgressObject {
     uint32_t playback_speed;
 };
 
-/// @brief Track metadata and playback state received from the server
+/// @brief Track metadata and playback state received from the server, handed to
+/// MetadataRoleListener::on_track_metadata()
 ///
-/// Each text field is at most 255 bytes in UTF-8 (artwork_url 2048), cut at a character boundary,
-/// and has no value when its MetadataRoleConfig flag is false.
-struct ServerMetadataStateObject {
+/// Each text field views at most 255 bytes of UTF-8 (artwork_url 2048), cut at a character
+/// boundary, and has no value when its MetadataRoleConfig flag is false. The views are valid for
+/// the duration of the callback; copy what is needed past it.
+struct TrackMetadata {
+    int64_t timestamp{};
+    std::optional<std::string_view> title{};
+    std::optional<std::string_view> artist{};
+    std::optional<std::string_view> album_artist{};
+    std::optional<std::string_view> album{};
+    std::optional<std::string_view> artwork_url{};
+    std::optional<uint16_t> year{};
+    std::optional<uint16_t> track{};
+    std::optional<MetadataProgressObject> progress{};
+};
+
+/// @brief TrackMetadata with each text field copied into a std::string
+/// @deprecated Use TrackMetadata, handed to MetadataRoleListener::on_track_metadata(); removed in
+/// v0.11.0.
+struct [[deprecated(
+    "use TrackMetadata and on_track_metadata(); removed in v0.11.0")]] ServerMetadataStateObject {
     int64_t timestamp{};
     std::optional<std::string> title;
     std::optional<std::string> artist;
@@ -60,8 +79,16 @@ class MetadataRoleListener {
 public:
     virtual ~MetadataRoleListener() = default;
 
-    /// @brief Called when metadata is updated by the server
-    virtual void on_metadata(const ServerMetadataStateObject& /*metadata*/) {}
+    /// @brief Called when the server's metadata state is applied
+    ///
+    /// The library calls this and then the deprecated on_metadata() for each state: override one
+    /// of them. A listener overriding both gets both, this one first.
+    virtual void on_track_metadata(const TrackMetadata& /*metadata*/) {}
+
+    /// @brief Called after on_track_metadata() with the same state
+    /// @deprecated Override on_track_metadata(); removed in v0.11.0.
+    [[deprecated("override on_track_metadata(); removed in v0.11.0")]] virtual void on_metadata(
+        const ServerMetadataStateObject& /*metadata*/) {}
 
     /// @brief Called when the cached metadata is dropped: the connection to the server was lost,
     /// or a server/activate took the metadata role out of the session's active roles
@@ -69,7 +96,7 @@ public:
     /// Implementations should clear any displayed track metadata, since the previous state is no
     /// longer valid. Idempotent by contract: a second clear with nothing to clear must be a
     /// no-op. A role removed from an active session
-    /// can be added back by a later activation, which resumes with a fresh on_metadata().
+    /// can be added back by a later activation, which resumes with a fresh on_track_metadata().
     virtual void on_metadata_clear() {}
 };
 
@@ -93,7 +120,7 @@ public:
  *
  * @code
  * struct MyMetadataListener : MetadataRoleListener {
- *     void on_metadata(const ServerMetadataStateObject& m) override {
+ *     void on_track_metadata(const TrackMetadata& m) override {
  *         if (m.title) display_title(*m.title);
  *         if (m.artist) display_artist(*m.artist);
  *     }
@@ -116,7 +143,8 @@ public:
     MetadataRole(MetadataRoleConfig config, SendspinClient* client);
     ~MetadataRole();
 
-    /// @brief Sets the listener for metadata events; it must outlive this role
+    /// @brief Sets the listener for metadata events; it must outlive this role. Set it before
+    /// SendspinClient::start() and leave it in place while the client runs.
     void set_listener(MetadataRoleListener* listener);
 
     /// @brief Returns the track duration in milliseconds, or 0 if unknown or the stream is live
