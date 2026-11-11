@@ -144,10 +144,10 @@ The tick returns the milliseconds until the earliest of its timers: a nursery en
 While the client is stopped, `SendspinClient::loop()` only frees the outbound attempts `stop()` left parked (`ConnectionManager::reap_finished()`). While started, each call polls the network provider (`poll_network_provider()`, which wakes the protocol task when the network comes up) and then runs `drain_inbox()`, which `stop()` also calls once so teardown callbacks are delivered synchronously:
 
 ```api
-1. Each role catches up to its current teardown generation (catch_up_teardown()): one
-   acquire load per role
-2. The server information server_slot carries, into the copy server_information() views; then
-   the high-performance requests: every acquire, the grant for them, then every release
+1. The server information server_slot carries, into the copy server_information() views; then
+   each role catches up to its current teardown generation (catch_up_teardown()): one acquire
+   load per role
+2. The high-performance requests: every acquire, the grant for them, then every release
 3. The time-sync report: on_time_sync_updated()
 4. The inbox event ring; each event's role first catches up on the teardown the event is
    stamped with (catch_up_teardown())

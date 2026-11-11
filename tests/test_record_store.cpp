@@ -1930,9 +1930,11 @@ TEST(SendspinClientIdentity, PairingTokenCarriesTheConfiguredPairingPsk) {
         EXPECT_FALSE(client.format_pairing_token(configured).has_value());
         ASSERT_TRUE(client.start());
 
-        const auto& client_key = client.identity_->public_bytes;
-        const std::string stored_token(format_pairing_token(client_key, stored.psk).view());
-        const std::string configured_token(format_pairing_token(client_key, configured).view());
+        const std::optional<std::array<uint8_t, X25519_KEY_SIZE>> client_key =
+            public_key_from_peer_id(client.client_id());
+        ASSERT_TRUE(client_key.has_value());
+        const std::string stored_token(format_pairing_token(*client_key, stored.psk).view());
+        const std::string configured_token(format_pairing_token(*client_key, configured).view());
         const std::string& in_use = configure ? configured_token : stored_token;
         EXPECT_EQ(token_text(client.client_pairing_token()), in_use);
         EXPECT_EQ(client.pairing_token(), in_use);

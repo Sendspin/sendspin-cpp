@@ -167,7 +167,10 @@ endif()
 # (protocol_task_->stop()), since no public call produces each abort reason and code format on
 # demand. The server information table hands the main loop two servers between drains as
 # ConnectionManager::refresh_published_state() does (note_server_information()), since no public
-# call changes the primary twice inside one main-loop tick. The stream-events table drives the
+# call changes the primary twice inside one main-loop tick. A second test also queues the metadata
+# role's teardown (its cleanup()) beside the server going to none, so its clear callback reads
+# server_information() as the drain delivers it, since no public call stages both in one tick.
+# The stream-events table drives the
 # player's handle_stream_start() and handle_stream_end() as the task would, and stages one
 # interleaving by waiting on the sync task's item list and the player's sync-idle topic bit, and its
 # clear row calls handle_stream_clear() the same way. The next-stream header table plays the sync
@@ -258,9 +261,7 @@ set_source_files_properties(test_inbound_ring.cpp PROPERTIES COMPILE_OPTIONS -fn
 # test_record_store.cpp reads records_ directly and calls the store's private locked-context
 # lookups (record_by_psk_id, record_by_server_id); the store deliberately exposes no copying
 # accessor for them, since nothing in the library needs one. It also reads the address of
-# records_'s block, the only sign of whether a change after construction reallocated it. The
-# pairing token test reads SendspinClient::identity_ for the client's public key, so it builds the
-# expected token with the library's encoder rather than through the getters it checks.
+# records_'s block, the only sign of whether a change after construction reallocated it.
 set_source_files_properties(test_record_store.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and

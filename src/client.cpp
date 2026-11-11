@@ -1009,6 +1009,15 @@ void SendspinClient::drain_inbox() {
 #endif
     };
 
+    // --- Server information ---
+    // First, ahead of the teardown catch-up's clear callbacks, so every callback this drain makes
+    // reads the server as of the drain's start. A later tick can change it while the drain runs,
+    // so a group or metadata update delivered further down may come from a newer server than
+    // server_information() reads until the next loop().
+    if ((es.inbox.poll() & INBOX_TOPIC_SERVER) != 0) {
+        (void)es.server_slot.take(es.server_information);
+    }
+
     // Each role catches up on the teardowns the protocol task ran since the last drain: one
     // acquire load per role. Event dispatch and the role drains catch up on their own, at the
     // stamp they act on; this pass covers a teardown whose stamped *_CLEARED event the full event
@@ -1019,14 +1028,6 @@ void SendspinClient::drain_inbox() {
     catch_up_roles(nullptr);
 
     const uint32_t inbox_bits = es.inbox.poll();
-
-    // --- Server information ---
-    // First, so the callbacks this drain makes read the server as of the drain's start. A later
-    // tick can change it while the drain runs, so a group or metadata update delivered further
-    // down may come from a newer server than server_information() reads until the next loop().
-    if (inbox_bits & INBOX_TOPIC_SERVER) {
-        (void)es.server_slot.take(es.server_information);
-    }
 
     // --- High-performance requests (time bursts) ---
     if (inbox_bits & INBOX_TOPIC_HIGH_PERFORMANCE) {

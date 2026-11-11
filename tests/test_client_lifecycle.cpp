@@ -3465,6 +3465,43 @@ TEST(ClientLifecycle, ServerInformationTakesTheLatestPrimary) {
     }
 }
 
+// The clear a teardown delivers reads the server the same tick left: a connection's loss publishes
+// "none" beside the role's teardown, and the drain takes the server before its catch-up fires the
+// clear. The test thread plays the protocol task's two halves of that tick.
+TEST(ClientLifecycle, AClearReadsTheServerItsTeardownLeft) {
+    struct ClearLog : MetadataRoleListener {
+        void on_metadata_clear() override {
+            this->server_seen = this->client->server_information().has_value();
+            ++this->clears;
+        }
+        SendspinClient* client{nullptr};
+        bool server_seen{true};
+        int clears{0};
+    };
+    PublishedServer server;
+    ASSERT_TRUE(server.server_id.assign("Y2xlYXItcmVhZHMtdGhlLXNlcnZlci10ZXN0LWlkLTQ"));
+    ASSERT_TRUE(server.name.assign("Lost"));
+    TestNetworkProvider network;
+    SendspinClient client(make_config(0));
+    client.set_network_provider(&network);
+    ClearLog log;
+    log.client = &client;
+    client.add_metadata().set_listener(&log);
+    ASSERT_TRUE(client.start());
+    client.protocol_task_->stop();
+
+    client.note_server_information(&server);
+    client.loop();
+    ASSERT_TRUE(client.server_information().has_value()) << "Control: the server is current";
+
+    client.note_server_information(nullptr);
+    client.metadata_->impl_->cleanup();
+    client.loop();
+    ASSERT_EQ(log.clears, 1);
+    EXPECT_FALSE(log.server_seen) << "the clear read the server its connection's loss replaced";
+    client.stop();
+}
+
 // ============================================================================
 // The high-performance grant
 // ============================================================================

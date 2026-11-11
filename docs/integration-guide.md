@@ -1199,7 +1199,7 @@ int64_t client_ts = client.get_client_time(server_timestamp);
 
 ## Deprecated String API
 
-The view forms hand the metadata, group, pairing and server text over as `std::string_view` into storage the library keeps, and the pairing token as a `std::array`; the deprecated forms copy it into `std::string`. The `std::string` forms are deprecated in v0.10.0 and removed in v0.11.0; naming one of them draws a `-Wdeprecated-declarations` warning.
+The view forms hand the metadata, group, pairing and server text over as `std::string_view` into storage the library keeps, and the pairing token as a `std::array`; the deprecated forms copy it into `std::string`. The `std::string` forms are deprecated in v0.10.0 and removed in v0.11.0. Using a deprecated type or calling a deprecated getter draws a `-Wdeprecated-declarations` warning, but overriding a deprecated callback does not: the metadata and group callbacks warn only because their parameter types are deprecated, and the four pairing callbacks (`on_pairing_started()`, `on_pairing_succeeded()`, `on_pairing_failed()`, `on_display_pairing_code()`) take none, so search for those names. Mark every override `override`, so that a callback removed in v0.11.0 fails to compile rather than silently going uncalled.
 
 | Deprecated | Replacement |
 |---|---|
