@@ -703,18 +703,20 @@ public:
     // Listener and provider setters
     // ========================================
 
-    /// @brief Sets the listener for client events. The listener must outlive this client
+    /// @brief Sets the listener for client events. The listener must outlive this client. Set it
+    /// before start() and leave it in place while the client runs.
     void set_listener(SendspinClientListener* listener) {
         this->listener_ = listener;
     }
 
-    /// @brief Sets the network provider (required before start())
-    /// The provider must outlive this client
+    /// @brief Sets the network provider (required). The provider must outlive this client. Set it
+    /// before start() and leave it in place while the client runs.
     void set_network_provider(SendspinNetworkProvider* provider) {
         this->network_provider_ = provider;
     }
 
-    /// @brief Sets the optional persistence provider. The provider must outlive this client
+    /// @brief Sets the optional persistence provider. The provider must outlive this client. Set it
+    /// before start() and leave it in place while the client runs.
     void set_persistence_provider(SendspinPersistenceProvider* provider) {
         this->persistence_provider_ = provider;
     }

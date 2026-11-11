@@ -147,7 +147,8 @@ public:
     VisualizerRole(VisualizerRoleConfig config, SendspinClient* client);
     ~VisualizerRole();
 
-    /// @brief Sets the listener for visualizer events; it must outlive this role
+    /// @brief Sets the listener for visualizer events; it must outlive this role. Set it before
+    /// SendspinClient::start() and leave it in place while the client runs.
     void set_listener(VisualizerRoleListener* listener);
 
 private:

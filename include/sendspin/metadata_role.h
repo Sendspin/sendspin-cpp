@@ -143,7 +143,8 @@ public:
     MetadataRole(MetadataRoleConfig config, SendspinClient* client);
     ~MetadataRole();
 
-    /// @brief Sets the listener for metadata events; it must outlive this role
+    /// @brief Sets the listener for metadata events; it must outlive this role. Set it before
+    /// SendspinClient::start() and leave it in place while the client runs.
     void set_listener(MetadataRoleListener* listener);
 
     /// @brief Returns the track duration in milliseconds, or 0 if unknown or the stream is live

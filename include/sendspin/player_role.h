@@ -145,7 +145,8 @@ public:
     PlayerRole(PlayerRoleConfig config, SendspinClient* client);
     ~PlayerRole();
 
-    /// @brief Sets the listener for player events
+    /// @brief Sets the listener for player events. Set it before SendspinClient::start() and
+    /// leave it in place while the client runs.
     /// @param listener Pointer to the listener implementation; must outlive this role
     void set_listener(PlayerRoleListener* listener);
 

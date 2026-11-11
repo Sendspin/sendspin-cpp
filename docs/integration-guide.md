@@ -779,6 +779,8 @@ client.set_network_provider(&network_provider);         // Required
 client.set_persistence_provider(&persistence_provider); // Optional
 ```
 
+Set every listener and provider before `start()` and leave it in place while the client runs: the library calls them without checking whether they changed, so replacing or clearing one (`set_listener(nullptr)`) while the client runs is not supported, including from inside a callback.
+
 ## Step 6: Start and Run
 
 ```cpp
@@ -1187,7 +1189,7 @@ int64_t client_ts = client.get_client_time(server_timestamp);
 
 ## Deprecated String API
 
-The metadata and group text is now handed over as `std::string_view` into storage the library keeps, rather than copied into `std::string`. The `std::string` forms are deprecated in v0.10.0 and removed in v0.11.0; naming one of them draws a `-Wdeprecated-declarations` warning.
+The view forms hand the metadata and group text over as `std::string_view` into storage the library keeps; the deprecated forms copy it into `std::string`. The `std::string` forms are deprecated in v0.10.0 and removed in v0.11.0; naming one of them draws a `-Wdeprecated-declarations` warning.
 
 | Deprecated | Replacement |
 |---|---|
@@ -1197,7 +1199,7 @@ The metadata and group text is now handed over as `std::string_view` into storag
 | `SendspinClientListener::on_group_update()` | `SendspinClientListener::on_group_state()` |
 | `SendspinClient::get_group_state()` | `SendspinClient::group_state()`, which returns by value |
 
-The fields keep their names and meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` returns until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. A `stop()` from the new callback ends the delivery there.
+The fields keep their names and meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` returns until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. A `stop()` from the new callback ends the delivery there.
 
 ## Thread Safety Summary
 
