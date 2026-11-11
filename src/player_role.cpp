@@ -523,10 +523,8 @@ void PlayerRole::Impl::drain_events() {
 
     // --- Server command events (volume, mute, output delay) ---
     // Check each field independently since multiple command types may have been merged into one
-    // inbox slot between drain ticks. Each callback may re-enter teardown (a listener calling
-    // stop()), whose own drain already reset this role, so the rest is abandoned when the
-    // generation moved on. roles/player/v1.md "server/command player object": a command absent
-    // from the current supported_commands is ignored.
+    // inbox slot between drain ticks. roles/player/v1.md "server/command player object": a
+    // command absent from the current supported_commands is ignored.
     if (have_command && cmd_msg.player.has_value()) {
         const ServerPlayerCommandObject& player_cmd = cmd_msg.player.value();
 
@@ -541,7 +539,7 @@ void PlayerRole::Impl::drain_events() {
 
         if (player_cmd.mute.has_value() && !this->mute_adjustable) {
             SS_LOGD(TAG, "Ignoring mute: not in supported_commands");
-        } else if (player_cmd.mute.has_value() && this->accepts(generation)) {
+        } else if (player_cmd.mute.has_value()) {
             this->update_muted(player_cmd.mute.value());
             if (this->listener) {
                 this->listener->on_mute_changed(player_cmd.mute.value());
@@ -551,16 +549,13 @@ void PlayerRole::Impl::drain_events() {
         const bool delay_advertised = this->output_delay_adjustable.load(std::memory_order_relaxed);
         if (player_cmd.output_delay_ms.has_value() && !delay_advertised) {
             SS_LOGD(TAG, "Ignoring set_output_delay: not in supported_commands");
-        } else if (player_cmd.output_delay_ms.has_value() && this->accepts(generation)) {
+        } else if (player_cmd.output_delay_ms.has_value()) {
             this->update_output_delay(player_cmd.output_delay_ms.value());
             if (this->listener) {
                 this->listener->on_output_delay_changed(
                     this->output_delay_ms.load(std::memory_order_relaxed));
             }
         }
-    }
-    if (!this->accepts(generation)) {
-        return;
     }
 
     // --- Process awaiting sync idle events ---
@@ -572,15 +567,7 @@ void PlayerRole::Impl::drain_events() {
     if (!this->awaiting_sync_idle_events.empty()) {
         bool sync_idle = !this->sync_task->is_running();
         size_t processed = 0;
-        bool teardown_reentered = false;
-
-        // Indexed with a fresh size() check per iteration (not a range-for): the listener
-        // callbacks below may re-enter connection teardown, whose own drain clears this vector
-        // mid-loop. Cached range-for iterators would dangle; re-checking size() ends the loop
-        // and the clamp before the erase below keeps the range valid.
-        // NOLINTNEXTLINE(modernize-loop-convert): body mutates the vector, see above
-        for (size_t idx = 0; idx < this->awaiting_sync_idle_events.size(); ++idx) {
-            const InboxEvent event = this->awaiting_sync_idle_events[idx];
+        for (const InboxEvent& event : this->awaiting_sync_idle_events) {
             const auto type = static_cast<PlayerStreamCallbackType>(event.code);
             if (type == PlayerStreamCallbackType::STREAM_END && !sync_idle) {
                 // Wait for the sync task to go idle before firing this and anything after it. The
@@ -594,8 +581,7 @@ void PlayerRole::Impl::drain_events() {
                     // Only fire the callback when a stream is actually open: every teardown owes
                     // a STREAM_END (complete_teardown()), and a failed stream start enqueues one
                     // with no preceding START, so gating here keeps on_stream_end() paired 1:1
-                    // with on_stream_start(). Cleared before the callback, which may re-enter
-                    // teardown and owe a STREAM_END of its own: that one finds the stream closed.
+                    // with on_stream_start().
                     if (this->stream_active) {
                         this->stream_active = false;
                         if (this->listener) {
@@ -605,9 +591,6 @@ void PlayerRole::Impl::drain_events() {
                     if (this->high_performance_requested_for_playback) {
                         this->client->release_high_performance();
                         this->high_performance_requested_for_playback = false;
-                    }
-                    if (!this->accepts(generation)) {
-                        teardown_reentered = true;
                     }
                     break;
                 case PlayerStreamCallbackType::STREAM_START: {
@@ -631,23 +614,9 @@ void PlayerRole::Impl::drain_events() {
                                          "down");
                         }
                     }
-                    // Mark the stream active before invoking the listener. on_stream_start() may
-                    // re-enter teardown, and the STREAM_END the teardown owes fires
-                    // on_stream_end() only when stream_active is set (see the gate above). Setting
-                    // it first keeps start/end paired even when the batch is abandoned below.
                     this->stream_active = true;
                     if (this->listener) {
                         this->listener->on_stream_start();
-                        // on_stream_start() may re-enter connection teardown, whose own drain
-                        // already ended the stream and replaced this vector's content.
-                        // Re-arming the sync task below would resurrect the dead stream, so
-                        // abandon the batch instead (the clamp below keeps the erase in range).
-                        // stream_active stays true so a STREAM_END the teardown still owes
-                        // delivers a paired on_stream_end().
-                        if (!this->accepts(generation)) {
-                            teardown_reentered = true;
-                            break;
-                        }
                     }
                     this->sync_task->signal_stream_start(event.serial);
                     // The sync task sets TASK_RUNNING asynchronously after this signal, so the
@@ -657,17 +626,9 @@ void PlayerRole::Impl::drain_events() {
                     break;
                 }
             }
-            if (teardown_reentered) {
-                break;
-            }
             ++processed;
         }
 
-        // Clamp: a re-entrant teardown may have cleared the vector mid-loop, so processed can
-        // exceed the current size.
-        if (processed > this->awaiting_sync_idle_events.size()) {
-            processed = this->awaiting_sync_idle_events.size();
-        }
         if (processed > 0) {
             this->awaiting_sync_idle_events.erase(
                 this->awaiting_sync_idle_events.begin(),
@@ -677,10 +638,8 @@ void PlayerRole::Impl::drain_events() {
 }
 
 void PlayerRole::Impl::cleanup() {
-    // Flag the teardown before anything else: it tells a drain_events() frame that may be on the
-    // call stack right now (a listener callback re-entering teardown) that the stream is gone,
-    // and it stamps every event queued from here on, so a START this teardown just invalidated is
-    // discarded (see cleanup_generation).
+    // Flag the teardown before anything else: it stamps every event queued from here on, so a
+    // START this teardown just invalidated is discarded (see cleanup_generation).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 

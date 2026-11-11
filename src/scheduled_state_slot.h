@@ -265,13 +265,7 @@ void drain_scheduled_state(RoleImpl& role, ScheduledStateSlot<State>& slot, Deli
     for (;;) {
         const typename Slot::Peek peek = slot.peek();
         bool current = peek.oldest.has_value();
-        const uint32_t generation = keep_current_payload(role, current, peek.generation, tag, what);
-        // Also catches a catch-up whose clear callback re-entered teardown (a listener calling
-        // stop()): its cleanup() moved the generation on, and its own drain already reset this
-        // role.
-        if (!role.accepts(generation)) {
-            return;
-        }
+        keep_current_payload(role, current, peek.generation, tag, what);
         // States stamped before the teardown are decided away: none delivered, none pending.
         const typename Slot::Decision decision =
             current ? Slot::decide(peek, is_due) : typename Slot::Decision{};
@@ -282,9 +276,6 @@ void drain_scheduled_state(RoleImpl& role, ScheduledStateSlot<State>& slot, Deli
             return;
         }
         apply();
-        // A callback that re-entered teardown (a listener calling stop()) reset the slot, and the
-        // drain stop() ran forgot pending_at() (the role's complete_teardown()), so this ends the
-        // loop too.
         const std::optional<int64_t> pending_at = slot.pending_at();
         if (!pending_at.has_value() || !is_due(*pending_at)) {
             return;

@@ -644,11 +644,8 @@ void ArtworkRole::Impl::drain_events() {
     // before this call, so it has already cleared held_display_mask before we get here.
     ArtworkDisplayUpdate update{};
     bool have_update = false;
-    const uint32_t generation = take_current_payload(*this, this->event_state->display_slot, update,
-                                                     have_update, TAG, "artwork displays");
-    if (!this->accepts(generation)) {
-        return;
-    }
+    take_current_payload(*this, this->event_state->display_slot, update, have_update, TAG,
+                         "artwork displays");
     if (have_update) {
         for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
             const uint8_t bit = static_cast<uint8_t>(1U << slot);
@@ -738,11 +735,6 @@ void ArtworkRole::Impl::drain_events() {
             } else {
                 this->listener->on_image_display(slot, display_lateness_ms(client_ts, overdue_us));
             }
-        }
-        // The callback may re-enter teardown (a listener calling stop()), whose own drain already
-        // dropped the holds.
-        if (!this->accepts(generation)) {
-            return;
         }
     }
 }

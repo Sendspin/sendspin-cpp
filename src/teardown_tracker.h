@@ -62,19 +62,14 @@ public:
         return true;
     }
 
-    /// @brief The latest teardown generation whose main-loop half has run
-    uint32_t completed() const {
-        return this->completed_;
-    }
-
 private:
     /// The latest teardown generation whose main-loop half has run.
     uint32_t completed_{0};
 };
 
 /**
- * @brief A role's teardown state, shared by every role's Impl: its teardown generation, the
- * check each drain makes against it, and its TeardownTracker
+ * @brief A role's teardown state, shared by every role's Impl: its teardown generation and its
+ * TeardownTracker
  *
  * cleanup() bumps cleanup_generation and stamps everything the role queues from then on with the
  * new value: its events, its slot payloads, the items it hands a role thread. Each protocol-task
@@ -82,17 +77,10 @@ private:
  * on the protocol task between two handlers, or from stop() once that task is joined, so the
  * generation stays current for the whole handler and the handler does not check it. The stamp
  * protects the threads that consume what the handler queued: the drains check a payload's stamp
- * with accepts() (event_is_current(), GenerationSlot), and a role thread an item's
- * (InboundConsumer::take()), so a teardown that runs before they take it discards it; a drain also
- * uses accepts() to detect a listener callback that re-entered teardown.
+ * (event_is_current(), keep_current_payload()), and a role thread an item's
+ * (InboundConsumer::take()), so a teardown that runs before they take it discards it.
  */
 struct RoleTeardown {
-    /// @brief Whether an effect stamped with `generation` may still be applied
-    /// @param generation The counter value the effect was stamped with.
-    bool accepts(uint32_t generation) const {
-        return generation == this->cleanup_generation.load(std::memory_order_acquire);
-    }
-
     TeardownTracker teardown;  ///< Main loop only.
     /// Written by cleanup() on the protocol task, or on the main loop in SendspinClient::stop()
     /// once the task is joined; read on the main loop, the protocol task, the role's own thread
@@ -134,9 +122,7 @@ uint32_t keep_current_payload(RoleImpl& role, bool& have, uint32_t stamp, const 
 ///
 /// Taken before the catch-up: a teardown that ran before the take is caught up here (its clear
 /// fires first) and drops a payload stamped before it; one that runs after the take is caught up
-/// by the next drain, behind what this drain applies. The caller then checks
-/// `role.accepts(generation)`, which also catches a clear callback that re-entered teardown (a
-/// listener calling stop()). Main loop only.
+/// by the next drain, behind what this drain applies. Main loop only.
 /// @param[out] have Whether `out` holds a payload stamped with the returned generation.
 /// @param what What the payload is, for the drop's log line.
 /// @return The role's generation the catch-up ran to.

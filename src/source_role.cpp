@@ -373,10 +373,6 @@ void SourceRole::Impl::handle_stream_ring_event(SourceStreamEventType event) {
     if (started == this->streaming_active) {
         return;  // Already reported
     }
-    // Flipped before the callback, which may re-enter teardown: its catch-up then finds the
-    // state the callback reports. The hold changes before the callback too: a stop() from
-    // on_streaming_stopped() catches up through complete_teardown(), which finds streaming_active
-    // already clear and releases nothing.
     this->streaming_active = started;
     if (started) {
         // An open stream holds high-performance networking, as playback does

@@ -116,9 +116,9 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   stamp it reads, persistence written from the main loop, controller command validation, and the
   metadata fields the listener is handed.
 - `test_client_lifecycle.cpp`: `start()`/`stop()`/restart: goodbyes, clear callbacks delivered
-  inside `stop()`, re-entrancy from callbacks, role start rollback, accepts refused at `stop()`,
-  the command queue's refusals and the lifecycle requests it never refuses, the protocol task's
-  next deadline, the teardown reorder guarantee for every role with main-loop state, stream
+  inside `stop()`, what a callback inside `stop()` sees, role start rollback, accepts refused at
+  `stop()`, the command queue's refusals and the lifecycle requests it never refuses, the protocol
+  task's next deadline, the teardown reorder guarantee for every role with main-loop state, stream
   starts acknowledged by number, the high-performance grant, the time filter slot, the
   inbound ring's size, the pairing callbacks in each listener form, and the metadata role's
   scheduled-state slot, whose three text blocks carry every state to the listener in order.

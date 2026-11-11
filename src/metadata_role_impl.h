@@ -111,7 +111,7 @@ struct MetadataRole::Impl : RoleTeardown {
     /// Whether a state's server-clock deadline has passed on the synchronized client clock.
     bool state_is_due(int64_t timestamp) const;
     /// @brief Hands the current state to on_track_metadata(), then to the deprecated
-    /// on_metadata() unless the first call re-entered teardown. Main loop, with no lock held.
+    /// on_metadata(). Main loop, with no lock held.
     void apply_current_state();
     /// @brief The public view of the current state, its text viewing the current block. Main loop.
     TrackMetadata track_metadata() const;

@@ -227,14 +227,9 @@ When a connection leaves the admitted array, `detach_inbound()` runs first. It d
 
 The source's `cleanup()` closes the stream gate without a message and clears the authorization; it recalls nothing, since the source holds no inbound ring item. The player's, the visualizer's and the artwork role's `cleanup()` also return what the sync task, the visualizer drain thread or the artwork decode thread has not taken, right after the generation bump and on the thread that hands the items over (`InboundConsumer::recall()`), so every item recalled carries an older stamp; a consumer that takes such an item between the bump and the recall returns it, by its stamp, without acting on it. The visualizer's `cleanup()` also moves its boundary sequence on (see the `stream/end` row under [Dispatch](#dispatch-protocol-task)), so its drain thread returns a frame it holds for its delivery time. The artwork decode thread, woken by its `cleanup()`, also drops the images it assembles or parks once it sees the generation move on. A role removed by a `server/activate` takes the same path. In `stop()` the role threads are joined and their lists returned and unbound (`InboundConsumer::unbind()`) before the main loop runs the roles' `cleanup()`, whose recall then finds no ring bound.
 
-### Re-entrant Teardown During Callback Dispatch
+### Callbacks During Dispatch
 
-Requests a listener callback makes (`connect_to()`, `disconnect()`, ...) are queued or posted to the protocol task, so no callback tears a connection down under the drain that fired it. `stop()` is the exception: called from a callback, it joins the protocol task, tears every role down on the main loop and runs a drain of its own beneath the one that fired the callback, and a `start()` that follows it in the same callback begins a new run. No other drain runs beneath one, since a callback never calls `loop()` (`client.h`). Two generation counters keep the outer drain from acting on what it already took:
-
-- `drain_generation` (on the client's `EventState`) is bumped by `stop()` before its teardown. The outer drain snapshots it once and stops as soon as it changes: the event ring between events, the pairing-note dispatch between notes, and the role drains and the group update before each starts.
-- Each role's `cleanup_generation` is bumped by its `cleanup()` and stamped onto every event and slot payload it queues afterwards; the ring drain drops stream events whose stamp no longer matches (`event_is_current()`). Inside a role drain the same counter catches a callback that re-entered teardown: the player checks it after each server-command callback and around each `on_stream_start()` and `on_stream_end()`, metadata and color by ending their drain once the teardown's catch-up has forgotten the pending deadline (`ScheduledStateSlot::pending_at()`), and artwork after each display or clear, and each abandons the rest of its work when it moved on.
-
-A state handed to the listener in two forms, the view and the deprecated `std::string` copy, is not handed over in the second once the first re-entered teardown: the group update checks the drain generation between `on_group_state()` and `on_group_update()`, the pairing-note dispatch between each text-carrying callback and its deprecated form (`on_pairing_attempt()` and `on_pairing_started()`, ...), and the metadata role checks between `on_track_metadata()` and `on_metadata()` whether its `TeardownTracker` completed a teardown, which on the main loop only `stop()` can do inside a callback.
+No listener, role or provider callback calls `loop()`, `start()` or `stop()` (`client.h`), and the requests a callback may make (`connect_to()`, `disconnect()`, a controller command, ...) are queued or posted to the protocol task. So no drain runs beneath another, and no role's main-loop half runs while one of its callbacks is on the stack: each drain delivers everything it took, and a role drain re-checks no teardown generation after its callbacks. A teardown the protocol task runs during a callback is caught up by the next drain, through the stamps described under [Cleanup](#cleanup), behind what the current drain delivers.
 
 ## Message Flow
 
@@ -415,9 +410,8 @@ Each getter reads the slot once, so a caller that checks `is_time_synced()` and 
 `SendspinClient::stop()` is synchronous and ordered so that every producer is gone before any state is reset:
 
 ```api
-0. lifecycle_ = STOPPING (loop() becomes a no-op; start/stop and every request that queues a
-   command or posts a request are refused or ignored, so a callback fired below cannot recurse
-   into the teardown)
+0. lifecycle_ = STOPPING (loop() becomes a no-op, and every request that queues a command or
+   posts a request is ignored, from another thread or from a callback fired below)
 1. Signal the visualizer and artwork threads to stop, without joining. The player is not
    signalled yet: it keeps returning the ring items it plays, so a transport waiting for ring
    space is not parked behind a stopped consumer
@@ -434,9 +428,8 @@ Each getter reads the slot once, so a caller that checks `is_time_synced()` and 
    connecting stays parked); then drop any command still queued and any request still posted
 5. Join all role threads; each then returns its items to the ring, and the emptied inbound ring
    is released; the source destroys its outbound ring, every item back since step 4
-6. Bump drain_generation, cleanup_connection_state() for every role (the protocol-task halves
-   run here, on the main loop), then queue the pairing-UI dismissals the step 3 snapshot calls
-   for
+6. cleanup_connection_state() for every role (the protocol-task halves run here, on the main
+   loop), then queue the pairing-UI dismissals the step 3 snapshot calls for
 7. drain_inbox() runs each role's main-loop half (its clear; the player's on_stream_end(), the
    source's on_streaming_stopped()), the high-performance releases the shutdown pass queued,
    the owed provider writes, and the pairing notes step 6 queued, each exactly once: a dismissal step 6 queues beside one an
@@ -472,7 +465,6 @@ A metadata state's text, only the fields `MetadataRoleConfig` keeps, each cut to
 | What | When |
 |------|------|
 | The pairing notes for the main loop beyond the room both of their buffers keep | A batch of more than `PAIRING_NOTE_CAPACITY` notes between two drains, on the protocol task; the grown room is kept |
-| Another drain buffer for the pairing notes, with room for `PAIRING_NOTE_CAPACITY` | A pairing listener callback that calls `stop()` while a prompt shows: the drain `stop()` runs finds the buffer lent to the dispatch that called it, and reserves one before it takes the dismissals, on the main loop |
 | The player's stream events held for the sync task's idle | Events beyond the list's kept capacity, on the main loop |
 
 The `std::function`s built after `start()` allocate nothing because each capture is one pointer, which fits both standard libraries' small buffer: the Noise transport's frame sinks, set as each connection is constructed; the frame write hook a time send builds, which ESP copies into each send; and the handshake's send function, built for each handshake frame. A change to one of these captures is checked against that buffer, since a callable that does not fit it allocates on every copy.

@@ -363,7 +363,8 @@ public:
     /// start, the roles that did start are stopped again so a corrected retry begins from the
     /// stopped state. A rejected configured pairing secret (SendspinClientConfig::pairing_psk or
     /// static_pairing_code) fails every start() of this instance, since the config is fixed at
-    /// construction. Main-loop thread only.
+    /// construction. Main-loop thread only, and never from a listener, role or provider callback
+    /// (docs/integration-guide.md, Thread Safety Summary).
     /// @return true if the client is running (including when it already was), false on failure
     bool start();
 
@@ -386,10 +387,9 @@ public:
     /// bounds are described in docs/integration-guide.md (Stopping and Restarting).
     ///
     /// Listener callbacks fire from inside this call, after every role has been reset, so the
-    /// state they observe through the getters is the stopped state. One that calls start() has
-    /// no effect and returns false; one that calls stop(), connect_to(), or disconnect() is
-    /// ignored. Main-loop thread only: calling it from a role-thread callback would join the
-    /// calling thread.
+    /// state they observe through the getters is the stopped state; one that calls connect_to()
+    /// or disconnect() is ignored. Main-loop thread only, and never from a listener, role or
+    /// provider callback (docs/integration-guide.md, Thread Safety Summary).
     void stop();
 
     /// @brief Returns true between a successful start() and stop()
@@ -857,8 +857,7 @@ private:
     /// @brief Drains the inbox: high-performance requests, the time-sync report, lifecycle events
     /// (each role's teardown half caught up ahead of its stamped events), provider writes,
     /// pairing notes, role slots, and group updates, dispatching listener callbacks on the
-    /// calling (main-loop) thread. Shared by loop() and stop(). A callback that calls stop()
-    /// abandons the rest of this drain (EventState::drain_generation).
+    /// calling (main-loop) thread. Shared by loop() and stop().
     void drain_inbox();
 
     /// @brief Applies the high-performance edges the protocol task queued: every acquire, then
@@ -1169,8 +1168,8 @@ private:
     std::atomic<bool> network_ready_{false};
     /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;
     /// atomic so is_started() can be read from any thread. STOPPING covers the whole of stop():
-    /// start() is refused and stop()/connect_to()/disconnect() are ignored while it is set, so a
-    /// listener callback fired from inside the teardown cannot recurse into it.
+    /// is_started() reads false, loop() is a no-op, and connect_to(), disconnect() and every
+    /// request that queues a command are ignored while it is set.
     enum class LifecycleState : uint8_t { STOPPED, RUNNING, STOPPING };
     std::atomic<LifecycleState> lifecycle_{LifecycleState::STOPPED};
 };

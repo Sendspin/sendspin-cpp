@@ -260,16 +260,7 @@ void MetadataRole::Impl::apply_current_state() {
     if (this->listener == nullptr) {
         return;
     }
-    // Moves only when the main loop runs a teardown's half, which during the callback means the
-    // listener called stop() (a callback never calls loop()). Not accepts(): the protocol task may
-    // bump the generation during the callback, and the deprecated form must still follow then;
-    // the clear that teardown queued comes on a later drain.
-    const uint32_t completed = this->teardown.completed();
     this->listener->on_track_metadata(this->track_metadata());
-    // The teardown delivered its clear: the deprecated form of the state must not follow it.
-    if (this->teardown.completed() != completed) {
-        return;
-    }
     this->fill_deprecated_state();
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
