@@ -420,8 +420,8 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     ASSERT_TRUE(server->send_app_json(metadata_state_json(scheduled_ts, "Up Next")));
     ASSERT_TRUE(server->send_app_json(color_state_json(scheduled_ts)));
     pump_until(client, [&] {
-        return client.metadata()->impl_->held_state.has_value() &&
-               client.color()->impl_->held_state.has_value();
+        return client.metadata()->impl_->event_state->slot.pending_at().has_value() &&
+               client.color()->impl_->event_state->slot.pending_at().has_value();
     });
     ASSERT_EQ(metadata_listener.updates, 1) << "a scheduled update was applied early";
 
@@ -431,9 +431,13 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
                controller_listener.clears == 1;
     });
 
-    EXPECT_FALSE(client.metadata()->impl_->held_state.has_value())
+    // The slot's states and the main loop's copy of the pending deadline alike.
+    const auto holds_scheduled = [](const auto& slot) {
+        return slot.peek().oldest.has_value() || slot.pending_at().has_value();
+    };
+    EXPECT_FALSE(holds_scheduled(client.metadata()->impl_->event_state->slot))
         << "the removed metadata role kept its scheduled update";
-    EXPECT_FALSE(client.color()->impl_->held_state.has_value())
+    EXPECT_FALSE(holds_scheduled(client.color()->impl_->event_state->slot))
         << "the removed color role kept its scheduled update";
     EXPECT_EQ(client.metadata()->get_track_duration_ms(), 0U);
     EXPECT_EQ(client.metadata()->get_track_progress_ms(), 0U);
@@ -450,25 +454,24 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     stream_audio_until(client, *server, player_listener, 1);
 
     // A state stamped with the pre-removal generation, the payload a drain takes on the far side
-    // of the removal, is discarded at the drain: writing the role's slot with that stamp forces
-    // the interleaving rather than racing for it.
-    ServerMetadataStateObject overtaken;
-    overtaken.timestamp = 1;
-    overtaken.title = "Overtaken By The Removal";
-    client.metadata()->impl_->event_state->slot.write(
-        PendingMetadataStates{.oldest = std::move(overtaken)}, metadata_generation);
+    // of the removal, is discarded at the drain: handing the role's slot a state with that stamp
+    // forces the interleaving rather than racing for it.
+    MetadataRole::Impl& metadata_impl = *client.metadata()->impl_;
+    const auto hand_over_stamped = [&metadata_impl](uint32_t generation) {
+        metadata_impl.event_state->slot.arrive(
+            [](MetadataStateBuffer& place) {
+                place.payload = MetadataStatePayload{.timestamp = 1};
+            },
+            generation);
+    };
+    hand_over_stamped(metadata_generation);
     pump_for(client, SETTLE_MS);
     EXPECT_EQ(metadata_listener.updates, 1)
         << "a payload stamped with the pre-removal generation was applied";
 
-    // Control: the same write carrying the generation the role reports now is applied, so the
+    // Control: the same hand-over carrying the generation the role reports now is applied, so the
     // refusal above came from the stale generation and nothing else.
-    ServerMetadataStateObject current;
-    current.timestamp = 1;
-    current.title = "Current Generation";
-    client.metadata()->impl_->event_state->slot.write(
-        PendingMetadataStates{.oldest = std::move(current)},
-        client.metadata()->impl_->cleanup_generation.load(std::memory_order_acquire));
+    hand_over_stamped(metadata_impl.cleanup_generation.load(std::memory_order_acquire));
     pump_until(client, [&] { return metadata_listener.updates == 2; });
 
     // roles/controller/v1.md "client/command controller object": the removal discarded the offered

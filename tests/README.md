@@ -59,8 +59,8 @@ a watchdog report rather than a flaky elapsed-time assertion.
 Each `test_*.cpp` file covers one unit of cross-platform logic:
 
 - `test_protocol.cpp`: wire-protocol parsing/formatting: enum round-trips, message dispatch, the
-  full-state metadata/color objects, and the hand-rolled `client/time` formatter checked against
-  `snprintf`.
+  full-state metadata/color objects, the metadata text caps and kept fields, and the hand-rolled
+  `client/time` formatter checked against `snprintf`.
 - `test_json_arena.cpp`: `SendspinArenaAllocator` wipes every byte its own buffer gives up
   when a block is freed, shrunk or moved (the wipe of a freed heap fallback block cannot be
   read back and is a named gap); a parse released through `ParsedJsonMessage` leaves only its
@@ -74,7 +74,9 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   and swap.
 - `test_fixed_block_pool.cpp`: `FixedBlockPool` claims each block once until released, also
   under concurrent claims.
-- `test_inbox.cpp`: `Inbox`/`InboxSlot` topic bits, event ring ordering, and slot binding.
+- `test_inbox.cpp`: `Inbox`/`InboxSlot` topic bits, event ring ordering, slot binding, the
+  `GenerationSlot` generation rules, and the `ScheduledStateSlot` decision table, generation
+  rules and a drain that decides with the Inbox mutex free.
 - `test_shared_ring_buffer.cpp`: the host `SharedRingBuffer`: ring-order reclamation under
   out-of-order returns, no-split wrap placement, the full-ring acquire policies, completion
   order, and concurrent producers.
@@ -111,19 +113,22 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   pairing over the pairing PSK, `server/unpair`, pre-admission traffic, role dispatch by
   ownership, `client/leave` gating, the `client/state` role-object rules, the combined
   `['playback','pairing']` activate, the re-prove watchdog, the liveness tick and the arrival
-  stamp it reads, persistence written from the main loop, and controller command validation.
+  stamp it reads, persistence written from the main loop, controller command validation, and the
+  metadata fields the listener is handed.
 - `test_client_lifecycle.cpp`: `start()`/`stop()`/restart: goodbyes, clear callbacks delivered
   inside `stop()`, re-entrancy from callbacks, role start rollback, accepts refused at `stop()`,
   the command queue's refusals and the lifecycle requests it never refuses, the protocol task's
   next deadline, the teardown reorder guarantee for every role with main-loop state, stream
-  starts acknowledged by number, the high-performance grant, the time filter slot, and the
-  inbound ring's size.
+  starts acknowledged by number, the high-performance grant, the time filter slot, the
+  inbound ring's size, and the metadata role's scheduled-state slot, whose three text blocks
+  carry every state to the listener in order.
 - `test_client_teardown.cpp`: destroying a running client joins every threaded role.
 - `test_role_deactivation.cpp`: a later `server/activate` that removes a role: output stopped,
   buffers and state dropped, the roles it keeps left alone, and a removed role added back.
 - `test_allocations.cpp`: how many times the library calls `operator new` from a connection's accept
   to its admission, from `connect_to()` to admission, for a `client/state`, for a time burst, for a
-  controller `server/state`, for `group/update`, for the `stream/*` messages, for the sync task's
+  controller `server/state`, for `group/update`, for metadata `server/state` (a first state, a
+  second, a scheduled one and one without text), for the `stream/*` messages, for the sync task's
   first FLAC codec header, for a FLAC `stream/start` the player takes, for a `stream/start` section
   the connection's roles do not take, for the first spectrum frame, and through the record flush
   that follows each of a playback handoff to another paired server, a `server/unpair`, a

@@ -470,8 +470,9 @@ bool SendspinClient::start() {
         return false;
     }
 
-    // Start the role threads. A failure part-way stops the roles that did start, so the client
-    // is back in the stopped state and a corrected retry begins clean.
+    // Start the role threads, and allocate the metadata role's text blocks. A failure part-way
+    // stops the roles that did start, so the client is back in the stopped state and a corrected
+    // retry begins clean.
     bool roles_started = true;
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (roles_started && this->player_) {
@@ -492,6 +493,11 @@ bool SendspinClient::start() {
 #ifdef SENDSPIN_ENABLE_SOURCE
     if (roles_started && this->source_) {
         roles_started = this->source_->impl_->start(this->protocol_task_.get());
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    if (roles_started && this->metadata_) {
+        roles_started = this->metadata_->impl_->start();
     }
 #endif
     if (!roles_started) {
@@ -1222,11 +1228,11 @@ ControllerRole& SendspinClient::add_controller() {
 #endif
 
 #ifdef SENDSPIN_ENABLE_METADATA
-MetadataRole& SendspinClient::add_metadata() {
+MetadataRole& SendspinClient::add_metadata(MetadataRoleConfig config) {
     if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_metadata() called while started");
     }
-    this->metadata_ = std::make_unique<MetadataRole>(this);
+    this->metadata_ = std::make_unique<MetadataRole>(config, this);
     this->metadata_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->metadata_;
 }

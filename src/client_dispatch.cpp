@@ -371,7 +371,10 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
     // copies the message into its plain struct through parsed.extract(), which releases the
     // document before any handler runs, so a reply a handler builds (client/state after
     // server/activate, a pairing reply, a re-handshake's msg2) fits the arena beside nothing. A
-    // case that reads no payload calls parsed.release() before acting.
+    // case that reads no payload calls parsed.release() before acting. The one exception is the
+    // metadata role's handler, which runs inside server/state's extract() to copy its kept text
+    // straight from the document into its slot; it builds no reply and keeps no view of the
+    // document.
     ParsedJsonMessage parsed(*this->json_arena_);
     if (!parsed.parse(data, len)) {
         SS_LOGW(TAG, "Failed to parse JSON message");
@@ -586,11 +589,12 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             break;
         }
         case SendspinServerToClientMessageType::SERVER_STATE: {
-            // The three sections are live together so one parse serves all three: every section a
-            // role takes is extracted in the one pass that releases the document, at the cost of
-            // the sections' combined size in this frame (the protocol task's stack is a fixed
-            // budget on ESP-IDF). Each section's role gate is decided first, so a section no role
-            // takes is not parsed.
+            // One parse serves all three sections: every section a role takes is extracted in the
+            // one pass that releases the document, the controller and color sections at the cost
+            // of their combined size in this frame (the protocol task's stack is a fixed budget on
+            // ESP-IDF), and the metadata section handed to its role's slot there, its text copied
+            // straight from the document. Each section's role gate is decided first, so a section
+            // no role takes is not parsed.
 #ifdef SENDSPIN_ENABLE_CONTROLLER
             const bool take_controller =
                 this->controller_ &&
@@ -602,8 +606,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             const bool take_metadata =
                 this->metadata_ &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::METADATA);
-            ServerMetadataStateObject metadata_state;
-            bool metadata_valid = false;
+            MetadataStateOutcome metadata_outcome = MetadataStateOutcome::IGNORED;
 #endif
 #ifdef SENDSPIN_ENABLE_COLOR
             const bool take_color = this->color_ && role_accepts_traffic(*this->connection_manager_,
@@ -617,13 +620,25 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                     take_controller && process_server_state_controller(root, &controller_state);
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
-                metadata_valid =
-                    take_metadata && process_server_state_metadata(root, &metadata_state);
+                if (take_metadata) {
+                    metadata_outcome = this->metadata_->impl_->handle_server_state(root);
+                }
 #endif
 #ifdef SENDSPIN_ENABLE_COLOR
                 color_valid = take_color && process_server_state_color(root, &color_state);
 #endif
             });
+
+#ifdef SENDSPIN_ENABLE_METADATA
+            if (metadata_outcome == MetadataStateOutcome::REJECTED) {
+                // messaging.md "Out-of-range values": a text field over its cap is a protocol
+                // error the client MUST close the connection on, so nothing else in the message is
+                // applied. Closed silently, like every other protocol error the receive path finds
+                // (see close_silently()).
+                conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+                break;
+            }
+#endif
 
 #ifdef SENDSPIN_ENABLE_CONTROLLER
             if (controller_valid) {
@@ -632,8 +647,10 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 #endif
 
 #ifdef SENDSPIN_ENABLE_METADATA
-            if (metadata_valid) {
-                this->metadata_->impl_->handle_server_state(std::move(metadata_state));
+            if (metadata_outcome == MetadataStateOutcome::CUT && conn->note_metadata_cut()) {
+                SS_LOGW(TAG, "Server sent metadata text over its cap (roles/metadata/v1.md "
+                             "\"server/state metadata object\"); cut to it, a future release "
+                             "closes the connection");
             }
 #endif
 

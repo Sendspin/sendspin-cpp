@@ -137,7 +137,7 @@ Measured on xtensa-esp32 with ESP-IDF 5.5 and GCC 14.2, at `-Os` (ESPHome's defa
 | --- | --- | --- | --- | --- | --- | --- |
 | httpd | `httpd_thread` | esp_http_server's own WebSocket upgrade response (544 to 576 bytes) | 4,032 | 3,968 | 4,608 (`DEFAULT_HTTPD_STACK_SIZE`) | shared ESP-IDF tail |
 | websocket client | `esp_websocket_client_task` | library event handler (3,520 / 3,600) closing on a stalled protocol task via `fail_inbound()` through the inbound transport's close | 3,904 | 3,968 | 4,608 (`DEFAULT_WEBSOCKET_STACK_SIZE`) | shared ESP-IDF tail |
-| protocol task | task entry | as bounded: an esp_websocket_client send error into the event handler, `handle_data()`, `fail_inbound()` and `httpd_sess_trigger_close` (unreachable); reachable: a pairing confirm dropping an outbound connection whose goodbye send fails (5,920 at -Os, 6,144 at -Og) | 6,544 | 6,688 | 7,168 (`DEFAULT_PROTOCOL_TASK_STACK_SIZE`) | shared ESP-IDF tail |
+| protocol task | task entry | as bounded: an esp_websocket_client send error into the event handler, `handle_data()`, `fail_inbound()` and `httpd_sess_trigger_close` (unreachable); reachable: a pairing confirm dropping an outbound connection whose goodbye send fails (5,888 at -Os, 6,080 at -Og) | 6,512 | 6,624 | 7,168 (`DEFAULT_PROTOCOL_TASK_STACK_SIZE`) | shared ESP-IDF tail |
 | source, PCM | `thread_entry()` | `begin_chunk()`'s outbound acquire | 1,104 | 1,168 | 2,048 (`DEFAULT_SOURCE_TASK_STACK_SIZE`) | FreeRTOS critical-section assert |
 | source, Opus | `thread_entry()` | the Opus encode, `quant_partition()` charged one pass | 5,152 | 5,168 | 6,656 (`DEFAULT_OPUS_SOURCE_TASK_STACK_SIZE`) | shared ESP-IDF tail |
 | source, FLAC | `thread_entry()` | the FLAC encode through micro-flac's LPC design | 4,464 | 4,432 | 5,120 (`DEFAULT_FLAC_SOURCE_TASK_STACK_SIZE`) | libgcc `__divdi3` |
@@ -151,8 +151,8 @@ Notes per task:
   connection takes. 3,968 + 384 = 4,352, rounded up.
 - protocol task: noise-c and libsodium included. The bounded chain's tail cannot execute (an
   outbound connection never reaches the server connection's close override), but the default
-  covers it anyway: 6,688 + 384 = 7,072, rounded up to 7,168. The reachable chain alone needs
-  6,144 + 384 = 6,528.
+  covers it anyway: 6,624 + 384 = 7,008, rounded up to 7,168. The reachable chain alone needs
+  6,080 + 384 = 6,464.
 - source, PCM: the task sends nothing itself and logs nothing. The `std::thread` entry frames
   above `thread_entry()` are not counted and come out of the rounding slack. 1,168 + 384 = 1,552,
   rounded up.

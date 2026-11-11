@@ -73,6 +73,11 @@ add_executable(sendspin_tests
 # SendspinDecoder::flac_decoder(), since a decoder object kept across streams shows nowhere else.
 set_source_files_properties(test_decoder.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
+# test_inbox.cpp probes the Inbox's mutex_ from another thread in the scheduled-state drain test,
+# since whether a deadline check runs under it shows in no outcome: the decision is the same
+# either way, and only the lock the check would take beneath it breaks the leaf-lock rule.
+set_source_files_properties(test_inbox.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
+
 # Built only with the trace it tests.
 if(SENDSPIN_ENABLE_MESSAGE_TRACE)
     target_sources(sendspin_tests PRIVATE test_message_trace.cpp)
@@ -164,17 +169,27 @@ endif()
 # IDLE wait: it calls SyncTask's wait_for_codec_header() and load_next_chunk() and returns items
 # through its inbound_,
 # resets the flags with event_flags_.clear_all() as start() would, sets and reads SyncContext's
-# active_ordinal and next_header, and reads PlayerRole::Impl::stream_ordinal.
+# active_ordinal and next_header, and reads PlayerRole::Impl::stream_ordinal. The metadata slot
+# table plays the protocol task's half of the metadata role (handle_server_state(), and for a
+# state stamped before a teardown, fill_place() through the slot's arrive() with the old stamp
+# and the role's layout, then cleanup()) and runs the role's drain_events() alone where an arrival
+# must land between its peek and its commit; it reads which text block each place names (the
+# slot's places through ScheduledStateSlot::slot_, the role's current state), the pending
+# state's text (text_of()) and ScheduledStateSlot::pending_at(), which nothing public shows, and
+# installs the primary clock (ConnectionManager::published_ under published_mutex_) so a scheduled
+# state waits for its deadline without a server, and moves it so one falls due inside a
+# callback.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
 # public surface does not expose: the sync task's run state and its item list, the artwork
 # transfer in flight and its decode thread's assembly buffers, the visualizer's stream flag and
-# list, a state role's held scheduled update and its teardown generation (including the metadata
-# slot written with that generation, a payload a drain takes across the removal), the controller's
-# supported-commands word (seeded, stamped with the role's generation, so a command reaches the
-# inactive-role send gate), plus the queued-event probe that proves ordering without a sleep (a
-# role inbox's topic bits).
+# list, a state role's pending scheduled update in its slot and the main loop's copy of its
+# deadline (ScheduledStateSlot::pending_at()) and its teardown generation (including a metadata
+# state handed to the slot with that generation, a payload a drain takes across the removal), the
+# controller's supported-commands word (seeded, stamped with the role's generation, so a command
+# reaches the inactive-role send gate), plus the queued-event probe that proves ordering without a
+# sleep (a role inbox's topic bits).
 set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_player_role.cpp drives PlayerRole::Impl directly (no connected server, no sync-task thread),
@@ -316,6 +331,9 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 #     reply a handler builds shares the arena with the parse that triggered it shows only in where
 #     the parse leaves the bump pointer and in the arena's peak, which is rewound so it measures
 #     one delivery; nothing a peer receives depends on either.
+#   - MetadataRole::impl_'s slot places (ScheduledStateSlot::slot_, read under the Inbox mutex)
+#     and text_of(): which state waits for a deadline the test never reaches shows nowhere else
+#     before that deadline.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

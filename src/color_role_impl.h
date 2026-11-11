@@ -19,6 +19,7 @@
 
 #include "inbox.h"
 #include "protocol_messages.h"
+#include "scheduled_state_slot.h"
 #include "sendspin/color_role.h"
 #include "teardown_tracker.h"
 
@@ -30,17 +31,10 @@ namespace sendspin {
 class SendspinClient;
 struct ClientHelloMessage;
 
-/// @brief Color palettes handed to the main loop but not yet drained
-///
-/// messaging.md "server/state" lets a server bring a client up to date and then schedule the next
-/// update straight after it, so two palettes can land between two main-loop ticks. Both are kept,
-/// in arrival order, so the current one is still applied on the tick that also takes the
-/// scheduled one. A third palette in the same window replaces `newest`, which no observer has
-/// seen.
-struct PendingColorStates {
-    std::optional<ServerColorStateObject> oldest;
-    std::optional<ServerColorStateObject> newest;
-};
+/// @brief The server-clock timestamp `color` applies at (ScheduledStateSlot)
+inline int64_t scheduled_time(const ServerColorStateObject& color) {
+    return color.timestamp;
+}
 
 /// @brief Private implementation of the color role
 struct ColorRole::Impl : RoleTeardown {
@@ -52,7 +46,7 @@ struct ColorRole::Impl : RoleTeardown {
     // ========================================
 
     struct EventState {
-        GenerationSlot<PendingColorStates> slot;
+        ScheduledStateSlot<ServerColorStateObject> slot;
     };
 
     // ========================================
@@ -61,24 +55,22 @@ struct ColorRole::Impl : RoleTeardown {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    // Takes a const reference, unlike the metadata and controller overloads: a
-    // ServerColorStateObject holds only optional RGB triples and a timestamp, so there is nothing
-    // for an rvalue reference to move out of.
+    /// @brief Hands a parsed palette to the slot, which copies it into the place it takes.
+    /// Protocol task.
     void handle_server_state(const ServerColorStateObject& color) const;
-    // True if a slot palette needs taking, or a palette already held from a prior tick (see
-    // held_state) is still waiting out its server-clock deadline: the deadline itself sets no
-    // inbox bit, so held_state must be polled every tick until it fires.
+    /// @brief True if a palette arrived, or the pending palette the last drain left in the slot
+    /// has come due: the deadline sets no inbox bit, so it is checked every tick, against
+    /// ScheduledStateSlot::pending_at(), without the Inbox mutex.
     bool needs_drain(uint32_t pending_bits) const {
-        return (pending_bits & INBOX_TOPIC_COLOR) != 0 || this->held_state.has_value();
+        const std::optional<int64_t> pending_at = this->event_state->slot.pending_at();
+        return (pending_bits & INBOX_TOPIC_COLOR) != 0 ||
+               (pending_at.has_value() && this->state_is_due(*pending_at));
     }
-    /// @brief Takes the slot, catches the role up on any teardown (complete_teardown()), then
-    /// holds the taken palettes if they were admitted under the current generation and applies
-    /// whichever is due. Main loop.
+    /// @brief Catches the role up on any teardown (complete_teardown()), then applies whichever
+    /// palette the slot holds is due (drain_scheduled_state()). Main loop.
     void drain_events();
     /// Whether a palette's server-clock deadline has passed on the synchronized client clock.
     bool state_is_due(int64_t timestamp) const;
-    /// Applies the held palette and fires the listener once its server-clock deadline has passed.
-    void apply_due_state();
 
     /// @brief Stops the role and discards the state the protocol task can reach. Protocol task,
     /// or the main loop in SendspinClient::stop() once every other thread is joined.
@@ -99,10 +91,9 @@ struct ColorRole::Impl : RoleTeardown {
     // ========================================
 
     // Struct fields
+    /// The applied palette, the one on_color() is handed. Main loop only; the slot's commit copies
+    /// the palette it delivers into it, under the Inbox mutex.
     ServerColorStateObject color{};
-    // Palette taken from the inbox slot, awaiting its server-clock deadline. Main-thread only:
-    // written and read exclusively from drain_events()/complete_teardown() on the loop thread.
-    std::optional<ServerColorStateObject> held_state;
 
     // Pointer fields
     SendspinClient* client;

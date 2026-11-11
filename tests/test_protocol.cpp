@@ -61,6 +61,42 @@ bool parse(const std::string& json, JsonDocument& doc, JsonObject& root) {
 const EnumSet<SendspinRole> STREAM_START_ROLES{SendspinRole::PLAYER, SendspinRole::ARTWORK,
                                                SendspinRole::VISUALIZER};
 
+const EnumSet<MetadataField> ALL_METADATA_FIELDS{
+    MetadataField::TITLE, MetadataField::ARTIST, MetadataField::ALBUM_ARTIST, MetadataField::ALBUM,
+    MetadataField::ARTWORK_URL};
+
+// A metadata state parsed for the fields it keeps, its text read back from the document it views.
+struct ParsedMetadata {
+    explicit ParsedMetadata(EnumSet<MetadataField> kept = ALL_METADATA_FIELDS) : kept(kept) {}
+
+    // Parses `root`'s metadata object into this state.
+    MetadataStateOutcome parse(JsonObject root) {
+        return process_server_state_metadata(root, this->kept, &this->view);
+    }
+
+    // The text the state holds for `field`.
+    std::optional<std::string> text(MetadataField field) const {
+        const auto i = static_cast<size_t>(field);
+        if (!this->view.payload.text_sizes[i].has_value()) {
+            return std::nullopt;
+        }
+        return std::string(this->view.text[i], *this->view.payload.text_sizes[i]);
+    }
+
+    // Holds `text` for `field`, as an earlier parse would have left it.
+    void hold(MetadataField field, const std::string& text) {
+        const auto i = static_cast<size_t>(field);
+        this->held[i] = text;
+        this->view.text[i] = this->held[i].data();
+        this->view.payload.text_sizes[i] = static_cast<uint16_t>(text.size());
+    }
+
+    EnumSet<MetadataField> kept;
+    MetadataStateView view;
+    std::array<std::string, METADATA_FIELD_COUNT> held;
+    MetadataStatePayload& payload{view.payload};
+};
+
 }  // namespace
 
 // ============================================================================
@@ -285,42 +321,154 @@ TEST(Protocol, MetadataObjectIsParsedIntoState) {
                       R"("playback_speed":1000}}}})",
                       doc, root));
 
-    ServerMetadataStateObject metadata;
-    ASSERT_TRUE(process_server_state_metadata(root, &metadata));
+    ParsedMetadata metadata;
+    ASSERT_EQ(metadata.parse(root), MetadataStateOutcome::PARSED);
 
-    EXPECT_EQ(metadata.timestamp, 123);
-    ASSERT_TRUE(metadata.title.has_value());
-    EXPECT_EQ(metadata.title.value(), "Song");
-    ASSERT_TRUE(metadata.artist.has_value());
-    EXPECT_EQ(metadata.artist.value(), "Band");
-    EXPECT_EQ(metadata.year.value_or(0), 1999);
-    EXPECT_EQ(metadata.track.value_or(0), 4);
-    ASSERT_TRUE(metadata.progress.has_value());
-    EXPECT_EQ(metadata.progress->track_progress, 1000u);
-    EXPECT_EQ(metadata.progress->track_duration, 240000u);
-    EXPECT_EQ(metadata.progress->playback_speed, 1000u);
+    EXPECT_EQ(metadata.payload.timestamp, 123);
+    EXPECT_EQ(metadata.text(MetadataField::TITLE), "Song");
+    EXPECT_EQ(metadata.text(MetadataField::ARTIST), "Band");
+    EXPECT_EQ(metadata.payload.year.value_or(0), 1999);
+    EXPECT_EQ(metadata.payload.track.value_or(0), 4);
+    ASSERT_TRUE(metadata.payload.progress.has_value());
+    EXPECT_EQ(metadata.payload.progress->track_progress, 1000u);
+    EXPECT_EQ(metadata.payload.progress->track_duration, 240000u);
+    EXPECT_EQ(metadata.payload.progress->playback_speed, 1000u);
 }
 
 // A field the object omits has no value, whatever the target struct held before.
 TEST(Protocol, MetadataObjectReplacesEveryFieldItOmits) {
-    ServerMetadataStateObject metadata;
-    metadata.title = "Old title";
-    metadata.artist = "Old artist";
-    metadata.progress = MetadataProgressObject{5000, 240000, 1000};
+    ParsedMetadata metadata;
+    metadata.hold(MetadataField::TITLE, "Old title");
+    metadata.hold(MetadataField::ARTIST, "Old artist");
+    metadata.payload.progress = MetadataProgressObject{5000, 240000, 1000};
 
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"metadata":)"
                       R"({"timestamp":200,"artist":"New artist"}}})",
                       doc, root));
-    ASSERT_TRUE(process_server_state_metadata(root, &metadata));
+    ASSERT_EQ(metadata.parse(root), MetadataStateOutcome::PARSED);
 
-    EXPECT_EQ(metadata.timestamp, 200);
-    ASSERT_TRUE(metadata.artist.has_value());
-    EXPECT_EQ(metadata.artist.value(), "New artist");
-    EXPECT_FALSE(metadata.title.has_value());
+    EXPECT_EQ(metadata.payload.timestamp, 200);
+    EXPECT_EQ(metadata.text(MetadataField::ARTIST), "New artist");
+    EXPECT_EQ(metadata.text(MetadataField::TITLE), std::nullopt);
     // roles/metadata/v1.md "server/state metadata object": omitting progress clears the position.
-    EXPECT_FALSE(metadata.progress.has_value());
+    EXPECT_FALSE(metadata.payload.progress.has_value());
+}
+
+// roles/metadata/v1.md "server/state metadata object": each text field is at most 255 bytes in
+// UTF-8, artwork_url 2048. While not strict, a longer one is cut to its cap at a character
+// boundary, so a character straddling the cap is dropped whole; while strict it is a protocol
+// error (messaging.md "Out-of-range values"). A value that is not a string is no value in either
+// mode. Every row runs at both caps.
+TEST(Protocol, MetadataTextIsKeptCutOrRejected) {
+    struct Row {
+        const char* what;
+        // The value as JSON, built from the cap: `fill` ASCII bytes followed by `tail`, quoted,
+        // or `json` as is when set
+        int fill_from_cap;
+        const char* tail;
+        const char* json;
+        MetadataTextOutcome lenient;
+        int kept_from_cap;  // Bytes kept while not strict, relative to the cap
+        MetadataTextOutcome strict;
+    };
+    const Row rows[] = {
+        {"Control: at the cap", 0, "", nullptr, MetadataTextOutcome::KEPT, 0,
+         MetadataTextOutcome::KEPT},
+        {"Control: a 2-byte character ending at the cap", -2, "\xC3\xA9", nullptr,
+         MetadataTextOutcome::KEPT, 0, MetadataTextOutcome::KEPT},
+        {"one byte over", 1, "", nullptr, MetadataTextOutcome::CUT, 0,
+         MetadataTextOutcome::REJECTED},
+        {"a 2-byte character straddling the cap", -1, "\xC3\xA9", nullptr,
+         MetadataTextOutcome::CUT, -1, MetadataTextOutcome::REJECTED},
+        {"a 3-byte character straddling the cap", -2, "\xE2\x82\xAC", nullptr,
+         MetadataTextOutcome::CUT, -2, MetadataTextOutcome::REJECTED},
+        {"a 4-byte character straddling the cap", -1, "\xF0\x9F\x98\x80", nullptr,
+         MetadataTextOutcome::CUT, -1, MetadataTextOutcome::REJECTED},
+        {"null", 0, "", "null", MetadataTextOutcome::ABSENT, 0, MetadataTextOutcome::ABSENT},
+        {"a number", 0, "", "7", MetadataTextOutcome::ABSENT, 0, MetadataTextOutcome::ABSENT},
+    };
+    for (const size_t cap : {MAX_METADATA_TEXT_BYTES, MAX_METADATA_URL_BYTES}) {
+        for (const Row& row : rows) {
+            SCOPED_TRACE(std::string(row.what) + " at " + std::to_string(cap));
+            const std::string sent =
+                std::string(cap + row.fill_from_cap, 'a') + std::string(row.tail);
+            const std::string value =
+                row.json != nullptr ? std::string(row.json) : R"(")" + sent + R"(")";
+            JsonDocument doc;
+            JsonObject root;
+            ASSERT_TRUE(parse(R"({"field":)" + value + "}", doc, root));
+
+            std::string_view lenient_text;
+            ASSERT_EQ(metadata_text_from_wire(root["field"], "field", cap, false, &lenient_text),
+                      row.lenient);
+            if (row.lenient != MetadataTextOutcome::ABSENT) {
+                EXPECT_EQ(lenient_text, sent.substr(0, cap + row.kept_from_cap));
+            }
+
+            std::string_view strict_text;
+            ASSERT_EQ(metadata_text_from_wire(root["field"], "field", cap, true, &strict_text),
+                      row.strict);
+            if (row.strict == MetadataTextOutcome::KEPT) {
+                EXPECT_EQ(strict_text, sent);
+            }
+        }
+    }
+}
+
+// MetadataRoleConfig: a field the role does not keep is dropped as it is parsed, so the
+// state carries no value for it and its text is never viewed, while every kept field is. An
+// unkept field over its cap still reports the cut, since the cap holds whether or not the client
+// keeps it; a kept one is cut in place.
+TEST(Protocol, MetadataFieldsNotKeptAreDropped) {
+    struct Row {
+        const char* what;
+        EnumSet<MetadataField> kept;
+        std::string title;
+        MetadataStateOutcome outcome;
+    };
+    const std::string long_title(MAX_METADATA_TEXT_BYTES + 1, 't');
+    const Row rows[] = {
+        {"Control: every field kept", ALL_METADATA_FIELDS, "Song", MetadataStateOutcome::PARSED},
+        {"title and artwork_url kept", {MetadataField::TITLE, MetadataField::ARTWORK_URL}, "Song",
+         MetadataStateOutcome::PARSED},
+        {"no field kept", {}, "Song", MetadataStateOutcome::PARSED},
+        {"a kept title over its cap", ALL_METADATA_FIELDS, long_title, MetadataStateOutcome::CUT},
+        {"an unkept title over its cap", {MetadataField::ARTIST}, long_title,
+         MetadataStateOutcome::CUT},
+    };
+    const std::pair<MetadataField, std::string> sent[] = {
+        {MetadataField::ARTIST, "Band"},
+        {MetadataField::ALBUM_ARTIST, "Various"},
+        {MetadataField::ALBUM, "Record"},
+        {MetadataField::ARTWORK_URL, "http://example.com/art.jpg"},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.what);
+        std::string json = R"({"type":"server/state","payload":{"metadata":{"timestamp":1,)";
+        json += R"("title":")" + row.title + R"(")";
+        for (const auto& [field, text] : sent) {
+            json += std::string(R"(,")") + to_cstr(field) + R"(":")" + text + R"(")";
+        }
+        json += "}}}";
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(json, doc, root));
+
+        ParsedMetadata metadata(row.kept);
+        ASSERT_EQ(metadata.parse(root), row.outcome);
+        const auto expected = [&row](MetadataField field, const std::string& text) {
+            return row.kept.contains(field)
+                       ? std::optional<std::string>(text.substr(0, metadata_field_cap(field)))
+                       : std::nullopt;
+        };
+        EXPECT_EQ(metadata.text(MetadataField::TITLE), expected(MetadataField::TITLE, row.title));
+        for (const auto& [field, text] : sent) {
+            SCOPED_TRACE(to_cstr(field));
+            EXPECT_EQ(metadata.text(field), expected(field, text));
+        }
+    }
 }
 
 // roles/metadata/v1.md and roles/color/v1.md "server/state ... object": timestamp is a required
@@ -348,11 +496,11 @@ TEST(Protocol, StateObjectTimestampMustBeAnInteger) {
         ASSERT_TRUE(parse(std::string(R"({"type":"server/state","payload":{"metadata":{)") +
                               row.timestamp_field + R"("title":"New"}}})",
                           doc, root));
-        ServerMetadataStateObject metadata;
-        metadata.title = "Kept";
-        EXPECT_EQ(process_server_state_metadata(root, &metadata), row.accepted);
-        ASSERT_TRUE(metadata.title.has_value());
-        EXPECT_EQ(metadata.title.value(), row.accepted ? "New" : "Kept");
+        ParsedMetadata metadata;
+        metadata.hold(MetadataField::TITLE, "Kept");
+        EXPECT_EQ(metadata.parse(root), row.accepted ? MetadataStateOutcome::PARSED
+                                                     : MetadataStateOutcome::IGNORED);
+        EXPECT_EQ(metadata.text(MetadataField::TITLE), row.accepted ? "New" : "Kept");
 
         ASSERT_TRUE(parse(std::string(R"({"type":"server/state","payload":{"color":{)") +
                               row.timestamp_field + R"("primary":[10,20,30]}}})",

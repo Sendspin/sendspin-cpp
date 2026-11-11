@@ -494,6 +494,25 @@ struct PlayerRoleConfig {
 };
 
 // ============================================================================
+// Metadata config types
+// ============================================================================
+
+/// @brief Configuration for the metadata role: which text fields of ServerMetadataStateObject it
+/// keeps. A field set false reaches the listener without a value and costs no storage
+/// (docs/integration-guide.md, MetadataRoleConfig).
+struct MetadataRoleConfig {
+    bool title{true};         ///< Keep ServerMetadataStateObject::title
+    bool artist{true};        ///< Keep ServerMetadataStateObject::artist
+    bool album_artist{true};  ///< Keep ServerMetadataStateObject::album_artist
+    bool album{true};         ///< Keep ServerMetadataStateObject::album
+    bool artwork_url{true};   ///< Keep ServerMetadataStateObject::artwork_url
+
+    /// @brief Placement of the text blocks of the states in flight (ESP-IDF only). The main loop
+    /// copies each state's text out of them once, so PSRAM-preferring.
+    MemoryLocation buffer_location{MemoryLocation::PREFER_EXTERNAL};
+};
+
+// ============================================================================
 // Artwork config types
 // ============================================================================
 

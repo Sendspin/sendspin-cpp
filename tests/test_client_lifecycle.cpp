@@ -46,8 +46,10 @@
 #include "sendspin/visualizer_role.h"
 #include "sync_task.h"
 #include "time_burst.h"  // ms_until_due(), staged directly
+#include "time_filter.h"
 #include "visualizer_role_impl.h"  // Ring state after stop(); private access, see tests/CMakeLists.txt
 
+#include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
@@ -56,6 +58,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -65,7 +68,9 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -2450,10 +2455,22 @@ ControllerStatePayload controller_state_with(uint8_t value) {
     return state;
 }
 
-ServerMetadataStateObject metadata_state_with(uint8_t value) {
-    ServerMetadataStateObject state;  // Timestamp 0: due at once
-    state.year = value;
-    return state;
+/// Hands the metadata role's slot a state whose year is `value`, due at once, stamped with
+/// `generation`.
+void hand_over_metadata_state(SendspinClient& c, uint8_t value, uint32_t generation) {
+    c.metadata_->impl_->event_state->slot.arrive(
+        [value](MetadataStateBuffer& place) {
+            place.payload = MetadataStatePayload{.year = value};  // Timestamp 0: due at once
+        },
+        generation);
+}
+
+/// The metadata role's handler for a state whose year is `value`, due at once.
+void handle_metadata_state(SendspinClient& c, uint8_t value) {
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, R"({"payload":{"metadata":{"timestamp":0,"year":)" +
+                                          std::to_string(value) + "}}}"));
+    c.metadata_->impl_->handle_server_state(doc.as<JsonObject>());
 }
 
 ServerColorStateObject color_state_with(uint8_t value) {
@@ -2514,14 +2531,7 @@ const StateRoleAccess STATE_ROLES[] = {
          return c.controller_->impl_->controller_state.volume;
      },
      true, false},
-    {"metadata",
-     [](SendspinClient& c, uint8_t v) {
-         c.metadata_->impl_->handle_server_state(metadata_state_with(v));
-     },
-     [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.metadata_->impl_->event_state->slot.write(
-             PendingMetadataStates{.oldest = metadata_state_with(v)}, g);
-     },
+    {"metadata", handle_metadata_state, hand_over_metadata_state,
      [](SendspinClient& c) { c.metadata_->impl_->cleanup(); },
      [](SendspinClient& c) { c.metadata_->impl_->drain_events(); },
      [](SendspinClient& c) { return c.metadata_->impl_->cleanup_generation.load(); },
@@ -2534,8 +2544,8 @@ const StateRoleAccess STATE_ROLES[] = {
          c.color_->impl_->handle_server_state(color_state_with(v));
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
-         c.color_->impl_->event_state->slot.write(
-             PendingColorStates{.oldest = color_state_with(v)}, g);
+         c.color_->impl_->event_state->slot.arrive(
+             [v](ServerColorStateObject& place) { place = color_state_with(v); }, g);
      },
      [](SendspinClient& c) { c.color_->impl_->cleanup(); },
      [](SendspinClient& c) { c.color_->impl_->drain_events(); },
@@ -2834,7 +2844,7 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
             pump_until(client, [&] { return !client.is_started(); });
         } else {
             client.controller_->impl_->handle_server_state(controller_state_with(11));
-            client.metadata_->impl_->handle_server_state(metadata_state_with(5));
+            handle_metadata_state(client, 5);
             client.loop();
         }
 
@@ -2848,6 +2858,218 @@ TEST(ClientLifecycle, StopFromInsideADrainCallbackIsSafe) {
         EXPECT_EQ(log.calls, row.expected_calls);
         client.stop();
     }
+}
+
+// The metadata role's states wait in its ScheduledStateSlot and reach the listener through
+// METADATA_TEXT_BLOCKS text blocks, one each for the slot's oldest and newest places and the main
+// loop's current state, which a delivery swaps with the delivered place. So after every step the
+// three name each block once, every state reaches the listener with the text it arrived with and
+// in order, and the slot leaves pending the state roles/metadata/v1.md "Scheduled metadata
+// updates" leaves waiting, with the main loop's copy of its deadline (pending_at()) set exactly
+// while one is, once a drain has run. The rows run in order on one client whose protocol task the
+// test thread plays: same-window arrivals (a third replacing the scheduled second), a pending
+// state replaced by an arrival, a teardown with states pending, a state stamped before it, an
+// arrival between a drain's peek and its commit (from the clear its catch-up delivers), a pending
+// state that falls due in the callback of the state before it, stop() from on_metadata(), and a
+// restart. Reaches the role's private state because which block each place names and which state
+// waits show nowhere else before a deadline the test never reaches; the primary clock is installed
+// by hand, so a scheduled state waits for its deadline without a server.
+TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
+    struct TitleLog : MetadataRoleListener {
+        void on_metadata(const ServerMetadataStateObject& metadata) override {
+            this->titles.push_back(metadata.title.value_or(""));
+            if (this->on_title) {
+                std::exchange(this->on_title, nullptr)(this->titles.back());
+            }
+        }
+        void on_metadata_clear() override {
+            ++this->clears;
+            if (this->on_clear) {
+                std::exchange(this->on_clear, nullptr)();
+            }
+        }
+        std::vector<std::string> titles;
+        int clears{0};
+        std::function<void(const std::string&)> on_title;
+        std::function<void()> on_clear;
+    };
+    enum class Step : uint8_t {
+        DUE,                // A state due at once arrives
+        SCHEDULED,          // A state an hour ahead arrives
+        STALE,              // A due state stamped before the last teardown arrives
+        DRAIN,              // A main-loop tick
+        DRAIN_ARRIVING,     // The role's drain, a scheduled state arriving from the clear it
+                            // catches up on, between its peek and its commit
+        DRAIN_FALLING_DUE,  // A tick whose first callback brings every scheduled state due
+        DRAIN_STOPPING,     // A tick whose first callback stops the client
+        CLEANUP,            // The protocol task's teardown
+        START,
+        RESTART,
+    };
+    struct Row {
+        const char* what;
+        Step step;
+        const char* title;
+        std::vector<std::string> delivered;  // Titles the step hands the listener, in order
+        const char* pending;                 // The pending state's title, nullptr when none
+        int clears;
+    };
+    const Row rows[] = {
+        {"Control: a due state arrives", Step::DUE, "A", {}, nullptr, 0},
+        {"Control: and is applied", Step::DRAIN, nullptr, {"A"}, nullptr, 0},
+        {"a due state", Step::DUE, "B", {}, nullptr, 0},
+        {"a scheduled one behind it", Step::SCHEDULED, "C", {}, nullptr, 0},
+        {"a third replaces the second", Step::SCHEDULED, "D", {}, nullptr, 0},
+        {"the drain applies the first and the third waits", Step::DRAIN, nullptr, {"B"}, "D", 0},
+        {"Control: and goes on waiting", Step::DRAIN, nullptr, {}, "D", 0},
+        {"a due state replaces the pending one", Step::DUE, "E", {}, nullptr, 0},
+        {"a scheduled one behind it", Step::SCHEDULED, "F", {}, nullptr, 0},
+        {"the drain applies it and the scheduled one waits", Step::DRAIN, nullptr, {"E"}, "F", 0},
+        {"a due state replaces the pending one again", Step::DUE, "G", {}, nullptr, 0},
+        {"a scheduled one behind it", Step::SCHEDULED, "H", {}, nullptr, 0},
+        {"a teardown with both held", Step::CLEANUP, nullptr, {}, nullptr, 0},
+        {"the drain delivers the clear alone", Step::DRAIN, nullptr, {}, nullptr, 1},
+        {"a scheduled state after it", Step::SCHEDULED, "J", {}, nullptr, 1},
+        {"waits", Step::DRAIN, nullptr, {}, "J", 1},
+        {"a state stamped before the teardown", Step::STALE, "K", {}, "J", 1},
+        {"is dropped, and the pending one goes on waiting", Step::DRAIN, nullptr, {}, "J", 1},
+        {"a teardown", Step::CLEANUP, nullptr, {}, nullptr, 1},
+        {"a due state after it", Step::DUE, "L", {}, nullptr, 1},
+        {"a scheduled one arriving mid-drain is seen by a fresh peek", Step::DRAIN_ARRIVING, "M",
+         {"L"}, "M", 2},
+        {"a due state replaces the pending one", Step::DUE, "N", {}, nullptr, 2},
+        {"a scheduled one behind it", Step::SCHEDULED, "O", {}, nullptr, 2},
+        {"falling due in the first callback, it follows in the same tick", Step::DRAIN_FALLING_DUE,
+         nullptr, {"N", "O"}, nullptr, 2},
+        {"a due state", Step::DUE, "P", {}, nullptr, 2},
+        {"a scheduled one behind it", Step::SCHEDULED, "Q", {}, nullptr, 2},
+        {"stop() from the first callback leaves nothing behind", Step::DRAIN_STOPPING, nullptr,
+         {"P"}, nullptr, 3},
+        {"a start", Step::START, nullptr, {}, nullptr, 3},
+        {"a scheduled state", Step::SCHEDULED, "R", {}, nullptr, 3},
+        {"waits", Step::DRAIN, nullptr, {}, "R", 3},
+        {"a restart drops it", Step::RESTART, nullptr, {}, nullptr, 4},
+        {"a due state after it", Step::DUE, "S", {}, nullptr, 4},
+        {"is applied", Step::DRAIN, nullptr, {"S"}, nullptr, 4},
+    };
+
+    TitleLog log;
+    TestNetworkProvider network;
+    SendspinClient client(make_config(0));
+    client.set_network_provider(&network);
+    client.add_metadata().set_listener(&log);
+    MetadataRole::Impl& impl = *client.metadata_->impl_;
+    // The primary clock, in sync with the client's; `offset` moves the server's clock ahead.
+    const auto set_clock = [&client](double offset) {
+        ConnectionManager& manager = *client.connection_manager_;
+        std::lock_guard<std::mutex> lock(manager.published_mutex_);
+        manager.published_.primary_slot = 0;
+        manager.published_.clocks[0] =
+            TimeTransform{.offset = offset, .last_update = platform_time_us(), .synced = true};
+    };
+    const auto start = [&client, &set_clock] {
+        ASSERT_TRUE(client.start());
+        client.protocol_task_->stop();
+        set_clock(0.0);
+    };
+    start();
+    const int64_t hour = 3600 * static_cast<int64_t>(US_PER_SECOND);
+    const int64_t scheduled_at = platform_time_us() + hour;
+    const auto state_json = [](const char* title, int64_t timestamp) {
+        return R"({"payload":{"metadata":{"timestamp":)" + std::to_string(timestamp) +
+               R"(,"title":")" + title + R"("}}})";
+    };
+    // The protocol task's handler, for a state carrying `title`.
+    const auto arrive = [&impl, &state_json](const char* title, int64_t timestamp) {
+        JsonDocument doc;
+        ASSERT_FALSE(deserializeJson(doc, state_json(title, timestamp)));
+        ASSERT_EQ(impl.handle_server_state(doc.as<JsonObject>()), MetadataStateOutcome::PARSED);
+    };
+    uint32_t before_teardown = 0;
+    std::vector<std::string> delivered;
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.what);
+        switch (row.step) {
+            case Step::DUE:
+                arrive(row.title, 1);
+                break;
+            case Step::SCHEDULED:
+                arrive(row.title, scheduled_at);
+                break;
+            case Step::STALE: {
+                JsonDocument doc;
+                ASSERT_FALSE(deserializeJson(doc, state_json(row.title, 1)));
+                MetadataStateView parsed;
+                ASSERT_EQ(process_server_state_metadata(doc.as<JsonObject>(), impl.layout.kept,
+                                                        &parsed),
+                          MetadataStateOutcome::PARSED);
+                impl.event_state->slot.arrive(
+                    [&impl, &parsed](MetadataStateBuffer& place) {
+                        impl.fill_place(place, parsed);
+                    },
+                    before_teardown);
+                break;
+            }
+            case Step::DRAIN:
+                client.loop();
+                break;
+            case Step::DRAIN_ARRIVING:
+                log.on_clear = [&arrive, &row, scheduled_at] { arrive(row.title, scheduled_at); };
+                impl.drain_events();
+                break;
+            case Step::DRAIN_FALLING_DUE:
+                log.on_title = [&set_clock](const std::string&) {
+                    set_clock(2.0 * static_cast<double>(hour));
+                };
+                client.loop();
+                set_clock(0.0);
+                break;
+            case Step::DRAIN_STOPPING:
+                log.on_title = [&client](const std::string&) {
+                    client.stop();
+                };
+                client.loop();
+                break;
+            case Step::CLEANUP:
+                before_teardown = impl.cleanup_generation.load();
+                impl.cleanup();
+                break;
+            case Step::START:
+                start();
+                break;
+            case Step::RESTART:
+                client.stop();
+                start();
+                break;
+        }
+
+        delivered.insert(delivered.end(), row.delivered.begin(), row.delivered.end());
+        EXPECT_EQ(log.titles, delivered);
+        EXPECT_EQ(log.clears, row.clears);
+
+        std::array<uint8_t, 3> blocks{};
+        std::optional<std::string> pending;
+        impl.event_state->slot.slot_.read([&](const auto& places) {
+            blocks = {places.oldest.state.block, places.newest.state.block, impl.current.block};
+            if (places.pending) {
+                pending = std::string(impl.text_of(places.oldest.state, MetadataField::TITLE)
+                                          .value_or("(no title)"));
+            }
+            return 0;
+        });
+        std::sort(blocks.begin(), blocks.end());
+        static_assert(METADATA_TEXT_BLOCKS == 3);
+        EXPECT_EQ(blocks, (std::array<uint8_t, 3>{0, 1, 2})) << "a text block has two places";
+        EXPECT_EQ(pending, row.pending != nullptr ? std::optional<std::string>(row.pending)
+                                                  : std::nullopt);
+        // The main loop's copy of the deadline is exact once a drain or a stop() has run.
+        if (row.step != Step::DUE && row.step != Step::SCHEDULED && row.step != Step::STALE &&
+            row.step != Step::CLEANUP) {
+            EXPECT_EQ(impl.event_state->slot.pending_at().has_value(), row.pending != nullptr);
+        }
+    }
+    client.stop();
 }
 
 /// Counts the pairing prompts and their dismissals. Main loop only.

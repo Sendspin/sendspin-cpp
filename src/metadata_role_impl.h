@@ -18,40 +18,64 @@
 #pragma once
 
 #include "inbox.h"
+#include "platform/memory.h"
 #include "protocol_messages.h"
+#include "reserved_text.h"
+#include "scheduled_state_slot.h"
 #include "sendspin/metadata_role.h"
 #include "teardown_tracker.h"
+#include <ArduinoJson.h>
 
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 namespace sendspin {
 
 class SendspinClient;
 struct ClientHelloMessage;
 
-/// @brief Metadata states handed to the main loop but not yet drained
-///
-/// messaging.md "server/state" lets a server bring a client up to date and then schedule the next
-/// update straight after it, so two states can land between two main-loop ticks. Both are kept,
-/// in arrival order, so the current one is still applied on the tick that also takes the
-/// scheduled one. A third state in the same window replaces `newest`, which no observer has seen.
-struct PendingMetadataStates {
-    std::optional<ServerMetadataStateObject> oldest;
-    std::optional<ServerMetadataStateObject> newest;
+/// @brief Text blocks a metadata role keeps, one state's kept text each (MetadataTextLayout): one
+/// for each place a state can be, the slot's oldest and newest places and the main loop's current
+/// state (ScheduledStateSlot). Each place names its block by index; a delivery swaps the
+/// delivered place's block with the current state's, so each block always has one place.
+constexpr uint8_t METADATA_TEXT_BLOCKS = 3;
+
+/// @brief A metadata state and the text block it names, an index into the role's text blocks;
+/// the block stays with the place when the place holds no state
+struct MetadataStateBuffer {
+    MetadataStatePayload payload{};
+    uint8_t block{0};
 };
+
+/// @brief The server-clock timestamp `state` applies at (ScheduledStateSlot)
+inline int64_t scheduled_time(const MetadataStateBuffer& state) {
+    return state.payload.timestamp;
+}
 
 /// @brief Private implementation of the metadata role
 struct MetadataRole::Impl : RoleTeardown {
-    explicit Impl(SendspinClient* client);
+    Impl(MetadataRoleConfig config, SendspinClient* client);
     ~Impl() = default;
 
     // ========================================
     // Event state
     // ========================================
 
+    /// The block each place names at first: the slot's oldest and newest places, then the
+    /// current state
+    static constexpr uint8_t OLDEST_FIRST_BLOCK = 0;
+    static constexpr uint8_t NEWEST_FIRST_BLOCK = 1;
+    static constexpr uint8_t CURRENT_FIRST_BLOCK = 2;
+    static_assert(CURRENT_FIRST_BLOCK + 1 == METADATA_TEXT_BLOCKS,
+                  "one block for each place a state can be");
+
     struct EventState {
-        GenerationSlot<PendingMetadataStates> slot;
+        ScheduledStateSlot<MetadataStateBuffer> slot{
+            MetadataStateBuffer{.block = OLDEST_FIRST_BLOCK},
+            MetadataStateBuffer{.block = NEWEST_FIRST_BLOCK}};
     };
 
     // ========================================
@@ -59,22 +83,43 @@ struct MetadataRole::Impl : RoleTeardown {
     // ========================================
 
     void attach_inbox(Inbox& inbox);
+    /// @brief Allocates the text blocks, once: they are kept across restarts, since the states
+    /// that own them hold only their indices. Main loop, from SendspinClient::start().
+    /// @return false (logged) when they cannot be allocated, which fails the start.
+    bool start();
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerMetadataStateObject&& metadata) const;
-    // True if a slot state needs taking, or a state already held from a prior tick (see
-    // held_state) is still waiting out its server-clock deadline: the deadline itself sets no
-    // inbox bit, so held_state must be polled every tick until it fires.
+    /// @brief Parses a server/state metadata object and hands it to the slot, copying its kept
+    /// text from the document into the block of the place it takes (fill_place()). Protocol task,
+    /// inside ParsedJsonMessage::extract(), the only window the document is alive.
+    /// @return What the parse made of it; a REJECTED or IGNORED object reaches no slot.
+    MetadataStateOutcome handle_server_state(JsonObject root);
+    /// @brief Writes `parsed` into `place`, its text into the block `place` names. Runs under the
+    /// Inbox mutex (ScheduledStateSlot::arrive()): a pure data copy of at most a text block, the
+    /// largest critical section the Inbox has.
+    void fill_place(MetadataStateBuffer& place, const MetadataStateView& parsed);
+    /// @brief True if a state arrived, or the pending state the last drain left in the slot has
+    /// come due: the deadline sets no inbox bit, so it is checked every tick, against
+    /// ScheduledStateSlot::pending_at(), without the Inbox mutex.
     bool needs_drain(uint32_t pending_bits) const {
-        return (pending_bits & INBOX_TOPIC_METADATA) != 0 || this->held_state.has_value();
+        const std::optional<int64_t> pending_at = this->event_state->slot.pending_at();
+        return (pending_bits & INBOX_TOPIC_METADATA) != 0 ||
+               (pending_at.has_value() && this->state_is_due(*pending_at));
     }
-    /// @brief Takes the slot, catches the role up on any teardown (complete_teardown()), then
-    /// holds the taken states if they were admitted under the current generation and applies
-    /// whichever is due. Main loop.
+    /// @brief Catches the role up on any teardown (complete_teardown()), then applies whichever
+    /// state the slot holds is due (drain_scheduled_state()). Main loop.
     void drain_events();
     /// Whether a state's server-clock deadline has passed on the synchronized client clock.
     bool state_is_due(int64_t timestamp) const;
-    /// Applies the held state and fires the listener once its server-clock deadline has passed.
-    void apply_due_state();
+    /// @brief Fills the public state from the current state and fires on_metadata(). Main loop,
+    /// with no lock held.
+    void apply_current_state();
+    /// @brief Fills the public state from `state`, its text from the block it names; an empty
+    /// state clears every field, keeping the text storage. Main loop.
+    void fill_public_state(const MetadataStateBuffer& state);
+    /// @brief The text `state` carries for `field`, viewing its block; nullopt when it carries
+    /// none
+    std::optional<std::string_view> text_of(const MetadataStateBuffer& state,
+                                            MetadataField field) const;
 
     /// @brief Stops the role and discards the state the protocol task can reach. Protocol task,
     /// or the main loop in SendspinClient::stop() once every other thread is joined.
@@ -102,10 +147,20 @@ struct MetadataRole::Impl : RoleTeardown {
     // ========================================
 
     // Struct fields
+    MetadataRoleConfig config;
+    /// The kept fields and where each lies in a text block. Fixed from add_metadata().
+    MetadataTextLayout layout;
+    /// METADATA_TEXT_BLOCKS blocks of layout.block_bytes, allocated by start(); empty when no
+    /// field is kept.
+    PlatformBuffer text_blocks;
+    /// The applied state, the one on_metadata() is handed. Main loop only.
     ServerMetadataStateObject metadata{};
-    // State taken from the inbox slot, awaiting its server-clock deadline. Main-thread only:
-    // written and read exclusively from drain_events()/complete_teardown() on the loop thread.
-    std::optional<ServerMetadataStateObject> held_state;
+    /// Storage for the public state's text fields, reserved for each kept field's cap. Main loop
+    /// only.
+    std::array<ReservedText, METADATA_FIELD_COUNT> metadata_text;
+    /// The state the last delivery handed over, whose text the public state is filled from. Main
+    /// loop only; the slot's commit swaps it, under the Inbox mutex, for the state it delivers.
+    MetadataStateBuffer current{.block = CURRENT_FIRST_BLOCK};
 
     // Pointer fields
     SendspinClient* client;

@@ -49,6 +49,11 @@ static const char* const TAG = "sendspin.protocol";
 /// not in that format closes the connection.
 static constexpr bool GROUP_ID_STRICT = false;
 
+/// @brief roles/metadata/v1.md "server/state metadata object": a text field over its cap is cut to
+/// it until servers keep to the caps, then this flips and such a server/state is a protocol error
+/// that closes the connection (messaging.md "Out-of-range values").
+static constexpr bool METADATA_STRICT = false;
+
 // ============================================================================
 // Static helpers
 // ============================================================================
@@ -288,17 +293,6 @@ static bool process_server_player_command_object(const JsonObject player_object,
     }
 
     return true;
-}
-
-// Parses a single string field of a server/state metadata object. A field the object does not
-// carry, or carries with the wrong type (logged), leaves `out` without a value.
-static void parse_metadata_string_field(JsonVariantConst var, const char* name,
-                                        std::optional<std::string>* out) {
-    if (var.is<const char*>()) {
-        *out = var.as<std::string>();
-    } else if (!var.isUnbound() && !var.isNull()) {
-        SS_LOGW(TAG, "Ignoring field '%s': expected string", name);
-    }
 }
 
 // Parses a single `[R, G, B]` color field of a server/state color object. A field the object does
@@ -684,16 +678,30 @@ bool process_server_command_source(JsonObject root, SourceCommand* source_cmd) {
     return true;
 }
 
-// server/state is parsed per section rather than into a single aggregate struct. Each section
-// here is an out-of-line function that fills a caller-owned struct directly, so no section's
-// fields are materialized twice (once in a parser frame, once in the caller's). The caller keeps
-// every section a role takes live together in its own frame for one parse of the document; that
-// combined frame is on the protocol task, whose stack is bounded on ESP-IDF and covers it (see
-// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
+MetadataTextOutcome metadata_text_from_wire(JsonVariantConst var, const char* name, size_t cap,
+                                            bool strict, std::string_view* out) {
+    if (!var.is<const char*>()) {
+        if (!var.isUnbound() && !var.isNull()) {
+            SS_LOGW(TAG, "Ignoring field '%s': expected string", name);
+        }
+        return MetadataTextOutcome::ABSENT;
+    }
+    const auto text = var.as<std::string_view>();
+    if (text.size() <= cap) {
+        *out = text;
+        return MetadataTextOutcome::KEPT;
+    }
+    if (strict) {
+        return MetadataTextOutcome::REJECTED;
+    }
+    *out = utf8_truncate(text, cap);
+    return MetadataTextOutcome::CUT;
+}
 
-bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* metadata) {
+MetadataStateOutcome process_server_state_metadata(JsonObject root, EnumSet<MetadataField> kept,
+                                                   MetadataStateView* metadata) {
     if (metadata == nullptr || !root["payload"]["metadata"].is<JsonObject>()) {
-        return false;
+        return MetadataStateOutcome::IGNORED;
     }
     const JsonObject metadata_object = root["payload"]["metadata"];
 
@@ -701,26 +709,48 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* m
     const JsonVariantConst timestamp = metadata_object["timestamp"];
     if (!timestamp.is<int64_t>()) {
         SS_LOGE(TAG, "Invalid metadata state object: missing or non-integer timestamp");
-        return false;
+        return MetadataStateOutcome::IGNORED;
     }
     // messaging.md "server/state": every message carries the full state of each role object it
     // includes, so an included metadata object is parsed into a fresh state rather than overlaid
     // on what came before.
-    *metadata = ServerMetadataStateObject{};
-    metadata->timestamp = timestamp.as<int64_t>();
+    *metadata = MetadataStateView{};
+    MetadataStatePayload& payload = metadata->payload;
+    payload.timestamp = timestamp.as<int64_t>();
 
-    parse_metadata_string_field(metadata_object["title"], "title", &metadata->title);
-    parse_metadata_string_field(metadata_object["artist"], "artist", &metadata->artist);
-    parse_metadata_string_field(metadata_object["album_artist"], "album_artist",
-                                &metadata->album_artist);
-    parse_metadata_string_field(metadata_object["album"], "album", &metadata->album);
-    parse_metadata_string_field(metadata_object["artwork_url"], "artwork_url",
-                                &metadata->artwork_url);
+    // A field the role does not keep is still measured against its cap: the cap holds for every
+    // field of an active role's object, kept or not.
+    bool cut = false;
+    for (size_t i = 0; i < METADATA_FIELD_COUNT; ++i) {
+        const auto field = static_cast<MetadataField>(i);
+        const char* name = to_cstr(field);
+        std::string_view value;
+        switch (metadata_text_from_wire(metadata_object[name], name, metadata_field_cap(field),
+                                        METADATA_STRICT, &value)) {
+            case MetadataTextOutcome::ABSENT:
+                break;
+            case MetadataTextOutcome::CUT:
+                cut = true;
+                [[fallthrough]];
+            case MetadataTextOutcome::KEPT:
+                if (kept.contains(field)) {
+                    metadata->text[i] = value.data();
+                    payload.text_sizes[i] = static_cast<uint16_t>(value.size());
+                }
+                break;
+            case MetadataTextOutcome::REJECTED:
+                SS_LOGW(TAG,
+                        "Invalid server/state metadata: %s is longer than %zu bytes; closing "
+                        "connection",
+                        name, metadata_field_cap(field));
+                return MetadataStateOutcome::REJECTED;
+        }
+    }
     if (auto v = read_uint_field<uint16_t>(metadata_object["year"], "year")) {
-        metadata->year = v;
+        payload.year = v;
     }
     if (auto v = read_uint_field<uint16_t>(metadata_object["track"], "track")) {
-        metadata->track = v;
+        payload.track = v;
     }
 
     // roles/metadata/v1.md "server/state metadata object": omitting progress clears the client's
@@ -740,11 +770,18 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* m
                 read_uint_field<uint32_t>(progress_object["playback_speed"], "playback_speed")) {
             progress.playback_speed = *v;
         }
-        metadata->progress = progress;
+        payload.progress = progress;
     }
 
-    return true;
+    return cut ? MetadataStateOutcome::CUT : MetadataStateOutcome::PARSED;
 }
+
+// server/state is parsed per section rather than into a single aggregate struct. The color and
+// controller sections are out-of-line functions that each fill a caller-owned struct directly, so
+// no section's fields are materialized twice (once in a parser frame, once in the caller's). The
+// caller keeps both live together in its own frame for one parse of the document; that combined
+// frame is on the protocol task, whose stack is bounded on ESP-IDF and covers it (see
+// SendspinClientConfig::DEFAULT_PROTOCOL_TASK_STACK_SIZE).
 
 bool process_server_state_color(JsonObject root, ServerColorStateObject* color) {
     if (color == nullptr || !root["payload"]["color"].is<JsonObject>()) {

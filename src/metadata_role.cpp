@@ -19,6 +19,7 @@
 #include "sendspin/client.h"
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 static const char* const TAG = "sendspin.metadata";
@@ -27,17 +28,52 @@ namespace sendspin {
 
 namespace {
 
-/// @brief Folds a newly arrived state into the states the main loop has not taken yet
-///
-/// `incoming` always carries exactly one state, in `oldest`. The first one to arrive after a
-/// drain keeps that place; every later one becomes `newest` (see PendingMetadataStates). Runs
-/// under the Inbox mutex, so it stays a pure data operation.
-void coalesce_metadata_states(PendingMetadataStates& current, PendingMetadataStates&& incoming) {
-    if (!current.oldest.has_value()) {
-        current.oldest = std::move(incoming.oldest);
-        return;
+/// @brief The text fields `config` keeps
+EnumSet<MetadataField> kept_fields(const MetadataRoleConfig& config) {
+    EnumSet<MetadataField> kept;
+    const std::pair<bool, MetadataField> flags[] = {
+        {config.title, MetadataField::TITLE},
+        {config.artist, MetadataField::ARTIST},
+        {config.album_artist, MetadataField::ALBUM_ARTIST},
+        {config.album, MetadataField::ALBUM},
+        {config.artwork_url, MetadataField::ARTWORK_URL},
+    };
+    for (const auto& [keep, field] : flags) {
+        if (keep) {
+            kept.insert(field);
+        }
     }
-    current.newest = std::move(incoming.oldest);
+    return kept;
+}
+
+/// @brief Text storage for each text field of the public state, reserved for the field's cap when
+/// `layout` keeps it, and for nothing when it does not
+std::array<ReservedText, METADATA_FIELD_COUNT> reserve_metadata_text(
+    const MetadataTextLayout& layout) {
+    const auto room = [&layout](MetadataField field) {
+        return layout.kept.contains(field) ? metadata_field_cap(field) : 0;
+    };
+    return {ReservedText(room(MetadataField::TITLE)), ReservedText(room(MetadataField::ARTIST)),
+            ReservedText(room(MetadataField::ALBUM_ARTIST)),
+            ReservedText(room(MetadataField::ALBUM)),
+            ReservedText(room(MetadataField::ARTWORK_URL))};
+}
+
+/// @brief The public state's member for `field`
+std::optional<std::string>& text_field(ServerMetadataStateObject& state, MetadataField field) {
+    switch (field) {
+        case MetadataField::TITLE:
+            return state.title;
+        case MetadataField::ARTIST:
+            return state.artist;
+        case MetadataField::ALBUM_ARTIST:
+            return state.album_artist;
+        case MetadataField::ALBUM:
+            return state.album;
+        case MetadataField::ARTWORK_URL:
+            return state.artwork_url;
+    }
+    return state.title;
 }
 
 }  // namespace
@@ -46,14 +82,19 @@ void coalesce_metadata_states(PendingMetadataStates& current, PendingMetadataSta
 // Impl constructor / destructor
 // ============================================================================
 
-MetadataRole::Impl::Impl(SendspinClient* client)
-    : client(client), event_state(std::make_unique<EventState>()) {}
+MetadataRole::Impl::Impl(MetadataRoleConfig config, SendspinClient* client)
+    : config(config),
+      layout(metadata_text_layout(kept_fields(config))),
+      metadata_text(reserve_metadata_text(this->layout)),
+      client(client),
+      event_state(std::make_unique<EventState>()) {}
 
 // ============================================================================
 // MetadataRole forwarding (public API → Impl)
 // ============================================================================
 
-MetadataRole::MetadataRole(SendspinClient* client) : impl_(std::make_unique<Impl>(client)) {}
+MetadataRole::MetadataRole(MetadataRoleConfig config, SendspinClient* client)
+    : impl_(std::make_unique<Impl>(config, client)) {}
 
 MetadataRole::~MetadataRole() = default;
 
@@ -119,17 +160,49 @@ void MetadataRole::Impl::attach_inbox(Inbox& inbox) {
     this->event_state->slot.bind(inbox, INBOX_TOPIC_METADATA);
 }
 
+bool MetadataRole::Impl::start() {
+    const size_t bytes = METADATA_TEXT_BLOCKS * static_cast<size_t>(this->layout.block_bytes);
+    if (bytes == 0 || this->text_blocks) {
+        return true;
+    }
+    if (!this->text_blocks.allocate(bytes, this->config.buffer_location)) {
+        SS_LOGE(TAG, "Failed to allocate the %zu byte metadata text buffer", bytes);
+        return false;
+    }
+    return true;
+}
+
 void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::METADATA);
 }
 
-void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadata) const {
+MetadataStateOutcome MetadataRole::Impl::handle_server_state(JsonObject root) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
-    // messaging.md "server/state": each included metadata object is the role's full state, never
-    // an overlay on the one before it (see coalesce_metadata_states).
-    PendingMetadataStates arrival;
-    arrival.oldest = std::move(metadata);
-    this->event_state->slot.merge(coalesce_metadata_states, std::move(arrival), generation);
+    // Parsed, and rejected or cut (logged), with no lock held; only the copy runs under it.
+    MetadataStateView parsed;
+    const MetadataStateOutcome outcome =
+        process_server_state_metadata(root, this->layout.kept, &parsed);
+    if (outcome == MetadataStateOutcome::PARSED || outcome == MetadataStateOutcome::CUT) {
+        // messaging.md "server/state": each included metadata object is the role's full state,
+        // never an overlay on the one before it, so it replaces the place's state whole.
+        this->event_state->slot.arrive(
+            [this, &parsed](MetadataStateBuffer& place) { this->fill_place(place, parsed); },
+            generation);
+    }
+    return outcome;
+}
+
+void MetadataRole::Impl::fill_place(MetadataStateBuffer& place, const MetadataStateView& parsed) {
+    place.payload = parsed.payload;
+    char* block = reinterpret_cast<char*>(this->text_blocks.data()) +
+                  static_cast<size_t>(place.block) * this->layout.block_bytes;
+    for (size_t i = 0; i < METADATA_FIELD_COUNT; ++i) {
+        const uint16_t size = parsed.payload.text_sizes[i].value_or(0);
+        if (size > 0) {
+            // At most the field's cap, the room the layout gives it
+            std::memcpy(block + this->layout.offsets[i], parsed.text[i], size);
+        }
+    }
 }
 
 bool MetadataRole::Impl::state_is_due(int64_t timestamp) const {
@@ -140,62 +213,45 @@ bool MetadataRole::Impl::state_is_due(int64_t timestamp) const {
     return client_ts == 0 || client_ts <= platform_time_us();
 }
 
-void MetadataRole::Impl::apply_due_state() {
-    if (!this->held_state.has_value() || !this->state_is_due(this->held_state->timestamp)) {
-        return;
+std::optional<std::string_view> MetadataRole::Impl::text_of(const MetadataStateBuffer& state,
+                                                            MetadataField field) const {
+    const auto i = static_cast<size_t>(field);
+    const std::optional<uint16_t> size = state.payload.text_sizes[i];
+    if (!size.has_value()) {
+        return std::nullopt;
     }
+    const char* block = reinterpret_cast<const char*>(this->text_blocks.data()) +
+                        static_cast<size_t>(state.block) * this->layout.block_bytes;
+    return std::string_view(block + this->layout.offsets[i], *size);
+}
 
-    this->metadata = std::move(this->held_state.value());
-    this->held_state.reset();
+void MetadataRole::Impl::fill_public_state(const MetadataStateBuffer& state) {
+    const MetadataStatePayload& payload = state.payload;
+    this->metadata.timestamp = payload.timestamp;
+    this->metadata.year = payload.year;
+    this->metadata.track = payload.track;
+    this->metadata.progress = payload.progress;
+    for (size_t i = 0; i < METADATA_FIELD_COUNT; ++i) {
+        const auto field = static_cast<MetadataField>(i);
+        this->metadata_text[i].fill(text_field(this->metadata, field), this->text_of(state, field));
+    }
+}
+
+void MetadataRole::Impl::apply_current_state() {
+    this->fill_public_state(this->current);
     if (this->listener) {
         this->listener->on_metadata(this->metadata);
     }
 }
 
 void MetadataRole::Impl::drain_events() {
-    PendingMetadataStates taken;
-    bool have_taken = false;
-    const uint32_t generation =
-        take_current_payload(*this, this->event_state->slot, taken, have_taken, TAG, "metadata");
-    // Every check below against `generation` also catches a listener callback that re-entered
-    // teardown (a listener calling stop()): its cleanup() moved the generation on, and its own
-    // drain already reset this role.
-    if (!this->accepts(generation)) {
-        return;
-    }
-
-    // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex;
-    // see inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
-    // moves the pending states into held_state, then each deadline is evaluated below with no
-    // lock held at all.
-    //
-    // roles/metadata/v1.md "Scheduled metadata updates": a state whose timestamp is still in the
-    // future is the pending update and a newer one replaces it, while a past or present one is
-    // applied at once and discards the pending update. Both fall out of replacing held_state with
-    // each taken state in arrival order, applying whatever is due in between.
-    if (have_taken) {
-        const bool collapses =
-            taken.newest.has_value() && this->state_is_due(taken.newest->timestamp);
-        if (taken.oldest.has_value() && !collapses) {
-            // Two states that are both due collapse instead: the older would be superseded
-            // within this tick, so no listener could observe it.
-            this->held_state = std::move(taken.oldest);
-            this->apply_due_state();
-            if (!this->accepts(generation)) {
-                return;
-            }
-        }
-        if (taken.newest.has_value()) {
-            this->held_state = std::move(taken.newest);
-        }
-    }
-
-    // A future-dated state is held across ticks without any topic bit set (take() above cleared
-    // it). It is re-evaluated against its deadline on later ticks only because needs_drain() ORs
-    // in held_state.has_value() alongside the INBOX_TOPIC_METADATA bit test, so this
-    // drain_events() keeps running each tick until the deadline fires. Dropping that OR term
-    // would strand the state until an unrelated new one re-set the topic bit.
-    this->apply_due_state();
+    // A delivery trades blocks rather than copying text: the delivered place takes the current
+    // state's block, which no state still to be delivered names, and the text is copied once, out
+    // of the current block into the public state, with no lock held.
+    drain_scheduled_state(
+        *this, this->event_state->slot,
+        [this](MetadataStateBuffer& place) { std::swap(place, this->current); },
+        [this] { this->apply_current_state(); }, TAG, "metadata");
 }
 
 void MetadataRole::Impl::cleanup() {
@@ -209,8 +265,8 @@ void MetadataRole::Impl::cleanup() {
 }
 
 void MetadataRole::Impl::complete_teardown() {
-    this->metadata = {};
-    this->held_state.reset();
+    this->fill_public_state(MetadataStateBuffer{});
+    this->event_state->slot.forget_pending();
     if (this->listener) {
         this->listener->on_metadata_clear();
     }

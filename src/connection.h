@@ -590,6 +590,14 @@ public:
         return !std::exchange(this->group_id_normalized_, true);
     }
 
+    /// @brief Notes that this connection's server sent metadata text over its cap, which the
+    /// parse cut (process_server_state_metadata()).
+    /// @return true the first time, so the server/state dispatch warns once per connection.
+    /// Protocol task only.
+    bool note_metadata_cut() {
+        return !std::exchange(this->metadata_cut_, true);
+    }
+
     /// @brief Returns true if `role` is active on this connection, judged on the exact versioned
     /// name this library implements.
     ///
@@ -1243,6 +1251,10 @@ protected:
     /// Whether the server sent a group_id that was normalized (note_group_id_normalized()).
     /// Protocol task only.
     bool group_id_normalized_{false};
+
+    /// Whether the server sent metadata text over its cap (note_metadata_cut()). Protocol task
+    /// only.
+    bool metadata_cut_{false};
 
     /// Memory placement preference for fallback_buf_ (ESP-IDF only).
     MemoryLocation fallback_location_{MemoryLocation::PREFER_EXTERNAL};

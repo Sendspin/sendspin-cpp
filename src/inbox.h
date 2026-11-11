@@ -115,7 +115,10 @@ class InboxSlot;
  * the inbox mutex is held. merge() functors passed to InboxSlot must be pure data operations on
  * the slot value, so nothing that calls back into application code. The Inbox mutex is a leaf, like
  * every library lock (docs/conventions.md): nothing takes another library lock while holding it,
- * and nothing locks the Inbox while holding another library lock.
+ * and nothing locks the Inbox while holding another library lock. So no slot takes a payload
+ * conditionally on a server-clock deadline, whose clock read takes a lock of its own: a role whose
+ * state waits for one decides with no lock held (ScheduledStateSlot). Every critical section is a
+ * short copy of bounded size; the largest is documented at MetadataRole::Impl::fill_place().
  *
  * @code
  * Inbox inbox;
@@ -333,6 +336,10 @@ public:
         this->bind(inbox, topic_bit);
     }
 
+    /// @brief Constructs unbound, holding `initial`, for a value read() and settle() keep in the
+    /// slot between drains rather than reset (see bind())
+    explicit InboxSlot(T initial) : slot_(std::move(initial)) {}
+
     ~InboxSlot() {
         // Release the bit claim so a replacement slot (e.g. a role re-added before start) can
         // bind it. Requires the bound Inbox to outlive this slot.
@@ -420,6 +427,37 @@ public:
         }
         std::lock_guard<std::mutex> lock(this->inbox_->mutex_);
         if (!this->dirty_ || fn(this->slot_)) {
+            return;
+        }
+        this->dirty_ = false;
+        this->inbox_->clear_bit_locked(this->topic_bit_);
+    }
+
+    /// @brief Calls fn(const T& current) under the Inbox mutex, pending or not, and returns what it
+    /// returns: for a value that stays in the slot after a drain decided on it. `fn` runs under
+    /// the Inbox mutex: a pure data operation only.
+    template <typename ReadFn>
+    auto read(ReadFn&& fn) const {
+        using Result = std::invoke_result_t<ReadFn&, const T&>;
+        if (!this->check_bound()) {
+            return Result{};
+        }
+        std::lock_guard<std::mutex> lock(this->inbox_->mutex_);
+        return fn(static_cast<const T&>(this->slot_));
+    }
+
+    /// @brief Changes the value in place with fn(T& current), pending or not; fn returns whether
+    /// anything is still pending, as for edit(): false cleans the slot and clears its topic bit,
+    /// keeping the value as fn left it, and true leaves the slot as pending as it was. For a value
+    /// that stays in the slot after a drain decided on it, unlike edit(), which leaves a clean slot
+    /// untouched. `fn` runs under the Inbox mutex: a pure data operation only.
+    template <typename SettleFn>
+    void settle(SettleFn&& fn) {
+        if (!this->check_bound()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(this->inbox_->mutex_);
+        if (fn(this->slot_)) {
             return;
         }
         this->dirty_ = false;
@@ -536,7 +574,7 @@ public:
     /// @brief Merges a delta into the pending payload with fn(T& current, T&& delta), under the
     /// rule in the class comment. `fn` runs under the Inbox mutex: a pure data operation only.
     /// The delta is taken and merged by reference: a by-value or stamped copy would put another
-    /// payload, a metadata state's strings among them, on the protocol task's stack.
+    /// payload on the protocol task's stack.
     template <typename MergeFn>
     void merge(MergeFn&& fn, T&& delta, uint32_t generation) {
         this->slot_.update([&fn, &delta, generation](Stamped& current) {

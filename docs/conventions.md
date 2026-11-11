@@ -73,9 +73,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - An event or a slot payload whose delivery must not survive its producer
   being torn down carries the producer's teardown generation and is checked
   against it at the drain (`push_event_or_log()` / `event_is_current()` for
-  events, `GenerationSlot` for a role's slots), rather than relying on the
-  ring or the slot being reset: a teardown that leaves other producers running
-  cannot reset it, and a drain can take a slot on either side of a teardown.
+  events, `GenerationSlot` or `ScheduledStateSlot` for a role's slots), rather
+  than relying on the ring or the slot being reset: a teardown that leaves
+  other producers running cannot reset it, and a drain can take a slot on
+  either side of a teardown.
 - Callback dispatch must tolerate re-entrant teardown: a listener callback may
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.
@@ -91,8 +92,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
   stamps the role's events and slot payloads with the new teardown generation,
   and the main loop runs the role's own half once per generation, through the
   role's `TeardownTracker` (`catch_up_teardown()`), before acting on anything
-  stamped with it. A role drain takes its slot before it catches up, then
-  applies only a payload stamped with the current generation.
+  stamped with it. A role drain takes (or peeks at) its slot before it
+  catches up, then applies only a payload stamped with the current
+  generation.
 - A protocol-task step has a bounded wait or none: the Noise DH operations, a
   ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, and a transport send
   bounded by the transport's own send timeout; no step waits on an
