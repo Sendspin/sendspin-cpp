@@ -22,14 +22,19 @@
 #include <cassert>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 namespace sendspin {
 
 /// @brief Bytes reserved for one Conn: the object plus the control block std::allocate_shared()
 /// places it in, whose fit ConnectionBlockAllocator::allocate() checks at compile time
+///
+/// 32 bytes cover a control block that counts with atomics. A libstdc++ built with the mutex lock
+/// policy, as Raspbian's ARMv6 one is, also embeds a mutex in it, and std::mutex has the size of
+/// that mutex.
 template <typename Conn>
-inline constexpr size_t CONNECTION_BLOCK_BYTES = sizeof(Conn) + 32;
+inline constexpr size_t CONNECTION_BLOCK_BYTES = sizeof(Conn) + 32 + sizeof(std::mutex);
 
 /// @brief Hands std::allocate_shared() one block reserved before the call, and frees it with
 /// platform_free() once the control block goes

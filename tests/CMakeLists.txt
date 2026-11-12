@@ -61,6 +61,7 @@ add_executable(sendspin_tests
     test_client_lifecycle.cpp
     test_role_deactivation.cpp
     test_windows_header_macros.cpp
+    test_connection_block.cpp
 
     # FilePersistenceProvider is a host example helper (examples/common/), not part of the
     # library; compile it into the test target so the record-store tests can exercise it.
