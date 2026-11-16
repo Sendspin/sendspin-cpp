@@ -18,6 +18,7 @@
 
 #include "connection.h"
 #include "connection_manager.h"
+#include "constants.h"
 #include "inbound_ring.h"
 #include "noise_handshake.h"
 #include "platform/compiler.h"
@@ -65,7 +66,7 @@ namespace sendspin {
 // A transport waiting for ring space while the protocol task sleeps out a yield window must not
 // time out and close its connection (YieldPacer)
 static_assert(YIELD_WINDOW_LENGTH_US + YIELD_MAX_UNIT_US <
-                  static_cast<int64_t>(INBOUND_ACQUIRE_TIMEOUT_MS) * 1000,
+                  static_cast<int64_t>(INBOUND_ACQUIRE_TIMEOUT_MS) * US_PER_MS,
               "The protocol task's longest yield must stay below a ring acquire's timeout");
 
 namespace {

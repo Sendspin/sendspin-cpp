@@ -60,7 +60,8 @@ inline void platform_configure_thread(const char* name, size_t stack_size, int p
 /// duration shorter than a tick period (newlib's usleep()), which would keep the core.
 /// @param duration_us Time to block for.
 inline void platform_sleep_blocking_us(int64_t duration_us) {
-    const int64_t ticks = (duration_us * configTICK_RATE_HZ + 999999) / 1000000;
+    constexpr int64_t US_PER_SECOND = 1000000;
+    const int64_t ticks = (duration_us * configTICK_RATE_HZ + US_PER_SECOND - 1) / US_PER_SECOND;
     vTaskDelay(ticks > 0 ? static_cast<TickType_t>(ticks) : 1);
 }
 
