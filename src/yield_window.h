@@ -90,17 +90,17 @@ public:
         this->busy_since_us_ = 0;
     }
 
-    /// @brief Call before a unit of work whose input was already waiting. Starts a busy stretch,
-    /// and once it has lasted YIELD_MIN_BUSY_US reports whether the unit would start in or run
-    /// into the next yield window, without sleeping.
+    /// @brief Call before taking the next unit's input while the thread is busy; a call that then
+    /// finds the input empty is followed by note_idle(). Starts a busy stretch, and once it has
+    /// lasted YIELD_MIN_BUSY_US reports whether the unit would start in or run into the next yield
+    /// window, without sleeping. Always false where PLATFORM_YIELD_WINDOWS is false.
     /// @param now_us The current platform_time_us().
     /// @return true when pause() would sleep now.
     bool pause_due(int64_t now_us) {
         return this->due_pause_us(now_us) > 0;
     }
 
-    /// @brief As pause_due(), and sleeps out the next yield window when a pause is due (the sleep
-    /// is a no-op on host)
+    /// @brief As pause_due(), and sleeps out the next yield window when a pause is due
     /// @param now_us The current platform_time_us().
     void pause(int64_t now_us) {
         const int64_t pause_us = this->due_pause_us(now_us);
@@ -124,6 +124,9 @@ public:
 private:
     /// @brief Starts a busy stretch, or returns the sleep due once it has lasted YIELD_MIN_BUSY_US
     int64_t due_pause_us(int64_t now_us) {
+        if constexpr (!PLATFORM_YIELD_WINDOWS) {
+            return 0;
+        }
         if (this->busy_since_us_ == 0) {
             this->busy_since_us_ = now_us;
             return 0;

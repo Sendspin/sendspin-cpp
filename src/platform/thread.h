@@ -66,6 +66,10 @@ inline void platform_sleep_blocking_us(int64_t duration_us) {
     vTaskDelay(ticks > 0 ? static_cast<TickType_t>(ticks) : 1);
 }
 
+/// @brief Whether the yield windows apply (see yield_window.h): the library's threads run above a
+/// consumer's main loop here
+inline constexpr bool PLATFORM_YIELD_WINDOWS = true;
+
 /// @brief Blocks the calling thread for the rest of a yield window (see yield_window.h)
 /// @param duration_us Time left in the window.
 inline void platform_yield_window_sleep(int64_t duration_us) {
@@ -97,7 +101,11 @@ inline void platform_sleep_blocking_us(int64_t duration_us) {
     std::this_thread::sleep_for(std::chrono::microseconds(duration_us));
 }
 
-/// @brief No-op on host, where the OS scheduler time-slices every thread
+/// @brief Whether the yield windows apply (see yield_window.h): not on host, where the OS
+/// scheduler time-slices every thread
+inline constexpr bool PLATFORM_YIELD_WINDOWS = false;
+
+/// @brief No-op on host (PLATFORM_YIELD_WINDOWS)
 /// @param duration_us Ignored on host.
 inline void platform_yield_window_sleep(int64_t /*duration_us*/) {}
 

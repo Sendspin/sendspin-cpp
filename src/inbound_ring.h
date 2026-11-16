@@ -865,7 +865,7 @@ public:
     /// INBOUND_ACQUIRE_TIMEOUT_MS waits for ring space a message can make. During a burst the pass
     /// also ends where the protocol task's YieldPacer would sleep, so the wait then covers one
     /// paced portion of the ring and the sleep after it (at most YIELD_WINDOW_LENGTH_US +
-    /// YIELD_MAX_UNIT_US), not a whole paced pass. A
+    /// YIELD_MAX_UNIT_US, plus up to a tick of rounding), which counts against the bound too. A
     /// stream/start makes the most, two (the player's codec header and the artwork role's
     /// RECONFIGURE marker, 200 ms). An artwork announce, cancel, stream/end or a stream/clear
     /// makes one, as does an image part dropped over the artwork quota (the DISCARD marker in its

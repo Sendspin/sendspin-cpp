@@ -170,8 +170,9 @@ uint32_t SendspinClient::protocol_tick() {
     // still covers 0.6 s of 20 ms audio chunks in one pass. A burst keeps the ring full for
     // seconds and this thread from blocking, so the pass also ends where its YieldPacer would
     // sleep, and the tick sleeps before it returns (step 11): the steps around the pass then come
-    // round between paced portions of the burst rather than after a whole paced pass. The tick
-    // asks to run again at once when it stops here.
+    // round between paced portions of the burst. The pacer's check comes before the take, so a
+    // pass can end with the ring already empty; the next tick then finds it so. The tick asks to
+    // run again at once when it stops here.
     constexpr size_t MAX_ITEMS_PER_TICK = 32;
     bool ring_drained = true;
     YieldPacer& pacer = this->protocol_task_->inbound_pacer();
@@ -256,8 +257,8 @@ uint32_t SendspinClient::protocol_tick() {
     if (!ring_drained || fallback_due) {
         next_deadline = 0;
     }
-    // A pass the pacer ended sleeps out the yield window here, after publishing, before the tick
-    // runs again; the sleep holds back the commands and stop() for at most its length
+    // A pass that ended before draining the ring sleeps out any yield window due here, after
+    // publishing, before the tick runs again; the sleep holds back the commands and stop().
     if (!ring_drained) {
         pacer.pause(platform_time_us());
     }
