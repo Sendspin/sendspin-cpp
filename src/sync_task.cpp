@@ -57,6 +57,12 @@ static constexpr uint32_t UNDERFLOW_SILENCE_KEEPALIVE_MS = 20U;
 /// sink before returning to its inner loop to re-check flags and drift.
 static constexpr uint32_t AUDIO_WRITE_TIMEOUT_MS = 20U;
 
+/// @brief Sleep (us) after a sink write that took nothing; on ESP-IDF it ends at the first tick
+/// after that.
+/// on_audio_write() waits up to its timeout for room, but one that returns 0 at once would
+/// otherwise spin the loops that retry it, above the consumer's main loop.
+static constexpr int64_t EMPTY_WRITE_BACKOFF_US = 1000;
+
 /// @brief Minimum sleep (ms) after an initial-sync push, to let the audio stack begin draining
 /// before the next push.
 static constexpr uint32_t INITIAL_SYNC_SETTLE_MIN_MS = 2U;
@@ -429,6 +435,9 @@ void SyncTask::send_pending_silence(SyncContext& sync_context) {
     }
     this->track_sent_audio(sync_context, bytes_written);
     sync_context.silence_remaining -= bytes_written;
+    if (bytes_written == 0) {
+        platform_sleep_blocking_us(EMPTY_WRITE_BACKOFF_US);
+    }
 
     if ((bytes_written > 0) && sync_context.initial_decode) {
         // Sent priming zeros - delay slightly to give the audio stack time to start consuming
@@ -465,9 +474,13 @@ bool SyncTask::transfer_audio(SyncContext& sync_context) {
     this->send_pending_silence(sync_context);
 
     if (sync_context.silence_remaining == 0 && sync_context.release_chunk) {
+        const bool had_audio = sync_context.decode_buffer.available() > 0;
         size_t decode_bytes_written =
             sync_context.decode_buffer.transfer_data_to_sink(AUDIO_WRITE_TIMEOUT_MS);
         this->track_sent_audio(sync_context, decode_bytes_written);
+        if (had_audio && decode_bytes_written == 0) {
+            platform_sleep_blocking_us(EMPTY_WRITE_BACKOFF_US);
+        }
     }
 
     // When decode buffer fully consumed and released, mark done

@@ -22,6 +22,7 @@
 #include "outbound_ring.h"
 #include "platform/types.h"
 #include "sendspin/types.h"
+#include "yield_window.h"
 #include <esp_err.h>
 #include <esp_http_server.h>
 
@@ -194,6 +195,16 @@ protected:
     /// WebSocket
     /// @param arg Pointer to the AsyncRespArg context allocated by queue_async_send().
     static void async_send_frame(void* arg);
+
+    // Struct fields
+
+    /// @brief Keeps frame receives out of the yield windows during a burst. httpd thread only.
+    YieldPacer receive_pacer_;
+
+    // 64-bit fields
+
+    /// @brief When the last frame's receive ended, or 0 before the first. httpd thread only.
+    int64_t last_frame_end_us_{0};
 
     // Pointer fields
 

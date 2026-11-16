@@ -23,6 +23,7 @@
 #include "sendspin/config.h"
 #include "sendspin/controller_role.h"
 #include "sendspin/types.h"
+#include "yield_window.h"
 
 #include <atomic>
 #include <cstddef>
@@ -271,6 +272,12 @@ public:
     /// @return false when no request is waiting; out is then left as it was.
     bool take_requests(LifecycleRequests& out);
 
+    /// @brief Keeps the tick's ring items out of the yield windows during a burst
+    /// (SendspinClient::protocol_tick()). Protocol task only.
+    YieldPacer& inbound_pacer() {
+        return this->inbound_pacer_;
+    }
+
 private:
     /// Event flag bits
     static constexpr uint32_t COMMAND_STOP = 1U << 0;
@@ -303,6 +310,8 @@ private:
     /// The lifecycle requests posted since the last take. Merged from any thread, taken by the
     /// protocol task; guarded by command_mutex_.
     LifecycleRequests requests_;
+    /// See inbound_pacer(). Protocol task only.
+    YieldPacer inbound_pacer_;
 
     // size_t fields
     /// Slots reserved for ACCEPT_CONNECTION: ACCEPT_SLOTS_PER_SOCKET per socket. Fixed at

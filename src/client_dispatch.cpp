@@ -18,6 +18,7 @@
 
 #include "connection.h"
 #include "connection_manager.h"
+#include "constants.h"
 #include "inbound_ring.h"
 #include "noise_handshake.h"
 #include "platform/compiler.h"
@@ -29,6 +30,7 @@
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "time_burst.h"
+#include "yield_window.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
 #endif
@@ -60,6 +62,12 @@
 static const char* const TAG = "sendspin.client";
 
 namespace sendspin {
+
+// A transport waiting for ring space while the protocol task sleeps out a yield window must not
+// time out and close its connection (YieldPacer)
+static_assert(YIELD_WINDOW_LENGTH_US + YIELD_MAX_UNIT_US <
+                  static_cast<int64_t>(INBOUND_ACQUIRE_TIMEOUT_MS) * US_PER_MS,
+              "The protocol task's longest yield must stay below a ring acquire's timeout");
 
 namespace {
 
@@ -157,19 +165,26 @@ uint32_t SendspinClient::protocol_tick() {
 
     // The ring, in arrival order across connections. Bounded per tick so the steps around it (a
     // command, a pending pre-admission message, a close report, a timer) come round again while
-    // a stream keeps the ring busy: an audio or visualizer item costs microseconds to hand over,
-    // so 32 of them delay those steps by well under a millisecond, while 32 still covers 0.6 s
-    // of 20 ms audio chunks in one pass. The tick asks to run again at once when it stops here.
+    // a stream keeps the ring busy: an item's cost is mostly its decrypt, from well under a
+    // millisecond for a small one to over 10 ms for a large audio chunk on a slow chip, and 32
+    // still covers 0.6 s of 20 ms audio chunks in one pass. A burst keeps the ring full for
+    // seconds and this thread from blocking, so the pass also ends where its YieldPacer would
+    // sleep, and the tick sleeps before it returns (step 11): the steps around the pass then come
+    // round between paced portions of the burst. The pacer's check comes before the take, so a
+    // pass can end with the ring already empty; the next tick then finds it so. The tick asks to
+    // run again at once when it stops here.
     constexpr size_t MAX_ITEMS_PER_TICK = 32;
     bool ring_drained = true;
+    YieldPacer& pacer = this->protocol_task_->inbound_pacer();
     for (size_t taken = 0;; ++taken) {
-        if (taken == MAX_ITEMS_PER_TICK) {
+        if (taken == MAX_ITEMS_PER_TICK || (taken > 0 && pacer.pause_due(platform_time_us()))) {
             ring_drained = false;
             break;
         }
         size_t item_len = 0;
         void* item = this->inbound_ring_->take(&item_len, 0);
         if (item == nullptr) {
+            pacer.note_idle();
             break;
         }
         const InboundItemHeader* header = inbound_item_header(item);
@@ -195,7 +210,9 @@ uint32_t SendspinClient::protocol_tick() {
         message.len = item_len;
         message.receive_time_us = header->receive_time_us;
         message.kind = header->kind;
+        pacer.start_unit(platform_time_us());
         this->process_inbound(*conn, message);
+        pacer.end_unit(platform_time_us());
     }
 
     // 6. Losses: a connection the receive path or a failed send closed, one the manager released,
@@ -239,6 +256,11 @@ uint32_t SendspinClient::protocol_tick() {
     manager.publish_connected();
     if (!ring_drained || fallback_due) {
         next_deadline = 0;
+    }
+    // A pass that ended before draining the ring sleeps out any yield window due here, after
+    // publishing, before the tick runs again; the sleep holds back the commands and stop().
+    if (!ring_drained) {
+        pacer.pause(platform_time_us());
     }
     // The snapshot's references drop here; see ConnectionManager::snapshot_connections().
     return next_deadline;
