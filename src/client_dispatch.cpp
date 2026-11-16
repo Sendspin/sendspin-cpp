@@ -29,6 +29,7 @@
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "time_burst.h"
+#include "yield_window.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
 #endif
@@ -60,6 +61,12 @@
 static const char* const TAG = "sendspin.client";
 
 namespace sendspin {
+
+// A transport waiting for ring space while the protocol task sleeps out a yield window must not
+// time out and close its connection (YieldPacer)
+static_assert(YIELD_WINDOW_LENGTH_US + YIELD_MAX_UNIT_US <
+                  static_cast<int64_t>(INBOUND_ACQUIRE_TIMEOUT_MS) * 1000,
+              "The protocol task's longest yield must stay below a ring acquire's timeout");
 
 namespace {
 
@@ -162,15 +169,24 @@ uint32_t SendspinClient::protocol_tick() {
     // of 20 ms audio chunks in one pass. The tick asks to run again at once when it stops here.
     constexpr size_t MAX_ITEMS_PER_TICK = 32;
     bool ring_drained = true;
+    int64_t item_end_us = 0;
     for (size_t taken = 0;; ++taken) {
         if (taken == MAX_ITEMS_PER_TICK) {
             ring_drained = false;
             break;
         }
+        YieldPacer& pacer = this->protocol_task_->inbound_pacer();
         size_t item_len = 0;
         void* item = this->inbound_ring_->take(&item_len, 0);
         if (item == nullptr) {
+            pacer.note_idle();
             break;
+        }
+        // A burst keeps the ring full for seconds and this thread from blocking; it pauses before
+        // each item after a tick's first, and before the tick it runs at once (below). The pause
+        // also holds back the commands and stop() for up to its longest sleep.
+        if (taken > 0) {
+            pacer.pause(item_end_us);
         }
         const InboundItemHeader* header = inbound_item_header(item);
         SendspinConnection* conn = nullptr;
@@ -195,7 +211,10 @@ uint32_t SendspinClient::protocol_tick() {
         message.len = item_len;
         message.receive_time_us = header->receive_time_us;
         message.kind = header->kind;
+        pacer.start_unit(platform_time_us());
         this->process_inbound(*conn, message);
+        item_end_us = platform_time_us();
+        pacer.end_unit(item_end_us);
     }
 
     // 6. Losses: a connection the receive path or a failed send closed, one the manager released,
@@ -239,6 +258,9 @@ uint32_t SendspinClient::protocol_tick() {
     manager.publish_connected();
     if (!ring_drained || fallback_due) {
         next_deadline = 0;
+    }
+    if (!ring_drained) {
+        this->protocol_task_->inbound_pacer().pause(platform_time_us());
     }
     // The snapshot's references drop here; see ConnectionManager::snapshot_connections().
     return next_deadline;

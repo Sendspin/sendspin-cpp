@@ -23,6 +23,7 @@
 #include "protocol_messages.h"
 #include "sendspin/types.h"
 #include "ws_server.h"
+#include "yield_window.h"
 #include <esp_err.h>
 
 #include <cstring>
@@ -265,6 +266,17 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, Sendspi
     // The connection was delivered (and wired to the inbound ring) from the upgrade GET before any
     // frame can arrive; a frame on a never-delivered or released connection is dropped by the
     // inbound routing (begin_inbound_message()).
+
+    // While a burst keeps the socket readable, frame after frame, this thread never blocks. Its
+    // pause also holds back the server's sends, and with them lwIP's and the Wi-Fi driver's work.
+    // httpd serves every session on this one task, so a pause holds back all of them.
+    const int64_t frame_start_us = platform_time_us();
+    if (receive_is_back_to_back(this->last_frame_end_us_, frame_start_us)) {
+        this->receive_pacer_.pause(frame_start_us);
+    } else {
+        this->receive_pacer_.note_idle();
+    }
+
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
 
@@ -292,8 +304,12 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, Sendspi
         if (target.route == InboundRoute::DROP) {
             return SendspinServerConnection::discard_frame_payload(req, ws_pkt, server);
         }
+        // The unit starts after begin_inbound_message(), which can wait for ring space
+        this->receive_pacer_.start_unit(platform_time_us());
         ret = SendspinServerConnection::receive_frame_payload(req, ws_pkt, target.data);
-        this->end_inbound_message(ret == ESP_OK, platform_time_us());
+        this->last_frame_end_us_ = platform_time_us();
+        this->receive_pacer_.end_unit(this->last_frame_end_us_);
+        this->end_inbound_message(ret == ESP_OK, this->last_frame_end_us_);
         return ret;
     }
 

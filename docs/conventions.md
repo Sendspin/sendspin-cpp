@@ -97,8 +97,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
   catches up, then applies only a payload stamped with the current
   generation.
 - A protocol-task step has a bounded wait or none: the Noise DH operations, a
-  ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, and a transport send
-  bounded by the transport's own send timeout; no step waits on an
+  ring acquire bounded by `INBOUND_ACQUIRE_TIMEOUT_MS`, a transport send
+  bounded by the transport's own send timeout, and a burst's yield-window
+  sleep (`YieldPacer`, kept below `INBOUND_ACQUIRE_TIMEOUT_MS`); no step waits on an
   asynchronous send's completion, and a goodbye is followed by its close at
   once. A released
   outbound attempt still connecting, whose destructor would join its

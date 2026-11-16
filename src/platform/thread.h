@@ -14,17 +14,20 @@
 
 /// @file thread.h
 /// @brief Platform-abstracted thread configuration helper for setting stack size, priority, name,
-/// and PSRAM stack allocation before spawning a std::thread
+/// and PSRAM stack allocation before spawning a std::thread, and the yield-window sleep
 
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 #ifdef ESP_PLATFORM
 
 #include "platform/logging.h"
 #include <esp_heap_caps.h>
 #include <esp_pthread.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 namespace sendspin {
 
@@ -52,9 +55,27 @@ inline void platform_configure_thread(const char* name, size_t stack_size, int p
     }
 }
 
+/// @brief Blocks the calling thread for at least `duration_us`, rounded up to whole ticks and never
+/// less than one, so the tasks below its priority run. std::this_thread::sleep_for() busy-waits a
+/// duration shorter than a tick period (newlib's usleep()), which would keep the core.
+/// @param duration_us Time to block for.
+inline void platform_sleep_blocking_us(int64_t duration_us) {
+    const int64_t ticks = (duration_us * configTICK_RATE_HZ + 999999) / 1000000;
+    vTaskDelay(ticks > 0 ? static_cast<TickType_t>(ticks) : 1);
+}
+
+/// @brief Blocks the calling thread for the rest of a yield window (see yield_window.h)
+/// @param duration_us Time left in the window.
+inline void platform_yield_window_sleep(int64_t duration_us) {
+    platform_sleep_blocking_us(duration_us);
+}
+
 }  // namespace sendspin
 
 #else  // Host
+
+#include <chrono>
+#include <thread>
 
 namespace sendspin {
 
@@ -67,6 +88,16 @@ inline void platform_configure_thread(const char* /*name*/, size_t /*stack_size*
                                       bool /*stack_in_psram*/) {
     // No-op on host - std::thread uses OS defaults.
 }
+
+/// @brief Blocks the calling thread for at least `duration_us`
+/// @param duration_us Time to block for.
+inline void platform_sleep_blocking_us(int64_t duration_us) {
+    std::this_thread::sleep_for(std::chrono::microseconds(duration_us));
+}
+
+/// @brief No-op on host, where the OS scheduler time-slices every thread
+/// @param duration_us Ignored on host.
+inline void platform_yield_window_sleep(int64_t /*duration_us*/) {}
 
 }  // namespace sendspin
 
