@@ -55,9 +55,10 @@ inline void platform_configure_thread(const char* name, size_t stack_size, int p
     }
 }
 
-/// @brief Blocks the calling thread for at least `duration_us`, rounded up to whole ticks and never
-/// less than one, so the tasks below its priority run. std::this_thread::sleep_for() busy-waits a
-/// duration shorter than a tick period (newlib's usleep()), which would keep the core.
+/// @brief Blocks the calling thread for `duration_us` rounded up to whole ticks, and never less
+/// than one, so the tasks below its priority run. vTaskDelay() ends at a tick interrupt, so the
+/// sleep can end up to a tick early. std::this_thread::sleep_for() busy-waits a duration shorter
+/// than a tick period (newlib's usleep()), which would keep the core.
 /// @param duration_us Time to block for.
 inline void platform_sleep_blocking_us(int64_t duration_us) {
     constexpr int64_t US_PER_SECOND = 1000000;

@@ -116,7 +116,8 @@ Every role state slot is a `GenerationSlot<T>`, except the metadata and color ro
 4. client/init on outbound connections whose WebSocket upgrade completed
 5. The receive pass over a snapshot of the managed connections: each connection's message
    pending in its fallback buffer once the ring items it wrote before it are taken, then up to
-   MAX_ITEMS_PER_TICK ring items in arrival order
+   MAX_ITEMS_PER_TICK ring items in arrival order; during a burst the pass also ends where the
+   protocol task's YieldPacer would sleep
 6. Losses: a connection whose gate is detached (by a close of the receive path, a failed send
    or a release) or whose close is ready is dropped (ConnectionManager::on_connection_lost()); a
    fallback message the ring items just taken held back makes the tick run again at once
@@ -136,10 +137,11 @@ Every role state slot is a `GenerationSlot<T>`, except the metadata and color ro
     clock, the primary's server information) and the paired flag; then publish_connected(), the
     connected flag other threads read, raised only here, after every handler of the tick, so is_connected() never reads true
     before the tick's whole effect (the published slots and the events it queued for the
-    drain); a loss lowers it at once
+    drain); a loss lowers it at once. A pass step 5 ended early then sleeps out the yield window
+    the YieldPacer called for, before the tick returns
 ```
 
-The tick returns the milliseconds until the earliest of its timers: a nursery entry's establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a released outbound connection's reaping deadline, a pending upgrade on the ESP server, the WebSocket server retry, and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound, or one that freed a held-back fallback message, returns 0 and runs again at once. No timer is periodic, the network included: the main loop polls the provider and wakes the task when it comes up. So an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 5, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
+The tick returns the milliseconds until the earliest of its timers: a nursery entry's establish deadline, an admitted connection's liveness, re-prove or pairing-attempt deadline, the pairing window, a released outbound connection's reaping deadline, a pending upgrade on the ESP server, the WebSocket server retry, and each time burst's next send or response timeout. With none pending it returns `ProtocolTask::NO_DEADLINE` and the task waits for a wake alone; a receive pass stopped by its item bound or its YieldPacer, or one that freed a held-back fallback message, returns 0 and runs again at once, after the pacer's sleep (at most `YIELD_WINDOW_LENGTH_US + YIELD_MAX_UNIT_US`) when it called for one. No timer is periodic, the network included: the main loop polls the provider and wakes the task when it comes up. So an idle admitted connection wakes the task for its time bursts (one deadline per `time_burst_interval_ms`, then one wake per reply) and its inbound traffic. Every handler a message reaches runs inside step 5, so an activation is applied, and a nursery connection that it makes operational admitted, before the connection's next message is parsed.
 
 ## One Main Loop Drain
 

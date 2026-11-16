@@ -36,6 +36,7 @@ static const char* const TAG = "sendspin.client_connection";
 // on other sends, not on the lock the client task holds while handle_data() waits for inbound
 // ring space. The exception is a failed write: esp_websocket_client then takes that lock with no
 // timeout to abort the connection, so the send waits out the handler's park (bounded by its
+// yield-window sleep, at most YIELD_WINDOW_LENGTH_US + YIELD_MAX_UNIT_US rounded up to a tick, its
 // inbound waits, InboundGate::WRITABLE_WAIT_MS and INBOUND_ACQUIRE_TIMEOUT_MS, plus the rest of
 // the frame) rather than deadlocking.
 static constexpr uint32_t WEBSOCKET_SEND_TIMEOUT_MS = 10U;

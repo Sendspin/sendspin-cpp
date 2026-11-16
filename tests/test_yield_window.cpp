@@ -47,6 +47,10 @@ TEST(YieldWindow, AUnitThatWouldRunIntoTheWindowWaitsItOut) {
         {"inside the window", BASE + START + 1'000, UNIT, PERIOD - START - 1'000},
         {"the window's start, nothing measured yet", BASE + START, 0, PERIOD - START},
         {"the window's last microsecond", BASE + PERIOD - 1, UNIT, 1},
+        {"a unit measured longer than YIELD_MAX_UNIT_US is planned as that long", BASE,
+         YIELD_MAX_UNIT_US * 4, 0},
+        {"a unit of exactly YIELD_MAX_UNIT_US still waits out the window",
+         BASE + START - YIELD_MAX_UNIT_US + 1, YIELD_MAX_UNIT_US, PERIOD - START + YIELD_MAX_UNIT_US - 1},
         {"Control: the next period's start", BASE + PERIOD, UNIT, 0},
     };
     for (const Row& row : rows) {

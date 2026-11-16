@@ -33,11 +33,11 @@ static constexpr int64_t YIELD_WINDOW_PERIOD_US = 100000;
 /// below get of each core while a burst lasts. On an ESP32 at 160 MHz a quarter of the period held
 /// the longest a priority-1 task went without a core to about 200 ms, against seconds without
 /// windows, and still worked off a backlog at about twice real time.
-static constexpr int64_t YIELD_WINDOW_LENGTH_US = 25000;
+static constexpr int64_t YIELD_WINDOW_LENGTH_US = YIELD_WINDOW_PERIOD_US / 4;
 
 /// @brief Longest unit of work (us) a YieldPacer plans around. Decrypting or receiving one large
-/// frame on a slow chip takes over 10 ms; a unit taken as longer (a preemption inflated it) would
-/// only idle the thread for more of each period.
+/// frame on a slow chip takes over 10 ms; a unit measured as longer (a preemption inflated it) is
+/// planned as this long, which keeps the longest sleep at YIELD_WINDOW_LENGTH_US plus this.
 static constexpr int64_t YIELD_MAX_UNIT_US = 20000;
 
 /// @brief A frame whose receive starts within this long (us) of the previous frame's end found its
@@ -52,12 +52,15 @@ static constexpr int64_t BACK_TO_BACK_RECEIVE_US = 1000;
 static constexpr int64_t YIELD_MIN_BUSY_US = 50000;
 
 /// @brief Returns how long (us) a thread about to start a unit of work expected to take
-/// `expected_unit_us` should sleep first: the rest of the window when `now_us` is in one, and up to
-/// the end of the next window when the unit would run into it, so the window stays free
+/// `expected_unit_us` (taken as at most YIELD_MAX_UNIT_US) should sleep first: the rest of the
+/// window when `now_us` is in one, and up to the end of the next window when the unit would run
+/// into it, so the window stays free. Never more than YIELD_WINDOW_LENGTH_US + YIELD_MAX_UNIT_US.
 constexpr int64_t yield_pause_us(int64_t now_us, int64_t expected_unit_us) {
     const int64_t phase = now_us % YIELD_WINDOW_PERIOD_US;
     const int64_t window_start = YIELD_WINDOW_PERIOD_US - YIELD_WINDOW_LENGTH_US;
-    if (phase >= window_start || expected_unit_us > window_start - phase) {
+    const int64_t unit_us =
+        expected_unit_us < YIELD_MAX_UNIT_US ? expected_unit_us : YIELD_MAX_UNIT_US;
+    if (phase >= window_start || unit_us > window_start - phase) {
         return YIELD_WINDOW_PERIOD_US - phase;
     }
     return 0;
@@ -76,8 +79,8 @@ constexpr bool busy_long_enough_to_yield(int64_t busy_since_us, int64_t now_us) 
 }
 
 /// @brief Keeps a thread working off a burst out of the yield windows. Once the thread has been
-/// busy for YIELD_MIN_BUSY_US, pause() sleeps when the coming unit of work, expected to take as
-/// long as the last one, would start in or run into the next window. One per thread loop; not
+/// busy for YIELD_MIN_BUSY_US, a pause is due whenever the coming unit of work, expected to take
+/// as long as the last one, would start in or run into the next window. One per thread loop; not
 /// thread-safe. The longest sleep is YIELD_WINDOW_LENGTH_US + YIELD_MAX_UNIT_US.
 class YieldPacer {
 public:
@@ -88,18 +91,19 @@ public:
     }
 
     /// @brief Call before a unit of work whose input was already waiting. Starts a busy stretch,
-    /// and once it has lasted YIELD_MIN_BUSY_US sleeps out the next yield window when the unit
-    /// would start in or run into it (the sleep is a no-op on host).
+    /// and once it has lasted YIELD_MIN_BUSY_US reports whether the unit would start in or run
+    /// into the next yield window, without sleeping.
+    /// @param now_us The current platform_time_us().
+    /// @return true when pause() would sleep now.
+    bool pause_due(int64_t now_us) {
+        return this->due_pause_us(now_us) > 0;
+    }
+
+    /// @brief As pause_due(), and sleeps out the next yield window when a pause is due (the sleep
+    /// is a no-op on host)
     /// @param now_us The current platform_time_us().
     void pause(int64_t now_us) {
-        if (this->busy_since_us_ == 0) {
-            this->busy_since_us_ = now_us;
-            return;
-        }
-        if (!busy_long_enough_to_yield(this->busy_since_us_, now_us)) {
-            return;
-        }
-        const int64_t pause_us = yield_pause_us(now_us, this->last_unit_us_);
+        const int64_t pause_us = this->due_pause_us(now_us);
         if (pause_us > 0) {
             platform_yield_window_sleep(pause_us);
         }
@@ -111,14 +115,25 @@ public:
         this->unit_start_us_ = now_us;
     }
 
-    /// @brief Marks the end of the unit start_unit() began; its length guides the next pause()
+    /// @brief Marks the end of the unit start_unit() began; its length guides the next pause
     /// @param now_us The current platform_time_us().
     void end_unit(int64_t now_us) {
-        const int64_t unit_us = now_us - this->unit_start_us_;
-        this->last_unit_us_ = unit_us < YIELD_MAX_UNIT_US ? unit_us : YIELD_MAX_UNIT_US;
+        this->last_unit_us_ = now_us - this->unit_start_us_;
     }
 
 private:
+    /// @brief Starts a busy stretch, or returns the sleep due once it has lasted YIELD_MIN_BUSY_US
+    int64_t due_pause_us(int64_t now_us) {
+        if (this->busy_since_us_ == 0) {
+            this->busy_since_us_ = now_us;
+            return 0;
+        }
+        if (!busy_long_enough_to_yield(this->busy_since_us_, now_us)) {
+            return 0;
+        }
+        return yield_pause_us(now_us, this->last_unit_us_);
+    }
+
     // 64-bit fields
     int64_t busy_since_us_{0};
     int64_t unit_start_us_{0};
