@@ -57,7 +57,8 @@ static constexpr uint32_t UNDERFLOW_SILENCE_KEEPALIVE_MS = 20U;
 /// sink before returning to its inner loop to re-check flags and drift.
 static constexpr uint32_t AUDIO_WRITE_TIMEOUT_MS = 20U;
 
-/// @brief Sleep (us) after a sink write that took nothing; on ESP-IDF, until a later tick.
+/// @brief Sleep (us) after a sink write that took nothing; on ESP-IDF it ends at the first tick
+/// after that.
 /// on_audio_write() waits up to its timeout for room, but one that returns 0 at once would
 /// otherwise spin the loops that retry it, above the consumer's main loop.
 static constexpr int64_t EMPTY_WRITE_BACKOFF_US = 1000;
