@@ -184,8 +184,9 @@ struct PlayerRole::Impl : RoleTeardown {
     /// loop only.
     ServerPlayerStreamObject current_stream_params{};
 #pragma GCC diagnostic pop
-    /// The stream the latest STREAM_START announced (stream_info()). Main loop only.
-    PlayerStreamInfo stream_info{};
+    /// The stream the open STREAM_START announced, nullopt with none or when its params were not
+    /// its own (stream_info()). Main loop only.
+    std::optional<PlayerStreamInfo> stream_info;
     std::vector<InboxEvent> awaiting_sync_idle_events;
 
     // Pointer fields

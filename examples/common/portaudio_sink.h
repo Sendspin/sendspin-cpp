@@ -50,7 +50,7 @@ public:
     /// @brief Returns the number of bytes that can be written.
     size_t free_space() const;
 
-    /// @brief Request the consumer to discard all buffered data.
+    /// @brief Request the consumer to discard the data written before this call.
     /// Safe to call while the PA callback is active; the consumer performs the
     /// actual drain on its next read(), preserving the SPSC invariant.
     void clear();
@@ -65,6 +65,7 @@ private:
     std::atomic<size_t> write_pos_{0};
     std::atomic<size_t> read_pos_{0};
     std::atomic<bool> clear_requested_{false};
+    std::atomic<size_t> clear_to_{0};  // write_pos_ when clear() was called
 };
 
 /// @brief Plays audio through PortAudio.

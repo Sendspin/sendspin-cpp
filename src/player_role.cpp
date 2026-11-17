@@ -201,9 +201,6 @@ void PlayerRole::set_mute_adjustable(bool adjustable) {
 }
 
 std::optional<PlayerStreamInfo> PlayerRole::stream_info() const {
-    if (!this->impl_->stream_active) {
-        return std::nullopt;
-    }
     return this->impl_->stream_info;
 }
 
@@ -606,6 +603,7 @@ void PlayerRole::Impl::drain_events() {
                     // a STREAM_END (complete_teardown()), and a failed stream start enqueues one
                     // with no preceding START, so gating here keeps on_stream_end() paired 1:1
                     // with on_stream_start().
+                    this->stream_info.reset();
                     if (this->stream_active) {
                         this->stream_active = false;
                         if (this->listener) {
@@ -629,6 +627,7 @@ void PlayerRole::Impl::drain_events() {
                     // START's own stamp: params a later teardown's next stream wrote while a
                     // callback above ran stay pending for that stream's START.
                     PlayerStreamParams stream_params;
+                    this->stream_info.reset();
                     if (this->event_state->stream_params_slot.take_stamped(stream_params,
                                                                            event.epoch)) {
                         this->current_stream_params.codec = stream_params.codec;

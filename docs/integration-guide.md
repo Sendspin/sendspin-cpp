@@ -1197,6 +1197,7 @@ auto server = client.server_information();     // Active server's id and name as
 uint8_t vol = player.get_volume();
 bool muted = player.get_muted();
 uint16_t delay = player.get_output_delay_ms();
+auto stream = player.stream_info();             // Main loop only; nullopt while no stream is active
 
 // Controller state
 auto& ctrl = controller.get_controller_state();  // volume, muted, repeat, shuffle, supported_commands, seek_max_ms

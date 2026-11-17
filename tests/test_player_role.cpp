@@ -770,7 +770,7 @@ TEST(PlayerHello, TheAdvertisedShareOfTheQuotaHoldsEncodedFrames) {
 
 // roles/player/v1.md "stream/start player object" ignores bit_depth for opus, which decodes to
 // 16-bit samples whatever the server sent. The codec header the sync task decodes with and the
-// params the consumer configures its output from both carry the decoded depth.
+// params stream_info() reports both carry the decoded depth.
 TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
     struct Row {
         const char* name;
