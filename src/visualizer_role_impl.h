@@ -112,7 +112,7 @@ struct VisualizerRole::Impl : RoleTeardown {
 
     /// @brief A stream/start as admitted, for the main loop to report (fire_stream_start())
     struct StartNotice {
-        VisualizerStream stream;
+        VisualizerStream stream{};
         /// The admitted spectrum n_disp_bins, 0 unless stream.spectrum, for the deprecated
         /// ServerVisualizerStreamObject.
         uint8_t spectrum_bins{0};
@@ -215,7 +215,7 @@ struct VisualizerRole::Impl : RoleTeardown {
     uint16_t move_boundary();
     /// @brief Returns every listed frame to the ring and signals the drain thread, which returns
     /// a frame it holds once it sees the boundary move_boundary() made, when one is running.
-    void recall_frames();
+    void recall_frames() const;
     /// @brief Whether a boundary has passed since `item` was listed. Drain thread.
     bool is_stale(void* item) const;
     /// @brief Whether the main loop has fired every stream event queued before `item` was listed.
@@ -231,7 +231,7 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// @brief Takes the notice of the STREAM_START numbered `ordinal` from start_slot.
     /// @return false when a later stream/start's notice has replaced it, which stays for its own
     ///         STREAM_START and is copied to `out`.
-    bool take_start_notice(uint16_t ordinal, StartNotice& out);
+    bool take_start_notice(uint16_t ordinal, StartNotice& out) const;
     /// @brief Fires on_visualizer_stream_started() and then the deprecated
     /// on_visualizer_stream_start() with a STREAM_START's admitted stream. Main loop.
     void fire_stream_start(const StartNotice& notice);

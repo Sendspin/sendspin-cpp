@@ -473,7 +473,7 @@ void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event, uint3
 // ============================================================================
 
 void VisualizerRole::Impl::on_stream_ring_event(const InboxEvent& event) {
-    if (this->held_events.size() == this->held_events.capacity()) {
+    if (this->held_events.size() == Inbox::EVENT_CAPACITY) {
         // Acknowledged as a dropped push is (enqueue_stream_event()).
         SS_LOGE(TAG, "Visualizer stream events held for the drain thread are full; dropping one");
         this->acknowledge(
@@ -561,7 +561,7 @@ void VisualizerRole::Impl::drain_events() {
     }
 }
 
-bool VisualizerRole::Impl::take_start_notice(uint16_t ordinal, StartNotice& out) {
+bool VisualizerRole::Impl::take_start_notice(uint16_t ordinal, StartNotice& out) const {
     bool taken = false;
     this->event_state->start_slot.edit([&out, &taken, ordinal](StartNotice& pending) {
         out = pending;
@@ -771,7 +771,7 @@ uint16_t VisualizerRole::Impl::move_boundary() {
     return ordinal;
 }
 
-void VisualizerRole::Impl::recall_frames() {
+void VisualizerRole::Impl::recall_frames() const {
     // Every listed frame predates the boundary, since the protocol task is the only appender.
     InboundConsumer& inbound = this->drain_task->inbound;
     inbound.recall();
