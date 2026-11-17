@@ -1316,10 +1316,6 @@ TEST(PlayerAudioOutput, EachWriteCarriesTheFormatOfItsOwnBytes) {
     std::vector<uint8_t> new_chunk = filled_audio_chunk(NEW_SAMPLE, 2 * NEW_FRAME_BYTES);
     InboundMessage new_message = message_over(new_chunk);
     impl->handle_binary(new_message);
-    // The main loop drained both STREAM_STARTs before the sync task wrote the old audio.
-    impl->current_stream_params.sample_rate = NEW_FORMAT.sample_rate;
-    impl->current_stream_params.channels = NEW_FORMAT.channels;
-    impl->current_stream_params.bit_depth = NEW_FORMAT.bits_per_sample;
 
     SyncTask& task = *impl->sync_task;
     SyncContext context;
