@@ -1383,9 +1383,10 @@ TEST_F(VisualizerOrdering, StopEndsAWaitForANotice) {
 // releases it, with frame 2, received before the boundary too, behind it; frame 2 is never
 // delivered. The teardowns (the role taken out of the active roles, the connection lost) owe the
 // end the same way. After a clear, frame 3 flows behind it. Whether the end has fired is read
-// once the main loop holds it (awaiting_drain), since no callback marks the hold; a main loop
-// that does not hold it fires it on that same pump. Each row connects a client of its own, a
-// teardown row's stream being gone, so the test takes about 400 ms a row.
+// once the main loop holds it (VisualizerRole::Impl::awaiting_drain, reached through the role's
+// impl_), since no callback marks the hold; a main loop that does not hold it fires it on that
+// same pump. Each row connects a client of its own, a teardown row's stream being gone, so the
+// test takes about 400 ms a row.
 TEST_F(VisualizerOrdering, NoFrameCallbackFollowsItsStreamsEndOrClear) {
     enum class Boundary : uint8_t { END, CLEAR, DEACTIVATION, CONNECTION_LOSS };
     struct Row {
@@ -1457,8 +1458,13 @@ TEST_F(VisualizerOrdering, NoFrameCallbackFollowsItsStreamsEndOrClear) {
 // take would leave the end held, and frame 4 would wait out its lag bound and be dropped; frame
 // 5, handed after the start's notice and displayed after frame 4, follows it on the same thread,
 // so it marks frame 4's fate settled. No server runs: the primary clock is installed directly
-// (see CMakeLists), and frame 4 is displayed 250 ms ahead, so a slow main loop has that long to
-// fire the notice.
+// (ConnectionManager::published_ under published_mutex_), and frame 4 is displayed 250 ms ahead,
+// so a slow main loop has that long to fire the notice. Reached, since no public call stages this
+// interleaving: SendspinClient's protocol_task_ (stopped) and connection_manager_; the visualizer
+// Impl's cleanup(), handle_stream_start(), handle_stream_end(), handle_binary(),
+// cleanup_generation and lifecycle_ordinal (the stamps of the frame handed through its drain
+// list's hand_message()) and its drain_task->inbound (InboundConsumer::items()); and the host
+// InboundRing::ring_'s mtx_.
 TEST(VisualizerDrainThread, AFrameTakenPastABoundaryItHasNotReportedIsDelivered) {
     constexpr int64_t FRAME_LEAD_US = 250 * 1000;
     VisualizerOrderLog log;
@@ -3235,6 +3241,9 @@ const StateRoleAccess STATE_ROLES[] = {
      [](SendspinClient& c, uint8_t v) {
          c.visualizer_->impl_->handle_stream_start(visualizer_stream_with(v));
      },
+     // Writes the start notice slot (event_state->start_slot) with a notice numbered by
+     // next_ordinal() and queues its STREAM_START (enqueue_stream_event()), as
+     // handle_stream_start() does, with the old stamp.
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          VisualizerRole::Impl& impl = *c.visualizer_->impl_;
          VisualizerStream stream;
@@ -3289,6 +3298,8 @@ struct StateRoleClient {
         InboundRing* ring = sync.inbound().ring();
         sync.stop();
         EXPECT_TRUE(sync.inbound().bind(ring, InboundHolder::PLAYER));
+        // The drain thread joined (VisualizerRole::Impl::stop()), so a held end or clear never
+        // waits for it, as the player's STREAM_END never waits for its stopped sync thread.
         this->client.visualizer_->impl_->stop();
     }
     ~StateRoleClient() {

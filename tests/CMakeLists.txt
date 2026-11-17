@@ -142,66 +142,57 @@ endif()
 # gesture won and whether an outbound attempt opened or was released. The connected-flag test
 # calls SendspinClient::on_handshake_complete() and ConnectionManager::drop_connection() on its
 # stand-in, the two halves of an activation and a loss, to read is_connected() between them and
-# the end of the tick, which no public call can stop at. The teardown reorder table interleaves the
-# protocol task (and, for artwork, the decode thread) with the main loop, which no public call does
-# on demand: it calls each role's handler or teardown (the controller, metadata and color roles'
+# the end of the tick, which no public call can stop at. The teardown reorder table interleaves the protocol task
+# (and, for artwork, the decode thread) with the main loop, which no public call does on demand:
+# it calls each role's handler or teardown (the controller, metadata and color roles'
 # handle_server_state(), the player's handle_stream_start() and handle_server_command(), the
 # visualizer's handle_stream_start(), each role's cleanup()) and drain step (drain_events()), writes
-# the generation-stamped slots (event_state, artwork's display_slot under its slot_epochs, the
-# visualizer's start_slot with a notice numbered by next_ordinal()) and queues a STREAM_START
-# (enqueue_stream_event()) with an old stamp, and reads cleanup_generation and the applied state
-# (controller_state, the metadata role's current, color, the player's stream_active,
-# current_stream_params and volume); its player runs with the sync thread stopped and the item list
-# bound by hand (SyncTask's stop() and inbound_), so a STREAM_END never waits for a thread to go
-# idle, and its visualizer with the drain thread joined (VisualizerRole::Impl::stop()) for the same
-# reason. The visualizer ordering tables read the role's held-event flag (awaiting_drain) to know
-# the main loop holds an end or clear for a frame callback in progress, the moment to check it has
-# not fired, which no callback marks. The visualizer drain-thread test plays the protocol task
-# (protocol_task_->stop()) with the primary clock installed as the metadata slot table installs it,
-# calls the visualizer's cleanup(), handle_stream_start(), handle_stream_end() and handle_binary(),
-# hands a frame stamped with the generation before cleanup_generation through its drain list's
-# hand_message() (stamped with lifecycle_ordinal), and holds InboundRing::ring_'s host mtx_ while it
-# waits for the list to empty (InboundConsumer::items()): the drain thread returning that frame
-# inside its take needs the lock, so the end, the start and the next frame arrive between its report
-# and its next take, an interleaving no public call stages. The stream-params test runs on the same
-# player, calling its cleanup() and handle_stream_start() from inside a listener callback, the
-# protocol task's work landing while a drain runs. The stop-callback test reads the protocol task's
-# request slot (take_requests()) after stop(), since start() drops what waits there and no peer sees
-# the difference. The high-performance grant tables play the protocol task's run_time_sync() on a
-# stand-in in the admitted slot (find_admitted(), its high_performance_held) and read the stand-in's
-# time_frame_sent_us_, the one trace of a time frame written without a Noise session that another
-# thread may read; the wake test restarts the protocol task (protocol_task_->start()) with liveness
-# off (liveness_timeout_us_) so the grant is the only wake, and polls the client's Inbox through a
-# role's impl_->inbox, which also lets the reorder table fill the event ring. The pairing teardown
-# table queues pairing notes as the protocol task's handlers do (SendspinClient's
-# note_display_pairing_code(), note_open_pairing_window(), note_clear_pairing_code() and
-# note_close_pairing_window()), since no public call shows a prompt, and runs the teardown
-# cleanup_connection_state() performs on a connection loss directly, before the main loop drains
-# what was queued. The pairing forms table queues every text-carrying note the same way
-# (note_pairing_started(), note_pairing_succeeded(), note_pairing_failed() and
-# note_display_pairing_code()) with the protocol task stopped (protocol_task_->stop()), since no
-# public call produces each abort reason and code format on demand. The server information table
-# hands the main loop two servers between drains as ConnectionManager::refresh_published_state()
-# does (note_server_information()), since no public call changes the primary twice inside one
-# main-loop tick. A second test also queues the metadata role's teardown (its cleanup()) beside the
-# server going to none, so its clear callback reads server_information() as the drain delivers it,
-# since no public call stages both in one tick. The stream-events table drives the player's
-# handle_stream_start() and handle_stream_end() as the task would, and stages one interleaving by
-# waiting on the sync task's item list and the player's sync-idle topic bit, and its clear row calls
-# handle_stream_clear() the same way. The next-stream header table plays the sync task itself on the
-# test thread, because no public call holds the task between its ACTIVE load and its next IDLE wait:
-# it calls SyncTask's wait_for_codec_header() and load_next_chunk() and returns items through its
-# inbound_, resets the flags with event_flags_.clear_all() as start() would, sets and reads
-# SyncContext's active_ordinal and next_header, and reads PlayerRole::Impl::stream_ordinal. The
-# metadata slot table plays the protocol task's half of the metadata role (handle_server_state(),
-# and for a state stamped before a teardown, fill_place() through the slot's arrive() with the old
-# stamp and the role's layout, then cleanup()) and runs the role's drain_events() alone where an
-# arrival must land between its peek and its commit; it reads which text block each place names (the
+# the generation-stamped slots (event_state, artwork's display_slot under its slot_epochs) and
+# queues a STREAM_START (enqueue_stream_event()) with an old stamp, and reads cleanup_generation
+# and the applied state (controller_state, the metadata
+# role's current, color, the player's stream_active, current_stream_params and volume); its player runs with the
+# sync thread stopped and the item list bound by hand (SyncTask's stop() and inbound_), so a
+# STREAM_END never waits for a thread to go idle. The stream-params test runs on the same player,
+# calling its cleanup() and handle_stream_start() from inside a listener callback, the protocol
+# task's work landing while a drain runs. The stop-callback test reads the protocol task's request
+# slot (take_requests()) after stop(), since start() drops what waits there and no peer sees the
+# difference. The high-performance grant tables
+# play the protocol task's run_time_sync() on a stand-in in the admitted slot (find_admitted(),
+# its high_performance_held) and read the stand-in's time_frame_sent_us_, the one trace of a time
+# frame written without a Noise session that another thread may read; the wake test restarts the
+# protocol task (protocol_task_->start()) with liveness off (liveness_timeout_us_) so the grant is
+# the only wake, and polls the client's Inbox through a role's impl_->inbox, which also lets the
+# reorder table fill the event ring. The pairing teardown table queues pairing notes as the
+# protocol task's handlers do (SendspinClient's note_display_pairing_code(),
+# note_open_pairing_window(), note_clear_pairing_code() and note_close_pairing_window()), since no
+# public call shows a prompt, and runs the teardown cleanup_connection_state() performs on a
+# connection loss directly, before the main loop drains what was queued. The pairing forms table
+# queues every text-carrying note the same way (note_pairing_started(), note_pairing_succeeded(),
+# note_pairing_failed() and note_display_pairing_code()) with the protocol task stopped
+# (protocol_task_->stop()), since no public call produces each abort reason and code format on
+# demand. The server information table hands the main loop two servers between drains as
+# ConnectionManager::refresh_published_state() does (note_server_information()), since no public
+# call changes the primary twice inside one main-loop tick. A second test also queues the metadata
+# role's teardown (its cleanup()) beside the server going to none, so its clear callback reads
+# server_information() as the drain delivers it, since no public call stages both in one tick.
+# The stream-events table drives the player's handle_stream_start() and handle_stream_end() as the
+# task would, and stages one interleaving by waiting on the sync task's item list and the player's
+# sync-idle topic bit, and its clear row calls handle_stream_clear() the same way. The next-stream
+# header table plays the sync task itself on the test thread, because no public call holds the
+# task between its ACTIVE load and its next IDLE wait: it calls SyncTask's wait_for_codec_header()
+# and load_next_chunk() and returns items through its inbound_,
+# resets the flags with event_flags_.clear_all() as start() would, sets and reads SyncContext's
+# active_ordinal and next_header, and reads PlayerRole::Impl::stream_ordinal. The metadata slot
+# table plays the protocol task's half of the metadata role (handle_server_state(), and for a
+# state stamped before a teardown, fill_place() through the slot's arrive() with the old stamp
+# and the role's layout, then cleanup()) and runs the role's drain_events() alone where an arrival
+# must land between its peek and its commit; it reads which text block each place names (the
 # slot's places through ScheduledStateSlot::slot_, the role's current state), the pending
 # state's text (text_of()) and ScheduledStateSlot::pending_at(), which nothing public shows, and
 # installs the primary clock (ConnectionManager::published_ under published_mutex_) so a scheduled
 # state waits for its deadline without a server, and moves it so one falls due inside a
-# callback.
+# callback. The visualizer tests (the reorder table's visualizer row, VisualizerOrdering and
+# VisualizerDrainThread) name the members they reach, and why, in their own comments.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
