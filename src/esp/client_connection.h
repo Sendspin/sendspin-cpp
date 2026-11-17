@@ -21,6 +21,7 @@
 #include "platform/types.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
+#include "yield_window.h"
 #include <esp_websocket_client.h>
 
 #include <atomic>
@@ -144,6 +145,14 @@ protected:
 
     /// @brief The WebSocket server URL
     std::string url_;
+
+    /// @brief Keeps frame receives out of the yield windows during a burst. Websocket task only.
+    YieldPacer receive_pacer_;
+
+    // 64-bit fields
+
+    /// @brief When the last frame's receive ended, or 0 before the first. Websocket task only.
+    int64_t last_frame_end_us_{0};
 
     // Pointer fields
 

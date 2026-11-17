@@ -15,9 +15,11 @@
 #include "client_connection.h"
 
 #include "platform/logging.h"
+#include "platform/time.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "sendspin/types.h"
+#include "yield_window.h"
 #include <esp_err.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -34,6 +36,7 @@ static const char* const TAG = "sendspin.client_connection";
 // on other sends, not on the lock the client task holds while handle_data() waits for inbound
 // ring space. The exception is a failed write: esp_websocket_client then takes that lock with no
 // timeout to abort the connection, so the send waits out the handler's park (bounded by its
+// yield-window sleep, at most YIELD_WINDOW_LENGTH_US + YIELD_MAX_UNIT_US plus up to a tick, its
 // inbound waits, InboundGate::WRITABLE_WAIT_MS and INBOUND_ACQUIRE_TIMEOUT_MS, plus the rest of
 // the frame) rather than deadlocking.
 static constexpr uint32_t WEBSOCKET_SEND_TIMEOUT_MS = 10U;
@@ -268,7 +271,17 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
         // connection is admitted. The destination is chosen on the first chunk, from the frame's
         // full length.
         if (offset == 0) {
+            // While a burst keeps the socket readable, frame after frame, this task never blocks.
+            // Its pause also holds back the server's sends, and with them lwIP's and the Wi-Fi
+            // driver's work.
+            if (receive_is_back_to_back(this->last_frame_end_us_, receive_time)) {
+                this->receive_pacer_.pause(receive_time);
+            } else {
+                this->receive_pacer_.note_idle();
+            }
             const InboundTarget target = this->begin_inbound_message(frame_len, is_text);
+            // The unit starts after begin_inbound_message(), which can wait for ring space
+            this->receive_pacer_.start_unit(platform_time_us());
             this->chunk_dest_ = target.route == InboundRoute::RECEIVE ? target.data : nullptr;
         }
         if (this->chunk_dest_ == nullptr) {
@@ -280,6 +293,8 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
         if (frame_done) {
             this->chunk_dest_ = nullptr;
             this->end_inbound_message(true, receive_time);
+            this->last_frame_end_us_ = platform_time_us();
+            this->receive_pacer_.end_unit(this->last_frame_end_us_);
         }
         return;
     }

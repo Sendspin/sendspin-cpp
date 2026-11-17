@@ -860,8 +860,12 @@ public:
     /// The protocol tick consumes a pending message in its receive step, so the wait can cover the
     /// rest of a tick under way: its ring pass of up to MAX_ITEMS_PER_TICK items
     /// (SendspinClient::protocol_tick()), more than one of which may wait, and the steps after it.
-    /// Most items hand over in microseconds; what waits is the Noise DH operations of a handshake
-    /// message and the INBOUND_ACQUIRE_TIMEOUT_MS waits for ring space a message can make. A
+    /// An item costs its decrypt (over 10 ms for a large audio chunk on a slow chip) and its
+    /// handover; what waits is the Noise DH operations of a handshake message and the
+    /// INBOUND_ACQUIRE_TIMEOUT_MS waits for ring space a message can make. During a burst the pass
+    /// also ends where the protocol task's YieldPacer would sleep, so the wait then covers one
+    /// paced portion of the ring and the sleep after it (at most YIELD_WINDOW_LENGTH_US +
+    /// YIELD_MAX_UNIT_US, plus up to a tick of rounding), which counts against the bound too. A
     /// stream/start makes the most, two (the player's codec header and the artwork role's
     /// RECONFIGURE marker, 200 ms). An artwork announce, cancel, stream/end or a stream/clear
     /// makes one, as does an image part dropped over the artwork quota (the DISCARD marker in its
