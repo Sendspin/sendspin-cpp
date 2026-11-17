@@ -410,9 +410,7 @@ size_t SyncTask::write_to_sink(const SyncContext& sync_context, const uint8_t* d
     if (this->player_impl_->listener == nullptr) {
         return 0;
     }
-    // Every byte the sink is handed is in current_stream_info: a codec header that changes it is
-    // decoded only once the decode buffer is empty, and it drops the pending silence (see
-    // decode_chunk()).
+    // Every byte handed here is in current_stream_info (see decode_chunk()).
     return this->player_impl_->listener->on_audio_output(
         std::span<const uint8_t>(data, length), audio_format_of(sync_context.current_stream_info),
         AUDIO_WRITE_TIMEOUT_MS);

@@ -44,12 +44,9 @@ enum class SendspinPlayerCommand : uint8_t {
 
 /// @brief The format of the decoded PCM one PlayerRoleListener::on_audio_output() call carries
 struct AudioFormat {
-    /// @brief Sample rate in Hz
     uint32_t sample_rate{0};
-    /// @brief Interleaved channel count
     uint8_t channels{0};
-    /// @brief The container depth each sample is stored in: 8, 16, 24 or 32. A stream of another
-    /// depth is reported at the next multiple of 8, its samples in the top bits.
+    /// @brief Container depth, 8, 16, 24 or 32 (see the integration guide's PlayerRoleListener)
     uint8_t bits_per_sample{0};
 
     bool operator==(const AudioFormat&) const = default;
@@ -61,9 +58,7 @@ static_assert(sizeof(AudioFormat) == 8, "the rate, channels and depth pack into 
 /// @brief The stream the server's latest stream/start announced (PlayerRole::stream_info())
 struct PlayerStreamInfo {
     SendspinCodecFormat codec{};
-    /// @brief Sample rate in Hz
     uint32_t sample_rate{0};
-    /// @brief Interleaved channel count
     uint8_t channels{0};
     /// @brief Bit depth the stream announced; an Opus stream reports the 16 bits it decodes to
     uint8_t bit_depth{0};
@@ -112,23 +107,16 @@ class PlayerRoleListener {
 public:
     virtual ~PlayerRoleListener() = default;
 
-    /// @brief Writes decoded PCM audio to the platform's audio output
-    ///
-    /// Fires on the sync task's background thread. May block up to timeout_ms. The library calls
-    /// only this method; until v0.11.0 its default forwards to the deprecated on_audio_write().
-    /// @param pcm Decoded PCM, interleaved, little-endian and signed, format.bits_per_sample / 8
-    /// bytes per sample (24-bit packed in 3 bytes); always a whole number of frames
-    /// @param format The format of exactly these bytes; a stream/start that changes the format
-    /// applies from the first audio received after it
+    /// @brief Writes decoded PCM to the platform's audio output; may block up to timeout_ms.
+    /// The layout and the whole-frame rule are in the integration guide's PlayerRoleListener.
+    /// @param pcm Decoded PCM, a whole number of frames
+    /// @param format The format of exactly these bytes
     /// @param timeout_ms Maximum time to wait for the write to complete
-    /// @return Number of bytes actually written. Partial writes are allowed but must be a whole
-    /// number of frames (a multiple of channels * bits_per_sample / 8): the sync task counts
-    /// played frames from this value, and the next write resends the rest of the same bytes.
+    /// @return Bytes written, a whole number of frames
     virtual size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
                                    uint32_t timeout_ms);
 
-    /// @brief Writes decoded PCM audio, in the format on_audio_output() is handed; called only by
-    /// the default on_audio_output()
+    /// @brief Writes decoded PCM audio; called only by the default on_audio_output()
     /// @deprecated Override on_audio_output(); removed in v0.11.0.
     [[deprecated("override on_audio_output(); removed in v0.11.0")]] virtual size_t on_audio_write(
         uint8_t* /*data*/, size_t /*length*/, uint32_t /*timeout_ms*/) {
