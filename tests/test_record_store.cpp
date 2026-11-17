@@ -72,6 +72,10 @@
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
+// Private access. Tests that check what the store holds read RecordStore's records_ or call its
+// locked-context lookups record_by_psk_id() and record_by_server_id(), since the store exposes
+// no copying accessor for its records (nothing in the library needs one).
+
 // ============================================================================
 // Test helpers
 // ============================================================================
@@ -599,7 +603,8 @@ TEST(RecordStore, EveryRecordWriteHasItsKeysFixedSize) {
 // ESPHome when internal RAM runs out (docs/internals.md "Memory"). The store loads fewer records
 // than its cap, in an order other than their slots', then fills up, re-pairs a server at capacity
 // (its retire must come before the insert, or the store briefly holds one more than its cap) and
-// pairs a new server at capacity.
+// pairs a new server at capacity. The address of records_'s block is the only sign of whether a
+// change after construction reallocated it.
 TEST(RecordStore, ChangesAfterConstructionKeepTheReservedRecords) {
     InMemoryPersistenceProvider provider;
     const std::vector<SendspinPairingRecord> seeded = {make_client_record("server-0"),

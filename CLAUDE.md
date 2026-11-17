@@ -111,7 +111,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
 - Memory: the `platform_malloc` family from `platform/memory.h`, never raw `heap_caps_malloc`/`malloc` in core code (variant semantics under Platform abstraction above); `operator new` only at construction, `add_*()` and `start()`, with bounded values held inline (`InlineText`, `InlineVector`, `EnumSet`). `docs/internals.md` "Memory" lists the exceptions
 - Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer. Connection state belongs to the protocol task; requests that act on a connection go through its command queue or, for latest-wins lifecycle requests, its request slot, and work bound for the main loop goes through the inbox. Every library lock is a leaf, so there is no lock order.
-- Tests: host-only and white-box; a test file that reaches private members compiles with `-fno-access-control` (`tests/CMakeLists.txt` says what and why), never through a production seam
+- Tests: host-only and white-box; a test file that reaches private members compiles with `-fno-access-control` (the file names each member it reaches, and why, once: a reach several tests share at its top or on their fixture, any other on the test or helper that takes it), never through a production seam
 - Apache 2.0 license headers on all files
 
 ## Pre-commit hooks

@@ -654,8 +654,8 @@ TEST(InboundConsumer, HandMessageKeepsRingItemsAndCopiesTheRest) {
 }
 
 // unbind() ends the drop run, since the role's cleanup() recall() after it is a no-op; an open run
-// would swallow the next run's first warning (the count is private, hence -fno-access-control).
-// Control: the over-quota drop opened a run.
+// would swallow the next run's first warning (the count, drop_log_.dropped_, is private and
+// nothing public reports it). Control: the over-quota drop opened a run.
 TEST(InboundConsumer, UnbindEndsTheDropRun) {
     InboundRing ring;
     ASSERT_TRUE(ring.create(1024, MemoryLocation::PREFER_EXTERNAL));
@@ -748,9 +748,9 @@ TEST(InboundGate, NothingIsWrittenWhileAPreAdmissionMessageIsPending) {
 // An indefinite wait survives a CONSUMED bit left over from the previous message (the protocol
 // task cleared the pending flag, the transport published again, then the task's bit landed): it
 // keeps waiting until the new message is actually consumed, and never returns false. The late
-// bit is set directly, since the interleaving that leaves it cannot be staged through the public
-// surface (hence -fno-access-control for this file). The join has no timeout; the sleep only
-// makes it likely the waiter has already absorbed the leftover bit before the consume.
+// bit is set directly (InboundGate's consumed_flags_ and its CONSUMED bit), since the interleaving
+// that leaves it cannot be staged through the public surface. The join has no timeout; the sleep
+// only makes it likely the waiter has already absorbed the leftover bit before the consume.
 TEST(InboundGate, IndefiniteWaitOutlastsALeftoverConsumedBit) {
     InboundGate gate;
     ASSERT_TRUE(gate.is_created());

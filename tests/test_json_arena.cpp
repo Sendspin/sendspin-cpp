@@ -32,6 +32,10 @@
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
+// Private access. The tests read SendspinArenaAllocator's base_ and cap_ (in_backing()) and
+// offset_: whether a freed block's bytes, still inside the backing buffer, were wiped and where
+// the bump pointer stands are the claims under test, and nothing public reports either.
+
 namespace {
 
 constexpr uint8_t PATTERN = 0xA5;
@@ -64,9 +68,8 @@ bool in_backing(const SendspinArenaAllocator& arena, const void* p, size_t len) 
 // Every block the arena's backing buffer gives up is zeroed: a freed block (an interior block's
 // shrunk-away tail with it), the tail a top block's shrinking reallocate() returns to free space
 // and the old copy a moving one leaves behind, including an arena block that moves to the heap.
-// The freed bytes are read back from the arena's backing buffer (base_ and cap_ through
-// -fno-access-control): a freed block's address stays inside that buffer, so the read is of the
-// arena's own memory.
+// The freed bytes are read back from the arena's backing buffer: a freed block's address stays
+// inside that buffer, so the read is of the arena's own memory.
 //
 // Gap: the wipe of a heap fallback block is not observed. Its bytes cannot be read after
 // platform_free() without a use-after-free, so the heap row shows only that the header the wipe
@@ -184,8 +187,7 @@ TEST(JsonArena, FreedArenaBytesAreWiped) {
 // variant pool, and a release that freed the pool before the strings above it (clear() rather
 // than destruction) would strand the pool as well. The arena is sized so both documents fit at
 // once (a host variant pool alone is 4 KB), so a build on top of a live parse would show as the
-// sum rather than spilling to the heap. offset_ is read through -fno-access-control: where the
-// bump pointer stands after the release is the claim under test.
+// sum rather than spilling to the heap.
 TEST(JsonArena, ParsedMessageIsReleasedBeforeItsReplyIsBuilt) {
     constexpr size_t ARENA_BYTES = 16 * 1024;
     // The parse's stranded first key ("type"): a block header and a short string node, against a

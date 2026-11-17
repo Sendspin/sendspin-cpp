@@ -58,9 +58,13 @@ during this review.
   directly (`tests/test_artwork_role.cpp`); connection tests use real
   loopback sockets (`tests/test_connection_lifecycle.cpp`); a test file that
   reaches private members compiles with `-fno-access-control`, set on that
-  translation unit in `tests/CMakeLists.txt` beside a comment naming each
-  member it reaches and why. A test that reaches a private member the
-  comment does not name is a finding.
+  translation unit in `tests/CMakeLists.txt`. The file names each private
+  member it reaches, and why, once: a reach several of its tests share at
+  the top of the file or on their fixture, any other in the comment of the
+  test or helper that takes it. A private member the file reaches but never
+  names is a finding, and so is the same reach named again test after test,
+  or a CMake comment beside the flag that names members or reasons instead
+  of saying only that the file compiles with it and names what it reaches.
 
 ## Mutation survival
 

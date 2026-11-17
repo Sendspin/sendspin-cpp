@@ -140,7 +140,12 @@ std::string activate_json(const std::string& roles_json) {
 }
 
 /// A source role whose rings exist without its task thread, so the test thread plays the
-/// capture thread, the source task (SourceTask::process()) and the protocol task's take.
+/// capture thread, the source task (SourceTask::process()) and the protocol task's take. Reached,
+/// since no public call stops the source task between its steps: SourceRole's impl_ (the task,
+/// and the stream gate and codec a stream opening sets); SourceTask's capture_ring_,
+/// outbound_ring_, event_flags_, protocol_task_ (pointed at the client's task), flac_encoder_
+/// and opus_encoder_, created or set as start() does but with no thread, so what a step produced
+/// stays to be read, and chunk_message_bytes_ (the size a completed chunk is acquired at).
 struct CaptureRig {
     explicit CaptureRig(SourceRoleConfig config = {})
         : client(SendspinClientConfig{}),
@@ -494,7 +499,8 @@ TEST(SourceConfigValidation, RejectsUnusableFormats) {
 
 // roles/source/v1.md "client/hello source@v1 support object" and "client/state source object":
 // a usable role advertises itself with its line_sense hint, an unusable one not at all, and the
-// state object carries a signal only for a role that senses one.
+// state object carries a signal only for a role that senses one. The hello and state objects are
+// built without a server, through SourceRole's impl_.
 TEST(SourceRoleObjects, HelloAndStateFields) {
     SendspinClient client(SendspinClientConfig{});
     SourceRoleConfig config;
@@ -610,7 +616,8 @@ TEST(SourceCapture, UnstampedWriteEndsNow) {
 
 // A run of refused writes belongs to one stream: the first write under a new generation ends the
 // last stream's run, logging its count, and a refusal there starts a run of its own. The run
-// shows only in the log, so the test reads its count.
+// shows only in the log, so the test reads its count (SourceTask's producer_drop_log_, its
+// InboundDropLog::dropped_).
 TEST(SourceCapture, EachStreamStartsItsOwnDropRun) {
     CaptureRig rig;
     rig.open(1);
@@ -656,7 +663,8 @@ TEST(SourceChunks, ChunksSpanWritesAndAnchorOnTheirFirstSample) {
 
 // A chunk carries one stream's audio only. The audio of a stream that closed is never read, a
 // chunk the stream changed under part-way is completed empty (the protocol task returns it
-// unsent), and the partial chunk in progress when the task stops is completed empty too.
+// unsent), and the partial chunk in progress when the task stops is completed empty too. The
+// stop row runs the task's loop (run()) to its exit.
 TEST(SourceChunks, AChunkNeverOutlivesItsStream) {
     struct Chunk {
         uint32_t generation;
@@ -731,7 +739,8 @@ TEST(SourceChunks, AChunkNeverOutlivesItsStream) {
 // outbound room; the next chunk with audio then starts at the first write made after. An outbound
 // ring with no room for a chunk is a send stall the capture ring rides out, so the backlog stays,
 // as it does for a write too long for any capture item, which is refused without counting as a
-// stall.
+// stall. Reached: SourceTask's chunk_item_ (a chunk begun but not filled) and bytes_per_frame_
+// (to size a write of whole frames that only its length refuses).
 TEST(SourceChunks, AStallResumesFromLiveCapture) {
     enum class Stall : uint8_t {
         NONE,
@@ -841,6 +850,13 @@ namespace {
 /// stand-in connection over a live Noise session installed as the admitted owner of source@v1.
 /// The network never reports ready, so no socket is opened. What the stand-in sends is decrypted
 /// on the initiator's side, in order, into wire(), each entry tagged with the step that sent it.
+/// Reached, to install the stand-in as the protocol task does and play that task's steps:
+/// SendspinClient's protocol_task_ (stopped), connection_manager_ (its install_admitted(),
+/// find_admitted(), close_admission() and liveness_timeout_us_, off so the stand-in's silence does
+/// not close it), json_arena_, process_json_message(), protocol_tick() and
+/// high_performance_ref_count_ (an open stream's hold); SendspinTimeBurst's
+/// last_burst_complete_time_ (no burst falls due); and SourceRole's impl_ (the task's
+/// chunk_message_bytes_, to complete a chunk as the source task would, and the stream gate).
 class SourceStandIn {
 public:
     struct Peer {
@@ -1026,7 +1042,9 @@ public:
 // step on the protocol task. Each step is followed by a protocol tick and a main-loop drain, and
 // what the server receives is tagged with the step that sent it. A chunk is one the source task
 // completed with the stream's generation (or the previous stream's). The listener's
-// callbacks stay paired, and an open stream holds high-performance networking.
+// callbacks stay paired, and an open stream holds high-performance networking. A quiet window
+// clears SendspinConnection's first_activate_received_ as a re-handshake's message 1 does, which
+// handle_noise_rehandshake() needs a whole re-handshake to reach.
 TEST(SourceStream, CommandsOpenAndCloseTheStream) {
     enum class Step : uint8_t {
         START,
@@ -1241,7 +1259,8 @@ TEST(SourceStream, AFailedChunkSendDropsTheConnection) {
 }
 
 // SendspinClient::stop() with the stream open: the shutdown pass ends the stream ahead of the
-// goodbye, and the drain inside stop() reports the stop and releases the stream's hold.
+// goodbye, and the drain inside stop() reports the stop and releases the stream's hold. The
+// shutdown pass is the stopped protocol task's final tick.
 TEST(SourceStream, StopEndsAnOpenStreamAheadOfTheGoodbye) {
     SourceStandIn rig;
     rig.deliver(source_command_json("start"));
@@ -1393,7 +1412,8 @@ TEST(SourceFlacEncoder, RoundTripsLosslesslyFromEitherPlacement) {
 
 // reset() restarts the frame numbering for a new stream, and so does running out of frame
 // numbers (2^31), rather than failing every chunk after: each encodes the same audio exactly as
-// the stream's first frame did.
+// the stream's first frame did. Exhaustion is unreachable otherwise, so the test sets micro-flac's
+// FLACEncoder::frame_number_ (through FlacSourceEncoder's encoder_) past the last number.
 TEST(SourceFlacEncoder, ResetAndFrameNumberExhaustionRestartTheNumbering) {
     const SourceRoleConfig config = make_flac_config();
     FlacSourceEncoder encoder(config);
@@ -1873,8 +1893,10 @@ TEST(SourceOpusChunks, AFailedEncodeDropsItsChunkAlone) {
 
 // micro-opus's pseudostack is per thread, so each run of the source task (a stop and a start)
 // warms the encoder up again on its own thread before its first opus stream. The real task
-// thread runs; start() keeps the stand-in encoder given to it, and the test thread plays the
-// protocol task. As above, the call record stands in for the unobservable warm-up.
+// thread runs; start() keeps the stand-in encoder given to it (SourceTask's opus_encoder_), and
+// the test thread plays the protocol task. As above, the call record stands in for the
+// unobservable warm-up. The role's task is stopped and started directly (impl_'s stop() and
+// start()) under one started client.
 TEST(SourceOpusStream, EachRunWarmsUpItsOwnThread) {
     SourceStandIn rig(true, make_opus_config());
     SourceRole::Impl& impl = *rig.source->impl_;
