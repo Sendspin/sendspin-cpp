@@ -432,15 +432,12 @@ TEST(CPaceRoundTrip, FixedScalarIsKnownAnswers) {
 // them, a wire-visible edit to derive()'s hash inputs would pass the whole file. This test closes
 // that: it drives the real derive()/isk()/tag() and compares against the reference vectors, so a
 // change that would desync us from a peer running the reference implementation fails here.
-//
-// start() always samples a fresh scalar from the CSPRNG, so reaching a known answer means
-// overwriting the private scalar_/public_share_ (see the -fno-access-control note in
-// tests/CMakeLists.txt) rather than adding an injection hook to production.
 // -----------------------------------------------------------------------------
 
 namespace {
 
-/// Replace a started CPace's sampled scalar with a fixed one, recomputing its public share so the
+/// Replace a started CPace's sampled scalar (the private scalar_, since start() always samples a
+/// fresh one from the CSPRNG) with a fixed one, recomputing its public share (public_share_) so the
 /// object is left exactly as if start() had sampled that scalar. `gen` must be the generator for
 /// the same (prs, ci, sid) the side was started with.
 bool force_fixed_scalar(CPace& side, const uint8_t (&scalar)[32],

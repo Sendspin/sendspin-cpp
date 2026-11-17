@@ -79,6 +79,12 @@ extern "C" {
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
+// Private access. Several tests reach a connection's noise_transport_ to make a transport send
+// directly (encrypt_in_place() among its calls), which no protocol-task step does on demand, and
+// to read what only the transport holds: send_buf_ (the bytes it staged, and their wipe),
+// is_send_desynced() and reasm_buf_, whose capacity is the only observable of the reassembly
+// growth policy and cap. NoiseSession's send_cipher_ is reached to exhaust the send nonce.
+
 namespace {
 
 /// A parsed copy of `json`, for send_json().
@@ -123,8 +129,9 @@ void pad_with_unknown_field(std::string& json, size_t size, size_t brace_from_en
 TEST(NoiseHandshakeLoopback, KKpsk2ChaChaPoly_FullHandshake) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value()) << "ChaChaPoly loopback handshake failed";
-    // The split() outcome has no public observable; the transport ciphers it installs are the
-    // state production code goes on to use.
+    // The split() outcome has no public observable; the transport ciphers it installs
+    // (NoiseSession's private send_cipher_ and recv_cipher_) are the state production code goes
+    // on to use.
     EXPECT_NE(r->responder_session->send_cipher_, nullptr);
     EXPECT_NE(r->responder_session->recv_cipher_, nullptr);
     EXPECT_NE(r->initiator.send_cs, nullptr);
@@ -977,6 +984,7 @@ TEST(FragmentSequence, ReassemblyBufferNeverGrowsPastTheCap) {
     // sizes: the largest message the cap admits arrives one small fragment past a buffer that is
     // already nearly a full MAX_REASSEMBLED_MESSAGE_BYTES, which is where an unclamped double
     // reserves ~2 MiB (~3 MiB in flight while the realloc copies), times MAX_OPEN_CONNECTIONS.
+    // The dispatched message is the same either way, so the buffer's capacity is what is read.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     FragmentReceiver rx(*r);
@@ -1506,7 +1514,8 @@ TEST(NoiseTransport, SendStagedJsonHandsItsWriteHookToTheFrame) {
 }
 
 // On a transport that writes synchronously, the default send_transport_frame() runs the hook
-// before the write, never after it.
+// before the write, never after it. Reached: SendspinConnection::send_transport_frame(), which
+// is protected, called directly since its default is what is under test.
 TEST(NoiseTransport, SendTransportFrameRunsTheHookBeforeTheWrite) {
     class OrderRecordingConnection : public TestConnection {
     public:
@@ -1568,7 +1577,8 @@ TEST(NoiseTransport, OnlyTheTimeFrameInFlightIsClaimedAndOnlyOnce) {
 }
 
 // The claim reports when the write hook ran, and never a time before the one the frame carries,
-// even if a leftover hook that sampled the clock before the seed stored an earlier one.
+// even if a leftover hook that sampled the clock before the seed stored an earlier one. That
+// earlier time is stored straight into time_frame_sent_us_, since no send produces it on demand.
 TEST(NoiseTransport, TimeFrameClaimReportsTheSocketWriteTime) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
@@ -1596,7 +1606,9 @@ TEST(NoiseTransport, TimeFrameClaimReportsTheSocketWriteTime) {
 }
 
 // Both halves of the frame in flight are low 32 bits of the microsecond clock, so a write that
-// lands just after they wrap is still a small delay on top of the full 64-bit echo.
+// lands just after they wrap is still a small delay on top of the full 64-bit echo. The frame is
+// seeded straight into time_frame_tag_ and time_frame_sent_us_, since no send lands a write just
+// past the wrap on demand.
 TEST(NoiseTransport, TimeFrameWriteDelaySurvivesTheLow32BitWrap) {
     DeferredWriteConnection conn;
     constexpr uint32_t TAG = 0xFFFFFF00U;
@@ -1696,7 +1708,9 @@ TEST(NoiseTransport, TimeMessageNeedsTheNoiseTransport) {
 // refusal before the encrypt leaves the connection up, and its next frame decrypts on the peer.
 // A detached connection or a closed transport is not closed again, and its next send is still
 // refused. A lent message's item goes back to the ring on every row that sends one. The encrypt
-// fails by exhausting the send nonce, the one failure a live session can meet.
+// fails by exhausting the send nonce, the one failure a live session can meet. The transport's
+// frame_sink_ is removed for one send, a refusal before the encrypt that send_json() cannot
+// otherwise meet.
 TEST(NoiseTransport, OnlyASendFailureAfterTheEncryptClosesTheConnection) {
     enum class Send : uint8_t {
         SINGLE,
@@ -1959,7 +1973,13 @@ TEST(NoiseTransport, ALentBinarySendReturnsItsItemOnEveryPath) {
 // bursts (after step 6, so step 10 drops it) and a release's goodbye. The test thread plays the
 // protocol task and the main loop; the stopped task's final tick took the client/state start()
 // published, before the stand-in was installed. In the Control row every send goes out and the
-// peer authenticates every frame in order.
+// peer authenticates every frame in order. Reached, since no public call installs a stand-in
+// admitted connection over a live Noise session: SendspinClient's connection_manager_,
+// protocol_task_ (stopped), json_arena_ (for the stand-in's goodbye) and protocol_tick();
+// ConnectionManager::install_admitted() and liveness_timeout_us_ (off, so the stand-in's silence
+// does not close it); SendspinTimeBurst::last_burst_complete_time_ (a burst due only in the row
+// that sends client/time); and the controller's impl_, whose supported_commands it seeds,
+// stamped with its cleanup_generation, so a send_command() is queued.
 TEST(NoiseTransport, ASendFailureAfterTheEncryptDropsTheConnectionInItsTick) {
     enum class Site : uint8_t { NONE, TIME, CLIENT_STATE, CONTROLLER, GOODBYE };
     struct Row {

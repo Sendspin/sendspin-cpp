@@ -22,7 +22,7 @@
 /// plays the Sendspin server over the real Noise transport, the test thread pumps client.loop(),
 /// and each later activation is sent as a plain application message.
 
-#include "artwork_role_impl.h"  // In-flight transfer state after a removal; private, see CMakeLists
+#include "artwork_role_impl.h"  // In-flight transfer state after a removal
 #include "color_role_impl.h"     // Held scheduled palette after a removal
 #include "controller_role_impl.h"  // Seeded supported-commands mask for the inactive-role send gate
 #include "crypto/constants.h"
@@ -55,6 +55,12 @@
 #include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
+
+// Private access. Most tests read what a removed role left behind, or stage what no public call
+// can, through the role's impl_. Four read the player's sync task (impl_->sync_task) for
+// SyncTask::is_running(), since no callback reports whether it left the stream, and the two
+// queued stream/start tests wait on PlayerRole::Impl::inbox, whose topic bits no public call
+// shows.
 
 namespace {
 
@@ -254,7 +260,9 @@ TEST(RoleDeactivation, RemovedPlayerStopsTheStreamAndLeavesTheOtherRolesAlone) {
 
 // An activation that drops visualizer@v1 ends its stream: the consumer sees
 // on_visualizer_stream_end(), the buffered frames are flushed, and later frames for the removed
-// role are not delivered. The player, which the same activation keeps, still plays.
+// role are not delivered. The player, which the same activation keeps, still plays. Reached:
+// VisualizerRole::Impl's stream_active and drain_task->inbound, since nothing public shows
+// whether the role still accepts frames or holds buffered ones.
 TEST(RoleDeactivation, RemovedVisualizerEndsTheStreamAndStopsDelivery) {
     CountingPlayerListener player_listener;
     CountingVisualizerListener visualizer_listener;
@@ -306,7 +314,8 @@ TEST(RoleDeactivation, RemovedVisualizerEndsTheStreamAndStopsDelivery) {
 // "Artwork (Binary)" has an artwork stream/end clear the current image and discard the pending
 // one, and the removal applies the same teardown) and drops the transfer that was in flight.
 // Adding the role back gives a working channel again: a whole image announced afterwards decodes,
-// with none of the abandoned bytes in it.
+// with none of the abandoned bytes in it. Reached: ArtworkRole::Impl::transfer and the decode
+// thread's assembly buffers (drain_task's assemblies), since no callback reports either.
 TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel) {
     constexpr uint32_t IMAGE_BYTES = 64;
     RecordingArtworkListener artwork_listener;
@@ -379,7 +388,10 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
 
 // An activation that drops metadata@v1, color@v1 and controller@v1 discards each role's current
 // state and the scheduled update behind it, and tells the consumer the same way a connection loss
-// does. The player, which the same activation keeps, is not touched.
+// does. The player, which the same activation keeps, is not touched. Reached: the metadata and
+// color Impls' event_state->slot, for the held update and the main loop's copy of its deadline
+// (ScheduledStateSlot::pending_at()), and MetadataRole::Impl::cleanup_generation, to stamp a
+// state handed to the slot (arrive()) with the pre-removal generation.
 TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     CountingPlayerListener player_listener;
     RecordingMetadataListener metadata_listener;
@@ -725,7 +737,8 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeAKeepingActivateStillStarts) {
 // with nothing holding it.
 //
 // Every receive path is driven. The controls are the first half of the test, where the same
-// traffic is applied while the roles are active.
+// traffic is applied while the roles are active. Reached: SyncTask::inbound(), since chunks
+// buffered for a removed player show nowhere else.
 TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     CountingPlayerListener player_listener;
     RecordingMetadataListener metadata_listener;
@@ -840,7 +853,8 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
 // alone, so its controller commands must stay off the wire until an activate adds the role.
 //
 // An inactive controller can hold no server/state, so the offered command is seeded: without it
-// the supported_commands check would drop the command before it reached the gate under test.
+// the supported_commands check would drop the command before it reached the gate under test. The
+// seed is ControllerRole::Impl::supported_commands, stamped with the Impl's cleanup_generation.
 TEST(RoleDeactivation, ControllerCommandsWaitForTheRoleToBeActive) {
     PairedClientBundle bundle(make_config(INACTIVE_ROLE_SEND_TEST_PORT));
     SendspinClient& client = bundle.client();
