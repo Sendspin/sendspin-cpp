@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -151,8 +152,8 @@ TEST(VisualizerDecode, PerTypePayloadShapes) {
 }
 
 // ============================================================================
-// handle_binary: the protocol task hands messages over verbatim, doing no per-type parsing or
-// capping.
+// handle_binary: the protocol task hands each frame over in a ring item, fitting spectrum and beat
+// frames to their stream and parsing no other payload.
 // ============================================================================
 
 namespace {
@@ -245,7 +246,7 @@ TEST(VisualizerHandleBinary, ForwardsTheWholeFrameInARingItem) {
         InboundRing& ring = *impl->drain_task->inbound.ring();
 
         // data = [server_ts(8)][loudness(2)], then more than this type defines: the protocol task
-        // neither truncates nor caps, so a spectrum with many bins survives intact.
+        // checks no loudness length, so the trailing bytes survive intact.
         std::vector<uint8_t> data;
         put_be64(data, 123456);
         put_be16(data, 0xABCD);
@@ -272,7 +273,10 @@ TEST(VisualizerHandleBinary, ForwardsTheWholeFrameInARingItem) {
 // ahead of its display time, or at once when that has passed, and dropped once it is more than the
 // lag bound past that delivery time. A server sends one message per visualization type for each
 // analysis frame, all with the same timestamp, so a slow listener leaves the drain thread
-// reaching the later ones after that timestamp; the bound lets those through.
+// reaching the later ones after that timestamp; the bound lets those through. A frame awaiting
+// its acknowledgement waits for it until the bound measured from that delivery time, not from
+// when the drain thread took it, and is dropped past the bound even once acknowledged: the drain
+// thread judges it again with the time of each wake.
 TEST(VisualizerDeliveryWait, DropsLateFramesAndShiftsByTheOffset) {
     constexpr int64_t MS = 1000;
     constexpr int64_t LAG = sendspin::VISUALIZER_MAX_DELIVERY_LAG_US;
@@ -281,30 +285,42 @@ TEST(VisualizerDeliveryWait, DropsLateFramesAndShiftsByTheOffset) {
         const char* name;
         int64_t client_ts;
         int32_t offset_ms;
+        bool acknowledged;
         int64_t now;
         std::optional<int64_t> wait_us;
     };
     const Row rows[] = {
-        {"Control: in time, waits for the display time", NOW + 50 * MS, 0, NOW, 50 * MS},
-        {"Control: due exactly now", NOW, 0, NOW, 0},
-        {"reached after its display time behind a sibling", NOW - 5 * MS, 0, NOW, 0},
-        {"Control: at the lag bound", NOW - LAG, 0, NOW, 0},
-        {"past the lag bound", NOW - LAG - 1, 0, NOW, std::nullopt},
-        {"positive offset fires early", NOW + 50 * MS, 15, NOW, 35 * MS},
-        {"negative offset delays", NOW + 50 * MS, -10, NOW, 60 * MS},
-        {"offset beyond the lead delivers at once", NOW + 50 * MS, 60, NOW, 0},
+        {"Control: in time, waits for the display time", NOW + 50 * MS, 0, true, NOW, 50 * MS},
+        {"Control: due exactly now", NOW, 0, true, NOW, 0},
+        {"reached after its display time behind a sibling", NOW - 5 * MS, 0, true, NOW, 0},
+        {"Control: at the lag bound", NOW - LAG, 0, true, NOW, 0},
+        {"past the lag bound", NOW - LAG - 1, 0, true, NOW, std::nullopt},
+        {"positive offset fires early", NOW + 50 * MS, 15, true, NOW, 35 * MS},
+        {"negative offset delays", NOW + 50 * MS, -10, true, NOW, 60 * MS},
+        {"offset beyond the lead delivers at once", NOW + 50 * MS, 60, true, NOW, 0},
         {"Control: a positive offset moves the bound earlier, at it", NOW + 100 * MS - LAG, 100,
+         true, NOW, 0},
+        {"a positive offset moves the bound earlier, past it", NOW + 100 * MS - LAG - 1, 100, true,
+         NOW, std::nullopt},
+        {"Control: a negative offset moves the bound later, at it", NOW - 10 * MS - LAG, -10, true,
          NOW, 0},
-        {"a positive offset moves the bound earlier, past it", NOW + 100 * MS - LAG - 1, 100, NOW,
+        {"a negative offset moves the bound later, past it", NOW - 10 * MS - LAG - 1, -10, true,
+         NOW, std::nullopt},
+        {"in time, awaiting its acknowledgement, waits to the lag bound", NOW + 50 * MS, 0, false,
+         NOW, 50 * MS + LAG},
+        {"taken 15 ms late awaiting its acknowledgement, waits the rest of the bound",
+         NOW - 15 * MS, 0, false, NOW, LAG - 15 * MS},
+        {"Control: taken 15 ms late, acknowledged within the bound", NOW - 15 * MS, 0, true,
+         NOW + 4 * MS, 0},
+        {"taken 15 ms late, acknowledged past the bound", NOW - 15 * MS, 0, true, NOW + 10 * MS,
          std::nullopt},
-        {"Control: a negative offset moves the bound later, at it", NOW - 10 * MS - LAG, -10, NOW,
-         0},
-        {"a negative offset moves the bound later, past it", NOW - 10 * MS - LAG - 1, -10, NOW,
-         std::nullopt},
+        {"taken 15 ms late, still awaiting its acknowledgement past the bound", NOW - 15 * MS, 0,
+         false, NOW + 10 * MS, std::nullopt},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        EXPECT_EQ(sendspin::visualizer_delivery_wait_us(row.client_ts, row.offset_ms, row.now),
+        EXPECT_EQ(sendspin::visualizer_delivery_wait_us(row.client_ts, row.offset_ms,
+                                                        row.acknowledged, row.now),
                   row.wait_us);
     }
 }
@@ -753,6 +769,67 @@ TEST(VisualizerHandshake, AFrameWaitsForTheStreamEventsQueuedBeforeIt) {
             impl->drain_task->inbound.ring()->return_item(item);
         }
         EXPECT_EQ(acknowledged, row.acknowledged);
+    }
+}
+
+// A run of stream/starts updating the running stream, none of them a boundary, keeps the
+// handshake's ordinal comparisons in range past half the counter's range: a frame received after
+// the run, once the main loop has fired it, is neither stale nor waiting, and a stream/end after
+// the run is held until the drain thread reports passing its boundary, whether that thread reported
+// through the run or sat in one frame callback through all of it. drain_events() holds an end only
+// while a drain thread runs, so a finished thread stands in for it (joined by the role's stop() at
+// destruction), and the rows write its report to passed_slot as report_passed() does. The run rows
+// fire 32,769 updates.
+TEST(VisualizerHandshake, ARunOfUpdatesPastHalfTheOrdinalsRangeKeepsTheHandshake) {
+    constexpr uint32_t PAST_HALF_THE_RANGE = 0x8001;
+    struct Row {
+        const char* name;
+        uint32_t updates;
+        bool reports_through_run;
+    };
+    const Row rows[] = {
+        {"Control: no updates", 0, true},
+        {"updates, the drain thread reporting through them", PAST_HALF_THE_RANGE, true},
+        {"updates, the drain thread in one frame callback through them", PAST_HALF_THE_RANGE,
+         false},
+    };
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    put_be16(data, 0x0001);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->stream_active = false;
+        impl->drain_task->drain_thread = std::thread([] {});
+        const auto report = [&impl] {
+            impl->event_state->passed_slot.write(impl->boundary_ordinal.load());
+        };
+        impl->handle_stream_start(loudness_stream(10));
+        dispatch_stream_events(*impl);
+        report();
+        for (uint32_t i = 0; i < row.updates; ++i) {
+            impl->handle_stream_start(loudness_stream(10));
+            if (row.reports_through_run) {
+                report();
+            }
+            dispatch_stream_events(*impl);
+        }
+
+        hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+        void* item = impl->drain_task->inbound.take(0, impl->cleanup_generation);
+        ASSERT_NE(item, nullptr);
+        EXPECT_FALSE(impl->is_stale(item));
+        EXPECT_TRUE(impl->is_acknowledged(item));
+        impl->drain_task->inbound.ring()->return_item(item);
+
+        StreamEventLog listener;
+        impl->listener = &listener;
+        impl->handle_stream_end();
+        dispatch_stream_events(*impl);
+        EXPECT_TRUE(listener.calls.empty()) << "the end fired before the drain thread passed it";
+        report();
+        impl->drain_events();
+        EXPECT_EQ(listener.calls, std::vector<std::string>{"end"});
     }
 }
 

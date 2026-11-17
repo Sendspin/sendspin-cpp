@@ -75,18 +75,22 @@ VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* p
 /// dropped rather than replayed late.
 static constexpr int64_t VISUALIZER_MAX_DELIVERY_LAG_US = 20000;
 
-/// @brief Decides when the drain thread delivers a frame. Pure, so the timing rules are unit
-/// tested with `now` as an argument.
+/// @brief Decides when the drain thread delivers a frame, judged again on every wake. Pure, so
+/// the timing rules are unit tested with `now` as an argument.
 ///
 /// roles/visualizer/v1.md "Visualization Data (Binary)": a frame is delivered display_offset_ms
 /// ahead of its display time (negative delays it), or at once when that has passed, and dropped
-/// once it is more than VISUALIZER_MAX_DELIVERY_LAG_US past that delivery time.
+/// once it is more than VISUALIZER_MAX_DELIVERY_LAG_US past that delivery time, acknowledged or
+/// not, so a frame awaiting its acknowledgement waits no later than that.
 /// @param client_ts         Display time in client time.
 /// @param display_offset_ms VisualizerRoleConfig::display_offset_ms.
+/// @param acknowledged      Whether every stream event queued before the frame arrived has fired
+///                          (VisualizerRole::Impl::is_acknowledged()).
 /// @param now               The current platform_time_us().
-/// @return Microseconds to wait before delivering (0 to deliver now), or std::nullopt to drop.
+/// @return Microseconds to wait: until the delivery time when acknowledged (0 to deliver now),
+///         otherwise until the lag bound; or std::nullopt to drop.
 std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int32_t display_offset_ms,
-                                                   int64_t now);
+                                                   bool acknowledged, int64_t now);
 
 /// @brief Private implementation of the visualizer role
 struct VisualizerRole::Impl : RoleTeardown {
@@ -277,10 +281,11 @@ struct VisualizerRole::Impl : RoleTeardown {
 
     // Atomic fields
     /// The lifecycle ordinal of the latest boundary (a stream/start with no stream running,
-    /// stream/end, stream/clear, a teardown): a frame stamped before it is stale. Written by
-    /// move_boundary() on the protocol task (or the main loop in stop() after the join), with
-    /// release; read with acquire on the drain thread and, for a teardown's owed end, the main
-    /// loop (complete_teardown()).
+    /// stream/end, stream/clear, a teardown), or of the trail an updating stream/start pulls it up
+    /// to when that is later (ORDINAL_TRAIL in visualizer_role.cpp): a frame stamped before it is
+    /// stale. Written by move_boundary() and handle_stream_start() on the protocol task (or the
+    /// main loop in stop() after the join), with release; read with acquire on the drain thread
+    /// and, for a teardown's owed end, the main loop (complete_teardown()).
     std::atomic<uint16_t> boundary_ordinal{0};
     /// The lifecycle ordinal through which every stream event has fired, or was dropped: a frame
     /// stamped later waits for it. Moved only forward by acknowledge(), with release, on the main
@@ -292,7 +297,8 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// and its teardowns, wrapping. handle_binary() stamps each frame with it
     /// (InboundItemHeader::serial). Protocol task only, like negotiated_types_mask.
     uint16_t lifecycle_ordinal{0};
-    /// The latest boundary ordinal the drain thread reported passing (passed_slot). Main loop.
+    /// The latest boundary ordinal the drain thread reported passing (passed_slot), pulled up
+    /// behind each event drain_events() judges (ORDINAL_TRAIL in visualizer_role.cpp). Main loop.
     uint16_t drain_passed{0};
     /// While start_owed, the ordinal of the latest notice in start_slot when the superseded
     /// STREAM_START was processed, the later start it waits for. Main loop.

@@ -91,11 +91,23 @@ static_assert(fits_advertised_fraction(BEAT_PAYLOAD_SIZE) &&
 static constexpr uint32_t COMMAND_STOP = sendspin::InboundItemList::FIRST_CONSUMER_BIT;
 // boundary_ordinal moved on (move_boundary(), recall_frames()).
 static constexpr uint32_t COMMAND_BOUNDARY = sendspin::InboundItemList::FIRST_CONSUMER_BIT << 1;
-// acked_ordinal moved on (acknowledge()), from the main loop.
+// acked_ordinal moved on (acknowledge()): by the main loop for each stream event it fires or
+// finds held_events full for (on_stream_ring_event()), or by the protocol task for one the full
+// inbox ring dropped (enqueue_stream_event()).
 static constexpr uint32_t COMMAND_ACK = sendspin::InboundItemList::FIRST_CONSUMER_BIT << 2;
 static_assert(COMMAND_ACK <= sendspin::InboundItemList::LAST_CONSUMER_BIT,
               "the drain thread's command bits must fit the list's usable event bits");
 static constexpr uint32_t DRAIN_COMMANDS = COMMAND_STOP | COMMAND_BOUNDARY | COMMAND_ACK;
+
+// How far boundary_ordinal and drain_passed may trail the ordinals compared with them: a quarter
+// of the lifecycle ordinal's range. A run of updating stream/starts moves no boundary, so each
+// pulls boundary_ordinal up to this far behind its own ordinal, and each event the main loop
+// judges pulls drain_passed up likewise, which keeps every count_after() on them within half the
+// range, as acknowledged_through() keeps acked_ordinal near the live ordinal. Only a frame still
+// buffered more than 16,384 stream/starts after it arrived turns stale by it. A frame callback
+// that blocks through more than half the range of further events can still leave an end held
+// until the counter comes round again; frames keep flowing meanwhile.
+static constexpr uint16_t ORDINAL_TRAIL = 0x4000;
 
 // ============================================================================
 // Big-endian helpers
@@ -411,6 +423,13 @@ void VisualizerRole::Impl::handle_stream_start(const VisualizerStreamPayload& st
     uint16_t ordinal = 0;
     if (update) {
         ordinal = this->next_ordinal();
+        // See ORDINAL_TRAIL. No event waits for the trail, and the frames it dates stale arrived
+        // ORDINAL_TRAIL starts ago or earlier, so it recalls nothing and wakes no thread: the
+        // drain thread reads it at its next staleness check or report.
+        const auto trail = static_cast<uint16_t>(ordinal - ORDINAL_TRAIL);
+        if (count_after(trail, this->boundary_ordinal.load(std::memory_order_relaxed))) {
+            this->boundary_ordinal.store(trail, std::memory_order_release);
+        }
     } else {
         ordinal = this->move_boundary();
         this->recall_frames();
@@ -501,6 +520,13 @@ void VisualizerRole::Impl::drain_events() {
     this->awaiting_drain = false;
     size_t processed = 0;
     for (const InboxEvent& event : this->held_events) {
+        // See ORDINAL_TRAIL. Every event ahead of this one has been processed, and none behind
+        // it is numbered ORDINAL_TRAIL before it while the main loop keeps up, so the pull
+        // passes no boundary an event awaits.
+        const auto trail = static_cast<uint16_t>(event.serial - ORDINAL_TRAIL);
+        if (count_after(trail, this->drain_passed)) {
+            this->drain_passed = trail;
+        }
         const auto type = static_cast<VisualizerEventType>(event.code);
         if (!event_is_current(event.epoch, generation, TAG, "a held visualizer stream event")) {
             ++processed;
@@ -705,12 +731,13 @@ void VisualizerRole::Impl::complete_teardown() {
 // ============================================================================
 
 std::optional<int64_t> visualizer_delivery_wait_us(int64_t client_ts, int32_t display_offset_ms,
-                                                   int64_t now) {
+                                                   bool acknowledged, int64_t now) {
     const int64_t deliver_at_us = client_ts - static_cast<int64_t>(display_offset_ms) * US_PER_MS;
-    if (now - VISUALIZER_MAX_DELIVERY_LAG_US > deliver_at_us) {
+    const int64_t drop_at_us = deliver_at_us + VISUALIZER_MAX_DELIVERY_LAG_US;
+    if (now > drop_at_us) {
         return std::nullopt;
     }
-    return std::max<int64_t>(deliver_at_us - now, 0);
+    return std::max<int64_t>((acknowledged ? deliver_at_us : drop_at_us) - now, 0);
 }
 
 VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* payload,
@@ -877,34 +904,28 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        const int64_t now = platform_time_us();
-        const std::optional<int64_t> wait_us =
-            visualizer_delivery_wait_us(client_ts, offset_ms, now);
-        if (!wait_us.has_value()) {
-            continue;
-        }
-
         // Wait for the delivery time, and first for the main loop to have fired every stream
         // event queued before the frame arrived (is_acknowledged()), which a frame waits for no
         // later than its lag bound before it is dropped as late: the frame keeps its ring item
         // through both, as it does for its delivery time. Every command wakes the wait to judge
         // the frame again; the first one to run out with the frame acknowledged delivers it.
-        const int64_t deliver_at_us = now + *wait_us;
-        const int64_t drop_at_us = deliver_at_us + VISUALIZER_MAX_DELIVERY_LAG_US;
         bool stop = false;
         bool deliver = false;
         bool ran_out = false;
         while (!self->is_stale(item)) {
             const bool acknowledged = self->is_acknowledged(item);
-            const int64_t left_us =
-                (acknowledged ? deliver_at_us : drop_at_us) - platform_time_us();
-            if (ran_out || left_us < US_PER_MS) {
+            const std::optional<int64_t> left_us =
+                visualizer_delivery_wait_us(client_ts, offset_ms, acknowledged, platform_time_us());
+            if (!left_us.has_value()) {
+                break;
+            }
+            if (ran_out || *left_us < US_PER_MS) {
                 deliver = acknowledged;
                 break;
             }
             report_passed();
             const auto wait_ms =
-                static_cast<uint32_t>(std::min<int64_t>(left_us / US_PER_MS, UINT32_MAX));
+                static_cast<uint32_t>(std::min<int64_t>(*left_us / US_PER_MS, UINT32_MAX));
             const uint32_t cmd = items.take_signals(DRAIN_COMMANDS, wait_ms);
             stop = (cmd & COMMAND_STOP) != 0;
             if (stop) {
