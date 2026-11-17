@@ -435,7 +435,10 @@ struct MyVisualizerListener : VisualizerRoleListener {
         update_peak_display(frequency_hz, amplitude);
     }
 
-    void on_spectrum(int64_t client_timestamp, const std::vector<uint16_t>& bins) override {
+    // One bin per n_disp_bins of the stream the frame arrived in, valid for the callback;
+    // config is the spectrum configuration it was received under.
+    void on_spectrum_bins(int64_t client_timestamp, std::span<const uint16_t> bins,
+                          const VisualizerSpectrumConfig& config) override {
         update_spectrum_bars(bins);
     }
 
@@ -450,11 +453,23 @@ struct MyVisualizerListener : VisualizerRoleListener {
     }
 
     // Called from the main loop thread.
-    void on_visualizer_stream_start(const ServerVisualizerStreamObject& stream) override { }
-    void on_visualizer_stream_end() override { }
-    void on_visualizer_stream_clear() override { }
+    void on_visualizer_stream_started(const VisualizerStream& stream) override {
+        show_meters(stream.loudness, stream.spectrum);
+    }
+    void on_visualizer_stream_end() override { reset_display(); }
+    void on_visualizer_stream_clear() override { reset_display(); }
 };
 ```
+
+The data callbacks run on the visualizer's drain thread and the stream callbacks on the main loop, and the library orders the two:
+
+- `on_visualizer_stream_started()` reports a visualizer `stream/start`, one that starts a stream and one that updates the running stream alike, and every frame received after it is delivered after it. A start whose notice a later start overwrote before it fired is folded into that later one: it fires nothing, so the latest notice before a frame describes the configuration the frame arrived with or a newer one. A frame received before an update keeps the configuration it arrived with (roles/visualizer/v1.md "Server -> Client: stream/start visualizer object") and may still be delivered after the update's notice.
+- No data callback of a stream runs after its `on_visualizer_stream_end()`, whether a `stream/end` or a teardown (the role taken out of the active roles, the connection lost, `stop()`) ends it: the main loop holds the end until a data callback in progress has returned. Every new stream's `on_visualizer_stream_started()` follows the end of the one before it, so a display resets in `on_visualizer_stream_end()`.
+- `on_visualizer_stream_clear()` comes after every frame delivered from before the clear and before every frame received after it.
+
+A frame waits for its notice no longer than its lag bound: one still waiting 20 ms past its delivery time is dropped like any late frame, so a main loop that lags behind a stream's frames loses those that follow a stream event. The end and the clear wait for a data callback in progress, so a callback that blocks delays them. A stream event the library drops for want of room, logged as an error, never fires, and the frames waiting for it are delivered unordered against it.
+
+`VisualizerStream` reports the stream as admitted: the data types the client will receive (those it requested), whether beat frames mark downbeats (only with `beat`), and `rate_max`. The frames carry the rest. A spectrum frame carries the stream's `n_disp_bins`, which may be lower than requested and may change in an update: size a display from each `bins.size()`, which `config.n_disp_bins` repeats beside the requested `scale`, `f_min` and `f_max`, the only ones a stream may serve. `downbeat` is false unless the stream tracks downbeats.
 
 ### ColorRoleListener
 
@@ -1197,9 +1212,9 @@ uint32_t duration = metadata.get_track_duration_ms();
 int64_t client_ts = client.get_client_time(server_timestamp);
 ```
 
-## Deprecated String API
+## Deprecated API
 
-The view forms hand the metadata, group, pairing and server text over as `std::string_view` into storage the library keeps, and the pairing token as a `std::array`; the deprecated forms copy it into `std::string`. The `std::string` forms are deprecated in v0.10.0 and removed in v0.11.0. Using a deprecated type or calling a deprecated getter draws a `-Wdeprecated-declarations` warning, but overriding a deprecated callback does not: the metadata and group callbacks warn only because their parameter types are deprecated, and the four pairing callbacks (`on_pairing_started()`, `on_pairing_succeeded()`, `on_pairing_failed()`, `on_display_pairing_code()`) take none, so search for those names. Mark every override `override`, so that a callback removed in v0.11.0 fails to compile rather than silently going uncalled.
+The view forms hand the metadata, group, pairing and server text over as `std::string_view` into storage the library keeps, and the pairing token as a `std::array`; the deprecated forms copy it into `std::string`. The visualizer's spectrum bins come as a `std::span` rather than a `std::vector`, and its stream start as a `VisualizerStream` rather than the stream object. The deprecated forms are deprecated in v0.10.0 and removed in v0.11.0. Using a deprecated type or calling a deprecated getter draws a `-Wdeprecated-declarations` warning, but overriding a deprecated callback does not: the metadata and group callbacks and `on_visualizer_stream_start()` warn only because their parameter types are deprecated, while the four pairing callbacks (`on_pairing_started()`, `on_pairing_succeeded()`, `on_pairing_failed()`, `on_display_pairing_code()`) and `on_spectrum()` take none, so search for those names. Mark every override `override`, so that a callback removed in v0.11.0 fails to compile rather than silently going uncalled.
 
 | Deprecated | Replacement |
 |---|---|
@@ -1216,8 +1231,11 @@ The view forms hand the metadata, group, pairing and server text over as `std::s
 | `SendspinClient::format_pairing_token()` | `SendspinClient::pairing_token_for()`, likewise |
 | `ServerInformationObject` | `ServerInformation` |
 | `SendspinClient::get_server_information()` | `SendspinClient::server_information()`, main loop only |
+| `VisualizerRoleListener::on_spectrum()` | `VisualizerRoleListener::on_spectrum_bins()`, the bins as a `std::span<const uint16_t>` beside the frame's spectrum configuration |
+| `VisualizerRoleListener::on_visualizer_stream_start()` | `VisualizerRoleListener::on_visualizer_stream_started()`, ordered against the data callbacks (see [VisualizerRoleListener](#visualizerrolelistener)) |
+| `ServerVisualizerStreamObject` | `VisualizerStream`, with each spectrum frame's configuration handed to `on_spectrum_bins()` |
 
-The fields and arguments keep their meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` and `server_information()` return until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view, like a pairing token's array, is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. `server_information()` reads a copy `loop()` refreshes as the server changes, so it is main loop only and can read the previous server, or `nullopt`, for one `loop()` after `is_connected()` turns true: read it on each `loop()` rather than only when `is_connected()` rises; `get_server_information()` reads from any thread, and code off the main loop has no replacement and keeps calling it until the removal. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first.
+The text fields and arguments keep their meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` and `server_information()` return until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view, like a pairing token's array, is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. `server_information()` reads a copy `loop()` refreshes as the server changes, so it is main loop only and can read the previous server, or `nullopt`, for one `loop()` after `is_connected()` turns true: read it on each `loop()` rather than only when `is_connected()` rises; `get_server_information()` reads from any thread, and code off the main loop has no replacement and keeps calling it until the removal. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. The deprecated `on_visualizer_stream_start()` follows each `on_visualizer_stream_started()`, before the frames received after it.
 
 ## Thread Safety Summary
 
@@ -1232,7 +1250,7 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 | `PlayerRoleListener::on_audio_write()` | Sync task background thread |
 | `ArtworkRoleListener::on_image_decode()` | Dedicated artwork decode thread |
 | `ArtworkRoleListener::on_image_display()` | Main loop thread |
-| `VisualizerRoleListener` data callbacks (`on_loudness()`, `on_beat()`, `on_f_peak()`, `on_spectrum()`, `on_peak()`) | Dedicated visualizer drain thread |
+| `VisualizerRoleListener` data callbacks (`on_loudness()`, `on_beat()`, `on_f_peak()`, `on_spectrum_bins()` and the deprecated `on_spectrum()`, `on_peak()`) | Dedicated visualizer drain thread, ordered against the stream callbacks on the main loop (see [VisualizerRoleListener](#visualizerrolelistener)) |
 | `SendspinClientConfig::message_trace` (built with `SENDSPIN_ENABLE_MESSAGE_TRACE`) | Protocol task |
 | All other listener methods | Main loop thread |
 
@@ -1534,7 +1552,7 @@ Configuration passed to `client.add_visualizer()`.
 
 | Field | Type | Description |
 |---|---|---|
-| `n_disp_bins` | `uint8_t` | Number of frequency bins to receive; `start()` reserves this many for `on_spectrum()`. A stream may serve fewer; one that serves more, or another `scale` or frequency range, drops its spectrum frames |
+| `n_disp_bins` | `uint8_t` | Number of frequency bins to receive; `start()` reserves this many for `on_spectrum_bins()`. A stream may serve fewer; one that serves more, or another `scale` or frequency range, drops its spectrum frames |
 | `scale` | `VisualizerSpectrumScale` | Frequency scale (`MEL`, `LOG`, or `LIN`) |
 | `f_min` | `uint16_t` | Minimum frequency in Hz |
 | `f_max` | `uint16_t` | Maximum frequency in Hz |

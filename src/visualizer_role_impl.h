@@ -19,6 +19,7 @@
 
 #include "inbound_ring.h"
 #include "inbox.h"
+#include "inline_vector.h"
 #include "protocol_messages.h"
 #include "sendspin/visualizer_role.h"
 #include "teardown_tracker.h"
@@ -36,7 +37,8 @@ class SendspinClient;
 struct ClientHelloMessage;
 struct ClientStateMessage;
 
-/// @brief Deferred visualizer event types (used internally in the visualizer role)
+/// @brief Deferred visualizer event types (used internally in the visualizer role). Each carries
+/// its lifecycle ordinal in InboxEvent::serial.
 enum class VisualizerEventType : uint8_t {
     STREAM_START,
     STREAM_END,
@@ -57,17 +59,15 @@ struct VisualizerDelivery {
 };
 
 /// @brief Validates and decodes one visualizer entry payload. Pure drain-thread logic with no I/O,
-/// factored out so it can be unit tested independently of the client and drain thread.
-/// @param wire_type        SENDSPIN_BINARY_VISUALIZER_* type byte.
-/// @param payload          Bytes following the entry's wire-type byte and 8-byte timestamp.
-/// @param configured_bins  Negotiated spectrum n_disp_bins (0 if SPECTRUM was not negotiated).
-/// @param tracks_downbeats Whether the active stream reports downbeats.
-/// @param spectrum_out     Scratch vector reused for SPECTRUM bins; resized to configured_bins,
-///                         which the drain thread keeps within its capacity.
+/// factored out so it can be unit tested independently of the client and drain thread. It needs
+/// no stream configuration: handle_binary() already fitted the frame to the one it arrived under.
+/// @param wire_type    SENDSPIN_BINARY_VISUALIZER_* type byte.
+/// @param payload      Bytes following the entry's wire-type byte and 8-byte timestamp.
+/// @param spectrum_out Scratch vector reused for SPECTRUM bins, resized to one bin per two
+///                     payload bytes, within the capacity start() reserved.
 /// @return What to deliver; Kind::None if the entry is malformed, short, or non-deliverable.
 VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* payload,
-                                             size_t payload_len, uint8_t configured_bins,
-                                             bool tracks_downbeats,
+                                             size_t payload_len,
                                              std::vector<uint16_t>& spectrum_out);
 
 /// @brief How far past its delivery time a frame may still be delivered, so frames sharing a
@@ -103,16 +103,37 @@ struct VisualizerRole::Impl : RoleTeardown {
         /// Its item list's flags also carry the drain thread's command bits.
         InboundConsumer inbound;
         std::thread drain_thread;
-        /// The bins on_spectrum() receives, reserved by start() for configured_spectrum_bins(),
-        /// beyond which no spectrum is admitted, so the drain thread never grows it. Main loop in
-        /// start() before the thread is spawned, then the drain thread.
+        /// The bins on_spectrum_bins() views and on_spectrum() receives, reserved by start() for
+        /// configured_spectrum_bins(), beyond which no spectrum is admitted, so the drain thread
+        /// never grows it. Main loop in start() before the thread is spawned, then the drain
+        /// thread.
         std::vector<uint16_t> spectrum_bins;
     };
 
-    /// @brief Deferred event state for the visualizer stream config, delivered to the main thread
-    /// via the shared Inbox
+    /// @brief A stream/start as admitted, for the main loop to report (fire_stream_start())
+    struct StartNotice {
+        VisualizerStream stream;
+        /// The admitted spectrum n_disp_bins, 0 unless stream.spectrum, for the deprecated
+        /// ServerVisualizerStreamObject.
+        uint8_t spectrum_bins{0};
+        /// The lifecycle ordinal of the STREAM_START this notice belongs to.
+        uint16_t ordinal{0};
+    };
+
+    /// @brief What the protocol task and the drain thread hand the main loop beside the stream
+    /// events (see docs/internals.md "Visualizer Stream Events")
     struct EventState {
-        GenerationSlot<VisualizerStreamPayload> config_slot;
+        /// The latest stream/start's notice, overwritten by the next one (latest-wins). The main
+        /// loop reports it at the STREAM_START numbered with its ordinal, and an earlier
+        /// STREAM_START, which it supersedes, reports nothing. A notice whose STREAM_START the
+        /// main loop never reaches (queued before a teardown, or dropped by the full event ring)
+        /// stays until the next start overwrites it; its topic bit wakes nothing, since the
+        /// STREAM_START events drive the drain. Protocol task to main loop.
+        InboxSlot<StartNotice> start_slot;
+        /// The latest boundary ordinal the drain thread has passed (boundary_ordinal, loaded
+        /// outside any frame callback), written each time it moves on, so a STREAM_END or
+        /// STREAM_CLEAR the main loop holds for it is re-examined then (see awaiting_drain).
+        InboxSlot<uint16_t> passed_slot;
     };
 
     // ========================================
@@ -142,15 +163,28 @@ struct VisualizerRole::Impl : RoleTeardown {
     void handle_stream_start(const VisualizerStreamPayload& stream);
     void handle_stream_end();
     void handle_stream_clear();
-    /// @brief Fires the listener callback for a current stream event. Main loop.
-    /// @param generation The event's stamp: a STREAM_START applies only the config written with
-    ///        the same stamp, filled into stream_object before the listener hears it.
-    void handle_stream_ring_event(VisualizerEventType event, uint32_t generation);
-    /// @brief The main-loop teardown half: delivers the stream end the teardown owes the
-    /// listener (on_visualizer_stream_end()). Its only other main-loop state, stream_object, is
-    /// refilled by each STREAM_START, so teardown leaves it. Main loop only, through
-    /// catch_up_teardown().
-    void complete_teardown() const;
+    /// @brief Holds a current VISUALIZER_STREAM event in held_events for drain_events() to fire,
+    /// or acknowledges one that finds it full. Main loop.
+    void on_stream_ring_event(const InboxEvent& event);
+    /// True if this tick has drainable visualizer work: the drain thread having passed a boundary
+    /// (passed_slot) while a STREAM_END or STREAM_CLEAR waits for it, or events in held_events,
+    /// appended by on_stream_ring_event() during this tick's ring dispatch or by a teardown's
+    /// catch-up (complete_teardown()), that are not held for the drain thread.
+    bool needs_drain(uint32_t pending_bits) const {
+        return (pending_bits & INBOX_TOPIC_VISUALIZER_PASSED) != 0 ||
+               (!this->held_events.empty() && !this->awaiting_drain);
+    }
+    /// @brief Fires held_events in order, holding a STREAM_END or STREAM_CLEAR, and everything
+    /// behind it, until the drain thread has passed its boundary, and acknowledging each event to
+    /// the drain thread once its callbacks return (acknowledged_through()). Skips an event a
+    /// teardown has since overtaken, and a STREAM_START a later one supersedes. Main loop.
+    void drain_events();
+    /// @brief The main-loop teardown half: replaces the events the teardown overtook with the
+    /// stream end it owes the listener (on_visualizer_stream_end()), which drain_events() fires
+    /// once the drain thread has passed the teardown's boundary. It leaves the other main-loop
+    /// state: stream_object, refilled by each STREAM_START, and start_owed (see
+    /// acknowledged_through()). Main loop only, through catch_up_teardown().
+    void complete_teardown();
 
     /// @brief Stops the role and discards its state. Protocol task, or the main loop in
     /// SendspinClient::stop() once every other thread is joined.
@@ -171,17 +205,43 @@ struct VisualizerRole::Impl : RoleTeardown {
     bool signal_stop() const;
     /// @brief Joins the drain thread and returns every frame it had not taken to the ring
     void stop() const;
-    /// @brief Returns every listed frame to the ring, moves boundary_sequence on and signals the
-    /// drain thread, which returns a frame it holds, when one is running.
-    void signal_boundary();
+    /// @brief Takes the next lifecycle ordinal for a stream event or a teardown. Protocol task.
+    uint16_t next_ordinal() {
+        return ++this->lifecycle_ordinal;
+    }
+    /// @brief Makes the next lifecycle ordinal a boundary: every frame stamped before it is stale
+    /// from here on. Protocol task.
+    /// @return The boundary's ordinal.
+    uint16_t move_boundary();
+    /// @brief Returns every listed frame to the ring and signals the drain thread, which returns
+    /// a frame it holds once it sees the boundary move_boundary() made, when one is running.
+    void recall_frames();
     /// @brief Whether a boundary has passed since `item` was listed. Drain thread.
     bool is_stale(void* item) const;
+    /// @brief Whether the main loop has fired every stream event queued before `item` was listed.
+    /// Drain thread.
+    bool is_acknowledged(void* item) const;
+    /// @brief Tells the drain thread every stream event up to `ordinal` has fired or never will,
+    /// moving acked_ordinal on to it unless it is there already. The main loop, or the protocol
+    /// task for an event the full inbox ring dropped (enqueue_stream_event()).
+    void acknowledge(uint16_t ordinal);
+    /// @brief The ordinal that firing (or losing) a `type` event numbered `ordinal` acknowledges
+    /// through: its own for a STREAM_START or STREAM_CLEAR, the one before it for a STREAM_END.
+    static uint16_t acknowledged_through(VisualizerEventType type, uint16_t ordinal);
+    /// @brief Takes the notice of the STREAM_START numbered `ordinal` from start_slot.
+    /// @return false when a later stream/start's notice has replaced it, which stays for its own
+    ///         STREAM_START and is copied to `out`.
+    bool take_start_notice(uint16_t ordinal, StartNotice& out);
+    /// @brief Fires on_visualizer_stream_started() and then the deprecated
+    /// on_visualizer_stream_start() with a STREAM_START's admitted stream. Main loop.
+    void fire_stream_start(const StartNotice& notice);
     /// @brief The spectrum bins the configuration requests: n_disp_bins when its types include
     /// SPECTRUM, otherwise none.
     uint8_t configured_spectrum_bins() const;
-    /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
-    /// against the live counter before dispatching it.
-    void enqueue_stream_event(VisualizerEventType event, uint32_t generation) const;
+    /// Queues a stream lifecycle event numbered `ordinal` and stamped with `generation`, which the
+    /// drain compares against the live counter before dispatching it. One the full ring drops is
+    /// acknowledged here instead, so no frame waits for it.
+    void enqueue_stream_event(VisualizerEventType event, uint32_t generation, uint16_t ordinal);
 
     static void drain_thread_func(VisualizerRole::Impl* self);
 
@@ -194,10 +254,19 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// (ClientVisualizerStateObject::types).
     VisualizerRoleConfig config;
     VisualizerSupportObject visualizer_support;
-    /// The stream on_visualizer_stream_start() reports, filled in place from each applied config
-    /// into the types capacity the constructor reserves for every type, so a fill never
-    /// allocates. Main loop.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    /// The stream the deprecated on_visualizer_stream_start() reports, filled in place from each
+    /// STREAM_START into the types capacity the constructor reserves for every type, so a fill
+    /// never allocates. Main loop.
     ServerVisualizerStreamObject stream_object{};
+#pragma GCC diagnostic pop
+    /// The stream events taken from the inbox ring, oldest first, while a STREAM_END or
+    /// STREAM_CLEAR at their head waits for the drain thread. As many as the inbox event ring
+    /// holds, a policy rather than a bound: each drain can add a full ring's worth while the head
+    /// waits. One arriving while this is full is dropped with an error and acknowledged
+    /// (on_stream_ring_event()), so no frame waits for it. Main loop.
+    InlineVector<InboxEvent, Inbox::EVENT_CAPACITY> held_events;
 
     // Pointer fields
     SendspinClient* client;
@@ -207,17 +276,27 @@ struct VisualizerRole::Impl : RoleTeardown {
     VisualizerRoleListener* listener{nullptr};
 
     // Atomic fields
-    /// The negotiated stream's spectrum shape. Written by handle_stream_start() on the protocol
-    /// task; read on the drain thread.
-    std::atomic<uint8_t> spectrum_bin_count{0};
-    std::atomic<bool> tracks_downbeats{false};
-    /// Counts stream boundaries (stream/start, stream/end, stream/clear, a teardown), wrapping.
-    /// handle_binary() stamps each frame with it (InboundItemHeader::serial); a frame whose stamp
-    /// differs is stale. Equality suffices: only the frame the drain thread holds can be stale, and
-    /// every boundary wakes the thread to check it. Written by
-    /// signal_boundary() on the protocol task (or the main loop in stop() after the join), with
-    /// release; read with acquire on the drain thread.
-    std::atomic<uint16_t> boundary_sequence{0};
+    /// The lifecycle ordinal of the latest boundary (a stream/start with no stream running,
+    /// stream/end, stream/clear, a teardown): a frame stamped before it is stale. Written by
+    /// move_boundary() on the protocol task (or the main loop in stop() after the join), with
+    /// release; read with acquire on the drain thread and, for a teardown's owed end, the main
+    /// loop (complete_teardown()).
+    std::atomic<uint16_t> boundary_ordinal{0};
+    /// The lifecycle ordinal through which every stream event has fired, or was dropped: a frame
+    /// stamped later waits for it. Moved only forward by acknowledge(), with release, on the main
+    /// loop and, for a dropped event, the protocol task; read with acquire on the drain thread.
+    std::atomic<uint16_t> acked_ordinal{0};
+
+    // 16-bit fields
+    /// Counts the stream events the role queues (every stream/start, stream/end and stream/clear)
+    /// and its teardowns, wrapping. handle_binary() stamps each frame with it
+    /// (InboundItemHeader::serial). Protocol task only, like negotiated_types_mask.
+    uint16_t lifecycle_ordinal{0};
+    /// The latest boundary ordinal the drain thread reported passing (passed_slot). Main loop.
+    uint16_t drain_passed{0};
+    /// While start_owed, the ordinal of the latest notice in start_slot when the superseded
+    /// STREAM_START was processed, the later start it waits for. Main loop.
+    uint16_t owed_start_ordinal{0};
 
     // 8-bit fields
     /// Bitmask of negotiated wire types, bit N = wire type SENDSPIN_BINARY_VISUALIZER_FIRST + N.
@@ -225,8 +304,22 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// admission is always judged against the config in force when a message arrives. Protocol
     /// task only; stop() runs cleanup() on the main loop once the task is joined.
     uint8_t negotiated_types_mask{0};
-    /// Whether a stream is running. Protocol task only, like negotiated_types_mask.
+    /// The negotiated spectrum n_disp_bins, while negotiated_types_mask admits spectrum. Protocol
+    /// task only, like negotiated_types_mask.
+    uint8_t negotiated_spectrum_bins{0};
+    /// Whether the negotiated stream's beat frames report downbeats. Protocol task only, like
+    /// negotiated_types_mask.
+    bool negotiated_tracks_downbeats{false};
+    /// Whether a stream is running, so a stream/start updates it in place. Protocol task only,
+    /// like negotiated_types_mask.
     bool stream_active{false};
+    /// True while the head of held_events is a STREAM_END or STREAM_CLEAR waiting for the drain
+    /// thread to pass its boundary. Main loop.
+    bool awaiting_drain{false};
+    /// True from a superseded STREAM_START until a STREAM_START fires or a clear queued after
+    /// owed_start_ordinal does. While it is, drain_events() holds back the acknowledgement of a
+    /// clear queued before owed_start_ordinal (see acknowledged_through()). Main loop.
+    bool start_owed{false};
 };
 
 }  // namespace sendspin

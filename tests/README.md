@@ -97,9 +97,12 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_decoder.cpp`: `SendspinDecoder` chunk decoding per codec (multi-frame FLAC, PCM at the
   spec maximum, an Opus packet longer than the estimate) and the sync task's whole-chunk decode.
 - `test_visualizer_role.cpp`: `decode_visualizer_message()` and the visualizer role's negotiation
-  and dispatch, the spectrum bins `start()` reserves, a frame handed to the drain thread whole (in
-  place or copied), when a frame is delivered or dropped, the stream boundaries that make listed
-  frames stale, and the recall after a teardown.
+  and dispatch, the stream each `stream/start` reports and the starts that fold into a later one,
+  the held events a teardown overtakes, the spectrum bins `start()` reserves, a frame handed to
+  the drain thread whole (in place or copied) and fitted to the stream it arrived in, when a frame
+  is delivered or dropped, the stream boundaries that make listed frames stale, the stream events
+  a frame waits for (across the ordinal's wrap, and for an event dropped for want of room), a
+  `stream/start` that updates the running stream in place, and the recall after a teardown.
 - `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: announce/part/cancel
   transfers and the messages and sequences that close the connection, the per-channel image cap,
   the inbound ring hand-off (item order, markers, the stale-stamp discard), decode thread, slot
@@ -119,7 +122,8 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   inside `stop()`, what a callback inside `stop()` sees, role start rollback, accepts refused at
   `stop()`, the command queue's refusals and the lifecycle requests it never refuses, the protocol
   task's next deadline, the teardown reorder guarantee for every role with main-loop state, stream
-  starts acknowledged by number, the high-performance grant, the time filter slot, the
+  starts acknowledged by number, the visualizer's stream callbacks ordered against its frames, the
+  high-performance grant, the time filter slot, the
   inbound ring's size, the pairing callbacks in each listener form, and the metadata role's
   scheduled-state slot, whose three text blocks carry every state to the listener in order.
 - `test_client_teardown.cpp`: destroying a running client joins every threaded role.

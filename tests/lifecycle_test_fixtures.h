@@ -1311,7 +1311,7 @@ public:
     void on_loudness(int64_t /*client_timestamp*/, uint16_t /*loudness*/) override {
         this->loudness.fetch_add(1);
     }
-    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) override {
+    void on_visualizer_stream_started(const VisualizerStream& /*stream*/) override {
         ++this->stream_starts;
     }
     void on_visualizer_stream_end() override {

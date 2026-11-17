@@ -29,6 +29,7 @@
 #include "crypto/keys.h"
 #include "fake_persistence.h"
 #include "inbound_ring.h"
+#include "inbound_test_helpers.h"
 #include "lifecycle_test_fixtures.h"
 #include "metadata_role_impl.h"  // The applied metadata state and its slot
 #include "platform/time.h"
@@ -45,6 +46,7 @@
 #include "sendspin/player_role.h"
 #include "sendspin/visualizer_role.h"
 #include "sync_task.h"
+#include "test_util.h"
 #include "time_burst.h"  // ms_until_due(), staged directly
 #include "time_filter.h"
 #include "visualizer_role_impl.h"  // Ring state after stop(); private access, see tests/CMakeLists.txt
@@ -61,6 +63,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +72,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -111,6 +115,16 @@ constexpr uint16_t OUTBOUND_GOODBYE_TEST_PORT = 19069;
 constexpr uint16_t NETWORK_PROVIDER_TEST_PORT = 19086;
 constexpr uint16_t INBOUND_OFF_TEST_PORT = 19106;
 constexpr uint16_t HELLO_CAP_ROLLBACK_TEST_PORT = 19107;
+constexpr uint16_t VISUALIZER_UPDATE_TEST_PORT = 19108;
+constexpr uint16_t SPECTRUM_VIEW_FORM_TEST_PORT = 19109;
+constexpr uint16_t SPECTRUM_DEPRECATED_FORM_TEST_PORT = 19111;
+constexpr uint16_t SPECTRUM_BOTH_FORMS_TEST_PORT = 19112;
+constexpr uint16_t VISUALIZER_NOTICE_TEST_PORT = 19113;
+constexpr uint16_t VISUALIZER_HELD_STOP_TEST_PORT = 19114;
+constexpr uint16_t VISUALIZER_ORDER_END_TEST_PORT = 19115;
+constexpr uint16_t VISUALIZER_ORDER_CLEAR_TEST_PORT = 19116;
+constexpr uint16_t VISUALIZER_ORDER_DEACTIVATION_TEST_PORT = 19117;
+constexpr uint16_t VISUALIZER_ORDER_LOSS_TEST_PORT = 19118;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -718,12 +732,15 @@ TEST(ClientLifecycle, AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayT
 /// Records the bins of the last spectrum frame the drain thread delivered.
 class RecordingSpectrumListener : public VisualizerRoleListener {
 public:
-    void on_spectrum(int64_t client_timestamp, const std::vector<uint16_t>& bins) override {
+    void on_spectrum_bins(int64_t client_timestamp, std::span<const uint16_t> bins,
+                          const VisualizerSpectrumConfig& config) override {
         {
             std::lock_guard<std::mutex> lock(this->mutex_);
-            this->bins_ = bins;
+            this->bins_.assign(bins.begin(), bins.end());
+            this->config_ = config;
             if (!bins.empty()) {
                 this->first_bins_.push_back(bins[0]);
+                this->bin_counts_.push_back(bins.size());
             }
             this->client_timestamp_ = client_timestamp;
             this->delivered_at_ = platform_time_us();
@@ -736,11 +753,26 @@ public:
         return this->bins_;
     }
 
+    /// The spectrum configuration the last frame was handed.
+    VisualizerSpectrumConfig last_config() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->config_;
+    }
+
     /// How many delivered frames had `bin` as their first bin.
     size_t delivered(uint16_t bin) const {
         std::lock_guard<std::mutex> lock(this->mutex_);
         return static_cast<size_t>(
             std::count(this->first_bins_.begin(), this->first_bins_.end(), bin));
+    }
+
+    /// The bin count of the first delivered frame whose first bin is `bin`, 0 if none was.
+    size_t bin_count(uint16_t bin) const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        const auto it = std::find(this->first_bins_.begin(), this->first_bins_.end(), bin);
+        return it == this->first_bins_.end()
+                   ? 0
+                   : this->bin_counts_[static_cast<size_t>(it - this->first_bins_.begin())];
     }
 
     /// How long before its client_timestamp the last frame was delivered (negative: after).
@@ -755,6 +787,8 @@ private:
     mutable std::mutex mutex_;
     std::vector<uint16_t> bins_;
     std::vector<uint16_t> first_bins_;
+    std::vector<size_t> bin_counts_;  ///< Each delivered frame's bin count, beside first_bins_
+    VisualizerSpectrumConfig config_{};
     int64_t client_timestamp_{0};
     int64_t delivered_at_{0};
 };
@@ -798,7 +832,8 @@ void send_spectrum_until(SendspinClient& client, FakeEncryptedServer& server,
 // requested one, governs how many bins each frame carries, up to the requested count (a served
 // count above it drops the spectrum frames). The negotiated count is what the drain thread
 // decodes with, so it is pinned where a consumer sees it: a stream that serves two bins to a
-// client that asked for four hands on_spectrum the first two of each wire frame.
+// client that asked for four hands on_spectrum_bins() the first two of each wire frame, with the
+// requested configuration but for that bin count.
 TEST(ClientLifecycle, TheServedSpectrumBinCountGovernsTheDeliveredFrame) {
     RecordingSpectrumListener listener;
     auto config = make_config(VISUALIZER_SPECTRUM_TEST_PORT);
@@ -818,6 +853,11 @@ TEST(ClientLifecycle, TheServedSpectrumBinCountGovernsTheDeliveredFrame) {
 
     send_spectrum_until(client, *server, [&] { return listener.frames.load() >= 1; });
     EXPECT_EQ(listener.last_bins(), (std::vector<uint16_t>{10, 20}));
+    const VisualizerSpectrumConfig spectrum = listener.last_config();
+    EXPECT_EQ(spectrum.n_disp_bins, 2);
+    EXPECT_EQ(spectrum.scale, VisualizerSpectrumScale::MEL);
+    EXPECT_EQ(spectrum.f_min, 40);
+    EXPECT_EQ(spectrum.f_max, 16000);
 
     client.stop();
 }
@@ -905,6 +945,599 @@ TEST_F(VisualizerDelivery, DisplayOffsetShiftsDeliveryFromTheDisplayTime) {
 
     EXPECT_LE(this->listener.last_lead_us(), (OFFSET_MS + 1) * 1000)
         << "delivered " << this->listener.last_lead_us() << " us before the display time";
+}
+
+// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": a stream/start that
+// updates the running stream keeps the buffered frames, the one the drain thread holds for its
+// display time and those listed behind it, and each is delivered with the bin count it arrived
+// under; the update here lowers the count from four to two. Control: a stream/end and a new
+// stream/start in its place return them undelivered (stamped an hour ahead, a frame left waiting
+// hangs the pump). The updated frames are stamped HELD_LEAD_US ahead, so they wait for the
+// update; each wait also ends at their display time, so a host too slow to send the update
+// before then only weakens the run.
+TEST_F(VisualizerDelivery, AnUpdatingStreamStartKeepsTheHeldAndListedFrames) {
+    constexpr int64_t HELD_LEAD_US = 1000 * 1000;
+    constexpr int64_t FAR_LEAD_US = 3600LL * 1000 * 1000;
+    ASSERT_NO_FATAL_FAILURE(this->start(VISUALIZER_UPDATE_TEST_PORT));
+    InboundConsumer& inbound = this->client().visualizer()->impl_->drain_task->inbound;
+    const InboundQuota& quota = inbound.ring()->quota(InboundHolder::VISUALIZER);
+    // Sends a frame of `bin`, waits for the drain thread to hold it, then sends one of `bin + 1`
+    // and waits for it to be listed behind it.
+    const auto hold_two = [&](int64_t display_us, uint16_t bin) {
+        this->send_frame_at(display_us, bin);
+        pump_until(this->client(), [&] {
+            return (inbound.items().is_empty() && quota.outstanding() > 0) ||
+                   platform_time_us() >= display_us;
+        });
+        this->send_frame_at(display_us, static_cast<uint16_t>(bin + 1));
+        pump_until(this->client(), [&] {
+            return !inbound.items().is_empty() || platform_time_us() >= display_us;
+        });
+    };
+
+    hold_two(platform_time_us() + HELD_LEAD_US, 1);
+    ASSERT_TRUE(this->server->send_app_json(stream_start_spectrum_json(2)));
+    pump_until(this->client(), [&] {
+        if (this->listener.delivered(3) > 0) {
+            return true;
+        }
+        this->send_frame_at(platform_time_us() + VISUALIZER_LEAD_US, 3);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return false;
+    });
+    EXPECT_EQ(this->listener.delivered(1), 1U) << "the held frame was not delivered";
+    EXPECT_EQ(this->listener.delivered(2), 1U) << "the listed frame was not delivered";
+    EXPECT_EQ(this->listener.bin_count(1), 4U);
+    EXPECT_EQ(this->listener.bin_count(2), 4U);
+    EXPECT_EQ(this->listener.bin_count(3), 2U);
+
+    // Control:
+    hold_two(platform_time_us() + FAR_LEAD_US, 4);
+    ASSERT_TRUE(this->server->send_app_json(R"({"type":"stream/end","payload":{}})"));
+    ASSERT_TRUE(this->server->send_app_json(stream_start_spectrum_json(4)));
+    pump_until(this->client(), [&] {
+        if (this->listener.delivered(6) > 0) {
+            return true;
+        }
+        this->send_frame_at(platform_time_us() + VISUALIZER_LEAD_US, 6);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return false;
+    });
+    EXPECT_EQ(this->listener.delivered(4), 0U);
+    EXPECT_EQ(this->listener.delivered(5), 0U);
+}
+
+/// Logs each spectrum callback a frame reaches, as its form ("view" or "deprecated") and bins,
+/// in the order they fire. Written on the drain thread, read on the test thread.
+class SpectrumFormLog : public VisualizerRoleListener {
+public:
+    std::vector<std::pair<std::string, std::vector<uint16_t>>> calls() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->calls_;
+    }
+
+protected:
+    void log(const char* form, const uint16_t* bins, size_t count) {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->calls_.emplace_back(form, std::vector<uint16_t>(bins, bins + count));
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<std::pair<std::string, std::vector<uint16_t>>> calls_;
+};
+
+class ViewSpectrumForm : public SpectrumFormLog {
+public:
+    void on_spectrum_bins(int64_t /*client_timestamp*/, std::span<const uint16_t> bins,
+                          const VisualizerSpectrumConfig& /*config*/) override {
+        this->log("view", bins.data(), bins.size());
+    }
+};
+
+class DeprecatedSpectrumForm : public SpectrumFormLog {
+public:
+    void on_spectrum(int64_t /*client_timestamp*/, const std::vector<uint16_t>& bins) override {
+        this->log("deprecated", bins.data(), bins.size());
+    }
+};
+
+class BothSpectrumForms : public SpectrumFormLog {
+public:
+    void on_spectrum_bins(int64_t /*client_timestamp*/, std::span<const uint16_t> bins,
+                          const VisualizerSpectrumConfig& /*config*/) override {
+        this->log("view", bins.data(), bins.size());
+    }
+    void on_spectrum(int64_t /*client_timestamp*/, const std::vector<uint16_t>& bins) override {
+        this->log("deprecated", bins.data(), bins.size());
+    }
+};
+
+// Until the deprecated on_spectrum() is removed, each spectrum frame reaches on_spectrum_bins()
+// and then on_spectrum() with the same bins, so a listener overriding one form hears every frame
+// and one overriding both hears both, the view form first. The stream serves two of the four
+// bins requested, so the bins each form hears are the frame's own count, not the request's.
+TEST(ClientLifecycle, SpectrumFramesReachBothListenerForms) {
+    ViewSpectrumForm view_only;
+    DeprecatedSpectrumForm deprecated_only;
+    BothSpectrumForms both;
+    struct Row {
+        const char* name;
+        SpectrumFormLog& listener;
+        uint16_t port;
+        std::vector<std::string> forms;
+    };
+    const Row rows[] = {
+        {"only the view form", view_only, SPECTRUM_VIEW_FORM_TEST_PORT, {"view"}},
+        {"only the deprecated form", deprecated_only, SPECTRUM_DEPRECATED_FORM_TEST_PORT,
+         {"deprecated"}},
+        {"both, the view form first", both, SPECTRUM_BOTH_FORMS_TEST_PORT,
+         {"view", "deprecated"}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto config = make_config(row.port);
+        config.time_burst_interval_ms = 100;  // Sync promptly: the drain thread needs client time
+        PairedClientBundle bundle(std::move(config));
+        SendspinClient& client = bundle.client();
+        client.add_visualizer(make_spectrum_visualizer_config()).set_listener(&row.listener);
+        FakeEncryptedServerOptions options;
+        options.answer_time = true;
+        ASSERT_TRUE(bundle.start());
+        auto server = connect_paired_server(bundle.peer, row.port, options);
+        pump_until_synced(client);
+        ASSERT_TRUE(server->send_app_json(stream_start_spectrum_json(2)));
+
+        send_spectrum_until(client, *server,
+                            [&] { return row.listener.calls().size() >= row.forms.size(); });
+        client.stop();
+
+        const auto calls = row.listener.calls();
+        ASSERT_GE(calls.size(), row.forms.size());
+        for (size_t i = 0; i < row.forms.size(); ++i) {
+            EXPECT_EQ(calls[i].first, row.forms[i]);
+            EXPECT_EQ(calls[i].second, (std::vector<uint16_t>{10, 20}));
+        }
+    }
+}
+
+/// Logs every visualizer callback in the order it fires, from the drain thread and the main loop
+/// alike: "started <rate_max>", "end", "clear", and each loudness frame as "frame <value>". The
+/// frame whose value is block_value logs "enter <value>", blocks until release(), then logs
+/// "exit <value>".
+class VisualizerOrderLog : public VisualizerRoleListener {
+public:
+    void on_loudness(int64_t /*client_timestamp*/, uint16_t value) override {
+        if (value != this->block_value.load()) {
+            this->log("frame " + std::to_string(value));
+            return;
+        }
+        this->log("enter " + std::to_string(value));
+        {
+            std::unique_lock<std::mutex> lock(this->mutex_);
+            this->gate_.wait(lock, [this] { return this->released_; });
+        }
+        this->log("exit " + std::to_string(value));
+    }
+    void on_visualizer_stream_started(const VisualizerStream& stream) override {
+        this->log("started " + std::to_string(stream.rate_max));
+    }
+    void on_visualizer_stream_end() override {
+        this->log("end");
+    }
+    void on_visualizer_stream_clear() override {
+        this->log("clear");
+    }
+
+    /// Lets a blocked frame callback return, and every later one pass.
+    void release() {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->released_ = true;
+        this->gate_.notify_all();
+    }
+    void clear() {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->calls_.clear();
+    }
+    /// Back to a fresh log: empty, blocking no frame. Only with no drain thread running.
+    void reset() {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->calls_.clear();
+        this->released_ = false;
+        this->block_value = 0;
+    }
+    bool logged(const std::string& entry) const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return std::find(this->calls_.begin(), this->calls_.end(), entry) != this->calls_.end();
+    }
+    /// The log up to and including the first `last`, or all of it when `last` is not logged.
+    std::vector<std::string> calls_through(const std::string& last) const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        const auto it = std::find(this->calls_.begin(), this->calls_.end(), last);
+        return {this->calls_.begin(), it == this->calls_.end() ? it : it + 1};
+    }
+
+    /// The frame value whose callback blocks, 0 for none.
+    std::atomic<uint16_t> block_value{0};
+
+private:
+    void log(std::string entry) {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->calls_.push_back(std::move(entry));
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable gate_;
+    bool released_{false};
+    std::vector<std::string> calls_;
+};
+
+/// A visualizer stream/start serving loudness at `rate_max`.
+std::string stream_start_loudness_json(unsigned rate_max) {
+    return R"({"type":"stream/start","payload":{"visualizer":{"types":["loudness"],"rate_max":)" +
+           std::to_string(rate_max) + "}}}";
+}
+
+// A synced client with a loudness stream running (rate_max 30), its start fired and its warm-up
+// frames delivered, logging to a VisualizerOrderLog. Frames are told apart by their loudness
+// value; a callback blocked on the log is released before the client stops.
+class VisualizerOrdering : public ::testing::Test {
+protected:
+    /// The warm-up frames' loudness, a value no row sends. settle()'s markers count up from the
+    /// next one.
+    static constexpr uint16_t WARM_UP_VALUE = 1000;
+
+    void start(uint16_t port) {
+        auto config = make_config(port);
+        config.time_burst_interval_ms = 100;  // Sync promptly: the drain thread needs client time
+        this->bundle = std::make_unique<PairedClientBundle>(std::move(config));
+        this->client().add_visualizer(make_visualizer_config()).set_listener(&this->log);
+        FakeEncryptedServerOptions options;
+        options.answer_time = true;
+        ASSERT_TRUE(this->bundle->start());
+        this->server = connect_paired_server(this->bundle->peer, port, options);
+        pump_until_synced(this->client());
+        ASSERT_TRUE(this->server->send_app_json(stream_start_loudness_json(30)));
+        this->send_until_delivered(WARM_UP_VALUE);
+        this->settle();
+    }
+
+    void TearDown() override {
+        this->finish();
+    }
+
+    /// Releases a blocked callback, stops and destroys the client, and resets the log, so a row
+    /// can start() again.
+    void finish() {
+        this->log.release();
+        if (this->bundle) {
+            this->client().stop();
+        }
+        this->server.reset();
+        this->bundle.reset();
+        this->log.reset();
+    }
+
+    SendspinClient& client() {
+        return this->bundle->client();
+    }
+    VisualizerRole::Impl& impl() {
+        return *this->client().visualizer()->impl_;
+    }
+
+    /// Sends a loudness frame of `value` stamped `display_us`.
+    void send_frame_at(int64_t display_us, uint16_t value) {
+        const std::string data{static_cast<char>(value >> 8), static_cast<char>(value & 0xFF)};
+        this->server->send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, display_us, data);
+    }
+
+    /// Pumps, sending a frame of `value` VISUALIZER_LEAD_US ahead each turn, until one is
+    /// delivered.
+    void send_until_delivered(uint16_t value) {
+        const std::string entry = "frame " + std::to_string(value);
+        pump_until(this->client(), [&] {
+            if (this->log.logged(entry)) {
+                return true;
+            }
+            this->send_frame_at(platform_time_us() + VISUALIZER_LEAD_US, value);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            return false;
+        });
+    }
+
+    /// Sends a marker frame and pumps until it is delivered, then clears the log. A marker still
+    /// unlogged at its lag bound, dropped as late or for want of client time, is followed by a
+    /// fresh one with a value of its own. The copies send_until_delivered() left in flight and the
+    /// earlier markers arrived before the last marker, so the drain thread has delivered or
+    /// dropped each of them by then, and none lands in the cleared log.
+    void settle() {
+        bool delivered = false;
+        while (!delivered) {
+            const uint16_t marker = this->next_settle_value++;
+            const std::string entry = "frame " + std::to_string(marker);
+            const int64_t display_us = platform_time_us() + VISUALIZER_LEAD_US;
+            this->send_frame_at(display_us, marker);
+            pump_until(this->client(), [&] {
+                delivered = this->log.logged(entry);
+                return delivered ||
+                       platform_time_us() > display_us + VISUALIZER_MAX_DELIVERY_LAG_US;
+            });
+        }
+        this->log.clear();
+    }
+
+    /// Whether the drain thread holds no frame and none is listed for it.
+    bool idle() {
+        InboundConsumer& inbound = this->impl().drain_task->inbound;
+        return inbound.items().is_empty() &&
+               inbound.ring()->quota(InboundHolder::VISUALIZER).outstanding() == 0;
+    }
+
+    VisualizerOrderLog log;
+    std::unique_ptr<PairedClientBundle> bundle;
+    std::unique_ptr<FakeEncryptedServer> server;
+    /// The loudness of settle()'s next marker.
+    uint16_t next_settle_value{WARM_UP_VALUE + 1};
+};
+
+// Every frame callback of a stream comes after the notice of the configuration it was received
+// under: the drain thread holds a frame received after a stream/start, fresh or updating the
+// running stream, or after a stream/clear, until the main loop has fired that event, and a frame
+// still waiting at its lag bound is dropped as late. Frame 2 follows the event; in the rows the
+// main loop runs no loop() until frame 2's lag bound has passed, it is dropped, and the first frame
+// delivered after the event is frame 3, sent once the notice has fired. A frame received before an
+// update (frame 1) waits for nothing. Control rows: a main loop that fires the event at once lets
+// frame 2 through behind it. The rows share one connection; each waits out frame 2's lag bound
+// or delivery, about 100 ms. Each row numbers its frames from a base of its own (frame 2 of the
+// second row is loudness 22) and waits out the copies it left in flight (settle()) before the
+// next row logs anything.
+TEST_F(VisualizerOrdering, AFrameAfterAStreamEventWaitsForItsNotice) {
+    enum class Event : uint8_t { FRESH_START, IN_PLACE_START, CLEAR };
+    struct Row {
+        const char* name;
+        Event event;
+        bool notice_late;
+        std::vector<std::string> expected;
+    };
+    const Row rows[] = {
+        {"a fresh start", Event::FRESH_START, true, {"started 20", "frame 3"}},
+        {"Control: a fresh start fired at once", Event::FRESH_START, false,
+         {"started 21", "frame 2"}},
+        {"an update", Event::IN_PLACE_START, true, {"frame 1", "started 22", "frame 3"}},
+        {"Control: an update fired at once", Event::IN_PLACE_START, false,
+         {"started 23", "frame 2"}},
+        {"a clear", Event::CLEAR, true, {"clear", "frame 3"}},
+        {"Control: a clear fired at once", Event::CLEAR, false, {"clear", "frame 2"}},
+    };
+    ASSERT_NO_FATAL_FAILURE(this->start(VISUALIZER_NOTICE_TEST_PORT));
+    unsigned rate_max = 20;
+    uint16_t base = 0;
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        base = static_cast<uint16_t>(base + 10);
+        // The row's frame `n`, its log entry, and the row's expected log in its own numbers.
+        const auto value = [base](uint16_t n) { return static_cast<uint16_t>(base + n); };
+        const auto entry = [&value](uint16_t n) { return "frame " + std::to_string(value(n)); };
+        std::vector<std::string> expected = row.expected;
+        for (std::string& call : expected) {
+            if (call.rfind("frame ", 0) == 0) {
+                call = entry(static_cast<uint16_t>(std::stoi(call.substr(6))));
+            }
+        }
+        if (row.event == Event::FRESH_START) {
+            ASSERT_TRUE(this->server->send_app_json(R"({"type":"stream/end","payload":{}})"));
+            pump_until(this->client(), [&] { return this->log.logged("end"); });
+        }
+        this->log.clear();
+        const std::string notice = row.event == Event::CLEAR
+                                       ? std::string("clear")
+                                       : "started " + std::to_string(rate_max);
+        const int64_t display_us = platform_time_us() + VISUALIZER_LEAD_US;
+        if (row.event == Event::IN_PLACE_START && row.notice_late) {
+            this->send_frame_at(display_us, value(1));
+        }
+        ASSERT_TRUE(this->server->send_app_json(
+            row.event == Event::CLEAR ? std::string(R"({"type":"stream/clear","payload":{}})")
+                                      : stream_start_loudness_json(rate_max++)));
+
+        if (row.notice_late) {
+            this->send_frame_at(display_us, value(2));
+            if (row.event == Event::IN_PLACE_START) {
+                wait_until([&] { return this->log.logged(entry(1)); });
+            }
+            wait_until([&] {
+                return platform_time_us() > display_us + VISUALIZER_MAX_DELIVERY_LAG_US &&
+                       this->idle();
+            });
+            pump_until(this->client(), [&] { return this->log.logged(notice); });
+            this->send_until_delivered(value(3));
+            EXPECT_EQ(this->log.calls_through(entry(3)), expected);
+        } else {
+            this->send_until_delivered(value(2));
+            EXPECT_EQ(this->log.calls_through(entry(2)), expected);
+        }
+        this->settle();
+    }
+}
+
+// stop() ends the drain thread's wait for a notice: a frame received after a stream/clear the
+// main loop never fires, stamped an hour ahead, is held for that hour unless the stop command
+// ends the wait, and a stop that did not would hang the join.
+TEST_F(VisualizerOrdering, StopEndsAWaitForANotice) {
+    constexpr int64_t HELD_FRAME_LEAD_US = 3600LL * 1000 * 1000;
+    ASSERT_NO_FATAL_FAILURE(this->start(VISUALIZER_HELD_STOP_TEST_PORT));
+    ASSERT_TRUE(this->server->send_app_json(R"({"type":"stream/clear","payload":{}})"));
+    this->send_frame_at(platform_time_us() + HELD_FRAME_LEAD_US, 2);
+    InboundConsumer& inbound = this->impl().drain_task->inbound;
+    const InboundQuota& quota = inbound.ring()->quota(InboundHolder::VISUALIZER);
+    wait_until([&] { return inbound.items().is_empty() && quota.outstanding() > 0; });
+
+    this->client().stop();
+    EXPECT_FALSE(this->log.logged("frame 2"));
+    EXPECT_TRUE(this->log.logged("end")) << "stop() owes the stream its end";
+}
+
+// No frame callback of a stream follows its end, or a clear: the main loop holds the
+// on_visualizer_stream_end() or on_visualizer_stream_clear() until the drain thread has left the
+// frame callback it was in when the boundary arrived. Frame 1's callback blocks until the test
+// releases it, with frame 2, received before the boundary too, behind it; frame 2 is never
+// delivered. The teardowns (the role taken out of the active roles, the connection lost) owe the
+// end the same way. After a clear, frame 3 flows behind it. Whether the end has fired is read
+// once the main loop holds it (awaiting_drain), since no callback marks the hold; a main loop
+// that does not hold it fires it on that same pump. Each row connects a client of its own, a
+// teardown row's stream being gone, so the test takes about 400 ms a row.
+TEST_F(VisualizerOrdering, NoFrameCallbackFollowsItsStreamsEndOrClear) {
+    enum class Boundary : uint8_t { END, CLEAR, DEACTIVATION, CONNECTION_LOSS };
+    struct Row {
+        const char* name;
+        uint16_t port;
+        Boundary boundary;
+    };
+    const Row rows[] = {
+        {"stream/end", VISUALIZER_ORDER_END_TEST_PORT, Boundary::END},
+        {"stream/clear", VISUALIZER_ORDER_CLEAR_TEST_PORT, Boundary::CLEAR},
+        {"the role deactivated", VISUALIZER_ORDER_DEACTIVATION_TEST_PORT, Boundary::DEACTIVATION},
+        {"the connection lost", VISUALIZER_ORDER_LOSS_TEST_PORT, Boundary::CONNECTION_LOSS},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        this->finish();
+        ASSERT_NO_FATAL_FAILURE(this->start(row.port));
+        this->log.block_value = 1;
+        const int64_t display_us = platform_time_us() + VISUALIZER_LEAD_US;
+        this->send_frame_at(display_us, 1);
+        this->send_frame_at(display_us, 2);
+        wait_until([&] { return this->log.logged("enter 1"); });
+
+        const std::string notice = row.boundary == Boundary::CLEAR ? "clear" : "end";
+        switch (row.boundary) {
+            case Boundary::END:
+                ASSERT_TRUE(this->server->send_app_json(R"({"type":"stream/end","payload":{}})"));
+                break;
+            case Boundary::CLEAR:
+                ASSERT_TRUE(this->server->send_app_json(R"({"type":"stream/clear","payload":{}})"));
+                break;
+            case Boundary::DEACTIVATION:
+                ASSERT_TRUE(this->server->send_app_json(
+                    R"({"type":"server/activate","payload":{"activities":["playback"],)"
+                    R"("active_roles":[]}})"));
+                break;
+            case Boundary::CONNECTION_LOSS:
+                this->server.reset();
+                break;
+        }
+        pump_until(this->client(),
+                   [&] { return this->impl().awaiting_drain || this->log.logged(notice); });
+        EXPECT_FALSE(this->log.logged(notice)) << "fired while a frame callback was running";
+
+        this->log.release();
+        pump_until(this->client(), [&] { return this->log.logged(notice); });
+        if (row.boundary == Boundary::CLEAR) {
+            this->send_until_delivered(3);
+            EXPECT_EQ(this->log.calls_through("frame 3"),
+                      (std::vector<std::string>{"enter 1", "exit 1", "clear", "frame 3"}));
+        } else {
+            EXPECT_EQ(this->log.calls_through(notice),
+                      (std::vector<std::string>{"enter 1", "exit 1", "end"}));
+        }
+        EXPECT_FALSE(this->log.logged("frame 2"));
+    }
+}
+
+// The drain thread reports the boundary it has passed before every wait, including the wait of a
+// frame it holds for its notice, so a frame it takes past a boundary it has not reported is
+// delivered: the main loop holds a stream/end until the drain thread reports passing it, and the
+// fresh stream/start behind the end, whose notice the frame waits for, fires only after that. The
+// drain thread takes such a frame when the end, the start and the frame all arrive between its
+// report and its take, which the test stages deterministically: the drain thread returns a frame
+// stamped with a teardown generation the role has left (one handed before a teardown, taken
+// between cleanup()'s generation bump and its recall) inside its take, while the test thread,
+// playing the stopped protocol task, holds the ring's lock that return needs and queues the end,
+// the start and frame 4. The take resumes with frame 4. A drain thread reporting only before its
+// take would leave the end held, and frame 4 would wait out its lag bound and be dropped; frame
+// 5, handed after the start's notice and displayed after frame 4, follows it on the same thread,
+// so it marks frame 4's fate settled. No server runs: the primary clock is installed directly
+// (see CMakeLists), and frame 4 is displayed 250 ms ahead, so a slow main loop has that long to
+// fire the notice.
+TEST(VisualizerDrainThread, AFrameTakenPastABoundaryItHasNotReportedIsDelivered) {
+    constexpr int64_t FRAME_LEAD_US = 250 * 1000;
+    VisualizerOrderLog log;
+    TestNetworkProvider network;
+    SendspinClient client(make_config(0));
+    client.set_network_provider(&network);
+    client.add_visualizer(make_visualizer_config()).set_listener(&log);
+    ASSERT_TRUE(client.start());
+    client.protocol_task_->stop();
+    {
+        ConnectionManager& manager = *client.connection_manager_;
+        std::lock_guard<std::mutex> lock(manager.published_mutex_);
+        manager.published_.primary_slot = 0;
+        manager.published_.clocks[0] =
+            TimeTransform{.last_update = platform_time_us(), .synced = true};
+    }
+    VisualizerRole::Impl& impl = *client.visualizer_->impl_;
+    InboundConsumer& inbound = impl.drain_task->inbound;
+    InboundRing& ring = *inbound.ring();
+    // A loudness frame of `value` displayed `lead_us` from now, received into a ring item.
+    const auto receive = [&ring](uint16_t value, int64_t lead_us) {
+        std::vector<uint8_t> bytes{SENDSPIN_BINARY_VISUALIZER_LOUDNESS};
+        put_be64(bytes, platform_time_us() + lead_us);
+        bytes.push_back(static_cast<uint8_t>(value >> 8));
+        bytes.push_back(static_cast<uint8_t>(value & 0xFF));
+        return receive_into_ring(ring, bytes, 0);
+    };
+    // The protocol task's dispatch of `message`, which returns the item the role did not take.
+    const auto hand = [&impl, &ring](InboundMessage message) {
+        impl.handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, message);
+        if (message.item != nullptr) {
+            ring.return_item(message.item);
+        }
+    };
+    const auto stream = [](uint16_t rate_max) {
+        VisualizerStreamPayload payload;
+        payload.types = {VisualizerDataType::LOUDNESS};
+        payload.rate_max = rate_max;
+        return payload;
+    };
+
+    // A teardown first, so the role has a generation to have left.
+    impl.cleanup();
+    client.loop();
+    impl.handle_stream_start(stream(30));
+    pump_until(client, [&] { return log.logged("started 30"); });
+    hand(receive(1, VISUALIZER_LEAD_US));
+    wait_until([&] { return log.logged("frame 1"); });
+    log.clear();
+
+    log.block_value = 2;
+    hand(receive(2, VISUALIZER_LEAD_US));
+    wait_until([&] { return log.logged("enter 2"); });
+    InboundMessage stale = receive(3, VISUALIZER_LEAD_US);
+    ASSERT_TRUE(inbound.hand_message(stale,
+                                     {.data_len = 2,
+                                      .serial = impl.lifecycle_ordinal,
+                                      .type = SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
+                                      .data_offset = 1 + BINARY_TIMESTAMP_SIZE},
+                                     impl.cleanup_generation.load() - 1));
+    InboundMessage frame = receive(4, FRAME_LEAD_US);
+
+    {
+        std::unique_lock<std::mutex> ring_lock(ring.ring_.mtx_);
+        log.release();
+        // Leaving frame 2's callback, the drain thread reports, then takes frame 3 and waits for
+        // the lock to return it.
+        wait_until([&] { return inbound.items().is_empty(); });
+        impl.handle_stream_end();
+        impl.handle_stream_start(stream(7));
+        hand(frame);
+    }
+    pump_until(client, [&] { return log.logged("started 7"); });
+    hand(receive(5, FRAME_LEAD_US));
+    pump_until(client, [&] { return log.logged("frame 5"); });
+    EXPECT_EQ(log.calls_through("frame 5"),
+              (std::vector<std::string>{"enter 2", "exit 2", "end", "started 7", "frame 4",
+                                        "frame 5"}));
+    client.stop();
 }
 
 /// Counts high-performance requests and releases without touching the client, as the listener
@@ -2413,7 +3046,7 @@ public:
     void on_volume_changed(uint8_t volume) override {
         this->calls.push_back("state " + std::to_string(volume));
     }
-    void on_visualizer_stream_start(const ServerVisualizerStreamObject& stream) override {
+    void on_visualizer_stream_started(const VisualizerStream& stream) override {
         this->visualizer_rate = static_cast<uint8_t>(stream.rate_max);
         this->calls.push_back("state " + std::to_string(stream.rate_max));
     }
@@ -2445,10 +3078,10 @@ public:
 /// the decode thread's display hand-off), `restore` writes the role's slot with an explicit stamp
 /// (the payload a drain holds when it took the slot on the far side of a teardown) and, for a
 /// role whose payload rides its STREAM_START, queues that START with the same stamp, `drain` is
-/// the role's step of drain_inbox() (the catch-up alone for the visualizer, which has no drain),
-/// and `applied` the state the role holds afterwards (0 when cleared). Each value is a state's
-/// identifying number. `has_clear` is false for the player's commands, device state a teardown
-/// keeps (`keeps_state`), so its rows expect no clear and A's value where a teardown clears.
+/// the role's step of drain_inbox(), and `applied` the state the role holds afterwards (0 when
+/// cleared). Each value is a state's identifying number. `has_clear` is false for the player's
+/// commands, device state a teardown keeps (`keeps_state`), so its rows expect no clear and A's
+/// value where a teardown clears.
 struct StateRoleAccess {
     const char* name;
     void (*admit)(SendspinClient&, uint8_t value);
@@ -2604,14 +3237,15 @@ const StateRoleAccess STATE_ROLES[] = {
      },
      [](SendspinClient& c, uint8_t v, uint32_t g) {
          VisualizerRole::Impl& impl = *c.visualizer_->impl_;
-         impl.event_state->config_slot.write(visualizer_stream_with(v), g);
-         impl.enqueue_stream_event(VisualizerEventType::STREAM_START, g);
+         VisualizerStream stream;
+         stream.loudness = true;
+         stream.rate_max = v;
+         const uint16_t ordinal = impl.next_ordinal();
+         impl.event_state->start_slot.write({.stream = stream, .ordinal = ordinal});
+         impl.enqueue_stream_event(VisualizerEventType::STREAM_START, g, ordinal);
      },
      [](SendspinClient& c) { c.visualizer_->impl_->cleanup(); },
-     [](SendspinClient& c) {
-         VisualizerRole::Impl& impl = *c.visualizer_->impl_;
-         catch_up_teardown(impl, impl.cleanup_generation.load());
-     },
+     [](SendspinClient& c) { c.visualizer_->impl_->drain_events(); },
      [](SendspinClient& c) { return c.visualizer_->impl_->cleanup_generation.load(); },
      [](SendspinClient&, const StateRoleLog& log) { return log.visualizer_rate; },
      true, false},
@@ -2631,7 +3265,8 @@ const StateRoleAccess STATE_ROLES[] = {
 /// protocol task the test thread plays: role handlers and teardowns run on the test thread,
 /// between the loop() calls the test makes. The player's sync task runs no thread: its item list
 /// is bound to the ring the way SyncTask::start() binds it, so the player's STREAM_END never
-/// waits for a thread to go idle and one loop() delivers it.
+/// waits for a thread to go idle and one loop() delivers it. The visualizer's drain thread is
+/// joined, as stop() joins it, so its held STREAM_END waits for no thread either.
 struct StateRoleClient {
     explicit StateRoleClient(StateRoleLog& log) : client(make_config(0)) {
         this->client.set_network_provider(&this->network);
@@ -2654,6 +3289,7 @@ struct StateRoleClient {
         InboundRing* ring = sync.inbound().ring();
         sync.stop();
         EXPECT_TRUE(sync.inbound().bind(ring, InboundHolder::PLAYER));
+        this->client.visualizer_->impl_->stop();
     }
     ~StateRoleClient() {
         // Hands the list back as SyncTask::stop() would, before stop() releases the ring.

@@ -79,6 +79,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -866,13 +867,9 @@ int main(int argc, char* argv[]) {
         TuiState& state;
         explicit TuiVisualizerListener(TuiState& s) : state(s) {}
 
-        void on_visualizer_stream_start(const ServerVisualizerStreamObject& vis_stream) override {
+        void on_visualizer_stream_started(const VisualizerStream& /*stream*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.visualizer_active = true;
-            if (vis_stream.spectrum.has_value()) {
-                state.vis_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0);
-                state.vis_display_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0.0f);
-            }
             state.vis_display_loudness = 0.0f;
         }
 
@@ -910,10 +907,11 @@ int main(int argc, char* argv[]) {
             state.vis_peak_freq = frequency_hz;
         }
 
-        void on_spectrum(int64_t /*client_timestamp*/,
-                         const std::vector<uint16_t>& bins) override {
+        // Each frame carries its stream's bin count; the render loop sizes the display to it.
+        void on_spectrum_bins(int64_t /*client_timestamp*/, std::span<const uint16_t> bins,
+                              const VisualizerSpectrumConfig& /*config*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.vis_spectrum = bins;
+            state.vis_spectrum.assign(bins.begin(), bins.end());
         }
 
         void on_beat(int64_t /*client_timestamp*/, bool /*downbeat*/) override {

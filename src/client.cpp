@@ -1071,7 +1071,8 @@ void SendspinClient::drain_inbox() {
                         catch_up_roles(&event);
                         break;
                     // ARTWORK_STREAM / VISUALIZER_STREAM: code is the role-local
-                    // ArtworkEventType/VisualizerEventType.
+                    // ArtworkEventType/VisualizerEventType. The visualizer's are appended to its
+                    // held_events, which its role drain fires.
                     case InboxEventType::ARTWORK_STREAM: {
 #ifdef SENDSPIN_ENABLE_ARTWORK
                         if (this->artwork_ &&
@@ -1094,8 +1095,7 @@ void SendspinClient::drain_inbox() {
                                                  std::memory_order_acquire),
                                              TAG, "a visualizer stream event")) {
                             catch_up_teardown(*this->visualizer_->impl_, event.epoch);
-                            this->visualizer_->impl_->handle_stream_ring_event(
-                                static_cast<VisualizerEventType>(event.code), event.epoch);
+                            this->visualizer_->impl_->on_stream_ring_event(event);
                         }
 #endif
                         break;
@@ -1216,6 +1216,11 @@ void SendspinClient::drain_inbox() {
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_ && this->artwork_->impl_->needs_drain(slot_bits)) {
         this->artwork_->impl_->drain_events();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_ && this->visualizer_->impl_->needs_drain(slot_bits)) {
+        this->visualizer_->impl_->drain_events();
     }
 #endif
 
