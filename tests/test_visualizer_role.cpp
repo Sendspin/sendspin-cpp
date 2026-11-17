@@ -833,6 +833,51 @@ TEST(VisualizerHandshake, ARunOfUpdatesPastHalfTheOrdinalsRangeKeepsTheHandshake
     }
 }
 
+// A run of stream/starts past half the counter's range, each superseded by the next before the
+// main loop reaches it, fires no start, yet keeps acked_ordinal in range: a frame received after
+// the run waits for the superseding start, whose notice describes it, and flows once that fires.
+// The rows drive the handlers and the main loop's drain with no drain thread and fire 32,769
+// superseded updates.
+TEST(VisualizerHandshake, ARunOfSupersededStartsPastHalfTheOrdinalsRangeKeepsAFrameWaiting) {
+    constexpr uint32_t PAST_HALF_THE_RANGE = 0x8001;
+    struct Row {
+        const char* name;
+        bool fire_superseding_start;
+        bool acknowledged;
+    };
+    const Row rows[] = {
+        {"the superseding start not yet fired", false, false},
+        {"Control: the superseding start fired", true, true},
+    };
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    put_be16(data, 0x0001);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->stream_active = false;
+        impl->handle_stream_start(loudness_stream(10));
+        dispatch_stream_events(*impl);
+        impl->handle_stream_start(loudness_stream(10));
+        hold_stream_events(*impl);
+        for (uint32_t i = 0; i < PAST_HALF_THE_RANGE; ++i) {
+            impl->handle_stream_start(loudness_stream(10));
+            impl->drain_events();  // The held start, superseded by the one just handled
+            hold_stream_events(*impl);
+        }
+
+        hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+        if (row.fire_superseding_start) {
+            impl->drain_events();
+        }
+        void* item = impl->drain_task->inbound.take(0, impl->cleanup_generation);
+        ASSERT_NE(item, nullptr);
+        EXPECT_FALSE(impl->is_stale(item));
+        EXPECT_EQ(impl->is_acknowledged(item), row.acknowledged);
+        impl->drain_task->inbound.ring()->return_item(item);
+    }
+}
+
 // roles/visualizer/v1.md "Server -> Client: stream/start": `types` "MUST be a subset of the types
 // the client requested", and the spectrum object "MUST match the client's current requested
 // configuration", though "Servers MAY impose an implementation-defined upper bound on

@@ -103,10 +103,11 @@ static constexpr uint32_t DRAIN_COMMANDS = COMMAND_STOP | COMMAND_BOUNDARY | COM
 // of the lifecycle ordinal's range. A run of updating stream/starts moves no boundary, so each
 // pulls boundary_ordinal up to this far behind its own ordinal, and each event the main loop
 // judges pulls drain_passed up likewise, which keeps every count_after() on them within half the
-// range, as acknowledged_through() keeps acked_ordinal near the live ordinal. Only a frame still
-// buffered more than 16,384 stream/starts after it arrived turns stale by it. A frame callback
-// that blocks through more than half the range of further events can still leave an end held
-// until the counter comes round again; frames keep flowing meanwhile.
+// range, as acknowledged_through() and a superseded start (drain_events()) keep acked_ordinal near
+// the live ordinal. Only a frame still buffered more than 16,384 stream/starts after it arrived
+// turns stale by it. A frame callback that blocks through more than half the range of further
+// events, with the main loop also behind, can leave an end held until the counter comes round
+// again, or let an end fire while the callback still runs; frames keep flowing meanwhile.
 static constexpr uint16_t ORDINAL_TRAIL = 0x4000;
 
 // ============================================================================
@@ -542,17 +543,25 @@ void VisualizerRole::Impl::drain_events() {
         bool fired = true;
         switch (type) {
             case VisualizerEventType::STREAM_START: {
-                // A start a later stream/start superseded fires and acknowledges nothing: the
-                // later notice describes a newer configuration, and the later start's
-                // acknowledgement, after that notice, releases this start's frames, as frames
-                // received before an in-place start may follow its notice. A boundary between
-                // the two makes them stale instead.
+                // A start a later stream/start superseded fires nothing: the later notice
+                // describes a newer configuration, and the later start's acknowledgement, after
+                // that notice, releases this start's frames, as frames received before an
+                // in-place start may follow its notice. A boundary between the two makes them
+                // stale instead.
                 StartNotice notice{.ordinal = event.serial};
                 fired = this->take_start_notice(event.serial, notice);
                 if (fired) {
                     this->fire_stream_start(notice);
                 } else {
                     this->owed_start_ordinal = notice.ordinal;
+                    // See ORDINAL_TRAIL. Handling this start moved boundary_ordinal to its own
+                    // ordinal (a new stream) or pulled it up to the trail behind it (an update),
+                    // and the boundary only moves on, so every frame stamped before the trail is
+                    // stale: acknowledging through there delivers none, a clear's held frames
+                    // included, and keeps acked_ordinal within the trail of the live ordinal
+                    // through a run of starts each superseded before the main loop reaches it. A
+                    // lost event's acknowledgement further on makes it a no-op.
+                    this->acknowledge(static_cast<uint16_t>(event.serial - ORDINAL_TRAIL - 1));
                 }
                 this->start_owed = !fired;
                 break;
