@@ -15,9 +15,10 @@
 /// PlayerRoleConfig as the player reports and enforces it: the timing parameters the player puts
 /// in every client/state player object, and the supported-format list the spec constrains.
 ///
-/// The role's Impl is driven directly and no sync-task thread is ever started, so nothing here
-/// races a background consumer: the encoded ring and the inbox hold whatever a handler put there.
-/// The binary audio chunk header is parsed directly too.
+/// The role's Impl (PlayerRole's private impl_) is driven directly and no sync-task thread is
+/// ever started, so nothing here races a background consumer: the encoded ring and the inbox hold
+/// whatever a handler put there, and an item is taken as the sync thread would (SyncTask's
+/// take_item()). The binary audio chunk header is parsed directly too.
 
 #include "connection.h"
 #include "connection_manager.h"
@@ -25,7 +26,7 @@
 #include "inbound_test_helpers.h"
 #include "inbox.h"
 #include "platform/time.h"
-#include "player_role_impl.h"  // build_state_fields(); private access, see tests/CMakeLists.txt
+#include "player_role_impl.h"  // build_state_fields()
 #include "protocol_messages.h"
 #include "protocol_task.h"
 #include "sync_task.h"
@@ -63,6 +64,7 @@ SendspinClientConfig make_client_config(const char* name) {
     return config;
 }
 
+// The player object of the client/state the role would send, which only the protocol task builds.
 ClientPlayerStateObject build_player_state(PlayerRole& player) {
     ClientStateMessage msg;
     player.impl_->build_state_fields(msg);
@@ -388,7 +390,10 @@ public:
 // roles/player/v1.md "Audio Chunks (Binary)": the player discards incoming audio while the
 // adopted client/state snapshot reports the client unavailable; a set_available() takes effect
 // only once its snapshot is adopted. A discarded chunk's ring item stays with the dispatcher,
-// for process_inbound() to return.
+// for process_inbound() to return. The client is never started, so the test publishes and
+// adopts each snapshot and dispatches the chunk itself, reaching SendspinClient's
+// protocol_task_, build_client_state(), adopt_client_state(), connection_manager_ (its
+// install_admitted()) and process_binary_message().
 TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
     struct Row {
         const char* name;
@@ -587,7 +592,8 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
 }
 
 // messaging.md "stream/clear": the sync task discards the audio buffered before the clear and
-// keeps what the server sent after it. The marker the protocol task appends is the boundary.
+// keeps what the server sent after it. The marker the protocol task appends is the boundary for
+// SyncTask's discard_to_clear_marker().
 TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
     struct Row {
         const char* name;
@@ -669,8 +675,8 @@ TEST(PlayerInboundHandOff, AStreamBoundaryFreesTheQuotaForTheRefillBehindIt) {
 // the old stream's audio never plays: cleanup() recalls what the sync task has not taken,
 // returning it and its quota charge to the ring, and an item the sync task takes between the
 // generation bump and the recall is dropped by its generation stamp and returned the same way.
-// That window has no observable trigger, so its row moves the generation on directly, leaving
-// the items listed.
+// That window has no observable trigger, so its row moves the generation on directly
+// (cleanup_generation), leaving the items listed.
 TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
     enum class Teardown { NONE, CLEANUP, GENERATION_ONLY };
     struct Row {
@@ -710,9 +716,9 @@ TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
 
 // A server command the drain takes is applied only if it was admitted under the role's current
 // generation: one stamped before a teardown (taken by a drain on the far side of it) is dropped,
-// not applied after the stream it belonged to was torn down. The slot is written with the old
-// stamp directly, the payload a drain that took it before the teardown would hold; no observable
-// call stages that interleaving on demand.
+// not applied after the stream it belonged to was torn down. The slot (event_state's
+// command_slot) is written with the old stamp directly, the payload a drain that took it before
+// the teardown would hold; no observable call stages that interleaving on demand.
 TEST(PlayerTeardownGeneration, ACommandStampedBeforeATeardownIsNotApplied) {
     struct Row {
         const char* name;
@@ -1063,7 +1069,8 @@ TEST(PlayerRoleOutputDelay, PersistedValueIsLoadedOnlyWithinTheSpecRange) {
 // ============================================================================
 
 // The estimate an underrun leaves behind (the end of the last audio played) is moved up to the
-// current time once it trails it by more than the hard-sync threshold.
+// current time once it trails it by more than the hard-sync threshold
+// (SyncTask::starved_playtime_floor()).
 TEST(PlayerHardSync, AStarvedEstimateIsFlooredAtNow) {
     constexpr int64_t NOW = 1'000'000'000;
     struct Row {
@@ -1084,8 +1091,9 @@ TEST(PlayerHardSync, AStarvedEstimateIsFlooredAtNow) {
     }
 }
 
-// A chunk is skipped undecoded only when it is later than its own length, predicted from the
-// previous chunk or MAX_AUDIO_CHUNK_MS until one has decoded; a less late chunk is decoded.
+// A chunk is skipped undecoded (SyncTask::chunk_is_unplayably_late()) only when it is later than
+// its own length, predicted from the previous chunk or MAX_AUDIO_CHUNK_MS until one has decoded;
+// a less late chunk is decoded.
 TEST(PlayerHardSync, OnlyAChunkLaterThanItsOwnLengthIsSkipped) {
     constexpr int64_t PLAYTIME = 1'000'000'000;
     constexpr int64_t TYPICAL_CHUNK_US = 25'000;
@@ -1146,7 +1154,8 @@ struct RecordingSink : PlayerRoleListener {
 
 // roles/player/v1.md "Large errors and startup": after a long underrun the estimate still ends
 // where the last audio did. Measured from there, a chunk due shortly would get the whole underrun
-// as silence ahead of it; measured from now it gets at most its own lead.
+// as silence ahead of it; measured from now it gets at most its own lead. The test thread runs
+// the hard-sync steps (SyncTask's handle_synchronize_audio() and handle_transfer_audio()).
 TEST(PlayerHardSync, AfterAnUnderrunTheGapIsMeasuredFromNow) {
     constexpr uint8_t CHUNK_SAMPLE = 0x7F;
     constexpr uint32_t LEAD_FRAMES = 44100;  // 1 s at 44.1 kHz
@@ -1222,6 +1231,10 @@ PlayerStreamParams pcm_stream(uint32_t sample_rate, uint8_t channels, uint8_t bi
     params.bit_depth = bit_depth;
     return params;
 }
+
+// The helpers below play the sync thread's steps on the test thread (SyncTask's reset_context(),
+// decode_chunk(), transfer_audio() and send_pending_silence()), since only the thread otherwise
+// writes a stream's audio and silence across a format change.
 
 // A SyncContext as IDLE leaves it for a new stream, past its initial-sync priming, so a silence
 // write does not wait for the sink to settle.

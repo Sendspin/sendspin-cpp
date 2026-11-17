@@ -409,10 +409,15 @@ struct CodeEmissionResult {
 // This file reaches ConnectionManager's and SendspinClient's private state
 // directly: tests/CMakeLists.txt compiles this one translation unit with
 // -fno-access-control so the production headers need no test friend
-// declarations. Route every such access through a fixture helper below (each
-// documents why the seam exists) rather than touching privates inline in
-// tests, so the private surface this harness depends on stays auditable in
-// one place.
+// declarations. Every test plays the protocol task on the test thread
+// (SendspinClient::protocol_task_ stopped, its protocol_tick() run by pump()).
+// A test that hands a server pairing message to the client reaches
+// SendspinClient::connection_manager_ inline, to call the public
+// on_pairing_message() or on_pair_abort() as process_json_message() does on
+// the protocol task. Access
+// shared by several tests goes through a fixture helper below, which names the
+// member it reaches and why; a test reaching anything else names it in its own
+// comment.
 // ============================================================================
 
 class PairingStateMachineTest : public ::testing::Test {
@@ -487,7 +492,9 @@ protected:
     }
 
     /// Pumps until `conn`'s time burst has a client/time frame in flight. Unbounded: a burst that
-    /// stopped sending hangs here and the suite watchdog names the test.
+    /// stopped sending hangs here and the suite watchdog names the test. Reads
+    /// SendspinConnection::time_frame_tag_ (protected), where the frame in flight shows, since
+    /// the send itself fails without a Noise session.
     void pump_until_time_frame(FakeConnection* conn) {
         while (conn->time_frame_tag_ == 0) {
             this->pump();
@@ -497,7 +504,10 @@ protected:
 
     /// Admits `conn` the way the promotion does, owning the roles its activation made active. A
     /// connection already in the admitted slot is displaced without a teardown; the fixture keeps
-    /// its own reference to every connection it injected.
+    /// its own reference to every connection it injected. Reached, since the harness has no
+    /// nursery handshake to promote through: ConnectionManager::admitted_ and
+    /// install_admitted(), the promotion's own steps, and SendspinConnection's protected
+    /// last_receive_time_us_.
     void admit(const std::shared_ptr<FakeConnection>& conn) {
         for (auto& entry : this->client_->connection_manager_->admitted_) {
             if (entry.conn != nullptr) {
@@ -557,15 +567,15 @@ protected:
     }
 
     /// Drive handle_enter_pairing() for the injected current connection via the same call
-    /// ConnectionManager::on_server_activate() makes for a first pairing activate. Called
-    /// directly (through the private-access seam) rather than replaying the full
+    /// ConnectionManager::on_server_activate() makes for a first pairing activate. Reaches the
+    /// private handle_enter_pairing() directly rather than replaying the full
     /// activate-arbitration path, since arbitration itself is exercised by test_admission.cpp and
     /// is not the subject of this harness.
     ///
     /// Production bumps pairing_index at the point a pairing server/activate is RECEIVED
     /// (ConnectionManager::on_server_activate(), before the admissibility gate), not
     /// inside handle_enter_pairing() itself: pairing_index must reflect every received activate,
-    /// not only ones that reach this seam. This seam skips that loop entirely, so it must bump
+    /// not only ones that reach this helper. This helper skips that loop entirely, so it must bump
     /// here to stand in for "a pairing server/activate was just received for this connection",
     /// matching what every real caller of handle_enter_pairing() already observes.
     void enter_pairing(SendspinConnection* conn) {
@@ -597,15 +607,16 @@ protected:
         this->client_->flush_pending_persistence();
     }
 
-    /// Returns the primary admitted connection (nullptr once dropped), through the
-    /// private-access seam. Unlike injected_conn_, this reflects whether the connection is still
+    /// Returns the primary admitted connection (nullptr once dropped), reaching the manager
+    /// directly. Unlike injected_conn_, this reflects whether the connection is still
     /// actually managed, not just whether the fixture's own reference is still alive.
     SendspinConnection* current_connection() {
         AdmittedEntry* primary = this->client_->connection_manager_->primary();
         return primary != nullptr ? primary->conn.get() : nullptr;
     }
 
-    /// Drive ConnectionManager's real teardown path for `conn`, through the private-access seam.
+    /// Drive ConnectionManager's real teardown path for `conn` (drop_connection(), private): the
+    /// single teardown every drop goes through, which no public call reaches for one connection.
     void drop_connection(SendspinConnection* conn, SendspinGoodbyeReason goodbye) {
         this->client_->connection_manager_->drop_connection(conn, goodbye);
     }
@@ -638,7 +649,8 @@ protected:
         conn->first_activate_received_ = !awaiting;
     }
 
-    /// Read the standing pairing-window deadline (0 = closed) through the private-access seam.
+    /// Read the standing pairing-window deadline (0 = closed),
+    /// ConnectionManager::pairing_window_open_until_us_, which no public call reports.
     int64_t window_deadline() {
         return this->client_->connection_manager_->pairing_window_open_until_us_;
     }
@@ -651,8 +663,8 @@ protected:
     /// Deliver the server's server/pair-finalize ack for `conn`, the way
     /// SendspinClient::process_json_message()'s SERVER_PAIR_FINALIZE handler does on the protocol
     /// task: commit the pending record and queue the pairing-succeeded note. Routed through
-    /// the private-access seam rather than a fake transport, since this harness never installs a
-    /// real Noise session to decrypt a frame through.
+    /// record_store_ rather than a fake transport, since this harness never installs a real
+    /// Noise session to decrypt a frame through.
     void deliver_pair_finalize_ack(FakeConnection* conn) {
         auto record = conn->take_pending_pairing_record();
         ASSERT_TRUE(record.has_value()) << "no record was staged for the ack to commit";
@@ -665,21 +677,24 @@ protected:
     }
 
     /// Read the connection the open window is bound to (nullptr until it admits its first
-    /// attempt), through the private-access seam.
+    /// attempt), ConnectionManager::pairing_window_conn_, which no public call reports.
     const SendspinConnection* window_connection() {
         return this->client_->connection_manager_->pairing_window_conn_;
     }
 
-    /// Read the window's failed-attempt count, through the private-access seam.
+    /// Read the window's failed-attempt count
+    /// (ConnectionManager::pairing_window_failed_attempts_), which no public call reports.
     uint32_t window_failed_attempts() {
         return this->client_->connection_manager_->pairing_window_failed_attempts_;
     }
 
+    /// The client's RecordStore (SendspinClient::record_store_, private), whose records no
+    /// public call lists.
     RecordStore& record_store() { return *this->client_->record_store_; }
 
     /// Return the `locations` array on the client/hello descriptor for `method`, or nullopt when
     /// the descriptor omits the hint. Fails the calling test if the method is not advertised at
-    /// all. build_client_hello() is private; this is the -fno-access-control seam for it.
+    /// all. Reaches the private build_client_hello() directly.
     std::optional<std::vector<std::string>> hello_locations(const char* method) {
         JsonDocument doc;
         JsonObject root;
@@ -812,7 +827,7 @@ protected:
     }
 
     /// Read ConnectionManager::pairing_rounds_since_verified_kc_, the count the dynamic-code
-    /// round limit is measured against (pairing.md "Rounds"), through the private-access seam.
+    /// round limit is measured against (pairing.md "Rounds"), which no public call reports.
     uint32_t rounds_since_verified_kc() {
         return this->client_->connection_manager_->pairing_rounds_since_verified_kc_;
     }
@@ -1272,6 +1287,7 @@ TEST_F(PairingStateMachineTest, StandingRoundLimitHoldsTheNextAttemptForAGesture
 // retry window between a local abort and the server's next server/activate.
 // ============================================================================
 
+// Reads and clears time_frame_tag_ so each wait sees a fresh send rather than the last one.
 TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-suppress");
 
@@ -1561,7 +1577,8 @@ TEST_F(PairingStateMachineTest, RetryRoundServerPairInitCarryingNonceClosesSilen
 // ConnectionManager::handle_pairing_message: no pair/abort and no client/goodbye, yet the
 // transport of the inbound connection is still closed, unless it is already gone. The control is
 // a drop that does send a goodbye (a received pair/abort concurrent_attempt), which closes through
-// disconnect() instead.
+// disconnect() instead. The gone transport is FakeConnection::connected_ (private to the fake)
+// set false, the state is_connected() reports.
 TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSilently) {
     struct Row {
         const char* name;
@@ -2105,7 +2122,8 @@ TEST_F(PairingStateMachineTest, SubsequentActivateEntersPairingForEitherCodeMeth
 // The client checks the emission format on receipt of the ACTIVATION (server/pair-init carries
 // only nonce_A): a format the client does not offer, or none at all on a dynamic_pairing_code
 // activation, is answered with pair/abort(method_not_supported), leaving the connection open
-// (messaging.md "server/activate").
+// (messaging.md "server/activate"). Edits SendspinClient::config_ (private) in place to offer
+// digits alone, a shape the fixture's builds (both formats or none) do not produce.
 TEST_F(PairingStateMachineTest, UnofferedFormatOnActivationIsRejected) {
     // A device that offers only `digits`, so `qr_code` is a format it does not currently offer.
     this->init_client(/*pairing_code_emission_supported=*/false);
@@ -2450,7 +2468,10 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
 // window prompt its attempt left showing, exactly once, and fires no on_pairing_failed. An open
 // pairing window stays open and bound (pairing.md "Pairing Window"). The control row cancels before
 // anything was shown. A pairing activate after an in-band re-handshake, which clears only the
-// in-progress flag, still dismisses the earlier attempt's prompt before the new one starts.
+// in-progress flag, still dismisses the earlier attempt's prompt before the new one starts. That
+// row sets SendspinConnection's client_hello_sent_ and server_hello_received_ (protected)
+// directly, to recreate the state handle_noise_rehandshake() leaves behind without the Noise
+// transport this harness lacks.
 TEST_F(PairingStateMachineTest, CancellingActivateDismissesThePromptItLeftShowing) {
     struct Row {
         const char* name;

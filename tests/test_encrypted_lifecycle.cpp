@@ -77,6 +77,17 @@
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
+// Private access. A test that plays the protocol task stops SendspinClient::protocol_task_ and
+// runs its steps on the test thread: protocol_tick(), process_json_message(), and the handlers
+// ConnectionManager::note_playback_activity() and handle_server_unpair() through
+// connection_manager_. A stand-in connection, with no handshake to promote it, is admitted
+// through install_admitted(), or pushed onto nursery_ for a real tick to promote, with a fresh
+// SendspinConnection::last_receive_time_us_ (protected), the liveness stamp a transport's receive
+// sets. Whether a record still resolves for this boot is asked through record_store_, and a
+// record write is owed and run apart from the RAM change through request_persist() and
+// flush_pending_persistence(). Metadata tests reach MetadataRole::impl_ to run the protocol
+// task's half of a teardown (cleanup()) on the test thread, or to read the role's slot.
+
 namespace {
 
 constexpr uint16_t RESUME_TEST_PORT = 18991;
@@ -1789,7 +1800,8 @@ TEST(EncryptedLifecycle, PairingActivateAfterARehandshakeThatAddsARoleSendsItsCl
 }
 
 /// Frees the manager's admitted slot, the way a drop does, without the teardown. Protocol-task
-/// work: the caller plays the task, or the client is not started.
+/// work: the caller plays the task, or the client is not started. Reaches
+/// ConnectionManager::admitted_, which otherwise only a drop's teardown frees.
 void release_admitted(ConnectionManager& manager) {
     for (auto& entry : manager.admitted_) {
         if (entry.conn != nullptr) {
@@ -2081,7 +2093,8 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
 // the lifecycle ring (docs/conventions.md "Threading and cross-thread state").
 //
 // Control: the same handler takes the reply to a frame in flight, seeded the way
-// send_time_message() records one, since the stand-in has no transport to send it over.
+// send_time_message() records one (SendspinConnection's time_frame_tag_ and time_frame_sent_us_,
+// protected), since the stand-in has no transport to send it over.
 TEST(EncryptedLifecycle, ServerTimeIsTakenOnlyAsTheReplyToTheFrameInFlight) {
     SendspinClientConfig config;
     config.name = "Unsolicited Time Test Client";
@@ -2316,8 +2329,7 @@ TEST(EncryptedLifecycle, MetadataKeepsTheConfiguredFieldsCutToTheirCaps) {
 
 // MetadataRole::get_track_duration_ms() reads the applied state's progress, whether or not a
 // listener is set: a state's track_duration while it is applied, 0 once a state without progress
-// replaces it, and 0 once the role's teardown (its cleanup(), the test thread playing the protocol
-// task) has been caught up on the main loop.
+// replaces it, and 0 once the role's teardown has been caught up on the main loop.
 TEST(EncryptedLifecycle, TrackDurationReadsTheAppliedStateWithOrWithoutAListener) {
     const std::string with_progress =
         R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Song",)"
@@ -2356,7 +2368,8 @@ TEST(EncryptedLifecycle, TrackDurationReadsTheAppliedStateWithOrWithoutAListener
 // immediately. Both land before the main loop runs, and the state describing what is playing now
 // must still be applied rather than skipped in favor of the one timed to the next track, which the
 // role holds until its moment. That the pending state is the scheduled one is read from the role's
-// slot: no observable shows it before its deadline, which is kept out of the test's reach.
+// slot (ScheduledStateSlot::slot_ read under the Inbox mutex, and text_of()): no observable
+// shows it before its deadline, which is kept out of the test's reach.
 TEST(EncryptedLifecycle, ImmediateMetadataSurvivesAScheduledStateInTheSameTick) {
     RecordingMetadataListener listener;
 
@@ -2849,8 +2862,8 @@ public:
 
 // Each state reaches on_track_metadata() and then the deprecated on_metadata(), so a listener
 // overriding either gets it and one overriding both gets both, the new form first. A teardown
-// the protocol task runs during on_track_metadata() (the test thread playing it, through the
-// role's cleanup()) does not stop the deprecated form: its clear comes on the next drain.
+// the protocol task runs during on_track_metadata() (the test thread playing it) does not stop
+// the deprecated form: its clear comes on the next drain.
 TEST(EncryptedLifecycle, EachMetadataListenerFormGetsTheStateNewFormFirst) {
     NewMetadataForm new_form;
     OldMetadataForm old_form;
@@ -3108,11 +3121,12 @@ public:
 // those are owed the initial state as well.
 //
 // Driven through the protocol task's own tick from the nursery, so the order under test is the
-// one a real promotion runs. The stand-in sends inline, which makes "was it admitted when the state
-// left" a plain read instead of a race against a socket. Every row runs with unpaired access, the
-// setting that makes its activation admissible on a Sentinel or Pairing PSK session. The pairing
-// row matches the Pairing PSK and selects pairing_psk, whose entry sends client/pair-init and
-// client/pair-finalize at once; those are not client/state, so the count below ignores them.
+// one a real promotion runs. The stand-in sends inline, which makes "was it admitted when the
+// state left" a plain read instead of a race against a socket. Every row runs with unpaired
+// access, the setting that makes its activation admissible on a Sentinel or Pairing PSK session.
+// The pairing row matches the Pairing PSK and selects pairing_psk, whose entry sends
+// client/pair-init and client/pair-finalize at once; those are not client/state, so the count
+// below ignores them.
 TEST(EncryptedLifecycle, TheFirstClientStateLeavesOnlyOnceTheConnectionIsAdmitted) {
     struct Row {
         const char* label;
@@ -3181,12 +3195,12 @@ public:
 
 // The protocol tick's liveness scan reads the admitted connection's last-arrival stamp: a
 // connection whose last arrival is older than the timeout is dropped with a restart goodbye
-// (messaging.md "client/goodbye"), and one heard from just now stays current. The stamp is set
-// directly rather than aged by waiting, and the timeout is the manager's own, default-derived and
-// tens of seconds, so no scheduling stall can age the control row past it. The stand-in is
-// promoted from the nursery by a real tick, so it holds the slot the way an established
-// connection does; as a Sentinel-category playback connection it is admissible only with unpaired
-// access on.
+// (messaging.md "client/goodbye"), and one heard from just now stays current. The stamp
+// (last_receive_time_us_) is set directly rather than aged by waiting, and the timeout is the
+// manager's own (liveness_timeout_us_), default-derived and tens of seconds, so no scheduling
+// stall can age the control row past it. The stand-in is promoted from the nursery by a real
+// tick, so it holds the slot the way an established connection does; as a Sentinel-category
+// playback connection it is admissible only with unpaired access on.
 TEST(EncryptedLifecycle, LivenessTickDropsOnlyAStaleCurrentConnection) {
     struct Row {
         const char* label;
@@ -3562,7 +3576,7 @@ TEST(EncryptedLifecycle, StopFlushesARecordChangeMadeAfterTheLastTick) {
 
 // The last-played server_id lives under its own key, so a flush that owes only that write must
 // leave every record key alone: rewriting a record slot for a handoff would be an NVS erase cycle
-// nothing asked for.
+// nothing asked for. SendspinClient::note_last_played_server() owes that one write.
 TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordKey) {
     Identity paired_identity = Identity::generate().value();
     SendspinPairingRecord paired_record = make_record_for(paired_identity);
@@ -3787,7 +3801,8 @@ TEST(EncryptedLifecycle, PersistedRecencyFollowsPlaybackActivates) {
 
 // A store that cannot take the writes does not undo the RAM decisions the locked handlers already
 // made: the revoked credential stays revoked for this boot (leaving it usable because flash is
-// full is strictly worse).
+// full is strictly worse). The recency order is read from RecordStore::records_, which no public
+// call lists.
 TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     Identity played_identity = Identity::generate().value();
     Identity other_identity = Identity::generate().value();

@@ -66,6 +66,9 @@ For every behavioral or API change in the diff, check each of these:
 - **Behavior derived from current code**: descriptions must state what the
   code does now. Flag text that describes a removed workaround, preserves a
   superseded rationale, or narrates history ("previously", "now uses").
+- **One home per fact**: a fact the diff states in a comment or doc is
+  stated once, at the code that owns it. A copy elsewhere is a finding
+  unless it is a pointer the site would mislead without.
 - **Workarounds are not laundered**: if the diff adds a workaround, the docs
   must not present it as designed behavior.
 - **New behavior is documented**: a new public API, config field, listener

@@ -120,7 +120,8 @@ TEST(Decoder, FlacChunkWithSeveralFramesDecodesEveryFrame) {
 }
 
 // The sync task keeps one decoder for its run and resets it between streams, so a FLAC stream that
-// follows another decodes from its own header on the same FLAC decoder.
+// follows another decodes from its own header on the same FLAC decoder (the protected
+// flac_decoder(), since a decoder object kept across streams shows nowhere else).
 TEST(Decoder, FlacStreamAfterAResetDecodesOnTheSameDecoder) {
     SendspinDecoder decoder;
     start_flac(decoder);
@@ -284,7 +285,8 @@ std::vector<uint32_t> chunk_item(const std::vector<uint8_t>& chunk) {
 
 // The sync task decodes a chunk all or nothing: every frame, growing the buffer as the decoder
 // asks, or, when any part fails or the whole decodes past roles/player/v1.md "Server Audio Send
-// Constraints" (150 ms), none of it.
+// Constraints" (150 ms), none of it. Reached: SyncTask::decode_whole_chunk(), since nothing public
+// runs that loop without the sync thread.
 TEST(SyncTaskDecodeWholeChunk, DecodesEveryFrameOrLeavesTheBufferEmpty) {
     const std::vector<uint8_t> stereo_48k_header(
         reinterpret_cast<const uint8_t*>(&STEREO_48K_HEADER),

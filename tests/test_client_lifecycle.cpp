@@ -20,8 +20,8 @@
 /// FakeEncryptedServer plays the Sendspin server over the real Noise transport and the test
 /// thread pumps client.loop().
 
-#include "artwork_role_impl.h"  // The display slot and its epochs; private, see CMakeLists
-#include "color_role_impl.h"       // The applied palette and its slot; private, see CMakeLists
+#include "artwork_role_impl.h"  // The display slot and its epochs
+#include "color_role_impl.h"       // The applied palette and its slot
 #include "connection.h"  // StubConnection stands in for a real connection
 #include "connection_manager.h"
 #include "controller_role_impl.h"  // The applied controller state and its slot
@@ -33,7 +33,7 @@
 #include "lifecycle_test_fixtures.h"
 #include "metadata_role_impl.h"  // The applied metadata state and its slot
 #include "platform/time.h"
-#include "player_role_impl.h"  // Stream start and the sync task; private access, see tests/CMakeLists.txt
+#include "player_role_impl.h"  // Stream start and the sync task
 #include "protocol_messages.h"  // SENDSPIN_BINARY_VISUALIZER_LOUDNESS
 #include "protocol_task.h"
 #include "server_connection.h"  // A delivered connection, handed over without a socket
@@ -49,7 +49,7 @@
 #include "test_util.h"
 #include "time_burst.h"  // ms_until_due(), staged directly
 #include "time_filter.h"
-#include "visualizer_role_impl.h"  // Ring state after stop(); private access, see tests/CMakeLists.txt
+#include "visualizer_role_impl.h"  // Ring state after stop()
 
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
@@ -78,6 +78,14 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+// Private access. Many tests play the protocol task on the test thread (protocol_task_ stopped,
+// protocol_tick()) so nothing ticks between the steps they inspect, and stage or read connections
+// in connection_manager_ (install_admitted(), liveness_timeout_us_ off so a stand-in's silence
+// does not close it; nursery_, reaping_, close_admission(), drop_connection()), which no public
+// call stages or reports. Tests with no server install the primary clock directly (published_
+// under published_mutex_). Roles are driven and read through impl_ (player_'s sync_task;
+// visualizer_'s drain_task->inbound and its quota) for what no callback marks.
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
@@ -447,8 +455,8 @@ TEST(ClientLifecycle, CallbackDuringStopSeesTheStoppedClient) {
         EXPECT_FALSE(listener.started_during_clear);
         EXPECT_FALSE(listener.group_had_state_during_clear);
         EXPECT_FALSE(client.is_started());
-        // Read from the request slot: the next start() drops whatever waits there, so nothing a
-        // peer sees tells an ignored request from one posted and dropped.
+        // Read from the request slot (take_requests()): the next start() drops whatever waits
+        // there, so nothing a peer sees tells an ignored request from one posted and dropped.
         LifecycleRequests requests;
         EXPECT_FALSE(client.protocol_task_->take_requests(requests))
             << "connect_to() or disconnect() inside stop() posted a request";
@@ -527,7 +535,7 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
 // messaging.md "client/hello" allows rolls them back as a failed role start does: the player's
 // sync task is stopped and the inbound ring released, and a second start() is refused the same
 // way rather than finding them still running. Whether the sync task was stopped (its consumer
-// unbound) and the ring released is read directly: nothing public reports either.
+// unbound) and the ring released (inbound_ring_) is read directly: nothing public reports either.
 TEST(ClientLifecycle, OversizedHelloRollsBackStartedRoles) {
     CountingPlayerListener listener;
     SendspinClientConfig config = make_config(HELLO_CAP_ROLLBACK_TEST_PORT);
@@ -565,8 +573,8 @@ void send_loudness_until(SendspinClient& client, FakeEncryptedServer& server, in
     });
 }
 
-/// Whether at least two items are linked on `list`, read under its lock: the drain thread holds
-/// the first frame it took, so these are frames waiting behind it.
+/// Whether at least two items are linked on `list` (head_, tail_), read under its mutex_: the
+/// drain thread holds the first frame it took, so these are frames waiting behind it.
 bool two_or_more_linked(const InboundItemList& list) {
     std::lock_guard<std::mutex> lock(list.mutex_);
     return list.head_ != INBOUND_LIST_END && list.head_ != list.tail_;
@@ -1385,10 +1393,9 @@ TEST_F(VisualizerOrdering, StopEndsAWaitForANotice) {
 // releases it, with frame 2, received before the boundary too, behind it; frame 2 is never
 // delivered. The teardowns (the role taken out of the active roles, the connection lost) owe the
 // end the same way. After a clear, frame 3 flows behind it. Whether the end has fired is read
-// once the main loop holds it (VisualizerRole::Impl::awaiting_drain, reached through the role's
-// impl_), since no callback marks the hold; a main loop that does not hold it fires it on that
-// same pump. Each row connects a client of its own, a teardown row's stream being gone, so the
-// test takes about 400 ms a row.
+// once the main loop holds it (VisualizerRole::Impl::awaiting_drain), since no callback marks the
+// hold; a main loop that does not hold it fires it on that same pump. Each row connects a client
+// of its own, a teardown row's stream being gone, so the test takes about 400 ms a row.
 TEST_F(VisualizerOrdering, NoFrameCallbackFollowsItsStreamsEndOrClear) {
     enum class Boundary : uint8_t { END, CLEAR, DEACTIVATION, CONNECTION_LOSS };
     struct Row {
@@ -1459,14 +1466,12 @@ TEST_F(VisualizerOrdering, NoFrameCallbackFollowsItsStreamsEndOrClear) {
 // the start and frame 4. The take resumes with frame 4. A drain thread reporting only before its
 // take would leave the end held, and frame 4 would wait out its lag bound and be dropped; frame
 // 5, handed after the start's notice and displayed after frame 4, follows it on the same thread,
-// so it marks frame 4's fate settled. No server runs: the primary clock is installed directly
-// (ConnectionManager::published_ under published_mutex_), and frame 4 is displayed 250 ms ahead,
-// so a slow main loop has that long to fire the notice. Reached, since no public call stages this
-// interleaving: SendspinClient's protocol_task_ (stopped) and connection_manager_; the visualizer
-// Impl's cleanup(), handle_stream_start(), handle_stream_end(), handle_binary(),
-// cleanup_generation and lifecycle_ordinal (the stamps of the frame handed through its drain
-// list's hand_message()) and its drain_task->inbound (InboundConsumer::items()); and the host
-// InboundRing::ring_'s mtx_.
+// so it marks frame 4's fate settled. No server runs: the primary clock is installed directly,
+// and frame 4 is displayed 250 ms ahead, so a slow main loop has that long to fire the notice.
+// Reached, since no public call stages this interleaving: the visualizer Impl's cleanup(),
+// handle_stream_start(), handle_stream_end(), handle_binary(), cleanup_generation and
+// lifecycle_ordinal (the stamps of the frame handed through its drain list's hand_message()) and
+// its list's InboundConsumer::items(); and the host InboundRing::ring_'s mtx_.
 TEST(VisualizerDrainThread, AFrameTakenPastABoundaryItHasNotReportedIsDelivered) {
     constexpr int64_t FRAME_LEAD_US = 250 * 1000;
     VisualizerOrderLog log;
@@ -1654,7 +1659,8 @@ private:
 // dropped; one the transport refuses as no longer connected is left for its close event or the
 // establish deadline. The stand-in has no Noise session, so the drop is the
 // hello scan's own; the close after the encrypt is covered for other sends by
-// NoiseTransport.ASendFailureAfterTheEncryptDropsTheConnectionInItsTick.
+// NoiseTransport.ASendFailureAfterTheEncryptDropsTheConnectionInItsTick. The stand-in's handshake
+// is marked finished (noise_handshake_complete_).
 TEST(ClientLifecycle, NurseryHelloIsSentOnceAndAFailedSendDropsTheConnection) {
     struct Row {
         const char* name;
@@ -1704,7 +1710,7 @@ TEST(ClientLifecycle, NurseryHelloIsSentOnceAndAFailedSendDropsTheConnection) {
 // Accepts queued at stop()
 // ============================================================================
 
-/// Commands waiting in the protocol task's queue.
+/// Commands waiting in the protocol task's queue (command_count_ under command_mutex_).
 size_t queued_commands(ProtocolTask& task) {
     std::lock_guard<std::mutex> lock(task.command_mutex_);
     return task.command_count_;
@@ -1721,7 +1727,8 @@ size_t queued_commands(ProtocolTask& task) {
 // goodbye.
 // The nursery-full rejection is covered by ConnectionLifecycle.FullNurseryOfLivePeersRejectsNewcomer.
 // Each row connects a real peer, and the Control row watches 200 ms for a goodbye that must not
-// come, so the table takes most of a second.
+// come, so the table takes most of a second. closing_ is read to see an accept refused at stop()
+// released at once, not held until finish_stop(), which the peer cannot tell apart.
 TEST(ClientLifecycle, StopRefusesAQueuedAcceptWithAShutdownGoodbye) {
     enum class Taker : uint8_t { FINAL_TICK, AFTER_CLOSE, OPEN_TICK };
     struct AcceptRow {
@@ -1810,7 +1817,8 @@ void fill_accept_slots(ProtocolTask& task) {
 // (SendspinWsServer::NewConnectionCallback), never inside it. A delivery is refused when every
 // accept slot is taken, and once admission is closed (ConnectionManager::close_admission() closes
 // the protocol task's accepts), when no tick would take an accept any more. The accepted row is
-// the control: the queued accept holds a reference for the protocol task.
+// the control: the queued accept holds a reference for the protocol task. The delivery is handed
+// to on_new_connection() directly.
 TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
     struct Row {
         const char* name;
@@ -1858,8 +1866,9 @@ TEST(ClientLifecycle, ARefusedDeliveryLeavesTheConnectionWithItsTransport) {
 // A lifecycle request left in its slot after a stop() (a call that raced it on another thread)
 // belongs to the run that ended: the next start() begins with no request waiting, so a stale
 // connect_to() opens nothing and a stale confirm opens no pairing window. Each is posted straight
-// to the stopped client's task, the state such a race leaves, since the public entry points refuse
-// while stopped. The Control rows post the same after start() and see it acted on.
+// to the stopped client's task (post_requests()), the state such a race leaves, since the public
+// entry points refuse while stopped. The Control rows post the same after start() and see it
+// acted on (pairing_window_open()).
 TEST(ClientLifecycle, AStaleCommandIsNotCarriedIntoTheNextRun) {
     struct Row {
         const char* name;
@@ -1933,7 +1942,8 @@ std::string loopback_url(uint16_t port) {
 // reap drops a parked connection on its transport's close, not only at its deadline. Control: an
 // attempt nothing releases stays in the nursery with nothing parked; it is the one the real
 // task's disconnect() then releases. Each row connects loopback sockets only, so the table runs
-// in tens of milliseconds.
+// in tens of milliseconds. The parked list is read right after each release (connect_to(),
+// disconnect(), scan_nursery()) to see whether it destroyed the connection.
 TEST(ClientLifecycle, AReleasedAttemptStillConnectingIsReapedOffTheProtocolTask) {
     enum class Release : uint8_t { DISCONNECT, REPLACED, ESTABLISH_REAP, NONE };
     struct Row {
@@ -2096,7 +2106,8 @@ TEST(ClientLifecycle, AnOpenedOutboundConnectionIsNotHeldForReaping) {
 // by marking the upgrade, what the transport's Open does; ESP never closes one that opens after
 // its release), or by the protocol task of a restarted client. Control: an attempt whose
 // transport closed before the stop is freed by finish_stop() itself (the protocol task is left
-// stopped for that row, so no tick reaps it first and no shutdown pass runs).
+// stopped for that row, so no tick reaps it first and no shutdown pass runs). Only the parked
+// entry shows stop() left the attempt unjoined.
 TEST(ClientLifecycle, StopDoesNotWaitForAnOutboundAttemptStillConnecting) {
     enum class Then : uint8_t { LOOP, OPENS, RESTART };
     struct Row {
@@ -2185,7 +2196,8 @@ TEST(ClientLifecycle, StopDoesNotWaitForAnOutboundAttemptStillConnecting) {
 // that drop joins the transport for what remains of its connect, which would hold up stop()'s
 // join of the protocol task. Stand-in connections, whose destructors join no transport, are parked
 // with the test thread playing the protocol task and the clock staged past the deadline. Control:
-// before the shutdown pass the deadline drops it.
+// before the shutdown pass the deadline drops it (park_for_reaping(), then reap_released() at the
+// staged clock).
 TEST(ClientLifecycle, TheReapDeadlineWaitsForTheNextRunOnceTheShutdownPassRan) {
     for (const bool shutdown : {true, false}) {
         SCOPED_TRACE(shutdown ? "after the shutdown pass" : "Control: before the shutdown pass");
@@ -2350,7 +2362,9 @@ std::string goodbye_event(SendspinGoodbyeReason reason) {
 // the queue; a row that drops the stand-in tears the controller down, so it is seeded again before
 // the drained queue is tried. The outbound attempts dial a listener that never answers, so an
 // attempt opened stays in the nursery. Control: a confirm with room in the queue, and a controller
-// command and a state change with no disconnect behind them.
+// command and a state change with no disconnect behind them. send_controller_command() takes the
+// controller's cleanup_generation and seeded supported_commands; pairing_window_open() shows
+// which gesture won.
 TEST(ClientLifecycle, TheCommandQueueRefusesSendsButNeverALifecycleRequest) {
     enum class Call : uint8_t {
         CONFIRM,
@@ -2617,7 +2631,8 @@ TEST(ClientLifecycle, AnAcceptBehindADisconnectFindsTheNurserySlotsItFreed) {
             client.disconnect(SendspinGoodbyeReason::USER_REQUEST);
         }
         auto newcomer = std::make_shared<RecordingConnection>();
-        // What the delivery sets before it queues the accept, for the client/init accept() sends.
+        // What the delivery sets (json_arena()) before it queues the accept, for the
+        // client/init accept() sends.
         newcomer->set_json_arena(manager.json_arena());
         ProtocolCommand command;
         command.type = ProtocolCommandType::ACCEPT_CONNECTION;
@@ -2647,7 +2662,10 @@ TEST(ClientLifecycle, AnAcceptBehindADisconnectFindsTheNurserySlotsItFreed) {
 // refreshes and reads false. is_paired() follows the same connection: true for this LONG_TERM
 // session, false once it is dropped, and still true while a re-handshake awaits its
 // server/activate, when is_connected() already reads false. The test thread plays the protocol
-// task. The stand-in has its hellos and its activation done; the liveness check is off.
+// task. The stand-in has its hellos and its activation done; the liveness check is off. Each step
+// (on_handshake_complete(), a drop, a re-handshake's first_activate_received_ and
+// refresh_published_state()) is called directly, so is_connected() is read between it and the
+// end of the tick, where no public call stops.
 TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
     enum class Then : uint8_t { NOTHING, DROP, REHANDSHAKE };
     struct Case {
@@ -2712,7 +2730,9 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
 
 // SendspinTimeBurst::ms_until_due() is the burst's part of the protocol task's wait: the end of
 // the interval between bursts, the timeout of the message in flight, or 0 when loop() has work
-// now. The burst's state is staged directly; loop() moves it through these states over real time.
+// now. The burst's state (burst_index_, last_burst_complete_time_, pending_embedded_,
+// current_message_sent_time_, pending_burst_completed_) is staged directly; loop() moves it
+// through these states over real time.
 TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
     struct Row {
         const char* name;
@@ -2850,7 +2870,8 @@ TEST(ClientLifecycle, TurningOffInboundConnectionsLeavesOnlyConnectTo) {
 // there is nothing to poll), whose timer is not armed; the running host server in the first has no
 // upgrade reap to report (the ESP server's reap deadline, SendspinWsServer::tick(), only builds
 // for ESP). The test thread plays the protocol task and stages each timer directly against a
-// fixed clock.
+// fixed clock (pairing_window_open_until_us_, ws_server_start_retry_time_us_, and the stand-in's
+// first_activate_received_ and last_receive_time_us_).
 TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
     constexpr int64_t NOW_US = 3LL << 32;
     constexpr int64_t LIVENESS_US = 30'000'000;
@@ -2958,7 +2979,8 @@ TEST(NextDeadline, TheTickReportsTheEarliestTimer) {
 // messages once its InboundGate::WRITABLE_WAIT_MS ran out. The Control row's second message fits
 // the ring: nothing waits and the tick has no deadline. The client runs with no roles, so its ring
 // is sized for JSON, and the stand-in has no Noise session, so the receive pass drops both
-// messages unread; what is under test is when the pending message is taken.
+// messages unread; what is under test is when the pending message is taken. The stand-in's
+// transport side (begin_inbound_message(), end_inbound_message()) writes into inbound_ring_.
 TEST(NextDeadline, AFallbackMessageHeldBehindARingItemRunsTheNextTickAtOnce) {
     struct Row {
         const char* name;
@@ -3172,6 +3194,10 @@ void write_artwork_display(SendspinClient& c, uint8_t value, uint32_t generation
                                          std::move(delta), generation);
 }
 
+// Each row reaches its role's impl_ (controller_, metadata_, color_, player_, visualizer_,
+// artwork_) to run a handler (handle_server_state()), write event_state's slots (artwork's
+// display_slot under slot_epochs) or queue the player's STREAM_START (enqueue_stream_event()) with
+// an old stamp, and read cleanup_generation and the applied state.
 const StateRoleAccess STATE_ROLES[] = {
     {"controller",
      [](SendspinClient& c, uint8_t v) {
@@ -3277,10 +3303,11 @@ const StateRoleAccess STATE_ROLES[] = {
 
 /// A started client with every role that holds main-loop state, all reporting to `log`, whose
 /// protocol task the test thread plays: role handlers and teardowns run on the test thread,
-/// between the loop() calls the test makes. The player's sync task runs no thread: its item list
-/// is bound to the ring the way SyncTask::start() binds it, so the player's STREAM_END never
-/// waits for a thread to go idle and one loop() delivers it. The visualizer's drain thread is
-/// joined, as stop() joins it, so its held STREAM_END waits for no thread either.
+/// between the loop() calls the test makes. The player's sync task runs no thread
+/// (SyncTask::stop()): its item list (inbound()) is bound to the ring the way SyncTask::start()
+/// binds it, so the player's STREAM_END never waits for a thread to go idle and one loop()
+/// delivers it. The visualizer's drain thread is joined (impl_->stop()), as stop() joins it, so
+/// its held STREAM_END waits for no thread either.
 struct StateRoleClient {
     explicit StateRoleClient(StateRoleLog& log) : client(make_config(0)) {
         this->client.set_network_provider(&this->network);
@@ -3326,10 +3353,10 @@ struct StateRoleClient {
 // teardown queued its CLEARED event (the slot written between the generation bump and the
 // drain), and a payload of the torn-down connection that a drain took on the far side of the
 // teardown, which must never be applied after the clear. Both are staged by calling the role's
-// drain step, and by writing the slot with the old stamp, through the private access the
-// CMakeLists entry describes: no public call interleaves the threads on demand, and the order of
-// the callbacks is the outcome. The last row fills the event ring so the teardown's CLEARED is
-// dropped: the clear still fires on the next loop(), from the catch-up that heads every drain.
+// drain step, and by writing the slot with the old stamp, through STATE_ROLES: no public call
+// interleaves the threads on demand, and the order of the callbacks is the outcome. The last row
+// fills the event ring (the controller's impl_->inbox) so the teardown's CLEARED is dropped: the
+// clear still fires on the next loop(), from the catch-up that heads every drain.
 TEST(TeardownReorder, AClearAlwaysPrecedesTheNextConnectionsState) {
     enum class Stage : uint8_t {
         CONTROL,
@@ -3435,7 +3462,9 @@ public:
 // parameters of its own left to apply, and the teardown's owed end follows), so B's
 // on_stream_start() reads B's sample rate. The test thread plays the protocol task
 // from inside on_volume_changed(), since no public call lands a teardown and a stream/start
-// inside one callback. Control: without the teardown A's START reads A's rate.
+// inside one callback: it calls handle_stream_start(), handle_server_command() and cleanup(),
+// and the listener reads current_stream_params. Control: without the teardown A's START reads
+// A's rate.
 TEST(TeardownReorder, AStreamStartTakesOnlyItsOwnStreamParams) {
     struct Row {
         const char* name;
@@ -3483,7 +3512,8 @@ TEST(TeardownReorder, AStreamStartTakesOnlyItsOwnStreamParams) {
 // state replaced by an arrival, a teardown with states pending, a state stamped before it, an
 // arrival between a drain's peek and its commit (from the clear its catch-up delivers), a pending
 // state that falls due in the callback of the state before it, and a restart. Reaches the role's
-// private state because which block each place names and which state waits show nowhere else
+// private state (slot_, current, text_of(), fill_place(), arrive(), cleanup_generation,
+// drain_events()) because which block each place names and which state waits show nowhere else
 // before a deadline the test never reaches; the primary clock is installed by hand, so a
 // scheduled state waits for its deadline without a server.
 TEST(MetadataSlot, ThreeBlocksCarryEveryStateToTheListenerInOrder) {
@@ -3696,8 +3726,10 @@ public:
 // operator's screen. A prompt still pending goes with its dismissal, since the operator never saw
 // it, and a dismissal the teardown's own path queues again beside a surviving one is delivered
 // once. A later prompt pending behind a shown prompt's dismissal takes only its own dismissals
-// with it. The notes are queued and the teardown run directly, as the protocol task's handlers do,
-// because no public call stages two drops inside one main-loop tick.
+// with it. The notes (note_display_pairing_code(), note_open_pairing_window(),
+// note_clear_pairing_code(), note_close_pairing_window()) are queued and the teardown
+// (cleanup_connection_state()) run directly, as the protocol task's handlers do, because no public
+// call stages two drops inside one main-loop tick.
 TEST(ClientLifecycle, AFullTeardownKeepsTheDismissalsOfShownPrompts) {
     enum class Pending : uint8_t { DISMISSALS, PROMPTS_AND_DISMISSALS, DISMISSALS_THEN_CYCLE };
     struct Row {
@@ -3820,7 +3852,8 @@ using BothPairingForms = WithDeprecatedPairingForms<ViewPairingForms>;
 // Each pairing callback with text, every abort reason and a code in each format, reaches a
 // listener in the forms it overrides: only the view form, only the deprecated std::string form,
 // or both, the view form first with the same content. The test thread plays the protocol task,
-// queueing the notes as its handlers do.
+// queueing the notes as its handlers do (note_pairing_started(), note_pairing_succeeded(),
+// note_pairing_failed(), note_display_pairing_code()).
 TEST(ClientLifecycle, PairingCallbacksReachBothForms) {
     const std::string server_id = "c2VuZHNwaW4tcGFpcmluZy1jYWxsYmFjay1mb3Jtcw0";
     const std::string token = "SP:14DQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -3894,8 +3927,9 @@ TEST(ClientLifecycle, PairingCallbacksReachBothForms) {
 
 // server_information() reports the latest server the protocol task handed the main loop since the
 // last loop(), "none" included: a primary that changes twice between two drains leaves only its
-// second value. The test thread plays the protocol task's refresh_published_state(), since no
-// public call changes the primary twice inside one main-loop tick.
+// second value. The test thread plays the protocol task's refresh_published_state()
+// (note_server_information()), since no public call changes the primary twice inside one
+// main-loop tick.
 TEST(ClientLifecycle, ServerInformationTakesTheLatestPrimary) {
     PublishedServer first;
     ASSERT_TRUE(first.server_id.assign("Zmlyc3Qtc2VydmVyLWluZm9ybWF0aW9uLXRlc3QtaWQ"));
@@ -3938,7 +3972,8 @@ TEST(ClientLifecycle, ServerInformationTakesTheLatestPrimary) {
 
 // The clear a teardown delivers reads the server the same tick left: a connection's loss publishes
 // "none" beside the role's teardown, and the drain takes the server before its catch-up fires the
-// clear. The test thread plays the protocol task's two halves of that tick.
+// clear. The test thread plays the protocol task's two halves of that tick
+// (note_server_information(), the metadata impl_->cleanup()).
 TEST(ClientLifecycle, AClearReadsTheServerItsTeardownLeft) {
     struct ClearLog : MetadataRoleListener {
         void on_metadata_clear() override {
@@ -4001,9 +4036,9 @@ public:
 };
 
 /// Whether the burst has written a client/time frame: send_time_message() seeds the frame's write
-/// time (never 0) before handing it to the transport. The stand-in has no Noise session, so the
-/// frame goes no further than that; the seed is the one trace a written frame leaves that another
-/// thread may read (an atomic, unlike the frame's tag).
+/// time (time_frame_sent_us_, never 0) before handing it to the transport. The stand-in has no
+/// Noise session, so the frame goes no further than that; the seed is the one trace a written
+/// frame leaves that another thread may read (an atomic, unlike the frame's tag).
 int time_frames_written(const SendspinConnection& conn) {
     return conn.time_frame_sent_us_.load() != 0 ? 1 : 0;
 }
@@ -4015,7 +4050,8 @@ int time_frames_written(const SendspinConnection& conn) {
 // task (run_time_sync(), on a stand-in connection in the admitted slot) and the main loop
 // (loop()), so a frame that must not be sent yet is proven unsent by the tick having returned
 // without writing it, not by a wait; the stand-in's frame write time is read for the reason given
-// at time_frames_written(). The Control row's burst is not due, so nothing is requested.
+// at time_frames_written(), and the hold from its admitted entry (find_admitted()). The Control
+// row's burst is not due, so nothing is requested.
 TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
     enum class Stage : uint8_t { NOT_DUE, WAITS_FOR_GRANT, RELEASE_NOT_GATED, STALLED_TICK };
     struct Row {
@@ -4208,13 +4244,14 @@ TEST(HighPerformanceGrant, TheGrantWakesTheBurstThatWaitsForIt) {
 // stream only on the main loop's acknowledgement of that stream's number, so stream events the
 // main loop drains together, however the sync task interleaved with them, still end each stream
 // before the next one starts: every held STREAM_END is released and the last stream plays under
-// its own on_stream_start(). The test thread plays the protocol task, so the stream events are
-// all queued before the main loop runs. The "start and its end" row stages the interleaving where
-// the acknowledgement finds no header left (the sync task took the header, met the end and went
-// back to waiting); the other rows leave the sync task free to interleave as it will, since the
-// outcome must not depend on it. Every wait has no timeout: a held end that is never released, or
-// a stream started under an earlier stream's acknowledgement (which holds the end behind it while
-// it plays), hangs here and the suite watchdog names this test.
+// its own on_stream_start(). The test thread plays the protocol task (handle_stream_clear() and
+// the rest), so the stream events are all queued before the main loop runs. The "start and its
+// end" row stages the interleaving where the acknowledgement finds no header left (the sync task
+// took the header, met the end and went back to waiting); the other rows leave the sync task free
+// to interleave as it will, since the outcome must not depend on it. Every wait has no timeout: a
+// held end that is never released, or a stream started under an earlier stream's acknowledgement
+// (which holds the end behind it while it plays), hangs here and the suite watchdog names this
+// test. Staging waits on event_flags_ and the inbox's sync-idle bit.
 TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
     enum class Stage : uint8_t {
         ONE_START,
@@ -4321,7 +4358,10 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
 // starts the next stream from IDLE instead of being decoded into the stream that ended. The test
 // thread plays the sync task: its IDLE take of the first header, the ordinal ACTIVE records for
 // it, its next ACTIVE load, then its next IDLE wait. Control: a stream/start with no end between
-// is the active stream's own format change, loaded to be decoded in place.
+// is the active stream's own format change, loaded to be decoded in place. No public call holds
+// the task between those steps, so the test calls SyncTask's wait_for_codec_header() and
+// load_next_chunk() and reads SyncContext's active_ordinal and next_header and the Impl's
+// stream_ordinal.
 TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) {
     struct Row {
         const char* name;
@@ -4619,8 +4659,9 @@ SendspinClientConfig make_stand_in_config(uint16_t port) {
 }
 
 /// Puts `conn` in the manager's admitted slot, owning every role, the way a promotion does, and
-/// returns what the slot held; a null `conn` only vacates it. Protocol-task work: the caller plays
-/// the task, or the client is not started.
+/// returns what the slot held; a null `conn` only vacates it. Writes admitted_ and runs
+/// refresh_published_state() directly. Protocol-task work: the caller plays the task, or the
+/// client is not started.
 std::shared_ptr<SendspinConnection> replace_admitted(ConnectionManager& manager,
                                                      std::shared_ptr<SendspinConnection> conn) {
     AdmittedEntry& entry = manager.admitted_[0];
@@ -4666,7 +4707,7 @@ std::shared_ptr<ObservedConnection> make_synced_connection(ConnectionObservation
 // converts with its offset, a vacated slot reads as unsynced, the slot never keeps a connection
 // alive, an unsynced newcomer installed over a synced one reads its own filter, and each of that
 // newcomer's measurements, its first and a later correction, reaches the slot at the protocol
-// task's next publish.
+// task's next publish, run on a client never started.
 TEST(ClientLifecycle, TheTimeFilterSlotFollowsTheAdmittedConnection) {
     ConnectionObservation dropped_obs;  // All outlive the client
     ConnectionObservation replaced_obs;
@@ -4770,7 +4811,8 @@ TEST(ClientLifecycle, ADroppedStreamConnectionIsGoodbyedOnceAndFreedOnTheProtoco
 // copied into the ring) that its holder already returned but the task never took in ring order
 // is counted on the ring's reset through its holder's list; with the roles reset first that list
 // is freed memory, and the process crashes or is reported by AddressSanitizer. The test thread
-// plays the protocol task, so nothing takes the item in ring order before the destructor.
+// plays the protocol task (handle_binary()), so nothing takes the item in ring order before the
+// destructor.
 TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     CountingPlayerListener listener;
     TestNetworkProvider network;
@@ -4790,8 +4832,9 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     impl.handle_binary(message);
     // The idle sync task may already have discarded the chunk and emptied the quota, so the
     // hand-over is read from state the sync thread cannot change: the chunk was copied into the
-    // ring, where it waits for a ring-order take only this thread (as the protocol task) makes,
-    // and was not dropped, which an over-quota hand-over does after the copy.
+    // ring (ring_'s items_waiting_ under mtx_), where it waits for a ring-order take only this
+    // thread (as the protocol task) makes, and was not dropped (drop_log_'s dropped_), which an
+    // over-quota hand-over does after the copy.
     size_t waiting = 0;
     {
         std::lock_guard<std::mutex> lock(ring.ring_.mtx_);
@@ -4825,12 +4868,12 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
 // the no-role budget unchanged. The time replies follow the configured burst cadence:
 // the default player syncing every second instead of every 10 s holds 88 bursts of 8 replies
 // (312 stored bytes each) behind its 87 s hold instead of 9. Read from the ring the client
-// creates, so every role's figures and the burst configuration have to reach the derivation.
-// Each row also reads the buffer_capacity the stream roles' client/hello advertises, which never
-// exceeds the ring's largest item, so any one chunk the server may send fits an item: the default
-// player's two-thirds share (666,666 bytes) is capped at the default ring's 621,312, while the
-// 25,000-byte player's 16,666, the default player's share in the larger rings and the
-// visualizer's seventh stay as derived.
+// creates (inbound_ring_'s storage_), so every role's figures and the burst configuration have to
+// reach the derivation. Each row also reads the buffer_capacity the stream roles' client/hello
+// advertises (build_hello_fields()), which never exceeds the ring's largest item, so any one
+// chunk the server may send fits an item: the default player's two-thirds share (666,666 bytes)
+// is capped at the default ring's 621,312, while the 25,000-byte player's 16,666, the default
+// player's share in the larger rings and the visualizer's seventh stay as derived.
 TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
     enum : uint8_t {
         PLAYER = 1 << 0,

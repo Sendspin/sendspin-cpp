@@ -265,7 +265,8 @@ void arrive_at(TimedSlot& slot, int64_t timestamp, uint32_t generation) {
 /// A role on a ScheduledStateSlot whose deadline check counts the times it found the Inbox mutex
 /// held, probed from another thread: a real deadline reads the client clock behind a lock of its
 /// own, so it must never run under the Inbox mutex. A state is due when its timestamp is at most
-/// `now`, and the drain records each delivered state's timestamp.
+/// `now`, and the drain records each delivered state's timestamp. Reached: Inbox::mutex_, since
+/// whether a check runs under it shows in no outcome, the decision being the same either way.
 struct ProbingRole : RoleTeardown {
     explicit ProbingRole(Inbox& inbox) : inbox(inbox) {
         this->slot.bind(inbox, INBOX_TOPIC_COLOR);

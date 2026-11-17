@@ -277,8 +277,12 @@ checklists in `.claude/skills/` apply these standards to a diff.
   contents, and which thread ran a step are reached only when no observable
   outcome distinguishes the correct path, and the test says so. A test file
   that reaches private members compiles with `-fno-access-control`, set on
-  that one translation unit in `tests/CMakeLists.txt` beside a comment naming
-  every member it reaches and why.
+  that one translation unit in `tests/CMakeLists.txt`. The file names each
+  private member it reaches, and why, once: a reach several of its tests
+  share (the protocol task played on the test thread, a role's `impl_`) at
+  the top of the file or on their fixture, and any other in the comment of
+  the test or helper that takes it. The comment beside the flag says only that the file
+  compiles with it and names what it reaches.
 - Elapsed time is never a pass/fail condition. A blocked call is proven by
   waiting with no timeout, by a value only the correct path can produce, or
   by a structural failure; hangs are caught by the suite watchdog and the
@@ -295,6 +299,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
   narration ("previously", "used to", "now uses"), no phase or porting
   language, and no references to PR numbers as rationale. Cite the Sendspin
   protocol spec by section when a behavior is spec-driven.
+- Each fact has one home: the comment or doc at the code that owns it. A
+  copy elsewhere is a pointer, and only where the site would mislead without
+  it; a comment does not restate what a nearby comment, the code, or the
+  spec already says.
 - Documentation drift is a defect. A change in behavior is not complete until
   every description of that behavior is updated in the same PR:
 
