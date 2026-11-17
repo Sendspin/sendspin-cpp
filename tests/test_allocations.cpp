@@ -63,6 +63,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -540,8 +541,10 @@ void expect_role_objects(const FakeEncryptedServer& server, size_t index) {
     ASSERT_EQ(deserializeJson(doc, states[index]), DeserializationError::Ok);
     EXPECT_EQ(doc["payload"]["artwork"]["channels"].size(), 2U);
     EXPECT_STREQ(doc["payload"]["artwork"]["channels"][1]["source"], "artist");
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     EXPECT_EQ(doc["payload"]["visualizer"]["types"].size(), 1U);
     EXPECT_STREQ(doc["payload"]["visualizer"]["types"][0], "loudness");
+#endif
 }
 
 /// Checks that the client/hello `server` received lists both configured application roles and
@@ -634,8 +637,10 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
         {SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 64},
     };
     client.add_artwork(std::move(artwork_config));
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     CountingVisualizerListener visualizer_listener;
     client.add_visualizer(make_visualizer_config()).set_listener(&visualizer_listener);
+#endif
     ASSERT_TRUE(bundle.start());
 
     FakeEncryptedServerOptions options;
@@ -778,7 +783,9 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     EXPECT_EQ(metadata_listener.sizes.title_size, 0U) << "the last state cleared the title";
     EXPECT_TRUE(metadata_listener.deprecated_sizes == metadata_listener.sizes);
 
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     const int starts_before_streams = visualizer_listener.stream_starts;
+#endif
 
     // Closes on the client/state the trailing volume command publishes, which the protocol task
     // sends only after handling the three stream messages ahead of it.
@@ -802,8 +809,10 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     expect_library_allocations(close_window(),
                                "stream/start, stream/end and stream/clear with roles",
                                STREAM_MESSAGES_ALLOCATIONS);
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     EXPECT_EQ(visualizer_listener.stream_starts, starts_before_streams + 1)
         << "the window closed before the main loop reported the visualizer stream";
+#endif
 
     // A FLAC stream/start the player takes, its codec header the fLaC marker and STREAMINFO of a
     // 48 kHz stereo 16-bit stream: the parse decodes it into fixed storage and the player copies
@@ -971,14 +980,22 @@ TEST(Allocations, ConnectToThroughAdmission) {
     pump_for(client, 100);
 }
 
+#ifdef SENDSPIN_ENABLE_VISUALIZER
 constexpr uint16_t SPECTRUM_TEST_PORT = 19306;
 
 constexpr size_t FIRST_SPECTRUM_FRAME_ALLOCATIONS = 0;
 
-/// Closes the open window in the first on_spectrum(), on the visualizer's drain thread, and keeps
-/// how many bins that frame carried.
+/// Overrides both spectrum forms and closes the open window in the first on_spectrum(), which the
+/// drain thread calls after on_spectrum_bins() with the same frame, and keeps how many bins each
+/// form was handed.
 class WindowClosingSpectrumListener : public VisualizerRoleListener {
 public:
+    void on_spectrum_bins(int64_t /*client_timestamp*/, std::span<const uint16_t> bins,
+                          const VisualizerSpectrumConfig& /*config*/) override {
+        if (!this->window_closed.load()) {
+            this->view_bins = bins.size();
+        }
+    }
     void on_spectrum(int64_t /*client_timestamp*/, const std::vector<uint16_t>& bins) override {
         if (!this->window_closed.load()) {
             this->window = close_window();
@@ -986,21 +1003,22 @@ public:
             this->window_closed.store(true);
         }
     }
-    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) override {
+    void on_visualizer_stream_started(const VisualizerStream& /*stream*/) override {
         ++this->stream_starts;
     }
 
     /// Written on the drain thread, then published by window_closed.
     Window window;
+    size_t view_bins{0};
     size_t delivered_bins{0};
     std::atomic<bool> window_closed{false};
     /// Main loop (the test thread) only.
     int stream_starts{0};
 };
 
-// A four-bin spectrum stream's first frame, from the server's send through on_spectrum() on the
-// drain thread, which delivers it in the bins the role reserved at start(). Frames are sent until
-// one is delivered, each stamped ahead of now so a slow host only takes longer.
+// A four-bin spectrum stream's first frame, from the server's send through both spectrum forms on
+// the drain thread, which delivers it in the bins the role reserved at start(). Frames are sent
+// until one is delivered, each stamped ahead of now so a slow host only takes longer.
 TEST(Allocations, FirstSpectrumFrame) {
     SendspinClientConfig config;
     config.name = "Allocation Test Spectrum Client";
@@ -1044,10 +1062,12 @@ TEST(Allocations, FirstSpectrumFrame) {
     expect_library_allocations(listener.window, "the first spectrum frame",
                                FIRST_SPECTRUM_FRAME_ALLOCATIONS);
     EXPECT_EQ(listener.delivered_bins, 4U);
+    EXPECT_EQ(listener.view_bins, 4U) << "the window missed the view form";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
 }
+#endif  // SENDSPIN_ENABLE_VISUALIZER
 
 constexpr uint16_t RECORD_FLUSH_TEST_PORT = 19301;
 constexpr uint16_t PAIRING_TEST_PORT = 19302;

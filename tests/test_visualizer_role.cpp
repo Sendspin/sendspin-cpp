@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -47,16 +48,15 @@ void put_be16(std::vector<uint8_t>& out, uint16_t val) {
 // ============================================================================
 
 // roles/visualizer/v1.md "Server -> Client: Visualizer Data (Binary)": each wire type carries a
-// fixed payload shape, a payload shorter than that shape is not deliverable, and the downbeat
-// bit is meaningful only while the stream tracks downbeats. Spectrum delivers exactly the
-// negotiated bin count: fewer bins on the wire than negotiated is short, more is trailing data.
+// fixed payload shape, and a payload shorter than that shape is not deliverable. A spectrum or
+// beat payload arrives already fitted to its stream by handle_binary() (see
+// VisualizerHandleBinary.FitsSpectrumAndBeatFramesToTheStreamTheyArriveIn), so decode reads the
+// bin count from the length and the downbeat from bit 0.
 TEST(VisualizerDecode, PerTypePayloadShapes) {
     struct Row {
         const char* name;
         uint8_t wire_type;
         std::vector<uint8_t> payload;
-        uint8_t negotiated_bins{0};
-        bool tracks_downbeats{false};
         VisualizerDelivery::Kind expected_kind{VisualizerDelivery::Kind::NONE};
         std::vector<uint16_t> expected_bins{};
         std::optional<uint16_t> expected_loudness{};
@@ -75,28 +75,19 @@ TEST(VisualizerDecode, PerTypePayloadShapes) {
         {.name = "loudness one byte short",
          .wire_type = SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
          .payload = {0x12}},
-        {.name = "beat downbeat bit set while tracking downbeats",
+        {.name = "beat downbeat bit set",
          .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
          .payload = {0x01},
-         .tracks_downbeats = true,
          .expected_kind = VisualizerDelivery::Kind::BEAT,
          .expected_downbeat = true},
-        {.name = "beat downbeat bit set while not tracking downbeats",
+        {.name = "Control: beat downbeat bit clear, reserved bits set",
          .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
-         .payload = {0x01},
-         .tracks_downbeats = false,
-         .expected_kind = VisualizerDelivery::Kind::BEAT,
-         .expected_downbeat = false},
-        {.name = "beat downbeat bit clear while tracking downbeats",
-         .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
-         .payload = {0x00},
-         .tracks_downbeats = true,
+         .payload = {0xFE},
          .expected_kind = VisualizerDelivery::Kind::BEAT,
          .expected_downbeat = false},
         {.name = "beat with no payload byte",
          .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
-         .payload = {},
-         .tracks_downbeats = true},
+         .payload = {}},
         {.name = "f_peak carries frequency then amplitude",
          .wire_type = SENDSPIN_BINARY_VISUALIZER_F_PEAK,
          .payload = {0x01, 0xB8, 0xBE, 0xEF},
@@ -106,26 +97,16 @@ TEST(VisualizerDecode, PerTypePayloadShapes) {
         {.name = "f_peak one byte short of both fields",
          .wire_type = SENDSPIN_BINARY_VISUALIZER_F_PEAK,
          .payload = {0x01, 0xB8, 0x00}},
-        {.name = "spectrum delivers the negotiated bin count",
+        {.name = "spectrum delivers one big-endian bin per two bytes",
          .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
-         .payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E},
-         .negotiated_bins = 3,
+         .payload = {0x00, 0x0A, 0x00, 0x14, 0x01, 0x1E},
          .expected_kind = VisualizerDelivery::Kind::SPECTRUM,
-         .expected_bins = {10, 20, 30}},
-        {.name = "spectrum ignores bins past the negotiated count",
-         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
-         .payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E},
-         .negotiated_bins = 2,
-         .expected_kind = VisualizerDelivery::Kind::SPECTRUM,
-         .expected_bins = {10, 20}},
-        {.name = "spectrum one bin short of the negotiated count",
-         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
-         .payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E},
-         .negotiated_bins = 4},
-        {.name = "spectrum that was never negotiated",
+         .expected_bins = {10, 20, 0x011E}},
+        {.name = "Control: spectrum of one bin",
          .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
          .payload = {0x00, 0x0A},
-         .negotiated_bins = 0},
+         .expected_kind = VisualizerDelivery::Kind::SPECTRUM,
+         .expected_bins = {10}},
         {.name = "peak carries one strength byte",
          .wire_type = SENDSPIN_BINARY_VISUALIZER_PEAK,
          .payload = {200},
@@ -141,11 +122,12 @@ TEST(VisualizerDecode, PerTypePayloadShapes) {
 
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
+        // Reserved past every row's bin count, as start() reserves the configured count.
         std::vector<uint16_t> bins;
+        bins.reserve(8);
         const uint8_t* payload = row.payload.empty() ? nullptr : row.payload.data();
 
-        auto out = decode_visualizer_message(row.wire_type, payload, row.payload.size(),
-                                             row.negotiated_bins, row.tracks_downbeats, bins);
+        auto out = decode_visualizer_message(row.wire_type, payload, row.payload.size(), bins);
 
         EXPECT_EQ(out.kind, row.expected_kind);
         if (row.expected_loudness.has_value()) {
@@ -170,8 +152,8 @@ TEST(VisualizerDecode, PerTypePayloadShapes) {
 }
 
 // ============================================================================
-// handle_binary: the protocol task hands messages over verbatim, doing no per-type parsing or
-// capping.
+// handle_binary: the protocol task hands each frame over in a ring item, fitting spectrum and beat
+// frames to their stream and parsing no other payload.
 // ============================================================================
 
 namespace {
@@ -264,7 +246,7 @@ TEST(VisualizerHandleBinary, ForwardsTheWholeFrameInARingItem) {
         InboundRing& ring = *impl->drain_task->inbound.ring();
 
         // data = [server_ts(8)][loudness(2)], then more than this type defines: the protocol task
-        // neither truncates nor caps, so a spectrum with many bins survives intact.
+        // checks no loudness length, so the trailing bytes survive intact.
         std::vector<uint8_t> data;
         put_be64(data, 123456);
         put_be16(data, 0xABCD);
@@ -291,7 +273,10 @@ TEST(VisualizerHandleBinary, ForwardsTheWholeFrameInARingItem) {
 // ahead of its display time, or at once when that has passed, and dropped once it is more than the
 // lag bound past that delivery time. A server sends one message per visualization type for each
 // analysis frame, all with the same timestamp, so a slow listener leaves the drain thread
-// reaching the later ones after that timestamp; the bound lets those through.
+// reaching the later ones after that timestamp; the bound lets those through. A frame awaiting
+// its acknowledgement waits for it until the bound measured from that delivery time, not from
+// when the drain thread took it, and is dropped past the bound even once acknowledged: the drain
+// thread judges it again with the time of each wake.
 TEST(VisualizerDeliveryWait, DropsLateFramesAndShiftsByTheOffset) {
     constexpr int64_t MS = 1000;
     constexpr int64_t LAG = sendspin::VISUALIZER_MAX_DELIVERY_LAG_US;
@@ -300,30 +285,42 @@ TEST(VisualizerDeliveryWait, DropsLateFramesAndShiftsByTheOffset) {
         const char* name;
         int64_t client_ts;
         int32_t offset_ms;
+        bool acknowledged;
         int64_t now;
         std::optional<int64_t> wait_us;
     };
     const Row rows[] = {
-        {"Control: in time, waits for the display time", NOW + 50 * MS, 0, NOW, 50 * MS},
-        {"Control: due exactly now", NOW, 0, NOW, 0},
-        {"reached after its display time behind a sibling", NOW - 5 * MS, 0, NOW, 0},
-        {"Control: at the lag bound", NOW - LAG, 0, NOW, 0},
-        {"past the lag bound", NOW - LAG - 1, 0, NOW, std::nullopt},
-        {"positive offset fires early", NOW + 50 * MS, 15, NOW, 35 * MS},
-        {"negative offset delays", NOW + 50 * MS, -10, NOW, 60 * MS},
-        {"offset beyond the lead delivers at once", NOW + 50 * MS, 60, NOW, 0},
+        {"Control: in time, waits for the display time", NOW + 50 * MS, 0, true, NOW, 50 * MS},
+        {"Control: due exactly now", NOW, 0, true, NOW, 0},
+        {"reached after its display time behind a sibling", NOW - 5 * MS, 0, true, NOW, 0},
+        {"Control: at the lag bound", NOW - LAG, 0, true, NOW, 0},
+        {"past the lag bound", NOW - LAG - 1, 0, true, NOW, std::nullopt},
+        {"positive offset fires early", NOW + 50 * MS, 15, true, NOW, 35 * MS},
+        {"negative offset delays", NOW + 50 * MS, -10, true, NOW, 60 * MS},
+        {"offset beyond the lead delivers at once", NOW + 50 * MS, 60, true, NOW, 0},
         {"Control: a positive offset moves the bound earlier, at it", NOW + 100 * MS - LAG, 100,
+         true, NOW, 0},
+        {"a positive offset moves the bound earlier, past it", NOW + 100 * MS - LAG - 1, 100, true,
+         NOW, std::nullopt},
+        {"Control: a negative offset moves the bound later, at it", NOW - 10 * MS - LAG, -10, true,
          NOW, 0},
-        {"a positive offset moves the bound earlier, past it", NOW + 100 * MS - LAG - 1, 100, NOW,
+        {"a negative offset moves the bound later, past it", NOW - 10 * MS - LAG - 1, -10, true,
+         NOW, std::nullopt},
+        {"in time, awaiting its acknowledgement, waits to the lag bound", NOW + 50 * MS, 0, false,
+         NOW, 50 * MS + LAG},
+        {"taken 15 ms late awaiting its acknowledgement, waits the rest of the bound",
+         NOW - 15 * MS, 0, false, NOW, LAG - 15 * MS},
+        {"Control: taken 15 ms late, acknowledged within the bound", NOW - 15 * MS, 0, true,
+         NOW + 4 * MS, 0},
+        {"taken 15 ms late, acknowledged past the bound", NOW - 15 * MS, 0, true, NOW + 10 * MS,
          std::nullopt},
-        {"Control: a negative offset moves the bound later, at it", NOW - 10 * MS - LAG, -10, NOW,
-         0},
-        {"a negative offset moves the bound later, past it", NOW - 10 * MS - LAG - 1, -10, NOW,
-         std::nullopt},
+        {"taken 15 ms late, still awaiting its acknowledgement past the bound", NOW - 15 * MS, 0,
+         false, NOW + 10 * MS, std::nullopt},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
-        EXPECT_EQ(sendspin::visualizer_delivery_wait_us(row.client_ts, row.offset_ms, row.now),
+        EXPECT_EQ(sendspin::visualizer_delivery_wait_us(row.client_ts, row.offset_ms,
+                                                        row.acknowledged, row.now),
                   row.wait_us);
     }
 }
@@ -374,86 +371,511 @@ TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
     EXPECT_EQ(entry.type, SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
 }
 
-/// Counts on_visualizer_stream_start() calls and keeps a copy of the latest stream reported.
-class StreamStartCounter : public VisualizerRoleListener {
-public:
-    void on_visualizer_stream_start(const ServerVisualizerStreamObject& stream) override {
-        ++this->starts;
-        this->last = stream;
-    }
-    int starts{0};
-    ServerVisualizerStreamObject last;
-};
-
-// A STREAM_START applies only the config written with its own stamp: a config left in the slot by
-// a stream a teardown ended (taken by a drain on the far side of that teardown) is dropped rather
-// than reported for the next stream. The slot is written with the old stamp directly, the payload
-// such a drain would hold; nothing public interleaves the two threads on demand.
-TEST(VisualizerStreamEvents, AStreamStartAppliesOnlyTheConfigOfItsOwnGeneration) {
+// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": each frame is
+// interpreted under the configuration in effect when it was received, so handle_binary() fits it
+// to the negotiated stream before the hand-over. "spectrum" carries n_disp_bins bins, so a frame
+// short of them is dropped and bins past them are left out; "beat" bit 0 is only meaningful when
+// tracks_downbeats is true. A beat with no payload byte is handed over for decode to drop.
+TEST(VisualizerHandleBinary, FitsSpectrumAndBeatFramesToTheStreamTheyArriveIn) {
     struct Row {
         const char* name;
-        bool stale;
-        int expected_starts;
+        uint8_t type;
+        std::vector<uint8_t> payload;
+        bool tracks_downbeats;
+        std::optional<std::vector<uint8_t>> handed;  // nullopt: dropped
     };
-    const Row rows[] = {{"Control: written under the event's generation", false, 1},
-                        {"written before a teardown", true, 0}};
+    const std::vector<Row> rows = {
+        {"Control: spectrum of the negotiated three bins", SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         {0, 1, 0, 2, 0, 3}, false, std::vector<uint8_t>{0, 1, 0, 2, 0, 3}},
+        {"spectrum one bin short", SENDSPIN_BINARY_VISUALIZER_SPECTRUM, {0, 1, 0, 2}, false,
+         std::nullopt},
+        {"spectrum past the negotiated bins", SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         {0, 1, 0, 2, 0, 3, 0, 4}, false, std::vector<uint8_t>{0, 1, 0, 2, 0, 3}},
+        {"Control: a downbeat while tracking downbeats", SENDSPIN_BINARY_VISUALIZER_BEAT, {0x03},
+         true, std::vector<uint8_t>{0x03}},
+        {"a downbeat bit while not tracking downbeats", SENDSPIN_BINARY_VISUALIZER_BEAT, {0x03},
+         false, std::vector<uint8_t>{0x02}},
+        {"Control: a beat with no payload byte", SENDSPIN_BINARY_VISUALIZER_BEAT, {}, false,
+         std::vector<uint8_t>{}},
+    };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        StreamStartCounter listener;
+        impl->negotiated_spectrum_bins = 3;
+        impl->negotiated_tracks_downbeats = row.tracks_downbeats;
+        std::vector<uint8_t> data;
+        put_be64(data, 1);
+        data.insert(data.end(), row.payload.begin(), row.payload.end());
+
+        hand(*impl, row.type, data);
+
+        Entry entry;
+        ASSERT_EQ(pop_entry(*impl, entry), row.handed.has_value());
+        if (row.handed.has_value()) {
+            EXPECT_EQ(std::vector<uint8_t>(entry.message.begin() + 1 + 8, entry.message.end()),
+                      *row.handed);
+        }
+    }
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+/// Logs the stream callbacks in the order they fire, each start with its rate_max and form
+/// ("started" for on_visualizer_stream_started(), "start" for the deprecated
+/// on_visualizer_stream_start()), and keeps the latest stream each form reported.
+class StreamEventLog : public VisualizerRoleListener {
+public:
+    void on_visualizer_stream_started(const VisualizerStream& stream) override {
+        this->started = stream;
+        this->calls.push_back("started " + std::to_string(stream.rate_max));
+    }
+    void on_visualizer_stream_start(const ServerVisualizerStreamObject& stream) override {
+        this->last = stream;
+        this->calls.push_back("start " + std::to_string(stream.rate_max));
+    }
+    void on_visualizer_stream_end() override {
+        this->calls.push_back("end");
+    }
+    void on_visualizer_stream_clear() override {
+        this->calls.push_back("clear");
+    }
+    std::vector<std::string> calls;
+    VisualizerStream started;
+    ServerVisualizerStreamObject last;
+};
+#pragma GCC diagnostic pop
+
+/// Hands every visualizer stream event `impl` has queued to the main loop, as the ring drain in
+/// SendspinClient::drain_inbox() does once each event's stamp is current, without the role drain
+/// that fires them.
+void hold_stream_events(VisualizerRole::Impl& impl) {
+    InboxEvent events[Inbox::EVENT_CAPACITY];
+    const size_t count = impl.inbox->take_events(events, Inbox::EVENT_CAPACITY);
+    for (size_t i = 0; i < count; ++i) {
+        if (events[i].type == InboxEventType::VISUALIZER_STREAM) {
+            impl.on_stream_ring_event(events[i]);
+        }
+    }
+}
+
+/// hold_stream_events(), then the role drain that fires them. No drain thread runs, so nothing
+/// is held for one.
+void dispatch_stream_events(VisualizerRole::Impl& impl) {
+    hold_stream_events(impl);
+    impl.drain_events();
+}
+
+/// Fills `impl`'s inbox event ring with events no role acts on, so the next push is dropped.
+void fill_event_ring(VisualizerRole::Impl& impl) {
+    InboxEvent filler{};
+    filler.type = InboxEventType::CONTROLLER_CLEARED;
+    while (impl.inbox->push_event(filler)) {
+    }
+}
+
+/// A stream/start serving loudness at `rate_max`.
+VisualizerStreamPayload loudness_stream(uint16_t rate_max) {
+    VisualizerStreamPayload stream;
+    stream.types = {VisualizerDataType::LOUDNESS};
+    stream.rate_max = rate_max;
+    return stream;
+}
+
+// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": a stream/start starts
+// a stream or updates the running one, and on_visualizer_stream_started() hears both, each with
+// its own stream, followed by the deprecated on_visualizer_stream_start(). A start whose notice a
+// later start overwrote before it fired is folded into that later one: it reports nothing, since
+// the later notice describes a newer configuration.
+TEST(VisualizerStreamEvents, AStartFiresStartedThenTheDeprecatedStartUnlessALaterOneSupersedesIt) {
+    enum class Step : uint8_t { START_10, START_20, END, FIRE };
+    struct Row {
+        const char* name;
+        bool running;
+        std::vector<Step> steps;
+        std::vector<std::string> calls;
+    };
+    const Row rows[] = {
+        {"Control: a start with no stream running", false, {Step::START_10},
+         {"started 10", "start 10"}},
+        {"a start updating the running stream", true, {Step::START_20},
+         {"started 20", "start 20"}},
+        {"a start, then one updating it, taken together", false, {Step::START_10, Step::START_20},
+         {"started 20", "start 20"}},
+        {"Control: a start fired before the one updating it",
+         false,
+         {Step::START_10, Step::FIRE, Step::START_20},
+         {"started 10", "start 10", "started 20", "start 20"}},
+        {"a start after an end", true, {Step::END, Step::START_20},
+         {"end", "started 20", "start 20"}},
+        {"a start superseded across an end", false, {Step::START_10, Step::END, Step::START_20},
+         {"end", "started 20", "start 20"}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->stream_active = row.running;
+        StreamEventLog listener;
         impl->listener = &listener;
-        const uint32_t before = impl->cleanup_generation.load();
-        impl->cleanup();
-        VisualizerStreamPayload config;
-        config.types = {VisualizerDataType::BEAT};
-        const uint32_t current = impl->cleanup_generation.load();
-        impl->event_state->config_slot.write(VisualizerStreamPayload{config},
-                                             row.stale ? before : current);
+        for (Step step : row.steps) {
+            if (step == Step::END) {
+                impl->handle_stream_end();
+            } else if (step == Step::FIRE) {
+                dispatch_stream_events(*impl);
+            } else {
+                impl->handle_stream_start(loudness_stream(step == Step::START_10 ? 10 : 20));
+            }
+        }
+        dispatch_stream_events(*impl);
+        EXPECT_EQ(listener.calls, row.calls);
+    }
+}
 
-        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, current);
-
-        EXPECT_EQ(listener.starts, row.expected_starts);
+// A stream event the main loop holds when a teardown overtakes it fires nothing: the teardown
+// owes the stream its end instead (complete_teardown(), on the next drain's catch-up), and a
+// stream/start queued before it must not report a stream the teardown ended. The rows hold the
+// event, as the ring drain does, then run the teardown's protocol-task half before the role
+// drain fires it.
+TEST(VisualizerStreamEvents, AHeldEventATeardownOvertookFiresNothing) {
+    struct Row {
+        const char* name;
+        bool clear;
+        bool teardown;
+        std::vector<std::string> calls;
+    };
+    const Row rows[] = {
+        {"Control: a held start", false, false, {"started 10", "start 10"}},
+        {"a held start a teardown overtook", false, true, {}},
+        {"Control: a held clear", true, false, {"clear"}},
+        {"a held clear a teardown overtook", true, true, {}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->stream_active = false;
+        impl->handle_stream_start(loudness_stream(10));
+        StreamEventLog listener;
+        if (row.clear) {
+            dispatch_stream_events(*impl);
+            impl->handle_stream_clear();
+        }
+        impl->listener = &listener;
+        hold_stream_events(*impl);
+        if (row.teardown) {
+            impl->cleanup();
+        }
+        impl->drain_events();
+        EXPECT_EQ(listener.calls, row.calls);
     }
 }
 
 // roles/visualizer/v1.md "Server -> Client: stream/start visualizer object" makes the types a
-// subset of the requested ones, so the stream the listener hears lists each once, in enumerator
-// order, beside every other field the parsed stream carries; a later stream's list replaces the
-// one before it.
-TEST(VisualizerStreamEvents, AStartedStreamReportsEveryFieldOfItsConfig) {
-    auto impl = make_impl();
-    StreamStartCounter listener;
-    impl->listener = &listener;
-    const uint32_t generation = impl->cleanup_generation.load();
-    const auto start = [&impl, generation](const VisualizerStreamPayload& stream) {
-        impl->event_state->config_slot.write(VisualizerStreamPayload{stream}, generation);
-        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START, generation);
-    };
-    const ServerVisualizerStreamObject& heard = listener.last;
-
-    const VisualizerSpectrumConfig spectrum{
+// subset of the requested ones and the spectrum the requested one, n_disp_bins aside. Each start
+// reports the stream it admitted, whether it starts the stream or updates it: the types kept,
+// tracks_downbeats with beat, and rate_max; the deprecated form lists the types once each, in
+// enumerator order, with the spectrum as requested but for the served bin count, and a later
+// stream replaces every field.
+TEST(VisualizerStreamEvents, EachStartReportsTheStreamItAdmitted) {
+    const VisualizerSpectrumConfig requested{
         .n_disp_bins = 16, .scale = VisualizerSpectrumScale::LOG, .f_min = 30, .f_max = 12000};
-    start({.types = {VisualizerDataType::PEAK, VisualizerDataType::SPECTRUM,
-                     VisualizerDataType::BEAT},
-           .rate_max = 24,
-           .tracks_downbeats = true,
-           .spectrum = spectrum});
+    auto impl = make_impl();
+    impl->stream_active = false;
+    impl->config.stream.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
+                                 VisualizerDataType::SPECTRUM, VisualizerDataType::PEAK};
+    impl->config.stream.spectrum = requested;
+    StreamEventLog listener;
+    impl->listener = &listener;
+
+    VisualizerSpectrumConfig served = requested;
+    served.n_disp_bins = 12;
+    impl->handle_stream_start({.types = {VisualizerDataType::PEAK, VisualizerDataType::SPECTRUM,
+                                         VisualizerDataType::BEAT},
+                               .rate_max = 24,
+                               .tracks_downbeats = true,
+                               .spectrum = served});
+    dispatch_stream_events(*impl);
+    VisualizerStream expected;
+    expected.beat = true;
+    expected.spectrum = true;
+    expected.peak = true;
+    expected.tracks_downbeats = true;
+    expected.rate_max = 24;
+    EXPECT_EQ(listener.started, expected);
+    const auto& heard = listener.last;
     EXPECT_EQ(heard.types, (std::vector{VisualizerDataType::BEAT, VisualizerDataType::SPECTRUM,
                                         VisualizerDataType::PEAK}));
     EXPECT_EQ(heard.rate_max, 24);
     EXPECT_TRUE(heard.tracks_downbeats);
     ASSERT_TRUE(heard.spectrum.has_value());
-    EXPECT_EQ(heard.spectrum->n_disp_bins, 16);
+    EXPECT_EQ(heard.spectrum->n_disp_bins, 12);
     EXPECT_EQ(heard.spectrum->scale, VisualizerSpectrumScale::LOG);
     EXPECT_EQ(heard.spectrum->f_min, 30);
     EXPECT_EQ(heard.spectrum->f_max, 12000);
 
-    // A later stream replaces every field, the ones it leaves at their defaults included.
-    start({.types = {VisualizerDataType::LOUDNESS}});
+    // An update that keeps loudness alone, served with downbeats it has no beat for.
+    impl->handle_stream_start({.types = {VisualizerDataType::LOUDNESS}, .tracks_downbeats = true});
+    dispatch_stream_events(*impl);
+    expected = VisualizerStream{};
+    expected.loudness = true;
+    EXPECT_EQ(listener.started, expected);
     EXPECT_EQ(heard.types, std::vector{VisualizerDataType::LOUDNESS});
     EXPECT_EQ(heard.rate_max, 0);
     EXPECT_FALSE(heard.tracks_downbeats);
     EXPECT_FALSE(heard.spectrum.has_value());
+    EXPECT_EQ(listener.calls,
+              (std::vector<std::string>{"started 24", "start 24", "started 0", "start 0"}));
+}
+
+// The drain thread holds a frame until the main loop has fired every stream event queued before the
+// frame arrived (is_acknowledged()): a stream/start, fresh or updating the running stream, or a
+// stream/clear the main loop has not fired holds the frames received after it, and the frames
+// received before an update keep the acknowledgement they had. The verdict holds across the
+// lifecycle ordinal's wrap, which the acknowledgement every end makes keeps it near (a run of ends
+// brings the next start to ordinal 0). An event the full inbox ring or the full held events drop
+// never fires, so it releases its frames at once, ordered against nothing, and an earlier event
+// fired after it does not take that back. A clear fired behind a start that an update queued after
+// the clear superseded holds the clear's frames, received under a configuration no fired notice
+// describes, until the update fires; one superseded by an update queued before the clear, which the
+// full event ring dropped, holds nothing back, and ends the wait for that update, so a clear across
+// the ordinal's wrap from it holds nothing back either. The rows drive the handlers and the main
+// loop's drain with no drain thread, so nothing is held but what a row holds itself, and read the
+// verdict on each frame left listed; the drain thread's wait on it is covered by
+// VisualizerOrdering.AFrameAfterAStreamEventWaitsForItsNotice. The wrap rows fire about 65,000 ends
+// or clears.
+TEST(VisualizerHandshake, AFrameWaitsForTheStreamEventsQueuedBeforeIt) {
+    enum class Step : uint8_t {
+        START,
+        CLEAR,
+        FIRE,
+        FRAME,
+        ENDS_TO_THE_WRAP,    // Ends, each fired, until the next ordinal is the counter's 0
+        CLEARS_TO_THE_WRAP,  // Clears, each fired, until the next ordinal is the counter's 0
+        FILL_RING,           // The inbox event ring left full, so the next push is dropped
+        FILL_HELD,           // Clears held for the drain thread until held_events is full
+        HOLD,                // The queued events held, with no role drain
+        DRAIN,               // The role drain alone, firing what is held
+    };
+    struct Row {
+        const char* name;
+        std::vector<Step> steps;
+        std::vector<bool> acknowledged;  // Each listed frame's verdict, oldest first
+    };
+    // Every row begins with no stream running.
+    const Row rows[] = {
+        {"Control: after a start the main loop fired", {Step::START, Step::FIRE, Step::FRAME},
+         {true}},
+        {"after a start the main loop has not fired", {Step::START, Step::FRAME}, {false}},
+        {"before and after an update the main loop has not fired",
+         {Step::START, Step::FIRE, Step::FRAME, Step::START, Step::FRAME},
+         {true, false}},
+        {"Control: before and after an update the main loop fired",
+         {Step::START, Step::FIRE, Step::FRAME, Step::START, Step::FIRE, Step::FRAME},
+         {true, true}},
+        {"after a clear the main loop has not fired",
+         {Step::START, Step::FIRE, Step::CLEAR, Step::FRAME},
+         {false}},
+        {"Control: after a clear the main loop fired",
+         {Step::START, Step::FIRE, Step::CLEAR, Step::FIRE, Step::FRAME},
+         {true}},
+        {"after a start the main loop has not fired, across the ordinal's wrap",
+         {Step::START, Step::FIRE, Step::ENDS_TO_THE_WRAP, Step::START, Step::FRAME},
+         {false}},
+        {"Control: after a start the main loop fired, across the ordinal's wrap",
+         {Step::START, Step::FIRE, Step::ENDS_TO_THE_WRAP, Step::START, Step::FIRE, Step::FRAME},
+         {true}},
+        {"after a start the full event ring dropped", {Step::FILL_RING, Step::START, Step::FRAME},
+         {true}},
+        {"after a clear the full event ring dropped",
+         {Step::START, Step::FIRE, Step::FILL_RING, Step::CLEAR, Step::FRAME},
+         {true}},
+        {"after a clear the full event ring dropped behind a start fired later",
+         {Step::START, Step::FILL_RING, Step::CLEAR, Step::FRAME, Step::FIRE},
+         {true}},
+        {"after a clear the full held events dropped",
+         {Step::START, Step::FIRE, Step::FILL_HELD, Step::CLEAR, Step::HOLD, Step::FRAME},
+         {true}},
+        {"Control: after a clear held, not dropped",
+         {Step::START, Step::FIRE, Step::CLEAR, Step::HOLD, Step::FRAME},
+         {false}},
+        {"after a clear behind a start an update after the clear superseded",
+         {Step::START, Step::CLEAR, Step::FRAME, Step::HOLD, Step::START, Step::DRAIN},
+         {false}},
+        {"Control: after a clear behind a superseded start, once the update fired",
+         {Step::START, Step::CLEAR, Step::FRAME, Step::HOLD, Step::START, Step::DRAIN, Step::FIRE},
+         {true}},
+        {"after a clear behind a start a dropped update before the clear superseded",
+         {Step::START, Step::FILL_RING, Step::START, Step::HOLD, Step::CLEAR, Step::FRAME,
+          Step::FIRE},
+         {true}},
+        {"after a clear across the ordinal's wrap from a dropped update that superseded a start",
+         {Step::START, Step::FILL_RING, Step::START, Step::HOLD, Step::CLEARS_TO_THE_WRAP,
+          Step::CLEAR, Step::FIRE, Step::FRAME},
+         {true}},
+    };
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    put_be16(data, 0x0001);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->stream_active = false;
+        for (Step step : row.steps) {
+            switch (step) {
+                case Step::START:
+                    impl->handle_stream_start(loudness_stream(10));
+                    break;
+                case Step::CLEAR:
+                    impl->handle_stream_clear();
+                    break;
+                case Step::FIRE:
+                    dispatch_stream_events(*impl);
+                    break;
+                case Step::FRAME:
+                    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+                    break;
+                case Step::ENDS_TO_THE_WRAP:
+                    while (impl->lifecycle_ordinal != UINT16_MAX) {
+                        impl->handle_stream_end();
+                        dispatch_stream_events(*impl);
+                    }
+                    break;
+                case Step::CLEARS_TO_THE_WRAP:
+                    while (impl->lifecycle_ordinal != UINT16_MAX) {
+                        impl->handle_stream_clear();
+                        dispatch_stream_events(*impl);
+                    }
+                    break;
+                case Step::FILL_RING:
+                    fill_event_ring(*impl);
+                    break;
+                case Step::FILL_HELD:
+                    while (impl->held_events.size() < impl->held_events.capacity()) {
+                        impl->handle_stream_clear();
+                        hold_stream_events(*impl);
+                    }
+                    break;
+                case Step::HOLD:
+                    hold_stream_events(*impl);
+                    break;
+                case Step::DRAIN:
+                    impl->drain_events();
+                    break;
+            }
+        }
+        std::vector<bool> acknowledged;
+        void* item = nullptr;
+        while ((item = impl->drain_task->inbound.take(0, impl->cleanup_generation)) != nullptr) {
+            EXPECT_FALSE(impl->is_stale(item));
+            acknowledged.push_back(impl->is_acknowledged(item));
+            impl->drain_task->inbound.ring()->return_item(item);
+        }
+        EXPECT_EQ(acknowledged, row.acknowledged);
+    }
+}
+
+// A run of stream/starts updating the running stream, none of them a boundary, keeps the
+// handshake's ordinal comparisons in range past half the counter's range: a frame received after
+// the run, once the main loop has fired it, is neither stale nor waiting, and a stream/end after
+// the run is held until the drain thread reports passing its boundary, whether that thread reported
+// through the run or sat in one frame callback through all of it. drain_events() holds an end only
+// while a drain thread runs, so a finished thread stands in for it (joined by the role's stop() at
+// destruction), and the rows write its report to passed_slot as report_passed() does. The run rows
+// fire 32,769 updates.
+TEST(VisualizerHandshake, ARunOfUpdatesPastHalfTheOrdinalsRangeKeepsTheHandshake) {
+    constexpr uint32_t PAST_HALF_THE_RANGE = 0x8001;
+    struct Row {
+        const char* name;
+        uint32_t updates;
+        bool reports_through_run;
+    };
+    const Row rows[] = {
+        {"Control: no updates", 0, true},
+        {"updates, the drain thread reporting through them", PAST_HALF_THE_RANGE, true},
+        {"updates, the drain thread in one frame callback through them", PAST_HALF_THE_RANGE,
+         false},
+    };
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    put_be16(data, 0x0001);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->stream_active = false;
+        impl->drain_task->drain_thread = std::thread([] {});
+        const auto report = [&impl] {
+            impl->event_state->passed_slot.write(impl->boundary_ordinal.load());
+        };
+        impl->handle_stream_start(loudness_stream(10));
+        dispatch_stream_events(*impl);
+        report();
+        for (uint32_t i = 0; i < row.updates; ++i) {
+            impl->handle_stream_start(loudness_stream(10));
+            if (row.reports_through_run) {
+                report();
+            }
+            dispatch_stream_events(*impl);
+        }
+
+        hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+        void* item = impl->drain_task->inbound.take(0, impl->cleanup_generation);
+        ASSERT_NE(item, nullptr);
+        EXPECT_FALSE(impl->is_stale(item));
+        EXPECT_TRUE(impl->is_acknowledged(item));
+        impl->drain_task->inbound.ring()->return_item(item);
+
+        StreamEventLog listener;
+        impl->listener = &listener;
+        impl->handle_stream_end();
+        dispatch_stream_events(*impl);
+        EXPECT_TRUE(listener.calls.empty()) << "the end fired before the drain thread passed it";
+        report();
+        impl->drain_events();
+        EXPECT_EQ(listener.calls, std::vector<std::string>{"end"});
+    }
+}
+
+// A run of stream/starts past half the counter's range, each superseded by the next before the
+// main loop reaches it, fires no start, yet keeps acked_ordinal in range: a frame received after
+// the run waits for the superseding start, whose notice describes it, and flows once that fires.
+// The rows drive the handlers and the main loop's drain with no drain thread and fire 32,769
+// superseded updates.
+TEST(VisualizerHandshake, ARunOfSupersededStartsPastHalfTheOrdinalsRangeKeepsAFrameWaiting) {
+    constexpr uint32_t PAST_HALF_THE_RANGE = 0x8001;
+    struct Row {
+        const char* name;
+        bool fire_superseding_start;
+        bool acknowledged;
+    };
+    const Row rows[] = {
+        {"the superseding start not yet fired", false, false},
+        {"Control: the superseding start fired", true, true},
+    };
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    put_be16(data, 0x0001);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->stream_active = false;
+        impl->handle_stream_start(loudness_stream(10));
+        dispatch_stream_events(*impl);
+        impl->handle_stream_start(loudness_stream(10));
+        hold_stream_events(*impl);
+        for (uint32_t i = 0; i < PAST_HALF_THE_RANGE; ++i) {
+            impl->handle_stream_start(loudness_stream(10));
+            impl->drain_events();  // The held start, superseded by the one just handled
+            hold_stream_events(*impl);
+        }
+
+        hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+        if (row.fire_superseding_start) {
+            impl->drain_events();
+        }
+        void* item = impl->drain_task->inbound.take(0, impl->cleanup_generation);
+        ASSERT_NE(item, nullptr);
+        EXPECT_FALSE(impl->is_stale(item));
+        EXPECT_EQ(impl->is_acknowledged(item), row.acknowledged);
+        impl->drain_task->inbound.ring()->return_item(item);
+    }
 }
 
 // roles/visualizer/v1.md "Server -> Client: stream/start": `types` "MUST be a subset of the types
@@ -533,7 +955,7 @@ TEST(VisualizerSpectrumWiring, OnlyRequestedTypesAndAMatchingSpectrumAreAdmitted
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        StreamStartCounter listener;
+        StreamEventLog listener;
         impl->listener = &listener;
         impl->config.stream.types = row.requested;
         impl->config.stream.spectrum = four_bins;
@@ -550,18 +972,19 @@ TEST(VisualizerSpectrumWiring, OnlyRequestedTypesAndAMatchingSpectrumAreAdmitted
         hand(*impl, wire_type(row.handed), data);
         Entry entry;
         EXPECT_EQ(pop_entry(*impl, entry), row.expected_admitted);
-        EXPECT_EQ(impl->spectrum_bin_count, row.expected_bins);
+        EXPECT_EQ(impl->negotiated_spectrum_bins, row.expected_bins);
 
         // The stream the main loop reports is the admitted one.
-        impl->handle_stream_ring_event(VisualizerEventType::STREAM_START,
-                                       impl->cleanup_generation.load());
-        ASSERT_EQ(listener.starts, 1);
-        const ServerVisualizerStreamObject& heard = listener.last;
+        dispatch_stream_events(*impl);
+        ASSERT_EQ(listener.calls.size(), 2U);
+        const auto& heard = listener.last;
         EXPECT_EQ(std::find(heard.types.begin(), heard.types.end(), row.handed) !=
                       heard.types.end(),
                   row.expected_admitted);
         EXPECT_EQ(heard.spectrum.has_value(), row.expected_bins != 0);
         EXPECT_EQ(heard.tracks_downbeats, row.expected_downbeats);
+        EXPECT_EQ(listener.started.spectrum, row.expected_bins != 0);
+        EXPECT_EQ(listener.started.tracks_downbeats, row.expected_downbeats);
     }
 }
 
@@ -589,17 +1012,22 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 }
 
 // ============================================================================
-// Stream boundaries: every stream/start, stream/end, stream/clear and teardown recalls the listed
-// frames and moves the role's boundary sequence on.
+// Stream boundaries: a stream/start with no stream running, stream/end, stream/clear and a
+// teardown each recall the listed frames and move the role's boundary on.
 // ============================================================================
 
 // A boundary returns the frames listed before it, so only frames sent after the latest one
-// survive (roles/visualizer/v1.md "stream/end", messaging.md "stream/clear"). The rows drive the
-// handlers with no drain thread; the held frame is covered by
-// ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime.
+// survive (roles/visualizer/v1.md "stream/end", messaging.md "stream/clear"). A stream/start that
+// updates the running stream is no boundary: the client keeps the buffered frames
+// (roles/visualizer/v1.md "Server -> Client: stream/start visualizer object"), those of a type
+// the update stops serving included, while later frames of that type are not admitted. Every
+// frame left is current, so the drain thread delivers it. The rows drive the handlers with no
+// drain thread; the held frame is covered by
+// ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime and
+// VisualizerDelivery.AnUpdatingStreamStartKeepsTheHeldAndListedFrames.
 // Gap: a current held frame's resumed wait.
 TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
-    enum class Step { END, START, CLEAR, CLEANUP, FRAME };
+    enum class Step { END, START, START_BEAT_ONLY, CLEAR, CLEANUP, FRAME };
     struct Row {
         const char* name;
         std::vector<Step> steps;
@@ -610,16 +1038,21 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
     const Row rows[] = {
         {"Control: no boundary keeps the running stream's frames", {}, {0x01, 0x01}},
         {"an end with no stream after it empties the list", {Step::END}, {}},
-        {"an end then a start keeps the new stream's frame",
+        {"Control: an end then a start keeps only the new stream's frame",
          {Step::END, Step::START, Step::FRAME},
          {0x02}},
         {"a clear keeps the frame sent after it", {Step::CLEAR, Step::FRAME}, {0x02}},
-        {"a start and its frame followed by an end empties the list",
+        {"a start updating the running stream keeps the frames before it",
+         {Step::START, Step::FRAME},
+         {0x01, 0x01, 0x02}},
+        {"two updates keep every frame", {Step::START, Step::FRAME, Step::START, Step::FRAME},
+         {0x01, 0x01, 0x02, 0x03}},
+        {"an update dropping the frames' type keeps those listed before it",
+         {Step::START_BEAT_ONLY, Step::FRAME},
+         {0x01, 0x01}},
+        {"an update and its frame followed by an end empties the list",
          {Step::START, Step::FRAME, Step::END},
          {}},
-        {"two starts keep only the second stream's frame",
-         {Step::START, Step::FRAME, Step::START, Step::FRAME},
-         {0x03}},
         {"a teardown then a start keeps the new stream's frame",
          {Step::CLEANUP, Step::START, Step::FRAME},
          {0x02}},
@@ -627,6 +1060,8 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
 
     VisualizerStreamPayload stream;
     stream.types = {VisualizerDataType::LOUDNESS};
+    VisualizerStreamPayload beat_only;
+    beat_only.types = {VisualizerDataType::BEAT};
     auto loudness = [](uint8_t value) {
         std::vector<uint8_t> data;
         put_be64(data, value);
@@ -649,6 +1084,9 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
                 case Step::START:
                     impl->handle_stream_start(stream);
                     break;
+                case Step::START_BEAT_ONLY:
+                    impl->handle_stream_start(beat_only);
+                    break;
                 case Step::CLEAR:
                     impl->handle_stream_clear();
                     break;
@@ -666,12 +1104,67 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
         while ((item = impl->drain_task->inbound.take(0, impl->cleanup_generation)) != nullptr) {
             const InboundItemHeader* header = inbound_item_header(item);
             surviving.push_back(inbound_item_bytes(item)[header->data_offset + header->data_len - 1]);
+            EXPECT_FALSE(impl->is_stale(item)) << "a frame left listed would not be delivered";
             ring.return_item(item);
         }
         EXPECT_EQ(surviving, row.surviving);
         EXPECT_EQ(ring.quota(InboundHolder::VISUALIZER).outstanding(), 0U)
             << "a stale frame kept its charge";
     }
+}
+
+// roles/visualizer/v1.md "Server -> Client: stream/start visualizer object": "Servers MAY impose
+// an implementation-defined upper bound on n_disp_bins", so a stream/start updating the running
+// stream can change the bin count, and the frames buffered before it keep theirs. Each frame is
+// judged against the count negotiated when it arrives (a frame short of it is dropped then) and
+// decoded, out of the bins start() reserves for the requested count, with the count it arrived
+// under.
+TEST(VisualizerStreamUpdate, EachFrameKeepsTheBinCountOfTheStreamItArrivedIn) {
+    const VisualizerSpectrumConfig four_bins{
+        .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
+    auto impl = make_impl();
+    impl->config.stream.types = {VisualizerDataType::SPECTRUM};
+    impl->config.stream.spectrum = four_bins;
+    impl->stream_active = false;
+    const auto start_with_bins = [&impl, &four_bins](uint8_t bins) {
+        VisualizerStreamPayload stream;
+        stream.types = {VisualizerDataType::SPECTRUM};
+        stream.spectrum = four_bins;
+        stream.spectrum->n_disp_bins = bins;
+        impl->handle_stream_start(stream);
+    };
+    // A spectrum frame of `bins` bins, the first holding `first`.
+    const auto spectrum = [](uint16_t first, size_t bins) {
+        std::vector<uint8_t> data;
+        put_be64(data, 1);
+        put_be16(data, first);
+        for (size_t b = 1; b < bins; ++b) {
+            put_be16(data, 0);
+        }
+        return data;
+    };
+
+    start_with_bins(4);
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_SPECTRUM, spectrum(1, 4));  // Control: four of four
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_SPECTRUM, spectrum(2, 2));  // Short of four
+    start_with_bins(2);
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_SPECTRUM, spectrum(3, 2));  // Control: two of two
+    hand(*impl, SENDSPIN_BINARY_VISUALIZER_SPECTRUM, spectrum(4, 1));  // Short of two
+
+    std::vector<uint16_t> bins;
+    bins.reserve(four_bins.n_disp_bins);
+    std::vector<std::pair<uint16_t, size_t>> delivered;  // Each frame's first bin and bin count
+    void* item = nullptr;
+    while ((item = impl->drain_task->inbound.take(0, impl->cleanup_generation)) != nullptr) {
+        EXPECT_FALSE(impl->is_stale(item));
+        const InboundItemHeader* header = inbound_item_header(item);
+        const VisualizerDelivery out = decode_visualizer_message(
+            header->type, inbound_item_data(item), header->data_len, bins);
+        EXPECT_EQ(out.kind, VisualizerDelivery::Kind::SPECTRUM);
+        delivered.emplace_back(bins.empty() ? 0 : bins[0], bins.size());
+        impl->drain_task->inbound.ring()->return_item(item);
+    }
+    EXPECT_EQ(delivered, (std::vector<std::pair<uint16_t, size_t>>{{1, 4}, {3, 2}}));
 }
 
 // A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and

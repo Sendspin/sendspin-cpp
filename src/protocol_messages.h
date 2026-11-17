@@ -977,7 +977,7 @@ inline constexpr size_t VISUALIZER_DATA_TYPE_COUNT =
     static_cast<size_t>(VisualizerDataType::PEAK) + 1;
 
 /// @brief A parsed stream/start visualizer object: ServerVisualizerStreamObject with its types
-/// held as a set, which the main loop lists into the public object
+/// held as a set, which the protocol task admits against the request
 struct VisualizerStreamPayload {
     EnumSet<VisualizerDataType> types{};
     uint16_t rate_max{};
@@ -986,7 +986,7 @@ struct VisualizerStreamPayload {
 };
 
 static_assert(std::is_trivially_copyable_v<VisualizerStreamPayload>,
-              "parsed on the protocol task and carried to the main loop with nothing on the heap");
+              "parsed on the protocol task with nothing on the heap");
 
 // --- source_role.h ---
 

@@ -22,6 +22,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
+#include <type_traits>
 #include <vector>
 
 namespace sendspin {
@@ -32,9 +34,30 @@ class SendspinClient;
 // Visualizer types
 // ============================================================================
 
+/// @brief A visualizer stream/start as admitted: the data types the client will receive, which
+/// leave out what the server sent beyond the request, and the stream's frame-rate cap
+struct VisualizerStream {
+    bool loudness : 1 {false};
+    bool beat : 1 {false};
+    bool f_peak : 1 {false};
+    bool spectrum : 1 {false};
+    bool peak : 1 {false};
+    /// @brief Whether beat frames mark downbeats; false unless beat is
+    bool tracks_downbeats : 1 {false};
+    /// @brief Periodic frames per second per type the server will emit
+    uint16_t rate_max{0};
+
+    bool operator==(const VisualizerStream&) const = default;
+};
+
+static_assert(std::is_trivially_copyable_v<VisualizerStream>, "handed over by value");
+static_assert(sizeof(VisualizerStream) == 4, "the flags and rate_max pack into four bytes");
+
 /// @brief A visualizer stream/start as admitted: what the client will receive, which leaves out
 /// what the server sent beyond the request
-struct ServerVisualizerStreamObject {
+/// @deprecated Handed only to the deprecated on_visualizer_stream_start(); removed in v0.11.0.
+struct [[deprecated(
+    "override on_visualizer_stream_started(); removed in v0.11.0")]] ServerVisualizerStreamObject {
     /// @brief Data types the client will receive, each once, in enumerator order
     std::vector<VisualizerDataType> types{};
     /// @brief Periodic frames per second the server will emit
@@ -53,11 +76,12 @@ struct ServerVisualizerStreamObject {
 /// mapped linearly in dB across that range.
 ///
 /// THREAD SAFETY: the per-type data callbacks (on_loudness, on_beat, on_f_peak,
-/// on_spectrum, on_peak) fire on a dedicated drain thread, VisualizerRoleConfig::display_offset_ms
-/// ahead of each frame's display timestamp (client_timestamp stays the display time). A frame
-/// more than 20 ms past its delivery time is dropped without a callback. Implementations must be
-/// thread-safe for these methods (copy data quickly, defer heavy processing).
-/// on_visualizer_stream_start/end/clear fire on the main loop thread.
+/// on_spectrum_bins, on_peak) fire on a dedicated drain thread,
+/// VisualizerRoleConfig::display_offset_ms ahead of each frame's display timestamp
+/// (client_timestamp stays the display time). A frame more than 20 ms past its delivery time is
+/// dropped without a callback. Implementations must be thread-safe for these methods (copy data
+/// quickly, defer heavy processing). The stream callbacks fire on the main loop thread, ordered
+/// against the data callbacks as docs/integration-guide.md "VisualizerRoleListener" describes.
 class VisualizerRoleListener {
 public:
     virtual ~VisualizerRoleListener() = default;
@@ -76,17 +100,34 @@ public:
     virtual void on_f_peak(int64_t /*client_timestamp*/, uint16_t /*frequency_hz*/,
                            uint16_t /*amplitude*/) {}
 
-    /// @brief Called with spectrum magnitudes per display bin, low to high frequency
-    /// @note The vector is reused across calls; copy it if it must outlive the callback
-    virtual void on_spectrum(int64_t /*client_timestamp*/, const std::vector<uint16_t>& /*bins*/) {}
+    /// @brief Called with spectrum magnitudes per display bin, low to high frequency: one per
+    /// n_disp_bins of the stream the frame arrived in, valid for the callback
+    ///
+    /// The library calls this and then the deprecated on_spectrum() with the same bins: override
+    /// one of them. A listener overriding both gets both, this one first.
+    /// @param config The spectrum configuration the frame was received under
+    virtual void on_spectrum_bins(int64_t /*client_timestamp*/, std::span<const uint16_t> /*bins*/,
+                                  const VisualizerSpectrumConfig& /*config*/) {}
+
+    /// @brief Called after on_spectrum_bins() with the same bins
+    /// @deprecated Override on_spectrum_bins(); removed in v0.11.0.
+    [[deprecated("override on_spectrum_bins(); removed in v0.11.0")]] virtual void on_spectrum(
+        int64_t /*client_timestamp*/, const std::vector<uint16_t>& /*bins*/) {}
 
     /// @brief Called on energy onset (transient) events, independent of musical timing
     /// @param strength Onset strength 0-255 for scaling flash intensity
     virtual void on_peak(int64_t /*client_timestamp*/, uint8_t /*strength*/) {}
 
-    /// @brief Called when a visualizer stream starts or its configuration changes, with the
-    /// stream as admitted: types the client did not request, or a mismatched spectrum, left out
-    virtual void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) {}
+    /// @brief Called for a visualizer stream/start, a new stream's or one updating the running
+    /// stream, before any frame received after it; a start whose notice a later start overwrote
+    /// before it fired is folded into that later one (see docs/integration-guide.md
+    /// "VisualizerRoleListener")
+    virtual void on_visualizer_stream_started(const VisualizerStream& /*stream*/) {}
+
+    /// @brief Called after on_visualizer_stream_started() with the stream as admitted
+    /// @deprecated Override on_visualizer_stream_started(); removed in v0.11.0.
+    [[deprecated("override on_visualizer_stream_started(); removed in v0.11.0")]] virtual void
+    on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) {}
 
     /// @brief Called when a visualizer stream ends
     ///
@@ -115,7 +156,8 @@ public:
  *
  * @code
  * struct MyVisualizerListener : VisualizerRoleListener {
- *     void on_spectrum(int64_t client_timestamp, const std::vector<uint16_t>& bins) override {
+ *     void on_spectrum_bins(int64_t client_timestamp, std::span<const uint16_t> bins,
+ *                           const VisualizerSpectrumConfig& config) override {
  *         display.update_spectrum(bins);
  *     }
  *     void on_beat(int64_t client_timestamp, bool downbeat) override {

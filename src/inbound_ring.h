@@ -194,7 +194,7 @@ struct InboundItemHeader {
     /// Non-zero once InboundRing::charge() assigned the item to `holder`; never cleared.
     uint8_t holder_set;
     /// Consumer-defined: the player's stream ordinal on a codec header item, the visualizer's
-    /// boundary sequence on a frame, the artwork channel (or, on a marker, the channel mask) on
+    /// lifecycle ordinal on a frame, the artwork channel (or, on a marker, the channel mask) on
     /// an artwork item, 0 on every other item.
     uint16_t serial;
 };

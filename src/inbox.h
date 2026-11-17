@@ -46,7 +46,7 @@ static constexpr uint32_t INBOX_TOPIC_METADATA = 1U << 3;              // Metada
 static constexpr uint32_t INBOX_TOPIC_COLOR = 1U << 4;                 // Color state slot
 static constexpr uint32_t INBOX_TOPIC_PLAYER_COMMAND = 1U << 5;        // Player command slot
 static constexpr uint32_t INBOX_TOPIC_PLAYER_STREAM_PARAMS = 1U << 6;  // Player stream params slot
-static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1U << 7;     // Visualizer config slot
+static constexpr uint32_t INBOX_TOPIC_VISUALIZER_PASSED = 1U << 7;     // Visualizer drain passed
 static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1U << 8;       // Artwork display slot
 static constexpr uint32_t INBOX_TOPIC_PERSIST = 1U << 9;               // Owed provider writes slot
 static constexpr uint32_t INBOX_TOPIC_TIME = 1U << 10;                 // Time-sync report slot
@@ -54,6 +54,7 @@ static constexpr uint32_t INBOX_TOPIC_PAIRING = 1U << 11;              // Pairin
 static constexpr uint32_t INBOX_TOPIC_HIGH_PERFORMANCE = 1U << 12;     // High-performance requests
 static constexpr uint32_t INBOX_TOPIC_PLAYER_SYNC_IDLE = 1U << 13;     // Sync task left a stream
 static constexpr uint32_t INBOX_TOPIC_SERVER = 1U << 14;               // Server information slot
+static constexpr uint32_t INBOX_TOPIC_VISUALIZER_START = 1U << 15;     // Visualizer start notice
 
 // ============================================================================
 // Event ring types
@@ -90,7 +91,9 @@ struct InboxEvent {
     InboxEventType type{};
     uint8_t code{0};  // Role-local enum value; 0 when unused
     /// Producer-defined sequence number, 0 when unused: the stream ordinal of a player
-    /// STREAM_START, which the drain hands back to the sync task as its start acknowledgement.
+    /// STREAM_START, which the drain hands back to the sync task as its start acknowledgement, or
+    /// a visualizer stream event's lifecycle ordinal, which the drain hands back to the drain
+    /// thread likewise.
     uint16_t serial{0};
     /// Teardown generation of the producing role at push time, 0 for events that have none; the
     /// consumer drops a mismatch so an event queued before a teardown cannot act after it (see
@@ -255,7 +258,8 @@ private:
 /// down". `error_level` logs the drop at ERROR rather than WARN: use it for events whose loss
 /// wedges the stream (player START/END), not for the idempotent CLEARED events. `serial` is the
 /// event's InboxEvent::serial.
-inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
+/// @return false when the event was dropped, for a producer that must make up for its loss.
+inline bool push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
                               const char* what, uint32_t epoch, bool error_level = false,
                               uint16_t serial = 0) {
     InboxEvent event{};
@@ -269,7 +273,9 @@ inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, c
         } else {
             SS_LOGW(tag, "Inbox event ring full; dropping %s", what);
         }
+        return false;
     }
+    return true;
 }
 
 /// @brief Whether count `a` is later than `b`, across the unsigned counter's wrap

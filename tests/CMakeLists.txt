@@ -146,10 +146,10 @@ endif()
 # (and, for artwork, the decode thread) with the main loop, which no public call does on demand:
 # it calls each role's handler or teardown (the controller, metadata and color roles'
 # handle_server_state(), the player's handle_stream_start() and handle_server_command(), the
-# visualizer's handle_stream_start(), each role's cleanup()) and drain step (drain_events(), the
-# visualizer's catch_up_teardown()), writes the generation-stamped slots (event_state, artwork's
-# display_slot under its slot_epochs) and queues a STREAM_START (enqueue_stream_event()) with an
-# old stamp, and reads cleanup_generation and the applied state (controller_state, the metadata
+# visualizer's handle_stream_start(), each role's cleanup()) and drain step (drain_events()), writes
+# the generation-stamped slots (event_state, artwork's display_slot under its slot_epochs) and
+# queues a STREAM_START (enqueue_stream_event()) with an old stamp, and reads cleanup_generation
+# and the applied state (controller_state, the metadata
 # role's current, color, the player's stream_active, current_stream_params and volume); its player runs with the
 # sync thread stopped and the item list bound by hand (SyncTask's stop() and inbound_), so a
 # STREAM_END never waits for a thread to go idle. The stream-params test runs on the same player,
@@ -191,7 +191,8 @@ endif()
 # state's text (text_of()) and ScheduledStateSlot::pending_at(), which nothing public shows, and
 # installs the primary clock (ConnectionManager::published_ under published_mutex_) so a scheduled
 # state waits for its deadline without a server, and moves it so one falls due inside a
-# callback.
+# callback. The visualizer tests (the reorder table's visualizer row, VisualizerOrdering and
+# VisualizerDrainThread) name the members they reach, and why, in their own comments.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
