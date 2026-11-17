@@ -39,7 +39,7 @@ checklists in `.claude/skills/` apply these standards to a diff.
   listener (its one consumer callback is the host-only
   `SendspinClientConfig::message_trace`), a role thread calls only the
   data-path callbacks `docs/integration-guide.md` names for it
-  (`on_audio_write()` on the sync task, `on_image_decode()` on the artwork
+  (`on_audio_output()` on the sync task, `on_image_decode()` on the artwork
   decode thread, the visualizer data callbacks on its drain thread), and only
   the main loop calls the persistence and network providers: everything else a
   consumer hears it hears from the main loop's drain. A thread that must wait for the main loop to

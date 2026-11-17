@@ -199,7 +199,7 @@ static bool process_player_stream_object(const JsonObject player_object,
     if (player == nullptr) {
         return false;
     }
-    ServerPlayerStreamObject* player_obj = &player->params;
+    PlayerStreamParams* player_obj = &player->params;
 
     if (require_all_fields) {
         if (!player_object["bit_depth"].is<JsonVariant>() ||

@@ -13,7 +13,7 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `ConnectionManager` (`connection_manager.h`): the admitted array with role ownership, the nursery, the reaping list, admission and arbitration, time bursts, watchdogs and the published clocks and server information; pairing state machines in `connection_manager_pairing.cpp`
 - `InboundRing` / `InboundItemList` / `InboundConsumer` / `InboundGate` (`inbound_ring.h`): the shared ring every admitted transport receives into (over `SharedRingBuffer`), the intrusive per-role item lists that hand audio, visualizer frames and artwork image parts to their consumer threads in place, and the per-connection transport/protocol-task hand-off
 - `OutboundRing` (`outbound_ring.h`): a ring one producer thread (the source task) writes outbound binary messages into; the protocol task encrypts each in place and lends its item to the transport, which returns it once the frame is written. The source's capture ring reuses the class
-- `PlayerRole` (`player_role.h`): audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
+- `PlayerRole` (`player_role.h`): audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_output` callback, each write carrying its format
 - `ControllerRole` (`controller_role.h`): sends playback commands to the server
 - `MetadataRole` (`metadata_role.h`): receives track metadata and progress
 - `ArtworkRole` (`artwork_role.h`): receives album artwork images; its decode thread takes each image's announce, parts and discard markers from its item list, copies each part into one buffer per channel and returns its item at once, and parks a complete image there while the channel's `frame_done()` gate is closed

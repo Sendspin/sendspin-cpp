@@ -14,8 +14,6 @@
 
 #include "transfer_buffer.h"
 
-#include "sendspin/player_role.h"
-
 #include <cstring>
 
 namespace sendspin {
@@ -44,17 +42,6 @@ void TransferBuffer::deallocate() {
     this->buffer_.reset();
     this->data_start_ = nullptr;
     this->buffer_length_ = 0;
-}
-
-size_t TransferBuffer::transfer_data_to_sink(uint32_t timeout_ms) {
-    size_t bytes_written = 0;
-    if (this->available() > 0 && this->listener_) {
-        bytes_written =
-            this->listener_->on_audio_write(this->data_start_, this->available(), timeout_ms);
-        this->decrease_buffer_length(bytes_written);
-    }
-
-    return bytes_written;
 }
 
 size_t TransferBuffer::free() const {

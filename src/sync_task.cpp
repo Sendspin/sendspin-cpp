@@ -53,13 +53,13 @@ static constexpr uint32_t ENCODED_CHUNK_RECEIVE_TIMEOUT_MS = 15U;
 /// bound: the fill bails as soon as a chunk lands and is paced by sink backpressure.
 static constexpr uint32_t UNDERFLOW_SILENCE_KEEPALIVE_MS = 20U;
 
-/// @brief Timeout (ms) for on_audio_write pushes; bounds how long the sync task blocks on the
+/// @brief Timeout (ms) for on_audio_output pushes; bounds how long the sync task blocks on the
 /// sink before returning to its inner loop to re-check flags and drift.
 static constexpr uint32_t AUDIO_WRITE_TIMEOUT_MS = 20U;
 
 /// @brief Sleep (us) after a sink write that took nothing; on ESP-IDF it ends at the first tick
 /// after that.
-/// on_audio_write() waits up to its timeout for room, but one that returns 0 at once would
+/// on_audio_output() waits up to its timeout for room, but one that returns 0 at once would
 /// otherwise spin the loops that retry it, above the consumer's main loop.
 static constexpr int64_t EMPTY_WRITE_BACKOFF_US = 1000;
 
@@ -86,6 +86,14 @@ static size_t frame_aligned_silence_bytes(const AudioStreamInfo& stream_info,
                                           uint32_t duration_ms) {
     return stream_info.frames_to_bytes(
         stream_info.bytes_to_frames(stream_info.ms_to_bytes(duration_ms)));
+}
+
+/// @brief The format a sink write reports for PCM of `stream_info`: each sample at its container
+/// depth, the whole bytes it is stored in (PlayerRoleListener::on_audio_output())
+static AudioFormat audio_format_of(const AudioStreamInfo& stream_info) {
+    return {.sample_rate = stream_info.get_sample_rate(),
+            .channels = stream_info.get_channels(),
+            .bits_per_sample = static_cast<uint8_t>(stream_info.samples_to_bytes(1) * 8)};
 }
 
 static const char* const TAG = "sendspin.sync_task";
@@ -397,6 +405,19 @@ void SyncTask::track_sent_audio(SyncContext& sync_context, size_t bytes_sent) {
         sync_context.current_stream_info.frames_to_microseconds(frames_sent);
 }
 
+size_t SyncTask::write_to_sink(const SyncContext& sync_context, const uint8_t* data,
+                               size_t length) {
+    if (this->player_impl_->listener == nullptr) {
+        return 0;
+    }
+    // Every byte the sink is handed is in current_stream_info: a codec header that changes it is
+    // decoded only once the decode buffer is empty, and it drops the pending silence (see
+    // decode_chunk()).
+    return this->player_impl_->listener->on_audio_output(
+        std::span<const uint8_t>(data, length), audio_format_of(sync_context.current_stream_info),
+        AUDIO_WRITE_TIMEOUT_MS);
+}
+
 int64_t SyncTask::starved_playtime_floor(int64_t playtime_us, int64_t now_us) {
     if (playtime_us < now_us - HARD_SYNC_THRESHOLD_US) {
         return now_us;
@@ -428,11 +449,7 @@ void SyncTask::send_pending_silence(SyncContext& sync_context) {
             chunk = std::min<size_t>(sync_context.silence_remaining, sync_context.bytes_per_frame);
         }
     }
-    size_t bytes_written = 0;
-    if (this->player_impl_->listener != nullptr) {
-        bytes_written = this->player_impl_->listener->on_audio_write(silence_scratch, chunk,
-                                                                     AUDIO_WRITE_TIMEOUT_MS);
-    }
+    const size_t bytes_written = this->write_to_sink(sync_context, silence_scratch, chunk);
     this->track_sent_audio(sync_context, bytes_written);
     sync_context.silence_remaining -= bytes_written;
     if (bytes_written == 0) {
@@ -473,12 +490,14 @@ bool SyncTask::transfer_audio(SyncContext& sync_context) {
     // Pending silence (priming or hard-sync gap fill) goes out before the decoded chunk
     this->send_pending_silence(sync_context);
 
-    if (sync_context.silence_remaining == 0 && sync_context.release_chunk) {
-        const bool had_audio = sync_context.decode_buffer.available() > 0;
-        size_t decode_bytes_written =
-            sync_context.decode_buffer.transfer_data_to_sink(AUDIO_WRITE_TIMEOUT_MS);
+    if (sync_context.silence_remaining == 0 && sync_context.release_chunk &&
+        sync_context.decode_buffer.available() > 0) {
+        const size_t decode_bytes_written =
+            this->write_to_sink(sync_context, sync_context.decode_buffer.get_buffer_start(),
+                                sync_context.decode_buffer.available());
+        sync_context.decode_buffer.decrease_buffer_length(decode_bytes_written);
         this->track_sent_audio(sync_context, decode_bytes_written);
-        if (had_audio && decode_bytes_written == 0) {
+        if (decode_bytes_written == 0) {
             platform_sleep_blocking_us(EMPTY_WRITE_BACKOFF_US);
         }
     }
@@ -619,6 +638,9 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             if (decoded_stream_info != sync_context.current_stream_info) {
                 sync_context.current_stream_info = decoded_stream_info;
                 sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
+                // Pending silence is counted in the previous format's bytes, which need not be
+                // whole frames of this one; the next chunk's sync measures any gap anew.
+                sync_context.silence_remaining = 0;
             }
 
             // Create or resize the decode buffer using the decoder's current required size
@@ -633,9 +655,6 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                     this->inbound_.return_item(sync_context.encoded_item);
                     sync_context.encoded_item = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
-                }
-                if (this->player_impl_->listener) {
-                    sync_context.decode_buffer.set_listener(this->player_impl_->listener);
                 }
             } else if (needed > sync_context.decode_buffer.capacity()) {
                 if (!sync_context.decode_buffer.reallocate(needed)) {

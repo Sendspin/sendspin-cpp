@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include "sendspin/player_role.h"
+
 #include <portaudio.h>
 
 #include <atomic>
@@ -22,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <vector>
 
 namespace sendspin {
@@ -66,7 +69,7 @@ private:
 
 /// @brief Plays audio through PortAudio.
 ///
-/// Bridges the push model (on_audio_write callback) with PortAudio's pull/callback
+/// Bridges the push model (on_audio_output callback) with PortAudio's pull/callback
 /// model using a lock-free SPSC ring buffer.
 class PortAudioSink {
 public:
@@ -77,11 +80,9 @@ public:
     PortAudioSink(const PortAudioSink&) = delete;
     PortAudioSink& operator=(const PortAudioSink&) = delete;
 
-    /// @brief Writes decoded PCM audio data into the ring buffer.
-    size_t write(uint8_t* data, size_t length, uint32_t timeout_ms);
-
-    /// @brief Configure audio format and (re)open the PortAudio stream.
-    bool configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
+    /// @brief Writes decoded PCM audio data into the ring buffer, (re)opening the PortAudio
+    /// stream in `format` when it differs from the previous write's. Sync task thread only.
+    size_t write(std::span<const uint8_t> pcm, const AudioFormat& format, uint32_t timeout_ms);
 
     /// @brief Stop playback and clear the ring buffer.
     void stop();
@@ -107,12 +108,20 @@ public:
     std::function<void(uint32_t frames, int64_t timestamp)> on_frames_played;
 
 private:
+    /// @brief Configure audio format and (re)open the PortAudio stream.
+    bool configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
+
+    /// @brief Waits up to `timeout_ms` for the PortAudio callback to play out the ring buffer.
+    /// @return true once it is empty.
+    bool wait_until_drained(uint32_t timeout_ms);
+
     static int pa_callback(const void* input, void* output, unsigned long frame_count,
                            const PaStreamCallbackTimeInfo* time_info,
                            PaStreamCallbackFlags status_flags, void* user_data);
 
     PortAudioRingBuffer ring_buffer_;
     PaStream* stream_{nullptr};
+    AudioFormat format_{};  // The format of the last write; written by write() only
     uint32_t sample_rate_{0};
     double actual_sample_rate_{0.0};
     uint8_t channels_{0};

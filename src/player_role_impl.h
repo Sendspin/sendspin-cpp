@@ -74,7 +74,7 @@ struct PlayerRole::Impl : RoleTeardown {
     // ========================================
 
     struct EventState {
-        GenerationSlot<ServerPlayerStreamObject> stream_params_slot;
+        GenerationSlot<PlayerStreamParams> stream_params_slot;
         GenerationSlot<ServerCommandMessage> command_slot;
         /// Written by the sync task each time it returns to idle from a stream it was running or
         /// about to run, so a STREAM_END the drain holds for the sync task to go idle is
@@ -178,7 +178,14 @@ struct PlayerRole::Impl : RoleTeardown {
 
     // Struct fields
     PlayerRoleConfig config;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    /// The deprecated get_current_stream_params() form of the latest STREAM_START's params. Main
+    /// loop only.
     ServerPlayerStreamObject current_stream_params{};
+#pragma GCC diagnostic pop
+    /// The stream the latest STREAM_START announced (stream_info()). Main loop only.
+    PlayerStreamInfo stream_info{};
     std::vector<InboxEvent> awaiting_sync_idle_events;
 
     // Pointer fields

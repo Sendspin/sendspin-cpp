@@ -13,7 +13,7 @@ Integration follows this pattern:
 5. Wire listeners and providers to the client and roles
 6. Start the server and run the main loop
 
-The only role with a required callback is the player role (`on_audio_write`). All other listener methods have default no-op implementations.
+The only role with a callback to implement is the player role (`on_audio_output()`). All other listener methods have default no-op implementations.
 
 ## Headers
 
@@ -91,18 +91,7 @@ auto& player = client.add_player(std::move(player_config));
 
 Each `AudioSupportedFormatObject` declares a codec/channels/sample_rate/bit_depth combination. The server selects from these when establishing an audio stream. The list must include at least one `FLAC` or `PCM` entry, since those are the codecs every server supports; `client.start()` fails and logs if it does not. `OPUS` is optional and needs a build with the Opus decoder (`SENDSPIN_ENABLE_OPUS`, on by default); `client.start()` also fails on an `OPUS` entry without it.
 
-The stream parameters negotiated by the server are available via `get_current_stream_params()`, which returns a `ServerPlayerStreamObject` with these fields:
-
-| Field | Type | Description |
-|---|---|---|
-| `codec` | `std::optional<SendspinCodecFormat>` | Audio codec |
-| `sample_rate` | `std::optional<uint32_t>` | Sample rate in Hz |
-| `channels` | `std::optional<uint8_t>` | Number of channels |
-| `bit_depth` | `std::optional<uint8_t>` | Bits per sample |
-
-Call `is_complete()` on the object to check that `codec`, `sample_rate`, `channels`, and
-`bit_depth` all have values. A FLAC stream's codec header goes to the decoder and is not
-part of the object.
+The format of the decoded audio comes with each write to the listener (see [PlayerRoleListener](#playerrolelistener-required-if-using-player-role)).
 
 ### Controller Role (Playback Commands)
 
@@ -241,23 +230,26 @@ the role resumes normally.
 
 ### PlayerRoleListener (Required if Using Player Role)
 
-The `on_audio_write` method is one of only two pure virtual (required) methods in the library;
-the other is `SendspinNetworkProvider::is_network_ready()`.
+Override `on_audio_output()`. It becomes pure virtual in v0.11.0, beside
+`SendspinNetworkProvider::is_network_ready()`, the library's other required method.
 
 ```cpp
 struct MyPlayerListener : PlayerRoleListener {
-    // REQUIRED: Write decoded PCM audio (interleaved, little-endian) to your audio output.
+    // REQUIRED: Write decoded PCM audio to your audio output, in the format it comes with.
     // Called from a background thread. May block up to timeout_ms.
     // Must return the number of bytes actually written.
-    size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
-        return my_audio_output.write(data, length, timeout_ms);
+    size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
+                           uint32_t timeout_ms) override {
+        if (format != output_format) {
+            my_audio_output.configure(format.sample_rate, format.channels, format.bits_per_sample);
+            output_format = format;
+        }
+        return my_audio_output.write(pcm.data(), pcm.size(), timeout_ms);
     }
 
     // Optional: Called when a new audio stream starts.
-    // Use this to configure your audio output with the new stream parameters.
     void on_stream_start() override {
-        auto& params = player_ref.get_current_stream_params();
-        my_audio_output.configure(*params.sample_rate, *params.channels, *params.bit_depth);
+        my_audio_output.prepare();
     }
 
     // Optional: Called when the audio stream ends.
@@ -277,8 +269,14 @@ struct MyPlayerListener : PlayerRoleListener {
 
     // Optional: Called when the server changes the output delay.
     void on_output_delay_changed(uint16_t delay_ms) override { }
+
+    AudioFormat output_format;  // Sync task thread only
 };
 ```
+
+Each write carries the format of exactly its bytes: interleaved, little-endian, signed PCM of `format.channels` channels at `format.sample_rate`, `format.bits_per_sample / 8` bytes per sample (24-bit packed in 3 bytes). `bits_per_sample` is the container depth, 8, 16, 24 or 32: a stream of another depth, such as a 20-bit FLAC stream, is reported at the next multiple of 8, its samples in the top bits. A `stream/start` that changes the format of the running stream applies from the first audio received after it, so the writes of the audio buffered before it keep the old format. Configure the output from the writes rather than from `on_stream_start()`, which the main loop can fire for such an update while the old audio is still being written. For display, `PlayerRole::stream_info()` reports on the main loop what the latest `stream/start` announced, its codec included, or `nullopt` while no stream is active.
+
+A write is always a whole number of frames (`channels * bits_per_sample / 8` bytes), and so must be what the callback returns: the sync task counts played frames from it, and the next write offers the rest of the same bytes.
 
 ### Audio Playback Feedback
 
@@ -838,7 +836,7 @@ Restarting is `start()` again; start, stop, and start again can be repeated inde
 
 - The transports' own close. The host server joins every accepted connection thread; a WebSocket peer completes its close handshake within about 300 ms, but a raw socket that connected and never completed the upgrade holds the join for the full 3 s handshake timeout. The ESP server waits for the httpd task to exit, which polls at 100 ms and first finishes any queued send, which can take up to httpd's send timeout for a peer that has stopped reading.
 - An open outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`): on ESP up to the websocket task's one-second read poll, and usually at once after the goodbye, since the peer closes on it.
-- A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
+- A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_output()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
 
 `stop()` does not wait for an outbound `connect_to()` attempt whose WebSocket upgrade has not completed, whether it is still pending or was released earlier by `disconnect()` or a replacing `connect_to()`. Stopping one would last up to the transport's connect and handshake timeout: 30 s on host (`SendspinClientConnection::HANDSHAKE_TIMEOUT_SECS`, the nursery's establish window), and on ESP esp_websocket_client's `network_timeout_ms` (10 s, `SendspinClientConnection::NETWORK_TIMEOUT_MS`) for each of the connect's three steps (TCP connect, upgrade request, its response), plus the DNS lookup before them, which lwIP's resolver bounds at 7 s per configured DNS server (3 servers by default, so about 21 s). Such an attempt has no peer to goodbye, so `stop()` closes it without blocking and leaves it to end on its own, the same way a replacing `connect_to()` does. It is freed once its transport has finished: by `loop()` while the client stays stopped, once the attempt fails or opens (one that opens is stopped there, on ESP up to the websocket task's one-second read poll), or by the protocol task of the next `start()`, which also drops it once its connect bound has passed (on ESP still waiting out the rest of a stalled DNS lookup there, off the main loop). This keeps `stop()` safe to call from a shutdown hook on a watchdog-supervised task. The waits left are a reap the protocol task had already begun when `stop()` was called (an earlier attempt dropped at its connect bound), which finishes first, and, after a restart while five or more earlier attempts are all still connecting, the oldest of them, which `stop()` evicts to make room. Destroying the client is the exception: the destructor joins such an attempt's transport, up to the bounds above.
 
@@ -848,7 +846,7 @@ Listener callbacks fire from inside `stop()`, after every role and the group sta
 
 `on_request_high_performance()` and `on_release_high_performance()` fire from the main loop with no internal lock held, and their bodies should only toggle the platform networking mode rather than calling back into the client or a role. A time burst waits for the request to have been delivered before it sends its first time message, so a main loop that stalls delays the next clock measurement rather than measuring it in power-save mode; a release is never delayed that way.
 
-Destroying a running client performs the transport half of `stop()` (goodbye, close, join) and dispatches no role teardown or clear callback; the only listener call is `on_release_high_performance()`, once for each hold the main loop granted and has not released. A request the main loop never delivered is dropped unheard, so the listener never sees a release without its request. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
+Destroying a running client performs the transport half of `stop()` (goodbye, close, join) and dispatches no role teardown or clear callback; the only listener call is `on_release_high_performance()`, once for each hold the main loop granted and has not released. A request the main loop never delivered is dropped unheard, so the listener never sees a release without its request. Role-thread callbacks (`on_audio_output()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
 
 ## Encryption and Pairing
 
@@ -1199,7 +1197,6 @@ auto server = client.server_information();     // Active server's id and name as
 uint8_t vol = player.get_volume();
 bool muted = player.get_muted();
 uint16_t delay = player.get_output_delay_ms();
-auto& stream = player.get_current_stream_params();
 
 // Controller state
 auto& ctrl = controller.get_controller_state();  // volume, muted, repeat, shuffle, supported_commands, seek_max_ms
@@ -1214,7 +1211,7 @@ int64_t client_ts = client.get_client_time(server_timestamp);
 
 ## Deprecated API
 
-The view forms hand the metadata, group, pairing and server text over as `std::string_view` into storage the library keeps, and the pairing token as a `std::array`; the deprecated forms copy it into `std::string`. The visualizer's spectrum bins come as a `std::span` rather than a `std::vector`, and its stream start as a `VisualizerStream` rather than the stream object. The deprecated forms are deprecated in v0.10.0 and removed in v0.11.0. Using a deprecated type or calling a deprecated getter draws a `-Wdeprecated-declarations` warning, but overriding a deprecated callback does not: the metadata and group callbacks and `on_visualizer_stream_start()` warn only because their parameter types are deprecated, while the four pairing callbacks (`on_pairing_started()`, `on_pairing_succeeded()`, `on_pairing_failed()`, `on_display_pairing_code()`) and `on_spectrum()` take none, so search for those names. Mark every override `override`, so that a callback removed in v0.11.0 fails to compile rather than silently going uncalled.
+The view forms hand the metadata, group, pairing and server text over as `std::string_view` into storage the library keeps, and the pairing token as a `std::array`; the deprecated forms copy it into `std::string`. The visualizer's spectrum bins come as a `std::span` rather than a `std::vector`, and its stream start as a `VisualizerStream` rather than the stream object. The player's PCM comes as a `std::span` beside the `AudioFormat` of exactly those bytes, rather than with the format of the latest `stream/start` the main loop reported. The deprecated forms are deprecated in v0.10.0 and removed in v0.11.0. Using a deprecated type or calling a deprecated getter draws a `-Wdeprecated-declarations` warning, but overriding a deprecated callback does not: the metadata and group callbacks and `on_visualizer_stream_start()` warn only because their parameter types are deprecated, while the four pairing callbacks (`on_pairing_started()`, `on_pairing_succeeded()`, `on_pairing_failed()`, `on_display_pairing_code()`), `on_spectrum()` and `on_audio_write()` take none, so search for those names. Mark every override `override`, so that a callback removed in v0.11.0 fails to compile rather than silently going uncalled.
 
 | Deprecated | Replacement |
 |---|---|
@@ -1234,8 +1231,11 @@ The view forms hand the metadata, group, pairing and server text over as `std::s
 | `VisualizerRoleListener::on_spectrum()` | `VisualizerRoleListener::on_spectrum_bins()`, the bins as a `std::span<const uint16_t>` beside the frame's spectrum configuration |
 | `VisualizerRoleListener::on_visualizer_stream_start()` | `VisualizerRoleListener::on_visualizer_stream_started()`, ordered against the data callbacks (see [VisualizerRoleListener](#visualizerrolelistener)) |
 | `ServerVisualizerStreamObject` | `VisualizerStream`, with each spectrum frame's configuration handed to `on_spectrum_bins()` |
+| `PlayerRoleListener::on_audio_write()` | `PlayerRoleListener::on_audio_output()`, the PCM as a `std::span<const uint8_t>` beside its `AudioFormat` (see [PlayerRoleListener](#playerrolelistener-required-if-using-player-role)) |
+| `PlayerRole::get_current_stream_params()` | `PlayerRole::stream_info()`, main loop only, for what the stream announced (codec included); the `AudioFormat` each `on_audio_output()` write carries for the PCM itself |
+| `ServerPlayerStreamObject` | `PlayerStreamInfo` |
 
-The text fields and arguments keep their meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` and `server_information()` return until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view, like a pairing token's array, is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. `server_information()` reads a copy `loop()` refreshes as the server changes, so it is main loop only and can read the previous server, or `nullopt`, for one `loop()` after `is_connected()` turns true: read it on each `loop()` rather than only when `is_connected()` rises; `get_server_information()` reads from any thread, and code off the main loop has no replacement and keeps calling it until the removal. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. The deprecated `on_visualizer_stream_start()` follows each `on_visualizer_stream_started()`, before the frames received after it.
+The text fields and arguments keep their meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` and `server_information()` return until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view, like a pairing token's array, is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. `server_information()` reads a copy `loop()` refreshes as the server changes, so it is main loop only and can read the previous server, or `nullopt`, for one `loop()` after `is_connected()` turns true: read it on each `loop()` rather than only when `is_connected()` rises; `get_server_information()` reads from any thread, and code off the main loop has no replacement and keeps calling it until the removal. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. The deprecated `on_visualizer_stream_start()` follows each `on_visualizer_stream_started()`, before the frames received after it. The player's write is the exception, since its return value counts the bytes written: the library calls only `on_audio_output()`, whose default hands the same bytes to `on_audio_write()`, so a listener that overrides both gets only `on_audio_output()`. One that overrides neither plays nothing: the deprecated default takes no bytes, and the sync task treats that as an output with no room, retrying the write after a short back-off rather than spinning.
 
 ## Thread Safety Summary
 
@@ -1247,7 +1247,7 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 
 | Callback | Thread |
 |---|---|
-| `PlayerRoleListener::on_audio_write()` | Sync task background thread |
+| `PlayerRoleListener::on_audio_output()` (and the deprecated `on_audio_write()` its default calls) | Sync task background thread |
 | `ArtworkRoleListener::on_image_decode()` | Dedicated artwork decode thread |
 | `ArtworkRoleListener::on_image_display()` | Main loop thread |
 | `VisualizerRoleListener` data callbacks (`on_loudness()`, `on_beat()`, `on_f_peak()`, `on_spectrum_bins()` and the deprecated `on_spectrum()`, `on_peak()`) | Dedicated visualizer drain thread, ordered against the stream callbacks on the main loop (see [VisualizerRoleListener](#visualizerrolelistener)) |
@@ -1305,13 +1305,15 @@ A minimal integration that receives and discards audio:
 #include "sendspin/player_role.h"
 
 #include <chrono>
+#include <span>
 #include <thread>
 
 using namespace sendspin;
 
 struct MinimalPlayer : PlayerRoleListener {
-    size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
-        return length;  // Discard audio
+    size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
+                           uint32_t timeout_ms) override {
+        return pcm.size();  // Discard audio
     }
 };
 
@@ -1466,7 +1468,7 @@ Configuration passed to `client.add_player()`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports, in priority order; advertised to the server during the hello handshake. The server selects one when establishing a stream. Must list at least one `FLAC` or `PCM` entry, the codecs every server supports; `OPUS` may be listed in addition when the build has the Opus decoder (`SENDSPIN_ENABLE_OPUS`). `start()` fails and logs otherwise. |
-| `audio_buffer_capacity` | `size_t` | `1000000` | Bytes of the shared inbound ring the player may hold as encoded audio (its quota; the ring is sized to include it). Each chunk is charged its stored size, so the client advertises the share that holds encoded frames at the smallest chunk size (2/3 of it) to the server; a server filling that share with frames under 144 bytes overruns the quota, and the excess is dropped with a warning. The advertised value is at most the ring's largest item so that any single chunk the server may send fits (621,312 bytes with the default ring, below the 666,666-byte share). The ring also holds the traffic that arrives while the oldest chunk is held (`derive_inbound_ring_bytes()` in `src/inbound_ring.h`), so the default quota yields a 1,242,704-byte ring; a visualizer's frame rate and the artwork channels' images add to it (1,641,776 bytes with one 128 KB artwork channel). Larger buffers absorb more jitter at the cost of memory. While the oldest chunk is held, the control messages and time replies have only that pass-through allowance; a sync task stalled in `on_audio_write()` or a server far over the advertised buffer can exhaust it, and an exhausted ring closes the connection with "ring pinned behind held items" ([The Inbound Ring](internals.md#the-inbound-ring)). |
+| `audio_buffer_capacity` | `size_t` | `1000000` | Bytes of the shared inbound ring the player may hold as encoded audio (its quota; the ring is sized to include it). Each chunk is charged its stored size, so the client advertises the share that holds encoded frames at the smallest chunk size (2/3 of it) to the server; a server filling that share with frames under 144 bytes overruns the quota, and the excess is dropped with a warning. The advertised value is at most the ring's largest item so that any single chunk the server may send fits (621,312 bytes with the default ring, below the 666,666-byte share). The ring also holds the traffic that arrives while the oldest chunk is held (`derive_inbound_ring_bytes()` in `src/inbound_ring.h`), so the default quota yields a 1,242,704-byte ring; a visualizer's frame rate and the artwork channels' images add to it (1,641,776 bytes with one 128 KB artwork channel). Larger buffers absorb more jitter at the cost of memory. While the oldest chunk is held, the control messages and time replies have only that pass-through allowance; a sync task stalled in `on_audio_output()` or a server far over the advertised buffer can exhaust it, and an exhausted ring closes the connection with "ring pinned behind held items" ([The Inbound Ring](internals.md#the-inbound-ring)). |
 | `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable output delay. |
 | `initial_output_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable output delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
 | `extra_startup_silence_ms` | `uint16_t` | `50` | Extra silence inserted at stream start, after the first playback notification and before the first decoded chunk reaches the sink. Added on top of the initial-sync priming silence to give the decode pipeline more slack to stay ahead of the sink, preventing the initial-playback stutter caused by the decoder briefly falling behind. Larger values trade a longer startup delay for more underflow protection; set to `0` to disable. |

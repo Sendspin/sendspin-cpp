@@ -24,14 +24,16 @@
 #endif
 
 #include <chrono>
+#include <span>
 #include <thread>
 
 using namespace sendspin;
 
 #ifdef SENDSPIN_ENABLE_PLAYER
 struct DiscardPlayer : PlayerRoleListener {
-    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
-        return length;
+    size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& /*format*/,
+                           uint32_t /*timeout_ms*/) override {
+        return pcm.size();
     }
 };
 #endif

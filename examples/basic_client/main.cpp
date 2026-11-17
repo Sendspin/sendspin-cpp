@@ -76,6 +76,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -375,32 +376,24 @@ int main(int argc, char* argv[]) {
     struct BasicPlayerListener : PlayerRoleListener {
 #ifdef BASIC_CLIENT_HAS_AUDIO_SINK
         PortAudioSink& sink;
-        PlayerRole& player;
-        BasicPlayerListener(PortAudioSink& s, PlayerRole& p) : sink(s), player(p) {}
+        explicit BasicPlayerListener(PortAudioSink& s) : sink(s) {}
 #endif
 
-        size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
+        // The sink opens its PortAudio stream in each write's format.
+        size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
+                               uint32_t timeout_ms) override {
 #ifdef BASIC_CLIENT_HAS_AUDIO_SINK
-            return sink.write(data, length, timeout_ms);
+            return sink.write(pcm, format, timeout_ms);
 #else
-            (void)data;
+            (void)format;
             (void)timeout_ms;
-            null_audio_total_bytes += length;
-            return length;
+            null_audio_total_bytes += pcm.size();
+            return pcm.size();
 #endif
         }
 
         void on_stream_start() override {
             fprintf(stderr, ">>> Stream started\n");
-#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
-            auto& params = player.get_current_stream_params();
-            if (params.sample_rate.has_value() && params.channels.has_value() &&
-                params.bit_depth.has_value()) {
-                sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
-            } else {
-                fprintf(stderr, ">>> Stream params not yet available for PortAudio\n");
-            }
-#endif
         }
 
         void on_stream_end() override {
@@ -493,7 +486,7 @@ int main(int argc, char* argv[]) {
     };
 
 #ifdef BASIC_CLIENT_HAS_AUDIO_SINK
-    BasicPlayerListener player_listener(audio_sink, player);
+    BasicPlayerListener player_listener(audio_sink);
     audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
         player.notify_audio_played(frames, timestamp);
     };

@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
+#include <type_traits>
 
 namespace sendspin {
 
@@ -40,8 +42,42 @@ enum class SendspinPlayerCommand : uint8_t {
     SET_OUTPUT_DELAY,  // Set the output delay
 };
 
+/// @brief The format of the decoded PCM one PlayerRoleListener::on_audio_output() call carries
+struct AudioFormat {
+    /// @brief Sample rate in Hz
+    uint32_t sample_rate{0};
+    /// @brief Interleaved channel count
+    uint8_t channels{0};
+    /// @brief The container depth each sample is stored in: 8, 16, 24 or 32. A stream of another
+    /// depth is reported at the next multiple of 8, its samples in the top bits.
+    uint8_t bits_per_sample{0};
+
+    bool operator==(const AudioFormat&) const = default;
+};
+
+static_assert(std::is_trivially_copyable_v<AudioFormat>, "handed to the sink with every write");
+static_assert(sizeof(AudioFormat) == 8, "the rate, channels and depth pack into eight bytes");
+
+/// @brief The stream the server's latest stream/start announced (PlayerRole::stream_info())
+struct PlayerStreamInfo {
+    SendspinCodecFormat codec{};
+    /// @brief Sample rate in Hz
+    uint32_t sample_rate{0};
+    /// @brief Interleaved channel count
+    uint8_t channels{0};
+    /// @brief Bit depth the stream announced; an Opus stream reports the 16 bits it decodes to
+    uint8_t bit_depth{0};
+
+    bool operator==(const PlayerStreamInfo&) const = default;
+};
+
+static_assert(std::is_trivially_copyable_v<PlayerStreamInfo>, "returned by value");
+
 /// @brief Stream parameters sent by the server in stream/start messages
-struct ServerPlayerStreamObject {
+/// @deprecated Returned only by the deprecated PlayerRole::get_current_stream_params(); removed in
+/// v0.11.0.
+struct [[deprecated(
+    "use PlayerRole::stream_info(); removed in v0.11.0")]] ServerPlayerStreamObject {
     std::optional<SendspinCodecFormat> codec{};
     std::optional<uint32_t> sample_rate;
     std::optional<uint8_t> channels;
@@ -68,7 +104,7 @@ struct ServerCommandMessage {
 
 /// @brief Listener for player role events
 ///
-/// THREAD SAFETY: on_audio_write() fires on the sync task's background thread.
+/// THREAD SAFETY: on_audio_output() fires on the sync task's background thread.
 /// Implementations must be thread-safe for this method. on_stream_start(), on_stream_end(),
 /// on_volume_changed(), on_mute_changed(), and on_output_delay_changed()
 /// fire on the main loop thread via drain_events(). The listener must outlive the role.
@@ -78,15 +114,26 @@ public:
 
     /// @brief Writes decoded PCM audio to the platform's audio output
     ///
-    /// Fires on the sync task's background thread. May block up to timeout_ms.
-    /// @param data Decoded PCM audio data, interleaved and little-endian
-    /// @param length Number of bytes to write; always a whole number of PCM frames
+    /// Fires on the sync task's background thread. May block up to timeout_ms. The library calls
+    /// only this method; until v0.11.0 its default forwards to the deprecated on_audio_write().
+    /// @param pcm Decoded PCM, interleaved, little-endian and signed, format.bits_per_sample / 8
+    /// bytes per sample (24-bit packed in 3 bytes); always a whole number of frames
+    /// @param format The format of exactly these bytes; a stream/start that changes the format
+    /// applies from the first audio received after it
     /// @param timeout_ms Maximum time to wait for the write to complete
-    /// @return Number of bytes actually written. Partial writes are allowed but must be a
-    /// whole number of PCM frames (a multiple of channels * bytes-per-sample): the sync task
-    /// counts played frames from this value, so a mid-frame count drifts the playtime estimate
-    /// and starts the next write mid-frame.
-    virtual size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) = 0;
+    /// @return Number of bytes actually written. Partial writes are allowed but must be a whole
+    /// number of frames (a multiple of channels * bits_per_sample / 8): the sync task counts
+    /// played frames from this value, and the next write resends the rest of the same bytes.
+    virtual size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
+                                   uint32_t timeout_ms);
+
+    /// @brief Writes decoded PCM audio, in the format on_audio_output() is handed; called only by
+    /// the default on_audio_output()
+    /// @deprecated Override on_audio_output(); removed in v0.11.0.
+    [[deprecated("override on_audio_output(); removed in v0.11.0")]] virtual size_t on_audio_write(
+        uint8_t* /*data*/, size_t /*length*/, uint32_t /*timeout_ms*/) {
+        return 0;
+    }
 
     /// @brief Called when a new audio stream starts
     virtual void on_stream_start() {}
@@ -113,18 +160,19 @@ public:
  * Owns a SyncTask that runs on a background thread. Encoded audio chunks are received into the
  * client's shared inbound ring, handed to the sync task by the protocol task in place, then
  * decoded and scheduled for output against the server clock via the time filter. Decoded PCM frames
- * are delivered to the platform through the PlayerRoleListener::on_audio_write() callback.
+ * are delivered to the platform through the PlayerRoleListener::on_audio_output() callback.
  *
  * Usage:
- * 1. Implement PlayerRoleListener with at minimum on_audio_write()
+ * 1. Implement PlayerRoleListener with at minimum on_audio_output()
  * 2. Add the role to the client via SendspinClient::add_player()
  * 3. Call set_listener() with your listener implementation
  * 4. Call notify_audio_played() from the audio output to report consumed frames
  *
  * @code
  * struct MyPlayerListener : PlayerRoleListener {
- *     size_t on_audio_write(uint8_t* data, size_t len, uint32_t timeout_ms) override {
- *         return audio_output.write(data, len, timeout_ms);
+ *     size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
+ *                            uint32_t timeout_ms) override {
+ *         return audio_output.write(pcm, format, timeout_ms);
  *     }
  *     void on_stream_start() override { audio_output.prepare(); }
  * };
@@ -205,8 +253,15 @@ public:
     // Queries
     // ========================================
 
-    /// @brief Returns a reference to the current stream parameters
-    const ServerPlayerStreamObject& get_current_stream_params() const;
+    /// @brief Returns the stream the latest stream/start announced, or nullopt while no stream is
+    /// active. For display: each write's own format comes with on_audio_output(). Main loop only.
+    [[nodiscard]] std::optional<PlayerStreamInfo> stream_info() const;
+
+    /// @brief Returns a reference to the current stream parameters. Main loop only.
+    /// @deprecated Use stream_info(), and each write's format from on_audio_output(); removed in
+    /// v0.11.0.
+    [[deprecated("use stream_info(); removed in v0.11.0")]] const ServerPlayerStreamObject&
+    get_current_stream_params() const;
 
     /// @brief Returns true if currently muted
     bool get_muted() const;

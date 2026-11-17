@@ -300,8 +300,9 @@ struct PublishedServer;
  *
  * @code
  * struct MyPlayerListener : PlayerRoleListener {
- *     size_t on_audio_write(uint8_t* data, size_t len, uint32_t timeout_ms) override {
- *         return audio_output.write(data, len, timeout_ms);
+ *     size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
+ *                            uint32_t timeout_ms) override {
+ *         return audio_output.write(pcm, format, timeout_ms);
  *     }
  * };
  *

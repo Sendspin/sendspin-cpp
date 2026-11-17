@@ -236,6 +236,11 @@ protected:
     /// speaker. These two must always be updated together to keep the playtime estimate consistent.
     void track_sent_audio(SyncContext& sync_context, size_t bytes_sent);
 
+    /// @brief Hands `length` bytes of PCM at `data` to the listener's on_audio_output() with their
+    /// format, the stream info in `sync_context`
+    /// @return The bytes the listener took.
+    size_t write_to_sink(const SyncContext& sync_context, const uint8_t* data, size_t length);
+
     /// @brief The playtime estimate floored at `now_us` once it trails it by more than
     /// HARD_SYNC_THRESHOLD_US: every frame sent has played, so the sink starved, and the silence
     /// it played on its own went unreported. New audio starts no earlier than now.
