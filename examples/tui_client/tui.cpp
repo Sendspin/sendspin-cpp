@@ -396,7 +396,7 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     if (snap.channels) {
         channels_display = (*snap.channels == 2) ? "Stereo" : std::to_string(*snap.channels) + "ch";
     }
-    bool has_stream = snap.codec.has_value();
+    bool has_stream = snap.sample_rate.has_value();
 
     auto stream_panel = window(text(" Stream ") | bold, vbox({
         info_row("Codec:    ", codec_display, has_stream),

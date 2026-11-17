@@ -417,11 +417,13 @@ TEST(ClientLifecycle, OpusStreamStartIsRefusedWithoutTheOpusDecoder) {
 
     auto server = connect_paired_server(bundle.peer, OPUS_STREAM_TEST_PORT);
     pump_until(client, [&] { return client.is_connected(); });
+    EXPECT_FALSE(client.player()->stream_info().has_value()) << "no stream is active yet";
 
     ASSERT_TRUE(server->send_app_json(stream_start_json("opus")));
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     pump_until(client, [&] {
-        return client.player()->get_current_stream_params().codec == SendspinCodecFormat::PCM;
+        const std::optional<PlayerStreamInfo> stream = client.player()->stream_info();
+        return stream.has_value() && stream->codec == SendspinCodecFormat::PCM;
     });
     EXPECT_EQ(listener.stream_starts, 1);
 
@@ -3061,11 +3063,14 @@ public:
     void on_color_clear() override {
         this->calls.push_back("clear");
     }
-    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
-        return length;
+    size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& /*format*/,
+                           uint32_t /*timeout_ms*/) override {
+        return pcm.size();
     }
     void on_stream_start() override {
-        const uint32_t rate = this->player->get_current_stream_params().sample_rate.value_or(0);
+        // The stream stream_info() reports is applied before this callback fires.
+        const std::optional<PlayerStreamInfo> stream = this->player->stream_info();
+        const uint32_t rate = stream.has_value() ? stream->sample_rate : 0;
         this->calls.push_back("state " + std::to_string(rate / 1000));
     }
     void on_stream_end() override {
@@ -3153,8 +3158,8 @@ ServerColorStateObject color_state_with(uint8_t value) {
 }
 
 /// A PCM stream whose sample rate is `value` kHz: the player's state value.
-ServerPlayerStreamObject player_stream_with(uint8_t value) {
-    ServerPlayerStreamObject params;
+PlayerStreamParams player_stream_with(uint8_t value) {
+    PlayerStreamParams params;
     params.codec = SendspinCodecFormat::PCM;
     params.sample_rate = static_cast<uint32_t>(value) * 1000;
     params.channels = 2;
@@ -4281,7 +4286,7 @@ TEST(ClientLifecycle, StreamEventsDrainedTogetherStartEachStreamOnItsOwnStart) {
         client.protocol_task_->stop();
         PlayerRole::Impl& player = *client.player_->impl_;
         SyncTask& sync = *player.sync_task;
-        ServerPlayerStreamObject params;
+        PlayerStreamParams params;
         params.codec = SendspinCodecFormat::PCM;
         params.sample_rate = 48000;
         params.channels = 2;
@@ -4374,7 +4379,7 @@ TEST(ClientLifecycle, AHeaderTakenAfterTheActiveStreamEndedStartsTheNextStream) 
         PlayerRole::Impl& player = *harness.client.player_->impl_;
         SyncTask& sync = *player.sync_task;
         sync.event_flags_.clear_all();  // As SyncTask::start() leaves them
-        ServerPlayerStreamObject params;
+        PlayerStreamParams params;
         params.codec = SendspinCodecFormat::PCM;
         params.sample_rate = 48000;
         params.channels = 2;
@@ -4428,9 +4433,10 @@ constexpr uint8_t SINK_AUDIO_MARK = 0x7F;
 /// is paced so the sink stays slower than a test thread filling the ring.
 class VirtualSinkListener : public PlayerRoleListener {
 public:
-    size_t on_audio_write(uint8_t* data, size_t length, uint32_t /*timeout_ms*/) override {
-        const bool marked = std::any_of(data, data + length, [](uint8_t b) { return b != 0; });
-        const auto frames = static_cast<uint32_t>(length / SINK_FRAME_BYTES);
+    size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& /*format*/,
+                           uint32_t /*timeout_ms*/) override {
+        const bool marked = std::any_of(pcm.begin(), pcm.end(), [](uint8_t b) { return b != 0; });
+        const auto frames = static_cast<uint32_t>(pcm.size() / SINK_FRAME_BYTES);
         const int64_t now = platform_time_us();
         if (this->playhead_us_ < now) {
             this->playhead_us_ = now;
@@ -4444,7 +4450,7 @@ public:
         if (marked && !this->decoded_seen_.exchange(true)) {
             this->first_decoded_.set_value();
         }
-        return length;
+        return pcm.size();
     }
     void on_stream_end() override {
         ++this->stream_ends;
@@ -4635,8 +4641,8 @@ private:
 };
 
 /// The stream the stand-in connection tests start: the format make_pcm_player_config() advertises.
-ServerPlayerStreamObject pcm_stream_params() {
-    ServerPlayerStreamObject params;
+PlayerStreamParams pcm_stream_params() {
+    PlayerStreamParams params;
     params.codec = SendspinCodecFormat::PCM;
     params.sample_rate = SINK_SAMPLE_RATE;
     params.channels = 2;

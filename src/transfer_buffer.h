@@ -26,32 +26,29 @@
 
 namespace sendspin {
 
-class PlayerRoleListener;
-
 /**
  * @brief Simple flat byte buffer with read/write cursors for transferring decoded audio to the
  * audio output sink.
  *
  * Manages a flat byte array with read/write cursors for audio data transfer. Data is written at
- * get_buffer_end() and read from get_buffer_start(). Supports dynamic reallocation and flushing
- * accumulated data to a PlayerRoleListener sink. Held by value: only the backing array comes from
- * the platform heap, so an owner can allocate it on first use and turn a failure into a refusal.
+ * get_buffer_end() and read from get_buffer_start(). Supports dynamic reallocation. Held by value:
+ * only the backing array comes from the platform heap, so an owner can allocate it on first use
+ * and turn a failure into a refusal.
  *
  * Usage:
  *   1. Call allocate() to allocate the backing buffer.
- *   2. Call set_listener() to register the audio sink.
- *   3. Write decoded audio to the buffer via the internal methods.
- *   4. Call transfer_data_to_sink() to flush buffered data to the listener.
+ *   2. Write decoded audio at get_buffer_end() and call increase_buffer_length().
+ *   3. Hand get_buffer_start() and available() to the sink, then call decrease_buffer_length()
+ *      with what it took.
  *
  * @code
  * TransferBuffer buf;
  * if (!buf.allocate(4096, MemoryLocation::PREFER_EXTERNAL)) {
  *     return false;
  * }
- * buf.set_listener(&my_player_listener);
  * // ... write decoded audio into buf.get_buffer_end() ...
  * buf.increase_buffer_length(bytes_written);
- * buf.transfer_data_to_sink(100);
+ * buf.decrease_buffer_length(sink.write(buf.get_buffer_start(), buf.available()));
  * @endcode
  */
 class TransferBuffer {
@@ -74,12 +71,6 @@ public:
     bool is_allocated() const {
         return static_cast<bool>(this->buffer_);
     }
-
-    /// @brief Writes buffered data to the sink.
-    /// @param timeout_ms Milliseconds to block while waiting for the sink (UINT32_MAX = wait
-    /// forever).
-    /// @return Number of bytes written to the sink.
-    size_t transfer_data_to_sink(uint32_t timeout_ms);
 
     /// @brief Returns the number of bytes available to read.
     /// @return Number of bytes currently held in the buffer.
@@ -109,12 +100,6 @@ public:
     /// @return Number of bytes that can be written before the buffer is full.
     size_t free() const;
 
-    /// @brief Sets the player listener for transfer_data_to_sink().
-    /// @param listener Pointer to the listener that receives audio data via on_audio_write().
-    void set_listener(PlayerRoleListener* listener) {
-        this->listener_ = listener;
-    }
-
     /// @brief Advances the read cursor after data has been consumed.
     /// @param bytes Number of bytes consumed from the start of the buffer.
     void decrease_buffer_length(size_t bytes);
@@ -134,7 +119,6 @@ protected:
 
     // Pointer fields
     uint8_t* data_start_{nullptr};
-    PlayerRoleListener* listener_{nullptr};
 
     // size_t fields
     size_t buffer_length_{0};

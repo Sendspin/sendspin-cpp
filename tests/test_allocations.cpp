@@ -484,16 +484,17 @@ public:
 /// signals the sync task to start the stream, and the sync task decodes nothing before that
 /// signal, so the window holds the protocol task's and the main loop's work on a stream/start and
 /// none of the sync task's. Asked instead to measure the sync task, it opens a window there and
-/// closes it on the stream's first on_audio_write(), the priming silence the sync task writes once
+/// closes it on the stream's first on_audio_output(), the priming silence the sync task writes once
 /// it has processed the codec header.
 class WindowClosingPlayerListener : public CountingPlayerListener {
 public:
-    size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
-        if (this->close_on_audio_write.exchange(false)) {
+    size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
+                           uint32_t timeout_ms) override {
+        if (this->close_on_audio_output.exchange(false)) {
             this->sync_window = close_window();
             this->sync_window_closed.store(true);
         }
-        return CountingPlayerListener::on_audio_write(data, length, timeout_ms);
+        return CountingPlayerListener::on_audio_output(pcm, format, timeout_ms);
     }
 
     void on_stream_start() override {
@@ -505,7 +506,7 @@ public:
         if (this->open_on_start) {
             this->open_on_start = false;
             open_window();
-            this->close_on_audio_write.store(true);
+            this->close_on_audio_output.store(true);
         }
     }
 
@@ -517,7 +518,7 @@ public:
     std::atomic<bool> sync_window_closed{false};
 
 private:
-    std::atomic<bool> close_on_audio_write{false};
+    std::atomic<bool> close_on_audio_output{false};
 };
 
 void expect_library_allocations(const Window& window, const char* title, size_t expected) {

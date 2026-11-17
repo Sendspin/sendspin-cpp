@@ -17,7 +17,10 @@
 
 #pragma once
 
+#include "sendspin/config.h"
+
 #include <cstdint>
+#include <optional>
 
 namespace sendspin {
 
@@ -37,6 +40,20 @@ struct DummyHeader {
     uint32_t sample_rate;
     uint8_t bits_per_sample;
     uint8_t channels;
+};
+
+/// @brief A stream/start player object's audio parameters (roles/player/v1.md "stream/start
+/// player object"), each present when the message carried it
+struct PlayerStreamParams {
+    std::optional<SendspinCodecFormat> codec{};
+    std::optional<uint32_t> sample_rate;
+    std::optional<uint8_t> channels;
+    std::optional<uint8_t> bit_depth;
+
+    bool is_complete() const {
+        return codec.has_value() && sample_rate.has_value() && channels.has_value() &&
+               bit_depth.has_value();
+    }
 };
 
 }  // namespace sendspin

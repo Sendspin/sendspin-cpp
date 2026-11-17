@@ -1241,7 +1241,7 @@ private:
 // ============================================================================
 //
 // One copy of each, because a per-file copy is where two suites quietly start disagreeing about
-// what the library does. Every callback here except on_audio_write() and on_loudness() is fired
+// what the library does. Every callback here except on_audio_output() and on_loudness() is fired
 // from SendspinClient::loop(), which in these suites is the test thread itself, so its counts are
 // plain ints; those two are reached from a role thread and are atomic.
 
@@ -1252,9 +1252,10 @@ private:
 class CountingPlayerListener : public PlayerRoleListener {
 public:
     /// The sync task's own thread writes here, unlike the callbacks below.
-    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
+    size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& /*format*/,
+                           uint32_t /*timeout_ms*/) override {
         this->audio_writes.fetch_add(1);
-        return length;
+        return pcm.size();
     }
     void on_stream_start() override {
         ++this->stream_starts;

@@ -67,9 +67,11 @@ size_t PortAudioRingBuffer::read(uint8_t* dest, size_t len) {
     // that read_pos_ is only ever written by the consumer thread, preserving
     // the SPSC invariant and eliminating the race where an externally-modified
     // read_pos_ could cause the consumer to compute a bogus available count.
-    if (clear_requested_.load(std::memory_order_acquire)) {
-        clear_requested_.store(false, std::memory_order_relaxed);
-        read_pos_.store(write_pos_.load(std::memory_order_acquire), std::memory_order_release);
+    // Only the bytes written before clear() go: a write since may already be the next stream's.
+    // Returning without a read keeps a second clear() that lands meanwhile from moving read_pos_
+    // back.
+    if (clear_requested_.exchange(false, std::memory_order_acq_rel)) {
+        read_pos_.store(clear_to_.load(std::memory_order_relaxed), std::memory_order_release);
         std::memset(dest, 0, len);
         return 0;
     }
@@ -110,6 +112,7 @@ size_t PortAudioRingBuffer::free_space() const {
 }
 
 void PortAudioRingBuffer::clear() {
+    clear_to_.store(write_pos_.load(std::memory_order_acquire), std::memory_order_relaxed);
     clear_requested_.store(true, std::memory_order_release);
 }
 
@@ -135,7 +138,23 @@ PortAudioSink::~PortAudioSink() {
     Pa_Terminate();
 }
 
-size_t PortAudioSink::write(uint8_t* data, size_t length, uint32_t timeout_ms) {
+size_t PortAudioSink::write(std::span<const uint8_t> pcm, const AudioFormat& format,
+                            uint32_t timeout_ms) {
+    if (format != format_ || stream_ == nullptr) {
+        // A stream/start changed the format, or a failed open left no stream. The stream plays
+        // out the old format's audio first, so every frame written is played and reported, then
+        // reopens in the new one.
+        if (stream_ != nullptr && !wait_until_drained(timeout_ms)) {
+            return 0;
+        }
+        if (!configure(format.sample_rate, format.channels, format.bits_per_sample)) {
+            return 0;  // Opened again on the next write
+        }
+        format_ = format;
+    }
+
+    const uint8_t* data = pcm.data();
+    const size_t length = pcm.size();
     size_t total_written = 0;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
@@ -179,6 +198,13 @@ size_t PortAudioSink::write(uint8_t* data, size_t length, uint32_t timeout_ms) {
     }
 
     return total_written;
+}
+
+bool PortAudioSink::wait_until_drained(uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(write_mutex_);
+    return write_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
+        return ring_buffer_.available() == 0 || abort_write_.load(std::memory_order_acquire);
+    });
 }
 
 bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample) {

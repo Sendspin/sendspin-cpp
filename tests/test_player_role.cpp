@@ -337,8 +337,8 @@ std::unique_ptr<PlayerRole::Impl> make_impl(InboundRing* ring = nullptr) {
 
 // A stream/start player object the role can serve: PCM sends a synthesized codec header, so the
 // blocking header send succeeds and the handler publishes the stream.
-ServerPlayerStreamObject pcm_stream_params() {
-    ServerPlayerStreamObject params;
+PlayerStreamParams pcm_stream_params() {
+    PlayerStreamParams params;
     params.codec = SendspinCodecFormat::PCM;
     params.sample_rate = 44100;
     params.channels = 2;
@@ -770,7 +770,7 @@ TEST(PlayerHello, TheAdvertisedShareOfTheQuotaHoldsEncodedFrames) {
 
 // roles/player/v1.md "stream/start player object" ignores bit_depth for opus, which decodes to
 // 16-bit samples whatever the server sent. The codec header the sync task decodes with and the
-// params the consumer configures its output from both carry the decoded depth.
+// params stream_info() reports both carry the decoded depth.
 TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
     struct Row {
         const char* name;
@@ -786,7 +786,7 @@ TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
-        ServerPlayerStreamObject params = pcm_stream_params();
+        PlayerStreamParams params = pcm_stream_params();
         params.codec = row.codec;
         params.sample_rate = 48000;
         params.bit_depth = 24;
@@ -800,7 +800,7 @@ TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
         impl->sync_task->inbound().return_item(header_item);
         EXPECT_EQ(header.bits_per_sample, row.decoded_bit_depth);
 
-        ServerPlayerStreamObject published;
+        PlayerStreamParams published;
         uint32_t generation = 0;
         ASSERT_TRUE(impl->event_state->stream_params_slot.take(published, generation));
         EXPECT_EQ(published.bit_depth, row.decoded_bit_depth);
@@ -902,8 +902,9 @@ TEST(PlayerRoleVolume, ValueOverTheSpecMaximumIsClamped) {
 TEST(PlayerRoleSupportedCommands, VolumeAndMuteCommandsAreIgnoredUnlessAdvertised) {
     class LevelListener : public PlayerRoleListener {
     public:
-        size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
-            return length;
+        size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& /*format*/,
+                               uint32_t /*timeout_ms*/) override {
+            return pcm.size();
         }
         void on_volume_changed(uint8_t volume) override {
             this->volumes.push_back(volume);
@@ -954,8 +955,9 @@ TEST(PlayerRoleSupportedCommands, VolumeAndMuteCommandsAreIgnoredUnlessAdvertise
 TEST(PlayerRoleOutputDelay, SetOutputDelayCommandIsIgnoredUnlessAdvertised) {
     class DelayListener : public PlayerRoleListener {
     public:
-        size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
-            return length;
+        size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& /*format*/,
+                               uint32_t /*timeout_ms*/) override {
+            return pcm.size();
         }
         void on_output_delay_changed(uint16_t delay_ms) override {
             this->changes.push_back(delay_ms);
@@ -1128,13 +1130,24 @@ TEST(PlayerHardSync, OnlyAChunkLaterThanItsOwnLengthIsSkipped) {
 
 namespace {
 
-// A sink that accepts every write and records the bytes in order.
+// A sink that accepts every write and records the bytes in order, and each write's length, first
+// byte and format.
 struct RecordingSink : PlayerRoleListener {
-    size_t on_audio_write(uint8_t* data, size_t length, uint32_t /*timeout_ms*/) override {
-        written.insert(written.end(), data, data + length);
-        return length;
+    struct Write {
+        size_t bytes;
+        uint8_t first_byte;
+        AudioFormat format;
+        bool operator==(const Write&) const = default;
+    };
+
+    size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
+                           uint32_t /*timeout_ms*/) override {
+        written.insert(written.end(), pcm.begin(), pcm.end());
+        writes.push_back({pcm.size(), pcm.empty() ? uint8_t{0} : pcm.front(), format});
+        return pcm.size();
     }
     std::vector<uint8_t> written;
+    std::vector<Write> writes;
 };
 
 }  // namespace
@@ -1159,7 +1172,6 @@ TEST(PlayerHardSync, AfterAnUnderrunTheGapIsMeasuredFromNow) {
     const size_t chunk_bytes = context.current_stream_info.frames_to_bytes(CHUNK_FRAMES);
     ASSERT_TRUE(context.decode_buffer.allocate(chunk_bytes + context.bytes_per_frame,
                                                MemoryLocation::PREFER_INTERNAL));
-    context.decode_buffer.set_listener(&sink);
     std::memset(context.decode_buffer.get_buffer_end(), CHUNK_SAMPLE, chunk_bytes);
     context.decode_buffer.increase_buffer_length(chunk_bytes);
     const int64_t now = platform_time_us();
@@ -1184,4 +1196,160 @@ TEST(PlayerHardSync, AfterAnUnderrunTheGapIsMeasuredFromNow) {
     EXPECT_LE(silence_frames, LEAD_FRAMES);
     // Control: the chunk follows the silence whole.
     EXPECT_EQ(sink.written.end() - first_chunk_byte, static_cast<std::ptrdiff_t>(chunk_bytes));
+}
+
+// ============================================================================
+// Audio output: the callback the library writes through and the format of every write
+// ============================================================================
+
+namespace {
+
+// A listener still on the deprecated on_audio_write(), recording the bytes it receives.
+struct DeprecatedFormListener : PlayerRoleListener {
+    size_t on_audio_write(uint8_t* data, size_t length, uint32_t /*timeout_ms*/) override {
+        written.insert(written.end(), data, data + length);
+        return length;
+    }
+    std::vector<uint8_t> written;
+};
+
+// An audio chunk message as handle_binary() receives it, due at server time 0, its frame `bytes`
+// bytes of `fill`.
+std::vector<uint8_t> filled_audio_chunk(uint8_t fill, size_t bytes) {
+    std::vector<uint8_t> chunk = audio_chunk();
+    chunk.resize(chunk.size() - 4);  // Drop audio_chunk()'s own frame
+    chunk.insert(chunk.end(), bytes, fill);
+    return chunk;
+}
+
+// A PCM stream/start player object of the given format.
+PlayerStreamParams pcm_stream(uint32_t sample_rate, uint8_t channels, uint8_t bit_depth) {
+    PlayerStreamParams params;
+    params.codec = SendspinCodecFormat::PCM;
+    params.sample_rate = sample_rate;
+    params.channels = channels;
+    params.bit_depth = bit_depth;
+    return params;
+}
+
+// The helpers below play the sync thread's steps on the test thread (SyncTask's reset_context(),
+// decode_chunk(), transfer_audio() and send_pending_silence()), since only the thread otherwise
+// writes a stream's audio and silence across a format change.
+
+// A SyncContext as IDLE leaves it for a new stream, past its initial-sync priming, so a silence
+// write does not wait for the sink to settle.
+void start_context(SyncTask& task, SyncContext& context) {
+    context.decoder = std::make_unique<SendspinDecoder>();
+    task.reset_context(context);
+    context.initial_decode = false;
+}
+
+// Takes the next item off the sync task's list and decodes it, as LOAD_CHUNK does.
+void decode_next_item(SyncTask& task, SyncContext& context) {
+    context.encoded_item = task.take_item(0);
+    ASSERT_NE(context.encoded_item, nullptr);
+    ASSERT_EQ(task.decode_chunk(context), DecodeResult::SUCCESS);
+}
+
+// Runs TRANSFER_AUDIO on the decoded chunk until everything pending is out. Bounded, so a
+// listener that takes nothing fails the caller's checks rather than hanging.
+void transfer_pending(SyncTask& task, SyncContext& context) {
+    context.release_chunk = true;
+    for (int pass = 0; pass < 8 && !task.transfer_audio(context); ++pass) {
+    }
+}
+
+}  // namespace
+
+// A listener still on the deprecated on_audio_write() (the ESPHome hub until it moves) gets the
+// audio through on_audio_output()'s default.
+TEST(PlayerAudioOutput, TheDeprecatedWriteStillReceivesTheAudio) {
+    constexpr uint8_t CHUNK_SAMPLE = 0x5A;
+    constexpr uint32_t CHUNK_FRAMES = 4;
+    constexpr uint32_t SILENCE_FRAMES = 2;
+    auto impl = make_impl();
+    DeprecatedFormListener listener;
+    impl->listener = &listener;
+    SyncContext context;
+    context.current_stream_info = AudioStreamInfo(16, 2, 44100);
+    context.bytes_per_frame = context.current_stream_info.frames_to_bytes(1);
+    const size_t chunk_bytes = context.current_stream_info.frames_to_bytes(CHUNK_FRAMES);
+    ASSERT_TRUE(context.decode_buffer.allocate(chunk_bytes + context.bytes_per_frame,
+                                               MemoryLocation::PREFER_INTERNAL));
+    std::memset(context.decode_buffer.get_buffer_end(), CHUNK_SAMPLE, chunk_bytes);
+    context.decode_buffer.increase_buffer_length(chunk_bytes);
+    context.silence_remaining = context.current_stream_info.frames_to_bytes(SILENCE_FRAMES);
+
+    transfer_pending(*impl->sync_task, context);
+
+    std::vector<uint8_t> expected(context.current_stream_info.frames_to_bytes(SILENCE_FRAMES),
+                                  0x00);
+    expected.insert(expected.end(), chunk_bytes, CHUNK_SAMPLE);
+    EXPECT_EQ(listener.written, expected);
+}
+
+// roles/player/v1.md "stream/start": a stream/start that updates the running stream changes the
+// format from the chunks after it; those before it are in the old one. Each write carries the
+// format of its own bytes, the silence included, though the main loop has already applied the
+// update by the time the old audio is written.
+TEST(PlayerAudioOutput, EachWriteCarriesTheFormatOfItsOwnBytes) {
+    constexpr AudioFormat OLD_FORMAT{.sample_rate = 44100, .channels = 2, .bits_per_sample = 16};
+    constexpr AudioFormat NEW_FORMAT{.sample_rate = 48000, .channels = 1, .bits_per_sample = 24};
+    constexpr uint8_t OLD_SAMPLE = 0xA1;
+    constexpr uint8_t NEW_SAMPLE = 0xB2;
+    constexpr size_t OLD_FRAME_BYTES = 4;
+    constexpr size_t NEW_FRAME_BYTES = 3;
+    auto impl = make_impl();
+    RecordingSink sink;
+    impl->listener = &sink;
+    // Every chunk due a second ahead, so none is skipped as late against the playtime the writes
+    // below advance.
+    impl->config.fixed_delay_us = -1'000'000;
+
+    impl->handle_stream_start(
+        {pcm_stream(OLD_FORMAT.sample_rate, OLD_FORMAT.channels, OLD_FORMAT.bits_per_sample)});
+    std::vector<uint8_t> old_chunk = filled_audio_chunk(OLD_SAMPLE, 2 * OLD_FRAME_BYTES);
+    InboundMessage old_message = message_over(old_chunk);
+    impl->handle_binary(old_message);
+    impl->handle_stream_start(
+        {pcm_stream(NEW_FORMAT.sample_rate, NEW_FORMAT.channels, NEW_FORMAT.bits_per_sample)});
+    std::vector<uint8_t> new_chunk = filled_audio_chunk(NEW_SAMPLE, 2 * NEW_FRAME_BYTES);
+    InboundMessage new_message = message_over(new_chunk);
+    impl->handle_binary(new_message);
+
+    SyncTask& task = *impl->sync_task;
+    SyncContext context;
+    start_context(task, context);
+    ASSERT_NO_FATAL_FAILURE(decode_next_item(task, context));  // The old format's header
+    ASSERT_NO_FATAL_FAILURE(decode_next_item(task, context));  // Its chunk
+    // A hard-sync gap ahead of it
+    context.silence_remaining = 2 * OLD_FRAME_BYTES;
+    transfer_pending(task, context);
+    // Underflow silence still pending when the update's header is taken: counted in the old
+    // format's bytes, which are not whole frames of the new one.
+    context.silence_remaining = 2 * OLD_FRAME_BYTES;
+    ASSERT_NO_FATAL_FAILURE(decode_next_item(task, context));  // The update's header
+    ASSERT_NO_FATAL_FAILURE(decode_next_item(task, context));  // Its chunk
+    transfer_pending(task, context);
+    // A hard-sync gap in the new format
+    context.silence_remaining = 2 * NEW_FRAME_BYTES;
+    task.send_pending_silence(context);
+
+    using Write = RecordingSink::Write;
+    const std::vector<Write> expected = {
+        {2 * OLD_FRAME_BYTES, 0x00, OLD_FORMAT},
+        {2 * OLD_FRAME_BYTES, OLD_SAMPLE, OLD_FORMAT},
+        {2 * NEW_FRAME_BYTES, NEW_SAMPLE, NEW_FORMAT},
+        {2 * NEW_FRAME_BYTES, 0x00, NEW_FORMAT},
+    };
+    ASSERT_EQ(sink.writes.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        SCOPED_TRACE("write " + std::to_string(i));
+        EXPECT_EQ(sink.writes[i].bytes, expected[i].bytes);
+        EXPECT_EQ(sink.writes[i].first_byte, expected[i].first_byte);
+        EXPECT_EQ(sink.writes[i].format, expected[i].format)
+            << sink.writes[i].format.sample_rate << " Hz, "
+            << int{sink.writes[i].format.channels} << " ch, "
+            << int{sink.writes[i].format.bits_per_sample} << "-bit";
+    }
 }

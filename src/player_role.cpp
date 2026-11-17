@@ -141,6 +141,20 @@ PlayerRole::Impl::~Impl() {
 }
 
 // ============================================================================
+// PlayerRoleListener
+// ============================================================================
+
+size_t PlayerRoleListener::on_audio_output(std::span<const uint8_t> pcm,
+                                           const AudioFormat& /*format*/, uint32_t timeout_ms) {
+    // The sync task writes from its decode buffer and its silence scratch, both mutable storage,
+    // so handing the deprecated form a pointer with const cast away is defined.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    return this->on_audio_write(const_cast<uint8_t*>(pcm.data()), pcm.size(), timeout_ms);
+#pragma GCC diagnostic pop
+}
+
+// ============================================================================
 // PlayerRole forwarding (public API → Impl)
 // ============================================================================
 
@@ -186,9 +200,19 @@ void PlayerRole::set_mute_adjustable(bool adjustable) {
     this->impl_->client->publish_state();
 }
 
+std::optional<PlayerStreamInfo> PlayerRole::stream_info() const {
+    if (!this->impl_->stream_active) {
+        return std::nullopt;
+    }
+    return this->impl_->stream_info;
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 const ServerPlayerStreamObject& PlayerRole::get_current_stream_params() const {
     return this->impl_->current_stream_params;
 }
+#pragma GCC diagnostic pop
 
 bool PlayerRole::get_muted() const {
     return this->impl_->muted;
@@ -367,7 +391,7 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
 }
 
 void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {
-    ServerPlayerStreamObject player_obj = player.params;
+    PlayerStreamParams player_obj = player.params;
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     bool header_sent = false;
     // Numbers the codec header and the STREAM_START, so the sync task starts the stream only on
@@ -380,9 +404,9 @@ void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {
     } else {
         auto codec = player_obj.codec.value();
         if (codec == SendspinCodecFormat::OPUS) {
-            // The codec header below and the params the consumer configures its output from both
-            // carry the depth the decoder writes, not stream/start's bit_depth, which is ignored
-            // for opus (roles/player/v1.md "stream/start player object").
+            // The codec header below, which sets the format of every write, and the deprecated
+            // stream params both carry the depth the decoder writes, not stream/start's bit_depth,
+            // which is ignored for opus (roles/player/v1.md "stream/start player object").
             player_obj.bit_depth = OPUS_DECODED_BITS_PER_SAMPLE;
         }
 
@@ -438,7 +462,7 @@ void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {
     // high_performance_requested_for_playback main-thread-only. Both carry `generation`, so a
     // teardown that runs before the drain takes them leaves a START the drain discards and params
     // it never applies (see drain_events()).
-    this->event_state->stream_params_slot.write(ServerPlayerStreamObject{player_obj}, generation);
+    this->event_state->stream_params_slot.write(PlayerStreamParams{player_obj}, generation);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation, ordinal);
 }
 
@@ -603,11 +627,21 @@ void PlayerRole::Impl::drain_events() {
                     }
                     // The params handle_stream_start() wrote with this START, taken under the
                     // START's own stamp: params a later teardown's next stream wrote while a
-                    // callback above ran stay pending for that stream's START.
-                    ServerPlayerStreamObject stream_params;
+                    // callback above ran stay pending for that stream's START. A START left without
+                    // its own params keeps the previous ones.
+                    PlayerStreamParams stream_params;
                     if (this->event_state->stream_params_slot.take_stamped(stream_params,
                                                                            event.epoch)) {
-                        this->current_stream_params = stream_params;
+                        this->current_stream_params.codec = stream_params.codec;
+                        this->current_stream_params.sample_rate = stream_params.sample_rate;
+                        this->current_stream_params.channels = stream_params.channels;
+                        this->current_stream_params.bit_depth = stream_params.bit_depth;
+                        // Complete: handle_stream_start() writes only params it handed on
+                        this->stream_info = {
+                            .codec = stream_params.codec.value_or(SendspinCodecFormat{}),
+                            .sample_rate = stream_params.sample_rate.value_or(0),
+                            .channels = stream_params.channels.value_or(0),
+                            .bit_depth = stream_params.bit_depth.value_or(0)};
                     }
                     this->stream_active = true;
                     if (this->listener) {

@@ -92,9 +92,9 @@ using namespace sendspin;
 static constexpr uint16_t DEFAULT_SENDSPIN_PORT = SendspinClientConfig::DEFAULT_SERVER_PORT;
 static const char* SENDSPIN_PATH = "/sendspin";
 
-// Null audio write callback (used when PortAudio is not available)
-static size_t null_audio_write(uint8_t*, size_t length, uint32_t) {
-    return length;
+// Null audio output callback (used when PortAudio is not available)
+static size_t null_audio_output(std::span<const uint8_t> pcm, const AudioFormat&, uint32_t) {
+    return pcm.size();
 }
 
 #ifdef SENDSPIN_HAS_MDNS
@@ -674,31 +674,28 @@ int main(int argc, char* argv[]) {
         TuiPlayerListener(TuiState& s, PlayerRole& p) : state(s), player(p) {}
 #endif
 
-        size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
+        // Shows each write's format, which the sink also opens its PortAudio stream in. No write
+        // of a stream follows its on_stream_end(), so the panel clears between streams.
+        size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
+                               uint32_t timeout_ms) override {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.sample_rate = format.sample_rate;
+                state.bit_depth = format.bits_per_sample;
+                state.channels = format.channels;
+            }
 #ifdef TUI_CLIENT_HAS_AUDIO_SINK
-            return sink.write(data, length, timeout_ms);
+            return sink.write(pcm, format, timeout_ms);
 #else
-            return null_audio_write(data, length, timeout_ms);
+            return null_audio_output(pcm, format, timeout_ms);
 #endif
         }
 
         void on_stream_start() override {
-            {
-                std::lock_guard<std::mutex> lock(state.mutex);
-                auto& params = player.get_current_stream_params();
-                state.codec = params.codec;
-                state.sample_rate = params.sample_rate;
-                state.bit_depth = params.bit_depth;
-                state.channels = params.channels;
-                state.streaming = true;
-            }
-#ifdef TUI_CLIENT_HAS_AUDIO_SINK
-            auto& params = player.get_current_stream_params();
-            if (params.sample_rate.has_value() && params.channels.has_value() &&
-                params.bit_depth.has_value()) {
-                sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
-            }
-#endif
+            const std::optional<PlayerStreamInfo> stream = player.stream_info();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.codec = stream ? std::optional(stream->codec) : std::nullopt;
+            state.streaming = true;
         }
 
         void on_stream_end() override {

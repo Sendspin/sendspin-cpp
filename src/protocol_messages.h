@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "audio_types.h"
 #include "crypto/psk_wrap.h"
 #include "enum_set.h"
 #include "inline_text.h"
@@ -534,10 +535,10 @@ struct PlayerSupportObject {
 inline constexpr size_t FLAC_CODEC_HEADER_BYTES = 42;
 using FlacCodecHeader = std::array<uint8_t, FLAC_CODEC_HEADER_BYTES>;
 
-/// @brief A parsed stream/start player object: the public ServerPlayerStreamObject, plus the
-/// decoded codec header the sync task's decoder takes, which only a FLAC stream carries
+/// @brief A parsed stream/start player object: its audio parameters, plus the decoded codec header
+/// the sync task's decoder takes, which only a FLAC stream carries
 struct PlayerStreamPayload {
-    ServerPlayerStreamObject params{};
+    PlayerStreamParams params{};
     std::optional<FlacCodecHeader> flac_header{};
 };
 
