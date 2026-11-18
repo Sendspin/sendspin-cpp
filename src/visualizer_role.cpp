@@ -477,7 +477,7 @@ void VisualizerRole::Impl::handle_stream_clear() {
     this->enqueue_stream_event(VisualizerEventType::STREAM_CLEAR, generation, ordinal);
 }
 
-void VisualizerRole::Impl::handle_stream_clear_from(int64_t from_us) {
+void VisualizerRole::Impl::handle_stream_clear_from(int64_t from_us) const {
     // roles/visualizer/v1.md "stream/clear visualizer": only the frames at or after the cut go,
     // and they count as never sent, so returning them releases their charge. Every listed item is
     // a frame.

@@ -169,7 +169,7 @@ struct VisualizerRole::Impl : RoleTeardown {
     void handle_stream_clear();
     /// @brief A stream/clear with from_timestamp: discards the frames at or after `from_us` and
     /// keeps the earlier ones. No stream event: the stream continues for the listener.
-    void handle_stream_clear_from(int64_t from_us);
+    void handle_stream_clear_from(int64_t from_us) const;
     /// @brief Holds a current VISUALIZER_STREAM event in held_events for drain_events() to fire,
     /// or acknowledges one that finds it full. Main loop.
     void on_stream_ring_event(const InboxEvent& event);
