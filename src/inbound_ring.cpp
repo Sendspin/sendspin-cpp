@@ -356,6 +356,56 @@ void InboundItemList::release_charges() {
     }
 }
 
+size_t InboundItemList::discard_from(int64_t cut, bool (*at_or_after)(void* item, int64_t cut)) {
+    uint32_t chain_head = INBOUND_LIST_END;
+    uint32_t chain_tail = INBOUND_LIST_END;
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->cut_since_take_ = std::min(this->cut_since_take_, cut);
+        uint32_t previous = INBOUND_LIST_END;
+        for (uint32_t offset = this->head_; offset != INBOUND_LIST_END;) {
+            void* item = this->item_at(offset);
+            InboundItemHeader* header = inbound_item_header(item);
+            const uint32_t next = header->next;
+            if (!at_or_after(item, cut)) {
+                previous = offset;
+                offset = next;
+                continue;
+            }
+            if (previous == INBOUND_LIST_END) {
+                this->head_ = next;
+            } else {
+                inbound_item_header(this->item_at(previous))->next = next;
+            }
+            if (this->tail_ == offset) {
+                this->tail_ = previous;
+            }
+            header->next = INBOUND_LIST_END;
+            if (chain_tail == INBOUND_LIST_END) {
+                chain_head = offset;
+            } else {
+                inbound_item_header(this->item_at(chain_tail))->next = offset;
+            }
+            chain_tail = offset;
+            offset = next;
+        }
+    }
+    // As recall(): the detached chain is returned outside the list's lock.
+    size_t returned = 0;
+    while (chain_head != INBOUND_LIST_END) {
+        void* item = this->item_at(chain_head);
+        chain_head = inbound_item_header(item)->next;
+        this->ring_->return_item(item);
+        ++returned;
+    }
+    return returned;
+}
+
+int64_t InboundItemList::cut_since_take() const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->cut_since_take_;
+}
+
 void* InboundItemList::pop() {
     std::lock_guard<std::mutex> lock(this->mutex_);
     if (this->head_ == INBOUND_LIST_END) {
@@ -366,6 +416,8 @@ void* InboundItemList::pop() {
     if (this->head_ == INBOUND_LIST_END) {
         this->tail_ = INBOUND_LIST_END;
     }
+    // A cut made from here on comes after this item was listed (cut_since_take()).
+    this->cut_since_take_ = INT64_MAX;
     return item;
 }
 
@@ -489,6 +541,13 @@ void InboundConsumer::release_charges() {
         return;
     }
     this->items_.release_charges();
+}
+
+size_t InboundConsumer::discard_from(int64_t cut, bool (*at_or_after)(void* item, int64_t cut)) {
+    if (this->ring() == nullptr) {
+        return 0;
+    }
+    return this->items_.discard_from(cut, at_or_after);
 }
 
 const char* InboundConsumer::dropped_items_name() const {

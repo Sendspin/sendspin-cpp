@@ -135,7 +135,8 @@ public:
     /// roles, which discards the buffered frames along with the stream.
     virtual void on_visualizer_stream_end() {}
 
-    /// @brief Called when a visualizer stream is cleared
+    /// @brief Called when a visualizer stream is cleared; not for a stream/clear with
+    /// from_timestamp, which keeps the stream's earlier frames
     virtual void on_visualizer_stream_clear() {}
 };
 

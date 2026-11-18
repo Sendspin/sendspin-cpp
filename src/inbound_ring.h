@@ -521,10 +521,10 @@ private:
  * thread, take()); recall()
  * may run on the protocol task, or on any thread once the consumer is joined.
  *
- * mutex_ guards head_, tail_ and every next link and charge of a linked item, and the return
- * count of a LOCAL item charged to this list's holder (InboundRing::return_item()). It is a leaf:
- * nothing is called under it, and the ring's lock is taken only after it is released (recall()
- * detaches the chain first, then returns the items).
+ * mutex_ guards head_, tail_, cut_since_take_ and every next link and charge of a linked item,
+ * and the return count of a LOCAL item charged to this list's holder (InboundRing::return_item()).
+ * It is a leaf: nothing is called under it, and the ring's lock is taken only after it is
+ * released (recall() and discard_from() detach their chain first, then return the items).
  */
 class InboundItemList {
 public:
@@ -605,6 +605,17 @@ public:
     /// consumer to take and return. Protocol task.
     void release_charges();
 
+    /// @brief Unlinks every item not yet taken for which `at_or_after(item, cut)` holds and
+    /// returns each through InboundRing::return_item(), oldest first, releasing its charge; the
+    /// rest stay linked in order. Lowers cut_since_take() to `cut`. Protocol task.
+    /// @return The number of items returned.
+    size_t discard_from(int64_t cut, bool (*at_or_after)(void* item, int64_t cut));
+
+    /// @brief The earliest cut a discard_from() made since the consumer's latest take, or
+    /// INT64_MAX: the item that take returned was listed before each such cut, so the consumer
+    /// judges it against this as discard_from() judged the listed ones. Consumer only.
+    int64_t cut_since_take() const;
+
     /// @brief Whether no item is linked. Any thread.
     bool is_empty() const {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -636,6 +647,10 @@ private:
     /// Written once by create(), before the producer and consumer run.
     InboundRing* ring_{nullptr};
     uint8_t* storage_{nullptr};
+
+    // 64-bit fields
+    /// See cut_since_take(). Lowered by discard_from() and reset by each take, under mutex_.
+    int64_t cut_since_take_{INT64_MAX};
 
     // 8-bit fields
     /// The holder create() registered the list for. Written once by create().
@@ -747,6 +762,12 @@ public:
     /// then. Protocol task, the thread that hands items over, so every item released
     /// predates the boundary. A no-op outside a run.
     void release_charges();
+
+    /// @brief InboundItemList::discard_from() on the consumer's list, for a stream/clear with
+    /// from_timestamp. Protocol task, the thread that hands items over, so every item judged
+    /// predates the clear. A no-op outside a run.
+    /// @return The number of items returned.
+    size_t discard_from(int64_t cut, bool (*at_or_after)(void* item, int64_t cut));
 
     /// @brief Why a message was dropped instead of handed over, which picks note_drop()'s warning
     enum class DropReason : uint8_t {

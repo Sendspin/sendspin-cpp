@@ -1013,7 +1013,8 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 
 // ============================================================================
 // Stream boundaries: a stream/start with no stream running, stream/end, stream/clear and a
-// teardown each recall the listed frames and move the role's boundary on.
+// teardown each recall the listed frames and move the role's boundary on; a stream/clear with
+// from_timestamp, no boundary, returns only the frames from its cut on.
 // ============================================================================
 
 // A boundary returns the frames listed before it, so only frames sent after the latest one
@@ -1021,20 +1022,22 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 // updates the running stream is no boundary: the client keeps the buffered frames
 // (roles/visualizer/v1.md "Server -> Client: stream/start visualizer object"), those of a type
 // the update stops serving included, while later frames of that type are not admitted. Every
-// frame left is current, so the drain thread delivers it. The rows drive the handlers with no
-// drain thread; the held frame is covered by
-// ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime and
+// frame left is current, so the drain thread delivers it. A stream/clear with from_timestamp is
+// no boundary either: it returns only the frames from its cut on (roles/visualizer/v1.md
+// "stream/clear visualizer"). The rows drive the handlers with no drain thread; the held frame is
+// covered by ClientLifecycle.AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime and
 // VisualizerDelivery.AnUpdatingStreamStartKeepsTheHeldAndListedFrames.
 // Gap: a current held frame's resumed wait.
 TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
-    enum class Step { END, START, START_BEAT_ONLY, CLEAR, CLEANUP, FRAME };
+    enum class Step { END, START, START_BEAT_ONLY, CLEAR, CLEAR_FROM, CLEANUP, FRAME };
     struct Row {
         const char* name;
         std::vector<Step> steps;
         std::vector<uint8_t> surviving;  // the last payload byte of each frame taken
+        int64_t cut = 0;                 // CLEAR_FROM's from_timestamp
     };
     // Every row first lists two frames of the running stream (payload 0x01); each FRAME step
-    // lists one carrying the next value from 0x02.
+    // lists one carrying the next value from 0x02. A frame's timestamp is its value.
     const Row rows[] = {
         {"Control: no boundary keeps the running stream's frames", {}, {0x01, 0x01}},
         {"an end with no stream after it empties the list", {Step::END}, {}},
@@ -1042,6 +1045,14 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
          {Step::END, Step::START, Step::FRAME},
          {0x02}},
         {"a clear keeps the frame sent after it", {Step::CLEAR, Step::FRAME}, {0x02}},
+        {"a clear from a timestamp keeps the frames before it and the frame sent after it",
+         {Step::FRAME, Step::FRAME, Step::CLEAR_FROM, Step::FRAME},
+         {0x01, 0x01, 0x02, 0x04},
+         3},
+        {"a clear from before every frame keeps only the frame sent after it",
+         {Step::CLEAR_FROM, Step::FRAME},
+         {0x02},
+         1},
         {"a start updating the running stream keeps the frames before it",
          {Step::START, Step::FRAME},
          {0x01, 0x01, 0x02}},
@@ -1089,6 +1100,9 @@ TEST(VisualizerBoundary, ABoundaryReturnsTheFramesListedBeforeIt) {
                     break;
                 case Step::CLEAR:
                     impl->handle_stream_clear();
+                    break;
+                case Step::CLEAR_FROM:
+                    impl->handle_stream_clear_from(row.cut);
                     break;
                 case Step::CLEANUP:
                     impl->cleanup();

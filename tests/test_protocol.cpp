@@ -955,6 +955,37 @@ TEST(Protocol, StreamEndAndClearRolesParse) {
     }
 }
 
+// messaging.md "stream/clear": `from_timestamp` is an optional signed server clock time; one that
+// is present but not an integer is malformed and rejects the message.
+TEST(Protocol, StreamClearFromTimestampParse) {
+    struct Row {
+        const char* payload;
+        bool accepted;
+        std::optional<int64_t> expected;
+    };
+    const Row rows[] = {
+        {R"({})", true, std::nullopt},  // Control: absent
+        {R"({"from_timestamp":null})", true, std::nullopt},
+        {R"({"from_timestamp":1700000000123456})", true, 1700000000123456},  // Control
+        {R"({"from_timestamp":-5})", true, -5},
+        {R"({"from_timestamp":"12"})", false, std::nullopt},
+        {R"({"from_timestamp":1.5})", false, std::nullopt},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.payload);
+        JsonDocument doc;
+        JsonObject root;
+        const std::string json = std::string(R"({"type":"stream/clear","payload":)") +
+                                 row.payload + "}";
+        ASSERT_TRUE(parse(json.c_str(), doc, root));
+        StreamClearMessage msg;
+        EXPECT_EQ(process_stream_clear_message(root, &msg), row.accepted);
+        if (row.accepted) {
+            EXPECT_EQ(msg.from_timestamp, row.expected);
+        }
+    }
+}
+
 // Enum fields are validated against the known wire strings: a recognized value is applied, an
 // unrecognized one is dropped (leaving the field untouched) rather than clearing or storing garbage.
 TEST(Protocol, GroupUpdatePlaybackStateValidation) {

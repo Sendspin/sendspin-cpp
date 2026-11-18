@@ -85,6 +85,7 @@ INITIAL_SYNC ──→ LOAD_CHUNK ──→ SYNCHRONIZE_AUDIO ──→ TRANSFER
      └──→ LOAD_CHUNK (once first playback progress callback confirms frames were consumed)
 
 COMMAND_STREAM_CLEAR from any state → discard up to the clear marker → INITIAL_SYNC
+COMMAND_STREAM_CUT in the inner loop → a decoded chunk starting at or after the cut is dropped → LOAD_CHUNK
 ```
 
 - **INITIAL_SYNC** primes the audio pipeline with `INITIAL_SYNC_PRIMING_MS` of silence, then adds `extra_startup_silence_ms` (`PlayerRoleConfig`) of lead once the sink confirms it is consuming, so the decoder starts with slack ahead of the sink.
@@ -93,6 +94,8 @@ COMMAND_STREAM_CLEAR from any state → discard up to the clear marker → INITI
 - **TRANSFER_AUDIO** writes the PCM through `on_audio_output`. When a hard sync inserted silence, it writes that first and then returns to SYNCHRONIZE_AUDIO to re-check the chunk it held back.
 
 A `stream/clear` (a seek) keeps the stream ACTIVE: the inner loop discards encoded and already-decoded audio up to the clear marker the protocol task appended, keeps the decoder, playtime accounting and any codec header queued ahead of the marker, and re-enters INITIAL_SYNC, which resumes priming only if it had not finished and otherwise passes straight to LOAD_CHUNK. The next chunk then re-aligns under the alignment rules above. A clear that reaches the task in WAIT FOR CLIENT ACK discards the same way and keeps the held header, so the stream still starts on its acknowledgement.
+
+A `stream/clear` with `from_timestamp` replaces only the audio from that time on and leaves alignment alone: the protocol task has already returned the listed chunks from the cut on, and the inner loop drops the chunk it decoded before the clear only if that chunk starts at or after the cut, then loads the next one. The kept audio plays on, and the replacement chunk, timestamped from the cut, lines up with where it ends. If the sink already took audio from past the cut, that audio plays and the next chunk's hard sync drops the start of the replacement up to where it ends, as roles/player/v1.md "stream/clear player" requires (an overlap within `HARD_SYNC_THRESHOLD_US` is absorbed by soft sync instead); outside alignment that hard sync is logged as a loss of sync, a sign that `required_lead_time_ms` does not cover the sink's buffer.
 
 ### Playback Progress
 

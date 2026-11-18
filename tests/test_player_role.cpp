@@ -644,9 +644,11 @@ TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
 // roles/player/v1.md "Player Buffer Accounting": a stream/clear or stream/end resets the server's
 // count, so it may refill the whole buffer before the sync task discards the audio queued ahead
 // of the boundary. The boundary releases that audio's charge at once, so the refill is kept, and
-// the sync task's later return of the old items releases nothing twice.
+// the sync task's later return of the old items releases nothing twice. A stream/clear with
+// from_timestamp removes only the chunks it discards from the count, so it frees exactly their
+// share: here one chunk of the refill fits and the next is over the quota.
 TEST(PlayerInboundHandOff, AStreamBoundaryFreesTheQuotaForTheRefillBehindIt) {
-    enum class Boundary { NONE, CLEAR, END };
+    enum class Boundary { NONE, CLEAR, CLEAR_FROM, END };
     struct Row {
         const char* name;
         Boundary boundary;
@@ -656,6 +658,7 @@ TEST(PlayerInboundHandOff, AStreamBoundaryFreesTheQuotaForTheRefillBehindIt) {
         {"Control: no boundary, the full quota drops the refill", Boundary::NONE, {0x01, 0x11}},
         // 0x00 is the clear marker, which carries no encoded bytes.
         {"stream/clear", Boundary::CLEAR, {0x01, 0x11, 0x00, 0x02, 0x12}},
+        {"stream/clear from the second chunk", Boundary::CLEAR_FROM, {0x01, 0x02}},
         {"stream/end", Boundary::END, {0x01, 0x11, 0x02, 0x12}},
     };
 
@@ -663,8 +666,8 @@ TEST(PlayerInboundHandOff, AStreamBoundaryFreesTheQuotaForTheRefillBehindIt) {
         SCOPED_TRACE(row.name);
         auto impl = make_impl();
         InboundRing& ring = *impl->sync_task->inbound().ring();
-        for (uint8_t marker : {0x01, 0x11}) {
-            InboundMessage old_chunk = receive_into_ring(ring, audio_chunk(marker), 0);
+        for (auto [marker, timestamp] : {std::pair<uint8_t, int64_t>{0x01, 100}, {0x11, 200}}) {
+            InboundMessage old_chunk = receive_into_ring(ring, audio_chunk(marker, timestamp), 0);
             impl->handle_binary(old_chunk);
         }
         const size_t full = ring.quota(InboundHolder::PLAYER).outstanding();
@@ -674,6 +677,8 @@ TEST(PlayerInboundHandOff, AStreamBoundaryFreesTheQuotaForTheRefillBehindIt) {
         if (row.boundary == Boundary::CLEAR) {
             impl->handle_stream_clear();
             take_in_ring_order(ring);
+        } else if (row.boundary == Boundary::CLEAR_FROM) {
+            impl->handle_stream_clear_from(200);
         } else if (row.boundary == Boundary::END) {
             impl->handle_stream_end();
         }
@@ -685,6 +690,117 @@ TEST(PlayerInboundHandOff, AStreamBoundaryFreesTheQuotaForTheRefillBehindIt) {
         EXPECT_EQ(take_all(*impl), row.listed);
         EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
             << "an item's charge was kept or released twice";
+    }
+}
+
+// roles/player/v1.md "stream/clear player": a stream/clear with from_timestamp discards only the
+// listed chunks at or after it and keeps the earlier ones playing, and the chunks sent after it
+// follow them. A codec header in the discarded stretch stays, since the clear does not change the
+// stream's format. Each item taken is reported by its frame's first byte, 0xFF for the header.
+TEST(PlayerInboundHandOff, StreamClearFromKeepsTheChunksBeforeItsCut) {
+    constexpr uint8_t HEADER = 0xFF;
+    struct Row {
+        const char* name;
+        std::optional<int64_t> cut;
+        std::vector<uint8_t> taken;
+    };
+    const Row rows[] = {
+        {"Control: no clear", std::nullopt, {0x01, 0x02, HEADER, 0x03, 0x04}},
+        {"Control: a cut after every chunk discards none", 400, {0x01, 0x02, HEADER, 0x03, 0x04}},
+        {"a cut at the last chunk", 300, {0x01, 0x02, HEADER, 0x04}},
+        {"a cut ahead of the header", 200, {0x01, HEADER, 0x04}},
+        {"a cut before every chunk", 0, {HEADER, 0x04}},
+        // The PCM header's bytes read as a negative timestamp, so only this cut would reach it
+        // without the chunk-type check.
+        {"a cut at the earliest timestamp", INT64_MIN, {HEADER, 0x04}},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        InboundRing& ring = *impl->sync_task->inbound().ring();
+        const auto receive = [&](uint8_t marker, int64_t timestamp) {
+            InboundMessage message = receive_into_ring(ring, audio_chunk(marker, timestamp), 0);
+            impl->handle_binary(message);
+        };
+        receive(0x01, 100);
+        receive(0x02, 200);
+        impl->handle_stream_start({pcm_stream_params()});
+        take_in_ring_order(ring);
+        receive(0x03, 300);
+        if (row.cut.has_value()) {
+            impl->handle_stream_clear_from(*row.cut);
+        }
+        receive(0x04, row.cut.value_or(400));
+
+        std::vector<uint8_t> taken;
+        while (void* item = impl->sync_task->take_item(0)) {
+            taken.push_back(SyncTask::chunk_type(item) == CHUNK_TYPE_ENCODED_AUDIO
+                                ? SyncTask::encoded_data(item)[0]
+                                : HEADER);
+            impl->sync_task->inbound().return_item(item);
+        }
+        EXPECT_EQ(taken, row.taken);
+        EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(), 0U)
+            << "an item's charge was kept or released twice";
+    }
+}
+
+// The chunk the sync task decoded before a stream/clear with from_timestamp is dropped, with the
+// gap silence queued ahead of it, only if it starts at or after the cut; the task then loads the
+// next chunk. A cut made before the task took the chunk was applied to it on the list, so it does
+// not apply again. Reaches SyncTask's apply_stream_cut() and event_flags_, the step and the flag
+// the sync thread runs and reads.
+TEST(PlayerStreamClearFrom, TheDecodedChunkGoesOnlyIfItStartsAtOrAfterTheCut) {
+    constexpr int64_t CHUNK_TS = 200;
+    constexpr size_t GAP_SILENCE = 64;
+    struct Row {
+        const char* name;
+        int64_t cut;
+        bool cut_before_take;
+        bool dropped;
+    };
+    const Row rows[] = {
+        {"Control: the chunk starts before the cut", 300, false, false},
+        {"the chunk starts at the cut", CHUNK_TS, false, true},
+        {"the chunk starts after the cut", 100, false, true},
+        {"a cut made before the chunk was taken", 100, true, false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        SyncTask& task = *impl->sync_task;
+        InboundRing& ring = *task.inbound().ring();
+        InboundMessage message = receive_into_ring(ring, audio_chunk(0x01, 0), 0);
+        impl->handle_binary(message);
+        if (row.cut_before_take) {
+            impl->handle_stream_clear_from(row.cut);
+        }
+        void* item = task.take_item(0);
+        ASSERT_NE(item, nullptr);
+        task.inbound().return_item(item);  // decoded: what the chunk held is in the buffer
+        if (!row.cut_before_take) {
+            impl->handle_stream_clear_from(row.cut);
+        }
+        ASSERT_NE(task.event_flags_.get() & COMMAND_STREAM_CUT, 0U);
+
+        SyncContext context;
+        context.current_stream_info = AudioStreamInfo(16, 2, 44100);
+        context.bytes_per_frame = context.current_stream_info.frames_to_bytes(1);
+        const size_t chunk_bytes = context.current_stream_info.frames_to_bytes(441);
+        ASSERT_TRUE(context.decode_buffer.allocate(chunk_bytes + context.bytes_per_frame,
+                                                   MemoryLocation::PREFER_INTERNAL));
+        context.decode_buffer.increase_buffer_length(chunk_bytes);
+        context.decoded_server_timestamp = CHUNK_TS;
+        context.silence_remaining = GAP_SILENCE;
+        SyncTaskState state = SyncTaskState::TRANSFER_AUDIO;
+
+        task.apply_stream_cut(context, state);
+        EXPECT_EQ(task.event_flags_.get() & COMMAND_STREAM_CUT, 0U);
+        EXPECT_EQ(context.decode_buffer.available(), row.dropped ? 0U : chunk_bytes);
+        EXPECT_EQ(context.silence_remaining, row.dropped ? 0U : GAP_SILENCE);
+        EXPECT_EQ(state, row.dropped ? SyncTaskState::LOAD_CHUNK : SyncTaskState::TRANSFER_AUDIO);
     }
 }
 

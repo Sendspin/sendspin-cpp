@@ -449,7 +449,9 @@ struct PlayerRoleConfig {
     /// client/state player object, measured from the server's transmission of a stream/start or
     /// stream/clear to the playback timestamp of the first chunk that can be played in full
     /// (roles/player/v1.md "client/state player object"). The server treats it as a hint and may
-    /// give less.
+    /// give less, except for a stream/clear with from_timestamp; while a stream runs it must also
+    /// cover the audio the output holds past on_audio_output() (roles/player/v1.md "Timing
+    /// parameters").
     ///
     /// Unset reports `pipeline_lead_time_ms(extra_startup_silence_ms)`, so raising the startup
     /// silence raises the lead the server gives. Set it to cover an output whose own startup

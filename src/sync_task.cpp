@@ -234,6 +234,16 @@ void SyncTask::signal_stream_clear() {
     this->inbound_.items().wake_receiver();
 }
 
+void SyncTask::signal_stream_cut() {
+    if (!this->is_initialized()) {
+        return;
+    }
+    // No wake: a task waiting in a take holds no chunk to judge, and the inner loop checks the
+    // flag before each step that writes one. A flag set while the task is idle is cleared by the
+    // next stream's first step, with nothing decoded yet to judge.
+    this->event_flags_.set(EventGroupBits::COMMAND_STREAM_CUT);
+}
+
 void SyncTask::signal_stream_start(uint16_t ordinal) {
     if (!this->is_initialized()) {
         return;
@@ -739,6 +749,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             return decoded;
         }
         sync_context.decoded_timestamp = client_timestamp;
+        sync_context.decoded_server_timestamp = server_timestamp(sync_context.encoded_item);
         // The buffer was empty on entry, so this is exactly this chunk's output, already capped at
         // MAX_AUDIO_CHUNK_MS by decode_whole_chunk().
         sync_context.last_chunk_duration_us =
@@ -907,6 +918,22 @@ void SyncTask::apply_stream_clear(SyncContext& sync_context) {
     this->event_flags_.clear(EventGroupBits::COMMAND_STREAM_CLEAR);
 }
 
+void SyncTask::apply_stream_cut(SyncContext& sync_context, SyncTaskState& sync_state) {
+    // Cleared before the cut is read: a cut made after the read sets the flag again.
+    this->event_flags_.clear(EventGroupBits::COMMAND_STREAM_CUT);
+    if (sync_context.decode_buffer.available() == 0 ||
+        sync_context.decoded_server_timestamp < this->inbound_.items().cut_since_take()) {
+        return;
+    }
+    // roles/player/v1.md "stream/clear player": the chunk was listed before the clear and starts
+    // at or after its from_timestamp. What of it the sink already took still plays, and the next
+    // chunk's sync drops the start of the replacement up to where that ends.
+    sync_context.decode_buffer.decrease_buffer_length(sync_context.decode_buffer.available());
+    sync_context.silence_remaining = 0;
+    sync_context.release_chunk = false;
+    sync_state = SyncTaskState::LOAD_CHUNK;
+}
+
 void SyncTask::discard_to_clear_marker(SyncContext& sync_context) {
     // A stream/clear arrived: discard the audio queued up to the marker the protocol task appends
     // right after signaling. The newest pending codec header on the way is kept in encoded_item,
@@ -958,6 +985,7 @@ void SyncTask::reset_context(SyncContext& sync_context) {
     // Reset SyncContext between streams without deallocating buffers.
     sync_context.encoded_item = nullptr;
     sync_context.decoded_timestamp = 0;
+    sync_context.decoded_server_timestamp = 0;
     sync_context.new_audio_client_playtime = 0;
     sync_context.last_chunk_duration_us = 0;
     sync_context.queued_audio.clear();
@@ -1131,6 +1159,9 @@ void SyncTask::thread_entry(void* params) {
                 this_task->discard_to_clear_marker(sync_context);
                 sync_state = SyncTaskState::INITIAL_SYNC;
                 continue;
+            }
+            if (flags & COMMAND_STREAM_CUT) {
+                this_task->apply_stream_cut(sync_context, sync_state);
             }
 
             this_task->process_playback_progress(sync_context);

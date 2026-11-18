@@ -112,6 +112,9 @@ struct PlayerRole::Impl : RoleTeardown {
     void handle_stream_start(const PlayerStreamPayload& player);
     void handle_stream_end() const;
     void handle_stream_clear();
+    /// @brief A stream/clear with from_timestamp: discards the audio at or after `from_us` and
+    /// keeps the earlier audio playing.
+    void handle_stream_clear_from(int64_t from_us) const;
     void handle_server_command(const ServerCommandMessage& cmd) const;
     /// @brief Holds a PLAYER_STREAM event (code: PlayerStreamCallbackType; serial: a STREAM_START's
     /// stream ordinal) in awaiting_sync_idle_events. Main loop.

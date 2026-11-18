@@ -612,10 +612,10 @@ constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 // publish, then one full burst of client/time and server/time exchanges, then the first
 // controller server/state, then the first group/update messages, then the first metadata
 // server/state messages, then an artwork and visualizer stream/start and a stream/end and a
-// stream/clear that name their roles, then the sync task's first FLAC codec header, then a FLAC
-// stream/start the player takes, then one that changes the running stream's sample rate through
-// to the sync task's first write at the new rate, then a stream/start whose player section the
-// connection, no longer owning the player, does not take.
+// stream/clear that name their roles and one with from_timestamp, then the sync task's first FLAC
+// codec header, then a FLAC stream/start the player takes, then one that changes the running
+// stream's sample rate through to the sync task's first write at the new rate, then a
+// stream/start whose player section the connection, no longer owning the player, does not take.
 // The roles' public command and type lists and the strings of the deprecated metadata and group
 // objects are reserved when they are built, so even the first fill on the main loop allocates
 // nothing; the metadata and group listeners override both forms, so each window counts the views
@@ -809,7 +809,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
 #endif
 
     // Closes on the client/state the trailing volume command publishes, which the protocol task
-    // sends only after handling the three stream messages ahead of it.
+    // sends only after handling the four stream messages ahead of it.
     const int states_before_streams = server->client_state_count();
     open_window();
     {
@@ -824,11 +824,13 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
         ASSERT_TRUE(server->send_app_json(
             R"({"type":"stream/clear","payload":{"roles":["player","visualizer"]}})"));
         ASSERT_TRUE(server->send_app_json(
+            R"({"type":"stream/clear","payload":{"from_timestamp":0,"roles":["player"]}})"));
+        ASSERT_TRUE(server->send_app_json(
             R"({"type":"server/command","payload":{"player":{"command":"volume","volume":17}}})"));
     }
     pump_while_not(client, [&] { return server->client_state_count() > states_before_streams; });
     expect_library_allocations(close_window(),
-                               "stream/start, stream/end and stream/clear with roles",
+                               "stream/start, stream/end and both stream/clear forms",
                                STREAM_MESSAGES_ALLOCATIONS);
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     EXPECT_EQ(visualizer_listener.stream_starts, starts_before_streams + 1)

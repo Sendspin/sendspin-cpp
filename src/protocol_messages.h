@@ -1236,6 +1236,9 @@ struct StreamEndMessage {
 /// @brief Parsed stream/clear message listing which roles the buffer flush applies to
 struct StreamClearMessage {
     StreamRoles roles{};
+    /// Server clock time from which buffered data is cleared; nullopt clears all of it
+    /// (messaging.md "stream/clear")
+    std::optional<int64_t> from_timestamp{};
 };
 
 /// @brief Parsed pair/abort message (received or sent during a pairing exchange)

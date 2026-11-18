@@ -516,13 +516,18 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 const bool clear_player = clears(SendspinRole::PLAYER);
                 const bool clear_visualizer = clears(SendspinRole::VISUALIZER);
 
-                SS_LOGD(TAG, "Stream clear - player:%d visualizer:%d", clear_player,
-                        clear_visualizer);
+                const std::optional<int64_t> from = clear_msg.from_timestamp;
+                SS_LOGD(TAG, "Stream clear - player:%d visualizer:%d partial:%d", clear_player,
+                        clear_visualizer, from.has_value());
 
 #ifdef SENDSPIN_ENABLE_PLAYER
                 if (this->player_ && clear_player &&
                     role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                    this->player_->impl_->handle_stream_clear();
+                    if (from.has_value()) {
+                        this->player_->impl_->handle_stream_clear_from(*from);
+                    } else {
+                        this->player_->impl_->handle_stream_clear();
+                    }
                 }
 #endif
 
@@ -530,7 +535,11 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 if (this->visualizer_ && clear_visualizer &&
                     role_accepts_traffic(*this->connection_manager_, conn,
                                          SendspinRole::VISUALIZER)) {
-                    this->visualizer_->impl_->handle_stream_clear();
+                    if (from.has_value()) {
+                        this->visualizer_->impl_->handle_stream_clear_from(*from);
+                    } else {
+                        this->visualizer_->impl_->handle_stream_clear();
+                    }
                 }
 #endif
             }

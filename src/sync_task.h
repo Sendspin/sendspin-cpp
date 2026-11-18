@@ -118,6 +118,9 @@ struct SyncContext {
 
     // 64-bit fields
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
+    /// Server timestamp of the chunk the decoded audio came from, judged against a
+    /// stream/clear's from_timestamp (apply_stream_cut())
+    int64_t decoded_server_timestamp{0};
     int64_t new_audio_client_playtime{0};
     /// How much audio the previous chunk of this stream decoded to, the predicted length of the
     /// next one; 0 until one has decoded.
@@ -148,10 +151,11 @@ enum EventGroupBits : uint16_t {
     COMMAND_STOP = (1 << 0),          // Signal task to stop
     COMMAND_STREAM_END = (1 << 1),    // Signal end of current stream
     COMMAND_STREAM_CLEAR = (1 << 2),  // Seek: discard buffered audio up to the clear marker
-    COMMAND_START = (1 << 3),  // Wake: a stream start was acknowledged (see started_ordinal_)
-    TASK_RUNNING = (1 << 8),   // Task is actively processing a stream
-    TASK_STOPPED = (1 << 10),  // Task thread has exited
-    TASK_IDLE = (1 << 12),     // Task is idle, waiting for a new stream
+    COMMAND_START = (1 << 3),       // Wake: a stream start was acknowledged (see started_ordinal_)
+    COMMAND_STREAM_CUT = (1 << 4),  // A stream/clear with from_timestamp (signal_stream_cut())
+    TASK_RUNNING = (1 << 8),        // Task is actively processing a stream
+    TASK_STOPPED = (1 << 10),       // Task thread has exited
+    TASK_IDLE = (1 << 12),          // Task is idle, waiting for a new stream
 };
 
 /// @brief Self-contained sync task for Sendspin synchronized audio playback
@@ -223,6 +227,12 @@ public:
     /// existing codec, decoder, and playtime accounting intact. It does not return to idle.
     /// Thread-safe: may be called from any context.
     void signal_stream_clear();
+
+    /// @brief Signals the sync task that a stream/clear with from_timestamp discarded the listed
+    /// audio from a cut on (InboundItemList::discard_from()). Non-blocking. The task drops the
+    /// decoded chunk it holds if that chunk starts at or after the cut and keeps playing
+    /// otherwise. Protocol task.
+    void signal_stream_cut();
 
     /// @brief Acknowledges the start of stream `ordinal` once the main loop has fired its
     /// on_stream_start() (docs/internals.md, "Stream End and Start"). Main loop.
@@ -362,6 +372,12 @@ protected:
     /// sync logic re-align on its own. The caller re-enters the loop at INITIAL_SYNC so unfinished
     /// priming resumes.
     void apply_stream_clear(SyncContext& sync_context);
+
+    /// @brief Handles COMMAND_STREAM_CUT: clears it, then drops the decoded audio and the gap
+    /// silence ahead of it when the chunk it came from starts at or after
+    /// InboundItemList::cut_since_take(), moving `sync_state` to LOAD_CHUNK. The codec, the
+    /// decoder, the playtime accounting, hard_syncing and aligning stay as they are.
+    void apply_stream_cut(SyncContext& sync_context, SyncTaskState& sync_state);
 
     /// @brief Gives up the active stream after a decode buffer allocation failure: frees the
     /// decode buffer and resets the codec state (the FLAC decoder object is kept for the next FLAC
