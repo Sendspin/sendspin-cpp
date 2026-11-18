@@ -148,6 +148,20 @@ static bool format_advertised(const std::vector<AudioSupportedFormatObject>& for
     });
 }
 
+/// @brief Whether a FLAC codec header's STREAMINFO describes `params`: the same sample rate and
+/// channels, and a bit depth equal to bit_depth or filling it as each write's container depth (a
+/// 20-bit stream announced as 24)
+static bool flac_header_describes(const FlacCodecHeader& header, const PlayerStreamParams& params) {
+    // RFC 9639 section 8.2 "Streaminfo", after "fLaC" and the 4-byte block header: the sample rate
+    // is the 20 bits from byte 18, then 3 bits of channels - 1 and 5 bits of bits per sample - 1.
+    const uint32_t sample_rate = (static_cast<uint32_t>(header[18]) << 12) |
+                                 (static_cast<uint32_t>(header[19]) << 4) | (header[20] >> 4);
+    const uint32_t channels = ((header[20] >> 1) & 0x07U) + 1;
+    const uint32_t bits = (((header[20] & 0x01U) << 4) | (header[21] >> 4)) + 1;
+    return params.sample_rate == sample_rate && params.channels == channels &&
+           (params.bit_depth == bits || params.bit_depth == (bits + 7) / 8 * 8);
+}
+
 // ============================================================================
 // Impl constructor / destructor
 // ============================================================================
@@ -464,6 +478,10 @@ void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {
         } else if (codec == SendspinCodecFormat::FLAC) {
             if (!player.flac_header.has_value()) {
                 SS_LOGE(TAG, "FLAC codec header missing");
+            } else if (!flac_header_describes(*player.flac_header, player_obj)) {
+                // The decoder takes its format from STREAMINFO, so a header that disagrees with the
+                // listed format the message names would hand the sink an unlisted one.
+                SS_LOGE(TAG, "FLAC codec header does not describe the stream/start format");
             } else {
                 header_sent = this->sync_task->inbound().hand_local(
                     player.flac_header->data(), FLAC_CODEC_HEADER_BYTES,

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -70,6 +71,9 @@ static constexpr uint32_t INITIAL_SYNC_SETTLE_MIN_MS = 2U;
 /// @brief Size of the shared silence scratch buffer. Bounds the bytes pushed to the sink per call;
 /// silence longer than this is sent over multiple iterations.
 static constexpr size_t SILENCE_SCRATCH_BYTES = 1024;
+// send_pending_silence() writes at least one whole frame from the scratch. The widest is PCM's:
+// 255 channels of 32-bit samples, the depth audio_formats_valid() caps a listed format at.
+static_assert(SILENCE_SCRATCH_BYTES >= UINT8_MAX * 4, "the widest PCM frame must fit the scratch");
 
 /// @brief Chunk of zeros streamed to the sink for initial-sync priming and hard-sync gap fills.
 /// Never written after zero-initialization (the sink only ever reads its input). Deliberately
