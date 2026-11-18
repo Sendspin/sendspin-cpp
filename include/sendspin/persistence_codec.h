@@ -16,7 +16,7 @@
 /// @brief Storage-format codec for the persistence structs in sendspin/config.h
 ///
 /// `SendspinPersistenceProvider` (sendspin/client.h) is a plain blob store. The library is the
-/// only caller of this codec: for the record slot keys (`persistence_keys::record_slot_key()`)
+/// only caller of this codec: for the record slot keys (`persistence_keys::RecordSlotKey`)
 /// and `PAIRING_PSK` it turns `SendspinPairingRecord` / `SendspinPairingPsk` into the binary blob
 /// a provider stores, and back. A provider must not parse these blobs itself. It is public so a
 /// custom provider or a test can inspect or seed that content in the same format.
@@ -46,7 +46,7 @@
 /// provider's choice.
 ///
 /// Long-term records are stored one per key, under the slot keys
-/// `persistence_keys::record_slot_key()` names, with `persistence_keys::RECORD_ORDER` holding
+/// `persistence_keys::RecordSlotKey` names, with `persistence_keys::RECORD_ORDER` holding
 /// their eviction order. A pairing or a revocation rewrites one slot instead of every record,
 /// and a corrupt slot costs one record instead of the store. Slot numbers keep the keys short:
 /// `psk_id` (43 characters) would not fit an NVS key at all.

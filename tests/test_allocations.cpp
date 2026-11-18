@@ -899,9 +899,9 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
 /// flushes the windows below measure.
 class TestOwnedPersistence : public InMemoryPersistenceProvider {
 public:
-    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+    bool write_blob(std::string_view key, std::span<const uint8_t> data) override {
         TestOwned test_owned;
-        return InMemoryPersistenceProvider::save_blob(key, data, len);
+        return InMemoryPersistenceProvider::write_blob(key, data);
     }
 
     bool commit() override {
@@ -1125,14 +1125,14 @@ TEST(Allocations, RecordFlushesAfterAPlaybackHandoffAndAnUnpair) {
     EXPECT_EQ(stored_record_order(persistence), (std::vector<uint8_t>{1, 0}))
         << "the handoff must make the incoming server's record the most recent";
 
-    const int slot_writes = persistence.writes(persistence_keys::record_slot_key(0));
+    const int slot_writes = persistence.writes(slot_key(0));
     open_window();
     {
         TestOwned test_owned;
         ASSERT_TRUE(incoming_server->send_app_json(R"({"type":"server/unpair","payload":{}})"));
     }
     pump_while_not(client, [&] {
-        return persistence.writes(persistence_keys::record_slot_key(0)) > slot_writes;
+        return persistence.writes(slot_key(0)) > slot_writes;
     });
     expect_library_allocations(close_window(), "server/unpair and its record flush",
                                UNPAIR_ALLOCATIONS);

@@ -44,8 +44,9 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
-#include <vector>
+#include <string_view>
 
 namespace sendspin {
 
@@ -63,8 +64,8 @@ public:
     /// @return "$HOME/<filename>", or "./<filename>" if the HOME environment variable is unset.
     static std::string default_path(const std::string& filename);
 
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override;
-    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override;
+    std::optional<size_t> read_blob(std::string_view key, std::span<uint8_t> out) override;
+    bool write_blob(std::string_view key, std::span<const uint8_t> data) override;
 
 private:
     // No locking: the provider contract guarantees every method is invoked on the main loop

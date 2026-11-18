@@ -329,7 +329,7 @@ TEST(ClientLifecycle, ProviderSetBetweenStopAndStartIsHonored) {
     ASSERT_TRUE(client.start());
     const std::string persisted_id = client.client_id();
     EXPECT_NE(persisted_id, ephemeral_id);
-    EXPECT_TRUE(store.load_blob(persistence_keys::KEYPAIR).has_value());
+    EXPECT_TRUE(store.blob(persistence_keys::KEYPAIR).has_value());
     client.stop();
 
     ASSERT_TRUE(client.start());

@@ -17,6 +17,7 @@
 #include "sendspin/persistence_codec.h"
 #include <ArduinoJson.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -210,23 +211,28 @@ std::string FilePersistenceProvider::default_path(const std::string& filename) {
 // Blob store
 // ============================================================================
 
-std::optional<std::vector<uint8_t>> FilePersistenceProvider::load_blob(const std::string& key) {
+std::optional<size_t> FilePersistenceProvider::read_blob(std::string_view key,
+                                                         std::span<uint8_t> out) {
     JsonDocument doc = load_doc(this->path_);
     if (!doc[key].is<const char*>()) {
         return std::nullopt;
     }
     auto decoded = base64url_decode(doc[key].as<const char*>());
     if (!decoded.has_value()) {
-        std::fprintf(stderr, "[FilePersistenceProvider] bad base64url for key '%s'\n",
-                     key.c_str());
+        std::fprintf(stderr, "[FilePersistenceProvider] bad base64url for key '%.*s'\n",
+                     static_cast<int>(key.size()), key.data());
         return std::nullopt;
     }
-    return decoded;
+    if (decoded->size() > out.size()) {
+        return std::nullopt;
+    }
+    std::copy(decoded->begin(), decoded->end(), out.begin());
+    return decoded->size();
 }
 
-bool FilePersistenceProvider::save_blob(const std::string& key, const uint8_t* data, size_t len) {
+bool FilePersistenceProvider::write_blob(std::string_view key, std::span<const uint8_t> data) {
     JsonDocument doc = load_doc(this->path_);
-    doc[key] = base64url_encode(data, len);
+    doc[key] = base64url_encode(data.data(), data.size());
     return save_doc(this->path_, doc);
 }
 

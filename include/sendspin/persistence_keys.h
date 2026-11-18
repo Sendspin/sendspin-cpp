@@ -19,8 +19,11 @@
 
 #pragma once
 
+#include <array>
+#include <charconv>
 #include <cstddef>
 #include <string>
+#include <string_view>
 
 namespace sendspin {
 
@@ -34,7 +37,7 @@ namespace sendspin {
 /// treats a stored blob of any other length as absent. Multi-byte integers are in the device's
 /// native byte order: a blob is only ever read back by the device that wrote it.
 ///
-/// A record slot key (`record_slot_key()`) and `PAIRING_PSK` hold the binary layouts of the
+/// A record slot key (`RecordSlotKey`) and `PAIRING_PSK` hold the binary layouts of the
 /// codec in `sendspin/persistence_codec.h`; the other keys hold raw bytes, as each constant's
 /// comment describes.
 namespace persistence_keys {
@@ -44,7 +47,7 @@ inline constexpr const char* KEYPAIR = "keypair";
 /// Size of the `KEYPAIR` blob.
 inline constexpr size_t KEYPAIR_SIZE = 32;
 
-/// Prefix of the per-slot record keys; see `record_slot_key()`.
+/// Prefix of the per-slot record keys; see `RecordSlotKey`.
 inline constexpr const char* RECORD_SLOT_PREFIX = "rec_";
 /// Size of a record slot blob: one `SendspinPairingRecord` as the codec encodes it.
 inline constexpr size_t RECORD_SLOT_SIZE = 64;
@@ -55,7 +58,7 @@ inline constexpr size_t RECORD_SLOT_SIZE = 64;
 /// and lowers it to at most 255. It decides which record is evicted when a pairing arrives at a
 /// full store, so it is rewritten whenever that order changes. A byte naming no stored record is
 /// ignored on load, and a stored record this blob does not name sorts after the ones it does.
-/// Being advisory, it is the one blob read at any length.
+/// Being advisory, it is the one blob read at any length up to 255 bytes; a longer one is ignored.
 inline constexpr const char* RECORD_ORDER = "rec_order";
 
 /// @brief Key of one long-term record slot: `RECORD_SLOT_PREFIX` followed by the decimal slot
@@ -67,10 +70,36 @@ inline constexpr const char* RECORD_ORDER = "rec_order";
 /// than a rewrite of every record. Slot numbers run from 0 to
 /// `SendspinClientConfig::max_pairing_records - 1`; a slot key is absent until that slot is first
 /// filled.
-/// @param slot The slot number.
-/// @return The storage key for that slot.
-inline std::string record_slot_key(size_t slot) {
-    return std::string(RECORD_SLOT_PREFIX) + std::to_string(slot);
+class RecordSlotKey {
+public:
+    /// @param slot The slot number, below `SendspinClientConfig::max_pairing_records`.
+    explicit RecordSlotKey(size_t slot) {
+        const std::string_view prefix(RECORD_SLOT_PREFIX);
+        prefix.copy(this->text_.data(), prefix.size());
+        const char* end = std::to_chars(this->text_.data() + prefix.size(),
+                                        this->text_.data() + this->text_.size(), slot)
+                              .ptr;
+        this->length_ = static_cast<size_t>(end - this->text_.data());
+    }
+
+    /// @return The storage key for the slot.
+    std::string_view view() const {
+        return {this->text_.data(), this->length_};
+    }
+
+private:
+    /// Digits of the highest slot number max_pairing_records allows.
+    static constexpr size_t MAX_SLOT_DIGITS = 3;
+
+    std::array<char, std::string_view(RECORD_SLOT_PREFIX).size() + MAX_SLOT_DIGITS> text_{};
+    size_t length_{0};
+};
+
+/// @brief Key of one long-term record slot.
+/// @deprecated Use RecordSlotKey; removed in v0.11.0.
+[[deprecated("use RecordSlotKey; removed in v0.11.0")]] inline std::string record_slot_key(
+    size_t slot) {
+    return std::string(RecordSlotKey(slot).view());
 }
 
 /// Codec blob: the accepted `SendspinPairingPsk` (`encode_pairing_psk()` / `decode_pairing_psk()`).

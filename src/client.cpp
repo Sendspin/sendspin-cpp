@@ -1770,22 +1770,52 @@ void SendspinClient::merge_group_update(const GroupUpdatePayload& delta) {
 }
 
 // ============================================================================
+// SendspinPersistenceProvider
+// ============================================================================
+
+std::optional<size_t> SendspinPersistenceProvider::read_blob(std::string_view key,
+                                                             std::span<uint8_t> out) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    auto blob = this->load_blob(std::string(key));
+#pragma GCC diagnostic pop
+    if (!blob.has_value()) {
+        return std::nullopt;
+    }
+    std::optional<size_t> length;
+    if (blob->size() <= out.size()) {
+        std::copy(blob->begin(), blob->end(), out.begin());
+        length = blob->size();
+    }
+    // The blob may be a private key or a PSK.
+    secure_zero_container(blob.value());
+    return length;
+}
+
+bool SendspinPersistenceProvider::write_blob(std::string_view key, std::span<const uint8_t> data) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    return this->save_blob(std::string(key), data.data(), data.size());
+#pragma GCC diagnostic pop
+}
+
+// ============================================================================
 // Persistence & identity
 // ============================================================================
 
 bool SendspinClient::load_or_generate_identity() {
     if (this->persistence_provider_ != nullptr) {
-        auto saved_priv = this->persistence_provider_->load_blob(persistence_keys::KEYPAIR);
+        std::array<uint8_t, persistence_keys::KEYPAIR_SIZE> priv_bytes{};
+        const auto saved_len =
+            this->persistence_provider_->read_blob(persistence_keys::KEYPAIR, priv_bytes);
         // No codec involved: the keypair blob is the raw private key, so the only validation
         // needed here is the exact-length check: anything else is corrupt or the wrong key.
-        if (saved_priv.has_value() && saved_priv->size() == persistence_keys::KEYPAIR_SIZE) {
-            std::array<uint8_t, 32> priv_bytes{};
-            std::copy(saved_priv->begin(), saved_priv->end(), priv_bytes.begin());
-            auto loaded = Identity::from_private_bytes(priv_bytes);
-            // The two plain byte buffers holding the raw private key cannot wipe themselves the
-            // way every Identity-shaped copy does via ~Identity().
-            secure_zero_container(priv_bytes);
-            secure_zero_container(saved_priv.value());
+        const bool whole_key = saved_len == persistence_keys::KEYPAIR_SIZE;
+        auto loaded = whole_key ? Identity::from_private_bytes(priv_bytes) : std::nullopt;
+        // The plain byte buffer cannot wipe itself the way every Identity-shaped copy does via
+        // ~Identity(), and a failed read may still have left part of a key in it.
+        secure_zero_container(priv_bytes);
+        if (whole_key) {
             if (loaded.has_value()) {
                 this->identity_ = std::make_unique<Identity>(loaded.value());
                 this->client_id_ = this->identity_->peer_id();
@@ -1796,9 +1826,9 @@ bool SendspinClient::load_or_generate_identity() {
             // as an all-zero identity: generate a fresh one (the device will need to re-pair)
             // rather than proceed with a predictable key.
             SS_LOGW(TAG, "Stored static keypair is invalid; generating a new one");
-        } else if (saved_priv.has_value()) {
+        } else if (saved_len.has_value()) {
             SS_LOGW(TAG, "Stored static keypair has the wrong size (%zu bytes); regenerating",
-                    saved_priv->size());
+                    saved_len.value());
         }
     }
 
@@ -1815,9 +1845,8 @@ bool SendspinClient::load_or_generate_identity() {
     this->client_id_ = this->identity_->peer_id();
 
     if (this->persistence_provider_ != nullptr) {
-        if (this->persistence_provider_->save_blob(persistence_keys::KEYPAIR,
-                                                   this->identity_->private_bytes.data(),
-                                                   this->identity_->private_bytes.size()) &&
+        if (this->persistence_provider_->write_blob(persistence_keys::KEYPAIR,
+                                                    this->identity_->private_bytes) &&
             this->persistence_provider_->commit()) {
             SS_LOGI(TAG, "Generated and persisted static keypair; client_id=%s",
                     this->client_id_.c_str());
@@ -1837,9 +1866,10 @@ void SendspinClient::load_last_played_server() {
         return;
     }
 
-    auto key_blob = this->persistence_provider_->load_blob(persistence_keys::LAST_PLAYED);
-    if (key_blob.has_value() && key_blob->size() == persistence_keys::LAST_PLAYED_SIZE) {
-        std::string server_id = b64url_encode(key_blob->data(), key_blob->size());
+    std::array<uint8_t, persistence_keys::LAST_PLAYED_SIZE> key_blob{};
+    if (this->persistence_provider_->read_blob(persistence_keys::LAST_PLAYED, key_blob) ==
+        persistence_keys::LAST_PLAYED_SIZE) {
+        std::string server_id = b64url_encode(key_blob.data(), key_blob.size());
         this->connection_manager_->set_last_played_server_id(server_id);
         SS_LOGI(TAG, "Loaded last played server: %s", server_id.c_str());
     }
@@ -1868,8 +1898,7 @@ void SendspinClient::write_last_played_server(std::string_view server_id) {
                     static_cast<int>(server_id.size()), server_id.data());
             return;
         }
-        if (this->persistence_provider_->save_blob(persistence_keys::LAST_PLAYED, key->data(),
-                                                   key->size())) {
+        if (this->persistence_provider_->write_blob(persistence_keys::LAST_PLAYED, key.value())) {
             SS_LOGD(TAG, "Persisted last played server: %.*s", static_cast<int>(server_id.size()),
                     server_id.data());
         } else {

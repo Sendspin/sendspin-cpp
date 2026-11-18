@@ -263,14 +263,14 @@ public:
     bool is_network_ready() override { return false; }
 };
 
-/// Persistence provider that stores nothing. Counts save_blob() calls per key, still returning
+/// Persistence provider that stores nothing. Counts write_blob() calls per key, still returning
 /// false like the base class default, so tests can assert on write counts (e.g. the
 /// note_last_played_server() dedup guard) without disturbing the always-fails behavior the
 /// record-storage-failure tests rely on.
 class FakePersistenceProvider : public SendspinPersistenceProvider {
 public:
-    bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
-        this->save_attempts_[key]++;
+    bool write_blob(std::string_view key, std::span<const uint8_t> /*data*/) override {
+        this->save_attempts_[std::string(key)]++;
         return false;
     }
 

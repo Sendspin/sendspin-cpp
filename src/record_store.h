@@ -307,7 +307,7 @@ private:
 
     /// @brief A record and the persistence slot holding it.
     ///
-    /// The slot names the persistence_keys::record_slot_key() the record is written under. It is
+    /// The slot names the persistence_keys::RecordSlotKey the record is written under. It is
     /// store bookkeeping, not part of the record's storage format: it is recovered on load from
     /// which key the record came out of.
     struct StoredRecord {
@@ -397,7 +397,7 @@ private:
     /// @param key The slot key or persistence_keys::RECORD_ORDER.
     /// @param blob The bytes to store; wiped in place before returning.
     /// @return true on success, false on a rejected write.
-    bool save_write(const std::string& key, std::span<uint8_t> blob);
+    bool save_write(std::string_view key, std::span<uint8_t> blob);
 
     // Struct fields
     /// Mutable so the const `has_pending_writes` can lock it.
