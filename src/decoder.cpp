@@ -42,15 +42,10 @@ SendspinDecoder::~SendspinDecoder() {
 }
 
 void SendspinDecoder::reset_decoders() {
-    // Kept, reset, for the next FLAC stream: one decoder object per sync task run rather than
-    // one per codec header.
+    // process_header() initializes the kept Opus state again.
     if (micro_flac::FLACDecoder* flac = this->flac_decoder()) {
         flac->reset();
     }
-
-#ifdef SENDSPIN_ENABLE_OPUS
-    this->opus_decoder_buf_.reset();
-#endif
 
     this->current_codec_ = SendspinCodecFormat::UNSUPPORTED;
 }
@@ -115,7 +110,8 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
             }
 
             size_t opus_size = opus_decoder_get_size(stream_info->get_channels());
-            if (!this->opus_decoder_buf_.allocate(opus_size, OPUS_STATE_LOCATION)) {
+            if (this->opus_decoder_buf_.size() < opus_size &&
+                !this->opus_decoder_buf_.allocate(opus_size, OPUS_STATE_LOCATION)) {
                 SS_LOGE(TAG, "Failed to allocate %zu bytes for OPUS decoder", opus_size);
                 return false;
             }
@@ -126,7 +122,6 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
 
             if (decoder_error != OPUS_OK) {
                 SS_LOGE(TAG, "Failed to create OPUS decoder, error %d", decoder_error);
-                this->opus_decoder_buf_.reset();
                 return false;
             }
 

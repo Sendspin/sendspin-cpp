@@ -22,6 +22,7 @@
 #include "audio_types.h"
 #include "decoder.h"
 #include "inbound_ring.h"
+#include "inline_vector.h"
 #include "platform/event_flags.h"
 #include "platform/shadow_slot.h"
 #include "sendspin/player_role.h"
@@ -37,6 +38,46 @@ namespace sendspin {
 struct PlaybackProgress {
     uint32_t frames_played;    // Number of audio frames played since last progress update
     int64_t finish_timestamp;  // The timestamp when the audio frames should finish playing
+};
+
+/// @brief The audio the sink accepted and has not yet reported played, kept as runs of one sample
+/// rate in write order
+///
+/// Played frames are taken from the oldest run first, so after a stream/start that changes the
+/// rate in place (roles/player/v1.md "stream/start"), the frames still queued at the old rate keep
+/// their old duration.
+class QueuedAudio {
+public:
+    /// @brief Appends `frames` written at `sample_rate`
+    void add(uint32_t sample_rate, uint32_t frames);
+
+    /// @brief Takes `frames` played from the oldest runs
+    /// @return false when more were played than were queued; the queue is then empty.
+    bool remove(uint32_t frames);
+
+    /// @brief The frames queued, across every run
+    uint32_t frames() const;
+
+    /// @brief How long the queued frames play for, each run at its own rate
+    int64_t duration_us() const;
+
+    /// @brief Empties the queue
+    void clear() {
+        this->runs_.clear();
+    }
+
+protected:
+    struct Run {
+        uint32_t sample_rate{0};
+        uint32_t frames{0};
+    };
+
+    /// A sink plays out one format before opening the next (integration guide, PlayerRoleListener),
+    /// so it holds two runs while its reports for the older lag; two more cover updates in that
+    /// lag. Past them add() folds the oldest run into the next.
+    static constexpr size_t MAX_RUNS = 4;
+
+    InlineVector<Run, MAX_RUNS> runs_;
 };
 
 /// @brief States of the sync task's inner decode/playback loop
@@ -62,6 +103,7 @@ struct SyncContext {
     TransferBuffer decode_buffer;  // Reusable decode + output buffer, allocated at the first codec
                                    // header; reserves one spare frame past the decoded data for
                                    // soft-sync frame insertion
+    QueuedAudio queued_audio;      // Written to the sink, not yet reported played
 
     // Pointer fields
     std::unique_ptr<SendspinDecoder> decoder;
@@ -84,9 +126,6 @@ struct SyncContext {
     size_t bytes_per_frame{0};
     size_t silence_remaining{0};  // Bytes of silence still to emit before the next/held chunk
                                   // (initial-sync priming or hard-sync gap fill)
-
-    // 32-bit fields
-    uint32_t buffered_frames{0};
 
     // 16-bit fields
     uint16_t active_ordinal{0};  // Ordinal of the codec header the active stream started on
@@ -232,7 +271,7 @@ protected:
     /// @brief Handles the TRANSFER_AUDIO state: sends buffered audio to the sink
     SyncTaskState handle_transfer_audio(SyncContext& sync_context);
 
-    /// @brief Updates buffered_frames and new_audio_client_playtime after sending audio to the
+    /// @brief Updates queued_audio and new_audio_client_playtime after sending audio to the
     /// speaker. These two must always be updated together to keep the playtime estimate consistent.
     void track_sent_audio(SyncContext& sync_context, size_t bytes_sent);
 
@@ -338,7 +377,7 @@ protected:
     /// @brief Resets SyncContext between streams without deallocating buffers
     void reset_context(SyncContext& sync_context);
 
-    /// @brief Processes playback progress messages from the speaker to update buffered_frames and
+    /// @brief Processes playback progress messages from the speaker to update queued_audio and
     /// playtime.
     void process_playback_progress(SyncContext& sync_context);
 

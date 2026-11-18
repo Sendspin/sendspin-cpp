@@ -105,6 +105,55 @@ static constexpr uint32_t LEAVE_BITS = EventGroupBits::COMMAND_STOP |
                                        EventGroupBits::COMMAND_STREAM_CLEAR;
 
 // ============================================================================
+// QueuedAudio
+// ============================================================================
+
+void QueuedAudio::add(uint32_t sample_rate, uint32_t frames) {
+    if (frames == 0) {
+        return;
+    }
+    if (!this->runs_.empty() && this->runs_[this->runs_.size() - 1].sample_rate == sample_rate) {
+        this->runs_[this->runs_.size() - 1].frames += frames;
+        return;
+    }
+    if (this->runs_.size() == MAX_RUNS) {
+        // Folded by count, so the queue stays in step with the sink's reports; only the duration
+        // is off, while the folded frames are still queued.
+        this->runs_[1].frames += this->runs_[0].frames;
+        this->runs_.erase(this->runs_.begin());
+    }
+    this->runs_.push_back({.sample_rate = sample_rate, .frames = frames});
+}
+
+bool QueuedAudio::remove(uint32_t frames) {
+    while (!this->runs_.empty() && frames >= this->runs_[0].frames) {
+        frames -= this->runs_[0].frames;
+        this->runs_.erase(this->runs_.begin());
+    }
+    if (this->runs_.empty()) {
+        return frames == 0;
+    }
+    this->runs_[0].frames -= frames;
+    return true;
+}
+
+uint32_t QueuedAudio::frames() const {
+    uint32_t frames = 0;
+    for (const Run& run : this->runs_) {
+        frames += run.frames;
+    }
+    return frames;
+}
+
+int64_t QueuedAudio::duration_us() const {
+    int64_t duration_us = 0;
+    for (const Run& run : this->runs_) {
+        duration_us += AudioStreamInfo::frames_to_microseconds(run.frames, run.sample_rate);
+    }
+    return duration_us;
+}
+
+// ============================================================================
 // Constructor / Destructor
 // ============================================================================
 
@@ -400,7 +449,7 @@ SyncTaskState SyncTask::handle_transfer_audio(SyncContext& sync_context) {
 
 void SyncTask::track_sent_audio(SyncContext& sync_context, size_t bytes_sent) {
     uint32_t frames_sent = sync_context.current_stream_info.bytes_to_frames(bytes_sent);
-    sync_context.buffered_frames += frames_sent;
+    sync_context.queued_audio.add(sync_context.current_stream_info.get_sample_rate(), frames_sent);
     sync_context.new_audio_client_playtime +=
         sync_context.current_stream_info.frames_to_microseconds(frames_sent);
 }
@@ -838,7 +887,7 @@ bool SyncTask::wait_for_start_acknowledgement(SyncContext& sync_context) {
 void SyncTask::apply_stream_clear(SyncContext& sync_context) {
     // Drop in-flight decoded audio (it carries the pre-seek timestamp; appending post-seek audio to
     // it would mis-stamp the buffer) and any pending hard-sync gap-fill silence. Codec/decoder
-    // state, buffered_frames and new_audio_client_playtime are deliberately left intact: the audio
+    // state, queued_audio and new_audio_client_playtime are deliberately left intact: the audio
     // already handed to the sink keeps draining, and the next chunk's server timestamp lets the
     // sync logic re-align on its own. Force hard_syncing on so that re-alignment uses the tight
     // settle threshold (the post-seek timestamp jump would trigger it anyway, but this is
@@ -907,7 +956,7 @@ void SyncTask::reset_context(SyncContext& sync_context) {
     sync_context.decoded_timestamp = 0;
     sync_context.new_audio_client_playtime = 0;
     sync_context.last_chunk_duration_us = 0;
-    sync_context.buffered_frames = 0;
+    sync_context.queued_audio.clear();
     sync_context.current_stream_info = AudioStreamInfo{};
     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
     sync_context.release_chunk = false;
@@ -940,18 +989,15 @@ void SyncTask::process_playback_progress(SyncContext& sync_context) {
                                             this->player_impl_->config.extra_startup_silence_ms);
         }
 
-        if (frames_played > sync_context.buffered_frames) {
+        const uint32_t queued_frames = sync_context.queued_audio.frames();
+        if (!sync_context.queued_audio.remove(frames_played)) {
             SS_LOGW(TAG,
                     "Buffered frames underflow: played %" PRIu32 " but only %" PRIu32 " buffered",
-                    frames_played, sync_context.buffered_frames);
-            sync_context.buffered_frames = 0;
-        } else {
-            sync_context.buffered_frames -= frames_played;
+                    frames_played, queued_frames);
         }
 
-        int64_t unplayed_us =
-            sync_context.current_stream_info.frames_to_microseconds(sync_context.buffered_frames);
-        sync_context.new_audio_client_playtime = playback_progress.finish_timestamp + unplayed_us;
+        sync_context.new_audio_client_playtime =
+            playback_progress.finish_timestamp + sync_context.queued_audio.duration_us();
     }
 }
 
@@ -1053,7 +1099,7 @@ void SyncTask::thread_entry(void* params) {
         // Drain any stale playback progress from the previous stream's I2S callbacks
         // before setting TASK_RUNNING. The I2S hardware may still be draining its DMA
         // buffer from the old stream, and those callbacks would corrupt the new stream's
-        // buffered_frames tracking.
+        // queued_audio tracking.
         this_task->playback_progress_slot_.reset();
 
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);

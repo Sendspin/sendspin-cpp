@@ -140,11 +140,14 @@ PortAudioSink::~PortAudioSink() {
 
 size_t PortAudioSink::write(std::span<const uint8_t> pcm, const AudioFormat& format,
                             uint32_t timeout_ms) {
+    // One deadline for the drain and the write, so a format change blocks the sync task no longer
+    // than any other write, plus the reopen.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     if (format != format_ || stream_ == nullptr) {
         // A stream/start changed the format, or a failed open left no stream. The stream plays
         // out the old format's audio first, so every frame written is played and reported, then
         // reopens in the new one.
-        if (stream_ != nullptr && !wait_until_drained(timeout_ms)) {
+        if (stream_ != nullptr && !wait_until_drained(deadline)) {
             return 0;
         }
         if (!configure(format.sample_rate, format.channels, format.bits_per_sample)) {
@@ -156,7 +159,6 @@ size_t PortAudioSink::write(std::span<const uint8_t> pcm, const AudioFormat& for
     const uint8_t* data = pcm.data();
     const size_t length = pcm.size();
     size_t total_written = 0;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     while (total_written < length) {
         {
@@ -170,7 +172,7 @@ size_t PortAudioSink::write(std::span<const uint8_t> pcm, const AudioFormat& for
             // so partial-frame bytes never accumulate in the ring buffer.  The
             // sync task counts sent frames via integer division (bytes_to_frames),
             // so untracked remainder bytes would cause the PA callback to report
-            // more frames_played than buffered_frames, triggering underflow
+            // more frames_played than the sync task counts as queued, triggering underflow
             // warnings.  When there is enough space for all remaining data we
             // write it all - the caller always provides frame-aligned buffers.
             size_t remaining = length - total_written;
@@ -200,9 +202,9 @@ size_t PortAudioSink::write(std::span<const uint8_t> pcm, const AudioFormat& for
     return total_written;
 }
 
-bool PortAudioSink::wait_until_drained(uint32_t timeout_ms) {
+bool PortAudioSink::wait_until_drained(std::chrono::steady_clock::time_point deadline) {
     std::unique_lock<std::mutex> lock(write_mutex_);
-    return write_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
+    return write_cv_.wait_until(lock, deadline, [this]() {
         return ring_buffer_.available() == 0 || abort_write_.load(std::memory_order_acquire);
     });
 }

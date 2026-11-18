@@ -74,8 +74,8 @@ public:
     SendspinDecoder(const SendspinDecoder&) = delete;
     SendspinDecoder& operator=(const SendspinDecoder&) = delete;
 
-    /// @brief Resets the state of the FLAC and Opus decoders; the FLAC decoder object is kept for
-    /// the next FLAC stream, so call it before each stream's process_header()
+    /// @brief Resets the state of the FLAC and Opus decoders, keeping their storage for the next
+    /// header of their codec; call it before each codec header's process_header()
     void reset_decoders();
 
     /// @brief Sets up the appropriate decoder and processes the codec header (which may be a dummy

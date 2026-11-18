@@ -485,14 +485,24 @@ public:
 /// signal, so the window holds the protocol task's and the main loop's work on a stream/start and
 /// none of the sync task's. Asked instead to measure the sync task, it opens a window there and
 /// closes it on the stream's first on_audio_output(), the priming silence the sync task writes once
-/// it has processed the codec header.
+/// it has processed the codec header. Given a sample rate in close_on_rate, it closes the open
+/// window on the first write at that rate instead, and with a player to report to it plays every
+/// write as it takes it, so a stream gets past its priming to take the codec headers behind it.
 class WindowClosingPlayerListener : public CountingPlayerListener {
 public:
     size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
                            uint32_t timeout_ms) override {
-        if (this->close_on_audio_output.exchange(false)) {
+        uint32_t rate = this->close_on_rate.load();
+        if (this->close_on_audio_output.exchange(false) ||
+            (rate == format.sample_rate &&
+             this->close_on_rate.compare_exchange_strong(rate, 0))) {
             this->sync_window = close_window();
             this->sync_window_closed.store(true);
+        }
+        if (PlayerRole* player = this->report_to.load()) {
+            player->notify_audio_played(
+                static_cast<uint32_t>(pcm.size() / (format.channels * (format.bits_per_sample / 8))),
+                platform_time_us());
         }
         return CountingPlayerListener::on_audio_output(pcm, format, timeout_ms);
     }
@@ -512,6 +522,8 @@ public:
 
     bool close_on_start{false};
     bool open_on_start{false};
+    std::atomic<uint32_t> close_on_rate{0};
+    std::atomic<PlayerRole*> report_to{nullptr};
     Window window;
     /// Written on the sync task, then published by sync_window_closed.
     Window sync_window;
@@ -585,6 +597,7 @@ constexpr size_t METADATA_STATE_ALLOCATIONS = 0;
 constexpr size_t STREAM_MESSAGES_ALLOCATIONS = 0;
 constexpr size_t PLAYER_FLAC_STREAM_START_ALLOCATIONS = 0;
 constexpr size_t SYNC_TASK_FIRST_FLAC_HEADER_ALLOCATIONS = 0;
+constexpr size_t IN_PLACE_FORMAT_CHANGE_ALLOCATIONS = 0;
 constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 
 // One paired connection with a player, a controller, metadata, two artwork channels, a visualizer
@@ -596,8 +609,9 @@ constexpr size_t UNTAKEN_STREAM_START_ALLOCATIONS = 0;
 // controller server/state, then the first group/update messages, then the first metadata
 // server/state messages, then an artwork and visualizer stream/start and a stream/end and a
 // stream/clear that name their roles, then the sync task's first FLAC codec header, then a FLAC
-// stream/start the player takes, then a stream/start whose player section the connection, no
-// longer owning the player, does not take.
+// stream/start the player takes, then one that changes the running stream's sample rate through
+// to the sync task's first write at the new rate, then a stream/start whose player section the
+// connection, no longer owning the player, does not take.
 // The roles' public command and type lists and the strings of the deprecated metadata and group
 // objects are reserved when they are built, so even the first fill on the main loop allocates
 // nothing; the metadata and group listeners override both forms, so each window counts the views
@@ -628,7 +642,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Lists FLAC for the streams below (roles/player/v1.md "stream/start player object")
     PlayerRoleConfig player_config = make_pcm_player_config();
     player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, 48000, 16});
-    client.add_player(std::move(player_config)).set_listener(&player_listener);
+    PlayerRole& player = client.add_player(std::move(player_config));
+    player.set_listener(&player_listener);
     ControllerRole& controller = client.add_controller();
     TextSizeMetadataListener metadata_listener;
     client.add_metadata().set_listener(&metadata_listener);
@@ -861,6 +876,47 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     play_flac_stream(Measure::SYNC_TASK_HEADER);
     // The second closes as the main loop reports the stream started.
     play_flac_stream(Measure::STREAM_START);
+
+    // roles/player/v1.md "stream/start": a FLAC stream/start for the running stream at 96 kHz
+    // changes its format in place. The window holds the protocol task's and the main loop's work
+    // on it and the sync task's on its codec header, and closes on the first write at the new rate.
+    // The 48 kHz stream starts outside it, up to its first write, and its writes are played as they
+    // are taken, so the sync task gets past its priming to take the header from LOAD_CHUNK.
+    constexpr const char* FLAC_96K_STREAM_START =
+        R"({"type":"stream/start","payload":{"player":{"codec":"flac","sample_rate":96000,)"
+        R"("channels":2,"bit_depth":16,)"
+        R"("codec_header":"ZkxhQ4AAACIQABAAAAAAAAAAF3AC8AAAAAAAAAAAAAAAAAAAAAAAAAAA"}}})";
+    {
+        const int starts_before = player_listener.stream_starts;
+        const int ends_before = player_listener.stream_ends;
+        player_listener.report_to.store(&player);
+        {
+            TestOwned test_owned;
+            ASSERT_TRUE(server->send_app_json(FLAC_STREAM_START));
+        }
+        const size_t writes_before = player_listener.audio_writes.load();
+        pump_while_not(client, [&] {
+            return player_listener.stream_starts > starts_before &&
+                   player_listener.audio_writes.load() > writes_before;
+        });
+        player_listener.sync_window_closed.store(false);
+        open_window();
+        player_listener.close_on_rate.store(96000);
+        {
+            TestOwned test_owned;
+            ASSERT_TRUE(server->send_app_json(FLAC_96K_STREAM_START));
+        }
+        pump_while_not(client, [&] { return player_listener.sync_window_closed.load(); });
+        expect_library_allocations(player_listener.sync_window,
+                                   "a stream/start that changes the sample rate in place",
+                                   IN_PLACE_FORMAT_CHANGE_ALLOCATIONS);
+        player_listener.report_to.store(nullptr);
+        {
+            TestOwned test_owned;
+            ASSERT_TRUE(server->send_app_json(PLAYER_STREAM_END));
+        }
+        pump_while_not(client, [&] { return player_listener.stream_ends > ends_before; });
+    }
 
     // An activation that leaves the player out takes the role from the connection, outside any
     // window. The window holds a FLAC stream/start whose player section a parse would validate

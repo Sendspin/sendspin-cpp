@@ -1353,3 +1353,57 @@ TEST(PlayerAudioOutput, EachWriteCarriesTheFormatOfItsOwnBytes) {
             << int{sink.writes[i].format.bits_per_sample} << "-bit";
     }
 }
+
+// roles/player/v1.md "stream/start": the audio written before an update that changes the sample
+// rate plays at the old rate. The sink's queue is timed run by run, its reports taken from the
+// oldest run first, so the old audio still queued keeps its own duration. Reached: SyncTask's
+// process_playback_progress(), the step that turns a report into the playtime estimate.
+TEST(PlayerAudioOutput, AudioQueuedBeforeARateChangeKeepsItsOwnDuration) {
+    constexpr uint32_t OLD_RATE = 48000;
+    constexpr uint32_t NEW_RATE = 96000;
+    constexpr uint32_t CHUNK_FRAMES = 960;  // 20 ms at the old rate, 10 ms at the new one
+    constexpr size_t FRAME_BYTES = 2;       // 16-bit mono
+    constexpr int64_t FINISH = 1'000'000'000;
+    auto impl = make_impl();
+    RecordingSink sink;
+    impl->listener = &sink;
+    // Every chunk due a second ahead, so none is skipped as late.
+    impl->config.fixed_delay_us = -1'000'000;
+
+    impl->handle_stream_start({pcm_stream(OLD_RATE, 1, 16)});
+    std::vector<uint8_t> old_chunk = filled_audio_chunk(0x11, CHUNK_FRAMES * FRAME_BYTES);
+    InboundMessage old_message = message_over(old_chunk);
+    impl->handle_binary(old_message);
+    impl->handle_stream_start({pcm_stream(NEW_RATE, 1, 16)});
+    std::vector<uint8_t> new_chunk = filled_audio_chunk(0x22, CHUNK_FRAMES * FRAME_BYTES);
+    InboundMessage new_message = message_over(new_chunk);
+    impl->handle_binary(new_message);
+
+    SyncTask& task = *impl->sync_task;
+    SyncContext context;
+    start_context(task, context);
+    for (int stream = 0; stream < 2; ++stream) {
+        ASSERT_NO_FATAL_FAILURE(decode_next_item(task, context));  // The header
+        ASSERT_NO_FATAL_FAILURE(decode_next_item(task, context));  // Its chunk
+        transfer_pending(task, context);
+    }
+    ASSERT_EQ(sink.written.size(), 2 * CHUNK_FRAMES * FRAME_BYTES);
+
+    // Each report in turn, the estimate the finish time plus what is still queued.
+    struct Report {
+        const char* name;
+        uint32_t frames_played;
+        int64_t queued_us;
+    };
+    const Report reports[] = {
+        {"half the old audio played", 480, 10'000 + 10'000},
+        {"the rest of it and half the new audio", 960, 5'000},
+        {"more than is queued", 1000, 0},
+    };
+    for (const Report& report : reports) {
+        SCOPED_TRACE(report.name);
+        task.notify_audio_played(report.frames_played, FINISH);
+        task.process_playback_progress(context);
+        EXPECT_EQ(context.new_audio_client_playtime, FINISH + report.queued_us);
+    }
+}
