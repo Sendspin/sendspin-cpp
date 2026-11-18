@@ -15,7 +15,7 @@
 /// @file fake_persistence.h
 /// @brief Shared in-memory SendspinPersistenceProvider fake for tests.
 ///
-/// A std::map<key, blob> plus fail-injection switches for save_blob()/commit(), since
+/// A std::map<key, blob> plus fail-injection switches for write_blob()/commit(), since
 /// several tests exercise persist-failure paths (a rejected pairing record,
 /// revocation-durability warnings). Prefer this over a bespoke per-file provider when a test
 /// only needs a generic blob store with optional failure injection; keep a bespoke fake when a
@@ -26,13 +26,16 @@
 
 #include "sendspin/client.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -41,24 +44,27 @@ namespace sendspin {
 /// file or NVS backing), with optional per-key or blanket save rejection and commit failure.
 class InMemoryPersistenceProvider : public SendspinPersistenceProvider {
 public:
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+    std::optional<size_t> read_blob(std::string_view key, std::span<uint8_t> out) override {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        this->load_attempts_[key]++;
-        auto it = this->blobs_.find(key);
-        if (it == this->blobs_.end()) {
+        const std::string name(key);
+        this->load_attempts_[name]++;
+        auto it = this->blobs_.find(name);
+        if (it == this->blobs_.end() || it->second.size() > out.size()) {
             return std::nullopt;
         }
-        return it->second;
+        std::copy(it->second.begin(), it->second.end(), out.begin());
+        return it->second.size();
     }
 
-    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+    bool write_blob(std::string_view key, std::span<const uint8_t> data) override {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        this->save_attempts_[key]++;
-        this->saved_keys_.push_back(key);
-        if (this->reject_all_saves || this->reject_save_keys.count(key) > 0) {
+        const std::string name(key);
+        this->save_attempts_[name]++;
+        this->saved_keys_.push_back(name);
+        if (this->reject_all_saves || this->reject_save_keys.count(name) > 0) {
             return false;
         }
-        this->blobs_[key] = std::vector<uint8_t>(data, data + len);
+        this->blobs_[name] = std::vector<uint8_t>(data.begin(), data.end());
         return true;
     }
 
@@ -68,7 +74,7 @@ public:
         if (this->fail_commits) {
             return false;
         }
-        // What the commit covered: every save_blob() call so far.
+        // What the commit covered: every write_blob() call so far.
         this->saves_at_last_commit_ = this->saved_keys_.size();
         return true;
     }
@@ -77,7 +83,7 @@ public:
     // Test-only inspection helpers
     // ========================================
 
-    /// @brief Directly seed a key's blob, bypassing save_blob() (and its fail-injection).
+    /// @brief Directly seed a key's blob, bypassing write_blob() (and its fail-injection).
     void seed_blob(const std::string& key, std::vector<uint8_t> bytes) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->blobs_[key] = std::move(bytes);
@@ -105,7 +111,7 @@ public:
         return it == this->load_attempts_.end() ? 0 : it->second;
     }
 
-    /// @brief Every key save_blob() was called with, in call order, rejected writes included.
+    /// @brief Every key write_blob() was called with, in call order, rejected writes included.
     [[nodiscard]] std::vector<std::string> saved_keys() const {
         std::lock_guard<std::mutex> lock(this->mutex_);
         return this->saved_keys_;
@@ -116,7 +122,7 @@ public:
         return this->commits_;
     }
 
-    /// @brief Keys save_blob() was called with after the last successful commit(), in call
+    /// @brief Keys write_blob() was called with after the last successful commit(), in call
     /// order: the writes a queueing provider would still be holding in RAM.
     [[nodiscard]] std::vector<std::string> uncommitted_keys() const {
         std::lock_guard<std::mutex> lock(this->mutex_);

@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -208,7 +209,7 @@ public:
 /// `SendspinClientConfig::pairing_psk` is unset.
 ///
 /// Re-entrancy: implementations must not call back into the library from inside
-/// load_blob/save_blob/commit. Every call is made from the middle of a library step that is
+/// read_blob/write_blob/commit. Every call is made from the middle of a library step that is
 /// part-way through updating the state the call is about. No internal lock is held across the
 /// call.
 ///
@@ -220,13 +221,11 @@ class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
 
-    /// @brief Load the blob stored under key.
-    /// @return The bytes, or nullopt if absent.
-    virtual std::optional<std::vector<uint8_t>> load_blob(const std::string& /*key*/) {
-        return std::nullopt;
-    }
+    /// @brief Read the blob stored under key into out.
+    /// @return The stored length, or nullopt when absent or longer than out.
+    virtual std::optional<size_t> read_blob(std::string_view key, std::span<uint8_t> out);
 
-    /// @brief Persist bytes under key. Returning true means the write was accepted: stored, or
+    /// @brief Persist data under key. Returning true means the write was accepted: stored, or
     /// queued until the next commit(). Every blob the library writes has the fixed size its key's
     /// `persistence_keys` comment gives, so a provider may store each key as a fixed-size value.
     ///
@@ -239,15 +238,28 @@ public:
     /// it back at the next boot, silently making the revoked PSK valid again (the record is dropped
     /// from RAM either way).
     /// @return true on success, false on failure.
-    virtual bool save_blob(const std::string& /*key*/, const uint8_t* /*data*/, size_t /*len*/) {
+    virtual bool write_blob(std::string_view key, std::span<const uint8_t> data);
+
+    /// @brief Loads the blob stored under key; called only by the default read_blob()
+    /// @deprecated Override read_blob(); removed in v0.11.0.
+    [[deprecated(
+        "override read_blob(); removed in v0.11.0")]] virtual std::optional<std::vector<uint8_t>>
+    load_blob(const std::string& /*key*/) {
+        return std::nullopt;
+    }
+
+    /// @brief Persists bytes under key; called only by the default write_blob()
+    /// @deprecated Override write_blob(); removed in v0.11.0.
+    [[deprecated("override write_blob(); removed in v0.11.0")]] virtual bool save_blob(
+        const std::string& /*key*/, const uint8_t* /*data*/, size_t /*len*/) {
         return false;
     }
 
     /// @brief Make every write accepted so far durable. A provider that writes through in
-    /// save_blob() keeps the default. Called once after a batch of accepted writes that holds
+    /// write_blob() keeps the default. Called once after a batch of accepted writes that holds
     /// pairing material (`KEYPAIR`, `PAIRING_PSK`, or a record slot) and never for the other
     /// keys alone, so a queueing provider may batch those on its own schedule. A false return
-    /// is logged like a rejected save_blob(), not retried.
+    /// is logged like a rejected write_blob(), not retried.
     /// @return true when the accepted writes are durable.
     virtual bool commit() {
         return true;

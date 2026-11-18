@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -90,17 +91,22 @@ inline SendspinPairingRecord make_client_record(const std::string& server_name) 
 
 /// True for any key RecordStore persists its long-term records under: a slot key or the
 /// record-order key.
-inline bool is_record_key(const std::string& key) {
+inline bool is_record_key(std::string_view key) {
     return key == persistence_keys::RECORD_ORDER ||
            key.rfind(persistence_keys::RECORD_SLOT_PREFIX, 0) == 0;
 }
 
-/// Wraps a string's bytes as a blob for load_blob()/seed_blob()/save_blob() calls.
+/// A record slot's key as a std::string, for the fakes' std::string-keyed inspection helpers.
+inline std::string slot_key(size_t slot) {
+    return std::string(persistence_keys::RecordSlotKey(slot).view());
+}
+
+/// Wraps a string's bytes as a blob for seed_blob() calls.
 inline std::vector<uint8_t> blob_bytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
-/// Wraps an encoded blob as a vector for load_blob()/seed_blob()/save_blob() calls.
+/// Wraps an encoded blob as a vector for seed_blob() calls.
 template <size_t N>
 inline std::vector<uint8_t> blob_bytes(const std::array<uint8_t, N>& a) {
     return std::vector<uint8_t>(a.begin(), a.end());
@@ -118,10 +124,10 @@ inline std::vector<uint8_t> record_blob(const SendspinPairingRecord& record) {
     return blob_bytes(encoded.value());
 }
 
-/// Answers a load_blob() for a store seeded with `records` laid out one per slot in index order,
+/// Answers a read_blob() for a store seeded with `records` laid out one per slot in index order,
 /// least recently used first. Returns nullopt for any other key, and for a slot no record fills.
 inline std::optional<std::vector<uint8_t>> seeded_record_blob(
-    const std::vector<SendspinPairingRecord>& records, const std::string& key) {
+    const std::vector<SendspinPairingRecord>& records, std::string_view key) {
     if (key == persistence_keys::RECORD_ORDER) {
         // Padded like the blob the library writes for the default cap.
         std::vector<uint8_t> order(
@@ -132,28 +138,42 @@ inline std::optional<std::vector<uint8_t>> seeded_record_blob(
         return order;
     }
     for (size_t i = 0; i < records.size(); ++i) {
-        if (key == persistence_keys::record_slot_key(i)) {
+        if (key == persistence_keys::RecordSlotKey(i).view()) {
             return record_blob(records[i]);
         }
     }
     return std::nullopt;
 }
 
+/// Answers a read_blob() from a fake's stored blob: copies it into out and returns its length, or
+/// nullopt when absent or longer than out.
+inline std::optional<size_t> serve_blob(const std::optional<std::vector<uint8_t>>& blob,
+                                        std::span<uint8_t> out) {
+    if (!blob.has_value() || blob->size() > out.size()) {
+        return std::nullopt;
+    }
+    std::copy(blob->begin(), blob->end(), out.begin());
+    return blob->size();
+}
+
 /// The record stored in a slot, or nullopt when the blob is absent, zeroed (a free slot), or does
 /// not decode.
 inline std::optional<SendspinPairingRecord> stored_record_in_slot(
     SendspinPersistenceProvider& provider, size_t slot) {
-    auto blob = provider.load_blob(persistence_keys::record_slot_key(slot));
-    if (!blob.has_value()) {
+    std::array<uint8_t, persistence_keys::RECORD_SLOT_SIZE> blob{};
+    const auto length = provider.read_blob(persistence_keys::RecordSlotKey(slot).view(), blob);
+    if (!length.has_value()) {
         return std::nullopt;
     }
-    return decode_pairing_record(blob->data(), blob->size());
+    return decode_pairing_record(blob.data(), length.value());
 }
 
 /// The stored record-order blob as slot numbers, least recently used first, without its padding;
 /// empty when absent.
 inline std::vector<uint8_t> stored_record_order(SendspinPersistenceProvider& provider) {
-    auto blob = provider.load_blob(persistence_keys::RECORD_ORDER).value_or(std::vector<uint8_t>{});
+    std::array<uint8_t, UINT8_MAX> buffer{};
+    const size_t length = provider.read_blob(persistence_keys::RECORD_ORDER, buffer).value_or(0);
+    std::vector<uint8_t> blob(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(length));
     blob.erase(std::remove(blob.begin(), blob.end(), uint8_t{0xFF}), blob.end());
     return blob;
 }
@@ -163,8 +183,7 @@ inline std::vector<uint8_t> stored_record_order(SendspinPersistenceProvider& pro
 template <typename TProvider>
 void seed_records(TProvider& provider, const std::vector<SendspinPairingRecord>& records) {
     for (size_t i = 0; i < records.size(); ++i) {
-        provider.seed_blob(persistence_keys::record_slot_key(i),
-                           record_blob(records[i]));
+        provider.seed_blob(slot_key(i), record_blob(records[i]));
     }
     provider.seed_blob(persistence_keys::RECORD_ORDER,
                        seeded_record_blob(records, persistence_keys::RECORD_ORDER).value());
@@ -177,7 +196,7 @@ void reject_record_saves(TProvider& provider,
                          size_t max_records = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS) {
     provider.reject_save_keys.insert(persistence_keys::RECORD_ORDER);
     for (size_t slot = 0; slot < max_records; ++slot) {
-        provider.reject_save_keys.insert(persistence_keys::record_slot_key(slot));
+        provider.reject_save_keys.insert(slot_key(slot));
     }
 }
 
@@ -189,8 +208,7 @@ size_t record_writes(const TProvider& provider,
                      size_t max_records = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS) {
     size_t writes = static_cast<size_t>(provider.save_attempts(persistence_keys::RECORD_ORDER));
     for (size_t slot = 0; slot < max_records; ++slot) {
-        writes +=
-            static_cast<size_t>(provider.save_attempts(persistence_keys::record_slot_key(slot)));
+        writes += static_cast<size_t>(provider.save_attempts(slot_key(slot)));
     }
     return writes;
 }

@@ -142,10 +142,10 @@ constexpr uint16_t UNPAIRED_TOGGLE_NURSERY_PAIRING_TEST_PORT = 19098;
 constexpr uint16_t UNPAIRED_BAD_METHOD_TEST_PORT = 19204;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
-// record persisted via save_blob() to a record slot key, so the pairing-flow test below
+// record persisted via write_blob() to a record slot key, so the pairing-flow test below
 // can assert on the psk_id/server_id/psk that pairing generated and persisted, and hand the same
 // psk/psk_id back to the fake server for the follow-up in-band re-handshake. The
-// server/pair-finalize commit is RAM-only on the protocol task; the save_blob call this
+// server/pair-finalize commit is RAM-only on the protocol task; the write_blob call this
 // captures is the deferred flush from the next loop() tick (RecordStore::persist_records()).
 // Locked anyway, per the general rule that a test provider should not assume the library's
 // threading beyond its documented contract.
@@ -169,22 +169,24 @@ public:
         this->seeded_long_term_record_ = std::move(record);
     }
 
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+    std::optional<size_t> read_blob(std::string_view key, std::span<uint8_t> out) override {
         if (key == persistence_keys::PAIRING_PSK && this->stored_pairing_psk_.has_value()) {
-            return blob_bytes(encode_pairing_psk(this->stored_pairing_psk_.value()));
+            return serve_blob(blob_bytes(encode_pairing_psk(this->stored_pairing_psk_.value())),
+                              out);
         }
         if (is_record_key(key) && this->seeded_long_term_record_.has_value()) {
-            return seeded_record_blob({this->seeded_long_term_record_.value()}, key);
+            return serve_blob(seeded_record_blob({this->seeded_long_term_record_.value()}, key),
+                              out);
         }
         return std::nullopt;
     }
 
-    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+    bool write_blob(std::string_view key, std::span<const uint8_t> data) override {
         if (!is_record_key(key) || key == persistence_keys::RECORD_ORDER) {
             return true;  // Keys other than the record slots are not under test here.
         }
         // A zeroed slot write frees that slot and carries no record to capture.
-        auto decoded = decode_pairing_record(data, len);
+        auto decoded = decode_pairing_record(data.data(), data.size());
         if (!decoded.has_value()) {
             return true;
         }
@@ -634,7 +636,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndPairsTheSession) {
     EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
 
     // The server's ack commits the record to RAM synchronously on the protocol task (see
-    // client.cpp's SERVER_PAIR_FINALIZE handler); the durable save_blob(RECORDS) this waits for
+    // client.cpp's SERVER_PAIR_FINALIZE handler); the durable write_blob(RECORDS) this waits for
     // is the deferred flush from the next loop() tick (RecordStore::persist_records()).
     pump_until(client, [&] { return persistence.captured_record().has_value(); });
     auto captured = persistence.captured_record();
@@ -3410,9 +3412,9 @@ TEST(EncryptedLifecycle, SeveralRecordChangesInOneTickWriteEachTouchedKeyOnce) {
         << "the tick's record changes must write each touched key once";
     EXPECT_EQ(persistence.save_attempts(persistence_keys::RECORD_ORDER), 1)
         << "two changes that both move the order must write it once";
-    EXPECT_EQ(persistence.save_attempts(persistence_keys::record_slot_key(2)), 1)
+    EXPECT_EQ(persistence.save_attempts(slot_key(2)), 1)
         << "the unpair must write its own slot once";
-    EXPECT_EQ(persistence.save_attempts(persistence_keys::record_slot_key(0)), 0)
+    EXPECT_EQ(persistence.save_attempts(slot_key(0)), 0)
         << "a recency move must not rewrite the played record's slot";
     // Control: the writes carry both changes, so this is coalescing rather than a lost write.
     // Least recently used first, so the played record comes last.
@@ -4008,14 +4010,14 @@ public:
     explicit BlockingRecordWriteProvider(SendspinPairingRecord record)
         : records_{std::move(record), make_client_record("server-more-recent")} {}
 
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+    std::optional<size_t> read_blob(std::string_view key, std::span<uint8_t> out) override {
         if (!is_record_key(key)) {
             return std::nullopt;
         }
-        return seeded_record_blob(this->records_, key);
+        return serve_blob(seeded_record_blob(this->records_, key), out);
     }
 
-    bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
+    bool write_blob(std::string_view key, std::span<const uint8_t> /*data*/) override {
         if (!is_record_key(key)) {
             return true;  // Keys other than the record slots must not park the tick.
         }

@@ -20,6 +20,7 @@
 #include "sendspin/client.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -27,10 +28,13 @@
 static const char* const TAG = "sendspin.player";
 
 /// @brief Reads the output-delay blob (persistence_keys::OUTPUT_DELAY): a native uint16_t.
-/// @return The stored value, or nullopt when the blob is not OUTPUT_DELAY_SIZE bytes.
-static std::optional<uint16_t> parse_output_delay_blob(const std::vector<uint8_t>& blob) {
+/// @return The stored value, or nullopt when the blob is absent or not OUTPUT_DELAY_SIZE bytes.
+static std::optional<uint16_t> read_output_delay_blob(
+    sendspin::SendspinPersistenceProvider& provider) {
     static_assert(sendspin::persistence_keys::OUTPUT_DELAY_SIZE == sizeof(uint16_t));
-    if (blob.size() != sendspin::persistence_keys::OUTPUT_DELAY_SIZE) {
+    std::array<uint8_t, sendspin::persistence_keys::OUTPUT_DELAY_SIZE> blob{};
+    if (provider.read_blob(sendspin::persistence_keys::OUTPUT_DELAY, blob) !=
+        sendspin::persistence_keys::OUTPUT_DELAY_SIZE) {
         return std::nullopt;
     }
     uint16_t value = 0;
@@ -735,10 +739,7 @@ void PlayerRole::Impl::load_output_delay() {
         return;
     }
 
-    std::optional<uint16_t> delay;
-    if (auto blob = this->persistence->load_blob(persistence_keys::OUTPUT_DELAY)) {
-        delay = parse_output_delay_blob(blob.value());
-    }
+    const std::optional<uint16_t> delay = read_output_delay_blob(*this->persistence);
     if (delay.has_value()) {
         if (delay.value() <= MAX_OUTPUT_DELAY_MS) {
             this->output_delay_ms.store(delay.value(), std::memory_order_relaxed);
@@ -763,8 +764,9 @@ uint16_t PlayerRole::Impl::get_effective_output_delay_ms() const {
 void PlayerRole::Impl::persist_output_delay() const {
     if (this->persistence) {
         uint16_t delay = this->output_delay_ms.load(std::memory_order_relaxed);
-        if (this->persistence->save_blob(persistence_keys::OUTPUT_DELAY,
-                                         reinterpret_cast<const uint8_t*>(&delay), sizeof(delay))) {
+        if (this->persistence->write_blob(
+                persistence_keys::OUTPUT_DELAY,
+                std::span(reinterpret_cast<const uint8_t*>(&delay), sizeof(delay)))) {
             SS_LOGD(TAG, "Persisted output delay: %u ms", delay);
         } else {
             SS_LOGW(TAG, "Failed to persist output delay");

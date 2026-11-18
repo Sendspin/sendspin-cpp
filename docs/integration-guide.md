@@ -556,14 +556,14 @@ pairing. On host platforms `examples/common/file_persistence_provider.h` provide
 `FilePersistenceProvider`, which persists to a single JSON file (one document mapping each
 key below to `base64url(bytes)`) -- use it directly or as a reference implementation.
 
-The interface is a plain byte-blob store: a load, a save, and a commit, independent of what is
+The interface is a plain byte-blob store: a read, a write, and a commit, independent of what is
 being stored:
 
 ```cpp
 class SendspinPersistenceProvider {
 public:
-    virtual std::optional<std::vector<uint8_t>> load_blob(const std::string& key);
-    virtual bool save_blob(const std::string& key, const uint8_t* data, size_t len);
+    virtual std::optional<size_t> read_blob(std::string_view key, std::span<uint8_t> out);
+    virtual bool write_blob(std::string_view key, std::span<const uint8_t> data);
     virtual bool commit();
 };
 ```
@@ -581,8 +581,8 @@ a Noise handshake or any other connection work -- but it does stop the main loop
 duration, so the call must be one bounded storage operation, and it must not call back into the
 client.
 Provisioning writes from inside `start()` rather than in response to a runtime event:
-`save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored, and
-`save_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored and none is
+`write_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored, and
+`write_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored and none is
 configured.
 
 #### Keyspace
@@ -602,7 +602,7 @@ byte order: a blob is only ever read back by the device that wrote it.
 | Key | Size | Contents |
 |---|---|---|
 | `persistence_keys::KEYPAIR` | `KEYPAIR_SIZE` (32) | The static X25519 private key. |
-| `persistence_keys::record_slot_key(n)` | `RECORD_SLOT_SIZE` (64) | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or 64 zero bytes when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
+| `persistence_keys::RecordSlotKey(n)` | `RECORD_SLOT_SIZE` (64) | ONE `SendspinPairingRecord` as a codec blob (`encode_pairing_record()` / `decode_pairing_record()` in `sendspin/persistence_codec.h`), or 64 zero bytes when slot `n` is free. `n` runs from 0 to `max_pairing_records - 1`; the key is absent until that slot is first filled. |
 | `persistence_keys::RECORD_ORDER` | `max_pairing_records` (12 by default) | The occupied slot numbers, least recently used first, one byte each, then `0xFF` in every remaining position. Decides which record a pairing at capacity evicts. |
 | `persistence_keys::PAIRING_PSK` | `PAIRING_PSK_SIZE` (32) | The stored `SendspinPairingPsk` as a codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). Never written while `SendspinClientConfig::pairing_psk` is set, which outranks a stored one. |
 | `persistence_keys::LAST_PLAYED` | `LAST_PLAYED_SIZE` (32) | The X25519 public key of the last-playback server, the key its base64url `server_id` encodes. |
@@ -620,7 +620,7 @@ recency writes only the order.
 
 #### Durability contract
 
-- `save_blob()` returning `true` means the write was accepted: stored, or queued until the next
+- `write_blob()` returning `true` means the write was accepted: stored, or queued until the next
   `commit()`. That includes the zeroed write that frees a record slot. A `false` return is
   reported, not retried: the in-memory state
   stays authoritative for the current boot. What the rejection costs decides the level: a write
@@ -639,7 +639,7 @@ recency writes only the order.
   accepted writes that holds pairing material (`KEYPAIR`, `PAIRING_PSK`, or a record slot) and,
   for a pairing, does so before `on_paired` fires. Writes to `RECORD_ORDER`,
   `LAST_PLAYED` and `OUTPUT_DELAY` never trigger it, so a provider that queues its writes may
-  batch those on its own schedule. A provider that writes through in `save_blob()` keeps the
+  batch those on its own schedule. A provider that writes through in `write_blob()` keeps the
   default, which returns `true`. A `false` return is logged like a rejected write and not
   retried.
 - The library never erases a key: every blob it owns is rewritten in place or left alone (a
@@ -674,13 +674,13 @@ survive reboots).
 
 ```cpp
 struct MyPersistenceProvider : SendspinPersistenceProvider {
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        std::vector<uint8_t> bytes;
-        if (nvs_read_bytes(key.c_str(), bytes)) return bytes;
+    std::optional<size_t> read_blob(std::string_view key, std::span<uint8_t> out) override {
+        size_t len = out.size();
+        if (nvs_read_bytes(std::string(key).c_str(), out.data(), &len)) return len;
         return std::nullopt;
     }
-    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
-        return nvs_write_bytes(key.c_str(), data, len);
+    bool write_blob(std::string_view key, std::span<const uint8_t> data) override {
+        return nvs_write_bytes(std::string(key).c_str(), data.data(), data.size());
     }
 };
 ```
@@ -1212,7 +1212,7 @@ int64_t client_ts = client.get_client_time(server_timestamp);
 
 ## Deprecated API
 
-The view forms hand the metadata, group, pairing and server text over as `std::string_view` into storage the library keeps, and the pairing token as a `std::array`; the deprecated forms copy it into `std::string`. The visualizer's spectrum bins come as a `std::span` rather than a `std::vector`, and its stream start as a `VisualizerStream` rather than the stream object. The player's PCM comes as a `std::span` beside the `AudioFormat` of exactly those bytes, rather than with the format of the latest `stream/start` the main loop reported. The deprecated forms are deprecated in v0.10.0 and removed in v0.11.0. Using a deprecated type or calling a deprecated getter draws a `-Wdeprecated-declarations` warning, but overriding a deprecated callback does not: the metadata and group callbacks and `on_visualizer_stream_start()` warn only because their parameter types are deprecated, while the four pairing callbacks (`on_pairing_started()`, `on_pairing_succeeded()`, `on_pairing_failed()`, `on_display_pairing_code()`), `on_spectrum()` and `on_audio_write()` take none, so search for those names. Mark every override `override`, so that a callback removed in v0.11.0 fails to compile rather than silently going uncalled.
+The view forms hand the metadata, group, pairing and server text over as `std::string_view` into storage the library keeps, and the pairing token as a `std::array`; the deprecated forms copy it into `std::string`. The visualizer's spectrum bins come as a `std::span` rather than a `std::vector`, and its stream start as a `VisualizerStream` rather than the stream object. The player's PCM comes as a `std::span` beside the `AudioFormat` of exactly those bytes, rather than with the format of the latest `stream/start` the main loop reported. The persistence provider takes its key as a `std::string_view` and its bytes as a `std::span`, reading into a buffer the library sizes for the key. The deprecated forms are deprecated in v0.10.0 and removed in v0.11.0. Using a deprecated type or calling a deprecated getter draws a `-Wdeprecated-declarations` warning, but overriding a deprecated callback does not: the metadata and group callbacks and `on_visualizer_stream_start()` warn only because their parameter types are deprecated, while the four pairing callbacks (`on_pairing_started()`, `on_pairing_succeeded()`, `on_pairing_failed()`, `on_display_pairing_code()`), `on_spectrum()`, `on_audio_write()`, `load_blob()` and `save_blob()` take none, so search for those names. Mark every override `override`, so that a callback removed in v0.11.0 fails to compile rather than silently going uncalled.
 
 | Deprecated | Replacement |
 |---|---|
@@ -1235,8 +1235,11 @@ The view forms hand the metadata, group, pairing and server text over as `std::s
 | `PlayerRoleListener::on_audio_write()` | `PlayerRoleListener::on_audio_output()`, the PCM as a `std::span<const uint8_t>` beside its `AudioFormat` (see [PlayerRoleListener](#playerrolelistener-required-if-using-player-role)) |
 | `PlayerRole::get_current_stream_params()` | `PlayerRole::stream_info()`, main loop only, for what the stream announced (codec included); the `AudioFormat` each `on_audio_output()` write carries for the PCM itself |
 | `ServerPlayerStreamObject` | `PlayerStreamInfo` |
+| `SendspinPersistenceProvider::load_blob()` | `SendspinPersistenceProvider::read_blob()` |
+| `SendspinPersistenceProvider::save_blob()` | `SendspinPersistenceProvider::write_blob()` |
+| `persistence_keys::record_slot_key()` | `persistence_keys::RecordSlotKey(slot).view()` |
 
-The text fields and arguments keep their meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` and `server_information()` return until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view, like a pairing token's array, is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. `server_information()` reads a copy `loop()` refreshes as the server changes, so it is main loop only and can read the previous server, or `nullopt`, for one `loop()` after `is_connected()` turns true: read it on each `loop()` rather than only when `is_connected()` rises; `get_server_information()` reads from any thread, and code off the main loop has no replacement and keeps calling it until the removal. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. The deprecated `on_visualizer_stream_start()` follows each `on_visualizer_stream_started()`, before the frames received after it. The player's write is the exception, since its return value counts the bytes written: the library calls only `on_audio_output()`, whose default hands the same bytes to `on_audio_write()`, so a listener that overrides both gets only `on_audio_output()`. One that overrides neither plays nothing: the deprecated default takes no bytes, and the sync task treats that as an output with no room, retrying the write after a short back-off rather than spinning.
+The text fields and arguments keep their meaning; only the text type changes. A view handed to a callback is valid for the duration of the callback, and the views `group_state()` and `server_information()` return until control next returns to `loop()` (from inside a callback: until the callback returns) or until `stop()`: copy what is needed beyond that. A view, like a pairing token's array, is not guaranteed to be NUL-terminated: print it with `%.*s` (its size, then its data) or copy it into a `std::string` before passing it to an API that expects a C string. `server_information()` reads a copy `loop()` refreshes as the server changes, so it is main loop only and can read the previous server, or `nullopt`, for one `loop()` after `is_connected()` turns true: read it on each `loop()` rather than only when `is_connected()` rises; `get_server_information()` reads from any thread, and code off the main loop has no replacement and keeps calling it until the removal. Until the removal the library calls the new callback and then the deprecated one with the same content, so a listener overrides one of the two; one that overrides both gets both, the new one first. The deprecated `on_visualizer_stream_start()` follows each `on_visualizer_stream_started()`, before the frames received after it. The player's write and the persistence provider are the exception, since their return values carry the result: the library calls only `on_audio_output()`, `read_blob()` and `write_blob()`, whose defaults forward to `on_audio_write()`, `load_blob()` and `save_blob()`, so an implementation that overrides both forms gets only the new one. A player listener that overrides neither plays nothing: the deprecated default takes no bytes, and the sync task treats that as an output with no room, retrying the write after a short back-off rather than spinning.
 
 ## Thread Safety Summary
 

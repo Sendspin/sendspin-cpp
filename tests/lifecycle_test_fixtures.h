@@ -91,7 +91,7 @@ public:
 // matching the PSK category the admission tests need. Optionally also seeds the last-played
 // server_id that the rank-0 arbitration tiebreak keys on.
 //
-// save_blob is left at the base class's rejecting default: nothing here is meant to
+// write_blob is left at the base class's rejecting default: nothing here is meant to
 // observe writes, and a store that accepted them would let a test's own traffic (a playback
 // recency flush, the keypair save) mutate the seed mid-run. Tests that need to observe or shape a write
 // bring their own provider.
@@ -108,13 +108,14 @@ public:
         this->last_played_server_id_ = std::move(server_id);
     }
 
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+    std::optional<size_t> read_blob(std::string_view key, std::span<uint8_t> out) override {
         if (is_record_key(key)) {
-            return seeded_record_blob(this->records_, key);
+            return serve_blob(seeded_record_blob(this->records_, key), out);
         }
         if (key == persistence_keys::LAST_PLAYED && !this->last_played_server_id_.empty()) {
             // Stored as the public key the id encodes.
-            return blob_bytes(public_key_from_peer_id(this->last_played_server_id_).value());
+            return serve_blob(
+                blob_bytes(public_key_from_peer_id(this->last_played_server_id_).value()), out);
         }
         return std::nullopt;
     }
