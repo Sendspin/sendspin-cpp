@@ -636,7 +636,8 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndPairsTheSession) {
     EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
 
     // The server's ack commits the record to RAM synchronously on the protocol task (see
-    // client.cpp's SERVER_PAIR_FINALIZE handler); the durable write_blob(RECORDS) this waits for
+    // client_dispatch.cpp's SERVER_PAIR_FINALIZE handler); the durable record-slot write_blob()
+    // this waits for
     // is the deferred flush from the next loop() tick (RecordStore::persist_records()).
     pump_until(client, [&] { return persistence.captured_record().has_value(); });
     auto captured = persistence.captured_record();

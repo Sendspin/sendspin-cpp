@@ -192,9 +192,9 @@ TEST(RecordStore, FirstBootProvisioningSurvivesPersistenceFailureForThisBoot) {
     EXPECT_EQ(resolved->category, PskCategory::PAIRING);
 }
 
-// A provider still on the deprecated load_blob()/save_blob() (the ESPHome hub until it moves)
-// gets its blobs saved and loaded through the read_blob()/write_blob() defaults: the Pairing PSK
-// the first store provisions is the one a second store over the same provider loads.
+// A provider still on the deprecated load_blob()/save_blob() gets its blobs saved and loaded
+// through the read_blob()/write_blob() defaults: the Pairing PSK the first store provisions is the
+// one a second store over the same provider loads.
 TEST(RecordStore, DeprecatedProviderFormsStillPersist) {
     struct DeprecatedFormProvider : SendspinPersistenceProvider {
         std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
@@ -215,6 +215,19 @@ TEST(RecordStore, DeprecatedProviderFormsStillPersist) {
     RecordStore second(&provider);
     ASSERT_TRUE(second.pairing_psk().has_value());
     EXPECT_EQ(second.pairing_psk()->psk, first.pairing_psk()->psk);
+}
+
+// Devices already hold records under these keys, so their format must not change: one digit, two
+// (the default max_pairing_records reaches slot 11), and the highest slot.
+TEST(PersistenceKeys, RecordSlotKeysKeepTheirStoredFormat) {
+    const std::pair<size_t, std::string_view> rows[] = {
+        {0, "rec_0"},  // Control
+        {10, "rec_10"},
+        {254, "rec_254"},
+    };
+    for (const auto& [slot, expected] : rows) {
+        EXPECT_EQ(persistence_keys::RecordSlotKey(slot).view(), expected);
+    }
 }
 
 // ============================================================================
@@ -1788,7 +1801,8 @@ TEST(PlayerRoleOutputDelay, PersistsAsANativeUint16) {
 // reinterpreting garbage as a number.
 TEST(PlayerRoleOutputDelay, InvalidPersistedValueIsTreatedAsAbsent) {
     InMemoryPersistenceProvider provider;
-    provider.seed_blob(persistence_keys::OUTPUT_DELAY, blob_bytes("not-a-number"));
+    // Shorter than OUTPUT_DELAY_SIZE, so the provider hands it over and the role must reject it.
+    provider.seed_blob(persistence_keys::OUTPUT_DELAY, {0x42});
 
     SendspinClientConfig config;
     config.name = "output-delay-invalid-test";

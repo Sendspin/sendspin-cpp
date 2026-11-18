@@ -58,7 +58,7 @@ inline constexpr size_t RECORD_SLOT_SIZE = 64;
 /// and lowers it to at most 255. It decides which record is evicted when a pairing arrives at a
 /// full store, so it is rewritten whenever that order changes. A byte naming no stored record is
 /// ignored on load, and a stored record this blob does not name sorts after the ones it does.
-/// Being advisory, it is the one blob read at any length.
+/// Being advisory, it is the one blob read at any length up to 255 bytes; a longer one is ignored.
 inline constexpr const char* RECORD_ORDER = "rec_order";
 
 /// @brief Key of one long-term record slot: `RECORD_SLOT_PREFIX` followed by the decimal slot

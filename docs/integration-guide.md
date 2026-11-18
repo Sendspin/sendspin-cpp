@@ -596,7 +596,7 @@ Every blob has a fixed size, published beside its key as a `*_SIZE` constant. Th
 always writes exactly that many bytes and treats a stored blob of any other length as absent, so
 a provider can store each key as a fixed-size value. `RECORD_ORDER` is the exception: it has no
 size constant, is written as exactly `max_pairing_records` bytes, after the clamp to 5..255
-described under Record capacity, and is read at any length. Integers are in the device's native
+described under Record capacity, and is read at any length up to 255 bytes, a longer one being ignored. Integers are in the device's native
 byte order: a blob is only ever read back by the device that wrote it.
 
 | Key | Size | Contents |
