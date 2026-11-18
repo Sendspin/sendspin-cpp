@@ -644,31 +644,49 @@ TEST(Protocol, PlayerCommandUnknownOrAbsentCommandRejectsTheObject) {
     EXPECT_EQ(valid->volume.value_or(0), 50);
 }
 
-// A malformed required scalar in stream/start (channels out of range) is dropped, leaving the player
-// object incomplete, so the whole message is rejected instead of being accepted with a bogus value.
+// A required scalar in stream/start that is out of range (a channel count past uint8_t, or zero,
+// which is no rate, channel count or depth) is dropped, leaving the player object incomplete, so
+// the whole message is rejected instead of being accepted with a bogus value.
 TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":{"codec":"pcm",)"
-                      R"("sample_rate":44100,"channels":300,"bit_depth":16}}}})",
-                      doc, root));
-    StreamStartMessage msg;
-    EXPECT_FALSE(process_stream_start_message(root, STREAM_START_ROLES, &msg));
-    // The rejected section is reset, so the codec, sample rate and bit depth that did parse do
-    // not survive into the caller's message beside the dropped channel count.
-    EXPECT_FALSE(msg.player.has_value());
+    struct Row {
+        const char* name;
+        const char* sample_rate;
+        const char* channels;
+        const char* bit_depth;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: in range", "44100", "2", "16", true},
+        {"channels past uint8_t", "44100", "300", "16", false},
+        {"zero channels", "44100", "0", "16", false},
+        {"zero sample rate", "0", "2", "16", false},
+        {"zero bit depth", "44100", "2", "0", false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        const std::string json = std::string(R"({"type":"stream/start","payload":{"player":{)") +
+                                 R"("codec":"pcm","sample_rate":)" + row.sample_rate +
+                                 R"(,"channels":)" + row.channels + R"(,"bit_depth":)" +
+                                 row.bit_depth + "}}}";
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(json.c_str(), doc, root));
+        StreamStartMessage msg;
+        EXPECT_EQ(process_stream_start_message(root, STREAM_START_ROLES, &msg), row.accepted);
+        // A rejected section is reset, so the fields that did parse do not survive into the
+        // caller's message beside the dropped one.
+        EXPECT_EQ(msg.player.has_value(), row.accepted);
+    }
 
-    // Control: the same message with an in-range channel count is accepted.
-    JsonDocument doc_ok;
-    JsonObject root_ok;
-    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":{"codec":"pcm",)"
-                      R"("sample_rate":44100,"channels":2,"bit_depth":16}}}})",
-                      doc_ok, root_ok));
-    StreamStartMessage ok;
-    EXPECT_TRUE(process_stream_start_message(root_ok, STREAM_START_ROLES, &ok));
-    ASSERT_TRUE(ok.player.has_value());
-    ASSERT_TRUE(ok.player->params.channels.has_value());
-    EXPECT_EQ(ok.player->params.channels.value(), 2);
+    // Control: opus ignores the depth (roles/player/v1.md "stream/start player object"), so a zero
+    // one passes.
+    JsonDocument opus_doc;
+    JsonObject opus_root;
+    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":{"codec":"opus",)"
+                      R"("sample_rate":48000,"channels":2,"bit_depth":0}}})",
+                      opus_doc, opus_root));
+    StreamStartMessage opus_msg;
+    EXPECT_TRUE(process_stream_start_message(opus_root, STREAM_START_ROLES, &opus_msg));
 }
 
 // roles/player/v1.md "Codec framing": a FLAC codec_header is required and carries the fLaC marker
@@ -732,8 +750,9 @@ TEST(Protocol, StreamStartFlacCodecHeaderMustBeMarkerAndStreamInfo) {
 }
 
 // A stream/start carrying a malformed section is rejected whole, so a well-formed section beside
-// it does not start a stream of its own: the client's caller breaks on the false return and
-// applies nothing. Without that rule a server could start half the stream it asked for.
+// it does not start a stream of its own: the client's caller applies nothing and ends the streams
+// of the roles the message carried (rejected_roles). Without that rule a server could start half
+// the stream it asked for.
 TEST(Protocol, StreamStartWithAMalformedPlayerDropsAValidArtworkSection) {
     JsonDocument doc;
     JsonObject root;
@@ -747,6 +766,10 @@ TEST(Protocol, StreamStartWithAMalformedPlayerDropsAValidArtworkSection) {
     EXPECT_FALSE(msg.player.has_value());
     EXPECT_FALSE(msg.artwork.has_value())
         << "the artwork section survived a message the parser rejected";
+    EXPECT_TRUE(msg.rejected_roles.contains(SendspinRole::PLAYER));
+    EXPECT_TRUE(msg.rejected_roles.contains(SendspinRole::ARTWORK));
+    // Control: a role whose section the message did not carry keeps its stream.
+    EXPECT_FALSE(msg.rejected_roles.contains(SendspinRole::VISUALIZER));
 
     // Control: the same artwork section alone is accepted and carried through.
     JsonDocument doc_ok;

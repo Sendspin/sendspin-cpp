@@ -1218,6 +1218,8 @@ struct StreamStartMessage {
     std::optional<PlayerStreamPayload> player;
     std::optional<ServerArtworkStreamObject> artwork;
     std::optional<VisualizerStreamPayload> visualizer;
+    /// When the message is rejected, the parsed roles whose section it carried
+    EnumSet<SendspinRole> rejected_roles;
 };
 
 static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 8, "EnumSet<SendspinRole> needs 8 bits");
@@ -1362,8 +1364,8 @@ bool process_server_state_controller(JsonObject root, ControllerStatePayload* co
 /// @brief Parses the sections of a stream/start JSON message that `roles` names into the provided
 /// struct
 /// @param roles The roles whose sections are parsed; any other section is skipped unvalidated.
-/// @return false (logged, every section reset) when a parsed section is malformed, which rejects
-/// the message.
+/// @return false (logged, every section reset, `rejected_roles` filled) when a parsed section is
+/// malformed, which rejects the message.
 bool process_stream_start_message(JsonObject root, EnumSet<SendspinRole> roles,
                                   StreamStartMessage* stream_msg);
 

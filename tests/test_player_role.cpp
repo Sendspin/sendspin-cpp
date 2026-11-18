@@ -81,7 +81,9 @@ ClientPlayerStateObject build_player_state(PlayerRole& player) {
 // roles/player/v1.md "client/hello player@v1 support object": supported_formats is non-empty and
 // a player MUST list either flac or pcm, the codecs every server supports. start() refuses a list
 // that breaks the rule rather than advertising it, and refuses an opus entry in a build without the
-// Opus decoder (SENDSPIN_ENABLE_OPUS), so the hello never advertises a codec it cannot decode.
+// Opus decoder (SENDSPIN_ENABLE_OPUS), so the hello never advertises a codec it cannot decode. A
+// stream/start may name only a listed format, so an entry is refused too without channels and a
+// sample rate, or for pcm and flac without a bit depth of 1 to 32 (opus ignores the depth).
 TEST(PlayerRoleFormats, StartValidatesTheFormatList) {
 #ifdef SENDSPIN_ENABLE_OPUS
     constexpr bool OPUS_DECODES = true;
@@ -102,6 +104,11 @@ TEST(PlayerRoleFormats, StartValidatesTheFormatList) {
         {"Control: flac alone", {flac}, true},
         {"Control: pcm alone", {pcm}, true},
         {"opus beside pcm", {opus, pcm}, OPUS_DECODES},
+        {"an entry without channels", {pcm, {SendspinCodecFormat::PCM, 0, 44100, 16}}, false},
+        {"an entry without a sample rate", {pcm, {SendspinCodecFormat::FLAC, 2, 0, 16}}, false},
+        {"an entry without a bit depth", {pcm, {SendspinCodecFormat::PCM, 2, 44100, 0}}, false},
+        {"an entry deeper than 32 bits", {pcm, {SendspinCodecFormat::FLAC, 2, 44100, 33}}, false},
+        {"opus with no bit depth", {pcm, {SendspinCodecFormat::OPUS, 2, 48000, 0}}, OPUS_DECODES},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -321,8 +328,14 @@ std::unique_ptr<PlayerRole::Impl> make_impl(InboundRing* ring = nullptr) {
     static std::deque<Inbox> inboxes;
     static std::deque<InboundRing> rings;
 
+    // Every format the tests in this file stream, since a stream/start may name only a listed one.
     PlayerRoleConfig config;
-    config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
+    config.audio_formats = {
+        {SendspinCodecFormat::PCM, 2, 44100, 16},  {SendspinCodecFormat::PCM, 2, 48000, 24},
+        {SendspinCodecFormat::PCM, 1, 48000, 24},  {SendspinCodecFormat::PCM, 1, 48000, 16},
+        {SendspinCodecFormat::PCM, 1, 96000, 16},  {SendspinCodecFormat::FLAC, 2, 44100, 16},
+        {SendspinCodecFormat::OPUS, 2, 48000, 16},
+    };
     clients.emplace_back(SendspinClientConfig{});
     auto impl = std::make_unique<PlayerRole::Impl>(std::move(config), &clients.back());
     inboxes.emplace_back();
@@ -804,6 +817,44 @@ TEST(PlayerStreamStart, BitDepthIsTheDecodedDepth) {
         uint32_t generation = 0;
         ASSERT_TRUE(impl->event_state->stream_params_slot.take(published, generation));
         EXPECT_EQ(published.bit_depth, row.decoded_bit_depth);
+    }
+}
+
+// roles/player/v1.md "stream/start player object": the format MUST be one the player listed, so a
+// stream/start naming any other is refused before anything of its stream reaches the sync task or
+// the main loop. The opus row of BitDepthIsTheDecodedDepth covers the bit depth opus ignores.
+TEST(PlayerStreamStart, AFormatThePlayerDidNotListIsRefused) {
+    struct Row {
+        const char* name;
+        uint32_t sample_rate;
+        uint8_t channels;
+        uint8_t bit_depth;
+        bool accepted;
+    };
+    const Row rows[] = {
+        {"Control: a listed format", 44100, 2, 16, true},
+        {"another sample rate", 32000, 2, 16, false},
+        {"another channel count", 44100, 6, 16, false},
+        {"another bit depth", 44100, 2, 8, false},
+        {"a format listed only for opus", 48000, 2, 16, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        PlayerStreamParams params = pcm_stream_params();
+        params.sample_rate = row.sample_rate;
+        params.channels = row.channels;
+        params.bit_depth = row.bit_depth;
+        impl->handle_stream_start({params});
+
+        void* header_item = impl->sync_task->take_item(0);
+        EXPECT_EQ(header_item != nullptr, row.accepted);
+        if (header_item != nullptr) {
+            impl->sync_task->inbound().return_item(header_item);
+        }
+        PlayerStreamParams published;
+        uint32_t generation = 0;
+        EXPECT_EQ(impl->event_state->stream_params_slot.take(published, generation), row.accepted);
     }
 }
 

@@ -133,6 +133,7 @@ constexpr uint16_t VISUALIZER_ORDER_END_TEST_PORT = 19115;
 constexpr uint16_t VISUALIZER_ORDER_CLEAR_TEST_PORT = 19116;
 constexpr uint16_t VISUALIZER_ORDER_DEACTIVATION_TEST_PORT = 19117;
 constexpr uint16_t VISUALIZER_ORDER_LOSS_TEST_PORT = 19118;
+constexpr uint16_t REFUSED_STREAM_START_TEST_PORT = 19119;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -403,8 +404,8 @@ TEST(ClientLifecycle, StopEndsTheStreamAndRestartPlaysAgain) {
 }
 
 #ifndef SENDSPIN_ENABLE_OPUS
-// Without the Opus decoder, a stream/start naming opus (a server ignoring the advertised list)
-// takes the unsupported-codec path: no codec header reaches the sync task and no
+// Without the Opus decoder, a stream/start naming opus (a server ignoring the advertised list) is
+// refused as a format the player did not list: no codec header reaches the sync task and no
 // on_stream_start() fires. The pcm stream/start sent right behind it starts normally; stream
 // events drain in arrival order, so once the pcm params are current an accepted opus start would
 // already have been counted.
@@ -431,6 +432,40 @@ TEST(ClientLifecycle, OpusStreamStartIsRefusedWithoutTheOpusDecoder) {
     EXPECT_EQ(listener.stream_ends, 1);
 }
 #endif
+
+// A stream/start the player refuses, rejected by the parse (a zero channel count) or naming a
+// format the player did not list, ends the stream it would have replaced rather than leaving the
+// sync task decoding the server's new format with the old one's parameters.
+TEST(ClientLifecycle, ARefusedStreamStartEndsTheRunningStream) {
+    CountingPlayerListener listener;
+    PairedClientBundle bundle(make_config(REFUSED_STREAM_START_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    auto server = connect_paired_server(bundle.peer, REFUSED_STREAM_START_TEST_PORT);
+    pump_until(client, [&] { return client.is_connected(); });
+
+    const char* const refused[] = {
+        R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
+        R"("channels":0,"bit_depth":16}}})",
+        R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":44100,)"
+        R"("channels":2,"bit_depth":16}}})",
+    };
+    for (const char* const message : refused) {
+        SCOPED_TRACE(message);
+        const int starts_before = listener.stream_starts;
+        const int ends_before = listener.stream_ends;
+        ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+        pump_until(client, [&] { return listener.stream_starts > starts_before; });
+        ASSERT_TRUE(server->send_app_json(message));
+        pump_until(client, [&] { return listener.stream_ends > ends_before; });
+        EXPECT_FALSE(client.player()->stream_info().has_value());
+        EXPECT_EQ(listener.stream_starts, starts_before + 1) << "the refused stream started";
+    }
+
+    client.stop();
+}
 
 // A listener callback fired from inside stop() sees the client (its started flag and its group
 // state) already stopped, and its disconnect() and connect_to() are ignored rather than reaching
@@ -3314,7 +3349,13 @@ struct StateRoleClient {
         this->client.add_controller().set_listener(&log);
         this->client.add_metadata().set_listener(&log);
         this->client.add_color().set_listener(&log);
-        PlayerRole& player = this->client.add_player(make_pcm_player_config());
+        // The rates player_stream_with() marks the streams below with, besides the 48 kHz listed
+        // already: a stream/start may name only a listed format.
+        PlayerRoleConfig player_config = make_pcm_player_config();
+        for (const uint32_t khz : {1U, 2U, 44U}) {
+            player_config.audio_formats.push_back({SendspinCodecFormat::PCM, 2, khz * 1000, 16});
+        }
+        PlayerRole& player = this->client.add_player(std::move(player_config));
         player.set_listener(&log);
         log.player = &player;
         this->client.add_visualizer(make_visualizer_config()).set_listener(&log);

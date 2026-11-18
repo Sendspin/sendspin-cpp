@@ -104,11 +104,21 @@ namespace sendspin {
 /// roles/player/v1.md "client/hello player@v1 support object" requires supported_formats to be a
 /// non-empty list in which the player lists either flac or pcm, since those are the two codecs
 /// every server supports and a player is not told which others a server has. Opus may be listed
-/// only when this build decodes it (SENDSPIN_ENABLE_OPUS).
+/// only when this build decodes it (SENDSPIN_ENABLE_OPUS). Every entry has channels and a sample
+/// rate, and a pcm or flac entry a bit depth of 1 to 32, since a stream/start may name only a
+/// listed format.
 static bool audio_formats_valid(const std::vector<AudioSupportedFormatObject>& formats) {
     bool has_baseline = false;
     bool has_opus = false;
     for (const auto& format : formats) {
+        if (format.channels == 0 || format.sample_rate == 0 ||
+            (format.codec != SendspinCodecFormat::OPUS &&
+             (format.bit_depth == 0 || format.bit_depth > 32))) {
+            SS_LOGE(TAG,
+                    "audio_formats has an entry with a zero channel count or sample rate, or a "
+                    "bit depth outside 1 to 32");
+            return false;
+        }
         if (format.codec == SendspinCodecFormat::FLAC || format.codec == SendspinCodecFormat::PCM) {
             has_baseline = true;
         } else if (format.codec == SendspinCodecFormat::OPUS) {
@@ -125,6 +135,17 @@ static bool audio_formats_valid(const std::vector<AudioSupportedFormatObject>& f
         return false;
     }
     return true;
+}
+
+/// @brief Whether `params` is one of `formats`: roles/player/v1.md "stream/start player object"
+/// allows only a format the player listed, its bit_depth ignored for opus
+static bool format_advertised(const std::vector<AudioSupportedFormatObject>& formats,
+                              const PlayerStreamParams& params) {
+    return std::any_of(formats.begin(), formats.end(), [&](const AudioSupportedFormatObject& f) {
+        return f.codec == params.codec && f.channels == params.channels &&
+               f.sample_rate == params.sample_rate &&
+               (f.codec == SendspinCodecFormat::OPUS || f.bit_depth == params.bit_depth);
+    });
 }
 
 // ============================================================================
@@ -405,6 +426,12 @@ void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {
     if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
         !player_obj.sample_rate.has_value() || !player_obj.codec.has_value()) {
         SS_LOGE(TAG, "Stream start message missing required audio parameters");
+    } else if (!format_advertised(this->config.audio_formats, player_obj)) {
+        SS_LOGE(TAG,
+                "Stream start format %s %" PRIu32 " Hz %" PRIu8 " ch %" PRIu8
+                "-bit is not one the player advertised",
+                to_cstr(*player_obj.codec), *player_obj.sample_rate, *player_obj.channels,
+                *player_obj.bit_depth);
     } else {
         auto codec = player_obj.codec.value();
         if (codec == SendspinCodecFormat::OPUS) {

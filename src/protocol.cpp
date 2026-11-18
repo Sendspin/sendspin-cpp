@@ -216,15 +216,19 @@ static bool process_player_stream_object(const JsonObject player_object,
         player_obj->codec = codec.value_or(SendspinCodecFormat::UNSUPPORTED);
     }
 
-    if (auto v = read_uint_field<uint32_t>(player_object["sample_rate"], "sample_rate")) {
+    // Zero is no rate, channel count or depth, though any depth passes for opus, which ignores it
+    // (roles/player/v1.md "stream/start player object"); a field left unset fails the section as
+    // incomplete.
+    if (auto v = read_uint_field<uint32_t>(player_object["sample_rate"], "sample_rate", 1U)) {
         player_obj->sample_rate = v;
     }
 
-    if (auto v = read_uint_field<uint8_t>(player_object["channels"], "channels")) {
+    if (auto v = read_uint_field<uint8_t>(player_object["channels"], "channels", uint8_t{1})) {
         player_obj->channels = v;
     }
 
-    if (auto v = read_uint_field<uint8_t>(player_object["bit_depth"], "bit_depth")) {
+    const uint8_t min_bit_depth = player_obj->codec == SendspinCodecFormat::OPUS ? 0 : 1;
+    if (auto v = read_uint_field<uint8_t>(player_object["bit_depth"], "bit_depth", min_bit_depth)) {
         player_obj->bit_depth = v;
     }
 
@@ -1008,6 +1012,13 @@ bool process_stream_start_message(JsonObject root, EnumSet<SendspinRole> roles,
         stream_msg->player.reset();
         stream_msg->artwork.reset();
         stream_msg->visualizer.reset();
+        for (const auto& [role, section] : {std::pair{SendspinRole::PLAYER, "player"},
+                                            std::pair{SendspinRole::ARTWORK, "artwork"},
+                                            std::pair{SendspinRole::VISUALIZER, "visualizer"}}) {
+            if (roles.contains(role) && payload[section].is<JsonObject>()) {
+                stream_msg->rejected_roles.insert(role);
+            }
+        }
     }
     return valid;
 }
