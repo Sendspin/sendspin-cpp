@@ -486,15 +486,16 @@ public:
 /// none of the sync task's. Asked instead to measure the sync task, it opens a window there and
 /// closes it on the stream's first on_audio_output(), the priming silence the sync task writes once
 /// it has processed the codec header. Given a sample rate in close_on_rate, it closes the open
-/// window on the first write at that rate instead, and with a player to report to it plays every
-/// write as it takes it, so a stream gets past its priming to take the codec headers behind it.
+/// window instead on the first write at that rate once on_stream_start() has set start_reported,
+/// and with a player to report to it plays every write as it takes it, so a stream gets past its
+/// priming to take the codec headers behind it.
 class WindowClosingPlayerListener : public CountingPlayerListener {
 public:
     size_t on_audio_output(std::span<const uint8_t> pcm, const AudioFormat& format,
                            uint32_t timeout_ms) override {
         uint32_t rate = this->close_on_rate.load();
         if (this->close_on_audio_output.exchange(false) ||
-            (rate == format.sample_rate &&
+            (rate == format.sample_rate && this->start_reported.load() &&
              this->close_on_rate.compare_exchange_strong(rate, 0))) {
             this->sync_window = close_window();
             this->sync_window_closed.store(true);
@@ -509,6 +510,7 @@ public:
 
     void on_stream_start() override {
         CountingPlayerListener::on_stream_start();
+        this->start_reported.store(true);
         if (this->close_on_start) {
             this->close_on_start = false;
             this->window = close_window();
@@ -523,6 +525,8 @@ public:
     bool close_on_start{false};
     bool open_on_start{false};
     std::atomic<uint32_t> close_on_rate{0};
+    /// Set by each on_stream_start(); cleared by the test before the stream/start it waits for.
+    std::atomic<bool> start_reported{false};
     std::atomic<PlayerRole*> report_to{nullptr};
     Window window;
     /// Written on the sync task, then published by sync_window_closed.
@@ -642,6 +646,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
     // Lists FLAC for the streams below (roles/player/v1.md "stream/start player object")
     PlayerRoleConfig player_config = make_pcm_player_config();
     player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, 48000, 16});
+    player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, 96000, 16});
     PlayerRole& player = client.add_player(std::move(player_config));
     player.set_listener(&player_listener);
     ControllerRole& controller = client.add_controller();
@@ -879,7 +884,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
 
     // roles/player/v1.md "stream/start": a FLAC stream/start for the running stream at 96 kHz
     // changes its format in place. The window holds the protocol task's and the main loop's work
-    // on it and the sync task's on its codec header, and closes on the first write at the new rate.
+    // on it and the sync task's on its codec header, and closes on the first write at the new rate
+    // after the main loop has reported the update.
     // The 48 kHz stream starts outside it, up to its first write, and its writes are played as they
     // are taken, so the sync task gets past its priming to take the header from LOAD_CHUNK.
     constexpr const char* FLAC_96K_STREAM_START =
@@ -900,6 +906,7 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
                    player_listener.audio_writes.load() > writes_before;
         });
         player_listener.sync_window_closed.store(false);
+        player_listener.start_reported.store(false);
         open_window();
         player_listener.close_on_rate.store(96000);
         {

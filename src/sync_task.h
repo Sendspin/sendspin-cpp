@@ -74,8 +74,9 @@ protected:
 
     /// A sink plays out one format before opening the next (integration guide, PlayerRoleListener),
     /// so it holds two runs while its reports for the older lag; two more cover updates in that
-    /// lag. Past them add() folds the oldest run into the next.
+    /// lag. Past them add() folds the second oldest run into the next.
     static constexpr size_t MAX_RUNS = 4;
+    static_assert(MAX_RUNS >= 3, "add() folds the second oldest run into the third");
 
     InlineVector<Run, MAX_RUNS> runs_;
 };

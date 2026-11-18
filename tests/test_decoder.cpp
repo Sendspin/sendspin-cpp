@@ -252,35 +252,45 @@ TEST(Decoder, OpusPacketLongerThanTheEstimateRaisesItAndDecodesOnRetry) {
 }
 
 // The sync task resets its decoder at every codec header, an in-place format change included, so
-// the Opus state is initialized again in the storage it already holds when that is large enough:
-// here a mono stream in the storage a stereo one sized. Reached: the protected opus_decoder_buf_,
-// since storage kept across headers shows nowhere else.
-TEST(Decoder, OpusStreamAfterAResetDecodesInTheStateItAlreadyHolds) {
+// the Opus state is initialized again in the storage it already holds when that is large enough and
+// grown when it is not. Reached: the protected opus_decoder_buf_, since storage kept across headers
+// shows nowhere else.
+TEST(Decoder, OpusStateGrowsForMoreChannelsAndIsKeptForFewer) {
     const std::vector<uint8_t> packet = opus_packet_40_ms();
     ASSERT_FALSE(packet.empty());
-    const sendspin::DummyHeader mono_header{
-        .sample_rate = 48000, .bits_per_sample = 16, .channels = 1};
+    const size_t mono_state = static_cast<size_t>(opus_decoder_get_size(1));
+    const size_t stereo_state = static_cast<size_t>(opus_decoder_get_size(2));
+    struct Row {
+        const char* name;
+        uint8_t channels;
+        size_t state_size;
+    };
+    const Row rows[] = {
+        {"mono, the first header", 1, mono_state},
+        {"stereo after mono: grown", 2, stereo_state},
+        {"mono after stereo: kept", 1, stereo_state},
+    };
 
     SendspinDecoder decoder;
-    AudioStreamInfo info;
-    ASSERT_TRUE(decoder.process_header(reinterpret_cast<const uint8_t*>(&STEREO_48K_HEADER),
-                                       sizeof(STEREO_48K_HEADER),
-                                       sendspin::CHUNK_TYPE_OPUS_DUMMY_HEADER, &info));
-    const uint8_t* const state = decoder.opus_decoder_buf_.data();
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        const sendspin::DummyHeader header{
+            .sample_rate = 48000, .bits_per_sample = 16, .channels = row.channels};
+        AudioStreamInfo info;
+        decoder.reset_decoders();
+        ASSERT_TRUE(decoder.process_header(reinterpret_cast<const uint8_t*>(&header),
+                                           sizeof(header), sendspin::CHUNK_TYPE_OPUS_DUMMY_HEADER,
+                                           &info));
+        EXPECT_EQ(decoder.opus_decoder_buf_.size(), row.state_size);
 
-    decoder.reset_decoders();
-    ASSERT_TRUE(decoder.process_header(reinterpret_cast<const uint8_t*>(&mono_header),
-                                       sizeof(mono_header), sendspin::CHUNK_TYPE_OPUS_DUMMY_HEADER,
-                                       &info));
-    EXPECT_EQ(decoder.opus_decoder_buf_.data(), state) << "the header allocated new Opus state";
-
-    std::vector<uint8_t> buffer(info.frames_to_bytes(OPUS_FRAMES_40_MS));
-    size_t consumed = 0;
-    size_t decoded = 0;
-    ASSERT_TRUE(decoder.decode_audio_chunk(packet.data(), packet.size(), buffer.data(),
-                                           buffer.size(), &consumed, &decoded));
-    EXPECT_EQ(consumed, packet.size());
-    EXPECT_EQ(decoded, info.frames_to_bytes(OPUS_FRAMES_40_MS));
+        std::vector<uint8_t> buffer(info.frames_to_bytes(OPUS_FRAMES_40_MS));
+        size_t consumed = 0;
+        size_t decoded = 0;
+        ASSERT_TRUE(decoder.decode_audio_chunk(packet.data(), packet.size(), buffer.data(),
+                                               buffer.size(), &consumed, &decoded));
+        EXPECT_EQ(consumed, packet.size());
+        EXPECT_EQ(decoded, info.frames_to_bytes(OPUS_FRAMES_40_MS));
+    }
 }
 #endif
 

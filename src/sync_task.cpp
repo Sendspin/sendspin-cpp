@@ -117,10 +117,10 @@ void QueuedAudio::add(uint32_t sample_rate, uint32_t frames) {
         return;
     }
     if (this->runs_.size() == MAX_RUNS) {
-        // Folded by count, so the queue stays in step with the sink's reports; only the duration
-        // is off, while the folded frames are still queued.
-        this->runs_[1].frames += this->runs_[0].frames;
-        this->runs_.erase(this->runs_.begin());
+        // Folded by count, so the queue stays in step with the sink's reports; only the folded
+        // frames' duration is off. The oldest run, the one the sink is playing, stays exact.
+        this->runs_[2].frames += this->runs_[1].frames;
+        this->runs_.erase(this->runs_.begin() + 1);
     }
     this->runs_.push_back({.sample_rate = sample_rate, .frames = frames});
 }
