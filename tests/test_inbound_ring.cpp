@@ -15,8 +15,8 @@
 /// @file test_inbound_ring.cpp
 /// @brief Tests for the shared inbound ring's pieces: InboundRing's take after a wrap and its
 /// quota charge and return path, the intrusive per-consumer item list (order, blocking take,
-/// wake, recall), a consumer's hand-overs, the outstanding-byte quota, the per-connection gate,
-/// and the ring size derivation
+/// wake, recall, discard from a cut), a consumer's hand-overs, the outstanding-byte quota, the
+/// per-connection gate, and the ring size derivation
 
 #include "inbound_ring.h"
 #include "sendspin/config.h"
@@ -531,6 +531,78 @@ TEST(InboundItemList, AppendAfterRecallStartsAFreshList) {
     void* item = routed_item(f.ring, 2);
     f.list.append(item);
     EXPECT_EQ(f.list.take(0), item);
+}
+
+// discard_from() returns exactly the listed items the predicate takes from the cut on, wherever
+// they sit, releasing their charges, and relinks the rest in order: an item appended afterwards
+// follows the last one kept. Here an item's tag is its timestamp, and type 1 marks an item with
+// none (a codec header), which stays among the discarded ones.
+TEST(InboundItemList, DiscardFromReturnsTheItemsFromTheCutAndRelinksTheRest) {
+    constexpr uint32_t HEADER_TAG = 25;
+    constexpr uint32_t APPENDED_TAG = 99;
+    constexpr size_t LEN = 16;
+    const auto at_or_after = [](void* item, int64_t cut) {
+        const InboundItemHeader* header = inbound_item_header(item);
+        return header->type == 0 && static_cast<int64_t>(header->generation) >= cut;
+    };
+    struct Row {
+        const char* name;
+        int64_t cut;
+        std::vector<uint32_t> kept;
+    };
+    const Row rows[] = {
+        {"Control: a cut after every item keeps them all", 50, {10, 20, HEADER_TAG, 30, 40}},
+        {"a cut at the tail", 30, {10, 20, HEADER_TAG}},
+        {"a cut mid-list passes over the header", 20, {10, HEADER_TAG}},
+        {"a cut before the head keeps only the header", 0, {HEADER_TAG}},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Fixture f(1024);
+        InboundQuota& quota = f.ring.quota(InboundHolder::PLAYER);
+        quota.set_limit(1024);
+        for (uint32_t tag : {10U, 20U, HEADER_TAG, 30U, 40U}) {
+            void* item = routed_item(f.ring, tag, LEN);
+            inbound_item_header(item)->type = tag == HEADER_TAG ? 1 : 0;
+            ASSERT_TRUE(f.ring.charge(item, LEN, InboundHolder::PLAYER, false));
+            f.list.append(item);
+        }
+        const size_t one = quota.outstanding() / 5;
+
+        EXPECT_EQ(f.list.discard_from(row.cut, at_or_after), 5 - row.kept.size());
+        EXPECT_EQ(quota.outstanding(), row.kept.size() * one) << "a discarded item kept its charge";
+
+        f.list.append(routed_item(f.ring, APPENDED_TAG, LEN));
+        std::vector<uint32_t> taken;
+        while (void* item = f.list.take(0)) {
+            taken.push_back(inbound_item_header(item)->generation);
+            f.ring.return_item(item);
+        }
+        std::vector<uint32_t> expected = row.kept;
+        expected.push_back(APPENDED_TAG);
+        EXPECT_EQ(taken, expected);
+    }
+}
+
+// cut_since_take() is the earliest cut since the latest take, so it judges only the item that
+// take returned: a cut made before the take was already applied to that item while it was listed.
+TEST(InboundItemList, CutSinceTakeCoversOnlyCutsAfterTheLatestTake) {
+    const auto none = [](void*, int64_t) { return false; };
+    Fixture f(1024);
+    f.list.append(routed_item(f.ring, 1));
+    f.list.append(routed_item(f.ring, 2));
+    (void)f.list.discard_from(10, none);
+    void* first = f.list.take(0);
+    EXPECT_EQ(f.list.cut_since_take(), INT64_MAX) << "a cut before the take still applied";
+    (void)f.list.discard_from(30, none);
+    (void)f.list.discard_from(50, none);
+    EXPECT_EQ(f.list.cut_since_take(), 30) << "the earliest cut since the take";
+    (void)f.list.discard_from(20, none);
+    EXPECT_EQ(f.list.cut_since_take(), 20);
+    f.ring.return_item(first);
+    void* second = f.list.take(0);
+    EXPECT_EQ(f.list.cut_since_take(), INT64_MAX);
+    f.ring.return_item(second);
 }
 
 // hand_message() hands a ring item in place and copies any other message into a LOCAL item

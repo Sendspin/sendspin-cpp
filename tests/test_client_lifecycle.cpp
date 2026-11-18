@@ -134,6 +134,7 @@ constexpr uint16_t VISUALIZER_ORDER_CLEAR_TEST_PORT = 19116;
 constexpr uint16_t VISUALIZER_ORDER_DEACTIVATION_TEST_PORT = 19117;
 constexpr uint16_t VISUALIZER_ORDER_LOSS_TEST_PORT = 19118;
 constexpr uint16_t REFUSED_STREAM_START_TEST_PORT = 19119;
+constexpr uint16_t VISUALIZER_HELD_CLEAR_FROM_TEST_PORT = 19120;
 #ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19089;
 #endif
@@ -713,13 +714,14 @@ TEST(ClientLifecycle, StreamEndAndClearReachOnlyTheNamedRoles) {
 }
 
 // stream/end, stream/clear and a teardown each return the frame the drain thread holds for its
-// display time, and those listed behind it, undelivered. One frame goes first, and the thread
+// display time, and those listed behind it, undelivered, as does a stream/clear from the held
+// frame's own timestamp, which fires no clear callback. One frame goes first, and the thread
 // holds it once the list is empty with its charge outstanding; stamped an hour ahead, a held
 // frame left waiting hangs the pump. stop() joins the thread before the count is read. Control:
 // the frames were charged before the boundary.
 TEST(ClientLifecycle, AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayTime) {
     constexpr int64_t HELD_FRAME_LEAD_US = 3600LL * 1000 * 1000;
-    enum class Boundary : uint8_t { END, CLEAR, TEARDOWN };
+    enum class Boundary : uint8_t { END, CLEAR, CLEAR_FROM, TEARDOWN };
     struct Row {
         const char* name;
         uint16_t port;
@@ -728,6 +730,8 @@ TEST(ClientLifecycle, AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayT
     const Row rows[] = {
         {"stream/end", VISUALIZER_HELD_END_TEST_PORT, Boundary::END},
         {"stream/clear", VISUALIZER_HELD_CLEAR_TEST_PORT, Boundary::CLEAR},
+        {"stream/clear from the held frame", VISUALIZER_HELD_CLEAR_FROM_TEST_PORT,
+         Boundary::CLEAR_FROM},
         {"a teardown", VISUALIZER_HELD_TEARDOWN_TEST_PORT, Boundary::TEARDOWN},
     };
     for (const Row& row : rows) {
@@ -748,14 +752,15 @@ TEST(ClientLifecycle, AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayT
         ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
         InboundConsumer& inbound = client.visualizer()->impl_->drain_task->inbound;
         const InboundQuota& quota = inbound.ring()->quota(InboundHolder::VISUALIZER);
-        ASSERT_TRUE(server->send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
-                                        platform_time_us() + HELD_FRAME_LEAD_US,
+        const int64_t held_timestamp = platform_time_us() + HELD_FRAME_LEAD_US;
+        ASSERT_TRUE(server->send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, held_timestamp,
                                         std::string("\x00\x10", 2)));
         pump_until(client,
                    [&] { return inbound.items().is_empty() && quota.outstanding() > 0; });
         send_loudness_until(client, *server, HELD_FRAME_LEAD_US,
                             [&] { return !inbound.items().is_empty(); });
 
+        const int clears = listener.stream_clears;
         switch (row.boundary) {
             case Boundary::END:
                 ASSERT_TRUE(server->send_app_json(R"({"type":"stream/end","payload":{}})"));
@@ -763,12 +768,30 @@ TEST(ClientLifecycle, AStreamBoundaryReturnsTheVisualizerFrameHeldForItsDisplayT
             case Boundary::CLEAR:
                 ASSERT_TRUE(server->send_app_json(R"({"type":"stream/clear","payload":{}})"));
                 break;
+            case Boundary::CLEAR_FROM:
+                ASSERT_TRUE(server->send_app_json(
+                    R"({"type":"stream/clear","payload":{"from_timestamp":)" +
+                    std::to_string(held_timestamp) + "}}"));
+                break;
             case Boundary::TEARDOWN:
                 server.reset();
                 break;
         }
         pump_until(client, [&] { return quota.outstanding() == 0; });
         EXPECT_TRUE(inbound.items().is_empty());
+        if (row.boundary != Boundary::TEARDOWN) {
+            // A frame left held pins the ring until the connection closes over it, and that
+            // teardown would return it instead.
+            EXPECT_TRUE(client.is_connected()) << "the frame came back through a teardown";
+        }
+        if (row.boundary == Boundary::CLEAR_FROM) {
+            // A clear callback would fire ahead of the end that follows it, so once the end has
+            // fired none did: a partial clear is no stream event.
+            const int ends = listener.stream_ends;
+            ASSERT_TRUE(server->send_app_json(R"({"type":"stream/end","payload":{}})"));
+            pump_until(client, [&] { return listener.stream_ends > ends; });
+            EXPECT_EQ(listener.stream_clears, clears) << "the partial clear fired a clear callback";
+        }
         client.stop();
         EXPECT_EQ(listener.loudness.load(), 0U);
     }

@@ -191,6 +191,9 @@
   "sendspin::HandshakeFrameResult sendspin::NoiseHandshake::on_text_frame(": [
    "sym:_Function_handler.*handle_noise_handshake_text.*_M_invoke"
   ],
+  "sendspin::InboundItemList::discard_from(": [
+   "sym:24handle_stream_clear_fromExENUlPvxE_4_FUN"
+  ],
   "sendspin::NoiseTransport::encrypt_and_send_frame(": [
    "SendspinServerConnection::send_transport_frame(",
    "SendspinConnection::send_transport_frame("

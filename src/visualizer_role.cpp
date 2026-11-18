@@ -95,9 +95,12 @@ static constexpr uint32_t COMMAND_BOUNDARY = sendspin::InboundItemList::FIRST_CO
 // finds held_events full for (on_stream_ring_event()), or by the protocol task for one the full
 // inbox ring dropped (enqueue_stream_event()).
 static constexpr uint32_t COMMAND_ACK = sendspin::InboundItemList::FIRST_CONSUMER_BIT << 2;
-static_assert(COMMAND_ACK <= sendspin::InboundItemList::LAST_CONSUMER_BIT,
+// A stream/clear with from_timestamp cut the stream (handle_stream_clear_from()).
+static constexpr uint32_t COMMAND_CUT = sendspin::InboundItemList::FIRST_CONSUMER_BIT << 3;
+static_assert(COMMAND_CUT <= sendspin::InboundItemList::LAST_CONSUMER_BIT,
               "the drain thread's command bits must fit the list's usable event bits");
-static constexpr uint32_t DRAIN_COMMANDS = COMMAND_STOP | COMMAND_BOUNDARY | COMMAND_ACK;
+static constexpr uint32_t DRAIN_COMMANDS =
+    COMMAND_STOP | COMMAND_BOUNDARY | COMMAND_ACK | COMMAND_CUT;
 
 // How far boundary_ordinal and drain_passed may trail the ordinals compared with them: a quarter
 // of the lifecycle ordinal's range. A run of updating stream/starts moves no boundary, so each
@@ -297,6 +300,12 @@ void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     msg.visualizer = visualizer_state;
 }
 
+/// @brief A listed frame's server timestamp, the eight bytes after its type byte
+/// (roles/visualizer/v1.md "Server -> Client: Visualization Data (Binary)")
+static int64_t frame_server_timestamp(void* item) {
+    return be64_to_host(inbound_item_bytes(item) + ENTRY_TYPE_SIZE);
+}
+
 // ============================================================================
 // Binary handling (protocol task)
 // ============================================================================
@@ -466,6 +475,19 @@ void VisualizerRole::Impl::handle_stream_clear() {
     this->recall_frames();
 
     this->enqueue_stream_event(VisualizerEventType::STREAM_CLEAR, generation, ordinal);
+}
+
+void VisualizerRole::Impl::handle_stream_clear_from(int64_t from_us) const {
+    // roles/visualizer/v1.md "stream/clear visualizer": only the frames at or after the cut go,
+    // and they count as never sent, so returning them releases their charge. Every listed item is
+    // a frame.
+    InboundConsumer& inbound = this->drain_task->inbound;
+    (void)inbound.discard_from(
+        from_us, [](void* item, int64_t cut) { return frame_server_timestamp(item) >= cut; });
+    // The frame the drain thread already took is judged against the same cut there.
+    if (inbound.ring() != nullptr) {
+        inbound.items().signal(COMMAND_CUT);
+    }
 }
 
 void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event, uint32_t generation,
@@ -906,7 +928,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         }
 
         const uint8_t wire_type = header->type;
-        const int64_t server_ts = be64_to_host(inbound_item_bytes(item) + ENTRY_TYPE_SIZE);
+        const int64_t server_ts = frame_server_timestamp(item);
         int64_t client_ts = self->client->get_client_time(server_ts);
 
         if (client_ts == 0) {
@@ -921,7 +943,8 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         bool stop = false;
         bool deliver = false;
         bool ran_out = false;
-        while (!self->is_stale(item)) {
+        // A stream/clear with from_timestamp after the take drops the frame at or after its cut.
+        while (!self->is_stale(item) && server_ts < items.cut_since_take()) {
             const bool acknowledged = self->is_acknowledged(item);
             const std::optional<int64_t> left_us =
                 visualizer_delivery_wait_us(client_ts, offset_ms, acknowledged, platform_time_us());

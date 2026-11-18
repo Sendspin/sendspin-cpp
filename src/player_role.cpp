@@ -548,6 +548,20 @@ void PlayerRole::Impl::handle_stream_clear() {
     }
 }
 
+void PlayerRole::Impl::handle_stream_clear_from(int64_t from_us) const {
+    // roles/player/v1.md "stream/clear player": only the chunks at or after the cut go, and they
+    // count as never sent, so returning them releases their charge before the server refills.
+    // Codec headers stay listed: the clear does not change the stream's format.
+    const size_t discarded =
+        this->sync_task->inbound().discard_from(from_us, [](void* item, int64_t cut) {
+            return SyncTask::chunk_type(item) == CHUNK_TYPE_ENCODED_AUDIO &&
+                   SyncTask::server_timestamp(item) >= cut;
+        });
+    SS_LOGD(TAG, "Stream clear from %" PRId64 ": discarded %zu chunks", from_us, discarded);
+    // The chunk the sync task already took is judged against the same cut there.
+    this->sync_task->signal_stream_cut();
+}
+
 void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) const {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     if (!cmd.player.has_value()) {

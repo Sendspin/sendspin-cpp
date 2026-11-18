@@ -1034,6 +1034,13 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
     if (clear_msg == nullptr) {
         return true;
     }
+    const JsonVariantConst from = root["payload"]["from_timestamp"];
+    if (!from.isNull() && !from.is<int64_t>()) {
+        SS_LOGE(TAG, "Invalid stream/clear message: from_timestamp is not an integer");
+        return false;
+    }
+    clear_msg->from_timestamp =
+        from.isNull() ? std::nullopt : std::optional<int64_t>(from.as<int64_t>());
     return read_stream_roles(root["payload"]["roles"], "stream/clear", &clear_msg->roles);
 }
 
