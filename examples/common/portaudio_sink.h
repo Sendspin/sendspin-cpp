@@ -19,6 +19,7 @@
 #include <portaudio.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -112,9 +113,9 @@ private:
     /// @brief Configure audio format and (re)open the PortAudio stream.
     bool configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
 
-    /// @brief Waits up to `timeout_ms` for the PortAudio callback to play out the ring buffer.
+    /// @brief Waits until `deadline` for the PortAudio callback to play out the ring buffer.
     /// @return true once it is empty.
-    bool wait_until_drained(uint32_t timeout_ms);
+    bool wait_until_drained(std::chrono::steady_clock::time_point deadline);
 
     static int pa_callback(const void* input, void* output, unsigned long frame_count,
                            const PaStreamCallbackTimeInfo* time_info,

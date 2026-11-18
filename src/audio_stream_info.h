@@ -118,7 +118,12 @@ public:
     /// @note The intermediate frames * US_PER_SECOND product is computed in 64-bit, so this is
     ///       avoids overflow for any reasonable frame count. The result is returned as int64_t
     ///       to match the playtime accumulators that consume it.
-    int64_t frames_to_microseconds(uint32_t frames) const;
+    int64_t frames_to_microseconds(uint32_t frames) const {
+        return frames_to_microseconds(frames, this->sample_rate_);
+    }
+
+    /// @brief frames_to_microseconds() at `sample_rate`
+    static int64_t frames_to_microseconds(uint32_t frames, uint32_t sample_rate);
 
     /// @brief Returns true if both AudioStreamInfo objects describe the same format
     /// @param rhs The other AudioStreamInfo to compare against.
