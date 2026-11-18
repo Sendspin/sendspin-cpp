@@ -404,12 +404,8 @@ struct AudioSupportedFormatObject {
 /// @brief Configuration for the player role
 struct PlayerRoleConfig {
     static constexpr size_t DEFAULT_AUDIO_BUFFER_CAPACITY = 1000000U;  ///< ~1MB default buffer
-    /// @brief Formats the player supports, in priority order (the first is preferred).
-    ///
-    /// Must list at least one flac or pcm entry: those are the codecs every server supports, and a
-    /// player is not told which others a server has (roles/player/v1.md "client/hello player@v1
-    /// support object"). Opus may be listed in addition, but only in a build with the Opus decoder
-    /// (SENDSPIN_ENABLE_OPUS, on by default). SendspinClient::start() fails and logs otherwise.
+    /// @brief Formats the player supports, in priority order (the first is preferred); start()
+    /// checks them and stream/start must name one (docs/integration-guide.md, PlayerRoleConfig).
     std::vector<AudioSupportedFormatObject> audio_formats{};
     /// @brief Bytes of the shared inbound ring the player may hold as encoded audio: its quota,
     /// which the ring is sized to include. The client advertises the two thirds of it that hold

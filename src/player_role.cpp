@@ -104,11 +104,21 @@ namespace sendspin {
 /// roles/player/v1.md "client/hello player@v1 support object" requires supported_formats to be a
 /// non-empty list in which the player lists either flac or pcm, since those are the two codecs
 /// every server supports and a player is not told which others a server has. Opus may be listed
-/// only when this build decodes it (SENDSPIN_ENABLE_OPUS).
+/// only when this build decodes it (SENDSPIN_ENABLE_OPUS). Every entry has channels and a sample
+/// rate, and a pcm or flac entry a bit depth of 1 to 32, since a stream/start may name only a
+/// listed format.
 static bool audio_formats_valid(const std::vector<AudioSupportedFormatObject>& formats) {
     bool has_baseline = false;
     bool has_opus = false;
     for (const auto& format : formats) {
+        if (format.channels == 0 || format.sample_rate == 0 ||
+            (format.codec != SendspinCodecFormat::OPUS &&
+             (format.bit_depth == 0 || format.bit_depth > 32))) {
+            SS_LOGE(TAG,
+                    "audio_formats has an entry with a zero channel count or sample rate, or a "
+                    "bit depth outside 1 to 32");
+            return false;
+        }
         if (format.codec == SendspinCodecFormat::FLAC || format.codec == SendspinCodecFormat::PCM) {
             has_baseline = true;
         } else if (format.codec == SendspinCodecFormat::OPUS) {
@@ -125,6 +135,31 @@ static bool audio_formats_valid(const std::vector<AudioSupportedFormatObject>& f
         return false;
     }
     return true;
+}
+
+/// @brief Whether `params` is one of `formats`: roles/player/v1.md "stream/start player object"
+/// allows only a format the player listed, its bit_depth ignored for opus
+static bool format_advertised(const std::vector<AudioSupportedFormatObject>& formats,
+                              const PlayerStreamParams& params) {
+    return std::any_of(formats.begin(), formats.end(), [&](const AudioSupportedFormatObject& f) {
+        return f.codec == params.codec && f.channels == params.channels &&
+               f.sample_rate == params.sample_rate &&
+               (f.codec == SendspinCodecFormat::OPUS || f.bit_depth == params.bit_depth);
+    });
+}
+
+/// @brief Whether a FLAC codec header's STREAMINFO describes `params`: the same sample rate and
+/// channels, and a bit depth equal to bit_depth or filling it as each write's container depth (a
+/// 20-bit stream announced as 24)
+static bool flac_header_describes(const FlacCodecHeader& header, const PlayerStreamParams& params) {
+    // RFC 9639 section 8.2 "Streaminfo", after "fLaC" and the 4-byte block header: the sample rate
+    // is the 20 bits from byte 18, then 3 bits of channels - 1 and 5 bits of bits per sample - 1.
+    const uint32_t sample_rate = (static_cast<uint32_t>(header[18]) << 12) |
+                                 (static_cast<uint32_t>(header[19]) << 4) | (header[20] >> 4);
+    const uint32_t channels = ((header[20] >> 1) & 0x07U) + 1;
+    const uint32_t bits = (((header[20] & 0x01U) << 4) | (header[21] >> 4)) + 1;
+    return params.sample_rate == sample_rate && params.channels == channels &&
+           (params.bit_depth == bits || params.bit_depth == (bits + 7) / 8 * 8);
 }
 
 // ============================================================================
@@ -405,6 +440,12 @@ void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {
     if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
         !player_obj.sample_rate.has_value() || !player_obj.codec.has_value()) {
         SS_LOGE(TAG, "Stream start message missing required audio parameters");
+    } else if (!format_advertised(this->config.audio_formats, player_obj)) {
+        SS_LOGE(TAG,
+                "Stream start format %s %" PRIu32 " Hz %" PRIu8 " ch %" PRIu8
+                "-bit is not one the player advertised",
+                to_cstr(*player_obj.codec), *player_obj.sample_rate, *player_obj.channels,
+                *player_obj.bit_depth);
     } else {
         auto codec = player_obj.codec.value();
         if (codec == SendspinCodecFormat::OPUS) {
@@ -437,6 +478,10 @@ void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {
         } else if (codec == SendspinCodecFormat::FLAC) {
             if (!player.flac_header.has_value()) {
                 SS_LOGE(TAG, "FLAC codec header missing");
+            } else if (!flac_header_describes(*player.flac_header, player_obj)) {
+                // The decoder takes its format from STREAMINFO, so a header that disagrees with the
+                // listed format the message names would hand the sink an unlisted one.
+                SS_LOGE(TAG, "FLAC codec header does not describe the stream/start format");
             } else {
                 header_sent = this->sync_task->inbound().hand_local(
                     player.flac_header->data(), FLAC_CODEC_HEADER_BYTES,

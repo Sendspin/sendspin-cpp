@@ -408,6 +408,29 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
     const SendspinServerToClientMessageType message_type =
         parsed.read([](JsonObject root) { return determine_message_type(root); });
 
+    // Ends the stream of each role in `roles` that this connection owns: a stream/end's roles, and
+    // a rejected stream/start's, which would otherwise keep decoding the stream it replaced.
+    const auto end_streams = [&]([[maybe_unused]] EnumSet<SendspinRole> roles) {
+#ifdef SENDSPIN_ENABLE_PLAYER
+        if (this->player_ && roles.contains(SendspinRole::PLAYER) &&
+            role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
+            this->player_->impl_->handle_stream_end();
+        }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+        if (this->artwork_ && roles.contains(SendspinRole::ARTWORK) &&
+            role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
+            this->artwork_->impl_->handle_stream_end();
+        }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+        if (this->visualizer_ && roles.contains(SendspinRole::VISUALIZER) &&
+            role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
+            this->visualizer_->impl_->handle_stream_end();
+        }
+#endif
+    };
+
     // Role-bound traffic is gated per role on ownership (role_accepts_traffic()): only the
     // admitted connection that owns a role reaches it. The connection is not closed over a
     // message it may not act on: a nursery member that is still racing toward promotion, or one
@@ -446,6 +469,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                     return process_stream_start_message(root, take, &stream_msg);
                 })) {
                 SS_LOGE(TAG, "Failed to parse stream/start message");
+                end_streams(stream_msg.rejected_roles);
                 break;
             }
 
@@ -472,37 +496,12 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
         case SendspinServerToClientMessageType::STREAM_END: {
             StreamEndMessage end_msg;
             if (parsed.extract<process_stream_end_message>(&end_msg)) {
-                const auto ends = [&end_msg](SendspinRole role) {
-                    return !end_msg.roles.has_value() || end_msg.roles->contains(role);
-                };
-                const bool end_player = ends(SendspinRole::PLAYER);
-                const bool end_artwork = ends(SendspinRole::ARTWORK);
-                const bool end_visualizer = ends(SendspinRole::VISUALIZER);
-
-                SS_LOGD(TAG, "Stream ended - player:%d artwork:%d visualizer:%d", end_player,
-                        end_artwork, end_visualizer);
-
-#ifdef SENDSPIN_ENABLE_PLAYER
-                if (this->player_ && end_player &&
-                    role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
-                    this->player_->impl_->handle_stream_end();
-                }
-#endif
-
-#ifdef SENDSPIN_ENABLE_ARTWORK
-                if (this->artwork_ && end_artwork &&
-                    role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::ARTWORK)) {
-                    this->artwork_->impl_->handle_stream_end();
-                }
-#endif
-
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-                if (this->visualizer_ && end_visualizer &&
-                    role_accepts_traffic(*this->connection_manager_, conn,
-                                         SendspinRole::VISUALIZER)) {
-                    this->visualizer_->impl_->handle_stream_end();
-                }
-#endif
+                const EnumSet<SendspinRole> roles = end_msg.roles.value_or(EnumSet<SendspinRole>{
+                    SendspinRole::PLAYER, SendspinRole::ARTWORK, SendspinRole::VISUALIZER});
+                SS_LOGD(TAG, "Stream ended - player:%d artwork:%d visualizer:%d",
+                        roles.contains(SendspinRole::PLAYER), roles.contains(SendspinRole::ARTWORK),
+                        roles.contains(SendspinRole::VISUALIZER));
+                end_streams(roles);
             }
             break;
         }
