@@ -121,6 +121,9 @@ struct SyncContext {
     /// Server timestamp of the chunk the decoded audio came from, judged against a
     /// stream/clear's from_timestamp (apply_stream_cut())
     int64_t decoded_server_timestamp{0};
+    /// The latest stream/clear's from_timestamp until the first chunk at or after it decodes,
+    /// INT64_MAX otherwise (apply_stream_cut(), decode_chunk())
+    int64_t pending_cut_us{INT64_MAX};
     int64_t new_audio_client_playtime{0};
     /// How much audio the previous chunk of this stream decoded to, the predicted length of the
     /// next one; 0 until one has decoded.
@@ -375,8 +378,10 @@ protected:
 
     /// @brief Handles COMMAND_STREAM_CUT: clears it, then drops the decoded audio and the gap
     /// silence ahead of it when the chunk it came from starts at or after
-    /// InboundItemList::cut_since_take(), moving `sync_state` to LOAD_CHUNK. The codec, the
-    /// decoder, the playtime accounting, hard_syncing and aligning stay as they are.
+    /// InboundItemList::cut_since_take(), moving `sync_state` to LOAD_CHUNK, and notes the cut
+    /// in `pending_cut_us` for decode_chunk(), or sets hard_syncing itself when the decoded chunk,
+    /// not yet synced, is already the replacement. The codec, the decoder, the playtime accounting
+    /// and aligning stay as they are.
     void apply_stream_cut(SyncContext& sync_context, SyncTaskState& sync_state);
 
     /// @brief Gives up the active stream after a decode buffer allocation failure: frees the

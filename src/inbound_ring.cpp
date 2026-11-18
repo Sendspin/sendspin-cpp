@@ -362,6 +362,7 @@ size_t InboundItemList::discard_from(int64_t cut, bool (*at_or_after)(void* item
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->cut_since_take_ = std::min(this->cut_since_take_, cut);
+        this->last_cut_ = cut;
         uint32_t previous = INBOUND_LIST_END;
         for (uint32_t offset = this->head_; offset != INBOUND_LIST_END;) {
             void* item = this->item_at(offset);
@@ -404,6 +405,11 @@ size_t InboundItemList::discard_from(int64_t cut, bool (*at_or_after)(void* item
 int64_t InboundItemList::cut_since_take() const {
     std::lock_guard<std::mutex> lock(this->mutex_);
     return this->cut_since_take_;
+}
+
+int64_t InboundItemList::last_cut() const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->last_cut_;
 }
 
 void* InboundItemList::pop() {

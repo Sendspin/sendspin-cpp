@@ -239,8 +239,7 @@ void SyncTask::signal_stream_cut() {
         return;
     }
     // No wake: a task waiting in a take holds no chunk to judge, and the inner loop checks the
-    // flag before each step that writes one. A flag set while the task is idle is cleared by the
-    // next stream's first step, with nothing decoded yet to judge.
+    // flag before each step that writes one. A flag a stream leaves unapplied is cleared on idle.
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_CUT);
 }
 
@@ -368,7 +367,10 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
         // A hard sync is needed. While aligning (initial-sync priming/alignment or post-seek
         // re-alignment) hard syncs are expected. Otherwise this is an unexpected loss of sync
         // (e.g. buffer underrun): log it once and keep filling with silence until we re-align.
-        if (!sync_context.aligning && !sync_context.sync_lost) {
+        // Settling on the first chunk past a stream/clear's from_timestamp is outside alignment,
+        // so there only an error past HARD_SYNC_THRESHOLD_US is a loss.
+        if (!sync_context.aligning && !sync_context.sync_lost &&
+            ((raw_error > HARD_SYNC_THRESHOLD_US) || (raw_error < -HARD_SYNC_THRESHOLD_US))) {
             sync_context.sync_lost = true;
             SS_LOGW(TAG, "Lost sync (%" PRId64 "us off)", raw_error);
         }
@@ -750,6 +752,13 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
         }
         sync_context.decoded_timestamp = client_timestamp;
         sync_context.decoded_server_timestamp = server_timestamp(sync_context.encoded_item);
+        if (sync_context.decoded_server_timestamp >= sync_context.pending_cut_us) {
+            // roles/player/v1.md "stream/clear player": the first chunk from a cut on may overlap
+            // audio the sink already holds, which is dropped rather than soft-synced, so it is
+            // aligned against the settle threshold.
+            sync_context.hard_syncing = true;
+            sync_context.pending_cut_us = INT64_MAX;
+        }
         // The buffer was empty on entry, so this is exactly this chunk's output, already capped at
         // MAX_AUDIO_CHUNK_MS by decode_whole_chunk().
         sync_context.last_chunk_duration_us =
@@ -911,6 +920,7 @@ void SyncTask::apply_stream_clear(SyncContext& sync_context) {
     sync_context.silence_remaining = 0;
     sync_context.release_chunk = false;
     sync_context.hard_syncing = true;
+    sync_context.pending_cut_us = INT64_MAX;
     // Post-seek re-alignment hard syncs are expected, not a loss of sync. Leave sync_lost as-is
     // so a pre-seek loss of sync still logs its recovery once we re-align.
     sync_context.aligning = true;
@@ -921,8 +931,21 @@ void SyncTask::apply_stream_clear(SyncContext& sync_context) {
 void SyncTask::apply_stream_cut(SyncContext& sync_context, SyncTaskState& sync_state) {
     // Cleared before the cut is read: a cut made after the read sets the flag again.
     this->event_flags_.clear(EventGroupBits::COMMAND_STREAM_CUT);
-    if (sync_context.decode_buffer.available() == 0 ||
-        sync_context.decoded_server_timestamp < this->inbound_.items().cut_since_take()) {
+    // The earliest cut not yet reached: the first chunk at or after it is the replacement's first.
+    const int64_t cut = std::min(sync_context.pending_cut_us, this->inbound_.items().last_cut());
+    sync_context.pending_cut_us = cut;
+    if (sync_context.decode_buffer.available() == 0) {
+        return;
+    }
+    if (sync_context.decoded_server_timestamp < this->inbound_.items().cut_since_take()) {
+        if (sync_context.decoded_server_timestamp >= cut) {
+            // Taken after the cut, so it is the replacement's first chunk; decode_chunk() ran
+            // before the cut was noted, so it is marked here while its sync is still ahead.
+            if (sync_state == SyncTaskState::SYNCHRONIZE_AUDIO) {
+                sync_context.hard_syncing = true;
+            }
+            sync_context.pending_cut_us = INT64_MAX;
+        }
         return;
     }
     // roles/player/v1.md "stream/clear player": the chunk was listed before the clear and starts
@@ -986,6 +1009,7 @@ void SyncTask::reset_context(SyncContext& sync_context) {
     sync_context.encoded_item = nullptr;
     sync_context.decoded_timestamp = 0;
     sync_context.decoded_server_timestamp = 0;
+    sync_context.pending_cut_us = INT64_MAX;
     sync_context.new_audio_client_playtime = 0;
     sync_context.last_chunk_duration_us = 0;
     sync_context.queued_audio.clear();
@@ -1077,7 +1101,8 @@ void SyncTask::thread_entry(void* params) {
             EventGroupBits::TASK_RUNNING | EventGroupBits::COMMAND_STREAM_END |
             EventGroupBits::COMMAND_STREAM_CLEAR | EventGroupBits::COMMAND_START;
         const bool left_stream = (this_task->event_flags_.get() & STREAM_BITS) != 0;
-        this_task->event_flags_.clear(STREAM_BITS);
+        // A cut the stream left unapplied belongs to it, not to the next one.
+        this_task->event_flags_.clear(STREAM_BITS | EventGroupBits::COMMAND_STREAM_CUT);
         this_task->event_flags_.set(EventGroupBits::TASK_IDLE);
         // After TASK_RUNNING is cleared: the main loop holds a STREAM_END until is_running() reads
         // false and re-examines it when this note arrives (PlayerRole::Impl::drain_events()). Only

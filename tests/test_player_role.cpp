@@ -746,64 +746,6 @@ TEST(PlayerInboundHandOff, StreamClearFromKeepsTheChunksBeforeItsCut) {
     }
 }
 
-// The chunk the sync task decoded before a stream/clear with from_timestamp is dropped, with the
-// gap silence queued ahead of it, only if it starts at or after the cut; the task then loads the
-// next chunk. A cut made before the task took the chunk was applied to it on the list, so it does
-// not apply again. Reaches SyncTask's apply_stream_cut() and event_flags_, the step and the flag
-// the sync thread runs and reads.
-TEST(PlayerStreamClearFrom, TheDecodedChunkGoesOnlyIfItStartsAtOrAfterTheCut) {
-    constexpr int64_t CHUNK_TS = 200;
-    constexpr size_t GAP_SILENCE = 64;
-    struct Row {
-        const char* name;
-        int64_t cut;
-        bool cut_before_take;
-        bool dropped;
-    };
-    const Row rows[] = {
-        {"Control: the chunk starts before the cut", 300, false, false},
-        {"the chunk starts at the cut", CHUNK_TS, false, true},
-        {"the chunk starts after the cut", 100, false, true},
-        {"a cut made before the chunk was taken", 100, true, false},
-    };
-
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        auto impl = make_impl();
-        SyncTask& task = *impl->sync_task;
-        InboundRing& ring = *task.inbound().ring();
-        InboundMessage message = receive_into_ring(ring, audio_chunk(0x01, 0), 0);
-        impl->handle_binary(message);
-        if (row.cut_before_take) {
-            impl->handle_stream_clear_from(row.cut);
-        }
-        void* item = task.take_item(0);
-        ASSERT_NE(item, nullptr);
-        task.inbound().return_item(item);  // decoded: what the chunk held is in the buffer
-        if (!row.cut_before_take) {
-            impl->handle_stream_clear_from(row.cut);
-        }
-        ASSERT_NE(task.event_flags_.get() & COMMAND_STREAM_CUT, 0U);
-
-        SyncContext context;
-        context.current_stream_info = AudioStreamInfo(16, 2, 44100);
-        context.bytes_per_frame = context.current_stream_info.frames_to_bytes(1);
-        const size_t chunk_bytes = context.current_stream_info.frames_to_bytes(441);
-        ASSERT_TRUE(context.decode_buffer.allocate(chunk_bytes + context.bytes_per_frame,
-                                                   MemoryLocation::PREFER_INTERNAL));
-        context.decode_buffer.increase_buffer_length(chunk_bytes);
-        context.decoded_server_timestamp = CHUNK_TS;
-        context.silence_remaining = GAP_SILENCE;
-        SyncTaskState state = SyncTaskState::TRANSFER_AUDIO;
-
-        task.apply_stream_cut(context, state);
-        EXPECT_EQ(task.event_flags_.get() & COMMAND_STREAM_CUT, 0U);
-        EXPECT_EQ(context.decode_buffer.available(), row.dropped ? 0U : chunk_bytes);
-        EXPECT_EQ(context.silence_remaining, row.dropped ? 0U : GAP_SILENCE);
-        EXPECT_EQ(state, row.dropped ? SyncTaskState::LOAD_CHUNK : SyncTaskState::TRANSFER_AUDIO);
-    }
-}
-
 // A teardown (a dropped connection, a removed role, stop()) moves the role's generation on, and
 // the old stream's audio never plays: cleanup() recalls what the sync task has not taken,
 // returning it and its quota charge to the ring, and an item the sync task takes between the
@@ -1439,8 +1381,8 @@ struct DeprecatedFormListener : PlayerRoleListener {
 
 // An audio chunk message as handle_binary() receives it, due at server time 0, its frame `bytes`
 // bytes of `fill`.
-std::vector<uint8_t> filled_audio_chunk(uint8_t fill, size_t bytes) {
-    std::vector<uint8_t> chunk = audio_chunk();
+std::vector<uint8_t> filled_audio_chunk(uint8_t fill, size_t bytes, int64_t server_timestamp = 0) {
+    std::vector<uint8_t> chunk = audio_chunk(0xDE, server_timestamp);
     chunk.resize(chunk.size() - 4);  // Drop audio_chunk()'s own frame
     chunk.insert(chunk.end(), bytes, fill);
     return chunk;
@@ -1629,5 +1571,147 @@ TEST(PlayerAudioOutput, AudioQueuedBeforeARateChangeKeepsItsOwnDuration) {
         task.notify_audio_played(report.frames_played, FINISH);
         task.process_playback_progress(context);
         EXPECT_EQ(context.new_audio_client_playtime, FINISH + report.queued_us);
+    }
+}
+
+namespace {
+
+// A player streaming 44.1 kHz stereo PCM, its codec header decoded as the sync thread would, past
+// priming and not hard syncing, every chunk due a second ahead so none is skipped as late.
+struct CutFixture {
+    CutFixture() {
+        this->impl->listener = &this->sink;
+        this->impl->config.fixed_delay_us = -1'000'000;
+        this->impl->handle_stream_start({pcm_stream(44100, 2, 16)});
+        start_context(this->task, this->context);
+        decode_next_item(this->task, this->context);  // The codec header
+        this->context.hard_syncing = false;
+    }
+    // Queues a 4-frame chunk stamped `server_timestamp`.
+    void receive(int64_t server_timestamp) {
+        std::vector<uint8_t> chunk = filled_audio_chunk(0x5A, 16, server_timestamp);
+        InboundMessage message = message_over(chunk);
+        this->impl->handle_binary(message);
+    }
+    std::unique_ptr<PlayerRole::Impl> impl = make_impl();
+    RecordingSink sink;
+    SyncTask& task = *impl->sync_task;
+    SyncContext context;
+};
+
+}  // namespace
+
+// The chunk the sync task decoded before a stream/clear with from_timestamp is dropped, with the
+// gap silence queued ahead of it, only if it starts at or after the cut; the task then loads the
+// next chunk. A replacement queued after the cut and decoded before the task saw it is kept: the
+// cut was applied while the replacement was not yet listed. Reaches SyncTask's apply_stream_cut()
+// and event_flags_, the step and the flag the sync thread runs and reads.
+TEST(PlayerStreamClearFrom, TheDecodedChunkGoesOnlyIfItStartsAtOrAfterTheCut) {
+    constexpr int64_t CHUNK_TS = 200;
+    constexpr size_t GAP_SILENCE = 64;
+    struct Row {
+        const char* name;
+        int64_t cut;
+        bool replacement;
+        bool dropped;
+    };
+    const Row rows[] = {
+        {"Control: the chunk starts before the cut", 300, false, false},
+        {"the chunk starts at the cut", CHUNK_TS, false, true},
+        {"the chunk starts after the cut", 100, false, true},
+        {"a replacement queued after the cut", 100, true, false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        CutFixture f;
+        ASSERT_FALSE(testing::Test::HasFatalFailure());
+        if (row.replacement) {
+            f.impl->handle_stream_clear_from(row.cut);
+        }
+        f.receive(CHUNK_TS);
+        ASSERT_NO_FATAL_FAILURE(decode_next_item(f.task, f.context));
+        if (!row.replacement) {
+            f.impl->handle_stream_clear_from(row.cut);
+        }
+        ASSERT_NE(f.task.event_flags_.get() & COMMAND_STREAM_CUT, 0U);
+        const size_t decoded = f.context.decode_buffer.available();
+        ASSERT_GT(decoded, 0U);
+        f.context.silence_remaining = GAP_SILENCE;
+        SyncTaskState state = SyncTaskState::TRANSFER_AUDIO;
+
+        f.task.apply_stream_cut(f.context, state);
+        EXPECT_EQ(f.task.event_flags_.get() & COMMAND_STREAM_CUT, 0U);
+        EXPECT_EQ(f.context.decode_buffer.available(), row.dropped ? 0U : decoded);
+        EXPECT_EQ(f.context.silence_remaining, row.dropped ? 0U : GAP_SILENCE);
+        EXPECT_EQ(state, row.dropped ? SyncTaskState::LOAD_CHUNK : SyncTaskState::TRANSFER_AUDIO);
+    }
+}
+
+// roles/player/v1.md "stream/clear player": the first chunk decoded at or after a cut is aligned
+// against the settle threshold (hard_syncing), so an overlap with audio the sink already holds is
+// dropped rather than soft-synced; a kept chunk before the cut is not, and the cut is spent on the
+// first chunk past it, or on a seek. A replacement decoded before the sync task noted the cut is
+// marked when it does, unless its sync already ran. Reaches SyncTask's apply_stream_cut() and
+// apply_stream_clear(), the steps the sync thread runs on the cut and seek flags.
+TEST(PlayerStreamClearFrom, TheFirstChunkFromTheCutIsAlignedTightly) {
+    constexpr int64_t CUT = 200;
+    enum class Cut : uint8_t {
+        NONE,
+        NOTED_BEFORE_DECODE,
+        TWO_NOTED,
+        NOTED_BEFORE_SYNC,
+        NOTED_AFTER_SYNC,
+        THEN_SEEK,
+    };
+    struct Row {
+        const char* name;
+        Cut cut;
+        int64_t chunk_ts;
+        bool hard_syncing;
+        int64_t pending;
+    };
+    const Row rows[] = {
+        {"Control: no cut", Cut::NONE, CUT, false, INT64_MAX},
+        {"a kept chunk before the cut", Cut::NOTED_BEFORE_DECODE, CUT - 1, false, CUT},
+        {"the chunk at the cut", Cut::NOTED_BEFORE_DECODE, CUT, true, INT64_MAX},
+        {"a chunk after the cut", Cut::NOTED_BEFORE_DECODE, CUT + 100, true, INT64_MAX},
+        {"the replacement of an earlier cut than the latest", Cut::TWO_NOTED, CUT, true, INT64_MAX},
+        {"the replacement decoded before the cut was noted", Cut::NOTED_BEFORE_SYNC, CUT, true,
+         INT64_MAX},
+        {"the replacement already synced when the cut was noted", Cut::NOTED_AFTER_SYNC, CUT, false,
+         INT64_MAX},
+        {"a seek after the cut", Cut::THEN_SEEK, CUT - 1, true, INT64_MAX},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        CutFixture f;
+        ASSERT_FALSE(testing::Test::HasFatalFailure());
+        SyncTaskState state = SyncTaskState::LOAD_CHUNK;
+        if (row.cut != Cut::NONE) {
+            f.impl->handle_stream_clear_from(CUT);
+        }
+        if (row.cut == Cut::NOTED_BEFORE_DECODE || row.cut == Cut::TWO_NOTED ||
+            row.cut == Cut::THEN_SEEK) {
+            f.task.apply_stream_cut(f.context, state);
+        }
+        if (row.cut == Cut::TWO_NOTED) {
+            f.impl->handle_stream_clear_from(CUT + 100);
+            f.task.apply_stream_cut(f.context, state);
+        }
+        if (row.cut == Cut::THEN_SEEK) {
+            f.task.apply_stream_clear(f.context);
+        }
+        f.receive(row.chunk_ts);
+        ASSERT_NO_FATAL_FAILURE(decode_next_item(f.task, f.context));
+        if (row.cut == Cut::NOTED_BEFORE_SYNC || row.cut == Cut::NOTED_AFTER_SYNC) {
+            state = row.cut == Cut::NOTED_BEFORE_SYNC ? SyncTaskState::SYNCHRONIZE_AUDIO
+                                                      : SyncTaskState::TRANSFER_AUDIO;
+            f.task.apply_stream_cut(f.context, state);
+        }
+        EXPECT_EQ(f.context.hard_syncing, row.hard_syncing);
+        EXPECT_EQ(f.context.pending_cut_us, row.pending)
+            << "the cut stays pending until a chunk reaches it, and only that long";
     }
 }

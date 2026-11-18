@@ -2214,7 +2214,7 @@ TEST(InboundReceive, TheFallbackBufferHandsOverOneMessageAtATime) {
 // leave the Noise receive nonce behind. Messages of the longest size the ring takes arrive with
 // nothing taken until one finds no room; the Control row takes and returns each item, as the
 // protocol task does, so the ring never fills. The closing row waits out the bound once (about
-// 100 ms): the bound running out is the behavior under test.
+// 200 ms): the bound running out is the behavior under test.
 TEST(InboundReceive, AnAdmittedMessageWithNoRingSpaceClosesTheConnection) {
     struct Row {
         const char* name;

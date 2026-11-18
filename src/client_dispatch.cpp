@@ -516,7 +516,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 const bool clear_player = clears(SendspinRole::PLAYER);
                 const bool clear_visualizer = clears(SendspinRole::VISUALIZER);
 
-                const std::optional<int64_t> from = clear_msg.from_timestamp;
+                const std::optional<int64_t>& from = clear_msg.from_timestamp;
                 SS_LOGD(TAG, "Stream clear - player:%d visualizer:%d partial:%d", clear_player,
                         clear_visualizer, from.has_value());
 

@@ -113,12 +113,15 @@ static constexpr uint32_t INBOUND_LIST_END = UINT32_MAX;
 /// nonce behind, so the connection could not continue past it); the protocol task's own acquires
 /// for a codec header or a marker wait the same bound. An acquire waits only while the protocol
 /// task is behind on taking items or ring-order reclamation holds space behind the oldest held item
-/// (see derive_inbound_ring_bytes()). Sized at the bottom of the 100-200 ms stall budget the
-/// library's threads are held to: longer than a tick running a Noise handshake's DH operations
-/// (tens of milliseconds on an ESP32), so a busy task does not cost a connection, and short enough
-/// that a stalled one costs the connection rather than a parked transport, which on ESP is the
-/// httpd task every inbound session shares.
-static constexpr uint32_t INBOUND_ACQUIRE_TIMEOUT_MS = 100;
+/// (see derive_inbound_ring_bytes()). Sized at the top of the 100-200 ms stall budget the
+/// library's threads are held to. It must outlast the longest audio chunk a server may send (150
+/// ms, roles/player/v1.md "Server Audio Send Constraints"): after a stream/clear with
+/// from_timestamp, the refill can fill the ring behind the kept chunks, and room then comes back
+/// one kept chunk at a time as the sync task decodes it. It is also longer than a tick running a
+/// Noise handshake's DH operations (tens of milliseconds on an ESP32), so a busy task does not cost
+/// a connection, and short enough that a stalled one costs the connection rather than a parked
+/// transport, which on ESP is the httpd task every inbound session shares.
+static constexpr uint32_t INBOUND_ACQUIRE_TIMEOUT_MS = 200;
 
 /// The largest WebSocket message a conforming peer sends: one Noise transport frame, plaintext
 /// plus the AEAD tag. Larger messages are fragmented inside the Noise transport (messaging.md
@@ -521,10 +524,11 @@ private:
  * thread, take()); recall()
  * may run on the protocol task, or on any thread once the consumer is joined.
  *
- * mutex_ guards head_, tail_, cut_since_take_ and every next link and charge of a linked item,
- * and the return count of a LOCAL item charged to this list's holder (InboundRing::return_item()).
- * It is a leaf: nothing is called under it, and the ring's lock is taken only after it is
- * released (recall() and discard_from() detach their chain first, then return the items).
+ * mutex_ guards head_, tail_, cut_since_take_, last_cut_ and every next link and charge of a linked
+ * item, and the return count of a LOCAL item charged to this list's holder
+ * (InboundRing::return_item()). It is a leaf: nothing is called under it but discard_from()'s
+ * predicate, which only reads its item, and the ring's lock is taken only after it is released
+ * (recall() and discard_from() detach their chain first, then return the items).
  */
 class InboundItemList {
 public:
@@ -608,6 +612,8 @@ public:
     /// @brief Unlinks every item not yet taken for which `at_or_after(item, cut)` holds and
     /// returns each through InboundRing::return_item(), oldest first, releasing its charge; the
     /// rest stay linked in order. Lowers cut_since_take() to `cut`. Protocol task.
+    /// @param at_or_after Called under mutex_: it may only read the item, taking no lock and
+    ///        making no call into the list.
     /// @return The number of items returned.
     size_t discard_from(int64_t cut, bool (*at_or_after)(void* item, int64_t cut));
 
@@ -615,6 +621,9 @@ public:
     /// INT64_MAX: the item that take returned was listed before each such cut, so the consumer
     /// judges it against this as discard_from() judged the listed ones. Consumer only.
     int64_t cut_since_take() const;
+
+    /// @brief The cut the latest discard_from() made, or INT64_MAX before any. Consumer only.
+    int64_t last_cut() const;
 
     /// @brief Whether no item is linked. Any thread.
     bool is_empty() const {
@@ -651,6 +660,8 @@ private:
     // 64-bit fields
     /// See cut_since_take(). Lowered by discard_from() and reset by each take, under mutex_.
     int64_t cut_since_take_{INT64_MAX};
+    /// See last_cut(). Written by discard_from(), under mutex_.
+    int64_t last_cut_{INT64_MAX};
 
     // 8-bit fields
     /// The holder create() registered the list for. Written once by create().
