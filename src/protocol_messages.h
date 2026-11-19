@@ -1466,8 +1466,8 @@ bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* pa
 bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload);
 
 /// @brief Builds a client/pair-pending message.
-/// Sent immediately on receiving a pairing server/activate whose attempt is gesture-gated while
-/// no pairing window is open; client/pair-init follows once a window opens. Does not start the
+/// Sent while the client holds the selected attempt back (pairing.md "Client -> Server:
+/// client/pair-pending"); client/pair-init follows once it releases it. Does not start the
 /// attempt or its timeout.
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
 ///                      handshake (see SendspinConnection::get_pairing_index()).

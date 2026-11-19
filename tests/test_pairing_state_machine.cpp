@@ -1281,6 +1281,67 @@ TEST_F(PairingStateMachineTest, StandingRoundLimitHoldsTheNextAttemptForAGesture
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
 
+TEST_F(PairingStateMachineTest, OnlyAGestureThatReleasesAnAttemptResetsTheRoundCount) {
+    // pairing.md "Rounds": only a gesture that releases held-back attempts resets the count.
+    // Two rounds short of the limit, a gesture before the attempt and one in the round that
+    // reaches the limit each leave the count, so round 2's failure ends the attempt.
+    this->set_rounds_since_verified_kc(18);
+    this->client_->confirm_pairing_window();
+    this->pump();
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-gesture-mid-attempt");
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+
+    CodeEmissionResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/6, display));
+    ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, /*round=*/1));
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-retry");
+
+    this->send_retry_round_pair_init();
+    this->client_->confirm_pairing_window();
+    this->pump();
+    ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, /*round=*/2));
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pairing_code_mismatch")
+        << "a gesture during the attempt must not buy it rounds past the limit";
+    EXPECT_EQ(this->rounds_since_verified_kc(), 20u);
+
+    // The window those gestures opened is still within its lifetime, yet the limit holds the
+    // next attempt back for a gesture of its own.
+    conn->sent_text_.clear();
+    this->enter_pairing(conn);
+    this->pump();
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
+    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-init"));
+
+    this->client_->confirm_pairing_window();
+    this->pump();
+    EXPECT_EQ(this->rounds_since_verified_kc(), 0u)
+        << "control: the gesture that releases the held-back attempt resets the count";
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+}
+
+TEST_F(PairingStateMachineTest, GestureAtTheLimitWithAnIdleConnectionResetsTheRoundCount) {
+    // An admitted connection whose attempt has ended is not one under way, so a gesture made
+    // before the next activation clears the standing limit and that attempt starts unprompted.
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-gesture-idle");
+    CodeEmissionResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/7, display));
+    this->set_rounds_since_verified_kc(20);
+    ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, /*round=*/1));
+    ASSERT_FALSE(conn->is_pairing_in_progress());
+
+    this->client_->confirm_pairing_window();
+    this->pump();
+    EXPECT_EQ(this->rounds_since_verified_kc(), 0u);
+
+    conn->sent_text_.clear();
+    this->listener_.events_.clear();
+    this->enter_pairing(conn);
+    this->pump();
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-pending"));
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
+}
+
 // ============================================================================
 // pairing.md "Entering and leaving pairing": pairing runs alongside playback, so a declared
 // 'pairing' activity suppresses nothing. Traffic keeps flowing across an attempt and across the

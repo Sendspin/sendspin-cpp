@@ -265,22 +265,23 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
         ps.set_prs(pairing_code_digits_prs(static_code.value()));
     }
 
-    // Gesture gating: the static pairing code gates every attempt on an operator gesture
-    // (pairing.md "Pairing Window"); the dynamic one runs ungated until the round limit stands,
-    // which holds attempts back until the same deliberate operator action clears it
-    // (pairing.md "Rounds"). Both wait the same way, sending client/pair-pending, which is what
+    // Gesture gating: the static pairing code gates every attempt on a pairing window
+    // (pairing.md "Pairing Window"). The dynamic one runs ungated until the round limit stands,
+    // and is then released only by the gesture that resets the count (pairing.md "Rounds"), not
+    // by a standing window. Both wait the same way, sending client/pair-pending, which is what
     // the limit asks a held-back attempt to send.
-    const bool gesture_gated = !is_dynamic || this->pairing_round_limit_reached();
+    const bool held_back =
+        is_dynamic ? this->pairing_round_limit_reached() : !this->pairing_window_admits(conn);
 
-    if (gesture_gated && !this->pairing_window_admits(conn)) {
-        // No window open: report the pending gesture with client/pair-pending and wait.
+    if (held_back) {
+        // Report the pending gesture with client/pair-pending and wait.
         // pair-pending does not start the attempt or its timeout (the server applies its
         // own timeout and cancels via server/activate), so no attempt deadline is armed
         // here (attempt_deadline_us == 0 disables the timeout check in scan_admitted()).
         ps.step = SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW;
         ps.attempt_deadline_us = 0;
         SS_LOGI(TAG,
-                "Sending client/pair-pending (%s, gesture-gated, no window open) for "
+                "Sending client/pair-pending (%s, awaiting the pairing-window gesture) for "
                 "server_id=%s",
                 to_cstr(ps.method), server_id.c_str());
         JsonDocument json = make_json_document(this->json_arena());
@@ -292,7 +293,7 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
         return;
     }
 
-    // Not gated, or a standing window is already open: start the attempt immediately
+    // Not held back: start the attempt immediately
     // (start_pairing_attempt binds an open window to this connection; it does not spend it).
     this->start_pairing_attempt(conn);
 }
@@ -868,10 +869,19 @@ void ConnectionManager::open_pairing_window() {
     // (pairing.md "Pairing Window"), so it is armed whether or not an attempt is waiting: with
     // none waiting it stands open for a pairing activate arriving within its lifetime.
     //
-    // The gesture is also the deliberate, manufacturer-defined operator action pairing.md
-    // "Rounds" requires to clear a standing round limit, so it resets the count before anything
-    // it admits can run.
-    this->pairing_rounds_since_verified_kc_ = 0;
+    // At a standing round limit with no attempt under way, the gesture is the deliberate,
+    // manufacturer-defined operator action that releases held-back attempts, so it resets the
+    // count before anything it admits can run; a gesture during an attempt does not
+    // (pairing.md "Rounds").
+    const bool attempt_under_way =
+        std::any_of(this->admitted_.begin(), this->admitted_.end(), [](const AdmittedEntry& entry) {
+            return entry.conn != nullptr && entry.conn->is_pairing_in_progress() &&
+                   entry.conn->pairing_session().step !=
+                       SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW;
+        });
+    if (this->pairing_round_limit_reached() && !attempt_under_way) {
+        this->pairing_rounds_since_verified_kc_ = 0;
+    }
     this->pairing_window_conn_ = nullptr;
     this->pairing_window_failed_attempts_ = 0;
     this->pairing_window_open_until_us_ = platform_time_us() + WINDOW_LIFETIME_US;

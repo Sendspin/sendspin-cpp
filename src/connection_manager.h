@@ -282,6 +282,9 @@ public:
     ///   that has it active until that connection's next activation.
     /// - An activation that adds a role another admitted connection owns never claims or
     ///   arbitrates for it (claimable_roles() simply leaves it out).
+    /// - open_pairing_window() skips the round-count reset while any connection's attempt is under
+    ///   way, yet still starts another connection's held-back dynamic attempt, which then runs at
+    ///   the standing round limit.
     /// - The socket budget: GRACEFUL_SOCKETS in start(), the default server_max_connections, and
     ///   the MAX_OPEN_CONNECTIONS < RecordStore::MIN_MAX_RECORDS static_assert below.
     static constexpr size_t MAX_ADMITTED = 1;
@@ -459,8 +462,8 @@ public:
     /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window(), the operator
     /// gesture). If an attempt is already waiting in AWAIT_PAIRING_WINDOW, the window admits it
     /// immediately; otherwise it stands open for WINDOW_LIFETIME_US (5 minutes) awaiting a
-    /// pairing activate. The gesture is also the deliberate operator action that clears a
-    /// standing round limit (pairing.md "Rounds").
+    /// pairing activate. Made at a standing round limit with no attempt under way, the gesture
+    /// also resets the round count (pairing.md "Rounds").
     void open_pairing_window();
 
     /// @brief Closes the pairing window (SendspinClient::cancel_pairing_window()).
