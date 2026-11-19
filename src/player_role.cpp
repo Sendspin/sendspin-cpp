@@ -408,24 +408,31 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
                       .audio_len = len - AUDIO_CHUNK_HEADER_SIZE};
 }
 
-SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
+SS_HOT bool PlayerRole::Impl::handle_binary(InboundMessage& message, bool available) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
+    // roles/player/v1.md "Audio Chunks (Binary)": a message shorter than its header is a protocol
+    // error, so this runs ahead of the discards below (messaging.md "Communication": a discarded
+    // payload still gets the role's required message checks).
+    auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
+    if (!chunk.has_value()) {
+        return false;
+    }
+    if (!available) {
+        // roles/player/v1.md "Audio Chunks (Binary)": an unavailable client discards audio.
+        SS_LOGV(TAG, "Discarding audio chunk while unavailable");
+        return true;
+    }
     InboundConsumer& inbound = this->sync_task->inbound();
     if (inbound.ring() == nullptr) {
         // Verbose on the per-chunk path: start() already warned once.
         SS_LOGV(TAG, "Discarding audio chunk: the sync task is not running");
-        return;
-    }
-    auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
-    if (!chunk.has_value()) {
-        inbound.note_drop(InboundConsumer::DropReason::TOO_SHORT);
-        return;
+        return true;
     }
     if (chunk->audio_len == 0) {
         // A complete header carrying no frame is nothing to decode. Verbose because this is the
         // per-chunk path.
         SS_LOGV(TAG, "Audio chunk carries no encoded frame");
-        return;
+        return true;
     }
     // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
     // advertised buffer_capacity, which the quota covers at the smallest chunk size.
@@ -435,6 +442,7 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
                                 .type = CHUNK_TYPE_ENCODED_AUDIO,
                                 .data_offset = AUDIO_FRAME_OFFSET},
                                generation);
+    return true;
 }
 
 void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {

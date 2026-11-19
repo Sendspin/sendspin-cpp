@@ -18,7 +18,11 @@
 /// The role's Impl (PlayerRole's private impl_) is driven directly and no sync-task thread is
 /// ever started, so nothing here races a background consumer: the encoded ring and the inbox hold
 /// whatever a handler put there, and an item is taken as the sync thread would (SyncTask's
-/// take_item()). The binary audio chunk header is parsed directly too.
+/// take_item()). The binary audio chunk header is parsed directly too. The binary dispatch tests
+/// never start the client, so they publish and adopt each client/state snapshot and dispatch the
+/// message themselves, reaching SendspinClient's protocol_task_, build_client_state(),
+/// adopt_client_state(), connection_manager_ (its install_admitted()) and
+/// process_binary_message().
 
 #include "connection.h"
 #include "connection_manager.h"
@@ -409,13 +413,15 @@ std::vector<uint8_t> audio_chunk(uint8_t marker = 0xDE, int64_t server_timestamp
     return chunk;
 }
 
-// An admitted player-owning connection with inert transport calls; dispatch reaches the player
-// only from one.
-class PlayerOwnerConnection : public SendspinConnection {
+// An admitted connection with inert transport calls, counting its closes; dispatch reaches a
+// role only from the connection that owns it.
+class AdmittedTestConnection : public SendspinConnection {
 public:
     void start() override {}
     void disconnect(SendspinGoodbyeReason) override {}
-    void close_transport_now() override {}
+    void close_transport_now() override {
+        ++this->closes;
+    }
     bool is_connected() const override {
         return true;
     }
@@ -425,6 +431,8 @@ public:
     SsErr send_text_message(const char* /*text*/, size_t /*len*/) override {
         return SsErr::OK;
     }
+
+    int closes{0};
 };
 
 }  // namespace
@@ -432,10 +440,7 @@ public:
 // roles/player/v1.md "Audio Chunks (Binary)": the player discards incoming audio while the
 // adopted client/state snapshot reports the client unavailable; a set_available() takes effect
 // only once its snapshot is adopted. A discarded chunk's ring item stays with the dispatcher,
-// for process_inbound() to return. The client is never started, so the test publishes and
-// adopts each snapshot and dispatches the chunk itself, reaching SendspinClient's
-// protocol_task_, build_client_state(), adopt_client_state(), connection_manager_ (its
-// install_admitted()) and process_binary_message().
+// for process_inbound() to return.
 TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
     struct Row {
         const char* name;
@@ -473,7 +478,7 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
             adopt_snapshot();
         }
 
-        auto conn = std::make_shared<PlayerOwnerConnection>();
+        auto conn = std::make_shared<AdmittedTestConnection>();
         conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"player@v1"},
                                     std::nullopt, std::nullopt);
         client.connection_manager_->install_admitted(conn, role_mask_bit(SendspinRole::PLAYER));
@@ -485,6 +490,82 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
         if (message.item != nullptr) {
             ring.return_item(message.item);
         }
+    }
+}
+
+// roles/player/v1.md "Audio Chunks (Binary)" and roles/visualizer/v1.md "Visualization Data
+// (Binary)": an audio message shorter than 13 bytes, or a visualization message shorter than 9,
+// closes the connection, and so does one whose payload the role would discard (messaging.md
+// "Communication": a discarded payload still gets the role's required message checks). A message
+// for a role inactive on the connection is discarded unchecked (messaging.md "server/activate"),
+// and so is one with a type roles/visualizer/v1.md reserves (messaging.md "Communication": an ID
+// the client does not implement is ignored). The visualizer is never started, so it has no stream.
+TEST(BinaryMessageLength, AShortMessageForAnActiveRoleClosesTheConnection) {
+    constexpr uint8_t PLAYER = SENDSPIN_BINARY_PLAYER_AUDIO;
+    constexpr uint8_t LOUDNESS = SENDSPIN_BINARY_VISUALIZER_LOUDNESS;
+    struct Row {
+        const char* name;
+        SendspinRole role;
+        uint8_t type;
+        size_t len;
+        bool active;
+        bool available;
+        bool sync_task_running;
+        bool closes;
+    };
+    const Row rows[] = {
+        {"player one byte short", SendspinRole::PLAYER, PLAYER, 12, true, true, true, true},
+        {"player one byte short, unavailable", SendspinRole::PLAYER, PLAYER, 12, true, false, true,
+         true},
+        {"player one byte short, sync task not running", SendspinRole::PLAYER, PLAYER, 12, true,
+         true, false, true},
+        {"player one byte short, role inactive", SendspinRole::PLAYER, PLAYER, 12, false, true, true,
+         false},
+        {"Control: player header with no frame", SendspinRole::PLAYER, PLAYER, 13, true, true, true,
+         false},
+        {"Control: player header with no frame, unavailable", SendspinRole::PLAYER, PLAYER, 13,
+         true, false, true, false},
+        {"visualizer one byte short, no stream", SendspinRole::VISUALIZER, LOUDNESS, 8, true, true,
+         true, true},
+        {"visualizer one byte short, role inactive", SendspinRole::VISUALIZER, LOUDNESS, 8, false,
+         true, true, false},
+        {"Control: visualizer timestamp with no data, no stream", SendspinRole::VISUALIZER,
+         LOUDNESS, 9, true, true, true, false},
+        {"reserved visualizer type with no timestamp", SendspinRole::VISUALIZER, 21, 1, true, true,
+         true, false},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundRing ring;  // outlives the client, whose sync task holds a pointer to it
+        create_test_ring(ring);
+        SendspinClient client(make_client_config("binary-message-length"));
+        PlayerRole::Impl& impl = *client.add_player(make_player_config()).impl_;
+        VisualizerRoleConfig visualizer_config;
+        visualizer_config.stream.types = {VisualizerDataType::LOUDNESS};
+        client.add_visualizer(std::move(visualizer_config));
+        if (row.sync_task_running) {
+            bind_items(impl, ring);
+        }
+        client.set_available(row.available);
+        client.protocol_task_->publish_state(client.build_client_state());
+        ClientStateMessage snapshot;
+        ASSERT_TRUE(client.protocol_task_->take_state(snapshot));
+        client.adopt_client_state(snapshot);
+
+        // An active role is the connection's alone; an inactive one leaves it owning nothing.
+        auto conn = std::make_shared<AdmittedTestConnection>();
+        conn->apply_server_activate({SendspinActivity::PLAYBACK},
+                                    row.active ? ActiveRoles{to_cstr(row.role)} : ActiveRoles{},
+                                    std::nullopt, std::nullopt);
+        client.connection_manager_->install_admitted(conn,
+                                                     row.active ? role_mask_bit(row.role) : 0);
+
+        std::vector<uint8_t> bytes(row.len, 0x00);
+        bytes[0] = row.type;
+        InboundMessage message = message_over(bytes);
+        client.process_binary_message(*conn, message);
+        EXPECT_EQ(conn->closes, row.closes ? 1 : 0);
     }
 }
 
@@ -550,7 +631,7 @@ TEST(PlayerInboundHandOff, AChunkInARingItemIsDecodedInPlace) {
             row.in_ring_item ? receive_into_ring(ring, chunk, 7) : message_over(chunk, 7);
         const uint8_t* frame_in_message = message.data + 13;
 
-        impl->handle_binary(message);
+        impl->handle_binary(message, true);
         take_in_ring_order(ring);
         EXPECT_EQ(message.item, nullptr) << "the role must take the item over, or never had one";
 
@@ -595,13 +676,13 @@ TEST(PlayerInboundHandOff, AnOverQuotaPlayerDropsItsChunkWhileTheVisualizerKeeps
         auto visualizer = make_visualizer(ring);
 
         InboundMessage first = receive_into_ring(ring, audio_chunk(0x01), 0);
-        player->handle_binary(first);
+        player->handle_binary(first, true);
         const size_t one_chunk = ring.quota(InboundHolder::PLAYER).outstanding();
         ASSERT_GT(one_chunk, 0U);
         ring.quota(InboundHolder::PLAYER).set_limit(row.player_quota_chunks * one_chunk);
 
         InboundMessage second = receive_into_ring(ring, audio_chunk(0x02), 0);
-        player->handle_binary(second);
+        player->handle_binary(second, true);
         EXPECT_EQ(ring.quota(InboundHolder::PLAYER).outstanding(),
                   std::min<size_t>(2, row.player_quota_chunks) * one_chunk);
         void* held = nullptr;
@@ -652,13 +733,13 @@ TEST(PlayerInboundHandOff, StreamClearDiscardsUpToItsMarker) {
         auto impl = make_impl();
         InboundRing& ring = *impl->sync_task->inbound().ring();
         InboundMessage before = receive_into_ring(ring, audio_chunk(0x01), 0);
-        impl->handle_binary(before);
+        impl->handle_binary(before, true);
         if (row.clear) {
             impl->handle_stream_clear();
             take_in_ring_order(ring);
         }
         InboundMessage after = receive_into_ring(ring, audio_chunk(0x02), 0);
-        impl->handle_binary(after);
+        impl->handle_binary(after, true);
 
         SyncContext context;
         impl->sync_task->discard_to_clear_marker(context);
@@ -693,7 +774,7 @@ TEST(PlayerInboundHandOff, AStreamBoundaryFreesTheQuotaForTheRefillBehindIt) {
         InboundRing& ring = *impl->sync_task->inbound().ring();
         for (auto [marker, timestamp] : {std::pair<uint8_t, int64_t>{0x01, 100}, {0x11, 200}}) {
             InboundMessage old_chunk = receive_into_ring(ring, audio_chunk(marker, timestamp), 0);
-            impl->handle_binary(old_chunk);
+            impl->handle_binary(old_chunk, true);
         }
         const size_t full = ring.quota(InboundHolder::PLAYER).outstanding();
         ASSERT_GT(full, 0U);
@@ -709,7 +790,7 @@ TEST(PlayerInboundHandOff, AStreamBoundaryFreesTheQuotaForTheRefillBehindIt) {
         }
         for (uint8_t marker : {0x02, 0x12}) {
             InboundMessage refill = receive_into_ring(ring, audio_chunk(marker), 0);
-            impl->handle_binary(refill);
+            impl->handle_binary(refill, true);
         }
 
         EXPECT_EQ(take_all(*impl), row.listed);
@@ -746,7 +827,7 @@ TEST(PlayerInboundHandOff, StreamClearFromKeepsTheChunksBeforeItsCut) {
         InboundRing& ring = *impl->sync_task->inbound().ring();
         const auto receive = [&](uint8_t marker, int64_t timestamp) {
             InboundMessage message = receive_into_ring(ring, audio_chunk(marker, timestamp), 0);
-            impl->handle_binary(message);
+            impl->handle_binary(message, true);
         };
         receive(0x01, 100);
         receive(0x02, 200);
@@ -797,7 +878,7 @@ TEST(PlayerInboundHandOff, ATeardownRecallsTheItemsTheSyncTaskHasNotTaken) {
         InboundRing& ring = *impl->sync_task->inbound().ring();
         for (uint8_t marker : {0x01, 0x02}) {
             InboundMessage message = receive_into_ring(ring, audio_chunk(marker), 0);
-            impl->handle_binary(message);
+            impl->handle_binary(message, true);
         }
         if (row.teardown == Teardown::CLEANUP) {
             impl->cleanup();
@@ -1521,12 +1602,12 @@ TEST(PlayerAudioOutput, EachWriteCarriesTheFormatOfItsOwnBytes) {
         {pcm_stream(OLD_FORMAT.sample_rate, OLD_FORMAT.channels, OLD_FORMAT.bits_per_sample)});
     std::vector<uint8_t> old_chunk = filled_audio_chunk(OLD_SAMPLE, 2 * OLD_FRAME_BYTES);
     InboundMessage old_message = message_over(old_chunk);
-    impl->handle_binary(old_message);
+    impl->handle_binary(old_message, true);
     impl->handle_stream_start(
         {pcm_stream(NEW_FORMAT.sample_rate, NEW_FORMAT.channels, NEW_FORMAT.bits_per_sample)});
     std::vector<uint8_t> new_chunk = filled_audio_chunk(NEW_SAMPLE, 2 * NEW_FRAME_BYTES);
     InboundMessage new_message = message_over(new_chunk);
-    impl->handle_binary(new_message);
+    impl->handle_binary(new_message, true);
 
     SyncTask& task = *impl->sync_task;
     SyncContext context;
@@ -1584,11 +1665,11 @@ TEST(PlayerAudioOutput, AudioQueuedBeforeARateChangeKeepsItsOwnDuration) {
     impl->handle_stream_start({pcm_stream(OLD_RATE, 1, 16)});
     std::vector<uint8_t> old_chunk = filled_audio_chunk(0x11, CHUNK_FRAMES * FRAME_BYTES);
     InboundMessage old_message = message_over(old_chunk);
-    impl->handle_binary(old_message);
+    impl->handle_binary(old_message, true);
     impl->handle_stream_start({pcm_stream(NEW_RATE, 1, 16)});
     std::vector<uint8_t> new_chunk = filled_audio_chunk(0x22, CHUNK_FRAMES * FRAME_BYTES);
     InboundMessage new_message = message_over(new_chunk);
-    impl->handle_binary(new_message);
+    impl->handle_binary(new_message, true);
 
     SyncTask& task = *impl->sync_task;
     SyncContext context;
@@ -1636,7 +1717,7 @@ struct CutFixture {
     void receive(int64_t server_timestamp) {
         std::vector<uint8_t> chunk = filled_audio_chunk(0x5A, 16, server_timestamp);
         InboundMessage message = message_over(chunk);
-        this->impl->handle_binary(message);
+        this->impl->handle_binary(message, true);
     }
     std::unique_ptr<PlayerRole::Impl> impl = make_impl();
     RecordingSink sink;
