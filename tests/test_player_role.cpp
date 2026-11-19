@@ -439,22 +439,25 @@ public:
 
 // roles/player/v1.md "Audio Chunks (Binary)": the player discards incoming audio while the
 // adopted client/state snapshot reports the client unavailable; a set_available() takes effect
-// only once its snapshot is adopted. A discarded chunk's ring item stays with the dispatcher,
-// for process_inbound() to return.
-TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
+// only once its snapshot is adopted. messaging.md "stream/start": it also discards audio on a
+// connection without 'playback'. A discarded chunk's ring item stays with the dispatcher, for
+// process_inbound() to return.
+TEST(PlayerRoleAvailability, AudioIsDiscardedWhileUnavailableOrWithoutPlayback) {
     struct Row {
         const char* name;
         bool available_when_adopted;
         bool available_on_arrival;
         bool adopted_again;
+        bool playback;
         bool queued;
     };
     const Row rows[] = {
-        {"Control: available", true, true, false, true},
-        {"unavailable", false, false, false, false},
-        {"unavailable, snapshot not yet adopted", true, false, false, true},
-        {"available again, snapshot not yet adopted", false, true, false, false},
-        {"Control: available again, snapshot adopted", false, true, true, true},
+        {"Control: available", true, true, false, true, true},
+        {"unavailable", false, false, false, true, false},
+        {"unavailable, snapshot not yet adopted", true, false, false, true, true},
+        {"available again, snapshot not yet adopted", false, true, false, true, false},
+        {"Control: available again, snapshot adopted", false, true, true, true, true},
+        {"available, connection without playback", true, true, false, false, false},
     };
 
     for (const Row& row : rows) {
@@ -479,8 +482,9 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
         }
 
         auto conn = std::make_shared<AdmittedTestConnection>();
-        conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"player@v1"},
-                                    std::nullopt, std::nullopt);
+        conn->apply_server_activate(
+            row.playback ? ActivitySet{SendspinActivity::PLAYBACK} : ActivitySet{},
+            ActiveRoles{"player@v1"}, std::nullopt, std::nullopt);
         client.connection_manager_->install_admitted(conn, role_mask_bit(SendspinRole::PLAYER));
 
         InboundMessage message = receive_into_ring(ring, audio_chunk(), 0);
@@ -495,11 +499,12 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
 
 // roles/player/v1.md "Audio Chunks (Binary)" and roles/visualizer/v1.md "Visualization Data
 // (Binary)": an audio message shorter than 13 bytes, or a visualization message shorter than 9,
-// closes the connection, and so does one whose payload the role would discard (messaging.md
-// "Communication": a discarded payload still gets the role's required message checks). A message
-// for a role inactive on the connection is discarded unchecked (messaging.md "server/activate"),
-// and so is one with a type roles/visualizer/v1.md reserves (messaging.md "Communication": an ID
-// the client does not implement is ignored). The visualizer is never started, so it has no stream.
+// closes the connection, and so does one whose payload the role would discard, the client
+// unavailable or the connection without 'playback' (messaging.md "Communication": a discarded
+// payload still gets the role's required message checks). A message for a role inactive on the
+// connection is discarded unchecked (messaging.md "server/activate"), and so is one with a type
+// roles/visualizer/v1.md reserves (messaging.md "Communication": an ID the client does not
+// implement is ignored). The visualizer is never started, so it has no stream.
 TEST(BinaryMessageLength, AShortMessageForAnActiveRoleClosesTheConnection) {
     constexpr uint8_t PLAYER = SENDSPIN_BINARY_PLAYER_AUDIO;
     constexpr uint8_t LOUDNESS = SENDSPIN_BINARY_VISUALIZER_LOUDNESS;
@@ -510,29 +515,34 @@ TEST(BinaryMessageLength, AShortMessageForAnActiveRoleClosesTheConnection) {
         size_t len;
         bool active;
         bool available;
+        bool playback;
         bool sync_task_running;
         bool closes;
     };
     const Row rows[] = {
-        {"player one byte short", SendspinRole::PLAYER, PLAYER, 12, true, true, true, true},
+        {"player one byte short", SendspinRole::PLAYER, PLAYER, 12, true, true, true, true, true},
         {"player one byte short, unavailable", SendspinRole::PLAYER, PLAYER, 12, true, false, true,
-         true},
-        {"player one byte short, sync task not running", SendspinRole::PLAYER, PLAYER, 12, true,
-         true, false, true},
-        {"player one byte short, role inactive", SendspinRole::PLAYER, PLAYER, 12, false, true, true,
-         false},
-        {"Control: player header with no frame", SendspinRole::PLAYER, PLAYER, 13, true, true, true,
-         false},
-        {"Control: player header with no frame, unavailable", SendspinRole::PLAYER, PLAYER, 13,
-         true, false, true, false},
-        {"visualizer one byte short, no stream", SendspinRole::VISUALIZER, LOUDNESS, 8, true, true,
          true, true},
-        {"visualizer one byte short, role inactive", SendspinRole::VISUALIZER, LOUDNESS, 8, false,
-         true, true, false},
-        {"Control: visualizer timestamp with no data, no stream", SendspinRole::VISUALIZER,
-         LOUDNESS, 9, true, true, true, false},
-        {"reserved visualizer type with no timestamp", SendspinRole::VISUALIZER, 21, 1, true, true,
+        {"player one byte short, without playback", SendspinRole::PLAYER, PLAYER, 12, true, true,
+         false, true, true},
+        {"player one byte short, sync task not running", SendspinRole::PLAYER, PLAYER, 12, true,
+         true, true, false, true},
+        {"player one byte short, role inactive", SendspinRole::PLAYER, PLAYER, 12, false, true, true,
          true, false},
+        {"Control: player header with no frame", SendspinRole::PLAYER, PLAYER, 13, true, true, true,
+         true, false},
+        {"Control: player header with no frame, unavailable", SendspinRole::PLAYER, PLAYER, 13,
+         true, false, true, true, false},
+        {"Control: player header with no frame, without playback", SendspinRole::PLAYER, PLAYER,
+         13, true, true, false, true, false},
+        {"visualizer one byte short, no stream", SendspinRole::VISUALIZER, LOUDNESS, 8, true, true,
+         true, true, true},
+        {"visualizer one byte short, role inactive", SendspinRole::VISUALIZER, LOUDNESS, 8, false,
+         true, true, true, false},
+        {"Control: visualizer timestamp with no data, no stream", SendspinRole::VISUALIZER,
+         LOUDNESS, 9, true, true, true, true, false},
+        {"reserved visualizer type with no timestamp", SendspinRole::VISUALIZER, 21, 1, true, true,
+         true, true, false},
     };
 
     for (const Row& row : rows) {
@@ -555,9 +565,10 @@ TEST(BinaryMessageLength, AShortMessageForAnActiveRoleClosesTheConnection) {
 
         // An active role is the connection's alone; an inactive one leaves it owning nothing.
         auto conn = std::make_shared<AdmittedTestConnection>();
-        conn->apply_server_activate({SendspinActivity::PLAYBACK},
-                                    row.active ? ActiveRoles{to_cstr(row.role)} : ActiveRoles{},
-                                    std::nullopt, std::nullopt);
+        conn->apply_server_activate(
+            row.playback ? ActivitySet{SendspinActivity::PLAYBACK} : ActivitySet{},
+            row.active ? ActiveRoles{to_cstr(row.role)} : ActiveRoles{}, std::nullopt,
+            std::nullopt);
         client.connection_manager_->install_admitted(conn,
                                                      row.active ? role_mask_bit(row.role) : 0);
 

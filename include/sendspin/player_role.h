@@ -129,7 +129,8 @@ public:
     /// @brief Called when the audio stream ends
     ///
     /// Also fires when a server/activate takes the player role out of the session's active roles,
-    /// which stops the decode and discards the buffered audio rather than letting it finish.
+    /// which stops the decode and discards the buffered audio rather than letting it finish, and
+    /// when one drops the 'playback' activity while the stream runs.
     virtual void on_stream_end() {}
 
     /// @brief Called when the volume is changed by the server

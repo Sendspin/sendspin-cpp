@@ -77,8 +77,9 @@ struct SourceRole::Impl : RoleTeardown {
 
     /// @brief A server/command source object from `conn`, which owns the role
     /// (roles/source/v1.md "Source command semantics")
-    /// @param available Whether the adopted client/state snapshot reports the client available.
-    void handle_server_command(SourceCommand command, SendspinConnection& conn, bool available);
+    /// @param may_start Whether the adopted client/state snapshot reports the client available
+    /// and `conn` declares 'playback'; a start is ignored otherwise.
+    void handle_server_command(SourceCommand command, SendspinConnection& conn, bool may_start);
     /// @brief Clears any pending authorization and closes the open stream, sending
     /// client-stream/end on `conn` when the stream is open there, or owing it to the next
     /// activation inside a quiet window.

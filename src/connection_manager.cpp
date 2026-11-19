@@ -700,6 +700,7 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn,
     // update to the active-role set changing, so the comparison needs the set this activation
     // replaces.
     const uint16_t roles_before = conn->get_active_role_mask();
+    const bool had_playback = conn->has_activity(SendspinActivity::PLAYBACK);
     conn->apply_server_activate(msg.activities, active_roles_to_apply, msg.pairing_method,
                                 msg.pairing_format);
     // Before anything this activation sends (SendspinClient::on_activation_applied())
@@ -719,6 +720,9 @@ void ConnectionManager::on_server_activate(SendspinConnection* conn,
         const auto removed = static_cast<uint16_t>(owned_before & ~admitted_entry->owned_roles);
         if (removed != 0) {
             this->client_->apply_role_removals(conn, removed);
+        }
+        if (had_playback && !conn->has_activity(SendspinActivity::PLAYBACK)) {
+            this->client_->end_playback_streams(conn);
         }
         if (admitted_entry->owned_roles != owned_before) {
             this->refresh_published_state();

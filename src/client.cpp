@@ -2022,6 +2022,31 @@ void SendspinClient::apply_role_removals([[maybe_unused]] SendspinConnection* co
 #endif
 }
 
+void SendspinClient::end_playback_streams([[maybe_unused]] SendspinConnection* conn) {
+    // messaging.md "stream/start" has the client discard player and visualizer data once
+    // 'playback' is gone. A stream the server left running ends here, so the stream/start a new
+    // 'playback' brings starts a stream rather than updating a stale one.
+    [[maybe_unused]] const ConnectionManager& manager = *this->connection_manager_;
+#ifdef SENDSPIN_ENABLE_PLAYER
+    // A STREAM_END behind the stream's own fires nothing (PlayerRole::Impl::drain_events())
+    if (this->player_ && manager.owns_role(conn, SendspinRole::PLAYER)) {
+        this->player_->impl_->handle_stream_end();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    // Only a running stream: the visualizer reports every STREAM_END it queues
+    if (this->visualizer_ && manager.owns_role(conn, SendspinRole::VISUALIZER) &&
+        this->visualizer_->impl_->stream_active) {
+        this->visualizer_->impl_->handle_stream_end();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_ && manager.owns_role(conn, SendspinRole::SOURCE)) {
+        this->source_->impl_->end_stream(conn);
+    }
+#endif
+}
+
 void SendspinClient::on_activation_applied([[maybe_unused]] SendspinConnection* conn) {
 #ifdef SENDSPIN_ENABLE_SOURCE
     if (this->source_) {

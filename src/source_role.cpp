@@ -254,16 +254,16 @@ void SourceRole::Impl::build_state_fields(ClientStateMessage& msg) const {
 // ============================================================================
 
 void SourceRole::Impl::handle_server_command(SourceCommand command, SendspinConnection& conn,
-                                             bool available) {
+                                             bool may_start) {
     if (command == SourceCommand::STOP) {
         this->end_stream(&conn);
         return;
     }
-    // roles/source/v1.md "Source command semantics": a start received while unavailable is
-    // ignored, and becoming available does not resume it; one received while an authorization is
-    // pending or the stream is open has no effect.
-    if (!available) {
-        SS_LOGI(TAG, "Ignoring source start: the client is unavailable");
+    // roles/source/v1.md "Source command semantics": a start received while unavailable or without
+    // 'playback' is ignored, and becoming available does not resume it; one received while an
+    // authorization is pending or the stream is open has no effect.
+    if (!may_start) {
+        SS_LOGI(TAG, "Ignoring source start: the client is unavailable or without playback");
         return;
     }
     if (this->authorized_connection_id != 0 || this->open_connection_id != 0) {

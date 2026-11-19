@@ -139,6 +139,10 @@ std::string activate_json(const std::string& roles_json) {
            roles_json + "}}";
 }
 
+/// Keeps source@v1 active and drops 'playback'
+constexpr const char* DROP_PLAYBACK_JSON =
+    R"({"type":"server/activate","payload":{"activities":[],"active_roles":["source@v1"]}})";
+
 /// A source role whose rings exist without its task thread, so the test thread plays the
 /// capture thread, the source task (SourceTask::process()) and the protocol task's take. Reached,
 /// since no public call stops the source task between its steps: SourceRole's impl_ (the task,
@@ -1040,12 +1044,13 @@ public:
 }  // namespace
 
 // roles/source/v1.md "Source command semantics" and connection.md "Re-handshake", played step by
-// step on the protocol task. Each step is followed by a protocol tick and a main-loop drain, and
-// what the server receives is tagged with the step that sent it. A chunk is one the source task
-// completed with the stream's generation (or the previous stream's). The listener's
-// callbacks stay paired, and an open stream holds high-performance networking. A quiet window
-// clears SendspinConnection's first_activate_received_ as a re-handshake's message 1 does, which
-// handle_noise_rehandshake() needs a whole re-handshake to reach.
+// step on the protocol task. A start counts only while 'playback' is declared, and dropping it
+// ends the stream as removing the role does. Each step is followed by a protocol tick and a
+// main-loop drain, and what the server receives is tagged with the step that sent it. A chunk is
+// one the source task completed with the stream's generation (or the previous stream's). The
+// listener's callbacks stay paired, and an open stream holds high-performance networking. A quiet
+// window clears SendspinConnection's first_activate_received_ as a re-handshake's message 1 does,
+// which handle_noise_rehandshake() needs a whole re-handshake to reach.
 TEST(SourceStream, CommandsOpenAndCloseTheStream) {
     enum class Step : uint8_t {
         START,
@@ -1054,6 +1059,7 @@ TEST(SourceStream, CommandsOpenAndCloseTheStream) {
         AVAILABLE,
         REMOVE_ROLE,
         RESTORE_ROLE,
+        DROP_PLAYBACK,
         CHUNK,
         CHUNK_OF_PREVIOUS_STREAM,
         SYNC,
@@ -1086,6 +1092,14 @@ TEST(SourceStream, CommandsOpenAndCloseTheStream) {
          {START, UNAVAILABLE}, {"0 start", "1 end", "1 state-"}, 1, 1},
         {"removing the role ends the stream; restoring it needs a new start", true,
          {START, REMOVE_ROLE, RESTORE_ROLE}, {"0 start", "1 end", "1 state+", "2 state+"}, 1, 1},
+        {"dropping playback ends the stream; restoring it needs a new start", true,
+         {START, DROP_PLAYBACK, ACTIVATE}, {"0 start", "1 end"}, 1, 1},
+        {"a start without playback is ignored, and restoring playback does not resume it", true,
+         {DROP_PLAYBACK, START, ACTIVATE}, {}, 0, 0},
+        {"dropping playback cancels an opening still waiting for the time sync", false,
+         {START, DROP_PLAYBACK, ACTIVATE, SYNC}, {}, 0, 0},
+        {"dropping playback as a quiet window ends sends the end ahead of the state", true,
+         {START, QUIET_WINDOW, DROP_PLAYBACK}, {"0 start", "2 end", "2 state+"}, 1, 1},
         {"a lost connection ends the stream without a message", true,
          {START, LOSE_CONNECTION, CHUNK}, {"0 start"}, 1, 1},
         {"the next connection opens on its own start", true, {START, LOSE_CONNECTION, START},
@@ -1127,6 +1141,9 @@ TEST(SourceStream, CommandsOpenAndCloseTheStream) {
                     break;
                 case REMOVE_ROLE:
                     rig.deliver(activate_json("[]"));
+                    break;
+                case DROP_PLAYBACK:
+                    rig.deliver(DROP_PLAYBACK_JSON);
                     break;
                 case RESTORE_ROLE:
                 case ACTIVATE:

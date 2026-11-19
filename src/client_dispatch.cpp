@@ -97,6 +97,18 @@ namespace {
     return false;
 }
 
+/// @brief Whether `conn` carries the playback streams: 'playback' is in the activities its latest
+/// server/activate applied, which a re-handshake keeps until the activation that follows it
+/// (connection.md "Re-handshake").
+///
+/// messaging.md "stream/start": without 'playback' the client ignores the player and visualizer
+/// objects in stream/start, unvalidated, and discards their data, and roles/source/v1.md "Source
+/// command semantics" has it ignore a source start. The roles stay active, so a discarded binary
+/// still gets its role's message checks (messaging.md "Communication"). Protocol task only.
+[[maybe_unused]] bool carries_playback(const SendspinConnection* conn) {
+    return conn->has_activity(SendspinActivity::PLAYBACK);
+}
+
 /// @brief Closes `conn` on a binary message its `role` handler reported as a protocol error.
 /// Closed silently, like every other protocol error the receive path finds (see
 /// close_silently()). Protocol task only.
@@ -471,10 +483,11 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             SS_LOGD(TAG, "Stream Started");
 
             // As with server/state, each section's role gate is decided before the parse (see
-            // process_stream_start_message()).
+            // process_stream_start_message()). The artwork stream is not a playback stream: it
+            // continues while the group is paused (messaging.md "stream/end").
             EnumSet<SendspinRole> take;
 #ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_ &&
+            if (this->player_ && carries_playback(conn) &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::PLAYER)) {
                 take.insert(SendspinRole::PLAYER);
             }
@@ -486,7 +499,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-            if (this->visualizer_ &&
+            if (this->visualizer_ && carries_playback(conn) &&
                 role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
                 take.insert(SendspinRole::VISUALIZER);
             }
@@ -752,8 +765,8 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
 #ifdef SENDSPIN_ENABLE_SOURCE
             if (source_valid) {
                 // The availability step 3 adopted
-                this->source_->impl_->handle_server_command(source_cmd, *conn,
-                                                            this->adopted_state_available());
+                this->source_->impl_->handle_server_command(
+                    source_cmd, *conn, this->adopted_state_available() && carries_playback(conn));
             }
 #endif
             break;
@@ -937,6 +950,9 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
             role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
             // roles/visualizer/v1.md reserves types 21-23, and messaging.md "Communication" has a
             // binary ID the client does not implement ignored, so it gets none of the checks.
+            // Unlike the player, handle_binary() needs no carries_playback() verdict: no
+            // visualizer stream runs on a connection without 'playback' (the stream/start gate,
+            // SendspinClient::end_playback_streams()), and it discards a frame outside a stream.
             if (binary_type > SENDSPIN_BINARY_VISUALIZER_LAST_DEFINED) {
                 SS_LOGW(TAG, "Unknown visualizer binary type %d", binary_type);
             } else if (!this->visualizer_->impl_->handle_binary(binary_type, message)) {
@@ -956,10 +972,11 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
                 if (slot != 0) {
                     SS_LOGW(TAG, "Unknown player binary slot %d", slot);
                 } else {
-                    // Read from the snapshot step 3 adopted, so the discard while unavailable
-                    // flips with the client/state it sends.
-                    const bool available = this->adopted_state_available();
-                    if (!this->player_->impl_->handle_binary(message, available)) {
+                    // Availability is read from the snapshot step 3 adopted, so the discard
+                    // while unavailable flips with the client/state it sends.
+                    const bool takes_audio =
+                        this->adopted_state_available() && carries_playback(conn);
+                    if (!this->player_->impl_->handle_binary(message, takes_audio)) {
                         close_on_malformed_binary(conn, SendspinRole::PLAYER);
                     }
                 }

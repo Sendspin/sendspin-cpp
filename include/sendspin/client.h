@@ -1057,6 +1057,13 @@ private:
     ///        does, as role_mask_bit() bits.
     void apply_role_removals(SendspinConnection* conn, uint16_t removed_roles);
 
+    /// @brief Ends the streams of the roles `conn` still owns after an activation dropped
+    /// 'playback' from it: the player's and the visualizer's, as the stream/end the server owed
+    /// ahead of the drop (messaging.md "server/activate") would, and the source's input stream
+    /// (roles/source/v1.md "Source command semantics"). Called by ConnectionManager after the
+    /// activation's role removals. Protocol task only.
+    void end_playback_streams(SendspinConnection* conn);
+
     /// @brief A server/activate was applied on `conn`, ending any re-handshake quiet window
     /// (connection.md "Re-handshake"): sends what the roles owed until then, the source's
     /// client-stream/end. Called by ConnectionManager right after the activation is applied, ahead
