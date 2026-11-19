@@ -764,7 +764,7 @@ struct MyClientListener : SendspinClientListener {
     // static pairing code attempt, and a dynamic one held back by the round limit). Confirm the
     // gesture by calling client.confirm_pairing_window() (thread-safe) once the operator
     // performs it; calling it with no attempt waiting opens a standing 5-minute pairing window
-    // that admits the next attempt without a further gesture.
+    // that admits the next static-code attempt without a further gesture.
     // client.cancel_pairing_window() closes an open window again.
     void on_open_pairing_window() override {
         prompt_pairing_button_press();
@@ -984,9 +984,11 @@ gesture performed before the activation arrives leaves the window standing open,
 within its lifetime proceeds without a prompt.
 
 The gesture is also the deliberate operator action `pairing.md` "Rounds" requires to clear a
-standing dynamic round limit, which it does only while no attempt is under way: a gesture made
-during an attempt leaves the limit standing, and the next attempt it holds back prompts again. A
-device that offers either pairing-code method should therefore implement the gesture: prompt on
+standing dynamic round limit, unless an attempt is already under way. An attempt withheld at
+`client/pair-pending` for the gesture is not under way yet, though `on_pairing_attempt` has
+fired for it. A gesture made while an attempt is under way leaves the limit standing, and the
+next attempt it holds back prompts again even if that gesture's window is still open. A device
+that offers either pairing-code method should therefore implement the gesture: prompt on
 `on_open_pairing_window` and call `confirm_pairing_window()` once the operator performs it.
 Without that a gated attempt waits at `client/pair-pending` until the server's own timeout cancels
 it.

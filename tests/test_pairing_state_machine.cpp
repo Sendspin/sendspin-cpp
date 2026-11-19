@@ -1319,6 +1319,29 @@ TEST_F(PairingStateMachineTest, OnlyAGestureThatReleasesAnAttemptResetsTheRoundC
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
 
+TEST_F(PairingStateMachineTest, GestureAtTheLimitWithAnIdleConnectionResetsTheRoundCount) {
+    // An admitted connection whose attempt has ended is not one under way, so a gesture made
+    // before the next activation clears the standing limit and that attempt starts unprompted.
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-gesture-idle");
+    CodeEmissionResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/7, display));
+    this->set_rounds_since_verified_kc(20);
+    ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, /*round=*/1));
+    ASSERT_FALSE(conn->is_pairing_in_progress());
+
+    this->client_->confirm_pairing_window();
+    this->pump();
+    EXPECT_EQ(this->rounds_since_verified_kc(), 0u);
+
+    conn->sent_text_.clear();
+    this->listener_.events_.clear();
+    this->enter_pairing(conn);
+    this->pump();
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-pending"));
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
+}
+
 // ============================================================================
 // pairing.md "Entering and leaving pairing": pairing runs alongside playback, so a declared
 // 'pairing' activity suppresses nothing. Traffic keeps flowing across an attempt and across the

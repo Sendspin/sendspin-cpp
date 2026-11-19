@@ -282,6 +282,9 @@ public:
     ///   that has it active until that connection's next activation.
     /// - An activation that adds a role another admitted connection owns never claims or
     ///   arbitrates for it (claimable_roles() simply leaves it out).
+    /// - open_pairing_window() skips the round-count reset while any connection's attempt is under
+    ///   way, yet still starts another connection's held-back dynamic attempt, which then runs at
+    ///   the standing round limit.
     /// - The socket budget: GRACEFUL_SOCKETS in start(), the default server_max_connections, and
     ///   the MAX_OPEN_CONNECTIONS < RecordStore::MIN_MAX_RECORDS static_assert below.
     static constexpr size_t MAX_ADMITTED = 1;

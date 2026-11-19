@@ -725,11 +725,12 @@ public:
     /// nothing, not even the round-limit reset, and a cancel then a confirm starts a waiting
     /// attempt. Opens a pairing window (pairing.md "Pairing Window"): a gesture-gated attempt
     /// already waiting proceeds immediately; otherwise the window stands open for 5 minutes and
-    /// admits pairing attempts on one connection without a further gesture. It closes before
-    /// those 5 minutes are up when a pairing under it succeeds, when the connection it is bound
-    /// to is lost, after five attempts fail verification, or on cancel_pairing_window(). Made
-    /// while no pairing attempt is under way, the gesture also clears a standing
-    /// dynamic-pairing-code round limit.
+    /// admits static-pairing-code attempts on one connection without a further gesture. It closes
+    /// before those 5 minutes are up when a pairing under it succeeds, when the connection it is
+    /// bound to is lost, after five attempts fail verification, or on cancel_pairing_window().
+    /// The gesture also clears a standing dynamic-pairing-code round limit unless an attempt is
+    /// already under way (one still withheld for this gesture is not); a dynamic attempt the
+    /// limit holds back waits for that gesture, not a standing window.
     void confirm_pairing_window();
 
     /// @brief Signals that the operator cancelled the pairing window.
