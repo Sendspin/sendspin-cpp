@@ -165,6 +165,11 @@ struct SendspinApplicationRole {
     std::optional<std::string> support_json{};
 };
 
+// The implicit copy and move members touch the deprecated time_burst_response_timeout_ms; only a
+// consumer's own use of it should warn.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start()
 struct SendspinClientConfig {
@@ -323,22 +328,36 @@ struct SendspinClientConfig {
     /// @brief Maximum simultaneous inbound connections, clamped to 7 on ESP
     uint8_t server_max_connections{DEFAULT_SERVER_MAX_CONNECTIONS};
 
-    static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
-    static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
-
-    static constexpr uint8_t DEFAULT_BURST_SIZE = 8;  ///< Default messages per time sync burst
+    /// @brief messaging.md "Clock Synchronization": the fewest messages a burst may hold; start()
+    /// refuses a smaller time_burst_size
+    static constexpr uint8_t MIN_BURST_SIZE = 8;
+    /// @brief messaging.md "Clock Synchronization": the furthest apart consecutive bursts may start
+    static constexpr int64_t MAX_BURST_SPACING_MS = 10000;
+    /// @brief The longest time_burst_interval_ms start() accepts: a second under
+    /// MAX_BURST_SPACING_MS for the main loop's high-performance grant, which a burst's first
+    /// message waits for
+    static constexpr int64_t MAX_BURST_INTERVAL_MS = MAX_BURST_SPACING_MS - 1000;
+    /// @brief Default ms from one burst's start to the next's
+    static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = MAX_BURST_INTERVAL_MS;
+    /// @deprecated Ignored with time_burst_response_timeout_ms. Removed in v0.11.0.
+    [[deprecated(
+        "ignored; removed in v0.11.0")]] static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;
+    static constexpr uint8_t DEFAULT_BURST_SIZE = MIN_BURST_SIZE;  ///< Default messages per burst
 
     uint8_t time_burst_size{DEFAULT_BURST_SIZE};  ///< Number of messages per time sync burst
-    int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};  ///< Milliseconds between bursts
-    int64_t time_burst_response_timeout_ms{
-        DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
+    /// Milliseconds from one burst's start to the next's, which also sets how long each message
+    /// waits for its reply (at most time_burst_interval_ms / (time_burst_size + 1))
+    int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};
+    /// @deprecated Ignored; see time_burst_interval_ms. Removed in v0.11.0.
+    [[deprecated("ignored; delete the assignment, removed in v0.11.0")]]
+    int64_t time_burst_response_timeout_ms{0};
 
     static constexpr int64_t MAX_LIVENESS_TIMEOUT_MS = 30LL * 60 * 1000;  ///< Liveness timeout cap
 
     /// @brief Milliseconds of inbound silence before the established connection is dropped as
-    /// dead. Unset derives it from the time burst settings, tolerating two consecutive unanswered
-    /// time messages (60000 with the defaults); 0 disables. Set or derived, it is capped at
-    /// MAX_LIVENESS_TIMEOUT_MS.
+    /// dead. Unset is three times MAX_BURST_SPACING_MS (30000), tolerating two consecutive time
+    /// bursts with no reply at any interval start() accepts; 0 disables. Set or derived, it is
+    /// capped at MAX_LIVENESS_TIMEOUT_MS.
     std::optional<int64_t> liveness_timeout_ms{};
 
     /// @brief Memory placement for the shared inbound ring every admitted connection receives
@@ -382,6 +401,8 @@ struct SendspinClientConfig {
     SendspinMessageTraceFn message_trace;
 #endif
 };
+
+#pragma GCC diagnostic pop
 
 // ============================================================================
 // Player config types

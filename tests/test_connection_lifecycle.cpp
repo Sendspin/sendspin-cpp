@@ -503,36 +503,34 @@ constexpr uint16_t LIVENESS_DISABLED_PORT = 18985;
 SendspinClientConfig make_liveness_config(uint16_t port, int64_t liveness_timeout_ms) {
     SendspinClientConfig config = make_config(port);
     config.time_burst_interval_ms = 20;
-    config.time_burst_response_timeout_ms = 20;
     config.liveness_timeout_ms = liveness_timeout_ms;
     return config;
 }
 
 }  // namespace
 
-// resolve_liveness_timeout_ms() either derives the window from the configured burst settings or
-// takes an explicitly configured one, and clamps either to the cap.
+// resolve_liveness_timeout_ms() either derives the window from the burst spacing start() allows,
+// whatever the configured burst settings, or takes an explicitly configured one, and clamps either
+// to the cap.
 TEST(LivenessTimeout, ResolvesFromConfig) {
     struct Row {
         const char* name;
         std::optional<uint32_t> burst_interval_ms;
-        std::optional<uint32_t> burst_response_timeout_ms;
         std::optional<int64_t> explicit_timeout_ms;
         int64_t expected_ms;
     };
     const Row rows[] = {
-        {"defaults derive", std::nullopt, std::nullopt, std::nullopt, 60000},
-        {"longer interval widens the window", 60000, std::nullopt, std::nullopt, 210000},
-        {"response timeout widens the window", 10000, 20000, std::nullopt, 90000},
-        {"explicit value overrides the derivation", 60000, std::nullopt, 5000, 5000},
-        {"explicit zero disables the check", 60000, std::nullopt, 0, 0},
-        {"Control: explicit value at the cap is kept", std::nullopt, std::nullopt,
+        {"Control: the defaults derive three burst spacings", std::nullopt, std::nullopt, 30000},
+        {"a short interval leaves the window as derived", 50, std::nullopt, 30000},
+        {"the longest interval leaves the window as derived",
+         SendspinClientConfig::MAX_BURST_INTERVAL_MS, std::nullopt, 30000},
+        {"explicit value overrides the derivation", 50, 5000, 5000},
+        {"explicit zero disables the check", std::nullopt, 0, 0},
+        {"Control: explicit value at the cap is kept", std::nullopt,
          SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS,
          SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS},
-        {"explicit value above the cap is clamped", std::nullopt, std::nullopt,
+        {"explicit value above the cap is clamped", std::nullopt,
          SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS + 1,
-         SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS},
-        {"derived value above the cap is clamped", 900000, std::nullopt, std::nullopt,
          SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS},
     };
 
@@ -541,9 +539,6 @@ TEST(LivenessTimeout, ResolvesFromConfig) {
         SendspinClientConfig config;
         if (row.burst_interval_ms.has_value()) {
             config.time_burst_interval_ms = row.burst_interval_ms.value();
-        }
-        if (row.burst_response_timeout_ms.has_value()) {
-            config.time_burst_response_timeout_ms = row.burst_response_timeout_ms.value();
         }
         config.liveness_timeout_ms = row.explicit_timeout_ms;
         EXPECT_EQ(resolve_liveness_timeout_ms(config), row.expected_ms);

@@ -311,7 +311,7 @@ public:
     std::optional<int64_t> claim_time_frame(int64_t client_transmitted);
 
     /// @brief Retires the client/time frame in flight, so a late reply to it is not claimed.
-    /// Protocol task (the burst's response timeout).
+    /// Protocol task (a time burst giving up on its message).
     void cancel_time_frame() {
         this->time_frame_tag_ = 0;
     }

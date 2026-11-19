@@ -693,7 +693,8 @@ TEST(Allocations, AcceptToAdmissionAndPerMessagePaths) {
 
     // Opens just after the main loop reports a completed burst and closes once it reports the
     // next: one burst's sends, its replies and its completion. The next burst starts
-    // time_burst_interval_ms after a completion, so none of it is in flight at the open.
+    // time_burst_interval_ms after this one started, which leaves the interval less this burst's
+    // answered round trips on loopback, so none of it is in flight at the open.
     const int bursts_seen = burst_listener.bursts;
     pump_while_not(client, [&] { return burst_listener.bursts > bursts_seen; });
     open_window();

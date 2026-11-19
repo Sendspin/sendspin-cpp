@@ -155,14 +155,11 @@ static_assert(SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS * US_PER_MS < INT32_
               "liveness cap exceeds the 32-bit arrival stamp's range");
 
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config) {
-    // The next message goes out after at most one inter-burst interval, and an unanswered one
-    // times out after one response timeout. Not value_or(): it would evaluate the derivation,
-    // which can overflow, even when unused.
-    const int64_t timeout_ms =
-        config.liveness_timeout_ms.has_value()
-            ? config.liveness_timeout_ms.value()
-            : (LIVENESS_TOLERATED_MISSES + 1) *
-                  (config.time_burst_interval_ms + config.time_burst_response_timeout_ms);
+    // Bursts start at most MAX_BURST_SPACING_MS apart (start() caps the interval below it), so the
+    // bound, not the configured interval, keeps a short cadence from shortening the window to a
+    // stall's length.
+    const int64_t timeout_ms = config.liveness_timeout_ms.value_or(
+        (LIVENESS_TOLERATED_MISSES + 1) * SendspinClientConfig::MAX_BURST_SPACING_MS);
     if (timeout_ms > SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS) {
         SS_LOGW(TAG, "Liveness timeout of %" PRId64 " ms exceeds the maximum, using %" PRId64 " ms",
                 timeout_ms, SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS);
@@ -343,8 +340,7 @@ bool ConnectionManager::on_new_connection(const std::shared_ptr<SendspinServerCo
     // On the transport's delivery thread, ahead of the connection's first frame and before the
     // protocol task can reach the connection: the push below publishes these writes to the task.
     conn->time_burst().configure(this->client_->config_.time_burst_size,
-                                 this->client_->config_.time_burst_interval_ms,
-                                 this->client_->config_.time_burst_response_timeout_ms);
+                                 this->client_->config_.time_burst_interval_ms);
     conn->set_inbound_buffer_location(this->client_->config_.inbound_ring_location);
     conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
     conn->set_json_arena(this->json_arena());
@@ -446,8 +442,7 @@ void ConnectionManager::connect_to(std::string url) {
                                 this->client_->protocol_task_.get());
 
     client_conn->time_burst().configure(this->client_->config_.time_burst_size,
-                                        this->client_->config_.time_burst_interval_ms,
-                                        this->client_->config_.time_burst_response_timeout_ms);
+                                        this->client_->config_.time_burst_interval_ms);
 
     // Start the nursery clock: the nursery scan reaps the connection if it has not completed the
     // hello handshake within NURSERY_ESTABLISH_TIMEOUT_US. The stamp predates DNS/TCP resolve,
@@ -972,9 +967,10 @@ uint32_t ConnectionManager::run_time_sync() {
         // measures, so it requests the hold when it comes due and sends its first time frame only
         // once the main loop has granted it: called the listener and counted the grant
         // (SendspinClient::high_performance_granted()). The grant wakes the task, so a burst
-        // waiting for it adds no deadline. The release at the burst's end waits for nothing.
-        // One clock read for both, so the burst loop() may open is the one the request was made
-        // for; loop() opens none without the grant (may_open_burst).
+        // waiting for it adds no deadline. A burst the next one ends opens that one with the hold
+        // it has; the release once no burst runs waits for nothing. One clock read for both, so
+        // the burst loop() may open is the one the request was made for; loop() opens none
+        // without the grant (may_open_burst).
         const int64_t now_ms = platform_time_us() / US_PER_MS;
         if (!entry.high_performance_held && burst.starts_burst(now_ms)) {
             entry.high_performance_ticket = this->client_->request_high_performance(true);
@@ -982,17 +978,16 @@ uint32_t ConnectionManager::run_time_sync() {
         }
         const bool granted = entry.high_performance_held &&
                              this->client_->high_performance_granted(entry.high_performance_ticket);
+        const TimeBurstResult result = burst.loop(conn, now_ms, granted);
+        // A filter with no measurement yet has no error to report.
+        if (result.burst_completed && &entry == primary && conn->is_time_synced()) {
+            this->client_->post_time_sync_error(conn->time_filter().get_error());
+        }
+        if (granted && !burst.burst_running()) {
+            this->client_->request_high_performance(false);
+            entry.high_performance_held = false;
+        }
         if (granted || !entry.high_performance_held) {
-            const TimeBurstResult result = burst.loop(conn, now_ms, granted);
-            if (result.burst_completed) {
-                if (entry.high_performance_held) {
-                    this->client_->request_high_performance(false);
-                    entry.high_performance_held = false;
-                }
-                if (&entry == primary) {
-                    this->client_->post_time_sync_error(conn->time_filter().get_error());
-                }
-            }
             next = std::min(next, burst.ms_until_due(now_ms));
         }
         // A client/state held for this connection's clock goes out with its first measurement.

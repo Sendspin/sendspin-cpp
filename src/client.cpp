@@ -61,6 +61,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <optional>
 #include <string>
 #include <utility>
@@ -491,6 +492,21 @@ bool SendspinClient::start() {
         !is_valid_static_pairing_code(this->config_.static_pairing_code.value())) {
         SS_LOGE(TAG, "Configured static pairing code is not %d decimal digits; cannot start",
                 STATIC_PAIRING_CODE_DIGITS);
+        return false;
+    }
+    // MIN_BURST_SIZE and MAX_BURST_INTERVAL_MS keep bursts within messaging.md "Clock
+    // Synchronization"; an interval of at least one more millisecond than messages leaves each
+    // message a wait of at least 1 ms (SendspinTimeBurst).
+    const uint8_t burst_size = this->config_.time_burst_size;
+    const int64_t burst_interval_ms = this->config_.time_burst_interval_ms;
+    if (burst_size < SendspinClientConfig::MIN_BURST_SIZE || burst_interval_ms <= burst_size ||
+        burst_interval_ms > SendspinClientConfig::MAX_BURST_INTERVAL_MS) {
+        SS_LOGE(TAG,
+                "Time bursts of %u messages %" PRId64
+                " ms apart are out of range (at least %u messages, more ms than messages, at "
+                "most %" PRId64 " ms); cannot start",
+                burst_size, burst_interval_ms, SendspinClientConfig::MIN_BURST_SIZE,
+                SendspinClientConfig::MAX_BURST_INTERVAL_MS);
         return false;
     }
     for (size_t i = 0; i < this->config_.application_roles.size(); ++i) {
