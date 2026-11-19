@@ -16,7 +16,8 @@
 /// activation that removes a role stops that role's output and clears its buffers, and discards a
 /// removed state role's current state and pending scheduled update. Roles the activation leaves
 /// active keep streaming untouched, an activation that moves no role changes nothing, and a role
-/// that is added back works again.
+/// that is added back works again. The player and visualizer streams also follow the 'playback'
+/// activity, which a later activation may drop while keeping the roles.
 ///
 /// The client is driven on loopback ports like test_client_lifecycle.cpp: a FakeEncryptedServer
 /// plays the Sendspin server over the real Noise transport, the test thread pumps client.loop(),
@@ -77,6 +78,9 @@ constexpr uint16_t STALE_START_CONTROL_TEST_PORT = 19038;
 constexpr uint16_t INACTIVE_TRAFFIC_TEST_PORT = 19039;
 constexpr uint16_t VERSION_REPLACED_TEST_PORT = 19040;
 constexpr uint16_t INACTIVE_ROLE_SEND_TEST_PORT = 19085;
+constexpr uint16_t WITHOUT_PLAYBACK_TEST_PORT = 19047;
+constexpr uint16_t PLAYBACK_DROPPED_TEST_PORT = 19048;
+constexpr uint16_t PLAYBACK_DROPPED_AFTER_END_TEST_PORT = 19049;
 
 /// A group/update the protocol task processes after whatever the server sent before it, so its
 /// inbox bit marks those messages as applied.
@@ -931,4 +935,136 @@ TEST(RoleDeactivation, ReplacingARoleVersionRemovesTheVersionInUse) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+// ============================================================================
+// The 'playback' activity
+// ============================================================================
+
+// messaging.md "stream/start": on a connection without 'playback' the client ignores the player
+// and visualizer objects in stream/start, unvalidated, and discards their data; the artwork stream
+// runs regardless. A malformed player or visualizer object, which rejects the whole stream/start
+// where 'playback' is declared and so ends the artwork stream, therefore leaves the artwork object
+// beside it applied. Control: the same stream/starts start both streams once an activation
+// declares 'playback'.
+TEST(RoleDeactivation, PlaybackStreamsWaitForThePlaybackActivity) {
+    CountingPlayerListener player_listener;
+    CountingVisualizerListener visualizer_listener;
+    RecordingArtworkListener artwork_listener;
+
+    PairedClientBundle bundle(make_config(WITHOUT_PLAYBACK_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
+    client.add_visualizer(make_visualizer_config()).set_listener(&visualizer_listener);
+    client.add_artwork(make_artwork_config()).set_listener(&artwork_listener);
+    ASSERT_TRUE(bundle.start());
+
+    const std::string roles = R"(["player@v1","visualizer@v1","artwork@v1"])";
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    options.first_activities_json = "[]";
+    options.first_roles_json = roles;
+    auto server =
+        connect_paired_server(bundle.peer, WITHOUT_PLAYBACK_TEST_PORT, std::move(options));
+    pump_until_synced(client);
+
+    // The image sent last marks everything before it handled.
+    ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
+    int64_t ts = platform_time_us() + 50 * 1000;
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(server->send_audio(ts, 48000 / 50 * 2 * 2));
+        ASSERT_TRUE(server->send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, ts,
+                                        std::string("\x00\x10", 2)));
+        ts += 20 * 1000;
+    }
+    ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), 32)));
+    ASSERT_TRUE(server->send_binary_body(artwork_part(32)));
+    pump_until(client, [&] { return artwork_listener.decodes.load() == 1; });
+    pump_for(client, SETTLE_MS);
+    EXPECT_EQ(player_listener.stream_starts, 0) << "a player stream started without playback";
+    EXPECT_EQ(visualizer_listener.stream_starts, 0)
+        << "a visualizer stream started without playback";
+    EXPECT_EQ(player_listener.audio_writes.load(), 0U);
+    EXPECT_EQ(visualizer_listener.loudness.load(), 0U);
+
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"stream/start","payload":{"player":{},"visualizer":{},"artwork":{"channels":[)"
+        R"({"source":"album","format":"jpeg","width":100,"height":100}]}}})"));
+    ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), 32)));
+    ASSERT_TRUE(server->send_binary_body(artwork_part(32)));
+    pump_until(client, [&] { return artwork_listener.decodes.load() == 2; });
+
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],"active_roles":)" +
+        roles + "}}"));
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
+    pump_until(client, [&] {
+        return player_listener.stream_starts == 1 && visualizer_listener.stream_starts == 1;
+    });
+    EXPECT_FALSE(server->closed());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// messaging.md "server/activate": a server ends the player and visualizer streams before it drops
+// 'playback'. One that leaves them running still has them ended by the drop, as its stream/end
+// would have: each consumer sees one end, the player's once the sync task has left the stream.
+// Control: after the server's own stream/end the drop reports no second end.
+TEST(RoleDeactivation, DroppingPlaybackEndsThePlaybackStreams) {
+    struct Row {
+        const char* name;
+        uint16_t port;
+        bool stream_end_first;
+    };
+    const Row rows[] = {
+        {"the server leaves the streams running", PLAYBACK_DROPPED_TEST_PORT, false},
+        {"Control: the server ends the streams first", PLAYBACK_DROPPED_AFTER_END_TEST_PORT, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        CountingPlayerListener player_listener;
+        CountingVisualizerListener visualizer_listener;
+
+        PairedClientBundle bundle(make_config(row.port));
+        SendspinClient& client = bundle.client();
+        client.add_player(make_pcm_player_config()).set_listener(&player_listener);
+        client.add_visualizer(make_visualizer_config()).set_listener(&visualizer_listener);
+        ASSERT_TRUE(bundle.start());
+
+        FakeEncryptedServerOptions options;
+        options.answer_time = true;
+        options.first_roles_json = R"(["player@v1","visualizer@v1"])";
+        auto server = connect_paired_server(bundle.peer, row.port, std::move(options));
+        pump_until_synced(client);
+
+        ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+        ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
+        pump_until(client, [&] {
+            return player_listener.stream_starts == 1 && visualizer_listener.stream_starts == 1;
+        });
+        stream_audio_until(client, *server, player_listener, 1);
+        send_loudness_until(client, *server,
+                            [&] { return visualizer_listener.loudness.load() >= 1; });
+
+        if (row.stream_end_first) {
+            ASSERT_TRUE(server->send_app_json(R"({"type":"stream/end","payload":{}})"));
+        }
+        ASSERT_TRUE(server->send_app_json(
+            R"({"type":"server/activate","payload":{"activities":[],)"
+            R"("active_roles":["player@v1","visualizer@v1"]}})"));
+        pump_until(client, [&] {
+            return player_listener.stream_ends >= 1 && visualizer_listener.stream_ends >= 1;
+        });
+        pump_for(client, SETTLE_MS);
+        EXPECT_EQ(player_listener.stream_ends, 1);
+        EXPECT_EQ(visualizer_listener.stream_ends, 1);
+        EXPECT_TRUE(client.is_connected()) << "the ends came from a teardown, not the drop";
+
+        client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+        pump_for(client, 100);
+    }
 }

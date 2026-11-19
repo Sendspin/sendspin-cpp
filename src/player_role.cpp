@@ -408,7 +408,7 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
                       .audio_len = len - AUDIO_CHUNK_HEADER_SIZE};
 }
 
-SS_HOT bool PlayerRole::Impl::handle_binary(InboundMessage& message, bool available) {
+SS_HOT bool PlayerRole::Impl::handle_binary(InboundMessage& message, bool takes_audio) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
     // roles/player/v1.md "Audio Chunks (Binary)": a message shorter than its header is a protocol
     // error, so this runs ahead of the discards below (messaging.md "Communication": a discarded
@@ -417,9 +417,10 @@ SS_HOT bool PlayerRole::Impl::handle_binary(InboundMessage& message, bool availa
     if (!chunk.has_value()) {
         return false;
     }
-    if (!available) {
-        // roles/player/v1.md "Audio Chunks (Binary)": an unavailable client discards audio.
-        SS_LOGV(TAG, "Discarding audio chunk while unavailable");
+    if (!takes_audio) {
+        // Audio is discarded while the client is unavailable (roles/player/v1.md "Audio Chunks
+        // (Binary)") and on a connection without 'playback' (messaging.md "stream/start").
+        SS_LOGV(TAG, "Discarding audio chunk while unavailable or without playback");
         return true;
     }
     InboundConsumer& inbound = this->sync_task->inbound();

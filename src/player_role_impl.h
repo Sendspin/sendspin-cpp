@@ -108,11 +108,11 @@ struct PlayerRole::Impl : RoleTeardown {
     /// @brief Hands an audio chunk to the sync task: by its ring item when it has one (clearing
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted chunk; `data` points at its message type byte.
-    /// @param available Whether the adopted client/state snapshot reports the client available;
-    /// an unavailable client discards the chunk.
+    /// @param takes_audio Whether the adopted client/state snapshot reports the client available
+    /// and the connection declares 'playback'; otherwise the chunk is discarded.
     /// @return false when the message is a protocol error per roles/player/v1.md "Audio Chunks
     /// (Binary)" and the caller must close the connection; true when handed over or discarded.
-    bool handle_binary(InboundMessage& message, bool available);
+    bool handle_binary(InboundMessage& message, bool takes_audio);
     void handle_stream_start(const PlayerStreamPayload& player);
     void handle_stream_end() const;
     void handle_stream_clear();

@@ -47,8 +47,8 @@ public:
     virtual void on_streaming_started() {}
 
     /// @brief Called when the input stream has closed (a server stop, the role being removed, the
-    /// client becoming unavailable, the connection ending, or the client stopping);
-    /// write_audio() rejects audio again
+    /// server dropping the 'playback' activity, the client becoming unavailable, the connection
+    /// ending, or the client stopping); write_audio() rejects audio again
     virtual void on_streaming_stopped() {}
 };
 

@@ -228,6 +228,14 @@ show" and make it idempotent. Until the server adds the role back, anything it s
 that role is ignored rather than acted on, so a removed role stays quiet; when it is added back,
 the role resumes normally.
 
+The player, visualizer and source streams also need the server to declare the `playback`
+activity, which it declares while the group plays or it wants the source to stream, and may drop
+while keeping the roles active. Without it the player and visualizer start no stream and discard
+what the server sends for them, and the source ignores a start. An activation that drops
+`playback` ends their streams as a role removal does (`on_stream_end()`,
+`on_visualizer_stream_end()`, `on_streaming_stopped()`), firing nothing for a stream the server had
+already ended; the artwork, metadata, controller and color roles carry on.
+
 ### PlayerRoleListener (Required if Using Player Role)
 
 Override `on_audio_output()`. It becomes pure virtual in v0.11.0, beside
@@ -514,8 +522,9 @@ struct MySourceListener : SourceRoleListener {
         capture.start();
     }
     void on_streaming_stopped() override {
-        // A server stop, the role's removal, the client becoming unavailable, the connection
-        // ending, or the client stopping; write_audio() refuses audio again
+        // A server stop, the role's removal, the server dropping playback, the client becoming
+        // unavailable, the connection ending, or the client stopping; write_audio() refuses
+        // audio again
         capture.stop();
     }
 };

@@ -132,7 +132,8 @@ public:
     /// @brief Called when a visualizer stream ends
     ///
     /// Also fires when a server/activate takes the visualizer role out of the session's active
-    /// roles, which discards the buffered frames along with the stream.
+    /// roles, which discards the buffered frames along with the stream, and when one drops the
+    /// 'playback' activity while the stream runs.
     virtual void on_visualizer_stream_end() {}
 
     /// @brief Called when a visualizer stream is cleared; not for a stream/clear with
