@@ -958,16 +958,17 @@ protected:
 
     /// @brief Chooses the destination for a complete message of `len` bytes. Transport thread.
     ///
-    /// An admitted connection receives straight into a ring item it acquires here, waiting up to
+    /// An empty message closes the connection in either admission state. An admitted connection
+    /// receives straight into a ring item it acquires here, waiting up to
     /// INBOUND_ACQUIRE_TIMEOUT_MS for room, and is closed with a warning when there is none,
     /// since a frame never decrypted leaves the Noise receive nonce behind; a message longer than
     /// INBOUND_MAX_MESSAGE_BYTES closes the connection, since no conforming peer sends one (the
     /// Noise layer fragments), and one longer than the ring takes
-    /// (InboundRing::max_message_bytes()) goes to route_to_fallback(), as does every message of
-    /// an unadmitted connection; one over InboundGate::PRE_ADMISSION_MESSAGE_BYTES first waits for
-    /// the message still pending to be consumed (it may be the one that admits the connection,
-    /// wait_until_writable()) and closes the connection if it is still unadmitted then. A
-    /// detached or unattached connection drops everything.
+    /// (InboundRing::max_message_bytes()) goes to route_to_fallback(), as does every non-empty
+    /// message of an unadmitted connection; one over InboundGate::PRE_ADMISSION_MESSAGE_BYTES first
+    /// waits for the message still pending to be consumed (it may be the one that admits the
+    /// connection, wait_until_writable()) and closes the connection if it is still unadmitted then.
+    /// A detached or unattached connection drops everything.
     InboundTarget route_inbound_message(size_t len, InboundKind kind);
 
     /// @brief Routes a complete message of `len` bytes to the fallback buffer, in order with the

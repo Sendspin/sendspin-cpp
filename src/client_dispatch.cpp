@@ -402,11 +402,12 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
     //
     // messaging.md "Binary Message ID Structure": a body that is not a UTF-8 JSON object with a
     // type string and a payload object is a protocol error the client MUST close the connection
-    // on, closed silently like every other one the receive path finds (see close_silently()).
+    // on, closed silently like every other one the receive path finds (see
+    // ConnectionManager::close_on_malformed_message()).
     // ArduinoJson does not check UTF-8, so the body is checked first; the JSON is judged as
-    // ArduinoJson parses it, accepting its single-quote and unquoted-key leniency. A body over the
-    // parser's own limits is the client's limit rather than the peer's error: dropped, connection
-    // kept.
+    // ArduinoJson parses it, accepting its single-quote and unquoted-key leniency. An object over
+    // the parser's own limits is the client's limit rather than the peer's error: dropped,
+    // connection kept.
     ParsedJsonMessage parsed(*this->json_arena_);
     const JsonParseResult parse_result = is_valid_utf8(std::string_view(data, len))
                                              ? parsed.parse(data, len)
@@ -418,7 +419,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
     if (parse_result != JsonParseResult::OBJECT ||
         !parsed.read([](JsonObject root) { return has_message_envelope(root); })) {
         SS_LOGW(TAG, "Malformed JSON message; closing connection");
-        conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        this->connection_manager_->close_on_malformed_message(conn);
         return;
     }
 

@@ -335,8 +335,8 @@ enum class JsonParseResult : uint8_t {
     OBJECT,
     /// Not JSON, JSON whose root is not an object, or an object followed by more than whitespace
     MALFORMED,
-    /// Over a limit of the client's own (the allocator ran out, or ArduinoJson's nesting limit was
-    /// passed), so the text may still be valid JSON
+    /// An object over a limit of the client's own (the allocator ran out, or ArduinoJson's nesting
+    /// limit was passed), so the text may still be valid JSON
     OVER_LIMIT,
 };
 
@@ -363,6 +363,13 @@ public:
     /// @brief Parses @p len bytes of JSON text, copying its strings into the document
     JsonParseResult parse(const char* data, size_t len) {
         if (!this->doc_) {
+            return JsonParseResult::MALFORMED;
+        }
+        // A root that is not an object is malformed however far a parse would get before a limit
+        // stops it, and its first byte names it (RFC 8259 section 2).
+        const std::string_view text(data, len);
+        const size_t first = text.find_first_not_of(" \t\n\r");
+        if (first == std::string_view::npos || text[first] != '{') {
             return JsonParseResult::MALFORMED;
         }
         JsonDocument& doc = *this->doc_;

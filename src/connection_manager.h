@@ -489,6 +489,10 @@ public:
     /// @brief Advances the pairing-code state machine of an admitted connection.
     void on_pairing_message(SendspinConnection* conn, const ServerPairingMessage& message);
 
+    /// @brief Closes a connection that sent a malformed message, silently; a pairing attempt it
+    /// ends is reported as UNKNOWN.
+    void close_on_malformed_message(SendspinConnection* conn);
+
     /// @brief Records a completed pairing: the server/pair-finalize handler stored the long-term
     /// record for `conn`. Closes the pairing window the attempt ran under and queues on_paired.
     void on_pairing_succeeded(SendspinConnection* conn);

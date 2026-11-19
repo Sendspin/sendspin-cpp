@@ -132,7 +132,8 @@ public:
     /// The connection usually stays open after this callback, so the server can re-activate
     /// pairing or resume normal operation on it (pairing.md "pair/abort"). It is closed for
     /// CONCURRENT_ATTEMPT, and closed without any further message for the UNKNOWN reported on a
-    /// pairing protocol error (a malformed or out-of-sequence pairing message).
+    /// protocol error during the attempt (a malformed message, or a pairing message out of
+    /// sequence).
     virtual void on_pairing_aborted(std::string_view /*server_id*/,
                                     SendspinPairAbortReason /*reason*/) {}
 

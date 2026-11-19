@@ -2161,7 +2161,7 @@ TEST(EncryptedLifecycle, AnUnhandledTypeIsLoggedOnlyUpToTheBound) {
 // object with a type string and a payload object is a protocol error the client closes the
 // connection on, silently. Every connection's JSON goes through this one dispatch, admitted or
 // not. Kept open: a well-formed message of an unrecognized type, which messaging.md
-// "Communication" ignores, and one nested past ArduinoJson's limit, which may be valid. Read
+// "Communication" ignores, and an object nested past ArduinoJson's limit, which may be valid. Read
 // through accepts_app_sends(): the stand-in's is_connected() is always true, so it is false only
 // once the close detached the connection.
 TEST(EncryptedLifecycle, AMalformedJsonBodyClosesTheConnection) {
@@ -2187,6 +2187,7 @@ TEST(EncryptedLifecycle, AMalformedJsonBodyClosesTheConnection) {
         {"trailing bytes", R"({"type":"server/state","payload":{}}garbage)", true},
         {"a second value", R"({"type":"server/state","payload":{}} {})", true},
         {"an array at the root", R"([{"type":"server/state","payload":{}}])", true},
+        {"an array at the root nested past the parser's limit", "[" + nested + "]", true},
         {"null at the root", "null", true},
         {"no type", R"({"payload":{}})", true},
         {"a type that is not a string", R"({"type":5,"payload":{}})", true},

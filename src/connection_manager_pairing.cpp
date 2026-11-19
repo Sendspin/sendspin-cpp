@@ -743,6 +743,21 @@ void ConnectionManager::local_abort_pairing(SendspinConnection* conn, PairAbortR
         to_public_abort_reason(reason), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
 }
 
+void ConnectionManager::close_on_malformed_message(SendspinConnection* conn) {
+    // pairing.md "Protocol Errors": the close is silent. An attempt it ends is reported as
+    // UNKNOWN, so the listener still hears it end; one the server acked pair-finalize for already
+    // ended at on_paired.
+    if (conn->is_pairing_in_progress() && !conn->is_pairing_finalized()) {
+        SS_LOGW(TAG, "Malformed message during pairing; aborting the attempt for server_id=%s",
+                conn->get_server_id().c_str());
+        this->abort_pairing_attempt(conn, /*wire_abort_reason=*/std::nullopt,
+                                    PairingDropAction::CLOSE_SILENTLY,
+                                    SendspinPairAbortReason::UNKNOWN);
+        return;
+    }
+    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+}
+
 void ConnectionManager::close_on_sequence_violation(SendspinConnection* conn,
                                                     const char* message_type) {
     // pairing.md "Sequence violations": a pairing message out of sequence for the selected

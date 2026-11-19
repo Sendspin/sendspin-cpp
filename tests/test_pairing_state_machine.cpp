@@ -1630,6 +1630,68 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSile
     }
 }
 
+// A malformed message of any type (messaging.md "Binary Message ID Structure") closes the
+// connection silently; one that ends a pairing attempt reports it as UNKNOWN. Controls: with no
+// attempt, or after the server acked pair-finalize (the attempt already ended at on_paired), the
+// close reports none. Reaches SendspinClient::process_json_message() and json_arena_ (private) to
+// hand the client a malformed body as process_inbound() does, arena reset first.
+TEST_F(PairingStateMachineTest, AMalformedMessageEndsThePairingAttemptItCloses) {
+    struct Row {
+        const char* name;
+        const char* server_id;
+        bool attempt;
+        bool finalized;
+        int expected_failed;
+    };
+    // The aborting row runs last, so no earlier row's attempt is charged to the window.
+    const Row rows[] = {
+        {"Control: no attempt", "server-malformed-idle", false, false, 0},
+        {"Control: finalized", "server-malformed-finalized", true, true, 0},
+        {"attempt in progress", "server-malformed-attempt", true, false, 1},
+    };
+    const std::string code = "13572468";
+    this->configure_static_pairing_code(code);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        FakeConnection* conn =
+            this->inject_current_connection(row.server_id, SendspinPairMethod::STATIC_PAIRING_CODE);
+        if (row.attempt) {
+            this->enter_pairing(conn);
+            this->pump();
+            this->client_->confirm_pairing_window();
+            this->pump();
+            ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+        }
+        if (row.finalized) {
+            ServerStandIn server;
+            ASSERT_TRUE(server.start(pairing_code_digits_prs(code),
+                                     conn->pairing_session().handshake_hash));
+            std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+            ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
+            this->send_pair_confirm(server_kc);
+            ASSERT_NO_FATAL_FAILURE(this->deliver_pair_finalize_ack(conn));
+            ASSERT_TRUE(conn->is_pairing_in_progress());
+        }
+        const size_t frames_before = conn->sent_text_.size();
+        const int failed_before = this->listener_.count(PairingEventKind::FAILED);
+
+        this->client_->json_arena_->reset();
+        this->client_->process_json_message(*conn, "[]", 2, platform_time_us());
+        this->pump();
+
+        EXPECT_EQ(conn->sent_text_.size(), frames_before) << "the close sends nothing";
+        // Closed silently; a connection the close leaves in its slot has its detached transport
+        // closed again by the tick.
+        EXPECT_EQ(conn->disconnect_count_, 0);
+        EXPECT_GE(conn->close_transport_now_count_, 1);
+        EXPECT_EQ(this->listener_.count(PairingEventKind::FAILED),
+                  failed_before + row.expected_failed);
+        if (row.expected_failed > 0) {
+            EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::UNKNOWN);
+        }
+    }
+}
+
 TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameWithNoActiveSessionIsIgnored) {
     // A connection with no active pairing-code session (pairing_session().step == IDLE) at all: a
     // stray

@@ -309,10 +309,7 @@ Protocol task: SendspinClient::protocol_tick()
                  failure, an empty plaintext or a malformed fragment sequence closes silently
                  └─ SendspinClient::process_inbound() dispatches on the plaintext type byte:
                     ├─ MSG_TYPE_JSON_BODY → SendspinClient::process_json_message(), which closes
-                    │  silently on a body that is not a UTF-8 JSON object with a type string and
-                    │  a payload object (messaging.md "Binary Message ID Structure"), as ArduinoJson
-                    │  parses it (its single-quote and unquoted-key leniency is accepted), and
-                    │  drops one over the parser's own limits
+                    │  silently on a malformed body
                     └─ other → SendspinClient::process_binary_message(), which hands
                        a player, visualizer or artwork part message over in its ring item
 ```

@@ -181,6 +181,7 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
     // messaging.md "Binary Message ID Structure": an empty plaintext is a protocol error.
     if (len == 0) {
         SS_LOGW(TAG, "accept_plaintext: empty plaintext");
+        this->reasm_reset();
         return {nullptr, 0, true};
     }
 

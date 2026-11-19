@@ -179,18 +179,6 @@ TEST(DynamicPairingCode, ParseServerPairInitNullNonceYieldsNoNonce) {
     EXPECT_FALSE(payload.nonce_a.has_value());
 }
 
-// Same for a message with no payload object at all: nonce_A is the only field it would carry,
-// and a retry round has nothing to put there.
-TEST(DynamicPairingCode, ParseServerPairInitWithoutPayloadYieldsNoNonce) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/pair-init"})", doc, root));
-
-    ServerPairInitPayload payload;
-    ASSERT_TRUE(process_server_pair_init_message(root, &payload));
-    EXPECT_FALSE(payload.nonce_a.has_value());
-}
-
 // ============================================================================
 // process_server_pair_auth_message
 // ============================================================================
