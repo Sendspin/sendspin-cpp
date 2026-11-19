@@ -48,9 +48,12 @@ static constexpr size_t BINARY_SEND_AHEAD_SIZE = 4;
 /// @brief Bytes an audio chunk spends on its header, after the message type byte.
 static constexpr size_t AUDIO_CHUNK_HEADER_SIZE =
     sendspin::BINARY_TIMESTAMP_SIZE + BINARY_SEND_AHEAD_SIZE;
-/// @brief Upper bound on the output delay, per roles/player/v1.md "Output delay": clients MUST
-/// clamp output_delay_ms to the range 0-5000.
+/// @brief Upper bound on output_delay_ms, which roles/player/v1.md "client/state player object"
+/// limits to 0-5000
 static constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000U;
+/// @brief Upper bound on min_buffer_ms, which roles/player/v1.md "client/state player object"
+/// limits to 0-5000
+static constexpr uint16_t MAX_MIN_BUFFER_MS = 5000U;
 /// @brief Offset of an audio chunk's encoded frame in its plaintext: the message type byte, then
 /// the chunk header.
 static constexpr size_t AUDIO_FRAME_OFFSET = 1 + AUDIO_CHUNK_HEADER_SIZE;
@@ -305,6 +308,11 @@ void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
 
 bool PlayerRole::Impl::start(SendspinPersistenceProvider* persistence, InboundRing* ring) {
     if (!audio_formats_valid(this->config.audio_formats)) {
+        return false;
+    }
+    if (this->config.min_buffer_ms > MAX_MIN_BUFFER_MS) {
+        SS_LOGE(TAG, "min_buffer_ms %u is over the %u roles/player/v1.md allows",
+                this->config.min_buffer_ms, MAX_MIN_BUFFER_MS);
         return false;
     }
 
@@ -787,18 +795,8 @@ void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event, uint
 }
 
 void PlayerRole::Impl::load_output_delay() {
-    if (!this->persistence) {
-        // No persistence provider - use initial value from config
-        if (this->config.initial_output_delay_ms > 0) {
-            this->output_delay_ms.store(this->config.initial_output_delay_ms,
-                                        std::memory_order_relaxed);
-            SS_LOGI(TAG, "Using initial output delay from config: %u ms",
-                    this->config.initial_output_delay_ms);
-        }
-        return;
-    }
-
-    const std::optional<uint16_t> delay = read_output_delay_blob(*this->persistence);
+    const std::optional<uint16_t> delay =
+        this->persistence ? read_output_delay_blob(*this->persistence) : std::nullopt;
     if (delay.has_value()) {
         if (delay.value() <= MAX_OUTPUT_DELAY_MS) {
             this->output_delay_ms.store(delay.value(), std::memory_order_relaxed);
@@ -807,10 +805,10 @@ void PlayerRole::Impl::load_output_delay() {
             SS_LOGW(TAG, "Persisted output delay out of range (%u), ignoring", delay.value());
         }
     } else if (this->config.initial_output_delay_ms > 0) {
-        this->output_delay_ms.store(this->config.initial_output_delay_ms,
-                                    std::memory_order_relaxed);
-        SS_LOGI(TAG, "Using initial output delay from config: %u ms",
-                this->config.initial_output_delay_ms);
+        const uint16_t initial =
+            std::min(this->config.initial_output_delay_ms, MAX_OUTPUT_DELAY_MS);
+        this->output_delay_ms.store(initial, std::memory_order_relaxed);
+        SS_LOGI(TAG, "Using initial output delay from config: %u ms", initial);
     }
 }
 

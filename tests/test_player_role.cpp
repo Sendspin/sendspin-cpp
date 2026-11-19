@@ -175,6 +175,31 @@ TEST(PlayerRoleTimingParameters, ReportedLeadTimeIsTheLargerOfTheConfiguredValue
     }
 }
 
+// roles/player/v1.md "client/state player object": min_buffer_ms is 0-5000, and every client/state
+// reports the configured value, so start() refuses one over the range rather than sending it.
+TEST(PlayerRoleTimingParameters, StartRefusesAMinBufferOverTheSpecRange) {
+    struct Row {
+        const char* name;
+        uint16_t min_buffer_ms;
+        bool starts;
+    };
+    const Row rows[] = {
+        {"Control: at the spec maximum", 5000, true},
+        {"over the spec maximum", 5001, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        PlayerRoleConfig config = make_player_config();
+        config.min_buffer_ms = row.min_buffer_ms;
+        SendspinClient client(make_client_config(row.name));
+        client.add_player(std::move(config));
+        EXPECT_EQ(client.start(), row.starts);
+        if (client.is_started()) {
+            client.stop();
+        }
+    }
+}
+
 // The timing parameters describe the pipeline, not the delay knob: an inadjustable delay reports
 // 0 without touching them.
 TEST(PlayerRoleTimingParameters, ReportedWhileOutputDelayIsNotAdjustable) {
@@ -1000,7 +1025,7 @@ TEST(PlayerStreamStart, AFlacHeaderMustDescribeTheAnnouncedFormat) {
 
 namespace {
 
-// roles/player/v1.md "Output delay": the delay a player accepts is at most 5000 ms. Spelled out
+// roles/player/v1.md "client/state player object": output_delay_ms is at most 5000. Spelled out
 // rather than read from the production constant, which is what the clamp is being checked against.
 constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000;
 
@@ -1164,6 +1189,26 @@ TEST(PlayerRoleOutputDelay, RequestOverTheSpecMaximumIsClamped) {
     // Control: a value inside the range reaches the player unchanged.
     fixture.player->update_output_delay(MAX_OUTPUT_DELAY_MS - 1);
     EXPECT_EQ(fixture.player->get_output_delay_ms(), MAX_OUTPUT_DELAY_MS - 1);
+}
+
+// The configured initial delay is held to the same maximum as a requested one, so a player with
+// nothing persisted never reports a delay over the range either.
+TEST(PlayerRoleOutputDelay, InitialValueOverTheSpecMaximumIsClamped) {
+    struct Row {
+        const char* name;
+        uint16_t initial;
+        uint16_t expected_delay_ms;
+    };
+    const Row rows[] = {
+        {"Control: under the spec maximum", MAX_OUTPUT_DELAY_MS - 1, MAX_OUTPUT_DELAY_MS - 1},
+        {"above the spec maximum", 60000, MAX_OUTPUT_DELAY_MS},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InMemoryPersistenceProvider provider;
+        DelayClient fixture(provider, row.initial);
+        EXPECT_EQ(fixture.player->get_output_delay_ms(), row.expected_delay_ms);
+    }
 }
 
 // A server that re-sends the delay it already set must not cost a flash write, which on device is

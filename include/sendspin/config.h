@@ -172,8 +172,10 @@ struct SendspinClientConfig {
     // keypair (client_id = base64url(public_key)), generated on first boot and persisted via
     // SendspinPersistenceProvider. Read it back via SendspinClient::client_id() after
     // start().
-    std::string name;  ///< Friendly display name
+    /// @brief Friendly display name; start() cuts it to the 64 bytes of UTF-8 client/hello allows
+    std::string name;
 
+    // start() cuts each of these three the same way
     std::optional<std::string> product_name{};  ///< Device product name (optional)
     std::optional<std::string> manufacturer{};  ///< Manufacturer name, e.g., "ESPHome" (optional)
     std::optional<std::string> software_version{};  ///< Software version string (optional)
@@ -414,6 +416,7 @@ struct PlayerRoleConfig {
     /// fits.
     size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
     int32_t fixed_delay_us{0};
+    /// @brief Output delay used until one is persisted, clamped to 5000 like update_output_delay()
     uint16_t initial_output_delay_ms{0};
 
     /// @brief Default extra silence (ms) inserted at stream start for decode-pipeline headroom
@@ -469,7 +472,8 @@ struct PlayerRoleConfig {
     /// a stream to absorb network jitter and decode timing variance
     /// (roles/player/v1.md "client/state player object"). Mostly relevant for live streams, where
     /// the server has little audio in hand. The audio it represents must fit
-    /// `audio_buffer_capacity` at the highest-bitrate format in `audio_formats`.
+    /// `audio_buffer_capacity` at the highest-bitrate format in `audio_formats`. At most 5000;
+    /// start() fails and logs over it.
     uint16_t min_buffer_ms{DEFAULT_MIN_BUFFER_MS};
 
     bool psram_stack{false};  ///< Allocate sync task stack in PSRAM (ESP-IDF only)

@@ -105,6 +105,7 @@ constexpr uint16_t UNPAIR_RECORD_TEST_PORT = 19004;
 constexpr uint16_t UNPAIR_SENTINEL_TEST_PORT = 19005;
 constexpr uint16_t CONTROLLER_VALIDATION_TEST_PORT = 19006;
 constexpr uint16_t LEAVE_TEST_PORT = 19007;
+constexpr uint16_t HELLO_TEXT_TEST_PORT = 19008;
 constexpr uint16_t LEAVE_PAIRING_TEST_PORT = 19009;
 constexpr uint16_t REKEY_ROLE_SEND_TEST_PORT = 19010;
 constexpr uint16_t REPROVE_REHANDSHAKE_TEST_PORT = 19011;
@@ -554,6 +555,58 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
         << "an out-channel and an emission format were configured on this client";
     EXPECT_FALSE(advertises("static_pairing_code"))
         << "no static pairing code or pairing window on this client";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// messaging.md "client/hello": name and each device_info string are at most 64 bytes of UTF-8,
+// and a server closes a connection whose hello breaks a limit ("Communication"), so start() cuts
+// longer configured text at a character boundary rather than sending it.
+TEST(EncryptedLifecycle, HelloCutsNameAndDeviceInfoToTheirLimit) {
+    struct Row {
+        const char* field;
+        std::string configured;
+        std::string sent;
+    };
+    const Row rows[] = {
+        {"name", std::string(63, 'n') + "\xC3\xA9", std::string(63, 'n')},  // a 2-byte e-acute
+        {"product_name", std::string(65, 'p'), std::string(64, 'p')},
+        {"manufacturer", std::string(100, 'm'), std::string(64, 'm')},
+        {"software_version", std::string(65, 'v'), std::string(64, 'v')},
+    };
+    SendspinClientConfig config;
+    config.server_port = HELLO_TEXT_TEST_PORT;
+    config.name = rows[0].configured;
+    config.product_name = rows[1].configured;
+    config.manufacturer = rows[2].configured;
+    config.software_version = rows[3].configured;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+    FakeEncryptedServer server(server_url(HELLO_TEXT_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), bundle.peer.server_identity,
+                               bundle.peer.record.psk_id, bundle.peer.psk);
+    pump_until(client, [&] { return client.is_connected(); });
+
+    JsonDocument doc;
+    for (const auto& message : server.messages()) {
+        if (message.type == "client/hello") {
+            ASSERT_EQ(deserializeJson(doc, reinterpret_cast<const char*>(message.body.data()),
+                                     message.body.size()),
+                      DeserializationError::Ok);
+        }
+    }
+    JsonObjectConst payload = doc["payload"].as<JsonObjectConst>();
+    ASSERT_FALSE(payload.isNull()) << "no client/hello was received";
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.field);
+        JsonVariantConst sent = std::string_view(row.field) == "name"
+                                    ? payload["name"]
+                                    : payload["device_info"][row.field];
+        EXPECT_EQ(sent.as<std::string>(), row.sent);
+    }
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
