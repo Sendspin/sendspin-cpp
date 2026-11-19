@@ -1662,9 +1662,12 @@ TEST(TimeBurst, CountsOnlyTheReplyToItsPendingMessage) {
         << "the second real reply ends the burst";
 }
 
-// A message loop() gives up on is retired on the connection, so its late reply is not claimed,
-// and the burst does not count one claimed just before that either.
-TEST(TimeBurst, AnUnansweredMessageIsRetired) {
+// A burst's last message loop() gives up on is retired on the connection, so its late reply is
+// not claimed, and the burst, already complete, does not count one claimed just before that
+// either. loop() gives up on it once the interval's share for it has passed, not before, however
+// much time the burst has left. The first message is answered, so no later send overwrites the
+// retired message's frame or echo.
+TEST(TimeBurst, AnUnansweredLastMessageIsRetired) {
     constexpr int64_t NOW_MS = 1'000'000;
     constexpr int64_t INTERVAL_MS = 1000;
     constexpr uint8_t SIZE = 2;
@@ -1678,25 +1681,71 @@ TEST(TimeBurst, AnUnansweredMessageIsRetired) {
     SendspinTimeBurst burst;
     burst.configure(SIZE, INTERVAL_MS);
     burst.loop(&conn, NOW_MS, true);
-    ASSERT_EQ(conn.sent_binary_.size(), 1U);
-    const int64_t echo = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_.at(0));
-    burst.loop(&conn, NOW_MS + INTERVAL_MS / (SIZE + 1), true);
-    ASSERT_EQ(conn.sent_binary_.size(), 2U) << "the next message did not follow the unanswered one";
+    TimeResponse reply;
+    reply.max_error = 50;
+    reply.client_transmitted =
+        sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_.at(0));
+    ASSERT_FALSE(burst.on_time_response(&conn, reply));
+    burst.loop(&conn, NOW_MS, true);
+    ASSERT_EQ(conn.sent_binary_.size(), 2U);
+    const int64_t echo = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_.at(1));
+    // The whole interval is still left, half of it for the last message; its share is less.
+    constexpr int64_t SHARE_MS = INTERVAL_MS / (SIZE + 1);
+    EXPECT_FALSE(burst.loop(&conn, NOW_MS + SHARE_MS - 1, true).burst_completed);
+    EXPECT_TRUE(burst.loop(&conn, NOW_MS + SHARE_MS, true).burst_completed);
+    ASSERT_EQ(conn.sent_binary_.size(), 2U) << "a message after the burst's last";
 
     EXPECT_FALSE(conn.claim_time_frame(echo).has_value());
     TimeResponse late;
     late.max_error = 50;
     late.client_transmitted = echo;
     EXPECT_FALSE(burst.on_time_response(&conn, late))
-        << "counted, the late reply would complete the burst its retirement already counted toward";
+        << "counted, the late reply would count past the burst its retirement completed";
+}
+
+// A burst the next one ends still feeds the filter the best measurement it got and reports its
+// completion, with the last message still awaiting its reply; with no reply at all (the Control
+// row) it reports its completion and leaves the filter unmeasured. Every answered message is
+// answered at once, so the burst is still running when loop() is called at the next one's due
+// time.
+TEST(TimeBurst, ABurstTheNextOneEndsFeedsTheFilterAndReportsCompletion) {
+    constexpr int64_t START_MS = 1'000'000;
+    constexpr int64_t INTERVAL_MS = SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS;
+    constexpr uint8_t SIZE = SendspinClientConfig::DEFAULT_BURST_SIZE;
+    for (const bool answered : {true, false}) {
+        SCOPED_TRACE(answered ? "all but the last message answered" : "Control: none answered");
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+        DeferredWriteConnection conn;
+        conn.set_noise_session(std::move(r->responder_session));
+        conn.set_client_hello_sent(true);
+        conn.set_server_hello_received(true);
+        SendspinTimeBurst burst;
+        burst.configure(SIZE, INTERVAL_MS);
+        const int answers = answered ? SIZE - 1 : 0;
+        ASSERT_TRUE(burst.loop(&conn, START_MS, true).sent);
+        for (int i = 0; i < answers; ++i) {
+            TimeResponse reply;
+            reply.max_error = 50;
+            reply.timestamp = START_MS * 1000;  // The filter takes only a time after its last (0).
+            reply.client_transmitted =
+                sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_.back());
+            ASSERT_FALSE(burst.on_time_response(&conn, reply));
+            ASSERT_TRUE(burst.loop(&conn, START_MS, true).sent);
+        }
+
+        const TimeBurstResult result = burst.loop(&conn, START_MS + INTERVAL_MS, true);
+        EXPECT_TRUE(result.burst_completed);
+        EXPECT_EQ(conn.is_time_synced(), answered);
+    }
 }
 
 // messaging.md "Clock Synchronization" bounds how far apart consecutive bursts start and how few
 // messages a burst holds, so a burst opens one interval after the last opened, whether that one's
-// replies arrived or not, and each message waits at most a share of the interval, so an
-// unanswered burst still sends every message before the next opens. A burst still running then
-// (its messages sent late here, each tick LATE_MS behind its deadline) ends there and the next
-// opens in the same call. A fresh burst is due at once, even just after the clock's zero (an ESP
+// replies arrived or not, and each message waits at most a share of the time left, so an
+// unanswered burst still sends every message before the next opens, even with each tick LATE_MS
+// behind its deadline; a burst still running then ends there and the next opens in the same
+// call. A fresh burst is due at once, even just after the clock's zero (an ESP
 // clock counts from boot). The burst is driven at each time ms_until_due() names plus the row's
 // lateness, on the clock loop() takes, and each reply answers at once. A burst opened at the check
 // sets the next one's due time, SendspinTimeBurst::next_burst_due_time_, to one interval later,
@@ -1725,8 +1774,8 @@ TEST(TimeBurst, EachBurstOpensOneIntervalAfterTheLastOpened) {
          START_MS + INTERVAL_MS, SIZE, true},
         {"an unanswered burst, short of one interval after it opened", true, false, 0,
          START_MS + INTERVAL_MS - 1, SIZE, false},
-        {"a burst still running when the next is due ends there", true, false, LATE_MS,
-         START_MS + INTERVAL_MS, SIZE - 1, true},
+        {"a burst driven late still sends every message, and the next ends it", true, false,
+         LATE_MS, START_MS + INTERVAL_MS, SIZE, true},
         {"a fresh burst, just after the clock's zero", false, false, 0, 5, 0, true},
     };
     for (const Row& row : rows) {

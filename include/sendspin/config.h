@@ -339,11 +339,14 @@ struct SendspinClientConfig {
     static constexpr int64_t MAX_BURST_INTERVAL_MS = MAX_BURST_SPACING_MS - 1000;
     /// @brief Default ms from one burst's start to the next's
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = MAX_BURST_INTERVAL_MS;
+    /// @deprecated Ignored with time_burst_response_timeout_ms. Removed in v0.11.0.
+    [[deprecated(
+        "ignored; removed in v0.11.0")]] static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;
     static constexpr uint8_t DEFAULT_BURST_SIZE = MIN_BURST_SIZE;  ///< Default messages per burst
 
     uint8_t time_burst_size{DEFAULT_BURST_SIZE};  ///< Number of messages per time sync burst
     /// Milliseconds from one burst's start to the next's, which also sets how long each message
-    /// waits for its reply (time_burst_interval_ms / (time_burst_size + 1))
+    /// waits for its reply (at most time_burst_interval_ms / (time_burst_size + 1))
     int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};
     /// @deprecated Ignored; see time_burst_interval_ms. Removed in v0.11.0.
     [[deprecated("ignored; delete the assignment, removed in v0.11.0")]]

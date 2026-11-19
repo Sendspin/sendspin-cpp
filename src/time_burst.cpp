@@ -63,7 +63,7 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
         this->next_burst_due_time_ = now_ms + this->burst_interval_ms_;
         SS_LOGV(TAG, "Starting new time burst");
     } else if (this->pending_embedded_ != 0) {
-        if (now_ms - this->current_message_sent_time_ < this->message_wait_ms_) {
+        if (now_ms < this->current_message_deadline_) {
             return {.sent = false, .burst_completed = completed};
         }
         SS_LOGW(TAG, "Time message %u/%u got no reply", this->burst_index_ + 1, this->burst_size_);
@@ -76,8 +76,15 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
 
     const int64_t embedded = conn->send_time_message();
     if (embedded != 0) {
+        // The interval's share, or less when late ticks have eaten into the time left before the
+        // next burst: then an equal share of it among this message and each one after it, so they
+        // shorten the waits left rather than the burst. The cut-off above has run, so now_ms is
+        // before the next burst is due.
+        const int64_t shares = this->burst_size_ - this->burst_index_;
         this->pending_embedded_ = embedded;
-        this->current_message_sent_time_ = now_ms;
+        this->current_message_deadline_ =
+            now_ms + std::min(this->burst_interval_ms_ / (this->burst_size_ + 1),
+                              (this->next_burst_due_time_ - now_ms) / shares);
         SS_LOGV(TAG, "Sent time message %u/%u", this->burst_index_ + 1, this->burst_size_);
         return {.sent = true, .burst_completed = completed};
     }
@@ -131,8 +138,7 @@ uint32_t SendspinTimeBurst::ms_until_due(int64_t now_ms) const {
     if (!this->burst_running()) {
         due_ms = this->next_burst_due_time_;
     } else if (this->pending_embedded_ != 0) {
-        due_ms = std::min(this->current_message_sent_time_ + this->message_wait_ms_,
-                          this->next_burst_due_time_);
+        due_ms = this->current_message_deadline_;
     }
     return ms_until(due_ms * US_PER_MS, now_ms * US_PER_MS);
 }
@@ -140,14 +146,13 @@ uint32_t SendspinTimeBurst::ms_until_due(int64_t now_ms) const {
 void SendspinTimeBurst::configure(uint8_t burst_size, int64_t burst_interval_ms) {
     this->burst_size_ = burst_size;
     this->burst_interval_ms_ = burst_interval_ms;
-    this->message_wait_ms_ = burst_interval_ms / (burst_size + 1);
     this->reset();
 }
 
 void SendspinTimeBurst::reset() {
     this->burst_index_ = this->burst_size_;
     this->next_burst_due_time_ = 0;
-    this->current_message_sent_time_ = 0;
+    this->current_message_deadline_ = 0;
     this->pending_burst_completed_ = false;
     this->pending_embedded_ = 0;
     this->best_max_error_ = std::numeric_limits<int64_t>::max();

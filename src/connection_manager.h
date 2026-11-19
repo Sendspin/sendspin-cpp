@@ -135,8 +135,8 @@ struct AdmittedEntry {
     /// SendspinClient::publish_client_state()).
     bool state_held{false};
     /// This connection's time burst holds a high-performance request: from the tick its burst
-    /// came due until the burst completes or the connection leaves the slot. The burst sends
-    /// nothing until the main loop has granted the request (see run_time_sync()).
+    /// came due until no burst runs once it is granted, or the connection leaves the slot. The
+    /// burst sends nothing until the main loop has granted the request (see run_time_sync()).
     bool high_performance_held{false};
 };
 

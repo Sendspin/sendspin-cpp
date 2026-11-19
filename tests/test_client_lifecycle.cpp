@@ -2788,31 +2788,28 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
 // ============================================================================
 
 // SendspinTimeBurst::ms_until_due() is the burst's part of the protocol task's wait: the next
-// burst's start, the end of the wait of the message in flight (cut short by the next burst's
-// start), or 0 when loop() has work now. The burst's state (burst_index_, next_burst_due_time_,
-// pending_embedded_, current_message_sent_time_, pending_burst_completed_) is staged directly;
-// loop() moves it through these states over real time.
+// burst's start, the deadline of the message in flight, or 0 when loop() has work now. The burst's
+// state (burst_index_, next_burst_due_time_, pending_embedded_, current_message_deadline_,
+// pending_burst_completed_) is staged directly; loop() moves it through these states over real
+// time.
 TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
     struct Row {
         const char* name;
         uint8_t burst_index;
         int64_t next_due_ms;
         int64_t pending;
-        int64_t sent_ms;
+        int64_t deadline_ms;
         bool completed;
         uint32_t expected_ms;
     };
     constexpr int64_t NOW_MS = 1'000'000;
     constexpr uint8_t SIZE = 8;
     constexpr int64_t INTERVAL_MS = 800;
-    constexpr int64_t WAIT_MS = INTERVAL_MS / (SIZE + 1);
     const Row rows[] = {
         {"between bursts", SIZE, NOW_MS + 300, 0, 0, false, 300},
         {"Control: the next burst is due", SIZE, NOW_MS, 0, 0, false, 0},
-        {"a message in flight waits its share of the interval", 3, NOW_MS + INTERVAL_MS, 42,
-         NOW_MS - 50, false, WAIT_MS - 50},
-        {"the next burst's start cuts a message's wait short", 3, NOW_MS + 20, 42, NOW_MS - 50,
-         false, 20},
+        {"a message in flight waits for its deadline", 3, NOW_MS + INTERVAL_MS, 42, NOW_MS + 50,
+         false, 50},
         {"Control: ready to send the next message", 3, NOW_MS + INTERVAL_MS, 0, 0, false, 0},
         {"a completed burst is reported at once", SIZE, NOW_MS + INTERVAL_MS, 0, 0, true, 0},
         {"a far interval clamps short of NO_DEADLINE", SIZE, NOW_MS + (1LL << 40), 0, 0, false,
@@ -2825,7 +2822,7 @@ TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
         burst.burst_index_ = row.burst_index;
         burst.next_burst_due_time_ = row.next_due_ms;
         burst.pending_embedded_ = row.pending;
-        burst.current_message_sent_time_ = row.sent_ms;
+        burst.current_message_deadline_ = row.deadline_ms;
         burst.pending_burst_completed_ = row.completed;
         EXPECT_EQ(burst.ms_until_due(NOW_MS), row.expected_ms);
     }
@@ -4195,7 +4192,8 @@ TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
                 conn->time_burst().next_burst_due_time_ = 0;
                 (void) manager.run_time_sync();
                 client.loop();
-                EXPECT_TRUE(conn->time_burst().burst_running()) << "the next burst did not open";
+                EXPECT_TRUE(conn->time_burst().burst_running());
+                EXPECT_FALSE(conn->time_burst().starts_burst(0)) << "the next burst did not open";
                 EXPECT_TRUE(manager.find_admitted(conn.get())->high_performance_held);
                 break;
             case Stage::RELEASE_NOT_GATED:
@@ -4362,7 +4360,8 @@ TEST(SendspinClientStart, RejectsTimeBurstSettingsOutOfRange) {
     constexpr uint8_t SIZE = SendspinClientConfig::MIN_BURST_SIZE;
     constexpr int64_t MAX_INTERVAL_MS = SendspinClientConfig::MAX_BURST_INTERVAL_MS;
     const Row rows[] = {
-        {"Control: the defaults", SIZE, SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS, true},
+        {"Control: a longer burst", static_cast<uint8_t>(2 * SIZE),
+         SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS, true},
         {"a burst one message short", static_cast<uint8_t>(SIZE - 1), MAX_INTERVAL_MS, false},
         {"Control: the shortest interval, 1 ms a message", SIZE, SIZE + 1, true},
         {"an interval leaving a message no wait", SIZE, SIZE, false},

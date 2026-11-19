@@ -39,8 +39,9 @@ struct TimeResponse {
 
 /// @brief Result of a single SendspinTimeBurst::loop() call
 struct TimeBurstResult {
-    bool sent;             ///< A time message was sent this call.
-    bool burst_completed;  ///< A burst ended since the last call (Kalman filter updated).
+    bool sent;  ///< A time message was sent this call.
+    /// A burst ended since the last call; the Kalman filter was updated if it got a measurement.
+    bool burst_completed;
 };
 
 /**
@@ -50,12 +51,13 @@ struct TimeBurstResult {
  * measurement, and feeds only the best sample (lowest round-trip delay) to the
  * connection's Kalman filter.
  *
- * A burst opens one interval after the last one opened. Each message waits at most
- * interval / (burst size + 1) for its reply before the next is sent, so a burst that gets no reply
- * still sends every message and ends a share before the next opens, so the caller can release its
- * high-performance hold until then; a burst still running when the next falls due (opened or
- * driven late) ends there. messaging.md "Clock Synchronization" bounds both the burst size and the
- * spacing.
+ * A burst opens one interval after the last one opened. Each message waits for its reply at most
+ * interval / (burst size + 1) before the next is sent, so a burst that gets no reply still sends
+ * every message and ends a share before the next opens, letting the caller release its
+ * high-performance hold until then. Once late ticks have eaten into the time left before the next
+ * burst, each message waits at most an equal share of that among it and the messages after it,
+ * so the waits shorten rather than the burst; a burst still running when the next falls due ends
+ * there. messaging.md "Clock Synchronization" bounds both the burst size and the spacing.
  *
  * Each SendspinConnection owns one, beside its time filter, and drives it on the protocol task:
  * 1. Call loop() on each tick while the connection is admitted and operational, and wake again
@@ -72,7 +74,7 @@ struct TimeBurstResult {
  * // On the protocol task's tick:
  * const int64_t now_ms = platform_time_us() / US_PER_MS;
  * TimeBurstResult result = burst.loop(conn, now_ms, burst.starts_burst(now_ms));
- * if (result.burst_completed) {
+ * if (result.burst_completed && conn->is_time_synced()) {
  *     int64_t server_now = conn->time_filter().compute_server_time(platform_time_us());
  * }
  *
@@ -103,7 +105,8 @@ public:
     /// message still pending
     /// @param conn The connection that received the response.
     /// @param response The measurement and the echo identifying the message it answers.
-    /// @return true if this completed the burst (Kalman filter was updated).
+    /// @return true if this completed the burst (the Kalman filter updated if the burst got a
+    ///         measurement).
     bool on_time_response(SendspinConnection* conn, const TimeResponse& response);
 
     /// @brief Whether the next loop() opens a new burst, which sends its first time frame: none is
@@ -133,7 +136,7 @@ public:
     /// invocation. Defaults match the library's built-in values if configure() is never called.
     /// @param burst_size Number of time messages per burst.
     /// @param burst_interval_ms Milliseconds from one burst's start to the next's; at least
-    ///        burst_size + 1, so a message waits at least 1 ms.
+    ///        burst_size + 1, so a message of a burst on time waits at least 1 ms.
     void configure(uint8_t burst_size, int64_t burst_interval_ms);
 
     /// @brief Reset state (call on connection loss/change); the next burst is due at once
@@ -158,14 +161,12 @@ protected:
     int64_t best_max_error_{std::numeric_limits<int64_t>::max()};
     int64_t best_offset_{0};
     int64_t best_timestamp_{0};
-    int64_t current_message_sent_time_{0};
+    // When loop() gives up on the message awaiting a reply (see the class comment)
+    int64_t current_message_deadline_{0};
     // When the next burst opens: one interval after the last opened, 0 (due at once on any clock
     // reading) after reset()
     int64_t next_burst_due_time_{0};
     int64_t burst_interval_ms_{SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS};
-    // The longest a message waits for its reply (see the class comment)
-    int64_t message_wait_ms_{SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS /
-                             (SendspinClientConfig::DEFAULT_BURST_SIZE + 1)};
     // client_transmitted of the time message awaiting a reply, 0 when none is (see
     // on_time_response())
     int64_t pending_embedded_{0};
