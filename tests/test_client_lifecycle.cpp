@@ -4975,7 +4975,7 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
     InboundMessage message;
     message.data = chunk.data();
     message.len = chunk.size();
-    impl.handle_binary(message);
+    impl.handle_binary(message, true);
     // The idle sync task may already have discarded the chunk and emptied the quota, so the
     // hand-over is read from state the sync thread cannot change: the chunk was copied into the
     // ring (ring_'s items_waiting_ under mtx_), where it waits for a ring-order take only this

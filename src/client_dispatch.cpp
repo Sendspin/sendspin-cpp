@@ -95,6 +95,14 @@ namespace {
     return false;
 }
 
+/// @brief Closes `conn` on a binary message its `role` handler reported as a protocol error.
+/// Closed silently, like every other protocol error the receive path finds (see
+/// close_silently()). Protocol task only.
+[[maybe_unused]] void close_on_malformed_binary(SendspinConnection* conn, SendspinRole role) {
+    SS_LOGW(TAG, "Malformed %s message; closing connection", to_cstr(role));
+    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -906,7 +914,13 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
 #ifdef SENDSPIN_ENABLE_VISUALIZER
         if (this->visualizer_ &&
             role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
-            this->visualizer_->impl_->handle_binary(binary_type, message);
+            // roles/visualizer/v1.md reserves types 21-23, and messaging.md "Communication" has a
+            // binary ID the client does not implement ignored, so it gets none of the checks.
+            if (binary_type > SENDSPIN_BINARY_VISUALIZER_LAST_DEFINED) {
+                SS_LOGW(TAG, "Unknown visualizer binary type %d", binary_type);
+            } else if (!this->visualizer_->impl_->handle_binary(binary_type, message)) {
+                close_on_malformed_binary(conn, SendspinRole::VISUALIZER);
+            }
         }
 #endif
         return;
@@ -920,13 +934,13 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
                 uint8_t slot = get_binary_slot(binary_type);
                 if (slot != 0) {
                     SS_LOGW(TAG, "Unknown player binary slot %d", slot);
-                } else if (!this->adopted_state_available()) {
-                    // roles/player/v1.md "Audio Chunks (Binary)": an unavailable client discards
-                    // audio. Read from the snapshot step 3 adopted, so the gate flips with the
-                    // client/state it sends.
-                    SS_LOGV(TAG, "Discarding audio chunk while unavailable");
                 } else {
-                    this->player_->impl_->handle_binary(message);
+                    // Read from the snapshot step 3 adopted, so the discard while unavailable
+                    // flips with the client/state it sends.
+                    const bool available = this->adopted_state_available();
+                    if (!this->player_->impl_->handle_binary(message, available)) {
+                        close_on_malformed_binary(conn, SendspinRole::PLAYER);
+                    }
                 }
             }
 #endif
@@ -951,10 +965,8 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
                 if (!this->artwork_->impl_->handle_binary(slot, message)) {
                     // roles/artwork/v1.md "Artwork (Binary)": a malformed artwork message, and a
                     // malformed sequence within an active artwork stream, are protocol errors the
-                    // client MUST close the connection on. Closed silently, like every other
-                    // protocol error the receive path finds (see close_silently()).
-                    SS_LOGW(TAG, "Malformed artwork message; closing connection");
-                    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+                    // client MUST close the connection on.
+                    close_on_malformed_binary(conn, SendspinRole::ARTWORK);
                 }
             }
 #endif

@@ -608,10 +608,6 @@ void InboundConsumer::note_drop(DropReason reason) {
             SS_LOGW(TAG, "%s received %s longer than the ring's largest item; dropping",
                     this->holder_name(), this->item_noun());
             return;
-        case DropReason::TOO_SHORT:
-            SS_LOGW(TAG, "%s received %s too short for its header; dropping", this->holder_name(),
-                    this->item_noun());
-            return;
         case DropReason::NO_ROOM:
             break;
     }

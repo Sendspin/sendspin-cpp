@@ -238,6 +238,24 @@ GroupState group_state_of(const GroupUpdatePayload& group) {
             .group_name = optional_view(group.group_name)};
 }
 
+/// @brief Cuts configured client/hello text to MAX_FRIENDLY_NAME_BYTES at a UTF-8 character
+/// boundary, warning when it was longer
+void cut_hello_text(std::string& text, const char* field) {
+    const size_t kept = utf8_truncate(text, MAX_FRIENDLY_NAME_BYTES).size();
+    if (kept < text.size()) {
+        SS_LOGW(TAG, "Truncating %s to the %zu bytes client/hello allows", field,
+                MAX_FRIENDLY_NAME_BYTES);
+        text.resize(kept);
+    }
+}
+
+/// @brief cut_hello_text() for an optional device_info string, which is left alone while unset
+void cut_hello_text(std::optional<std::string>& text, const char* field) {
+    if (text.has_value()) {
+        cut_hello_text(text.value(), field);
+    }
+}
+
 }  // namespace
 
 /// @brief The main-loop-bound channels the client itself owns, beside the roles' own slots
@@ -521,6 +539,13 @@ bool SendspinClient::start() {
             app_role.support_json = std::move(normalized);
         }
     }
+    // messaging.md "client/hello": name and each device_info string are at most 64 bytes of
+    // UTF-8. Cut rather than refused, so a long device name does not keep the device off the
+    // network.
+    cut_hello_text(this->config_.name, "name");
+    cut_hello_text(this->config_.product_name, "product_name");
+    cut_hello_text(this->config_.manufacturer, "manufacturer");
+    cut_hello_text(this->config_.software_version, "software_version");
 
     // lifecycle_ stays STOPPED until every step below has succeeded. Marking the client running
     // up front would report it started even when this function returns false (e.g. identity
@@ -1733,9 +1758,10 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     }
     const ClientStateMessage& snapshot = client_state.value();
 
-    // messaging.md "client/state": a player or source reports `available: true` only after
-    // clock synchronization, and `false` would mean it will not yield, so the state waits for
-    // this connection's first measurement when it owns either; run_time_sync() sends it then.
+    // messaging.md "Clock Synchronization" and "stream/start": a connection that owns an active
+    // player or source sends no client/state, neither its initial one nor the update an
+    // activation of either requires (which lets the server start that stream), until its time
+    // filter has a measurement; run_time_sync() sends it then.
     bool clocked_role = false;
 #ifdef SENDSPIN_ENABLE_PLAYER
     clocked_role =
@@ -1745,7 +1771,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     clocked_role = clocked_role || (this->source_ && this->connection_manager_->owns_role(
                                                          conn, SendspinRole::SOURCE));
 #endif
-    const bool waits_for_clock = snapshot.available && clocked_role && !conn->is_time_synced();
+    const bool waits_for_clock = clocked_role && !conn->is_time_synced();
     entry->state_held = waits_for_clock;
     if (waits_for_clock) {
         return;

@@ -48,9 +48,12 @@ static constexpr size_t BINARY_SEND_AHEAD_SIZE = 4;
 /// @brief Bytes an audio chunk spends on its header, after the message type byte.
 static constexpr size_t AUDIO_CHUNK_HEADER_SIZE =
     sendspin::BINARY_TIMESTAMP_SIZE + BINARY_SEND_AHEAD_SIZE;
-/// @brief Upper bound on the output delay, per roles/player/v1.md "Output delay": clients MUST
-/// clamp output_delay_ms to the range 0-5000.
+/// @brief Upper bound on output_delay_ms, which roles/player/v1.md "client/state player object"
+/// limits to 0-5000
 static constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000U;
+/// @brief Upper bound on min_buffer_ms, which roles/player/v1.md "client/state player object"
+/// limits to 0-5000
+static constexpr uint16_t MAX_MIN_BUFFER_MS = 5000U;
 /// @brief Offset of an audio chunk's encoded frame in its plaintext: the message type byte, then
 /// the chunk header.
 static constexpr size_t AUDIO_FRAME_OFFSET = 1 + AUDIO_CHUNK_HEADER_SIZE;
@@ -307,6 +310,11 @@ bool PlayerRole::Impl::start(SendspinPersistenceProvider* persistence, InboundRi
     if (!audio_formats_valid(this->config.audio_formats)) {
         return false;
     }
+    if (this->config.min_buffer_ms > MAX_MIN_BUFFER_MS) {
+        SS_LOGE(TAG, "min_buffer_ms %u is over the %u roles/player/v1.md allows",
+                this->config.min_buffer_ms, MAX_MIN_BUFFER_MS);
+        return false;
+    }
 
     this->persistence = persistence;
     this->largest_ring_item_bytes = ring->max_item_message_bytes();
@@ -400,24 +408,31 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
                       .audio_len = len - AUDIO_CHUNK_HEADER_SIZE};
 }
 
-SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
+SS_HOT bool PlayerRole::Impl::handle_binary(InboundMessage& message, bool available) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
+    // roles/player/v1.md "Audio Chunks (Binary)": a message shorter than its header is a protocol
+    // error, so this runs ahead of the discards below (messaging.md "Communication": a discarded
+    // payload still gets the role's required message checks).
+    auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
+    if (!chunk.has_value()) {
+        return false;
+    }
+    if (!available) {
+        // roles/player/v1.md "Audio Chunks (Binary)": an unavailable client discards audio.
+        SS_LOGV(TAG, "Discarding audio chunk while unavailable");
+        return true;
+    }
     InboundConsumer& inbound = this->sync_task->inbound();
     if (inbound.ring() == nullptr) {
         // Verbose on the per-chunk path: start() already warned once.
         SS_LOGV(TAG, "Discarding audio chunk: the sync task is not running");
-        return;
-    }
-    auto chunk = parse_audio_chunk(message.data + 1, message.len - 1);
-    if (!chunk.has_value()) {
-        inbound.note_drop(InboundConsumer::DropReason::TOO_SHORT);
-        return;
+        return true;
     }
     if (chunk->audio_len == 0) {
         // A complete header carrying no frame is nothing to decode. Verbose because this is the
         // per-chunk path.
         SS_LOGV(TAG, "Audio chunk carries no encoded frame");
-        return;
+        return true;
     }
     // roles/player/v1.md "client/hello player@v1 support object": the server keeps the
     // advertised buffer_capacity, which the quota covers at the smallest chunk size.
@@ -427,6 +442,7 @@ SS_HOT void PlayerRole::Impl::handle_binary(InboundMessage& message) {
                                 .type = CHUNK_TYPE_ENCODED_AUDIO,
                                 .data_offset = AUDIO_FRAME_OFFSET},
                                generation);
+    return true;
 }
 
 void PlayerRole::Impl::handle_stream_start(const PlayerStreamPayload& player) {
@@ -787,18 +803,8 @@ void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event, uint
 }
 
 void PlayerRole::Impl::load_output_delay() {
-    if (!this->persistence) {
-        // No persistence provider - use initial value from config
-        if (this->config.initial_output_delay_ms > 0) {
-            this->output_delay_ms.store(this->config.initial_output_delay_ms,
-                                        std::memory_order_relaxed);
-            SS_LOGI(TAG, "Using initial output delay from config: %u ms",
-                    this->config.initial_output_delay_ms);
-        }
-        return;
-    }
-
-    const std::optional<uint16_t> delay = read_output_delay_blob(*this->persistence);
+    const std::optional<uint16_t> delay =
+        this->persistence ? read_output_delay_blob(*this->persistence) : std::nullopt;
     if (delay.has_value()) {
         if (delay.value() <= MAX_OUTPUT_DELAY_MS) {
             this->output_delay_ms.store(delay.value(), std::memory_order_relaxed);
@@ -807,10 +813,10 @@ void PlayerRole::Impl::load_output_delay() {
             SS_LOGW(TAG, "Persisted output delay out of range (%u), ignoring", delay.value());
         }
     } else if (this->config.initial_output_delay_ms > 0) {
-        this->output_delay_ms.store(this->config.initial_output_delay_ms,
-                                    std::memory_order_relaxed);
-        SS_LOGI(TAG, "Using initial output delay from config: %u ms",
-                this->config.initial_output_delay_ms);
+        const uint16_t initial =
+            std::min(this->config.initial_output_delay_ms, MAX_OUTPUT_DELAY_MS);
+        this->output_delay_ms.store(initial, std::memory_order_relaxed);
+        SS_LOGI(TAG, "Using initial output delay from config: %u ms", initial);
     }
 }
 

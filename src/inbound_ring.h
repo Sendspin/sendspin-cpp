@@ -780,20 +780,18 @@ public:
     /// @return The number of items returned.
     size_t discard_from(int64_t cut, bool (*at_or_after)(void* item, int64_t cut));
 
+private:
     /// @brief Why a message was dropped instead of handed over, which picks note_drop()'s warning
     enum class DropReason : uint8_t {
         OVER_QUOTA,  ///< hand(): the holder is over its quota
         TOO_LONG,    ///< hand_message(): longer than the ring's largest item
         NO_ROOM,     ///< hand_message(): no ring space for the copy
-        TOO_SHORT,   ///< The role's handler: too short for the holder's message header
     };
 
     /// @brief Counts a drop in the throttled run (InboundDropLog), logging `reason`'s warning
-    /// when the drop starts one. Protocol task: the hand-overs, and a role handler dropping a
-    /// malformed message. A no-op outside a run.
+    /// when the drop starts one. Protocol task: the hand-overs. A no-op outside a run.
     void note_drop(DropReason reason);
 
-private:
     /// @brief Fills `item`'s consumer fields, stamps it with `generation`, charges it to the
     /// holder's quota and appends it. Over quota the item is returned to the ring with a
     /// throttled warning: the server overran the buffer_capacity the role advertises, which the

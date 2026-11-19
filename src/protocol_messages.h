@@ -106,13 +106,14 @@ enum SendspinBinaryType : uint8_t {
     SENDSPIN_BINARY_SOURCE_AUDIO = SENDSPIN_ROLE_SOURCE << 2,    // Source slot 0: captured audio
     // Visualizer expanded allocation (IDs 16-23); each data type is its own message
     // carrying exactly one frame of [timestamp:8][data]
-    SENDSPIN_BINARY_VISUALIZER_LOUDNESS = 16,  // uint16 A-weighted loudness
-    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,      // uint8 flags (bit 0 = downbeat)
-    SENDSPIN_BINARY_VISUALIZER_F_PEAK = 18,    // uint16 freq Hz + uint16 amplitude
-    SENDSPIN_BINARY_VISUALIZER_SPECTRUM = 19,  // uint16[n_disp_bins] magnitudes
-    SENDSPIN_BINARY_VISUALIZER_PEAK = 20,      // uint8 onset strength
-    SENDSPIN_BINARY_VISUALIZER_FIRST = 16,     // Start of visualizer ID range
-    SENDSPIN_BINARY_VISUALIZER_LAST = 23,      // End of visualizer ID range (21-23 reserved)
+    SENDSPIN_BINARY_VISUALIZER_LOUDNESS = 16,      // uint16 A-weighted loudness
+    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,          // uint8 flags (bit 0 = downbeat)
+    SENDSPIN_BINARY_VISUALIZER_F_PEAK = 18,        // uint16 freq Hz + uint16 amplitude
+    SENDSPIN_BINARY_VISUALIZER_SPECTRUM = 19,      // uint16[n_disp_bins] magnitudes
+    SENDSPIN_BINARY_VISUALIZER_PEAK = 20,          // uint8 onset strength
+    SENDSPIN_BINARY_VISUALIZER_FIRST = 16,         // Start of visualizer ID range
+    SENDSPIN_BINARY_VISUALIZER_LAST_DEFINED = 20,  // Last defined visualizer type
+    SENDSPIN_BINARY_VISUALIZER_LAST = 23,          // End of visualizer ID range (21-23 reserved)
 };
 
 /// @brief JSON message types sent from the server to the client
@@ -1151,9 +1152,9 @@ struct ClientStreamStartMessage {
 static_assert(static_cast<uint8_t>(SendspinCodecFormat::UNSUPPORTED) < 8,
               "EnumSet<SendspinCodecFormat> needs 8 bits");
 
-/// @brief Longest friendly name the server sends, in UTF-8 bytes: messaging.md "server/hello"
-/// caps `name` and "group/update" caps `group_name` at 64 bytes, and a client truncates a longer
-/// one at a UTF-8 character boundary.
+/// @brief Longest friendly name, in UTF-8 bytes: messaging.md "server/hello" and "client/hello"
+/// cap `name`, "client/hello" each `device_info` string and "group/update" `group_name` at 64
+/// bytes, and a client truncates a longer one at a UTF-8 character boundary.
 constexpr size_t MAX_FRIENDLY_NAME_BYTES = 64;
 
 /// @brief The server's friendly name from server/hello, cut to MAX_FRIENDLY_NAME_BYTES
@@ -1466,8 +1467,8 @@ bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* pa
 bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload);
 
 /// @brief Builds a client/pair-pending message.
-/// Sent immediately on receiving a pairing server/activate whose attempt is gesture-gated while
-/// no pairing window is open; client/pair-init follows once a window opens. Does not start the
+/// Sent while the client holds the selected attempt back (pairing.md "Client -> Server:
+/// client/pair-pending"); client/pair-init follows once it releases it. Does not start the
 /// attempt or its timeout.
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
 ///                      handshake (see SendspinConnection::get_pairing_index()).

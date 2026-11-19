@@ -12,7 +12,7 @@ Each `client/time` round trip is timed from the socket write, not from the time 
 
 The filter is a two-state `[offset, drift]` Kalman filter, tuned by `SendspinTimeFilter::Config`. Drift is estimated from the second measurement on, but applied to time conversions only once it is statistically significant (`drift_significance_threshold`). Once `min_samples` measurements have accumulated, a residual larger than `adaptive_cutoff` times the measurement's round-trip error inflates the covariances, so the filter recovers quickly from a step change in the server's clock. The protocol task alone updates and reads it; the sync task and the visualizer drain thread convert timestamps through the copy of its transform it publishes.
 
-The filter's first measurement gates playback: the sync task decodes no audio until the clock is synced. While the player role is active, it also gates the client's `client/state` reporting `available: true` (messaging.md "client/state").
+The filter's first measurement gates playback: the sync task decodes no audio until the clock is synced. While the player or source role is active, it also gates the connection's `client/state` (messaging.md "Clock Synchronization", "stream/start").
 
 ## Sync Task
 

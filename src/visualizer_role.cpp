@@ -310,11 +310,19 @@ static int64_t frame_server_timestamp(void* item) {
 // Binary handling (protocol task)
 // ============================================================================
 
-void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& message) {
+bool VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& message) {
     const uint32_t generation = this->cleanup_generation.load(std::memory_order_acquire);
+    // roles/visualizer/v1.md "Visualization Data (Binary)": a message shorter than its timestamp is
+    // a protocol error, so this runs ahead of the discards below (messaging.md "Communication": a
+    // discarded payload still gets the role's required message checks). Of the other types'
+    // lengths, only the timestamp's is checked here; the drain thread checks each one's payload
+    // length (decode_visualizer_message()).
+    if (message.len < FRAME_PAYLOAD_OFFSET) {
+        return false;
+    }
     InboundConsumer& inbound = this->drain_task->inbound;
     if (!this->stream_active || inbound.ring() == nullptr) {
-        return;
+        return true;
     }
 
     // Admit only wire types the active stream negotiated in stream/start. The mask is written by
@@ -322,14 +330,7 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
     // in force when it arrived. The caller guarantees binary_type is in the visualizer range.
     uint8_t type_bit = 1U << (binary_type - SENDSPIN_BINARY_VISUALIZER_FIRST);
     if ((this->negotiated_types_mask & type_bit) == 0) {
-        return;
-    }
-
-    // Of the other types' lengths, only the timestamp's is checked here; the drain thread checks
-    // each one's payload length (decode_visualizer_message()).
-    if (message.len < FRAME_PAYLOAD_OFFSET) {
-        inbound.note_drop(InboundConsumer::DropReason::TOO_SHORT);
-        return;
+        return true;
     }
     size_t data_len = message.len - FRAME_PAYLOAD_OFFSET;
 
@@ -343,7 +344,7 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
         // the hand-over.
         const size_t spectrum_len = sizeof(uint16_t) * this->negotiated_spectrum_bins;
         if (data_len < spectrum_len) {
-            return;
+            return true;
         }
         data_len = spectrum_len;
     } else if (binary_type == SENDSPIN_BINARY_VISUALIZER_BEAT && data_len >= BEAT_PAYLOAD_SIZE &&
@@ -359,6 +360,7 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, InboundMessage& me
                                 .type = binary_type,
                                 .data_offset = static_cast<uint8_t>(FRAME_PAYLOAD_OFFSET)},
                                generation);
+    return true;
 }
 
 // ============================================================================

@@ -1104,7 +1104,7 @@ TEST(SourceStream, CommandsOpenAndCloseTheStream) {
         {"a stop cancels an opening still waiting for the time sync", false, {START, STOP, SYNC},
          {}, 0, 0},
         {"becoming unavailable cancels an opening still waiting for the time sync", false,
-         {START, UNAVAILABLE, AVAILABLE, SYNC}, {"1 state-", "3 state+"}, 0, 0},
+         {START, UNAVAILABLE, AVAILABLE, SYNC}, {"3 state+"}, 0, 0},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -2146,9 +2146,9 @@ TEST(SourceWire, StreamsPcmBetweenStartAndEnd) {
     pump_for(client, 100);
 }
 
-// messaging.md "client/state": a source reports available: true only once its clock is
-// synchronized, so with source@v1 active and the time filter still empty no client/state goes
-// out. The control activates no role, so its state goes out without a clock.
+// messaging.md "Clock Synchronization": with source@v1 active, the initial client/state waits for
+// the time filter's first measurement, so with the filter still empty no client/state goes out.
+// The control activates no role, so its state goes out without a clock.
 TEST(SourceWire, ClientStateWaitsForTheClockWhileTheSourceIsActive) {
     struct Row {
         const char* name;
