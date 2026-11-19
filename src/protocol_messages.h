@@ -1151,9 +1151,9 @@ struct ClientStreamStartMessage {
 static_assert(static_cast<uint8_t>(SendspinCodecFormat::UNSUPPORTED) < 8,
               "EnumSet<SendspinCodecFormat> needs 8 bits");
 
-/// @brief Longest friendly name the server sends, in UTF-8 bytes: messaging.md "server/hello"
-/// caps `name` and "group/update" caps `group_name` at 64 bytes, and a client truncates a longer
-/// one at a UTF-8 character boundary.
+/// @brief Longest friendly name, in UTF-8 bytes: messaging.md "server/hello" and "client/hello"
+/// cap `name`, "client/hello" each `device_info` string and "group/update" `group_name` at 64
+/// bytes, and a client truncates a longer one at a UTF-8 character boundary.
 constexpr size_t MAX_FRIENDLY_NAME_BYTES = 64;
 
 /// @brief The server's friendly name from server/hello, cut to MAX_FRIENDLY_NAME_BYTES

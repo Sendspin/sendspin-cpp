@@ -212,7 +212,7 @@ public:
     ///
     /// The value is always persisted (if a persistence provider is set), independent of
     /// adjustability.
-    /// @param delay_ms Output delay in milliseconds
+    /// @param delay_ms Output delay in milliseconds, clamped to 5000
     void update_output_delay(uint16_t delay_ms);
 
     /// @brief Enables or disables the output delay adjustment command. Main loop only.

@@ -237,6 +237,24 @@ GroupState group_state_of(const GroupUpdatePayload& group) {
             .group_name = optional_view(group.group_name)};
 }
 
+/// @brief Cuts configured client/hello text to MAX_FRIENDLY_NAME_BYTES at a UTF-8 character
+/// boundary, warning when it was longer
+void cut_hello_text(std::string& text, const char* field) {
+    const size_t kept = utf8_truncate(text, MAX_FRIENDLY_NAME_BYTES).size();
+    if (kept < text.size()) {
+        SS_LOGW(TAG, "Truncating %s to the %zu bytes client/hello allows", field,
+                MAX_FRIENDLY_NAME_BYTES);
+        text.resize(kept);
+    }
+}
+
+/// @brief cut_hello_text() for an optional device_info string, which is left alone while unset
+void cut_hello_text(std::optional<std::string>& text, const char* field) {
+    if (text.has_value()) {
+        cut_hello_text(text.value(), field);
+    }
+}
+
 }  // namespace
 
 /// @brief The main-loop-bound channels the client itself owns, beside the roles' own slots
@@ -505,6 +523,13 @@ bool SendspinClient::start() {
             app_role.support_json = std::move(normalized);
         }
     }
+    // messaging.md "client/hello": name and each device_info string are at most 64 bytes of
+    // UTF-8. Cut rather than refused, so a long device name does not keep the device off the
+    // network.
+    cut_hello_text(this->config_.name, "name");
+    cut_hello_text(this->config_.product_name, "product_name");
+    cut_hello_text(this->config_.manufacturer, "manufacturer");
+    cut_hello_text(this->config_.software_version, "software_version");
 
     // lifecycle_ stays STOPPED until every step below has succeeded. Marking the client running
     // up front would report it started even when this function returns false (e.g. identity
