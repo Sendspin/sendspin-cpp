@@ -106,13 +106,14 @@ enum SendspinBinaryType : uint8_t {
     SENDSPIN_BINARY_SOURCE_AUDIO = SENDSPIN_ROLE_SOURCE << 2,    // Source slot 0: captured audio
     // Visualizer expanded allocation (IDs 16-23); each data type is its own message
     // carrying exactly one frame of [timestamp:8][data]
-    SENDSPIN_BINARY_VISUALIZER_LOUDNESS = 16,  // uint16 A-weighted loudness
-    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,      // uint8 flags (bit 0 = downbeat)
-    SENDSPIN_BINARY_VISUALIZER_F_PEAK = 18,    // uint16 freq Hz + uint16 amplitude
-    SENDSPIN_BINARY_VISUALIZER_SPECTRUM = 19,  // uint16[n_disp_bins] magnitudes
-    SENDSPIN_BINARY_VISUALIZER_PEAK = 20,      // uint8 onset strength
-    SENDSPIN_BINARY_VISUALIZER_FIRST = 16,     // Start of visualizer ID range
-    SENDSPIN_BINARY_VISUALIZER_LAST = 23,      // End of visualizer ID range (21-23 reserved)
+    SENDSPIN_BINARY_VISUALIZER_LOUDNESS = 16,      // uint16 A-weighted loudness
+    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,          // uint8 flags (bit 0 = downbeat)
+    SENDSPIN_BINARY_VISUALIZER_F_PEAK = 18,        // uint16 freq Hz + uint16 amplitude
+    SENDSPIN_BINARY_VISUALIZER_SPECTRUM = 19,      // uint16[n_disp_bins] magnitudes
+    SENDSPIN_BINARY_VISUALIZER_PEAK = 20,          // uint8 onset strength
+    SENDSPIN_BINARY_VISUALIZER_FIRST = 16,         // Start of visualizer ID range
+    SENDSPIN_BINARY_VISUALIZER_LAST_DEFINED = 20,  // Last defined visualizer type
+    SENDSPIN_BINARY_VISUALIZER_LAST = 23,          // End of visualizer ID range (21-23 reserved)
 };
 
 /// @brief JSON message types sent from the server to the client

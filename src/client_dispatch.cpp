@@ -913,9 +913,14 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection& connectio
         binary_type <= SENDSPIN_BINARY_VISUALIZER_LAST) {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
         if (this->visualizer_ &&
-            role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER) &&
-            !this->visualizer_->impl_->handle_binary(binary_type, message)) {
-            close_on_malformed_binary(conn, SendspinRole::VISUALIZER);
+            role_accepts_traffic(*this->connection_manager_, conn, SendspinRole::VISUALIZER)) {
+            // roles/visualizer/v1.md reserves types 21-23, and messaging.md "Communication" has a
+            // binary ID the client does not implement ignored, so it gets none of the checks.
+            if (binary_type > SENDSPIN_BINARY_VISUALIZER_LAST_DEFINED) {
+                SS_LOGW(TAG, "Unknown visualizer binary type %d", binary_type);
+            } else if (!this->visualizer_->impl_->handle_binary(binary_type, message)) {
+                close_on_malformed_binary(conn, SendspinRole::VISUALIZER);
+            }
         }
 #endif
         return;

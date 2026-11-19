@@ -472,12 +472,16 @@ TEST(PlayerRoleAvailability, AudioIsDiscardedWhileTheClientIsUnavailable) {
 // (Binary)": an audio message shorter than 13 bytes, or a visualization message shorter than 9,
 // closes the connection, and so does one whose payload the role would discard (messaging.md
 // "Communication": a discarded payload still gets the role's required message checks). A message
-// for a role inactive on the connection is discarded unchecked (messaging.md "server/activate").
-// The visualizer is never started, so it has no stream.
+// for a role inactive on the connection is discarded unchecked (messaging.md "server/activate"),
+// and so is one with a type roles/visualizer/v1.md reserves (messaging.md "Communication": an ID
+// the client does not implement is ignored). The visualizer is never started, so it has no stream.
 TEST(BinaryMessageLength, AShortMessageForAnActiveRoleClosesTheConnection) {
+    constexpr uint8_t PLAYER = SENDSPIN_BINARY_PLAYER_AUDIO;
+    constexpr uint8_t LOUDNESS = SENDSPIN_BINARY_VISUALIZER_LOUDNESS;
     struct Row {
         const char* name;
         SendspinRole role;
+        uint8_t type;
         size_t len;
         bool active;
         bool available;
@@ -485,21 +489,25 @@ TEST(BinaryMessageLength, AShortMessageForAnActiveRoleClosesTheConnection) {
         bool closes;
     };
     const Row rows[] = {
-        {"player one byte short", SendspinRole::PLAYER, 12, true, true, true, true},
-        {"player one byte short, unavailable", SendspinRole::PLAYER, 12, true, false, true, true},
-        {"player one byte short, sync task not running", SendspinRole::PLAYER, 12, true, true,
-         false, true},
-        {"player one byte short, role inactive", SendspinRole::PLAYER, 12, false, true, true,
-         false},
-        {"Control: player header with no frame", SendspinRole::PLAYER, 13, true, true, true, false},
-        {"Control: player header with no frame, unavailable", SendspinRole::PLAYER, 13, true, false,
-         true, false},
-        {"visualizer one byte short, no stream", SendspinRole::VISUALIZER, 8, true, true, true,
+        {"player one byte short", SendspinRole::PLAYER, PLAYER, 12, true, true, true, true},
+        {"player one byte short, unavailable", SendspinRole::PLAYER, PLAYER, 12, true, false, true,
          true},
-        {"visualizer one byte short, role inactive", SendspinRole::VISUALIZER, 8, false, true,
-         true, false},
-        {"Control: visualizer timestamp with no data, no stream", SendspinRole::VISUALIZER, 9, true,
+        {"player one byte short, sync task not running", SendspinRole::PLAYER, PLAYER, 12, true,
+         true, false, true},
+        {"player one byte short, role inactive", SendspinRole::PLAYER, PLAYER, 12, false, true, true,
+         false},
+        {"Control: player header with no frame", SendspinRole::PLAYER, PLAYER, 13, true, true, true,
+         false},
+        {"Control: player header with no frame, unavailable", SendspinRole::PLAYER, PLAYER, 13,
+         true, false, true, false},
+        {"visualizer one byte short, no stream", SendspinRole::VISUALIZER, LOUDNESS, 8, true, true,
+         true, true},
+        {"visualizer one byte short, role inactive", SendspinRole::VISUALIZER, LOUDNESS, 8, false,
          true, true, false},
+        {"Control: visualizer timestamp with no data, no stream", SendspinRole::VISUALIZER,
+         LOUDNESS, 9, true, true, true, false},
+        {"reserved visualizer type with no timestamp", SendspinRole::VISUALIZER, 21, 1, true, true,
+         true, false},
     };
 
     for (const Row& row : rows) {
@@ -529,8 +537,7 @@ TEST(BinaryMessageLength, AShortMessageForAnActiveRoleClosesTheConnection) {
                                                      row.active ? role_mask_bit(row.role) : 0);
 
         std::vector<uint8_t> bytes(row.len, 0x00);
-        bytes[0] = row.role == SendspinRole::PLAYER ? SENDSPIN_BINARY_PLAYER_AUDIO
-                                                    : SENDSPIN_BINARY_VISUALIZER_LOUDNESS;
+        bytes[0] = row.type;
         InboundMessage message = message_over(bytes);
         client.process_binary_message(*conn, message);
         EXPECT_EQ(conn->closes, row.closes ? 1 : 0);
