@@ -231,7 +231,8 @@ the role resumes normally.
 The player, visualizer and source streams also need the server to declare the `playback`
 activity, which it declares while the group plays or it wants the source to stream, and may drop
 while keeping the roles active. Without it the player and visualizer start no stream and discard
-what the server sends for them, and the source ignores a start. An activation that drops
+incoming audio and visualization data, and the source ignores a start. Player commands,
+`stream/end` and `stream/clear` still apply. An activation that drops
 `playback` ends their streams as a role removal does (`on_stream_end()`,
 `on_visualizer_stream_end()`, `on_streaming_stopped()`), firing nothing for a stream the server had
 already ended; the artwork, metadata, controller and color roles carry on.

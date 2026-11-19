@@ -1012,7 +1012,7 @@ TEST(RoleDeactivation, PlaybackStreamsWaitForThePlaybackActivity) {
 
 // messaging.md "server/activate": a server ends the player and visualizer streams before it drops
 // 'playback'. One that leaves them running still has them ended by the drop, as its stream/end
-// would have: each consumer sees one end, the player's once the sync task has left the stream.
+// would have: each consumer sees one end.
 // Control: after the server's own stream/end the drop reports no second end.
 TEST(RoleDeactivation, DroppingPlaybackEndsThePlaybackStreams) {
     struct Row {
