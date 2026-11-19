@@ -533,7 +533,7 @@ public:
     /// @brief Drives each admitted, operational connection's time burst: requests the
     /// high-performance hold when a burst comes due and sends its first client/time only once the
     /// main loop has granted that request (SendspinClient::high_performance_granted()), releases
-    /// the hold when the burst completes without waiting for anything, reports a completed
+    /// the hold, waiting for nothing, once no burst runs, reports a completed
     /// burst's filter error to the main loop once the filter has a measurement, and sends a
     /// client/state that waited for the clock
     /// @return Milliseconds until the earliest burst is due, or ProtocolTask::NO_DEADLINE; a

@@ -476,19 +476,19 @@ bool SendspinClient::start() {
                 STATIC_PAIRING_CODE_DIGITS);
         return false;
     }
-    // messaging.md "Clock Synchronization" (MIN_BURST_SIZE, MAX_BURST_SPACING_MS). A burst still
-    // running when the next falls due holds it back, so one losing every reply must fit the
-    // spacing too: each message times out 1 ms past the timeout.
+    // MIN_BURST_SIZE and MAX_BURST_INTERVAL_MS keep bursts within messaging.md "Clock
+    // Synchronization"; an interval of at least one more millisecond than messages leaves each
+    // message a wait of at least 1 ms (SendspinTimeBurst).
     const uint8_t burst_size = this->config_.time_burst_size;
     const int64_t burst_interval_ms = this->config_.time_burst_interval_ms;
-    const int64_t burst_timeout_ms = this->config_.time_burst_response_timeout_ms;
-    if (burst_size < SendspinClientConfig::MIN_BURST_SIZE || burst_interval_ms <= 0 ||
-        burst_interval_ms > SendspinClientConfig::MAX_BURST_SPACING_MS || burst_timeout_ms <= 0 ||
-        burst_timeout_ms >= SendspinClientConfig::MAX_BURST_SPACING_MS / burst_size) {
+    if (burst_size < SendspinClientConfig::MIN_BURST_SIZE || burst_interval_ms <= burst_size ||
+        burst_interval_ms > SendspinClientConfig::MAX_BURST_INTERVAL_MS) {
         SS_LOGE(TAG,
-                "Time bursts of %u messages, %" PRId64 " ms apart with a %" PRId64
-                " ms timeout break the clock sync rules; cannot start",
-                burst_size, burst_interval_ms, burst_timeout_ms);
+                "Time bursts of %u messages %" PRId64
+                " ms apart are out of range (at least %u messages, more ms than messages, at "
+                "most %" PRId64 " ms); cannot start",
+                burst_size, burst_interval_ms, SendspinClientConfig::MIN_BURST_SIZE,
+                SendspinClientConfig::MAX_BURST_INTERVAL_MS);
         return false;
     }
     for (size_t i = 0; i < this->config_.application_roles.size(); ++i) {

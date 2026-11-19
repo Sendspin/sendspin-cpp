@@ -1642,8 +1642,8 @@ TEST(TimeBurst, CountsOnlyTheReplyToItsPendingMessage) {
     };
 
     SendspinTimeBurst burst;
-    // Long enough that loop() never times a message out here.
-    burst.configure(/*burst_size=*/2, /*burst_interval_ms=*/0, /*response_timeout_ms=*/60000);
+    // Long enough that loop() never gives up on a message or opens the next burst here.
+    burst.configure(/*burst_size=*/2, /*burst_interval_ms=*/120000);
     burst.loop(&conn, platform_time_us() / 1000, true);
     const int64_t first = sent_echo(0);
 
@@ -1662,9 +1662,12 @@ TEST(TimeBurst, CountsOnlyTheReplyToItsPendingMessage) {
         << "the second real reply ends the burst";
 }
 
-// A message loop() times out is retired on the connection, so its late reply is not claimed, and
-// the burst does not count one claimed just before the timeout either.
-TEST(TimeBurst, TimedOutMessageIsRetired) {
+// A message loop() gives up on is retired on the connection, so its late reply is not claimed,
+// and the burst does not count one claimed just before that either.
+TEST(TimeBurst, AnUnansweredMessageIsRetired) {
+    constexpr int64_t NOW_MS = 1'000'000;
+    constexpr int64_t INTERVAL_MS = 1000;
+    constexpr uint8_t SIZE = 2;
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     DeferredWriteConnection conn;
@@ -1673,60 +1676,58 @@ TEST(TimeBurst, TimedOutMessageIsRetired) {
     conn.set_server_hello_received(true);
 
     SendspinTimeBurst burst;
-    burst.configure(/*burst_size=*/2, /*burst_interval_ms=*/0, /*response_timeout_ms=*/0);
-    burst.loop(&conn, platform_time_us() / 1000, true);
+    burst.configure(SIZE, INTERVAL_MS);
+    burst.loop(&conn, NOW_MS, true);
     ASSERT_EQ(conn.sent_binary_.size(), 1U);
     const int64_t echo = sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_.at(0));
-    // A zero timeout expires once the millisecond clock moves past the send.
-    const int64_t sent_ms = platform_time_us() / 1000;
-    while (platform_time_us() / 1000 <= sent_ms) {
-    }
-    burst.loop(&conn, platform_time_us() / 1000, true);
+    burst.loop(&conn, NOW_MS + INTERVAL_MS / (SIZE + 1), true);
+    ASSERT_EQ(conn.sent_binary_.size(), 2U) << "the next message did not follow the unanswered one";
 
     EXPECT_FALSE(conn.claim_time_frame(echo).has_value());
     TimeResponse late;
     late.max_error = 50;
     late.client_transmitted = echo;
     EXPECT_FALSE(burst.on_time_response(&conn, late))
-        << "counted, the late reply would complete the burst its timeout already counted toward";
+        << "counted, the late reply would complete the burst its retirement already counted toward";
 }
 
-// messaging.md "Clock Synchronization" bounds how far apart consecutive bursts start, so the
-// interval runs from a burst's start, whether its replies arrive or every one times out. A burst
-// still running when the next falls due holds that one back, never running two at once, until it
-// completes. A fresh burst is due at once, even within an interval of the clock's zero (an ESP
-// clock counts from boot). The burst is driven at each time ms_until_due() names, on the clock
-// loop() takes, and each reply answers at once.
-TEST(TimeBurst, TheNextBurstIsDueOneIntervalAfterThisOneStarted) {
+// messaging.md "Clock Synchronization" bounds how far apart consecutive bursts start and how few
+// messages a burst holds, so a burst opens one interval after the last opened, whether that one's
+// replies arrived or not, and each message waits at most a share of the interval, so an
+// unanswered burst still sends every message before the next opens. A burst still running then
+// (its messages sent late here, each tick LATE_MS behind its deadline) ends there and the next
+// opens in the same call. A fresh burst is due at once, even just after the clock's zero (an ESP
+// clock counts from boot). The burst is driven at each time ms_until_due() names plus the row's
+// lateness, on the clock loop() takes, and each reply answers at once. A burst opened at the check
+// sets the next one's due time, SendspinTimeBurst::next_burst_due_time_, to one interval later,
+// the observable no frame count gives (a burst's next message and the next burst's first both
+// write one).
+TEST(TimeBurst, EachBurstOpensOneIntervalAfterTheLastOpened) {
     constexpr int64_t START_MS = 1'000'000;
     constexpr int64_t INTERVAL_MS = SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS;
-    constexpr int64_t TIMEOUT_MS = SendspinClientConfig::DEFAULT_BURST_TIMEOUT_MS;
-    constexpr int64_t SHORT_INTERVAL_MS = 1000;
-    // Each message of an unanswered burst times out strictly after the timeout.
-    constexpr int64_t UNANSWERED_MS = SendspinClientConfig::DEFAULT_BURST_SIZE * (TIMEOUT_MS + 1);
-    static_assert(UNANSWERED_MS > SHORT_INTERVAL_MS && UNANSWERED_MS < INTERVAL_MS);
+    constexpr uint8_t SIZE = SendspinClientConfig::DEFAULT_BURST_SIZE;
+    constexpr int64_t LATE_MS = 400;
     struct Row {
         const char* name;
-        int64_t interval_ms;
+        bool open;
         bool answered;
-        std::optional<int64_t> open_ms;  ///< When the burst opens; nullopt opens none.
+        int64_t late_ms;
         int64_t check_ms;
-        bool expected;
+        size_t expected_frames;  ///< Written before the check.
+        bool expected_opens;     ///< loop() at the check opens a burst.
     };
     const Row rows[] = {
-        {"Control: an answered burst, one interval after it started", INTERVAL_MS, true, START_MS,
-         START_MS + INTERVAL_MS, true},
-        {"an answered burst, short of one interval after it started", INTERVAL_MS, true, START_MS,
-         START_MS + INTERVAL_MS - 1, false},
-        {"an unanswered burst, one interval after it started", INTERVAL_MS, false, START_MS,
-         START_MS + INTERVAL_MS, true},
-        {"an unanswered burst, short of one interval after it started", INTERVAL_MS, false,
-         START_MS, START_MS + INTERVAL_MS - 1, false},
-        {"a burst still running when the next falls due holds it back", SHORT_INTERVAL_MS, false,
-         START_MS, START_MS + SHORT_INTERVAL_MS, false},
-        {"the burst held back is due as the running one completes", SHORT_INTERVAL_MS, false,
-         START_MS, START_MS + UNANSWERED_MS, true},
-        {"a fresh burst, just after the clock's zero", INTERVAL_MS, false, std::nullopt, 5, true},
+        {"Control: an answered burst, one interval after it opened", true, true, 0,
+         START_MS + INTERVAL_MS, SIZE, true},
+        {"an answered burst, short of one interval after it opened", true, true, 0,
+         START_MS + INTERVAL_MS - 1, SIZE, false},
+        {"an unanswered burst sends every message, one interval after it opened", true, false, 0,
+         START_MS + INTERVAL_MS, SIZE, true},
+        {"an unanswered burst, short of one interval after it opened", true, false, 0,
+         START_MS + INTERVAL_MS - 1, SIZE, false},
+        {"a burst still running when the next is due ends there", true, false, LATE_MS,
+         START_MS + INTERVAL_MS, SIZE - 1, true},
+        {"a fresh burst, just after the clock's zero", false, false, 0, 5, 0, true},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -1737,30 +1738,30 @@ TEST(TimeBurst, TheNextBurstIsDueOneIntervalAfterThisOneStarted) {
         conn.set_client_hello_sent(true);
         conn.set_server_hello_received(true);
         SendspinTimeBurst burst;
-        burst.configure(SendspinClientConfig::DEFAULT_BURST_SIZE, row.interval_ms, TIMEOUT_MS);
-        if (row.open_ms.has_value()) {
-            int64_t now_ms = row.open_ms.value();
-            bool may_open = true;
-            while (now_ms <= row.check_ms) {
-                const TimeBurstResult result = burst.loop(&conn, now_ms, may_open);
-                if (may_open) {
-                    ASSERT_TRUE(result.sent) << "the burst did not open";
-                    may_open = false;
-                }
-                if (result.burst_completed) {
-                    break;
-                }
-                if (result.sent && row.answered) {
+        burst.configure(SIZE, INTERVAL_MS);
+        if (row.open) {
+            int64_t now_ms = START_MS;
+            bool sent = burst.loop(&conn, now_ms, true).sent;
+            ASSERT_TRUE(sent) << "the burst did not open";
+            while (true) {
+                if (row.answered && sent) {
                     TimeResponse reply;
                     reply.max_error = 50;
                     reply.client_transmitted =
                         sent_client_transmitted(r->initiator.recv_cs, conn.sent_binary_.back());
                     (void) burst.on_time_response(&conn, reply);
                 }
-                now_ms += burst.ms_until_due(now_ms);
+                const int64_t step_ms = burst.ms_until_due(now_ms) + row.late_ms;
+                if (now_ms + step_ms >= row.check_ms) {
+                    break;
+                }
+                now_ms += step_ms;
+                sent = burst.loop(&conn, now_ms, true).sent;
             }
         }
-        EXPECT_EQ(burst.starts_burst(row.check_ms), row.expected);
+        EXPECT_EQ(conn.sent_binary_.size(), row.expected_frames);
+        (void) burst.loop(&conn, row.check_ms, true);
+        EXPECT_EQ(burst.next_burst_due_time_ == row.check_ms + INTERVAL_MS, row.expected_opens);
     }
 }
 
@@ -2050,7 +2051,7 @@ TEST(NoiseTransport, ALentBinarySendReturnsItsItemOnEveryPath) {
 // admitted connection over a live Noise session: SendspinClient's connection_manager_,
 // protocol_task_ (stopped), json_arena_ (for the stand-in's goodbye) and protocol_tick();
 // ConnectionManager::install_admitted() and liveness_timeout_us_ (off, so the stand-in's silence
-// does not close it); SendspinTimeBurst::last_burst_start_time_ (a burst due only in the row
+// does not close it); SendspinTimeBurst::next_burst_due_time_ (a burst due only in the row
 // that sends client/time); and the controller's impl_, whose supported_commands it seeds,
 // stamped with its cleanup_generation, so a send_command() is queued.
 TEST(NoiseTransport, ASendFailureAfterTheEncryptDropsTheConnectionInItsTick) {
@@ -2094,13 +2095,14 @@ TEST(NoiseTransport, ASendFailureAfterTheEncryptDropsTheConnectionInItsTick) {
         conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"controller@v1"},
                                     std::nullopt, std::nullopt);
         // Not due until the row opens it, so only the row's own site sends.
-        conn->time_burst().last_burst_start_time_ = platform_time_us() / 1000;
+        conn->time_burst().next_burst_due_time_ =
+            platform_time_us() / 1000 + SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS;
         manager.install_admitted(conn, role_mask_bit(SendspinRole::CONTROLLER));
 
         const bool time = row.site == Site::TIME || row.site == Site::NONE;
         if (time) {
             // The burst asks for the high-performance hold, which the main loop grants.
-            conn->time_burst().last_burst_start_time_ = 0;
+            conn->time_burst().next_burst_due_time_ = 0;
             (void) client.protocol_tick();
             client.loop();
         }
@@ -2152,13 +2154,13 @@ TEST(NoiseTransport, ASendFailureAfterTheEncryptDropsTheConnectionInItsTick) {
     }
 }
 
-// A client/time not sent counts as timed out: a burst whose every send is refused (no Noise
+// A client/time not sent counts as unanswered: a burst whose every send is refused (no Noise
 // session here) ends after its last message, waits out the interval and leaves the connection
-// up. The Control row sends, so its message waits for its reply.
-TEST(TimeBurst, AnUnsentTimeMessageCountsAsTimedOut) {
+// up. The Control row sends, so its message waits its share of the interval for its reply.
+TEST(TimeBurst, AnUnsentTimeMessageCountsAsUnanswered) {
     constexpr int64_t NOW_MS = 1'000'000;
     constexpr int64_t INTERVAL_MS = 500;
-    constexpr int64_t TIMEOUT_MS = 100;
+    constexpr uint8_t SIZE = 2;
     for (const bool session : {true, false}) {
         SCOPED_TRACE(session ? "Control: the message is sent" : "the message is not sent");
         DeferredWriteConnection conn;
@@ -2172,7 +2174,7 @@ TEST(TimeBurst, AnUnsentTimeMessageCountsAsTimedOut) {
         conn.set_server_hello_received(true);
 
         SendspinTimeBurst burst;
-        burst.configure(/*burst_size=*/2, INTERVAL_MS, TIMEOUT_MS);
+        burst.configure(SIZE, INTERVAL_MS);
         const TimeBurstResult first = burst.loop(&conn, NOW_MS, true);
         const TimeBurstResult second = burst.loop(&conn, NOW_MS, true);
         EXPECT_EQ(first.sent, session);
@@ -2182,7 +2184,7 @@ TEST(TimeBurst, AnUnsentTimeMessageCountsAsTimedOut) {
         EXPECT_FALSE(conn.inbound_gate().is_detached())
             << "an unsent message closed the connection";
         EXPECT_EQ(burst.ms_until_due(NOW_MS),
-                  static_cast<uint32_t>(session ? TIMEOUT_MS + 1 : INTERVAL_MS));
+                  static_cast<uint32_t>(session ? INTERVAL_MS / (SIZE + 1) : INTERVAL_MS));
     }
 }
 

@@ -1628,13 +1628,10 @@ public:
 
 // The high-performance hold taken for a time burst is released inside the connection-loss path
 // and again by stop(); request and release stay paired across a peer loss, a reconnect, and the
-// stop. The longest timeout start() accepts and no liveness check keep an unanswered burst, and
-// its hold, open for seconds, far longer than the test runs.
+// stop. With the default interval and no liveness check an unanswered burst, and its hold, stays
+// open for seconds, far longer than the test runs.
 TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
     auto config = make_config(HIGH_PERF_TEST_PORT);
-    config.time_burst_interval_ms = 50;
-    config.time_burst_response_timeout_ms =
-        SendspinClientConfig::MAX_BURST_SPACING_MS / config.time_burst_size - 1;
     config.liveness_timeout_ms = 0;
     PairedClientBundle bundle(std::move(config));
     SendspinClient& client = bundle.client();
@@ -1644,7 +1641,7 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
 
     auto server = connect_paired_server(bundle.peer, HIGH_PERF_TEST_PORT);
     pump_until(client, [&] { return client.is_connected(); });
-    // The default fake server never answers client/time, so the burst waits out each timeout and
+    // The default fake server never answers client/time, so the burst waits out each message and
     // the hold stays held until the connection is lost.
     pump_until(client, [&] { return listener.requests == 1; });
     EXPECT_EQ(listener.releases, 0);
@@ -2790,16 +2787,16 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
 // The protocol task's next deadline
 // ============================================================================
 
-// SendspinTimeBurst::ms_until_due() is the burst's part of the protocol task's wait: the end of
-// the interval between bursts, the timeout of the message in flight, or 0 when loop() has work
-// now. The burst's state (burst_index_, last_burst_start_time_, pending_embedded_,
-// current_message_sent_time_, pending_burst_completed_) is staged directly; loop() moves it
-// through these states over real time.
+// SendspinTimeBurst::ms_until_due() is the burst's part of the protocol task's wait: the next
+// burst's start, the end of the wait of the message in flight (cut short by the next burst's
+// start), or 0 when loop() has work now. The burst's state (burst_index_, next_burst_due_time_,
+// pending_embedded_, current_message_sent_time_, pending_burst_completed_) is staged directly;
+// loop() moves it through these states over real time.
 TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
     struct Row {
         const char* name;
         uint8_t burst_index;
-        int64_t last_start_ms;
+        int64_t next_due_ms;
         int64_t pending;
         int64_t sent_ms;
         bool completed;
@@ -2807,24 +2804,26 @@ TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
     };
     constexpr int64_t NOW_MS = 1'000'000;
     constexpr uint8_t SIZE = 8;
-    constexpr int64_t INTERVAL_MS = 500;
-    constexpr int64_t TIMEOUT_MS = 100;
+    constexpr int64_t INTERVAL_MS = 800;
+    constexpr int64_t WAIT_MS = INTERVAL_MS / (SIZE + 1);
     const Row rows[] = {
-        {"between bursts", SIZE, NOW_MS - 200, 0, 0, false, 300},
-        {"Control: the interval has elapsed", SIZE, NOW_MS - INTERVAL_MS, 0, 0, false, 0},
-        {"a message in flight times out strictly after the timeout", 3, 0, 42, NOW_MS - 50, false,
-         51},
-        {"Control: ready to send the next message", 3, 0, 0, 0, false, 0},
-        {"a completed burst is reported at once", SIZE, NOW_MS, 0, 0, true, 0},
+        {"between bursts", SIZE, NOW_MS + 300, 0, 0, false, 300},
+        {"Control: the next burst is due", SIZE, NOW_MS, 0, 0, false, 0},
+        {"a message in flight waits its share of the interval", 3, NOW_MS + INTERVAL_MS, 42,
+         NOW_MS - 50, false, WAIT_MS - 50},
+        {"the next burst's start cuts a message's wait short", 3, NOW_MS + 20, 42, NOW_MS - 50,
+         false, 20},
+        {"Control: ready to send the next message", 3, NOW_MS + INTERVAL_MS, 0, 0, false, 0},
+        {"a completed burst is reported at once", SIZE, NOW_MS + INTERVAL_MS, 0, 0, true, 0},
         {"a far interval clamps short of NO_DEADLINE", SIZE, NOW_MS + (1LL << 40), 0, 0, false,
          ProtocolTask::NO_DEADLINE - 1},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
         SendspinTimeBurst burst;
-        burst.configure(SIZE, INTERVAL_MS, TIMEOUT_MS);
+        burst.configure(SIZE, INTERVAL_MS);
         burst.burst_index_ = row.burst_index;
-        burst.last_burst_start_time_ = row.last_start_ms;
+        burst.next_burst_due_time_ = row.next_due_ms;
         burst.pending_embedded_ = row.pending;
         burst.current_message_sent_time_ = row.sent_ms;
         burst.pending_burst_completed_ = row.completed;
@@ -4116,28 +4115,43 @@ int time_frames_written(const SendspinConnection& conn) {
 }
 
 // A time burst requests the high-performance hold when it comes due and sends its first
-// time frame only once the main loop has granted the request (called the listener); its release
-// waits for nothing, and an acquire and a release queued inside one stalled main-loop tick still
-// reach the listener as a request followed by its release. A burst completed before the filter's
-// first measurement reports no filter error (on_time_sync_updated()). The test thread plays the
+// time frame only once the main loop has granted the request (called the listener); the hold
+// stays while a burst runs, passing to the next burst when that one ends it, its release waits
+// for nothing, and an acquire and a release queued inside one stalled main-loop tick still reach
+// the listener as a request followed by its release. A burst completed before the filter's first
+// measurement reports no filter error (on_time_sync_updated()); the measured Control row's filter
+// has one (seeded through time_filter()), and its error is reported. The test thread plays the
 // protocol task (run_time_sync(), on a stand-in connection in the admitted slot) and the main loop
 // (loop()), so a frame that must not be sent yet is proven unsent by the tick having returned
 // without writing it, not by a wait; the stand-in's frame write time is read for the reason given
-// at time_frames_written(), and the hold from its admitted entry (find_admitted()). The Control
-// row's burst is not due, so nothing is requested.
+// at time_frames_written(), and the hold from its admitted entry (find_admitted()). The burst's
+// due time (next_burst_due_time_) is staged where a row needs it not due or due again, and its end
+// (burst_index_ set to burst_size_, pending_embedded_, pending_burst_completed_) where
+// on_time_response() would complete it. The first Control row's burst is not due, so nothing is requested.
 TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
-    enum class Stage : uint8_t { NOT_DUE, WAITS_FOR_GRANT, RELEASE_NOT_GATED, STALLED_TICK };
+    enum class Stage : uint8_t {
+        NOT_DUE,
+        WAITS_FOR_GRANT,
+        HANDED_ON,
+        RELEASE_NOT_GATED,
+        STALLED_TICK
+    };
     struct Row {
         const char* name;
         Stage stage;
         int expected_frames;
         std::vector<std::string> expected_edges;
+        bool measured{false};
+        int expected_time_sync_updates{0};
     };
     const Row rows[] = {
         {"Control: a burst that is not due requests nothing", Stage::NOT_DUE, 0, {}},
         {"the first frame waits for the grant", Stage::WAITS_FOR_GRANT, 1, {"request"}},
-        {"the release at the burst's end is not gated", Stage::RELEASE_NOT_GATED, 1,
-         {"request", "release"}},
+        {"a burst the next one ends hands it the hold", Stage::HANDED_ON, 1, {"request"}},
+        {"the release at the burst's end is not gated, an unmeasured filter reports nothing",
+         Stage::RELEASE_NOT_GATED, 1, {"request", "release"}},
+        {"Control: a measured filter's error is reported", Stage::RELEASE_NOT_GATED, 1,
+         {"request", "release"}, true, 1},
         {"an acquire and a release inside one stalled tick", Stage::STALLED_TICK, 0,
          {"request", "release"}},
     };
@@ -4156,7 +4170,8 @@ TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
 
         switch (row.stage) {
             case Stage::NOT_DUE:
-                conn->time_burst().last_burst_start_time_ = platform_time_us() / 1000;
+                conn->time_burst().next_burst_due_time_ =
+                    platform_time_us() / 1000 + SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS;
                 (void) manager.run_time_sync();
                 client.loop();
                 break;
@@ -4168,19 +4183,37 @@ TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
                 client.loop();  // The grant
                 ASSERT_EQ(log.edges, std::vector<std::string>{"request"});
                 (void) manager.run_time_sync();
+                EXPECT_TRUE(manager.find_admitted(conn.get())->high_performance_held)
+                    << "the hold was released while the burst runs";
+                break;
+            case Stage::HANDED_ON:
+                (void) manager.run_time_sync();
+                client.loop();
+                (void) manager.run_time_sync();
+                ASSERT_EQ(time_frames_written(*conn), 1);
+                // The next burst falls due while this one runs.
+                conn->time_burst().next_burst_due_time_ = 0;
+                (void) manager.run_time_sync();
+                client.loop();
+                EXPECT_TRUE(conn->time_burst().burst_running()) << "the next burst did not open";
+                EXPECT_TRUE(manager.find_admitted(conn.get())->high_performance_held);
                 break;
             case Stage::RELEASE_NOT_GATED:
                 (void) manager.run_time_sync();
                 client.loop();
                 (void) manager.run_time_sync();
                 ASSERT_EQ(time_frames_written(*conn), 1);
+                if (row.measured) {
+                    conn->time_filter().update(0, 1000, platform_time_us());
+                }
                 // The burst completes; the tick releases the hold without the main loop.
+                conn->time_burst().burst_index_ = conn->time_burst().burst_size_;
+                conn->time_burst().pending_embedded_ = 0;
                 conn->time_burst().pending_burst_completed_ = true;
                 (void) manager.run_time_sync();
                 EXPECT_FALSE(manager.find_admitted(conn.get())->high_performance_held)
                     << "the release waited for the main loop";
                 client.loop();
-                EXPECT_EQ(log.time_sync_updates, 0) << "an unmeasured filter reported an error";
                 break;
             case Stage::STALLED_TICK:
                 (void) manager.run_time_sync();
@@ -4193,6 +4226,7 @@ TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
 
         EXPECT_EQ(time_frames_written(*conn), row.expected_frames);
         EXPECT_EQ(log.edges, row.expected_edges);
+        EXPECT_EQ(log.time_sync_updates, row.expected_time_sync_updates);
         // stop()'s order with the task played here: admission closes, then the task's final tick
         // runs the shutdown pass, which releases a hold still held.
         manager.close_admission();
@@ -4314,36 +4348,26 @@ TEST(HighPerformanceGrant, TheGrantWakesTheBurstThatWaitsForIt) {
 // Time bursts
 // ============================================================================
 
-// start() fails closed on time burst settings that break messaging.md "Clock Synchronization":
-// fewer than MIN_BURST_SIZE messages, an interval that is not positive or past
-// MAX_BURST_SPACING_MS, or a response timeout that is not positive or with which a burst losing
-// every reply, each message timing out 1 ms past the timeout, would outlast that spacing.
-TEST(SendspinClientStart, RejectsTimeBurstSettingsTheSpecForbids) {
+// start() fails closed on time burst settings out of range: fewer than MIN_BURST_SIZE messages
+// (messaging.md "Clock Synchronization"), an interval past MAX_BURST_INTERVAL_MS, which leaves the
+// main loop's grant its second under MAX_BURST_SPACING_MS, or one too short to give each message
+// a wait of at least 1 ms.
+TEST(SendspinClientStart, RejectsTimeBurstSettingsOutOfRange) {
     struct Row {
         const char* name;
         uint8_t size;
         int64_t interval_ms;
-        int64_t timeout_ms;
         bool expect_started;
     };
     constexpr uint8_t SIZE = SendspinClientConfig::MIN_BURST_SIZE;
-    constexpr int64_t SPACING_MS = SendspinClientConfig::MAX_BURST_SPACING_MS;
-    constexpr int64_t INTERVAL_MS = SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS;
-    constexpr int64_t TIMEOUT_MS = SendspinClientConfig::DEFAULT_BURST_TIMEOUT_MS;
+    constexpr int64_t MAX_INTERVAL_MS = SendspinClientConfig::MAX_BURST_INTERVAL_MS;
     const Row rows[] = {
-        {"Control: the defaults", SIZE, INTERVAL_MS, TIMEOUT_MS, true},
-        {"a burst one message short", static_cast<uint8_t>(SIZE - 1), INTERVAL_MS, TIMEOUT_MS,
-         false},
-        {"a zero interval", SIZE, 0, TIMEOUT_MS, false},
-        {"Control: an interval at the spacing", SIZE, SPACING_MS, TIMEOUT_MS, true},
-        {"an interval past the spacing", SIZE, SPACING_MS + 1, TIMEOUT_MS, false},
-        {"a zero timeout", SIZE, INTERVAL_MS, 0, false},
-        {"Control: an unanswered burst ending at the spacing", SIZE, INTERVAL_MS,
-         SPACING_MS / SIZE - 1, true},
-        {"an unanswered burst outlasting the spacing by 1 ms a message", SIZE, INTERVAL_MS,
-         SPACING_MS / SIZE, false},
-        {"a longer burst the timeout no longer fits", static_cast<uint8_t>(2 * SIZE), INTERVAL_MS,
-         SPACING_MS / SIZE - 1, false},
+        {"Control: the defaults", SIZE, SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS, true},
+        {"a burst one message short", static_cast<uint8_t>(SIZE - 1), MAX_INTERVAL_MS, false},
+        {"Control: the shortest interval, 1 ms a message", SIZE, SIZE + 1, true},
+        {"an interval leaving a message no wait", SIZE, SIZE, false},
+        {"Control: the longest interval", SIZE, MAX_INTERVAL_MS, true},
+        {"an interval past the longest", SIZE, MAX_INTERVAL_MS + 1, false},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -4351,7 +4375,6 @@ TEST(SendspinClientStart, RejectsTimeBurstSettingsTheSpecForbids) {
         SendspinClientConfig config = make_config(0);
         config.time_burst_size = row.size;
         config.time_burst_interval_ms = row.interval_ms;
-        config.time_burst_response_timeout_ms = row.timeout_ms;
         SendspinClient client(config);
         client.set_network_provider(&network);
         EXPECT_EQ(client.start(), row.expect_started);
@@ -4979,23 +5002,23 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
 // A client without the player or artwork is floored at two JSON messages (2 x 16,440 =
 // 32,880 bytes) instead of two maximal frames (131,152), and a small player's ring follows its
 // buffer: 25,000 bytes advertise 16,666, so its chunks are at most 16,682 bytes with the tag and
-// the ring is 25,000 + 5,568 held pass-through + 2 x 16,724 = 64,016 bytes; a visualizer
+// the ring is 25,000 + 8,064 held pass-through + 2 x 16,724 = 66,512 bytes; a visualizer
 // advertising a seventh of 140,000 bytes is sent messages of up to 20,016, and at 30 loudness
 // frames a second (2,040 stored bytes) holds its oldest for 69 s, which pins 69 s of state JSON
-// and 8 time bursts behind it (70,656 + 19,968 bytes). Every ring also carries a baseline of two
+// and 9 time bursts behind it (70,656 + 22,464 bytes). Every ring also carries a baseline of two
 // of its longest messages that can sit behind a held item (2 x 65,576 bytes with artwork). The
 // artwork role adds its quota of one image per channel in flight, sent in parts of at least
 // 4,096 bytes (133,024 stored bytes for one default 128 KiB channel: the image plus 61 bytes for
 // each of 32 parts; 40,610 for a 40,000-byte one in 10 parts), and behind the player's 87 s hold
 // two more returned images (one per 30 s). Controller and metadata hold nothing, so they leave
 // the no-role budget unchanged. The time replies follow the configured burst cadence:
-// the default player syncing every second instead of every 9 s holds 88 bursts of 8 replies
-// (312 stored bytes each) behind its 87 s hold instead of 10. Read from the ring the client
+// the default player syncing every second instead of every 9 s holds 89 bursts of 8 replies
+// (312 stored bytes each) behind its 87 s hold instead of 11. Read from the ring the client
 // creates (inbound_ring_'s storage_), so every role's figures and the burst configuration have to
 // reach the derivation. Each row also reads the buffer_capacity the stream roles' client/hello
 // advertises (build_hello_fields()), which never exceeds the ring's largest item, so any one
 // chunk the server may send fits an item: the default player's two-thirds share (666,666 bytes)
-// is capped at the default ring's 622,560, while the 25,000-byte player's 16,666, the default
+// is capped at the default ring's 623,808, while the 25,000-byte player's 16,666, the default
 // player's share in the larger rings and the visualizer's seventh stay as derived.
 TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
     enum : uint8_t {
@@ -5021,20 +5044,20 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         {"no roles: two JSON messages", 0, 32880, 16400, 0, 0},
         {"controller and metadata: the no-role budget", CONTROLLER_METADATA, 32880, 16400, 0, 0},
         {"visualizer only: its 4,096-byte quota, 3 s of pass-through, the JSON floor", VISUALIZER,
-         42544, 21232, 0, 585},
+         45040, 22480, 0, 585},
         {"a 140,000-byte visualizer: 69 s of pass-through, two 20,016-byte messages",
-         LARGE_VISUALIZER, 270736, INBOUND_MAX_MESSAGE_BYTES, 0, 20000},
+         LARGE_VISUALIZER, 273232, INBOUND_MAX_MESSAGE_BYTES, 0, 20000},
         {"a 25,000-byte player: two of its longest chunks, its share advertised uncapped",
-         SMALL_PLAYER, 64016, 31968, 16666, 0},
+         SMALL_PLAYER, 66512, 33216, 16666, 0},
         {"artwork only: one default image in flight and the two-frame baseline", ARTWORK, 264176,
          INBOUND_MAX_MESSAGE_BYTES, 0, 0},
         {"artwork capped at 40,000-byte images: one in flight and the baseline", SMALL_ARTWORK,
          171764, INBOUND_MAX_MESSAGE_BYTES, 0, 0},
         {"Control: the default player, its advertised share capped at the ring's largest item",
-         PLAYER, 1245200, INBOUND_MAX_MESSAGE_BYTES, 622560, 0},
+         PLAYER, 1247696, INBOUND_MAX_MESSAGE_BYTES, 623808, 0},
         {"the default player, a time burst every second: its share fits the larger ring", PLAYER,
-         1439888, INBOUND_MAX_MESSAGE_BYTES, 666666, 0, 1000},
-        {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1825848,
+         1442384, INBOUND_MAX_MESSAGE_BYTES, 666666, 0, 1000},
+        {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1828344,
          INBOUND_MAX_MESSAGE_BYTES, 666666, 585},
     };
     for (const Row& row : rows) {

@@ -516,8 +516,7 @@ protected:
             }
         }
         conn->time_burst().configure(SendspinClientConfig{}.time_burst_size,
-                                     SendspinClientConfig{}.time_burst_interval_ms,
-                                     SendspinClientConfig{}.time_burst_response_timeout_ms);
+                                     SendspinClientConfig{}.time_burst_interval_ms);
         // Fresh inbound traffic, so the liveness watchdog reads the connection as live.
         conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                           std::memory_order_relaxed);
@@ -1320,15 +1319,15 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     conn->set_server_hello_received(true);
     ASSERT_TRUE(conn->is_operational());
 
-    // A fresh SendspinTimeBurst starts its first burst immediately (last_burst_start_time_
-    // starts one interval back, so the inter-burst wait is satisfied), so any tick that reaches
-    // the connection's time_burst().loop() sends. The connection still declares 'pairing', which
+    // A fresh SendspinTimeBurst starts its first burst immediately (next_burst_due_time_ starts
+    // at 0, due on any clock reading), so any tick that reaches the connection's
+    // time_burst().loop() sends. The connection still declares 'pairing', which
     // must not stop it: a player keeps its timeline across an attempt and can only do that with a
     // converging filter.
     //
     // Without a Noise session the send itself fails, but send_time_message() records the frame in
     // flight before sending, so a nonzero tag shows the burst reached the send. An unsent message
-    // counts as timed out, so the burst then waits out its interval; each wait below resets it to
+    // counts as unanswered, so the burst then waits out its interval; each wait below resets it to
     // make it due at once, and the suite watchdog names a burst that never sends.
     ASSERT_EQ(conn->time_frame_tag_, 0U);
     conn->time_burst().reset();

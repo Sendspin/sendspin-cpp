@@ -1372,8 +1372,8 @@ static constexpr size_t inbound_hold_seconds(size_t held_bytes, size_t stored_by
  * configuration bounds.
  *
  * With the default configuration (a 1,000,000-byte player quota, no visualizer or artwork) this
- * is 1,000,000 + 114,048 held pass-through bytes (87 s at 1,024 B/s, plus 10 bursts of 8 time
- * replies at 312 stored bytes) + 131,152 for two maximal messages = 1,245,200 bytes, against
+ * is 1,000,000 + 116,544 held pass-through bytes (87 s at 1,024 B/s, plus 11 bursts of 8 time
+ * replies at 312 stored bytes) + 131,152 for two maximal messages = 1,247,696 bytes, against
  * separate buffers of 1,000,000 bytes of encoded audio plus one maximal payload buffer per open
  * connection (1,065,535 bytes with one connection).
  */
@@ -1383,9 +1383,11 @@ static constexpr size_t derive_inbound_ring_bytes(const InboundRingBudget& budge
     const size_t hold_seconds = std::max(
         player_hold_seconds, inbound_hold_seconds(budget.visualizer_hold_bytes,
                                                   budget.visualizer_stored_bytes_per_second));
+    // The bursts that start inside the window, plus the one before it, whose replies can still
+    // land inside (a reply later than its message's wait is beyond this budget).
     const size_t bursts =
         hold_seconds > 0 && budget.time_burst_interval_ms > 0
-            ? hold_seconds * 1000 / static_cast<size_t>(budget.time_burst_interval_ms) + 1
+            ? hold_seconds * 1000 / static_cast<size_t>(budget.time_burst_interval_ms) + 2
             : 0;
     const size_t held_passthrough =
         hold_seconds * INBOUND_STATE_BYTES_PER_SECOND +
