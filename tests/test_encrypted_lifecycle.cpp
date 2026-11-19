@@ -121,6 +121,7 @@ constexpr uint16_t CLOCK_GATE_SYNCED_TEST_PORT = 19080;
 constexpr uint16_t CLOCK_GATE_UNSYNCED_TEST_PORT = 19081;
 constexpr uint16_t CLOCK_GATE_NO_PLAYER_TEST_PORT = 19082;
 constexpr uint16_t CLOCK_GATE_UNAVAILABLE_TEST_PORT = 19083;
+constexpr uint16_t CLOCK_GATE_LATER_PLAYER_TEST_PORT = 19087;
 constexpr uint16_t RESELECT_PAIRING_TEST_PORT = 19015;
 constexpr uint16_t ROLE_STATE_OBJECTS_TEST_PORT = 19016;
 constexpr uint16_t ROLE_ADDED_STATE_TEST_PORT = 19017;
@@ -1012,27 +1013,33 @@ TEST(EncryptedLifecycle, AvailabilityIsDeviceStateAndPublishesOnChange) {
     pump_for(client, 100);
 }
 
-// messaging.md "client/state": an available player reports its state only after clock
-// synchronization; a client with no active player, or an unavailable one, does not wait. The first
-// row is the control: every later row differs from it in one input.
-TEST(EncryptedLifecycle, ClientStateWaitsForClockSyncOnlyForAnAvailablePlayer) {
+// messaging.md "Clock Synchronization" and "stream/start": a connection whose player role is active
+// sends no client/state until its clock is synchronized, whatever `available` says, including the
+// update a later activation of the player requires; a client with no active player does not wait.
+// The first row is the control. The second differs from it in answer_time, the third and fourth
+// each differ from the second in one input, and the last adds a later activation to the third.
+TEST(EncryptedLifecycle, ClientStateWaitsForClockSyncWhileAPlayerIsActive) {
     struct Row {
         const char* name;
         uint16_t port;
-        bool with_player;
+        const char* first_roles;
+        const char* later_roles;  // A second activation once the first state is out, or none.
         bool answer_time;
         bool available;
         bool expect_state;
     };
     const Row rows[] = {
-        {"Control: available player, clock synced", CLOCK_GATE_SYNCED_TEST_PORT, true, true, true,
-         true},
-        {"available player, clock never synced", CLOCK_GATE_UNSYNCED_TEST_PORT, true, false, true,
-         false},
-        {"no player role, clock never synced", CLOCK_GATE_NO_PLAYER_TEST_PORT, false, false, true,
-         true},
-        {"unavailable player, clock never synced", CLOCK_GATE_UNAVAILABLE_TEST_PORT, true, false,
-         false, true},
+        {"Control: available player, clock synced", CLOCK_GATE_SYNCED_TEST_PORT, R"(["player@v1"])",
+         nullptr, true, true, true},
+        {"available player, clock never synced", CLOCK_GATE_UNSYNCED_TEST_PORT, R"(["player@v1"])",
+         nullptr, false, true, false},
+        {"no player role, clock never synced", CLOCK_GATE_NO_PLAYER_TEST_PORT, R"(["metadata@v1"])",
+         nullptr, false, true, true},
+        {"unavailable player, clock never synced", CLOCK_GATE_UNAVAILABLE_TEST_PORT,
+         R"(["player@v1"])", nullptr, false, false, false},
+        {"player activated after the first state, clock never synced",
+         CLOCK_GATE_LATER_PLAYER_TEST_PORT, R"(["metadata@v1"])", R"(["metadata@v1","player@v1"])",
+         false, true, true},
     };
     for (const Row& row : rows) {
         SCOPED_TRACE(row.name);
@@ -1044,17 +1051,14 @@ TEST(EncryptedLifecycle, ClientStateWaitsForClockSyncOnlyForAnAvailablePlayer) {
         PairedClientBundle bundle(config);
         SendspinClient& client = bundle.client();
         CountingPlayerListener player_listener;
-        if (row.with_player) {
-            client.add_player(make_pcm_player_config()).set_listener(&player_listener);
-        } else {
-            client.add_metadata();
-        }
+        client.add_player(make_pcm_player_config()).set_listener(&player_listener);
+        client.add_metadata();
         ASSERT_TRUE(bundle.start());
         client.set_available(row.available);
 
         FakeEncryptedServerOptions options;
         options.answer_time = row.answer_time;
-        options.first_roles_json = row.with_player ? R"(["player@v1"])" : R"(["metadata@v1"])";
+        options.first_roles_json = row.first_roles;
         auto server = connect_paired_server(bundle.peer, row.port, std::move(options));
 
         // The first client/time shows the connection is operational.
@@ -1068,7 +1072,15 @@ TEST(EncryptedLifecycle, ClientStateWaitsForClockSyncOnlyForAnAvailablePlayer) {
         } else {
             pump_for(client, 300);
             EXPECT_EQ(server->client_state_count(), 0)
-                << "an available player reported its state before its clock synchronized";
+                << "an active player sent its initial state before its clock synchronized";
+        }
+        if (row.later_roles != nullptr) {
+            ASSERT_TRUE(server->send_app_json(
+                std::string(R"({"type":"server/activate","payload":{"activities":["playback"],)") +
+                R"("active_roles":)" + row.later_roles + "}}"));
+            pump_for(client, 300);
+            EXPECT_EQ(server->client_state_count(), 1)
+                << "the activated player was reported before its clock synchronized";
         }
 
         client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -3029,7 +3041,8 @@ TEST(EncryptedLifecycle, ClientStateCarriesOnlyTheOwnedRoles) {
         conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                           std::memory_order_relaxed);
         bundle.client_ref().connection_manager_->install_admitted(conn, row.owned_roles);
-        // Unavailable, so a player's state does not wait for the clock.
+        // A clock measurement, so a player's state does not wait for one.
+        conn->time_filter().update(0, 1000, platform_time_us());
         bundle.client_ref().set_available(false);
         bundle.pump();
 
@@ -3083,7 +3096,8 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
     conn->last_receive_time_us_.store(static_cast<uint32_t>(platform_time_us()),
                                       std::memory_order_relaxed);
     bundle.client_ref().connection_manager_->install_admitted(conn, ALL_ROLES_MASK);
-    // Unavailable, so a player's state does not wait for the clock.
+    // A clock measurement, so a player's state does not wait for one.
+    conn->time_filter().update(0, 1000, platform_time_us());
     bundle.client_ref().set_available(false);
     bundle.pump();
     ASSERT_FALSE(conn->states.empty()) << "the connection never became operational";

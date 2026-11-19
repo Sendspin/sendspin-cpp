@@ -988,10 +988,10 @@ private:
     /// @brief Sends the latest client/state snapshot to an admitted connection, with the role
     /// objects of the roles it owns. Protocol task only.
     ///
-    /// Nothing for a connection that is not admitted and operational. Held while the snapshot is
-    /// available and `conn` owns an active player or source with no clock sync yet
-    /// (AdmittedEntry::state_held); ConnectionManager::run_time_sync() sends it with the first
-    /// measurement.
+    /// Nothing for a connection that is not admitted and operational. Held while `conn` owns an
+    /// active player or source with no clock sync yet (AdmittedEntry::state_held; messaging.md
+    /// "Clock Synchronization", "stream/start"); ConnectionManager::run_time_sync() sends it with
+    /// the first measurement.
     void publish_client_state(SendspinConnection* conn);
 
     /// @brief Makes `snapshot` the client/state every admitted connection's is built from, and
