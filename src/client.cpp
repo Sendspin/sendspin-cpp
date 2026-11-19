@@ -1717,9 +1717,10 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     }
     const ClientStateMessage& snapshot = client_state.value();
 
-    // messaging.md "client/state": a player or source reports `available: true` only after
-    // clock synchronization, and `false` would mean it will not yield, so the state waits for
-    // this connection's first measurement when it owns either; run_time_sync() sends it then.
+    // messaging.md "Clock Synchronization" and "stream/start": a connection that owns an active
+    // player or source sends no client/state, neither its initial one nor the update an
+    // activation of either requires (which lets the server start that stream), until its time
+    // filter has a measurement; run_time_sync() sends it then.
     bool clocked_role = false;
 #ifdef SENDSPIN_ENABLE_PLAYER
     clocked_role =
@@ -1729,7 +1730,7 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     clocked_role = clocked_role || (this->source_ && this->connection_manager_->owns_role(
                                                          conn, SendspinRole::SOURCE));
 #endif
-    const bool waits_for_clock = snapshot.available && clocked_role && !conn->is_time_synced();
+    const bool waits_for_clock = clocked_role && !conn->is_time_synced();
     entry->state_held = waits_for_clock;
     if (waits_for_clock) {
         return;
