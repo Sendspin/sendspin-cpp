@@ -205,7 +205,7 @@ TEST(JsonArena, ParsedMessageIsReleasedBeforeItsReplyIsBuilt) {
     {
         SendspinArenaAllocator alone(ARENA_BYTES);
         ParsedJsonMessage parsed(alone);
-        ASSERT_TRUE(parsed.parse(stream_start.data(), stream_start.size()));
+        ASSERT_EQ(parsed.parse(stream_start.data(), stream_start.size()), JsonParseResult::OBJECT);
         parse_peak = alone.high_water();
     }
     size_t build_peak = 0;
@@ -220,7 +220,7 @@ TEST(JsonArena, ParsedMessageIsReleasedBeforeItsReplyIsBuilt) {
 
     SendspinArenaAllocator arena(ARENA_BYTES);
     ParsedJsonMessage parsed(arena);
-    ASSERT_TRUE(parsed.parse(stream_start.data(), stream_start.size()));
+    ASSERT_EQ(parsed.parse(stream_start.data(), stream_start.size()), JsonParseResult::OBJECT);
     StreamStartMessage stream_msg;
     ASSERT_TRUE(parsed.extract([&stream_msg](JsonObject root) {
         return process_stream_start_message(root, EnumSet<SendspinRole>{SendspinRole::PLAYER},

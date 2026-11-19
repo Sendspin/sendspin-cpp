@@ -287,9 +287,9 @@ static void check_session_roundtrip(CipherPair& init_pair, NoiseSession& respond
     {
         auto ct = raw_encrypt(init_pair.send_cs, plaintext);
         ASSERT_FALSE(ct.empty());
-        size_t pt_len = responder_session.decrypt(ct.data(), ct.size());
-        ASSERT_GT(pt_len, 0u);
-        ct.resize(pt_len);
+        const std::optional<size_t> pt_len = responder_session.decrypt(ct.data(), ct.size());
+        ASSERT_TRUE(pt_len.has_value());
+        ct.resize(*pt_len);
         EXPECT_EQ(ct, plaintext) << "Initiator->Responder round-trip failed";
     }
     // Responder -> Initiator (responder.encrypt, initiator.recv_cs)
@@ -356,7 +356,7 @@ TEST(NoiseRehandshake, RehandshakeRotatesKeys_ChaChaPoly) {
         // Ciphertext from the old session must not decrypt under the new one: keys rotated.
         std::vector<uint8_t> old_ct = raw_encrypt(init.initiator.send_cs, plaintext);
         ASSERT_FALSE(old_ct.empty());
-        EXPECT_EQ(rr.responder_session->decrypt(old_ct.data(), old_ct.size()), 0u);
+        EXPECT_FALSE(rr.responder_session->decrypt(old_ct.data(), old_ct.size()).has_value());
     }
 }
 

@@ -781,8 +781,7 @@ public:
     /// which detaches the inbound gate. The caller returns whichever of `message.item` and
     /// `complete.item` is still set after dispatch, NONE included.
     /// @param message The message as received.
-    /// @param complete Set to the complete message, if one exists; a single-frame empty JSON body
-    ///        sets it and returns NONE.
+    /// @param complete Set to the complete message, if one exists.
     /// @return What to dispatch @p complete as.
     InboundDispatch process_inbound_message(InboundMessage& message, InboundMessage& complete);
 

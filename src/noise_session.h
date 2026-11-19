@@ -136,8 +136,9 @@ public:
 
     /// @brief Decrypt ciphertext in-place.
     /// @param len  Number of ciphertext bytes (plaintext + AEAD_TAG_SIZE of tag).
-    /// @return Number of plaintext bytes, or 0 on auth failure.
-    size_t decrypt(uint8_t* ciphertext, size_t len);
+    /// @return Number of plaintext bytes, 0 for an authentic empty plaintext, or nullopt on auth
+    ///         failure.
+    std::optional<size_t> decrypt(uint8_t* ciphertext, size_t len);
 
 private:
     NoiseSession() = default;

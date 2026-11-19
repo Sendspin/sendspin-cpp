@@ -377,12 +377,8 @@ SendspinConnection::InboundDispatch SendspinConnection::classify_complete_noise_
     InboundMessage& complete) {
     // data[0] is the message type; fragment types never reach here.
     if (complete.data[0] == MSG_TYPE_JSON_BODY) {
-        // Type 0: JSON control body, routed without the type byte. A frame carrying only
-        // the type byte (no body) is a malformed/empty JSON message; drop it.
-        if (complete.len < 2) {
-            SS_LOGW(TAG, "empty JSON body after Noise decrypt; dropping");
-            return InboundDispatch::NONE;
-        }
+        // Type 0: JSON control body, routed without the type byte. An empty body is judged with
+        // every other one (SendspinClient::process_json_message()).
         ++complete.data;
         --complete.len;
         return InboundDispatch::JSON;
@@ -452,8 +448,9 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
 
     // Decrypt in place: the message holds the full ciphertext (plaintext + AEAD_TAG_SIZE of tag),
     // in the ring item it was received into when it has one.
-    const size_t pt_len = this->noise_transport_.decrypt_in_place(message.data, message.len);
-    if (pt_len == 0) {
+    const std::optional<size_t> pt_len =
+        this->noise_transport_.decrypt_in_place(message.data, message.len);
+    if (!pt_len.has_value()) {
         // Spec Failure Handling: an AEAD failure once in transport mode closes the WebSocket
         // silently. It is also unrecoverable if left open: the underlying Noise decrypt never
         // advances the receive-direction nonce counter on an auth failure, so every later frame
@@ -464,12 +461,11 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
     }
     // Route through the fragment state machine; hand any completed message to the caller.
     const NoiseTransport::CompleteMessage reassembled = this->noise_transport_.accept_plaintext(
-        message.data, pt_len, this->inbound_gate_.is_admitted());
+        message.data, *pt_len, this->inbound_gate_.is_admitted());
     if (reassembled.malformed) {
-        // messaging.md "Malformed sequences" is a protocol error the receiver MUST close the
-        // connection for; NoiseTransport::CompleteMessage::malformed enumerates the sequences
-        // that set it.
-        SS_LOGW(TAG, "Malformed fragment sequence; closing connection");
+        // A protocol error the receiver MUST close the connection for;
+        // NoiseTransport::CompleteMessage::malformed enumerates the cases that set it.
+        SS_LOGW(TAG, "Malformed binary message; closing connection");
         this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
         return InboundDispatch::NONE;
     }
@@ -562,11 +558,16 @@ SendspinConnection::InboundTarget SendspinConnection::route_inbound_message(size
         return {nullptr, InboundRoute::DROP};
     }
 
+    // An empty frame is neither a handshake message nor a Noise transport message, which carries
+    // at least its tag, so in any phase it closes the connection silently, as connection.md
+    // "Failure Handling" closes on a malformed handshake message or an AEAD failure.
+    if (len == 0) {
+        SS_LOGW(TAG, "Empty WebSocket message; closing");
+        this->fail_inbound();
+        return {nullptr, InboundRoute::CLOSE};
+    }
+
     if (!this->inbound_gate_.is_admitted()) {
-        // An empty frame can never be a valid handshake or JSON message.
-        if (len == 0) {
-            return {nullptr, InboundRoute::DROP};
-        }
         if (len <= InboundGate::PRE_ADMISSION_MESSAGE_BYTES) {
             return this->route_to_fallback(len, kind, /*admitted=*/false);
         }
@@ -814,6 +815,12 @@ void SendspinConnection::end_inbound_fragment(size_t len, bool last, int64_t com
         return;
     }
     if (!this->inbound_gate_.is_admitted()) {
+        // Closed like an empty single-frame message (route_inbound_message()).
+        if (this->fallback_len_ == 0) {
+            SS_LOGW(TAG, "Empty WebSocket message; closing");
+            this->fail_inbound();
+            return;
+        }
         this->inbound_to_fallback_ = true;
         this->end_inbound_message(true, complete_time_us);
         return;

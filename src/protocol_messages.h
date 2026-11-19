@@ -1284,6 +1284,10 @@ struct ServerPairConfirmPayload {
 // caller destroys it once sent (a document that fits one variant pool frees the arena back down
 // to where it found it; see SendspinArenaAllocator). Neither ever resets the arena.
 
+/// @brief Whether `root` has a `type` string and a `payload` object, the shape messaging.md
+/// "Communication" gives every JSON message
+bool has_message_envelope(JsonObject root);
+
 /// @brief Determines the message type of an incoming server-to-client JSON message; UNKNOWN if
 /// not recognized
 SendspinServerToClientMessageType determine_message_type(JsonObject root);

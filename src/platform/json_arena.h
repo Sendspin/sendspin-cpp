@@ -289,6 +289,57 @@ struct RefersIntoDocument
 template <typename T>
 struct RefersIntoDocument<std::optional<T>> : RefersIntoDocument<std::remove_cv_t<T>> {};
 
+/// @brief ArduinoJson reader over `len` bytes of text that records how far a parse read, since
+/// deserializeJson() stops after the root value and reports success whatever follows it
+class CountingJsonReader {
+public:
+    CountingJsonReader(const char* data, size_t len) : data_(data), len_(len) {}
+
+    /// @brief The next byte, or -1 at the end
+    int read() {
+        return this->pos_ < this->len_ ? static_cast<unsigned char>(this->data_[this->pos_++]) : -1;
+    }
+
+    /// @brief Copies up to @p length bytes into @p buffer and returns how many it copied
+    // NOLINTNEXTLINE(readability-identifier-naming): the name ArduinoJson's Reader calls
+    size_t readBytes(char* buffer, size_t length) {
+        const size_t n = std::min(length, this->len_ - this->pos_);
+        std::memcpy(buffer, this->data_ + this->pos_, n);
+        this->pos_ += n;
+        return n;
+    }
+
+    /// @brief Whether every byte the parse left unread is JSON whitespace (RFC 8259 section 2)
+    bool rest_is_whitespace() const {
+        for (size_t i = this->pos_; i < this->len_; ++i) {
+            const char c = this->data_[i];
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    // Pointer fields
+    const char* data_;
+
+    // size_t fields
+    size_t len_;
+    size_t pos_{0};
+};
+
+/// @brief How ParsedJsonMessage::parse() went
+enum class JsonParseResult : uint8_t {
+    /// Parsed, with an object at its root
+    OBJECT,
+    /// Not JSON, JSON whose root is not an object, or an object followed by more than whitespace
+    MALFORMED,
+    /// Over a limit of the client's own (the allocator ran out, or ArduinoJson's nesting limit was
+    /// passed), so the text may still be valid JSON
+    OVER_LIMIT,
+};
+
 /**
  * @brief A parsed inbound JSON message, read once and released before anything acts on it
  *
@@ -310,13 +361,19 @@ public:
     explicit ParsedJsonMessage(SendspinArenaAllocator& arena) : doc_(std::in_place, &arena) {}
 
     /// @brief Parses @p len bytes of JSON text, copying its strings into the document
-    /// @return false on a parse error or an empty (null) document
-    bool parse(const char* data, size_t len) {
+    JsonParseResult parse(const char* data, size_t len) {
         if (!this->doc_) {
-            return false;
+            return JsonParseResult::MALFORMED;
         }
         JsonDocument& doc = *this->doc_;
-        return !deserializeJson(doc, data, len) && !doc.isNull();
+        CountingJsonReader reader(data, len);
+        const DeserializationError error = deserializeJson(doc, reader);
+        if (error == DeserializationError::NoMemory || error == DeserializationError::TooDeep) {
+            return JsonParseResult::OVER_LIMIT;
+        }
+        return !error && doc.is<JsonObject>() && reader.rest_is_whitespace()
+                   ? JsonParseResult::OBJECT
+                   : JsonParseResult::MALFORMED;
     }
 
     /// @brief Calls @p reader with the root object and returns its result, keeping the document

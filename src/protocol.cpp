@@ -339,6 +339,10 @@ static void parse_color_field(JsonVariantConst var, const char* name,
 
 // Message type determination
 
+bool has_message_envelope(JsonObject root) {
+    return root["type"].is<const char*>() && root["payload"].is<JsonObject>();
+}
+
 SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     // Read in place with its length, so a type with an escaped NUL matches no name below.
     const std::string_view type = root["type"] | std::string_view("");

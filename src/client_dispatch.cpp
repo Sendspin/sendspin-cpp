@@ -20,6 +20,7 @@
 #include "connection_manager.h"
 #include "constants.h"
 #include "inbound_ring.h"
+#include "inline_text.h"
 #include "noise_handshake.h"
 #include "platform/compiler.h"
 #include "platform/json_arena.h"
@@ -56,6 +57,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -397,9 +399,26 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
     // metadata role's handler, which runs inside server/state's extract() to copy its kept text
     // straight from the document into its slot; it builds no reply and keeps no view of the
     // document.
+    //
+    // messaging.md "Binary Message ID Structure": a body that is not a UTF-8 JSON object with a
+    // type string and a payload object is a protocol error the client MUST close the connection
+    // on, closed silently like every other one the receive path finds (see close_silently()).
+    // ArduinoJson does not check UTF-8, so the body is checked first; the JSON is judged as
+    // ArduinoJson parses it, accepting its single-quote and unquoted-key leniency. A body over the
+    // parser's own limits is the client's limit rather than the peer's error: dropped, connection
+    // kept.
     ParsedJsonMessage parsed(*this->json_arena_);
-    if (!parsed.parse(data, len)) {
-        SS_LOGW(TAG, "Failed to parse JSON message");
+    const JsonParseResult parse_result = is_valid_utf8(std::string_view(data, len))
+                                             ? parsed.parse(data, len)
+                                             : JsonParseResult::MALFORMED;
+    if (parse_result == JsonParseResult::OVER_LIMIT) {
+        SS_LOGW(TAG, "JSON message of %zu bytes over the parser's limits; dropping", len);
+        return;
+    }
+    if (parse_result != JsonParseResult::OBJECT ||
+        !parsed.read([](JsonObject root) { return has_message_envelope(root); })) {
+        SS_LOGW(TAG, "Malformed JSON message; closing connection");
+        conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
         return;
     }
 
@@ -869,7 +888,8 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             break;
         }
         default: {
-            // Nothing acts on an unhandled message, so its type is read in place.
+            // messaging.md "Communication": a well-formed message of an unrecognized type is
+            // ignored. Nothing acts on it, so its type is read in place.
             const std::string_view type = parsed.read([](JsonObject root) {
                 return peer_text_for_log(root["type"] | std::string_view("unknown"));
             });
