@@ -169,7 +169,8 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     // payload is released as soon as its two fields are read out, so the msg2 envelope the
     // caller builds has the arena to itself.
     ParsedJsonMessage payload(arena);
-    if (!payload.parse(reinterpret_cast<const char*>(msg1_payload.data()), payload_size.value())) {
+    if (payload.parse(reinterpret_cast<const char*>(msg1_payload.data()), payload_size.value()) !=
+        JsonParseResult::OBJECT) {
         SS_LOGE(TAG, "%s: failed to parse msg1 payload JSON", log_prefix);
         return std::nullopt;
     }
@@ -346,7 +347,7 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
     // One parse per frame. The fields the step needs are copied out and the frame released
     // before the step runs, so the msg2 envelope it builds has the arena to itself.
     ParsedJsonMessage frame(this->arena_);
-    if (!frame.parse(text.data(), text.size())) {
+    if (frame.parse(text.data(), text.size()) != JsonParseResult::OBJECT) {
         SS_LOGE(TAG, "on_text_frame: JSON parse failed");
         this->state_ = State::ABORTED;
         return HandshakeFrameResult::ABORT;

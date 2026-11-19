@@ -77,38 +77,14 @@ inline bool is_valid_application_role_name(const std::string& role) {
 /// a valid pair is dropped or replaced by another character, and an out-of-range number becomes
 /// null. Both still go out as valid JSON.
 inline std::optional<std::string> normalize_support_object_json(const std::string& json) {
-    // ArduinoJson reader that records how far the parse consumed
-    struct CountingReader {
-        const std::string& text;
-        size_t pos{0};
-        int read() {
-            return this->pos < this->text.size()
-                       ? static_cast<unsigned char>(this->text[this->pos++])
-                       : -1;
-        }
-        // NOLINTNEXTLINE(readability-identifier-naming): the name ArduinoJson's Reader calls
-        size_t readBytes(char* buffer, size_t length) {
-            size_t n = 0;
-            while (n < length && this->pos < this->text.size()) {
-                buffer[n++] = this->text[this->pos++];
-            }
-            return n;
-        }
-    };
-
     // Capacity 0: every block comes from the platform allocator, wiped and freed on return
     SendspinArenaAllocator allocator(0);
     JsonDocument doc = make_json_document(allocator);
-    CountingReader reader{json};
+    CountingJsonReader reader(json.data(), json.size());
     const DeserializationOption::NestingLimit nesting(MAX_SUPPORT_OBJECT_NESTING);
-    if (deserializeJson(doc, reader, nesting) || !doc.is<JsonObject>()) {
+    if (deserializeJson(doc, reader, nesting) || !doc.is<JsonObject>() ||
+        !reader.rest_is_whitespace()) {
         return std::nullopt;
-    }
-    for (size_t i = reader.pos; i < json.size(); ++i) {
-        const char c = json[i];
-        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
-            return std::nullopt;
-        }
     }
     std::string out;
     serializeJson(doc, out);

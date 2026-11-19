@@ -886,9 +886,9 @@ observes pairing via `SendspinClientListener` callbacks:
 
    Whether the connection survives depends on the reason. Most reasons the server sends in a
    `pair/abort` leave it open, so the server can re-activate pairing or resume normal operation
-   on it. `CONCURRENT_ATTEMPT` closes it, as do protocol errors (a malformed pairing frame or a
-   bad CPace share), which are reported as `UNKNOWN` and close the transport without sending a
-   `client/goodbye`.
+   on it. `CONCURRENT_ATTEMPT` closes it, as do protocol errors during the attempt (a malformed
+   message, a pairing message out of sequence or a bad CPace share), which are reported as
+   `UNKNOWN` and close the transport without sending a `client/goodbye`.
 
    A persistence provider that rejects the durable write does not fail the pairing:
    `on_paired` fires, the record is authoritative for the rest of this boot, and a

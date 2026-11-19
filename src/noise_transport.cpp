@@ -167,10 +167,10 @@ SsErr NoiseTransport::send_msg2_and_swap(size_t len, NoiseSession next_session) 
 // Inbound (decrypt + reassemble)
 // ============================================================================
 
-size_t NoiseTransport::decrypt_in_place(uint8_t* ciphertext, size_t len) {
+std::optional<size_t> NoiseTransport::decrypt_in_place(uint8_t* ciphertext, size_t len) {
     // Protocol task only, like every use of the session (see the file comment).
     if (!this->session_) {
-        return 0;
+        return std::nullopt;
     }
     return this->session_->decrypt(ciphertext, len);
 }
@@ -178,9 +178,11 @@ size_t NoiseTransport::decrypt_in_place(uint8_t* ciphertext, size_t len) {
 NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaintext, size_t len,
                                                                  bool admitted) {
     // Protocol task only.
+    // messaging.md "Binary Message ID Structure": an empty plaintext is a protocol error.
     if (len == 0) {
         SS_LOGW(TAG, "accept_plaintext: empty plaintext");
-        return {};
+        this->reasm_reset();
+        return {nullptr, 0, true};
     }
 
     if (plaintext[0] != MSG_TYPE_FRAGMENT) {

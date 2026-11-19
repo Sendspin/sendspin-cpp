@@ -281,6 +281,7 @@ Encryption is mandatory, so every application message arrives as a binary Noise 
 ```api
 Transport thread (IXWebSocket / esp_http_server / esp_websocket_client)
   │
+  ├─ An empty message closes the connection, admitted or not
   ├─ Admitted connection: receives the message straight into an InboundRing item
   │  (waits up to INBOUND_ACQUIRE_TIMEOUT_MS for room, else closes the connection with a
   │  warning: see The Inbound Ring); a message longer than the ring takes
@@ -304,9 +305,11 @@ Protocol task: SendspinClient::protocol_tick()
      ├─ Text frame → handshake driver only (server/init, noise/handshake)
      └─ Binary frame → Noise transport active?
         ├─ no  → refused
-        └─ yes → decrypt in place, reassemble Noise-level fragments (copied)
+        └─ yes → decrypt in place, reassemble Noise-level fragments (copied); an AEAD
+                 failure, an empty plaintext or a malformed fragment sequence closes silently
                  └─ SendspinClient::process_inbound() dispatches on the plaintext type byte:
-                    ├─ MSG_TYPE_JSON_BODY → SendspinClient::process_json_message()
+                    ├─ MSG_TYPE_JSON_BODY → SendspinClient::process_json_message(), which closes
+                    │  silently on a malformed body
                     └─ other → SendspinClient::process_binary_message(), which hands
                        a player, visualizer or artwork part message over in its ring item
 ```

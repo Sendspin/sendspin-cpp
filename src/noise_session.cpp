@@ -288,10 +288,10 @@ size_t NoiseSession::encrypt(uint8_t* plaintext, size_t len, size_t capacity) {
     return buf.size;
 }
 
-size_t NoiseSession::decrypt(uint8_t* ciphertext, size_t len) {
+std::optional<size_t> NoiseSession::decrypt(uint8_t* ciphertext, size_t len) {
     if (!this->recv_cipher_) {
         SS_LOGE(TAG, "decrypt: transport not ready");
-        return 0;
+        return std::nullopt;
     }
 
     NoiseBuffer buf;
@@ -299,7 +299,7 @@ size_t NoiseSession::decrypt(uint8_t* ciphertext, size_t len) {
     int err = noise_cipherstate_decrypt(this->recv_cipher_, &buf);
     if (err != NOISE_ERROR_NONE) {
         SS_LOGW(TAG, "decrypt: noise_cipherstate_decrypt failed (err=%d)", err);
-        return 0;
+        return std::nullopt;
     }
     return buf.size;
 }

@@ -76,8 +76,9 @@ public:
         /// error: a first fragment while one is in flight, a non-first fragment with none in
         /// flight, a non-fragment message while one is in flight, a nonzero reserved flag bit,
         /// an orig_type of 1, a fragment frame missing its flags byte, or a first fragment
-        /// missing its orig_type, rather than the benign "no complete message yet"
-        /// mid-reassembly state. The caller must close the connection when this is true.
+        /// missing its orig_type, or an empty plaintext ("Binary Message ID Structure"), rather
+        /// than the benign "no complete message yet" mid-reassembly state. The caller must close
+        /// the connection when this is true.
         bool malformed{false};
     };
 
@@ -167,8 +168,9 @@ public:
     /// @brief Decrypts one transport frame in-place. Protocol task only, sequential with the
     /// session swap (see the file comment).
     /// @param len  Ciphertext length (plaintext + AEAD_TAG_SIZE of tag).
-    /// @return Plaintext length, or 0 on auth failure / no active session.
-    size_t decrypt_in_place(uint8_t* ciphertext, size_t len);
+    /// @return Plaintext length (0 for an authentic empty plaintext), or nullopt on auth failure /
+    ///         no active session.
+    std::optional<size_t> decrypt_in_place(uint8_t* ciphertext, size_t len);
 
     /// @brief Routes one decrypted plaintext frame through the fragment state machine.
     /// Non-fragment frames are returned directly (the same pointer, so the caller can tell the

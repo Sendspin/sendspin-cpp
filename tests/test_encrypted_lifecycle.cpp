@@ -2215,11 +2215,59 @@ TEST(EncryptedLifecycle, AnUnhandledTypeIsLoggedOnlyUpToTheBound) {
 
     const std::string type(4 * PEER_TEXT_LOG_BYTES, 'x');
     StderrCapture capture;
-    bundle.deliver(conn, R"({"type":")" + type + R"("})");
+    bundle.deliver(conn, R"({"type":")" + type + R"(","payload":{}})");
     const std::string log = capture.release();
     EXPECT_NE(log.find(type.substr(0, PEER_TEXT_LOG_BYTES)), std::string::npos)
         << "Control: the type is logged at all: " << log;
     EXPECT_EQ(log.find(type.substr(0, PEER_TEXT_LOG_BYTES + 1)), std::string::npos) << log;
+}
+
+// messaging.md "Binary Message ID Structure": a JSON body (ID 0) that is not a valid UTF-8 JSON
+// object with a type string and a payload object is a protocol error the client closes the
+// connection on, silently. Every connection's JSON goes through this one dispatch, admitted or
+// not. Kept open: a well-formed message of an unrecognized type, which messaging.md
+// "Communication" ignores, and an object nested past ArduinoJson's limit, which may be valid. Read
+// through accepts_app_sends(): the stand-in's is_connected() is always true, so it is false only
+// once the close detached the connection.
+TEST(EncryptedLifecycle, AMalformedJsonBodyClosesTheConnection) {
+    struct Row {
+        const char* name;
+        std::string body;
+        bool closes;
+    };
+    const std::string nested = std::string(ARDUINOJSON_DEFAULT_NESTING_LIMIT, '[') +
+                               std::string(ARDUINOJSON_DEFAULT_NESTING_LIMIT, ']');
+    const Row rows[] = {
+        {"Control: a recognized type", R"({"type":"server/state","payload":{}})", false},
+        {"Control: trailing whitespace", " {\"type\":\"server/state\",\"payload\":{}} \t\r\n",
+         false},
+        {"Control: an unrecognized type, with UTF-8 text",
+         "{\"type\":\"made/up\",\"payload\":{\"name\":\"Caf\xC3\xA9\"}}", false},
+        {"nested past the parser's limit",
+         R"({"type":"server/state","payload":{"_app":)" + nested + "}}", false},
+        {"empty body", "", true},
+        {"not UTF-8", "{\"type\":\"made/up\",\"payload\":{\"name\":\"Caf\xC3\"}}", true},
+        {"not JSON", "server/state", true},
+        {"truncated", R"({"type":"server/state","payload":{})", true},
+        {"trailing bytes", R"({"type":"server/state","payload":{}}garbage)", true},
+        {"a second value", R"({"type":"server/state","payload":{}} {})", true},
+        {"an array at the root", R"([{"type":"server/state","payload":{}}])", true},
+        {"an array at the root nested past the parser's limit", "[" + nested + "]", true},
+        {"null at the root", "null", true},
+        {"no type", R"({"payload":{}})", true},
+        {"a type that is not a string", R"({"type":5,"payload":{}})", true},
+        {"no payload", R"({"type":"server/state"})", true},
+        {"a payload that is not an object", R"({"type":"server/state","payload":[]})", true},
+    };
+    DispatchTestClient bundle("Malformed JSON Test Client");
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        DispatchTestConnection& conn = bundle.connection();
+
+        bundle.deliver(conn, row.body);
+
+        EXPECT_EQ(conn.accepts_app_sends(), !row.closes);
+    }
 }
 
 // messaging.md "server/state": each metadata object carries the role's full state, so what a
@@ -3127,7 +3175,7 @@ TEST(EncryptedLifecycle, AReplyBuiltInsideAHandlerHasTheArenaToItself) {
     {
         SendspinArenaAllocator alone(ARENA_BYTES);
         ParsedJsonMessage parsed(alone);
-        ASSERT_TRUE(parsed.parse(activate.data(), activate.size()));
+        ASSERT_EQ(parsed.parse(activate.data(), activate.size()), JsonParseResult::OBJECT);
         parse_end = alone.offset_;
     }
     size_t smallest_reply_peak = 0;

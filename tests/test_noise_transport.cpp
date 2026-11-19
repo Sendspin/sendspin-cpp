@@ -767,7 +767,7 @@ TEST(FragmentSequence, CompleteMessageCarriesTheRingItemOnlyWhenItIsTheReceivedF
          {MSG_TYPE_FRAGMENT, FRAGMENT_FLAG_LAST, 0x02},
          SendspinConnection::InboundDispatch::BINARY, false},
         {"single-frame empty JSON body", {}, {MSG_TYPE_JSON_BODY},
-         SendspinConnection::InboundDispatch::NONE, true},
+         SendspinConnection::InboundDispatch::JSON, true},
     };
 
     int sentinel_storage = 0;
@@ -1243,6 +1243,34 @@ TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     EXPECT_TRUE(conn.disconnect_calls_.empty());
     EXPECT_TRUE(conn.sent_text_.empty());
     EXPECT_TRUE(conn.sent_binary_.empty());
+}
+
+// messaging.md "Binary Message ID Structure": an authentic message whose plaintext is empty is a
+// protocol error, closed silently. Control: a plaintext of its ID byte alone is a message, handed
+// on for its role to judge.
+TEST(NoiseTransport, AnEmptyPlaintextClosesSilently) {
+    struct Row {
+        const char* name;
+        std::vector<uint8_t> plaintext;
+        bool closes;
+    };
+    const Row rows[] = {
+        {"empty plaintext", {}, true},
+        {"Control: the ID byte alone", {SENDSPIN_BINARY_PLAYER_AUDIO}, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+        FragmentReceiver rx(*r);
+
+        rx.inject(row.plaintext);
+
+        EXPECT_EQ(rx.closed(), row.closes);
+        EXPECT_EQ(rx.binary_dispatched_ + rx.json_dispatched_, row.closes ? 0 : 1);
+        EXPECT_TRUE(rx.conn_.disconnect_calls_.empty()) << "the close must be silent";
+        EXPECT_TRUE(rx.conn_.sent_binary_.empty());
+    }
 }
 
 // connection.md "Failure Handling": a cleartext message after the switch to transport mode is a
@@ -2381,6 +2409,7 @@ TEST(InboundReceive, AnAdmittedMessageWithNoRingSpaceClosesTheConnection) {
 // A message larger than the cap in force closes the connection: before admission that is
 // InboundGate::PRE_ADMISSION_MESSAGE_BYTES, after it one Noise frame (INBOUND_MAX_MESSAGE_BYTES).
 // No conforming peer sends either, and the transport learns the length before receiving a byte.
+// An empty message, which no phase of the connection accepts, closes it in either state too.
 // The pre-admission cap is judged once the message still pending is consumed, since that message
 // may be the server/activate that admits the connection: the behind-admission row leaves a
 // message pending and has a second thread admit the connection and consume it, as the protocol
@@ -2403,7 +2432,8 @@ TEST(InboundReceive, AMessageOverTheCapInForceClosesTheConnection) {
         {"one byte over behind the pending message that admits it", false, true,
          InboundGate::PRE_ADMISSION_MESSAGE_BYTES + 1, TestConnection::InboundRoute::RECEIVE},
         {"Control: pre-admission, one byte", false, false, 1, TestConnection::InboundRoute::RECEIVE},
-        {"pre-admission, zero length", false, false, 0, TestConnection::InboundRoute::DROP},
+        {"pre-admission, zero length", false, false, 0, TestConnection::InboundRoute::CLOSE},
+        {"admitted, zero length", true, false, 0, TestConnection::InboundRoute::CLOSE},
         {"Control: admitted, one Noise frame", true, false, INBOUND_MAX_MESSAGE_BYTES,
          TestConnection::InboundRoute::RECEIVE},
         {"admitted, one byte over a Noise frame", true, false, INBOUND_MAX_MESSAGE_BYTES + 1,
@@ -2493,6 +2523,42 @@ TEST(InboundReceive, AMultiFrameMessageIsCappedOnItsRunningTotal) {
             len = pending.len;
         }
         EXPECT_EQ(len, row.cap);
+    }
+}
+
+// A message split across WebSocket frames whose frames are all empty closes the connection, as an
+// empty single-frame message does, in either admission state. Control: a one-byte total.
+TEST(InboundReceive, AnEmptyMultiFrameMessageClosesTheConnection) {
+    struct Row {
+        const char* name;
+        bool admitted;
+        size_t second_len;
+    };
+    const Row rows[] = {
+        {"pre-admission, empty", false, 0},
+        {"Control: pre-admission, one byte", false, 1},
+        {"admitted, empty", true, 0},
+        {"Control: admitted, one byte", true, 1},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InboundHarness h;
+        h.conn.set_admitted(row.admitted);
+
+        ASSERT_EQ(h.conn.begin_inbound_fragment(0, /*first=*/true, /*is_text=*/false).route,
+                  TestConnection::InboundRoute::RECEIVE);
+        h.conn.end_inbound_fragment(0, /*last=*/false, platform_time_us());
+        const TestConnection::InboundTarget last =
+            h.conn.begin_inbound_fragment(row.second_len, /*first=*/false, /*is_text=*/false);
+        ASSERT_EQ(last.route, TestConnection::InboundRoute::RECEIVE);
+        if (row.second_len > 0) {
+            std::memset(last.data, 0x22, row.second_len);
+        }
+        h.conn.end_inbound_fragment(row.second_len, /*last=*/true, platform_time_us());
+
+        const bool closes = row.second_len == 0;
+        EXPECT_EQ(h.conn.close_transport_now_calls_, closes ? 1 : 0);
+        EXPECT_EQ(h.conn.inbound_gate().is_detached(), closes);
     }
 }
 
