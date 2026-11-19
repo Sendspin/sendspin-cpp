@@ -510,8 +510,9 @@ SendspinClientConfig make_liveness_config(uint16_t port, int64_t liveness_timeou
 
 }  // namespace
 
-// resolve_liveness_timeout_ms() either derives the window from the configured burst settings or
-// takes an explicitly configured one, and clamps either to the cap.
+// resolve_liveness_timeout_ms() either derives the window from the burst spacing start() allows,
+// whatever the configured burst settings, or takes an explicitly configured one, and clamps either
+// to the cap.
 TEST(LivenessTimeout, ResolvesFromConfig) {
     struct Row {
         const char* name;
@@ -521,18 +522,18 @@ TEST(LivenessTimeout, ResolvesFromConfig) {
         int64_t expected_ms;
     };
     const Row rows[] = {
-        {"defaults derive", std::nullopt, std::nullopt, std::nullopt, 60000},
-        {"longer interval widens the window", 60000, std::nullopt, std::nullopt, 210000},
-        {"response timeout widens the window", 10000, 20000, std::nullopt, 90000},
-        {"explicit value overrides the derivation", 60000, std::nullopt, 5000, 5000},
-        {"explicit zero disables the check", 60000, std::nullopt, 0, 0},
+        {"Control: the defaults derive three burst spacings", std::nullopt, std::nullopt,
+         std::nullopt, 30000},
+        {"a short interval and timeout leave the window as derived", 50, 1, std::nullopt, 30000},
+        {"the longest interval and timeout leave the window as derived", 10000, 1249, std::nullopt,
+         30000},
+        {"explicit value overrides the derivation", 50, std::nullopt, 5000, 5000},
+        {"explicit zero disables the check", std::nullopt, std::nullopt, 0, 0},
         {"Control: explicit value at the cap is kept", std::nullopt, std::nullopt,
          SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS,
          SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS},
         {"explicit value above the cap is clamped", std::nullopt, std::nullopt,
          SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS + 1,
-         SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS},
-        {"derived value above the cap is clamped", 900000, std::nullopt, std::nullopt,
          SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS},
     };
 

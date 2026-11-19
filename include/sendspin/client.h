@@ -76,7 +76,8 @@ public:
     [[deprecated("override on_group_state(); removed in v0.11.0")]] virtual void on_group_update(
         const GroupUpdateObject& /*group*/) {}
 
-    /// @brief Called after a time sync burst completes with the Kalman filter error
+    /// @brief Called after a time sync burst completes, once the Kalman filter has a measurement,
+    /// with the filter's error
     virtual void on_time_sync_updated(float /*error*/) {}
 
     /// @brief Called when the library needs high-performance networking (e.g., disable WiFi

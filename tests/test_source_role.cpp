@@ -855,7 +855,7 @@ namespace {
 /// find_admitted(), close_admission() and liveness_timeout_us_, off so the stand-in's silence does
 /// not close it), json_arena_, process_json_message(), protocol_tick() and
 /// high_performance_ref_count_ (an open stream's hold); SendspinTimeBurst's
-/// last_burst_complete_time_ (no burst falls due); and SourceRole's impl_ (the task's
+/// last_burst_start_time_ (no burst falls due); and SourceRole's impl_ (the task's
 /// chunk_message_bytes_, to complete a chunk as the source task would, and the stream gate).
 class SourceStandIn {
 public:
@@ -913,7 +913,7 @@ public:
         conn->apply_server_activate({SendspinActivity::PLAYBACK}, ActiveRoles{"source@v1"},
                                     std::nullopt, std::nullopt);
         // No time burst falls due during a test, so no client/time interleaves.
-        conn->time_burst().last_burst_complete_time_ = platform_time_us() / 1000;
+        conn->time_burst().last_burst_start_time_ = platform_time_us() / 1000;
         if (synced) {
             sync(*conn);
         }

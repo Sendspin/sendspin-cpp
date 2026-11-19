@@ -520,8 +520,8 @@ struct FakeEncryptedServerOptions {
     bool withhold_pair_finalize_ack{false};
     // When true, every client/time is answered with a server/time whose clock is the client's
     // own plus server_clock_offset_us (both sides read platform_time_us()). Off by default: a
-    // peer that never answers keeps the time burst open, which the liveness and
-    // high-performance-hold tests rely on.
+    // peer that never answers stays silent, which the liveness tests rely on; each burst then
+    // ends only by its timeouts.
     bool answer_time{false};
     // How far the answered server clock runs ahead of the client's. Nonzero lets a test tell a
     // timestamp mapped onto the server clock from one left on the client's.

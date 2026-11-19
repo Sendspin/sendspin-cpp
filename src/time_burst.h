@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "sendspin/config.h"
+
 #include <cstdint>
 #include <limits>
 
@@ -46,8 +48,8 @@ struct TimeBurstResult {
  *
  * Sends a rapid burst of time messages over a WebSocket connection, tracks each RTT
  * measurement, and feeds only the best sample (lowest round-trip delay) to the
- * connection's Kalman filter. Waiting for the inter-burst interval between rounds
- * reduces filter update frequency while still capturing clean measurements.
+ * connection's Kalman filter. Starting bursts one interval apart reduces filter update
+ * frequency while still capturing clean measurements.
  *
  * Each SendspinConnection owns one, beside its time filter, and drives it on the protocol task:
  * 1. Call loop() on each tick while the connection is admitted and operational, and wake again
@@ -99,15 +101,16 @@ public:
     bool on_time_response(SendspinConnection* conn, const TimeResponse& response);
 
     /// @brief Whether the next loop() starts a new burst: the previous one is complete and the
-    /// interval since it has elapsed, so loop() would send the burst's first time frame
+    /// interval since it started has elapsed, so loop() would send the burst's first time frame
     /// @param now_ms platform_time_us() / US_PER_MS, the value the caller passes loop().
     [[nodiscard]] bool starts_burst(int64_t now_ms) const {
         return this->burst_index_ >= this->burst_size_ && !this->pending_burst_completed_ &&
-               now_ms - this->last_burst_complete_time_ >= this->burst_interval_ms_;
+               now_ms - this->last_burst_start_time_ >= this->burst_interval_ms_;
     }
 
     /// @brief Milliseconds until loop() has something to do: the next message of a burst (0),
-    /// the timeout of the message in flight, or the end of the inter-burst interval
+    /// the timeout of the message in flight, or the end of the interval since the last burst
+    /// started
     /// @param now_ms platform_time_us() / US_PER_MS, as loop() reads it.
     /// @return 0 when loop() is due now.
     [[nodiscard]] uint32_t ms_until_due(int64_t now_ms) const;
@@ -116,14 +119,14 @@ public:
     // Lifecycle
     // ========================================
 
-    /// @brief Configures burst parameters. Call before the first loop() invocation.
-    /// Defaults match the library's built-in values if configure() is never called.
+    /// @brief Configures burst parameters and resets the burst. Call before the first loop()
+    /// invocation. Defaults match the library's built-in values if configure() is never called.
     /// @param burst_size Number of time messages per burst.
-    /// @param burst_interval_ms Milliseconds between bursts.
+    /// @param burst_interval_ms Milliseconds from one burst's start to the next's.
     /// @param response_timeout_ms Milliseconds before an individual message times out.
     void configure(uint8_t burst_size, int64_t burst_interval_ms, int64_t response_timeout_ms);
 
-    /// @brief Reset state (call on connection loss/change)
+    /// @brief Reset state (call on connection loss/change); the next burst is due at once
     void reset();
 
 protected:
@@ -134,28 +137,27 @@ protected:
     /// @brief Ends the current message without a measurement (timed out or not sent); at the
     /// burst's last message, feeds the best measurement to the time filter.
     /// @param conn The connection that owns this burst.
-    /// @param now_ms The loop() call's clock, stamped as the completion time.
     /// @return true if this completed the burst.
-    bool retire_message(SendspinConnection* conn, int64_t now_ms);
-
-    static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;
-    static constexpr int64_t DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
+    bool retire_message(SendspinConnection* conn);
 
     // 64-bit fields
     int64_t best_max_error_{std::numeric_limits<int64_t>::max()};
     int64_t best_offset_{0};
     int64_t best_timestamp_{0};
     int64_t current_message_sent_time_{0};
-    int64_t last_burst_complete_time_{0};
-    int64_t burst_interval_ms_{DEFAULT_BURST_INTERVAL_MS};
-    int64_t response_timeout_ms_{DEFAULT_RESPONSE_TIMEOUT_MS};
+    // When loop() opened the last burst; reset() backdates it one interval, so the first burst is
+    // due at once however soon after the clock's zero it comes
+    int64_t last_burst_start_time_{-SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS};
+    int64_t burst_interval_ms_{SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS};
+    int64_t response_timeout_ms_{SendspinClientConfig::DEFAULT_BURST_TIMEOUT_MS};
     // client_transmitted of the time message awaiting a reply, 0 when none is (see
     // on_time_response())
     int64_t pending_embedded_{0};
 
     // 8-bit fields
-    uint8_t burst_size_{8};
-    uint8_t burst_index_{8};  // starts "complete" so first loop triggers a burst
+    uint8_t burst_size_{SendspinClientConfig::DEFAULT_BURST_SIZE};
+    // Starts "complete" so first loop triggers a burst
+    uint8_t burst_index_{SendspinClientConfig::DEFAULT_BURST_SIZE};
     // Flag set by on_time_response() when burst completes, consumed by loop()
     bool pending_burst_completed_{false};
 };

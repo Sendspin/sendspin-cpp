@@ -75,12 +75,12 @@ static constexpr double REPROVE_TIMEOUT_S = NURSERY_ESTABLISH_TIMEOUT_S;
 
 /// @brief Timeout in microseconds (derived from REPROVE_TIMEOUT_S).
 static constexpr int64_t REPROVE_TIMEOUT_US = seconds_to_us(REPROVE_TIMEOUT_S);
-/// @brief Consecutive unanswered client/time messages the derived liveness timeout tolerates.
+/// @brief Consecutive time bursts with no reply the derived liveness timeout tolerates.
 static constexpr int64_t LIVENESS_TOLERATED_MISSES = 2;
 
-/// @brief Returns config.liveness_timeout_ms or, if unset, a timeout derived from the time burst
-/// settings that outlasts LIVENESS_TOLERATED_MISSES consecutive unanswered time messages by at
-/// least one response timeout; either is capped at SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS.
+/// @brief Returns config.liveness_timeout_ms or, if unset, LIVENESS_TOLERATED_MISSES + 1 times
+/// SendspinClientConfig::MAX_BURST_SPACING_MS, whatever the configured burst cadence; either is
+/// capped at SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS.
 /// @param config The client configuration.
 /// @return Timeout in milliseconds; 0 or negative disables the check.
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config);
@@ -534,7 +534,8 @@ public:
     /// high-performance hold when a burst comes due and sends its first client/time only once the
     /// main loop has granted that request (SendspinClient::high_performance_granted()), releases
     /// the hold when the burst completes without waiting for anything, reports a completed
-    /// burst's filter error to the main loop, and sends a client/state that waited for the clock
+    /// burst's filter error to the main loop once the filter has a measurement, and sends a
+    /// client/state that waited for the clock
     /// @return Milliseconds until the earliest burst is due, or ProtocolTask::NO_DEADLINE; a
     ///         burst waiting for its grant adds no deadline, since the grant wakes the task.
     uint32_t run_time_sync();

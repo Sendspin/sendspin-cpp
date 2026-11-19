@@ -1320,8 +1320,8 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     conn->set_server_hello_received(true);
     ASSERT_TRUE(conn->is_operational());
 
-    // A fresh SendspinTimeBurst starts its first burst immediately (last_burst_complete_time_
-    // defaults to 0, so the inter-burst wait is trivially satisfied), so any tick that reaches
+    // A fresh SendspinTimeBurst starts its first burst immediately (last_burst_start_time_
+    // starts one interval back, so the inter-burst wait is satisfied), so any tick that reaches
     // the connection's time_burst().loop() sends. The connection still declares 'pairing', which
     // must not stop it: a player keeps its timeline across an attempt and can only do that with a
     // converging filter.

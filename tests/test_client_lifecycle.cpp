@@ -1628,10 +1628,14 @@ public:
 
 // The high-performance hold taken for a time burst is released inside the connection-loss path
 // and again by stop(); request and release stay paired across a peer loss, a reconnect, and the
-// stop.
+// stop. The longest timeout start() accepts and no liveness check keep an unanswered burst, and
+// its hold, open for seconds, far longer than the test runs.
 TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
     auto config = make_config(HIGH_PERF_TEST_PORT);
     config.time_burst_interval_ms = 50;
+    config.time_burst_response_timeout_ms =
+        SendspinClientConfig::MAX_BURST_SPACING_MS / config.time_burst_size - 1;
+    config.liveness_timeout_ms = 0;
     PairedClientBundle bundle(std::move(config));
     SendspinClient& client = bundle.client();
     CountingClientListener listener;
@@ -1640,8 +1644,8 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
 
     auto server = connect_paired_server(bundle.peer, HIGH_PERF_TEST_PORT);
     pump_until(client, [&] { return client.is_connected(); });
-    // The default fake server never answers client/time, so the burst stays open and the hold
-    // stays held until the connection is lost.
+    // The default fake server never answers client/time, so the burst waits out each timeout and
+    // the hold stays held until the connection is lost.
     pump_until(client, [&] { return listener.requests == 1; });
     EXPECT_EQ(listener.releases, 0);
 
@@ -2788,14 +2792,14 @@ TEST(ClientLifecycle, TheConnectedFlagRisesOnlyAtTheEndOfTheTick) {
 
 // SendspinTimeBurst::ms_until_due() is the burst's part of the protocol task's wait: the end of
 // the interval between bursts, the timeout of the message in flight, or 0 when loop() has work
-// now. The burst's state (burst_index_, last_burst_complete_time_, pending_embedded_,
+// now. The burst's state (burst_index_, last_burst_start_time_, pending_embedded_,
 // current_message_sent_time_, pending_burst_completed_) is staged directly; loop() moves it
 // through these states over real time.
 TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
     struct Row {
         const char* name;
         uint8_t burst_index;
-        int64_t last_complete_ms;
+        int64_t last_start_ms;
         int64_t pending;
         int64_t sent_ms;
         bool completed;
@@ -2820,7 +2824,7 @@ TEST(NextDeadline, TheTimeBurstReportsItsNextStep) {
         SendspinTimeBurst burst;
         burst.configure(SIZE, INTERVAL_MS, TIMEOUT_MS);
         burst.burst_index_ = row.burst_index;
-        burst.last_burst_complete_time_ = row.last_complete_ms;
+        burst.last_burst_start_time_ = row.last_start_ms;
         burst.pending_embedded_ = row.pending;
         burst.current_message_sent_time_ = row.sent_ms;
         burst.pending_burst_completed_ = row.completed;
@@ -4085,8 +4089,12 @@ public:
     void on_release_high_performance() override {
         this->edges.emplace_back("release");
     }
+    void on_time_sync_updated(float /*error*/) override {
+        ++this->time_sync_updates;
+    }
 
     std::vector<std::string> edges;
+    int time_sync_updates{0};
 };
 
 /// An admitted, operational stand-in for a connection whose time burst runs.
@@ -4110,8 +4118,9 @@ int time_frames_written(const SendspinConnection& conn) {
 // A time burst requests the high-performance hold when it comes due and sends its first
 // time frame only once the main loop has granted the request (called the listener); its release
 // waits for nothing, and an acquire and a release queued inside one stalled main-loop tick still
-// reach the listener as a request followed by its release. The test thread plays the protocol
-// task (run_time_sync(), on a stand-in connection in the admitted slot) and the main loop
+// reach the listener as a request followed by its release. A burst completed before the filter's
+// first measurement reports no filter error (on_time_sync_updated()). The test thread plays the
+// protocol task (run_time_sync(), on a stand-in connection in the admitted slot) and the main loop
 // (loop()), so a frame that must not be sent yet is proven unsent by the tick having returned
 // without writing it, not by a wait; the stand-in's frame write time is read for the reason given
 // at time_frames_written(), and the hold from its admitted entry (find_admitted()). The Control
@@ -4147,7 +4156,7 @@ TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
 
         switch (row.stage) {
             case Stage::NOT_DUE:
-                conn->time_burst().last_burst_complete_time_ = platform_time_us() / 1000;
+                conn->time_burst().last_burst_start_time_ = platform_time_us() / 1000;
                 (void) manager.run_time_sync();
                 client.loop();
                 break;
@@ -4171,6 +4180,7 @@ TEST(HighPerformanceGrant, TheFirstTimeFrameWaitsForTheMainLoop) {
                 EXPECT_FALSE(manager.find_admitted(conn.get())->high_performance_held)
                     << "the release waited for the main loop";
                 client.loop();
+                EXPECT_EQ(log.time_sync_updates, 0) << "an unmeasured filter reported an error";
                 break;
             case Stage::STALLED_TICK:
                 (void) manager.run_time_sync();
@@ -4298,6 +4308,55 @@ TEST(HighPerformanceGrant, TheGrantWakesTheBurstThatWaitsForIt) {
 
     client.stop();
     EXPECT_EQ(log.edges, (std::vector<std::string>{"request", "release"}));
+}
+
+// ============================================================================
+// Time bursts
+// ============================================================================
+
+// start() fails closed on time burst settings that break messaging.md "Clock Synchronization":
+// fewer than MIN_BURST_SIZE messages, an interval that is not positive or past
+// MAX_BURST_SPACING_MS, or a response timeout that is not positive or with which a burst losing
+// every reply, each message timing out 1 ms past the timeout, would outlast that spacing.
+TEST(SendspinClientStart, RejectsTimeBurstSettingsTheSpecForbids) {
+    struct Row {
+        const char* name;
+        uint8_t size;
+        int64_t interval_ms;
+        int64_t timeout_ms;
+        bool expect_started;
+    };
+    constexpr uint8_t SIZE = SendspinClientConfig::MIN_BURST_SIZE;
+    constexpr int64_t SPACING_MS = SendspinClientConfig::MAX_BURST_SPACING_MS;
+    constexpr int64_t INTERVAL_MS = SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS;
+    constexpr int64_t TIMEOUT_MS = SendspinClientConfig::DEFAULT_BURST_TIMEOUT_MS;
+    const Row rows[] = {
+        {"Control: the defaults", SIZE, INTERVAL_MS, TIMEOUT_MS, true},
+        {"a burst one message short", static_cast<uint8_t>(SIZE - 1), INTERVAL_MS, TIMEOUT_MS,
+         false},
+        {"a zero interval", SIZE, 0, TIMEOUT_MS, false},
+        {"Control: an interval at the spacing", SIZE, SPACING_MS, TIMEOUT_MS, true},
+        {"an interval past the spacing", SIZE, SPACING_MS + 1, TIMEOUT_MS, false},
+        {"a zero timeout", SIZE, INTERVAL_MS, 0, false},
+        {"Control: an unanswered burst ending at the spacing", SIZE, INTERVAL_MS,
+         SPACING_MS / SIZE - 1, true},
+        {"an unanswered burst outlasting the spacing by 1 ms a message", SIZE, INTERVAL_MS,
+         SPACING_MS / SIZE, false},
+        {"a longer burst the timeout no longer fits", static_cast<uint8_t>(2 * SIZE), INTERVAL_MS,
+         SPACING_MS / SIZE - 1, false},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TestNetworkProvider network;
+        SendspinClientConfig config = make_config(0);
+        config.time_burst_size = row.size;
+        config.time_burst_interval_ms = row.interval_ms;
+        config.time_burst_response_timeout_ms = row.timeout_ms;
+        SendspinClient client(config);
+        client.set_network_provider(&network);
+        EXPECT_EQ(client.start(), row.expect_started);
+        client.stop();
+    }
 }
 
 // ============================================================================
@@ -4923,20 +4982,20 @@ TEST(ClientLifecycle, DestroyingARunningClientWithAReturnedLocalItemIsClean) {
 // the ring is 25,000 + 5,568 held pass-through + 2 x 16,724 = 64,016 bytes; a visualizer
 // advertising a seventh of 140,000 bytes is sent messages of up to 20,016, and at 30 loudness
 // frames a second (2,040 stored bytes) holds its oldest for 69 s, which pins 69 s of state JSON
-// and 7 time bursts behind it (70,656 + 17,472 bytes). Every ring also carries a baseline of two
+// and 8 time bursts behind it (70,656 + 19,968 bytes). Every ring also carries a baseline of two
 // of its longest messages that can sit behind a held item (2 x 65,576 bytes with artwork). The
 // artwork role adds its quota of one image per channel in flight, sent in parts of at least
 // 4,096 bytes (133,024 stored bytes for one default 128 KiB channel: the image plus 61 bytes for
 // each of 32 parts; 40,610 for a 40,000-byte one in 10 parts), and behind the player's 87 s hold
 // two more returned images (one per 30 s). Controller and metadata hold nothing, so they leave
 // the no-role budget unchanged. The time replies follow the configured burst cadence:
-// the default player syncing every second instead of every 10 s holds 88 bursts of 8 replies
-// (312 stored bytes each) behind its 87 s hold instead of 9. Read from the ring the client
+// the default player syncing every second instead of every 9 s holds 88 bursts of 8 replies
+// (312 stored bytes each) behind its 87 s hold instead of 10. Read from the ring the client
 // creates (inbound_ring_'s storage_), so every role's figures and the burst configuration have to
 // reach the derivation. Each row also reads the buffer_capacity the stream roles' client/hello
 // advertises (build_hello_fields()), which never exceeds the ring's largest item, so any one
 // chunk the server may send fits an item: the default player's two-thirds share (666,666 bytes)
-// is capped at the default ring's 621,312, while the 25,000-byte player's 16,666, the default
+// is capped at the default ring's 622,560, while the 25,000-byte player's 16,666, the default
 // player's share in the larger rings and the visualizer's seventh stay as derived.
 TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
     enum : uint8_t {
@@ -4964,7 +5023,7 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         {"visualizer only: its 4,096-byte quota, 3 s of pass-through, the JSON floor", VISUALIZER,
          42544, 21232, 0, 585},
         {"a 140,000-byte visualizer: 69 s of pass-through, two 20,016-byte messages",
-         LARGE_VISUALIZER, 268240, INBOUND_MAX_MESSAGE_BYTES, 0, 20000},
+         LARGE_VISUALIZER, 270736, INBOUND_MAX_MESSAGE_BYTES, 0, 20000},
         {"a 25,000-byte player: two of its longest chunks, its share advertised uncapped",
          SMALL_PLAYER, 64016, 31968, 16666, 0},
         {"artwork only: one default image in flight and the two-frame baseline", ARTWORK, 264176,
@@ -4972,10 +5031,10 @@ TEST(ClientLifecycle, TheInboundRingFollowsTheEnabledRoles) {
         {"artwork capped at 40,000-byte images: one in flight and the baseline", SMALL_ARTWORK,
          171764, INBOUND_MAX_MESSAGE_BYTES, 0, 0},
         {"Control: the default player, its advertised share capped at the ring's largest item",
-         PLAYER, 1242704, INBOUND_MAX_MESSAGE_BYTES, 621312, 0},
+         PLAYER, 1245200, INBOUND_MAX_MESSAGE_BYTES, 622560, 0},
         {"the default player, a time burst every second: its share fits the larger ring", PLAYER,
          1439888, INBOUND_MAX_MESSAGE_BYTES, 666666, 0, 1000},
-        {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1823352,
+        {"every role", PLAYER | VISUALIZER | ARTWORK | CONTROLLER_METADATA, 1825848,
          INBOUND_MAX_MESSAGE_BYTES, 666666, 585},
     };
     for (const Row& row : rows) {

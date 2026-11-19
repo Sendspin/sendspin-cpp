@@ -155,14 +155,10 @@ static_assert(SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS * US_PER_MS < INT32_
               "liveness cap exceeds the 32-bit arrival stamp's range");
 
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config) {
-    // The next message goes out after at most one inter-burst interval, and an unanswered one
-    // times out after one response timeout. Not value_or(): it would evaluate the derivation,
-    // which can overflow, even when unused.
-    const int64_t timeout_ms =
-        config.liveness_timeout_ms.has_value()
-            ? config.liveness_timeout_ms.value()
-            : (LIVENESS_TOLERATED_MISSES + 1) *
-                  (config.time_burst_interval_ms + config.time_burst_response_timeout_ms);
+    // start() holds burst starts at most MAX_BURST_SPACING_MS apart, so the bound, not the
+    // configured interval, keeps a short cadence from shortening the window to a stall's length.
+    const int64_t timeout_ms = config.liveness_timeout_ms.value_or(
+        (LIVENESS_TOLERATED_MISSES + 1) * SendspinClientConfig::MAX_BURST_SPACING_MS);
     if (timeout_ms > SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS) {
         SS_LOGW(TAG, "Liveness timeout of %" PRId64 " ms exceeds the maximum, using %" PRId64 " ms",
                 timeout_ms, SendspinClientConfig::MAX_LIVENESS_TIMEOUT_MS);
@@ -989,7 +985,8 @@ uint32_t ConnectionManager::run_time_sync() {
                     this->client_->request_high_performance(false);
                     entry.high_performance_held = false;
                 }
-                if (&entry == primary) {
+                // A filter with no measurement yet has no error to report.
+                if (&entry == primary && conn->is_time_synced()) {
                     this->client_->post_time_sync_error(conn->time_filter().get_error());
                 }
             }

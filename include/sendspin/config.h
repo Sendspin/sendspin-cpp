@@ -321,22 +321,32 @@ struct SendspinClientConfig {
     /// @brief Maximum simultaneous inbound connections, clamped to 7 on ESP
     uint8_t server_max_connections{DEFAULT_SERVER_MAX_CONNECTIONS};
 
-    static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
-    static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
+    /// @brief messaging.md "Clock Synchronization": the fewest messages a burst may hold; start()
+    /// refuses a smaller time_burst_size
+    static constexpr uint8_t MIN_BURST_SIZE = 8;
+    /// @brief messaging.md "Clock Synchronization": the furthest apart consecutive bursts may
+    /// start. start() refuses a longer interval, or a timeout with which a burst losing every
+    /// reply would outlast it.
+    static constexpr int64_t MAX_BURST_SPACING_MS = 10000;
+    /// @brief Default ms from one burst's start to the next's, a second under MAX_BURST_SPACING_MS
+    /// for the main loop's high-performance grant, which a burst's first message waits for
+    static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = MAX_BURST_SPACING_MS - 1000;
+    static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 1000;  ///< Default burst timeout ms
 
-    static constexpr uint8_t DEFAULT_BURST_SIZE = 8;  ///< Default messages per time sync burst
+    static constexpr uint8_t DEFAULT_BURST_SIZE = MIN_BURST_SIZE;  ///< Default messages per burst
 
     uint8_t time_burst_size{DEFAULT_BURST_SIZE};  ///< Number of messages per time sync burst
-    int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};  ///< Milliseconds between bursts
+    /// Milliseconds from one burst's start to the next's
+    int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};
     int64_t time_burst_response_timeout_ms{
         DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
 
     static constexpr int64_t MAX_LIVENESS_TIMEOUT_MS = 30LL * 60 * 1000;  ///< Liveness timeout cap
 
     /// @brief Milliseconds of inbound silence before the established connection is dropped as
-    /// dead. Unset derives it from the time burst settings, tolerating two consecutive unanswered
-    /// time messages (60000 with the defaults); 0 disables. Set or derived, it is capped at
-    /// MAX_LIVENESS_TIMEOUT_MS.
+    /// dead. Unset is three times MAX_BURST_SPACING_MS (30000), tolerating two consecutive time
+    /// bursts with no reply whatever the burst settings; 0 disables. Set or derived, it is capped
+    /// at MAX_LIVENESS_TIMEOUT_MS.
     std::optional<int64_t> liveness_timeout_ms{};
 
     /// @brief Memory placement for the shared inbound ring every admitted connection receives

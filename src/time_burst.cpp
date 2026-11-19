@@ -17,12 +17,16 @@
 #include "connection.h"
 #include "constants.h"
 #include "platform/logging.h"
-#include "platform/time.h"
 #include "time_filter.h"
 
 namespace sendspin {
 
 static const char* const TAG = "sendspin.time_burst";
+
+static_assert(SendspinClientConfig::DEFAULT_BURST_SIZE *
+                      SendspinClientConfig::DEFAULT_BURST_TIMEOUT_MS <
+                  SendspinClientConfig::DEFAULT_BURST_INTERVAL_MS,
+              "a default burst losing every reply outlasts the default interval");
 
 // ============================================================================
 // Public API
@@ -46,12 +50,13 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
     if (this->burst_index_ >= this->burst_size_) {
         // The caller's permission is the one gate on opening a burst: the burst it opens is the one
         // starts_burst() reported at the same `now_ms`, which the caller has prepared for.
-        if (!may_open_burst ||
-            now_ms - this->last_burst_complete_time_ < this->burst_interval_ms_) {
+        if (!may_open_burst || !this->starts_burst(now_ms)) {
             return {.sent = false, .burst_completed = false};
         }
-        // Start a new burst
+        // Start a new burst. messaging.md "Clock Synchronization" bounds how far apart bursts
+        // start, so the interval runs from here.
         this->burst_index_ = 0;
+        this->last_burst_start_time_ = now_ms;
         this->best_max_error_ = std::numeric_limits<int64_t>::max();
         SS_LOGV(TAG, "Starting new time burst");
         // Fall through to send first message
@@ -63,7 +68,7 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
             SS_LOGW(TAG, "Time message %u/%u timed out", this->burst_index_ + 1, this->burst_size_);
             conn->cancel_time_frame();
             this->pending_embedded_ = 0;
-            return {.sent = false, .burst_completed = this->retire_message(conn, now_ms)};
+            return {.sent = false, .burst_completed = this->retire_message(conn)};
         }
         return {.sent = false, .burst_completed = false};
     }
@@ -79,7 +84,7 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn, int64_t now_ms
     }
 
     SS_LOGD(TAG, "Time message %u/%u not sent", this->burst_index_ + 1, this->burst_size_);
-    return {.sent = false, .burst_completed = this->retire_message(conn, now_ms)};
+    return {.sent = false, .burst_completed = this->retire_message(conn)};
 }
 
 bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeResponse& response) {
@@ -114,7 +119,6 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, const TimeRes
                                        this->best_timestamp_);
             SS_LOGV(TAG, "Burst complete, best max_error: %" PRId64 " us", this->best_max_error_);
         }
-        this->last_burst_complete_time_ = platform_time_us() / US_PER_MS;
         this->pending_burst_completed_ = true;
         return true;
     }
@@ -133,7 +137,7 @@ uint32_t SendspinTimeBurst::ms_until_due(int64_t now_ms) const {
     int64_t due_ms = now_ms;
     if (this->burst_index_ >= this->burst_size_) {
         // loop() starts the next burst once the interval has fully elapsed.
-        due_ms = this->last_burst_complete_time_ + this->burst_interval_ms_;
+        due_ms = this->last_burst_start_time_ + this->burst_interval_ms_;
     } else if (this->pending_embedded_ != 0) {
         // loop() times the message out once strictly more than the timeout has passed.
         due_ms = this->current_message_sent_time_ + this->response_timeout_ms_ + 1;
@@ -146,12 +150,12 @@ void SendspinTimeBurst::configure(uint8_t burst_size, int64_t burst_interval_ms,
     this->burst_size_ = burst_size;
     this->burst_interval_ms_ = burst_interval_ms;
     this->response_timeout_ms_ = response_timeout_ms;
-    this->burst_index_ = burst_size;  // "complete" state; next loop will wait for interval
+    this->reset();
 }
 
 void SendspinTimeBurst::reset() {
-    this->burst_index_ = this->burst_size_;  // "complete" state; next loop will wait for interval
-    this->last_burst_complete_time_ = 0;
+    this->burst_index_ = this->burst_size_;  // "complete" state
+    this->last_burst_start_time_ = -this->burst_interval_ms_;
     this->current_message_sent_time_ = 0;
     this->pending_burst_completed_ = false;
     this->pending_embedded_ = 0;
@@ -164,7 +168,7 @@ void SendspinTimeBurst::reset() {
 // Internal helpers
 // ============================================================================
 
-bool SendspinTimeBurst::retire_message(SendspinConnection* conn, int64_t now_ms) {
+bool SendspinTimeBurst::retire_message(SendspinConnection* conn) {
     this->burst_index_++;
     if (this->burst_index_ < this->burst_size_) {
         return false;
@@ -175,7 +179,6 @@ bool SendspinTimeBurst::retire_message(SendspinConnection* conn, int64_t now_ms)
         SS_LOGV(TAG, "Burst complete (with retired messages), best max_error: %" PRId64 " us",
                 this->best_max_error_);
     }
-    this->last_burst_complete_time_ = now_ms;
     return true;
 }
 
