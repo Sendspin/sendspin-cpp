@@ -163,7 +163,10 @@ struct VisualizerRole::Impl : RoleTeardown {
     /// @brief Hands a frame to the drain thread: by its ring item when it has one (clearing
     /// `message.item`), otherwise copied into an item the protocol task acquires.
     /// @param message The decrypted frame; `data` points at its message type byte.
-    void handle_binary(uint8_t binary_type, InboundMessage& message);
+    /// @return false when the message is a protocol error per roles/visualizer/v1.md
+    /// "Visualization Data (Binary)" and the caller must close the connection; true when handed
+    /// over or discarded.
+    bool handle_binary(uint8_t binary_type, InboundMessage& message);
     void handle_stream_start(const VisualizerStreamPayload& stream);
     void handle_stream_end();
     void handle_stream_clear();

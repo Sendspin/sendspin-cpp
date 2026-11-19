@@ -195,12 +195,14 @@ std::vector<uint8_t> frame_message(uint8_t type, const std::vector<uint8_t>& dat
     return message;
 }
 
-// Hands `data` to the role as wire type `type`, outside any ring item.
-void hand(VisualizerRole::Impl& impl, uint8_t type, const std::vector<uint8_t>& data) {
+// Hands `data` to the role as wire type `type`, outside any ring item, and returns what
+// handle_binary() reported.
+bool hand(VisualizerRole::Impl& impl, uint8_t type, const std::vector<uint8_t>& data) {
     std::vector<uint8_t> bytes = frame_message(type, data);
     InboundMessage message = message_over(bytes);
-    impl.handle_binary(type, message);
+    const bool accepted = impl.handle_binary(type, message);
     take_in_ring_order(*impl.drain_task->inbound.ring());
+    return accepted;
 }
 
 // One item the drain thread would take: its item type (the wire type) and the message bytes it
@@ -325,14 +327,41 @@ TEST(VisualizerDeliveryWait, DropsLateFramesAndShiftsByTheOffset) {
     }
 }
 
-TEST(VisualizerHandleBinary, DropsMessageWithoutTimestamp) {
-    auto impl = make_impl();
+// roles/visualizer/v1.md "Visualization Data (Binary)": a message shorter than its timestamp is a
+// protocol error the caller closes the connection on, and so is one whose payload the role would
+// discard (messaging.md "Communication": a discarded payload still gets the role's required
+// message checks).
+TEST(VisualizerHandleBinary, AMessageShorterThanItsTimestampIsAProtocolError) {
+    struct Row {
+        const char* name;
+        size_t timestamp_bytes;
+        bool stream_active;
+        bool negotiated;
+        bool accepted;
+        bool handed_over;
+    };
+    const Row rows[] = {
+        {"one timestamp byte short", 7, true, true, false, false},
+        {"one timestamp byte short, no stream", 7, false, true, false, false},
+        {"one timestamp byte short, type not negotiated", 7, true, false, false, false},
+        {"Control: a whole timestamp, type not negotiated", 8, true, false, true, false},
+        {"Control: a whole timestamp", 8, true, true, true, true},
+    };
 
-    std::vector<uint8_t> data(7, 0);  // fewer than the 8 timestamp bytes
-    hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->stream_active = row.stream_active;
+        if (!row.negotiated) {
+            impl->negotiated_types_mask = 0;
+        }
 
-    Entry entry;
-    EXPECT_FALSE(pop_entry(*impl, entry));
+        EXPECT_EQ(hand(*impl, SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
+                       std::vector<uint8_t>(row.timestamp_bytes, 0)),
+                  row.accepted);
+        Entry entry;
+        EXPECT_EQ(pop_entry(*impl, entry), row.handed_over);
+    }
 }
 
 TEST(VisualizerHandleBinary, DropsWhenStreamInactive) {
