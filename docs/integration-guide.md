@@ -984,10 +984,12 @@ gesture performed before the activation arrives leaves the window standing open,
 within its lifetime proceeds without a prompt.
 
 The gesture is also the deliberate operator action `pairing.md` "Rounds" requires to clear a
-standing dynamic round limit. A device that offers either pairing-code method should therefore
-implement the gesture: prompt on `on_open_pairing_window` and call `confirm_pairing_window()` once
-the operator performs it. Without that a gated attempt waits at `client/pair-pending` until the
-server's own timeout cancels it.
+standing dynamic round limit, which it does only while no attempt is under way: a gesture made
+during an attempt leaves the limit standing, and the next attempt it holds back prompts again. A
+device that offers either pairing-code method should therefore implement the gesture: prompt on
+`on_open_pairing_window` and call `confirm_pairing_window()` once the operator performs it.
+Without that a gated attempt waits at `client/pair-pending` until the server's own timeout cancels
+it.
 
 #### The locations hint
 

@@ -727,8 +727,9 @@ public:
     /// already waiting proceeds immediately; otherwise the window stands open for 5 minutes and
     /// admits pairing attempts on one connection without a further gesture. It closes before
     /// those 5 minutes are up when a pairing under it succeeds, when the connection it is bound
-    /// to is lost, after five attempts fail verification, or on cancel_pairing_window(). The
-    /// gesture also clears a standing dynamic-pairing-code round limit.
+    /// to is lost, after five attempts fail verification, or on cancel_pairing_window(). Made
+    /// while no pairing attempt is under way, the gesture also clears a standing
+    /// dynamic-pairing-code round limit.
     void confirm_pairing_window();
 
     /// @brief Signals that the operator cancelled the pairing window.

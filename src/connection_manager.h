@@ -459,8 +459,8 @@ public:
     /// @brief Opens the pairing window (SendspinClient::confirm_pairing_window(), the operator
     /// gesture). If an attempt is already waiting in AWAIT_PAIRING_WINDOW, the window admits it
     /// immediately; otherwise it stands open for WINDOW_LIFETIME_US (5 minutes) awaiting a
-    /// pairing activate. The gesture is also the deliberate operator action that clears a
-    /// standing round limit (pairing.md "Rounds").
+    /// pairing activate. Made at a standing round limit with no attempt under way, the gesture
+    /// also resets the round count (pairing.md "Rounds").
     void open_pairing_window();
 
     /// @brief Closes the pairing window (SendspinClient::cancel_pairing_window()).
