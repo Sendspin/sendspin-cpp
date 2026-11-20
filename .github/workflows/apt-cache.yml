@@ -8,7 +8,7 @@ name: Seed apt cache
 # only restores and reinstalls, and fails if the entry no longer installs.
 on:
   push:
-    branches: [main]
+    branches: [main, ci-cache-apt-packages]
   schedule:
     - cron: '23 6 * * *'
   # Manual "Run workflow" from the Actions tab.

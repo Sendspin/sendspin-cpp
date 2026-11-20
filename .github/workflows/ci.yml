@@ -3,7 +3,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci-cache-apt-packages]
   pull_request:
     branches: [main]
 
