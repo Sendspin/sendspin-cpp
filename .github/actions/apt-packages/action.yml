@@ -71,10 +71,10 @@ runs:
         debs="${HOME}/.cache/apt-debs"
         read -ra package_list <<< "${PACKAGES}"
         # Every apt call is bounded; timeout runs under sudo so it can kill apt-get itself. Each
-        # install names packages, never .deb files: apt then takes a deb from the archives
-        # folder only if its hash matches the image's signed package lists, so a tampered or
-        # incomplete entry, or one whose debs don't match the lists, fails --no-download and
-        # falls through to the download.
+        # install names packages, never .deb files, so apt takes a cached deb only where its name
+        # and size match the version the image's package lists pick; an entry that is incomplete
+        # or holds other versions (a previous image's, say) fails --no-download and falls through
+        # to the download. A named .deb would be installed whatever its version.
         apt_get() {
           local limit="$1"
           shift
@@ -82,6 +82,10 @@ runs:
             -o Dir::Cache::archives="${debs}" "$@"
         }
 
+        # No hash check: apt matches a cached deb by name and size only, but only someone able to
+        # write the cache entry could plant a deb that passes, and actions/cache extracts with
+        # `tar -P`, so they could write files anywhere without one. The exposure is who can write
+        # main's cache scope, not this check.
         if [ -n "${RESTORED_KEY}" ] && compgen -G "${debs}/*.deb" > /dev/null; then
           if apt_get 120 install --no-download "${package_list[@]}"; then
             echo "Installed ${PACKAGES} from cache entry ${RESTORED_KEY}"
@@ -93,9 +97,16 @@ runs:
             exit 1
           fi
           echo "::warning::Cached packages from ${RESTORED_KEY} did not install; downloading them instead"
+          # An install that dpkg started (one the time limit killed, say) leaves it half-configured.
+          sudo DEBIAN_FRONTEND=noninteractive timeout -k 10 60 dpkg --configure -a || true
         fi
 
-        sudo rm -rf "${debs}"
+        # A job that doesn't save keeps what it restored: the download reuses every deb whose name
+        # and size still match (most of a previous image's entry, say) and fetches only the rest.
+        # A saving run starts clean, so its entry holds only debs it downloaded.
+        if [ "${SAVE}" = true ]; then
+          sudo rm -rf "${debs}"
+        fi
         mkdir -p "${debs}/partial"
         # The mirror calls share one 300 s budget rather than a limit each. The mirror has run as
         # slow as 25 kB/s, which still fetched these few MB in under 2 minutes, while apt's own
@@ -113,7 +124,7 @@ runs:
           net_apt install --download-only "${package_list[@]}"
         }
         # Try the image's own package lists first: they are usually fresh enough, and refreshing
-        # them is the step a congested mirror makes slow. Refresh only if a package 404s.
+        # them is the step a congested mirror makes slow. Refresh only if that download fails.
         refreshed=false
         if ! download; then
           # A failing third-party source must not stop the retry; the download reports real failures.
