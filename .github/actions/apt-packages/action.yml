@@ -28,14 +28,15 @@ runs:
         # The runner sets ImageOS/ImageVersion; os-release covers runners that don't. The image
         # version is in the key because the debs only fit the package lists of the image they
         # were resolved against. The prefix without it lets a PR try the previous image's entry
-        # until main reseeds.
+        # until main reseeds. The key ends in a delimiter because the cache prefix-matches even
+        # the primary key: without it, image version 20261116.202.1 would also match .202.10.
         image_os="${ImageOS:-$(. /etc/os-release && echo "${ID}${VERSION_ID}")}"
         packages_hash="$(sha256sum <<< "${packages}" | cut -c1-12)"
         prefix="apt-v${cache_version}-${packages_hash}-${image_os}-$(uname -m)-"
         {
           echo "packages=${packages}"
           echo "prefix=${prefix}"
-          echo "key=${prefix}${ImageVersion:-unknown}"
+          echo "key=${prefix}${ImageVersion:-unknown}-"
         } >> "${GITHUB_OUTPUT}"
 
         # The debs are downloaded by root into a runner-owned folder, which apt's _apt sandbox
@@ -48,6 +49,10 @@ runs:
     - name: Restore cached packages
       id: restore
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      env:
+        # A stalled cache download gives up after 2 minutes instead of the default 10, leaving
+        # the mirror fallback its time. Restores take seconds.
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: "2"
       with:
         path: ~/.cache/apt-debs/*.deb
         key: ${{ steps.key.outputs.key }}
@@ -60,6 +65,7 @@ runs:
       env:
         PACKAGES: ${{ steps.key.outputs.packages }}
         RESTORED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        EXACT_HIT: ${{ steps.restore.outputs.cache-hit }}
         SAVE: ${{ inputs.save }}
       run: |
         debs="${HOME}/.cache/apt-debs"
@@ -82,7 +88,7 @@ runs:
             exit 0
           fi
           # Saved entries can't be overwritten, so the seed fails to flag a cache_version bump.
-          if [ "${SAVE}" = true ]; then
+          if [ "${EXACT_HIT}" = true ] && [ "${SAVE}" = true ]; then
             echo "::error::Cache entry ${RESTORED_KEY} no longer installs; bump cache_version"
             exit 1
           fi
@@ -91,16 +97,27 @@ runs:
 
         sudo rm -rf "${debs}"
         mkdir -p "${debs}/partial"
-        # The mirror has run as slow as 25 kB/s, which still fetches these few MB within 300 s.
+        # The mirror calls share one 300 s budget rather than a limit each. The mirror has run as
+        # slow as 25 kB/s, which still fetched these few MB in under 2 minutes, while apt's own
+        # 15 s timeout catches a dead connection.
+        net_deadline=$((SECONDS + 300))
+        net_apt() {
+          local left=$((net_deadline - SECONDS))
+          if [ "${left}" -lt 5 ]; then
+            echo "::error::Downloading ${PACKAGES} from the Ubuntu mirror took over 5 minutes"
+            return 1
+          fi
+          apt_get "${left}" "$@"
+        }
         download() {
-          apt_get 300 install --download-only "${package_list[@]}"
+          net_apt install --download-only "${package_list[@]}"
         }
         # Try the image's own package lists first: they are usually fresh enough, and refreshing
         # them is the step a congested mirror makes slow. Refresh only if a package 404s.
         refreshed=false
         if ! download; then
           # A failing third-party source must not stop the retry; the download reports real failures.
-          apt_get 120 update || true
+          net_apt update || true
           refreshed=true
           download
         fi
@@ -115,6 +132,7 @@ runs:
         fi
 
     - name: Save packages to the cache
+      id: save
       if: >-
         inputs.save == 'true'
         && steps.restore.outputs.cache-hit != 'true'
@@ -123,3 +141,23 @@ runs:
       with:
         path: ~/.cache/apt-debs/*.deb
         key: ${{ steps.key.outputs.key }}
+
+    # actions/cache/save only warns when an upload fails, which would leave the seed green while
+    # every job keeps downloading from the mirror. A parallel run saving the same key first passes.
+    - name: Check the entry was saved
+      id: saved
+      if: steps.save.outcome == 'success'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/apt-debs/*.deb
+        key: ${{ steps.key.outputs.key }}
+        lookup-only: true
+
+    - name: Fail if the entry is missing
+      if: steps.save.outcome == 'success' && steps.saved.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        KEY: ${{ steps.key.outputs.key }}
+      run: |
+        echo "::error::Saving cache entry ${KEY} failed; see the save step's warning"
+        exit 1
