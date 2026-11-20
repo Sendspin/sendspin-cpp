@@ -1,0 +1,38 @@
+---
+name: Seed apt cache
+
+# Fills the apt package cache that CI's host jobs restore (.github/actions/apt-packages). An entry
+# saved on a PR branch is visible to that PR alone, so this runs on main and saves the one entry
+# per runner image that every PR restores. The key includes the runner image version, so the
+# daily run reseeds after GitHub rolls out a new image even when main is quiet; on a cache hit it
+# only restores and reinstalls, and fails if the entry no longer installs.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 6 * * *'
+  # Manual "Run workflow" from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    name: Seed apt cache
+    # Must match the host jobs in ci.yml: the entry only fits the image it was resolved on.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github
+
+      - name: Install and cache the apt packages
+        uses: ./.github/actions/apt-packages
+        with:
+          save: "true"

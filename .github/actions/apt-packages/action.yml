@@ -1,0 +1,124 @@
+---
+name: Install apt packages (cached)
+description: >-
+  Installs the host jobs' apt packages from .deb files kept in the GitHub Actions cache, so a slow
+  or unreachable Ubuntu mirror only matters on a cache miss. The package list lives here and
+  nowhere else, because the cache key is derived from it.
+
+inputs:
+  save:
+    description: >-
+      "true" saves the packages when the cache has no entry for this runner image yet. Only the
+      apt-cache workflow sets it: an entry saved on a PR branch is visible to that PR alone, so
+      main saves the one entry every PR restores.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the cache key and configure apt
+      id: key
+      shell: bash
+      run: |
+        # libavahi-compat-libdnssd-dev gives the examples their mDNS code path.
+        packages="ccache libavahi-compat-libdnssd-dev"
+        # Bump to drop every saved entry, e.g. after a bad one was saved.
+        cache_version=1
+        # The runner sets ImageOS/ImageVersion; os-release covers runners that don't. The image
+        # version is in the key because the debs only fit the package lists of the image they
+        # were resolved against. The prefix without it lets a PR try the previous image's entry
+        # until main reseeds.
+        image_os="${ImageOS:-$(. /etc/os-release && echo "${ID}${VERSION_ID}")}"
+        packages_hash="$(sha256sum <<< "${packages}" | cut -c1-12)"
+        prefix="apt-v${cache_version}-${packages_hash}-${image_os}-$(uname -m)-"
+        {
+          echo "packages=${packages}"
+          echo "prefix=${prefix}"
+          echo "key=${prefix}${ImageVersion:-unknown}"
+        } >> "${GITHUB_OUTPUT}"
+
+        # The debs are downloaded by root into a runner-owned folder, which apt's _apt sandbox
+        # user can't write to. The hosted image's own zz-retries already bounds each connection.
+        echo 'APT::Sandbox::User "root";' | sudo tee /etc/apt/apt.conf.d/zzz-ci-apt > /dev/null
+        # Skip fsyncs and the man-db index rebuild: the runner is thrown away after the job.
+        echo force-unsafe-io | sudo tee /etc/dpkg/dpkg.cfg.d/99ci-unsafe-io > /dev/null
+        sudo rm -f /var/lib/man-db/auto-update
+
+    - name: Restore cached packages
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/apt-debs/*.deb
+        key: ${{ steps.key.outputs.key }}
+        # A seed on a new image downloads afresh instead of re-saving the previous image's debs.
+        restore-keys: ${{ inputs.save != 'true' && steps.key.outputs.prefix || '' }}
+
+    - name: Install packages
+      id: install
+      shell: bash
+      env:
+        PACKAGES: ${{ steps.key.outputs.packages }}
+        RESTORED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        SAVE: ${{ inputs.save }}
+      run: |
+        debs="${HOME}/.cache/apt-debs"
+        read -ra package_list <<< "${PACKAGES}"
+        # Every apt call is bounded; timeout runs under sudo so it can kill apt-get itself. Each
+        # install names packages, never .deb files: apt then takes a deb from the archives
+        # folder only if its hash matches the image's signed package lists, so a tampered or
+        # incomplete entry, or one whose debs don't match the lists, fails --no-download and
+        # falls through to the download.
+        apt_get() {
+          local limit="$1"
+          shift
+          sudo DEBIAN_FRONTEND=noninteractive timeout -k 15 "${limit}" apt-get -q -y \
+            -o Dir::Cache::archives="${debs}" "$@"
+        }
+
+        if [ -n "${RESTORED_KEY}" ] && compgen -G "${debs}/*.deb" > /dev/null; then
+          if apt_get 120 install --no-download "${package_list[@]}"; then
+            echo "Installed ${PACKAGES} from cache entry ${RESTORED_KEY}"
+            exit 0
+          fi
+          # Saved entries can't be overwritten, so the seed fails to flag a cache_version bump.
+          if [ "${SAVE}" = true ]; then
+            echo "::error::Cache entry ${RESTORED_KEY} no longer installs; bump cache_version"
+            exit 1
+          fi
+          echo "::warning::Cached packages from ${RESTORED_KEY} did not install; downloading them instead"
+        fi
+
+        sudo rm -rf "${debs}"
+        mkdir -p "${debs}/partial"
+        download() {
+          apt_get 120 install --download-only "${package_list[@]}"
+        }
+        # Try the image's own package lists first: they are usually fresh enough, and refreshing
+        # them is the step a congested mirror makes slow. Refresh only if a package 404s.
+        refreshed=false
+        if ! download; then
+          # A failing third-party source must not stop the retry; the download reports real failures.
+          apt_get 120 update || true
+          refreshed=true
+          download
+        fi
+        apt_get 120 install --no-download "${package_list[@]}"
+
+        # Debs resolved against refreshed lists would never match the image's own lists in the
+        # jobs that restore them, and there is nothing to save when the image had every package.
+        if [ "${refreshed}" = true ]; then
+          echo "::warning::The image's package lists are out of date; not caching these packages"
+        elif compgen -G "${debs}/*.deb" > /dev/null; then
+          echo "saveable=true" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Save packages to the cache
+      if: >-
+        inputs.save == 'true'
+        && steps.restore.outputs.cache-hit != 'true'
+        && steps.install.outputs.saveable == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/apt-debs/*.deb
+        key: ${{ steps.key.outputs.key }}
