@@ -10,14 +10,20 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # Its own build directory, so the trace option below never changes the main build
 BUILD_DIR="${ROOT_DIR}/build-tidy"
 
-# Find clang-tidy
-CLANG_TIDY=""
-for name in clang-tidy clang-tidy-18 clang-tidy-17 clang-tidy-16 clang-tidy-15; do
-    if command -v "$name" &> /dev/null; then
-        CLANG_TIDY="$name"
-        break
+# Find clang-tidy, unless the CLANG_TIDY environment variable names one
+if [ -n "${CLANG_TIDY:-}" ]; then
+    if ! command -v "$CLANG_TIDY" &> /dev/null; then
+        echo "Error: CLANG_TIDY=$CLANG_TIDY not found"
+        exit 1
     fi
-done
+else
+    for name in clang-tidy clang-tidy-18 clang-tidy-17 clang-tidy-16 clang-tidy-15; do
+        if command -v "$name" &> /dev/null; then
+            CLANG_TIDY="$name"
+            break
+        fi
+    done
+fi
 
 # Check Homebrew LLVM paths on macOS
 if [ -z "$CLANG_TIDY" ]; then

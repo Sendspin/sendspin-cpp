@@ -1,0 +1,174 @@
+---
+name: Install apt packages (cached)
+description: >-
+  Installs the host jobs' apt packages from .deb files kept in the GitHub Actions cache, so a slow
+  or unreachable Ubuntu mirror only matters on a cache miss. The package list lives here and
+  nowhere else, because the cache key is derived from it.
+
+inputs:
+  save:
+    description: >-
+      "true" saves the packages when the cache has no entry for this runner image yet. Only the
+      apt-cache workflow sets it: an entry saved on a PR branch is visible to that PR alone, so
+      main saves the one entry every PR restores.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the cache key and configure apt
+      id: key
+      shell: bash
+      run: |
+        # libavahi-compat-libdnssd-dev gives the examples their mDNS code path.
+        packages="ccache libavahi-compat-libdnssd-dev"
+        # Bump to drop every saved entry, e.g. after a bad one was saved.
+        cache_version=1
+        # The runner sets ImageOS/ImageVersion; os-release covers runners that don't. The image
+        # version is in the key because the debs only fit the package lists of the image they
+        # were resolved against. The prefix without it lets a PR try the previous image's entry
+        # until main reseeds. The key ends in a delimiter because the cache prefix-matches even
+        # the primary key: without it, image version 20261116.202.1 would also match .202.10.
+        image_os="${ImageOS:-$(. /etc/os-release && echo "${ID}${VERSION_ID}")}"
+        packages_hash="$(sha256sum <<< "${packages}" | cut -c1-12)"
+        prefix="apt-v${cache_version}-${packages_hash}-${image_os}-$(uname -m)-"
+        {
+          echo "packages=${packages}"
+          echo "prefix=${prefix}"
+          echo "key=${prefix}${ImageVersion:-unknown}-"
+        } >> "${GITHUB_OUTPUT}"
+
+        # The debs are downloaded by root into a runner-owned folder, which apt's _apt sandbox
+        # user can't write to. The hosted image's own zz-retries already bounds each connection.
+        echo 'APT::Sandbox::User "root";' | sudo tee /etc/apt/apt.conf.d/zzz-ci-apt > /dev/null
+        # Skip fsyncs and the man-db index rebuild: the runner is thrown away after the job.
+        echo force-unsafe-io | sudo tee /etc/dpkg/dpkg.cfg.d/99ci-unsafe-io > /dev/null
+        sudo rm -f /var/lib/man-db/auto-update
+
+    - name: Restore cached packages
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      env:
+        # A stalled cache download gives up after 2 minutes instead of the default 10, leaving
+        # the mirror fallback its time. Restores take seconds.
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: "2"
+      with:
+        path: ~/.cache/apt-debs/*.deb
+        key: ${{ steps.key.outputs.key }}
+        # A seed on a new image downloads afresh instead of re-saving the previous image's debs.
+        restore-keys: ${{ inputs.save != 'true' && steps.key.outputs.prefix || '' }}
+
+    - name: Install packages
+      id: install
+      shell: bash
+      env:
+        PACKAGES: ${{ steps.key.outputs.packages }}
+        RESTORED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        EXACT_HIT: ${{ steps.restore.outputs.cache-hit }}
+        SAVE: ${{ inputs.save }}
+      run: |
+        debs="${HOME}/.cache/apt-debs"
+        read -ra package_list <<< "${PACKAGES}"
+        # Every apt call is bounded; timeout runs under sudo so it can kill apt-get itself. Each
+        # install names packages, never .deb files, so apt takes a cached deb only where its name
+        # and size match the version the image's package lists pick; an entry that is incomplete
+        # or holds other versions (a previous image's, say) fails --no-download and falls through
+        # to the download. A named .deb would be installed whatever its version.
+        apt_get() {
+          local limit="$1"
+          shift
+          sudo DEBIAN_FRONTEND=noninteractive timeout -k 15 "${limit}" apt-get -q -y \
+            -o Dir::Cache::archives="${debs}" "$@"
+        }
+
+        # No hash check: apt matches a cached deb by name and size only, but only someone able to
+        # write the cache entry could plant a deb that passes, and actions/cache extracts with
+        # `tar -P`, so they could write files anywhere without one. The exposure is who can write
+        # main's cache scope, not this check.
+        if [ -n "${RESTORED_KEY}" ] && compgen -G "${debs}/*.deb" > /dev/null; then
+          if apt_get 120 install --no-download "${package_list[@]}"; then
+            echo "Installed ${PACKAGES} from cache entry ${RESTORED_KEY}"
+            exit 0
+          fi
+          # Saved entries can't be overwritten, so the seed fails to flag a cache_version bump.
+          if [ "${EXACT_HIT}" = true ] && [ "${SAVE}" = true ]; then
+            echo "::error::Cache entry ${RESTORED_KEY} no longer installs; bump cache_version"
+            exit 1
+          fi
+          echo "::warning::Cached packages from ${RESTORED_KEY} did not install; downloading them instead"
+          # An install that dpkg started (one the time limit killed, say) leaves it half-configured.
+          sudo DEBIAN_FRONTEND=noninteractive timeout -k 10 60 dpkg --configure -a || true
+        fi
+
+        # A job that doesn't save keeps what it restored: the download reuses every deb whose name
+        # and size still match (most of a previous image's entry, say) and fetches only the rest.
+        # A saving run starts clean, so its entry holds only debs it downloaded.
+        if [ "${SAVE}" = true ]; then
+          sudo rm -rf "${debs}"
+        fi
+        mkdir -p "${debs}/partial"
+        # The mirror calls share one 300 s budget rather than a limit each. The mirror has run as
+        # slow as 25 kB/s, which still fetched these few MB in under 2 minutes, while apt's own
+        # 15 s timeout catches a dead connection.
+        net_deadline=$((SECONDS + 300))
+        net_apt() {
+          local left=$((net_deadline - SECONDS))
+          if [ "${left}" -lt 5 ]; then
+            echo "::error::Downloading ${PACKAGES} from the Ubuntu mirror took over 5 minutes"
+            return 1
+          fi
+          apt_get "${left}" "$@"
+        }
+        download() {
+          net_apt install --download-only "${package_list[@]}"
+        }
+        # Try the image's own package lists first: they are usually fresh enough, and refreshing
+        # them is the step a congested mirror makes slow. Refresh only if that download fails.
+        refreshed=false
+        if ! download; then
+          # A failing third-party source must not stop the retry; the download reports real failures.
+          net_apt update || true
+          refreshed=true
+          download
+        fi
+        apt_get 120 install --no-download "${package_list[@]}"
+
+        # Debs resolved against refreshed lists would never match the image's own lists in the
+        # jobs that restore them, and there is nothing to save when the image had every package.
+        if [ "${refreshed}" = true ]; then
+          echo "::warning::The image's package lists are out of date; not caching these packages"
+        elif compgen -G "${debs}/*.deb" > /dev/null; then
+          echo "saveable=true" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Save packages to the cache
+      id: save
+      if: >-
+        inputs.save == 'true'
+        && steps.restore.outputs.cache-hit != 'true'
+        && steps.install.outputs.saveable == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/apt-debs/*.deb
+        key: ${{ steps.key.outputs.key }}
+
+    # actions/cache/save only warns when an upload fails, which would leave the seed green while
+    # every job keeps downloading from the mirror. A parallel run saving the same key first passes.
+    - name: Check the entry was saved
+      id: saved
+      if: steps.save.outcome == 'success'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/apt-debs/*.deb
+        key: ${{ steps.key.outputs.key }}
+        lookup-only: true
+
+    - name: Fail if the entry is missing
+      if: steps.save.outcome == 'success' && steps.saved.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        KEY: ${{ steps.key.outputs.key }}
+      run: |
+        echo "::error::Saving cache entry ${KEY} failed; see the save step's warning"
+        exit 1

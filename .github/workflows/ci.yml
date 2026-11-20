@@ -14,10 +14,12 @@ concurrency:
 permissions:
   contents: read
 
+# Every job pins ubuntu-26.04 rather than ubuntu-latest, so an image change is deliberate: the
+# cached apt packages (.github/actions/apt-packages) and the lint job's clang-tidy-21 fit it.
 jobs:
   pre-commit:
     name: Pre-commit checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -29,21 +31,20 @@ jobs:
 
   lint:
     name: Static analysis
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-tidy libavahi-compat-libdnssd-dev
-
       - name: Run clang-tidy
+        # The image's own clang-tidy-21, named so an image change cannot swap the version and its
+        # findings; it is the version Ubuntu 26.04's clang-tidy package installs.
+        env:
+          CLANG_TIDY: clang-tidy-21
         run: ./script/clang-tidy.sh
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The host CMake build compiles through ccache once it is installed. Every host job restores
     # its newest cache, but only pushes to main save one, so PR runs reuse main's objects without
     # filling the repository's cache quota.
@@ -53,10 +54,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ccache libavahi-compat-libdnssd-dev
+      - name: Install apt packages
+        uses: ./.github/actions/apt-packages
 
       - name: Restore ccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -83,17 +82,15 @@ jobs:
 
   test:
     name: Unit tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 300M
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ccache libavahi-compat-libdnssd-dev
+      - name: Install apt packages
+        uses: ./.github/actions/apt-packages
 
       - name: Restore ccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -126,17 +123,15 @@ jobs:
 
   test-no-opus:
     name: Build and test without Opus
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 300M
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ccache libavahi-compat-libdnssd-dev
+      - name: Install apt packages
+        uses: ./.github/actions/apt-packages
 
       - name: Restore ccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -169,17 +164,15 @@ jobs:
 
   test-tsan:
     name: Unit tests (ThreadSanitizer)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 300M
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ccache libavahi-compat-libdnssd-dev
+      - name: Install apt packages
+        uses: ./.github/actions/apt-packages
 
       - name: Restore ccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -220,7 +213,7 @@ jobs:
 
   esp-idf:
     name: ESP-IDF ${{ matrix.idf }} build (${{ matrix.config.name }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     container: espressif/idf:${{ matrix.idf }}
     strategy:
       fail-fast: false
@@ -261,7 +254,7 @@ jobs:
   ci:
     name: CI
     needs: [pre-commit, lint, build, test, test-no-opus, test-tsan, esp-idf]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     if: always()
     steps:
       - name: Verify all jobs passed
