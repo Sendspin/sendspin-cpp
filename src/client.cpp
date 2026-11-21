@@ -1245,14 +1245,37 @@ void SendspinClient::drain_inbox() {
 
     // --- Role events: bit-gated so an idle tick performs zero inbox mutex acquisitions here ---
     // Each role drain takes its slot first and catches the role up on its teardowns before
-    // applying anything (see TeardownTracker). The source has no role drain.
-    this->for_each_role([slot_bits](auto& impl, SendspinRole) {
-        if constexpr (requires { impl.needs_drain(slot_bits); }) {
-            if (impl.needs_drain(slot_bits)) {
-                impl.drain_events();
-            }
-        }
-    });
+    // applying anything (see TeardownTracker).
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (this->player_ && this->player_->impl_->needs_drain(slot_bits)) {
+        this->player_->impl_->drain_events();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    if (this->controller_ && this->controller_->impl_->needs_drain(slot_bits)) {
+        this->controller_->impl_->drain_events();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    if (this->metadata_ && this->metadata_->impl_->needs_drain(slot_bits)) {
+        this->metadata_->impl_->drain_events();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    if (this->color_ && this->color_->impl_->needs_drain(slot_bits)) {
+        this->color_->impl_->drain_events();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    if (this->artwork_ && this->artwork_->impl_->needs_drain(slot_bits)) {
+        this->artwork_->impl_->drain_events();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_ && this->visualizer_->impl_->needs_drain(slot_bits)) {
+        this->visualizer_->impl_->drain_events();
+    }
+#endif
 
     // --- Group update events ---
     if ((slot_bits & INBOX_TOPIC_GROUP) != 0) {
