@@ -20,6 +20,7 @@
 // except CPaceDraft21Vectors, which come from the spec itself.
 
 #include "crypto/cpace.h"
+#include "crypto_test_helpers.h"
 #include "test_util.h"
 #include "field25519.h"
 #include "platform/crypto.h"

@@ -27,9 +27,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <optional>
-#include <string>
-#include <vector>
 
 // noise-c is a C library; wrap the includes in extern "C" to avoid C++
 // name-mangling issues when compiling under -Wpedantic.
@@ -46,7 +43,7 @@ namespace sendspin {
 /// @brief Number of bytes in a SHA-256 digest.
 static constexpr size_t SHA256_DIGEST_SIZE = 32;
 
-/// @brief Streaming SHA-256. For one or two buffers, use the sha256_oneshot() overloads below.
+/// @brief Streaming SHA-256.
 class Sha256 {
 public:
     Sha256() {
@@ -109,25 +106,6 @@ private:
     // 8-bit fields
     bool failed_{false};
 };
-
-/// @brief Compute SHA-256(data, len).
-inline std::array<uint8_t, SHA256_DIGEST_SIZE> sha256_oneshot(const uint8_t* data, size_t len) {
-    Sha256 h;
-    h.update(data, len);
-    return h.finalize();
-}
-
-/// @brief Compute SHA-256(prefix, prefix_len || suffix, suffix_len).
-/// Used for psk_id derivation: SHA-256(PSK_ID_LABEL || psk).
-inline std::array<uint8_t, SHA256_DIGEST_SIZE> sha256_oneshot(const uint8_t* prefix,
-                                                              size_t prefix_len,
-                                                              const uint8_t* suffix,
-                                                              size_t suffix_len) {
-    Sha256 h;
-    h.update(prefix, prefix_len);
-    h.update(suffix, suffix_len);
-    return h.finalize();
-}
 
 // ============================================================================
 // SHA-512
@@ -393,13 +371,6 @@ std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512_streamed(const uint8_t* key,
     return mac;
 }
 
-/// @brief Compute HMAC-SHA-512(key, data); see hmac_sha512_streamed().
-inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, size_t key_len,
-                                                           const uint8_t* data, size_t data_len) {
-    return hmac_sha512_streamed(key, key_len,
-                                [data, data_len](Sha512& inner) { inner.update(data, data_len); });
-}
-
 // ============================================================================
 // CSPRNG
 // ============================================================================
@@ -474,11 +445,8 @@ private:
 /// (ChaChaPoly uses a 16-byte tag).
 static constexpr size_t AEAD_TAG_SIZE = 16;
 
-/// @brief Number of bytes in the fixed nonce used by aead_oneshot_encrypt/decrypt.
-static constexpr size_t AEAD_ONESHOT_NONCE_SIZE = 12;
-
 /// @brief Map a full Noise suite name (e.g. "Noise_KKpsk2_25519_ChaChaPoly_SHA256") to the
-/// noise-c cipher name ("ChaChaPoly") for use with aead_oneshot_encrypt/decrypt. The client only
+/// noise-c cipher name ("ChaChaPoly") for use with aead_oneshot_encrypt(). The client only
 /// ever negotiates ChaChaPoly, so this validates the suite string rather than selecting between
 /// alternatives. Returns nullptr if the suite name does not contain the expected cipher
 /// component.
@@ -526,41 +494,6 @@ inline bool aead_oneshot_encrypt(const char* cipher_name, const uint8_t* key, si
         secure_zero(out, out_len);
     }
     return sealed;
-}
-
-/// @brief Decrypt `ciphertext` (ciphertext || tag) with the named AEAD cipher, key `key`, an
-/// all-zero 12-byte nonce, and empty associated data. Returns the plaintext, or nullopt on any
-/// cipher-allocation failure or AEAD authentication failure (wrong key or corrupted input).
-inline std::optional<std::vector<uint8_t>> aead_oneshot_decrypt(const char* cipher_name,
-                                                                const uint8_t* key, size_t key_len,
-                                                                const uint8_t* ciphertext,
-                                                                size_t ciphertext_len) {
-    NoiseCipherState* cipher = nullptr;
-    int err = noise_cipherstate_new_by_name(&cipher, cipher_name);
-    if (err != NOISE_ERROR_NONE || cipher == nullptr) {
-        return std::nullopt;
-    }
-    err = noise_cipherstate_init_key(cipher, key, key_len);
-    if (err != NOISE_ERROR_NONE) {
-        noise_cipherstate_free(cipher);
-        return std::nullopt;
-    }
-    err = noise_cipherstate_set_nonce(cipher, 0);
-    if (err != NOISE_ERROR_NONE) {
-        noise_cipherstate_free(cipher);
-        return std::nullopt;
-    }
-
-    std::vector<uint8_t> buf(ciphertext, ciphertext + ciphertext_len);
-    NoiseBuffer nbuf;
-    noise_buffer_set_inout(nbuf, buf.data(), buf.size(), buf.size());
-    err = noise_cipherstate_decrypt_with_ad(cipher, nullptr, 0, &nbuf);
-    noise_cipherstate_free(cipher);
-    if (err != NOISE_ERROR_NONE) {
-        return std::nullopt;
-    }
-    buf.resize(nbuf.size);
-    return buf;
 }
 
 // ============================================================================

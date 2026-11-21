@@ -27,12 +27,40 @@
 #include "platform/crypto.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
+
+/// @brief Decrypts `ciphertext` (ciphertext || tag) with the named AEAD cipher, an all-zero
+/// nonce and empty associated data: the inverse of sendspin::aead_oneshot_encrypt().
+/// @return The plaintext, or nullopt on a cipher-allocation or authentication failure.
+inline std::optional<std::vector<uint8_t>> aead_oneshot_decrypt(const char* cipher_name,
+                                                                const uint8_t* key, size_t key_len,
+                                                                const uint8_t* ciphertext,
+                                                                size_t ciphertext_len) {
+    NoiseCipherState* cipher = nullptr;
+    if (noise_cipherstate_new_by_name(&cipher, cipher_name) != NOISE_ERROR_NONE ||
+        cipher == nullptr) {
+        return std::nullopt;
+    }
+    std::vector<uint8_t> buf(ciphertext, ciphertext + ciphertext_len);
+    NoiseBuffer nbuf;
+    noise_buffer_set_inout(nbuf, buf.data(), buf.size(), buf.size());
+    const bool opened = noise_cipherstate_init_key(cipher, key, key_len) == NOISE_ERROR_NONE &&
+                        noise_cipherstate_set_nonce(cipher, 0) == NOISE_ERROR_NONE &&
+                        noise_cipherstate_decrypt_with_ad(cipher, nullptr, 0, &nbuf) ==
+                            NOISE_ERROR_NONE;
+    noise_cipherstate_free(cipher);
+    if (!opened) {
+        return std::nullopt;
+    }
+    buf.resize(nbuf.size);
+    return buf;
+}
 
 /// @brief Opens a field sealed by sendspin::wrap_value(), as the server does.
 /// @param label       Per-field wrap label (PSK_WRAP_LABEL or NONCE_WRAP_LABEL).
@@ -49,8 +77,8 @@ inline std::optional<std::array<uint8_t, 32>> unwrap_value_as_server(
     if (!k_wrap.has_value()) {
         return std::nullopt;
     }
-    auto pt = sendspin::aead_oneshot_decrypt(cipher_name, k_wrap->data(), k_wrap->size(),
-                                             wrapped.data(), wrapped.size());
+    auto pt = aead_oneshot_decrypt(cipher_name, k_wrap->data(), k_wrap->size(), wrapped.data(),
+                                   wrapped.size());
     sendspin::secure_zero_container(k_wrap.value());
     if (!pt.has_value() || pt->size() != 32) {
         return std::nullopt;

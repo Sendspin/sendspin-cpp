@@ -65,7 +65,9 @@ inline std::array<uint8_t, NOISE_PSK_SIZE> make_random_psk() {
 /// server_id form a record can be stored under. Deterministic, so a test can spell the same
 /// server twice.
 inline std::string test_peer_id(const std::string& name) {
-    auto key = sha256_oneshot(reinterpret_cast<const uint8_t*>(name.data()), name.size());
+    Sha256 hash;
+    hash.update(reinterpret_cast<const uint8_t*>(name.data()), name.size());
+    auto key = hash.finalize();
     return b64url_encode(key.data(), key.size());
 }
 

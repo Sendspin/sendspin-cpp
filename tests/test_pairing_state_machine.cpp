@@ -58,6 +58,7 @@
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -960,8 +961,10 @@ protected:
         auto nonce_b = unwrap_value_as_server(NONCE_WRAP_LABEL, "ChaChaPoly", server.initiator.sid(),
                                     server.initiator.isk().value(), wrapped);
         ASSERT_TRUE(nonce_b.has_value()) << "server-side unwrap of wrapped_nonce_B failed";
-        EXPECT_TRUE(pairing_code_verify_commit(nonce_b->data(), nonce_b->size(), commit_b->data(),
-                                               commit_b->size()))
+        auto reopened = pairing_code_commit(nonce_b->data(), nonce_b->size());
+        ASSERT_TRUE(reopened.has_value());
+        EXPECT_TRUE(std::equal(reopened->begin(), reopened->end(), commit_b->begin(),
+                               commit_b->end()))
             << "the revealed nonce does not open the commitment sent in client/pair-init";
     }
 
