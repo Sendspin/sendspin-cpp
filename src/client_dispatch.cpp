@@ -114,7 +114,7 @@ namespace {
 /// close_silently()). Protocol task only.
 [[maybe_unused]] void close_on_malformed_binary(SendspinConnection* conn, SendspinRole role) {
     SS_LOGW(TAG, "Malformed %s message; closing connection", to_cstr(role));
-    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+    conn->close_silently();
 }
 
 }  // namespace
@@ -628,12 +628,8 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
             if (!msg1_bytes.has_value() ||
                 !conn->handle_noise_rehandshake({msg1_bytes->data(), msg1_bytes->size()})) {
                 SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
-                // Do not leave a half-swapped session. UNAUTHORIZED is the closest available
-                // reason for a crypto failure, though close_silently() never transmits it
-                // (connection.md "Failure Handling": close without any application-level
-                // message). disconnect() can block on a transport join, which close_silently()
-                // avoids; see close_transport_now()'s doc comment in connection.h.
-                conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+                // Do not leave a half-swapped session (connection.md "Failure Handling").
+                conn->close_silently();
             }
             break;
         }
@@ -706,7 +702,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 // error the client MUST close the connection on, so nothing else in the message is
                 // applied. Closed silently, like every other protocol error the receive path finds
                 // (see close_silently()).
-                conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+                conn->close_silently();
                 break;
             }
 #endif
@@ -787,7 +783,7 @@ void SendspinClient::process_json_message(SendspinConnection& connection, const 
                 // close_silently()). One the client had no memory to normalize closes it too,
                 // rather than applying the rest of the update under the previous group's id; on the
                 // next connection the server sends the group again after its first server/activate.
-                conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+                conn->close_silently();
                 break;
             }
             if (group_msg.group_id_normalized && conn->note_group_id_normalized()) {

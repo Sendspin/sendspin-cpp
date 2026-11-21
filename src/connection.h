@@ -337,7 +337,7 @@ public:
     /// block on a transport join; see close_transport_now()). The inbound gate is detached first,
     /// so nothing the peer sent after the failure is processed, and the protocol task reports the
     /// loss.
-    void close_silently(SendspinGoodbyeReason /*reason*/) {
+    void close_silently() {
         this->detach_inbound();
         this->close_transport_now();
     }

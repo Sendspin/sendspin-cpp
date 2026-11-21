@@ -195,21 +195,11 @@ static bool decode_flac_codec_header(std::string_view encoded, FlacCodecHeader* 
 }
 
 static bool process_player_stream_object(const JsonObject player_object,
-                                         PlayerStreamPayload* player, bool require_all_fields) {
+                                         PlayerStreamPayload* player) {
     if (player == nullptr) {
         return false;
     }
     PlayerStreamParams* player_obj = &player->params;
-
-    if (require_all_fields) {
-        if (!player_object["bit_depth"].is<JsonVariant>() ||
-            !player_object["channels"].is<JsonVariant>() ||
-            !player_object["sample_rate"].is<JsonVariant>() ||
-            !player_object["codec"].is<JsonVariant>()) {
-            SS_LOGE(TAG, "Invalid player object: missing required fields");
-            return false;
-        }
-    }
 
     if (player_object["codec"].is<JsonVariant>()) {
         auto codec = codec_format_from_string(player_object["codec"].as<std::string_view>());
@@ -886,7 +876,7 @@ static bool process_stream_start_player(JsonObject payload,
         return true;
     }
     PlayerStreamPayload& player_obj = player->emplace();
-    if (!process_player_stream_object(payload["player"], &player_obj, true)) {
+    if (!process_player_stream_object(payload["player"], &player_obj)) {
         return false;
     }
     if (!player_obj.params.is_complete()) {

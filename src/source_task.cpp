@@ -160,7 +160,7 @@ bool SourceTask::start(ProtocolTask* protocol_task) {
                               config.psram_stack);
     this->task_thread_ = std::thread(thread_entry, this);
     this->event_flags_.wait(SourceTaskBits::SOURCE_TASK_IDLE | SourceTaskBits::SOURCE_TASK_STOPPED,
-                            false, false, UINT32_MAX);
+                            false, UINT32_MAX);
     return true;
 }
 

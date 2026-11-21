@@ -586,7 +586,7 @@ public:
     /// only.
     /// @return The bits among `bits` that were set; 0 on timeout.
     uint32_t take_signals(uint32_t bits, uint32_t timeout_ms) {
-        return this->flags_.wait(bits, false, true, timeout_ms) & bits;
+        return this->flags_.wait(bits, true, timeout_ms) & bits;
     }
 
     /// @brief Clears every bit. Before the consumer thread starts, while the list is empty.

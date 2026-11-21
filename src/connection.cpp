@@ -142,7 +142,7 @@ SsErr SendspinConnection::settle_noise_send(SsErr err) {
         this->is_connected()) {
         SS_LOGW(TAG, "Send failed after its frame was encrypted (err=%d); closing the connection",
                 static_cast<int>(err));
-        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        this->close_silently();
     }
     return err;
 }
@@ -237,7 +237,7 @@ void SendspinConnection::send_noise_client_init() {
         // No memory for the prologue: without client/init the peer never proceeds, so the
         // connection would only hold its nursery slot until the establish deadline.
         this->noise_handshake_.reset();
-        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        this->close_silently();
         return;
     }
 #ifdef SENDSPIN_ENABLE_MESSAGE_TRACE
@@ -271,7 +271,7 @@ void SendspinConnection::handle_noise_handshake_text(std::string_view text) {
         // connection.md "Failure Handling": a handshake-phase failure closes the WebSocket
         // without sending any application-level message.
         this->noise_handshake_.reset();
-        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        this->close_silently();
         return;
     }
 
@@ -424,7 +424,7 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
             // connection.md "Failure Handling": a cleartext message after the switch to transport
             // mode is a silent failure.
             SS_LOGW(TAG, "TEXT frame in transport mode; closing connection");
-            this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+            this->close_silently();
             return InboundDispatch::NONE;
         }
         SS_LOGW(TAG, "TEXT frame before the Noise handshake started; dropping");
@@ -439,7 +439,7 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
             // with the Noise/PSK/admission chain bypassed. Treated as a handshake-phase failure
             // per connection.md "Failure Handling": close without any application-level message.
             SS_LOGW(TAG, "Binary frame before the Noise handshake completed; closing connection");
-            this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+            this->close_silently();
             return InboundDispatch::NONE;
         }
         SS_LOGW(TAG, "Binary frame before the Noise handshake started; dropping");
@@ -456,7 +456,7 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
         // advances the receive-direction nonce counter on an auth failure, so every later frame
         // on this connection would fail authentication forever too.
         SS_LOGW(TAG, "Noise AEAD failure in transport mode; closing connection");
-        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        this->close_silently();
         return InboundDispatch::NONE;
     }
     // Route through the fragment state machine; hand any completed message to the caller.
@@ -466,7 +466,7 @@ SS_HOT SendspinConnection::InboundDispatch SendspinConnection::process_inbound_m
         // A protocol error the receiver MUST close the connection for;
         // NoiseTransport::CompleteMessage::malformed enumerates the cases that set it.
         SS_LOGW(TAG, "Malformed binary message; closing connection");
-        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        this->close_silently();
         return InboundDispatch::NONE;
     }
     if (reassembled.data == nullptr) {

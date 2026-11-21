@@ -33,7 +33,7 @@ namespace sendspin {
  * @brief Bit-flag group that supports blocking waits on one or more bits
  *
  * Backed by a FreeRTOS event group on ESP and a mutex/condition-variable pair on host.
- * Threads can block until any or all of a set of bits are set, with an optional timeout.
+ * Threads can block until any of a set of bits is set, with an optional timeout.
  * Call create() before any other method.
  *
  * Usage:
@@ -50,7 +50,7 @@ namespace sendspin {
  * flags.set(0x01);
  *
  * // In another thread:
- * uint32_t bits = flags.wait(0x01, false, true, 1000);
+ * uint32_t bits = flags.wait(0x01, true, 1000);
  * @endcode
  */
 class EventFlags {
@@ -108,15 +108,14 @@ public:
         return xEventGroupGetBits(this->handle_);
     }
 
-    /// @brief Waits for bits to be set
+    /// @brief Waits for any of the given bits to be set
     /// @param bits_to_wait Bitmask of bits to wait for.
-    /// @param wait_all If true, wait for ALL bits; if false, wait for ANY bit.
     /// @param clear_on_exit If true, clear the waited bits before returning.
     /// @param timeout_ms Milliseconds to wait (UINT32_MAX = wait forever).
     /// @return The bit pattern at the time the wait completed or timed out.
-    uint32_t wait(uint32_t bits_to_wait, bool wait_all, bool clear_on_exit, uint32_t timeout_ms) {
+    uint32_t wait(uint32_t bits_to_wait, bool clear_on_exit, uint32_t timeout_ms) {
         return xEventGroupWaitBits(this->handle_, bits_to_wait, clear_on_exit ? pdTRUE : pdFALSE,
-                                   wait_all ? pdTRUE : pdFALSE, platform_ms_to_ticks(timeout_ms));
+                                   pdFALSE, platform_ms_to_ticks(timeout_ms));
     }
 
 private:
@@ -145,9 +144,8 @@ namespace sendspin {
 /**
  * @brief Bit-flag group that supports blocking waits on one or more bits
  *
- * Backed by a mutex/condition-variable pair on host. Threads can block until any or
- * all of a set of bits are set, with an optional timeout. Call create() before any
- * other method.
+ * Backed by a mutex/condition-variable pair on host. Threads can block until any of a set
+ * of bits is set, with an optional timeout. Call create() before any other method.
  *
  * Usage:
  * 1. Declare an EventFlags member and call create() during initialization
@@ -163,7 +161,7 @@ namespace sendspin {
  * flags.set(0x01);
  *
  * // In another thread:
- * uint32_t bits = flags.wait(0x01, false, true, 1000);
+ * uint32_t bits = flags.wait(0x01, true, 1000);
  * @endcode
  */
 class EventFlags {
@@ -224,21 +222,15 @@ public:
         return this->bits_;
     }
 
-    /// @brief Waits for bits to be set
+    /// @brief Waits for any of the given bits to be set
     /// @param bits_to_wait Bitmask of bits to wait for.
-    /// @param wait_all If true, wait for ALL bits; if false, wait for ANY bit.
     /// @param clear_on_exit If true, clear the waited bits before returning.
     /// @param timeout_ms Milliseconds to wait (UINT32_MAX = wait forever).
     /// @return The bit pattern at the time the wait completed or timed out.
-    uint32_t wait(uint32_t bits_to_wait, bool wait_all, bool clear_on_exit, uint32_t timeout_ms) {
+    uint32_t wait(uint32_t bits_to_wait, bool clear_on_exit, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
 
-        auto pred = [&]() -> bool {
-            if (wait_all) {
-                return (this->bits_ & bits_to_wait) == bits_to_wait;
-            }
-            return (this->bits_ & bits_to_wait) != 0;
-        };
+        auto pred = [&]() -> bool { return (this->bits_ & bits_to_wait) != 0; };
 
         if (!pred()) {
             if (timeout_ms == 0) {

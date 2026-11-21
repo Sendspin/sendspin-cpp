@@ -143,10 +143,10 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
 
     // psk_id lives inside msg1's encrypted payload, so the PSK is not known yet when the
     // session is built. KKpsk2 mixes the PSK only into msg2, so msg1 authenticates under the
-    // static keys alone (KK's "es"/"ss" tokens); build the responder with no PSK bound and
-    // defer that until it is resolved below (see NoiseSession::set_psk).
+    // static keys alone (KK's "es"/"ss" tokens); the PSK is bound once it is resolved below
+    // (see NoiseSession::set_psk).
     auto session = NoiseSession::as_responder(suite_name, identity.private_bytes.data(),
-                                              server_pub->data(), prologue, prologue_len, nullptr);
+                                              server_pub->data(), prologue, prologue_len);
     if (!session.has_value()) {
         SS_LOGE(TAG, "%s: failed to build session", log_prefix);
         return std::nullopt;

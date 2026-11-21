@@ -201,7 +201,7 @@ bool SyncTask::start(InboundRing* ring, bool task_stack_in_psram, unsigned prior
     this->sync_thread_ = std::thread(thread_entry, this);
 
     // Wait for the thread to reach IDLE before returning
-    this->event_flags_.wait(EventGroupBits::TASK_IDLE | EventGroupBits::TASK_STOPPED, false, false,
+    this->event_flags_.wait(EventGroupBits::TASK_IDLE | EventGroupBits::TASK_STOPPED, false,
                             UINT32_MAX);
 
     return true;
@@ -903,8 +903,7 @@ bool SyncTask::wait_for_start_acknowledgement(SyncContext& sync_context) {
             // reads idle, and this task never ran it, so note idle for it again.
             this->player_impl_->note_sync_idle();
         }
-        this->event_flags_.wait(EventGroupBits::COMMAND_START | LEAVE_BITS, false, false,
-                                UINT32_MAX);
+        this->event_flags_.wait(EventGroupBits::COMMAND_START | LEAVE_BITS, false, UINT32_MAX);
     }
 }
 
