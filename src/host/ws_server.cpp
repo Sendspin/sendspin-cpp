@@ -46,8 +46,8 @@ SendspinWsServer::~SendspinWsServer() {
     this->stop();
 }
 
-bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*/,
-                             unsigned /*task_priority*/, size_t /*task_stack_size*/) {
+bool SendspinWsServer::start(bool /*task_stack_in_psram*/, unsigned /*task_priority*/,
+                             size_t /*task_stack_size*/) {
     if (this->server_ != nullptr) {
         SS_LOGW(TAG, "Server already started");
         return true;
@@ -60,8 +60,6 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
         SS_LOGE(TAG, "Failed to initialize the network stack");
         return false;
     }
-
-    this->client_ = client;
 
     // Create IXWebSocket server on the configured port. max_connections_ is enforced here (IX
     // closes surplus sockets at accept), so the configured budget is real on host, matching the
