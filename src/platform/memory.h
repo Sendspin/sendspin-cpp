@@ -169,11 +169,6 @@ public:
         return true;
     }
 
-    /// @brief Returns the location preference last passed to allocate()
-    MemoryLocation location() const {
-        return this->location_;
-    }
-
     /// @brief Frees the held memory
     void reset() {
         if (this->ptr_ != nullptr) {
