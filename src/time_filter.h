@@ -62,46 +62,6 @@ struct TimeTransform {
 /// other threads read its transform().
 class SendspinTimeFilter {
 public:
-    /// @brief Configuration parameters for the time synchronization filter.
-    struct Config {
-        /// Diffusion coefficient for offset random walk, in µs / sqrt(µs), modeling clock jitter.
-        /// Offset variance grows by process_std_dev² * dt per µs of elapsed time.
-        double process_std_dev = 0.0;
-        /// Diffusion coefficient for drift random walk, in 1 / sqrt(µs), modeling frequency wander.
-        /// Drift is dimensionless (µs of offset per µs of time), so its variance grows by
-        /// drift_process_std_dev² * dt per µs of elapsed time.
-        double drift_process_std_dev = 1e-11;
-        /// Forgetting factor (>1) applied to covariances when large residuals are detected.
-        /// Higher values enable faster recovery from disruptions but may reduce stability.
-        double forget_factor = 2.0;
-        /// Multiple of max_error that triggers adaptive forgetting.
-        /// When residual > adaptive_cutoff * max_error, forgetting is applied; values > 1 require
-        /// larger residuals.
-        double adaptive_cutoff = 3.0;
-        /// Minimum number of samples before adaptive forgetting is enabled.
-        /// Building sufficient history before enabling forgetting improves stability.
-        uint8_t min_samples = 100U;  // NOLINT(readability-magic-numbers)
-        /// SNR threshold for applying drift compensation in time conversions.
-        /// Drift is only used when drift² > threshold² * drift_covariance, ensuring
-        /// the drift estimate is statistically significant before applying corrections.
-        double drift_significance_threshold = 2.0;
-        /// Scale factor applied to max_error before it is used as the measurement standard
-        /// deviation. Values < 1 indicate the round-trip half-delay overestimates true measurement
-        /// noise.
-        double max_error_scale = 0.5;
-    };
-
-    // ========================================
-    // Lifecycle
-    // ========================================
-
-    /// @brief Constructs a Kalman filter for time synchronization.
-    ///
-    /// @param config Filter configuration parameters. See Config for field documentation and
-    /// defaults.
-    explicit SendspinTimeFilter(const Config& config);
-    SendspinTimeFilter();
-
     // ========================================
     // Core API
     // ========================================
@@ -149,14 +109,6 @@ public:
     // Accessors
     // ========================================
 
-    /// @brief Returns the offset variance in microseconds squared.
-    ///
-    /// Provides the raw variance value from the Kalman filter's covariance matrix. This represents
-    /// the statistical uncertainty in the offset estimate.
-    ///
-    /// @return Variance of the offset estimate in microseconds squared.
-    int64_t get_covariance() const;
-
     /// @brief Returns the estimated standard deviation of the offset in microseconds.
     ///
     /// Provides a measure of the current synchronization accuracy by computing the square root of
@@ -179,22 +131,15 @@ protected:
     // ========================================
 
     // 64-bit fields
-    const double adaptive_forgetting_cutoff;
     double drift_{0.0};
     double drift_covariance_{0.0};
-    const double drift_process_variance;
-    const double drift_significance_threshold_squared;
-    const double forget_variance_factor;
     int64_t last_update_{0};
-    const double max_error_scale;
     double offset_{0.0};
     double offset_covariance_{std::numeric_limits<double>::infinity()};
     double offset_drift_covariance_{0.0};
-    const double process_variance;
 
     // 8-bit fields
     uint8_t count_{0};
-    const uint8_t min_samples_for_forgetting;
     bool use_drift_{false};
 };
 
