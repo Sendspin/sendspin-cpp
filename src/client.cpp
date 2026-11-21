@@ -210,13 +210,38 @@ struct HighPerformanceRequests {
     uint32_t releases{0};
 };
 
-/// @brief Whether `role` is in `mask`, logging the teardown once per role rather than once per
-/// call site.
-[[maybe_unused]] bool role_removed(uint16_t mask, SendspinRole role) {
-    if ((mask & role_mask_bit(role)) == 0) {
+/// @brief Whether `type` is the *_CLEARED event `role`'s cleanup() queues
+[[maybe_unused]] constexpr bool is_cleared_event_of(InboxEventType type, SendspinRole role) {
+    switch (role) {
+        case SendspinRole::PLAYER:
+            return type == InboxEventType::PLAYER_CLEARED;
+        case SendspinRole::CONTROLLER:
+            return type == InboxEventType::CONTROLLER_CLEARED;
+        case SendspinRole::METADATA:
+            return type == InboxEventType::METADATA_CLEARED;
+        case SendspinRole::ARTWORK:
+            return type == InboxEventType::ARTWORK_CLEARED;
+        case SendspinRole::VISUALIZER:
+            return type == InboxEventType::VISUALIZER_CLEARED;
+        case SendspinRole::COLOR:
+            return type == InboxEventType::COLOR_CLEARED;
+        case SendspinRole::SOURCE:
+            return type == InboxEventType::SOURCE_CLEARED;
+        case SendspinRole::COUNT:
+            break;
+    }
+    return false;
+}
+
+/// @brief Whether `event`, a stream event of `impl`'s role, carries the role's current teardown
+/// generation (logged as `what` when not), catching the role up on that teardown when it does
+template <typename RoleImpl>
+bool take_stream_event(RoleImpl& impl, const InboxEvent& event, const char* what) {
+    if (!event_is_current(event.epoch, impl.cleanup_generation.load(std::memory_order_acquire), TAG,
+                          what)) {
         return false;
     }
-    SS_LOGI(TAG, "Role %s left its connection: stopping the role", to_cstr(role));
+    catch_up_teardown(impl, event.epoch);
     return true;
 }
 
@@ -388,6 +413,45 @@ struct SendspinClient::TaskState {
     /// latest one. Protocol task only.
     uint32_t high_performance_requests{0};
 };
+
+template <typename Visit>
+void SendspinClient::for_each_role([[maybe_unused]] Visit&& visit) const {
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (this->player_) {
+        visit(*this->player_->impl_, SendspinRole::PLAYER);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    if (this->controller_) {
+        visit(*this->controller_->impl_, SendspinRole::CONTROLLER);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    if (this->metadata_) {
+        visit(*this->metadata_->impl_, SendspinRole::METADATA);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    if (this->color_) {
+        visit(*this->color_->impl_, SendspinRole::COLOR);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    if (this->artwork_) {
+        visit(*this->artwork_->impl_, SendspinRole::ARTWORK);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_) {
+        visit(*this->visualizer_->impl_, SendspinRole::VISUALIZER);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        visit(*this->source_->impl_, SendspinRole::SOURCE);
+    }
+#endif
+}
 
 // ============================================================================
 // Constructor / Destructor
@@ -985,50 +1049,14 @@ void SendspinClient::drain_inbox() {
 
     // Catches each role up on a teardown: with `cleared` null, to the role's current generation;
     // otherwise only the role a *_CLEARED event names, to the generation it carries.
-    // [[maybe_unused]]: with every role compiled out the body is empty.
-    const auto catch_up_roles = [&]([[maybe_unused]] const InboxEvent* cleared) {
-        [[maybe_unused]] const auto catch_up = [cleared](auto& impl, InboxEventType type) {
+    const auto catch_up_roles = [this](const InboxEvent* cleared) {
+        this->for_each_role([cleared](auto& impl, SendspinRole role) {
             if (cleared == nullptr) {
                 catch_up_teardown(impl, impl.cleanup_generation.load(std::memory_order_acquire));
-            } else if (cleared->type == type) {
+            } else if (is_cleared_event_of(cleared->type, role)) {
                 catch_up_teardown(impl, cleared->epoch);
             }
-        };
-#ifdef SENDSPIN_ENABLE_PLAYER
-        if (this->player_) {
-            catch_up(*this->player_->impl_, InboxEventType::PLAYER_CLEARED);
-        }
-#endif
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-        if (this->controller_) {
-            catch_up(*this->controller_->impl_, InboxEventType::CONTROLLER_CLEARED);
-        }
-#endif
-#ifdef SENDSPIN_ENABLE_METADATA
-        if (this->metadata_) {
-            catch_up(*this->metadata_->impl_, InboxEventType::METADATA_CLEARED);
-        }
-#endif
-#ifdef SENDSPIN_ENABLE_COLOR
-        if (this->color_) {
-            catch_up(*this->color_->impl_, InboxEventType::COLOR_CLEARED);
-        }
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-        if (this->artwork_) {
-            catch_up(*this->artwork_->impl_, InboxEventType::ARTWORK_CLEARED);
-        }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-        if (this->visualizer_) {
-            catch_up(*this->visualizer_->impl_, InboxEventType::VISUALIZER_CLEARED);
-        }
-#endif
-#ifdef SENDSPIN_ENABLE_SOURCE
-        if (this->source_) {
-            catch_up(*this->source_->impl_, InboxEventType::SOURCE_CLEARED);
-        }
-#endif
+        });
     };
 
     // --- Server information ---
@@ -1087,12 +1115,8 @@ void SendspinClient::drain_inbox() {
                     // awaiting_sync_idle_events (the sync-idle gate itself is untouched).
                     case InboxEventType::PLAYER_STREAM: {
 #ifdef SENDSPIN_ENABLE_PLAYER
-                        if (this->player_ &&
-                            event_is_current(event.epoch,
-                                             this->player_->impl_->cleanup_generation.load(
-                                                 std::memory_order_acquire),
-                                             TAG, "a player stream event")) {
-                            catch_up_teardown(*this->player_->impl_, event.epoch);
+                        if (this->player_ && take_stream_event(*this->player_->impl_, event,
+                                                               "a player stream event")) {
                             this->player_->impl_->on_stream_ring_event(event);
                         }
 #endif
@@ -1116,12 +1140,8 @@ void SendspinClient::drain_inbox() {
                     // held_events, which its role drain fires.
                     case InboxEventType::ARTWORK_STREAM: {
 #ifdef SENDSPIN_ENABLE_ARTWORK
-                        if (this->artwork_ &&
-                            event_is_current(event.epoch,
-                                             this->artwork_->impl_->cleanup_generation.load(
-                                                 std::memory_order_acquire),
-                                             TAG, "an artwork stream event")) {
-                            catch_up_teardown(*this->artwork_->impl_, event.epoch);
+                        if (this->artwork_ && take_stream_event(*this->artwork_->impl_, event,
+                                                                "an artwork stream event")) {
                             this->artwork_->impl_->handle_stream_ring_event(
                                 static_cast<ArtworkEventType>(event.code));
                         }
@@ -1130,12 +1150,8 @@ void SendspinClient::drain_inbox() {
                     }
                     case InboxEventType::VISUALIZER_STREAM: {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-                        if (this->visualizer_ &&
-                            event_is_current(event.epoch,
-                                             this->visualizer_->impl_->cleanup_generation.load(
-                                                 std::memory_order_acquire),
-                                             TAG, "a visualizer stream event")) {
-                            catch_up_teardown(*this->visualizer_->impl_, event.epoch);
+                        if (this->visualizer_ && take_stream_event(*this->visualizer_->impl_, event,
+                                                                   "a visualizer stream event")) {
                             this->visualizer_->impl_->on_stream_ring_event(event);
                         }
 #endif
@@ -1144,12 +1160,8 @@ void SendspinClient::drain_inbox() {
                     // SOURCE_STREAM: code is the role-local SourceStreamEventType.
                     case InboxEventType::SOURCE_STREAM: {
 #ifdef SENDSPIN_ENABLE_SOURCE
-                        if (this->source_ &&
-                            event_is_current(event.epoch,
-                                             this->source_->impl_->cleanup_generation.load(
-                                                 std::memory_order_acquire),
-                                             TAG, "a source stream event")) {
-                            catch_up_teardown(*this->source_->impl_, event.epoch);
+                        if (this->source_ && take_stream_event(*this->source_->impl_, event,
+                                                               "a source stream event")) {
                             this->source_->impl_->handle_stream_ring_event(
                                 static_cast<SourceStreamEventType>(event.code));
                         }
@@ -1233,37 +1245,14 @@ void SendspinClient::drain_inbox() {
 
     // --- Role events: bit-gated so an idle tick performs zero inbox mutex acquisitions here ---
     // Each role drain takes its slot first and catches the role up on its teardowns before
-    // applying anything (see TeardownTracker).
-#ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_ && this->player_->impl_->needs_drain(slot_bits)) {
-        this->player_->impl_->drain_events();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (this->controller_ && this->controller_->impl_->needs_drain(slot_bits)) {
-        this->controller_->impl_->drain_events();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_METADATA
-    if (this->metadata_ && this->metadata_->impl_->needs_drain(slot_bits)) {
-        this->metadata_->impl_->drain_events();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_COLOR
-    if (this->color_ && this->color_->impl_->needs_drain(slot_bits)) {
-        this->color_->impl_->drain_events();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_ && this->artwork_->impl_->needs_drain(slot_bits)) {
-        this->artwork_->impl_->drain_events();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_ && this->visualizer_->impl_->needs_drain(slot_bits)) {
-        this->visualizer_->impl_->drain_events();
-    }
-#endif
+    // applying anything (see TeardownTracker). The source has no role drain.
+    this->for_each_role([slot_bits](auto& impl, SendspinRole) {
+        if constexpr (requires { impl.needs_drain(slot_bits); }) {
+            if (impl.needs_drain(slot_bits)) {
+                impl.drain_events();
+            }
+        }
+    });
 
     // --- Group update events ---
     if ((slot_bits & INBOX_TOPIC_GROUP) != 0) {
@@ -1512,27 +1501,13 @@ ClientStateMessage SendspinClient::build_client_state() const {
     state_msg.available = this->available_;
 
     // Every role's object: the protocol task sends each admitted connection the objects of the
-    // roles it owns and has active (client_state_for_roles()).
-#ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        this->player_->impl_->build_state_fields(state_msg);
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_) {
-        this->artwork_->impl_->build_state_fields(state_msg);
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_) {
-        this->visualizer_->impl_->build_state_fields(state_msg);
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_SOURCE
-    if (this->source_) {
-        this->source_->impl_->build_state_fields(state_msg);
-    }
-#endif
+    // roles it owns and has active (client_state_for_roles()). Only the player, artwork,
+    // visualizer and source have one.
+    this->for_each_role([&state_msg](auto& impl, SendspinRole) {
+        if constexpr (requires { impl.build_state_fields(state_msg); }) {
+            impl.build_state_fields(state_msg);
+        }
+    });
     return state_msg;
 }
 
@@ -1605,43 +1580,13 @@ void SendspinClient::cleanup_connection_state(uint16_t teardown_roles) {
         });
     }
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_ && (teardown_roles & role_mask_bit(SendspinRole::PLAYER)) != 0) {
-        this->player_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (this->controller_ && (teardown_roles & role_mask_bit(SendspinRole::CONTROLLER)) != 0) {
-        this->controller_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_METADATA
-    if (this->metadata_ && (teardown_roles & role_mask_bit(SendspinRole::METADATA)) != 0) {
-        this->metadata_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_COLOR
-    if (this->color_ && (teardown_roles & role_mask_bit(SendspinRole::COLOR)) != 0) {
-        this->color_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_ && (teardown_roles & role_mask_bit(SendspinRole::ARTWORK)) != 0) {
-        this->artwork_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_ && (teardown_roles & role_mask_bit(SendspinRole::VISUALIZER)) != 0) {
-        this->visualizer_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_SOURCE
-    // The connection is going away, or stop() ended the stream in its shutdown pass: the stream
-    // closes without a client-stream/end.
-    if (this->source_ && (teardown_roles & role_mask_bit(SendspinRole::SOURCE)) != 0) {
-        this->source_->impl_->cleanup();
-    }
-#endif
+    // For the source, the connection is going away, or stop() ended the stream in its shutdown
+    // pass: the stream closes without a client-stream/end.
+    this->for_each_role([teardown_roles](auto& impl, SendspinRole role) {
+        if ((teardown_roles & role_mask_bit(role)) != 0) {
+            impl.cleanup();
+        }
+    });
 }
 
 bool SendspinClient::hello_within_cap() {
@@ -1706,41 +1651,7 @@ void SendspinClient::build_client_hello(ClientHelloMessage& msg) {
     msg.application_roles = this->config_.application_roles;
 
     // Let each role add its fields to the hello message
-#ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        this->player_->impl_->build_hello_fields(msg);
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (this->controller_) {
-        this->controller_->impl_->build_hello_fields(msg);
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_METADATA
-    if (this->metadata_) {
-        this->metadata_->impl_->build_hello_fields(msg);
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_COLOR
-    if (this->color_) {
-        this->color_->impl_->build_hello_fields(msg);
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_) {
-        this->artwork_->impl_->build_hello_fields(msg);
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_) {
-        this->visualizer_->impl_->build_hello_fields(msg);
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_SOURCE
-    if (this->source_) {
-        this->source_->impl_->build_hello_fields(msg);
-    }
-#endif
+    this->for_each_role([&msg](auto& impl, SendspinRole) { impl.build_hello_fields(msg); });
 }
 
 // ============================================================================
@@ -1966,8 +1877,7 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     this->publish_client_state(conn);
 }
 
-void SendspinClient::apply_role_removals([[maybe_unused]] SendspinConnection* conn,
-                                         [[maybe_unused]] uint16_t removed_roles) {
+void SendspinClient::apply_role_removals(SendspinConnection* conn, uint16_t removed_roles) {
     // messaging.md "server/activate", "When applying a server/activate, the client MUST": every
     // removed server-to-client stream role stops its remaining output and clears its buffers, even
     // where an earlier stream/end had let buffered data finish, and every removed role with a
@@ -1979,47 +1889,21 @@ void SendspinClient::apply_role_removals([[maybe_unused]] SendspinConnection* co
     // the role may be re-added later. Coming back is the role's ordinary start path: a role
     // whose state object the server needs again is carried by the client/state the activation
     // publishes, and a stream role re-arms on the next stream/start.
-#ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_ && role_removed(removed_roles, SendspinRole::PLAYER)) {
-        this->player_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (this->controller_ && role_removed(removed_roles, SendspinRole::CONTROLLER)) {
-        this->controller_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_METADATA
-    if (this->metadata_ && role_removed(removed_roles, SendspinRole::METADATA)) {
-        this->metadata_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_COLOR
-    if (this->color_ && role_removed(removed_roles, SendspinRole::COLOR)) {
-        this->color_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    // roles/artwork/v1.md "Server -> Client: Artwork (Binary)" clears the current image and
-    // discards the pending one for the whole role, which is what cleanup() carries out per
-    // channel.
-    if (this->artwork_ && role_removed(removed_roles, SendspinRole::ARTWORK)) {
-        this->artwork_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_ && role_removed(removed_roles, SendspinRole::VISUALIZER)) {
-        this->visualizer_->impl_->cleanup();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_SOURCE
-    // roles/source/v1.md "Source command semantics": the removal clears the authorization and ends
-    // an open stream with client-stream/end, on a connection that stays up.
-    if (this->source_ && role_removed(removed_roles, SendspinRole::SOURCE)) {
-        this->source_->impl_->end_stream(conn);
-        this->source_->impl_->cleanup();
-    }
-#endif
+    this->for_each_role([conn, removed_roles](auto& impl, SendspinRole role) {
+        if ((removed_roles & role_mask_bit(role)) == 0) {
+            return;
+        }
+        SS_LOGI(TAG, "Role %s left its connection: stopping the role", to_cstr(role));
+        // roles/source/v1.md "Source command semantics": the removal clears the authorization and
+        // ends an open stream with client-stream/end, on a connection that stays up.
+        if constexpr (requires { impl.end_stream(conn); }) {
+            impl.end_stream(conn);
+        }
+        // For artwork, roles/artwork/v1.md "Server -> Client: Artwork (Binary)" clears the current
+        // image and discards the pending one for the whole role, which cleanup() carries out per
+        // channel.
+        impl.cleanup();
+    });
 }
 
 void SendspinClient::end_playback_streams([[maybe_unused]] SendspinConnection* conn) {

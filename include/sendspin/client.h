@@ -844,6 +844,11 @@ private:
     bool send_controller_command(const ClientCommandControllerObject& cmd, uint16_t generation);
 #endif
 
+    /// @brief Calls `visit(impl, role)` with each added role's Impl and SendspinRole, in the
+    /// order player, controller, metadata, color, artwork, visualizer, source.
+    template <typename Visit>
+    void for_each_role(Visit&& visit) const;
+
     /// @brief The protocol-task half of a teardown: when `teardown_roles` covers every role, wipes
     /// the event ring, the pending group and time-sync slots, and the pairing notes other than a
     /// dismissal already owed; and runs cleanup() on each role in
