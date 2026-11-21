@@ -138,11 +138,6 @@ public:
     /// @return false when the storage cannot be allocated or the size is refused.
     bool create(size_t storage_bytes, MemoryLocation location);
 
-    /// @brief Whether create() succeeded
-    bool is_created() const {
-        return this->ring_.is_created();
-    }
-
     /// @brief The largest message capacity an acquire() can succeed for: what an item of the
     /// ring's largest size (SharedRingLayout::max_item_size(), half its storage) holds after its
     /// header. Written by create(); read by any thread after it.

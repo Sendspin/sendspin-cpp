@@ -58,6 +58,7 @@
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -88,7 +89,11 @@ namespace {
 /// so this harness's needs can diverge without disturbing that file's fixture.
 class FakeConnection : public SendspinConnection {
 public:
-    FakeConnection() = default;
+    /// The suite name init_noise_handshake() would record, so the wrapping (pairing.md
+    /// "Wrapping") resolves an AEAD cipher without an active Noise session.
+    FakeConnection() {
+        this->noise_suite_name_ = "Noise_KKpsk2_25519_ChaChaPoly_SHA256";
+    }
     ~FakeConnection() override = default;
 
     // Interface stubs
@@ -122,12 +127,6 @@ public:
         return this->canned_hash_;
     }
 
-    /// Report a canned Noise suite name without an active Noise session, so the wrapping
-    /// (pairing.md "Wrapping") can resolve an AEAD cipher during the PAIR_CONFIRM step.
-    const char* get_noise_suite_name() const override {
-        return this->canned_suite_name_.c_str();
-    }
-
     // Accumulated outgoing messages / disconnect bookkeeping
 
     std::vector<std::string> sent_text_;
@@ -138,7 +137,6 @@ public:
 
 private:
     std::optional<std::array<uint8_t, 32>> canned_hash_{std::array<uint8_t, 32>{}};
-    std::string canned_suite_name_{"Noise_KKpsk2_25519_ChaChaPoly_SHA256"};
     bool connected_{true};
 };
 
@@ -960,8 +958,10 @@ protected:
         auto nonce_b = unwrap_value_as_server(NONCE_WRAP_LABEL, "ChaChaPoly", server.initiator.sid(),
                                     server.initiator.isk().value(), wrapped);
         ASSERT_TRUE(nonce_b.has_value()) << "server-side unwrap of wrapped_nonce_B failed";
-        EXPECT_TRUE(pairing_code_verify_commit(nonce_b->data(), nonce_b->size(), commit_b->data(),
-                                               commit_b->size()))
+        auto reopened = pairing_code_commit(nonce_b->data(), nonce_b->size());
+        ASSERT_TRUE(reopened.has_value());
+        EXPECT_TRUE(std::equal(reopened->begin(), reopened->end(), commit_b->begin(),
+                               commit_b->end()))
             << "the revealed nonce does not open the commitment sent in client/pair-init";
     }
 

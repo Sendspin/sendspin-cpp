@@ -247,7 +247,7 @@ bool InboundGate::wait_until_writable(uint32_t timeout_ms) {
             }
             wait_ms = static_cast<uint32_t>((remaining_us + US_PER_MS - 1) / US_PER_MS);
         }
-        this->consumed_flags_.wait(CONSUMED, false, true, wait_ms);
+        this->consumed_flags_.wait(CONSUMED, true, wait_ms);
     }
     return true;
 }
@@ -315,7 +315,7 @@ void* InboundItemList::take(uint32_t timeout_ms) {
     // An append between the pop above and this wait has already set ITEMS_APPENDED, so the wait
     // returns at once rather than missing it. A bit left by an append whose item an earlier pop
     // took returns here with nothing to pop, which the caller treats as a retry.
-    this->flags_.wait(ITEMS_APPENDED | WAKE, false, true, timeout_ms);
+    this->flags_.wait(ITEMS_APPENDED | WAKE, true, timeout_ms);
     return this->pop();
 }
 

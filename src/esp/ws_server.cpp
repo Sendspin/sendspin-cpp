@@ -55,14 +55,12 @@ SendspinWsServer::~SendspinWsServer() {
     this->stop();
 }
 
-bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
-                             unsigned task_priority, size_t task_stack_size) {
+bool SendspinWsServer::start(bool task_stack_in_psram, unsigned task_priority,
+                             size_t task_stack_size) {
     if (this->server_ != nullptr) {
         SS_LOGW(TAG, "Server already started");
         return true;
     }
-
-    this->client_ = client;
 
     // Configure the HTTP server
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();

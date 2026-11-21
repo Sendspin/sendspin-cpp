@@ -102,7 +102,7 @@ void ProtocolTask::thread_entry(ProtocolTask* self) {
         const uint32_t next_deadline_ms = self->tick_();
         // NO_DEADLINE is UINT32_MAX, which EventFlags::wait() takes as no timeout.
         const uint32_t bits =
-            self->event_flags_.wait(COMMAND_STOP | WORK_PENDING, false, true, next_deadline_ms);
+            self->event_flags_.wait(COMMAND_STOP | WORK_PENDING, true, next_deadline_ms);
         if ((bits & COMMAND_STOP) != 0) {
             // One final tick, so the work queued and posted before stop() was called is seen by
             // the task.

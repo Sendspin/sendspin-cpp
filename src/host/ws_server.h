@@ -30,8 +30,6 @@
 namespace sendspin {
 
 // Forward declarations
-class SendspinClient;
-class SendspinConnection;
 class SendspinServerConnection;
 
 /**
@@ -67,8 +65,7 @@ public:
 
     /// @brief Starts the WebSocket server on the configured port; the three task parameters are
     /// ESP-IDF httpd settings and are ignored here.
-    bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority,
-               size_t task_stack_size);
+    bool start(bool task_stack_in_psram, unsigned task_priority, size_t task_stack_size);
 
     /// @brief Stops the WebSocket server and releases its resources
     void stop();
@@ -128,9 +125,6 @@ protected:
     NewConnectionCallback new_connection_callback_;
 
     // Pointer fields
-
-    /// @brief Stored as the user context for the IX callbacks
-    SendspinClient* client_{nullptr};
 
     std::unique_ptr<ix::WebSocketServer> server_;
 

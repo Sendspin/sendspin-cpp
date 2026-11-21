@@ -63,34 +63,10 @@ std::optional<std::array<uint8_t, 32>> digest_of(const DeriveInputs& in) {
 }  // namespace
 
 // ============================================================================
-// pairing_code_commit / pairing_code_verify_commit
+// pairing_code_commit
 // ============================================================================
 
-TEST(PairingCodeCommit, RoundTripSucceeds) {
-    auto nonce = pairing_generate_nonce();
-    auto commitment = pairing_code_commit(nonce.data(), nonce.size());
-    ASSERT_TRUE(commitment.has_value());
-    EXPECT_TRUE(pairing_code_verify_commit(nonce.data(), nonce.size(), commitment->data(),
-                                           commitment->size()));
-}
-
-TEST(PairingCodeCommit, WrongNonceFailsVerify) {
-    auto nonce = pairing_generate_nonce();
-    auto commitment = pairing_code_commit(nonce.data(), nonce.size());
-    ASSERT_TRUE(commitment.has_value());
-    nonce[0] ^= 0xFF;
-    EXPECT_FALSE(pairing_code_verify_commit(nonce.data(), nonce.size(), commitment->data(),
-                                            commitment->size()));
-}
-
-// The commit/verify length guards. pairing_code_commit() and pairing_code_verify_commit() are
-// one family: a commitment is only ever checked against the nonce that produced it, so both
-// lengths are guarded on both sides.
-TEST(PairingCodeCommit, LengthGuardsRejectWrongSizedArguments) {
-    const auto nonce = pairing_generate_nonce();
-    const auto commitment = pairing_code_commit(nonce.data(), nonce.size());
-    ASSERT_TRUE(commitment.has_value());
-
+TEST(PairingCodeCommit, LengthGuardRejectsWrongSizedNonce) {
     struct CommitRow {
         const char* name;
         size_t nonce_len;
@@ -107,29 +83,6 @@ TEST(PairingCodeCommit, LengthGuardsRejectWrongSizedArguments) {
     for (const CommitRow& row : commit_rows) {
         SCOPED_TRACE(row.name);
         EXPECT_EQ(pairing_code_commit(spare.data(), row.nonce_len).has_value(), row.expect_ok);
-    }
-
-    // The verify rows pin the composed contract, not one line: the nonce clause cannot be seen on
-    // its own from here, since pairing_code_commit() rejects the same length and the call would
-    // return false without it.
-    struct VerifyRow {
-        const char* name;
-        size_t nonce_len;
-        size_t commitment_len;
-        bool expect_ok;
-    };
-    const VerifyRow verify_rows[] = {
-        {"verify/short-commitment", PAIRING_NONCE_SIZE, 16, false},
-        {"verify/short-nonce", 16, PAIRING_COMMIT_SIZE, false},
-        {"verify/both-short", 16, 16, false},
-        // Control: both arguments at their defined lengths verify.
-        {"verify/both-defined-lengths", PAIRING_NONCE_SIZE, PAIRING_COMMIT_SIZE, true},
-    };
-    for (const VerifyRow& row : verify_rows) {
-        SCOPED_TRACE(row.name);
-        EXPECT_EQ(pairing_code_verify_commit(nonce.data(), row.nonce_len, commitment->data(),
-                                             row.commitment_len),
-                  row.expect_ok);
     }
 }
 

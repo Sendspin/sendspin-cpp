@@ -56,8 +56,7 @@ using NoiseMsg2 = std::array<uint8_t, NOISE_MSG2_BYTES>;
 /// @brief Noise KKpsk2 session: handshake and transport state.
 ///
 /// Construct via the factory `NoiseSession::as_responder()`.
-/// Call `read_msg1()`, then `set_psk()` (if the PSK was not supplied at
-/// construction), then `write_msg2_and_split()` to complete the handshake.
+/// Call `read_msg1()`, then `set_psk()`, then `write_msg2_and_split()` to complete the handshake.
 /// After split(), use `encrypt()` / `decrypt()` for transport traffic.
 class NoiseSession {
 public:
@@ -73,25 +72,14 @@ public:
     // Factory
     // ========================================
 
-    /// @brief Build a KKpsk2 responder session (the Sendspin client role).
-    ///
-    /// The real PSK is only known after `read_msg1` reveals the psk_id carried in its
-    /// payload, so `psk` may be null here: noise-c permits
-    /// `noise_handshakestate_set_pre_shared_key` to be called at any point before the "psk"
-    /// token is processed, which for KKpsk2 happens in msg2. The handshake driver
-    /// (noise_handshake.cpp run_msg1_core) builds the session with `psk = nullptr`, calls
-    /// `read_msg1` to expose the psk_id (KK's "es"/"ss" msg1 tokens authenticate against the
-    /// static keys and do not involve the PSK), resolves the real PSK via the record store,
-    /// binds it with `set_psk`, and only then calls `write_msg2_and_split`.
-    ///
+    /// @brief Build a KKpsk2 responder session (the Sendspin client role) with no PSK; set_psk()
+    /// binds it before write_msg2_and_split().
     /// @param prologue    Exact prologue bytes (init messages, or prior hash on re-handshake).
-    /// @param psk         32-byte PSK, or nullptr to bind it later via `set_psk`.
     /// @return Session ready for `read_msg1`, or nullopt on error.
     static std::optional<NoiseSession> as_responder(const char* suite_name,
                                                     const uint8_t* local_priv,
                                                     const uint8_t* remote_pub,
-                                                    const uint8_t* prologue, size_t prologue_len,
-                                                    const uint8_t* psk);
+                                                    const uint8_t* prologue, size_t prologue_len);
 
     // ========================================
     // Handshake

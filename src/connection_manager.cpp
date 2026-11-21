@@ -1204,7 +1204,7 @@ uint32_t ConnectionManager::maybe_start_ws_server(int64_t now_us) {
     this->ws_server_->set_discard_capacity(
         std::max(ring != nullptr ? ring->largest_message_bytes() : INBOUND_MAX_MESSAGE_BYTES,
                  InboundGate::PRE_ADMISSION_MESSAGE_BYTES));
-    if (!this->ws_server_->start(this->client_, this->client_->config_.httpd_psram_stack,
+    if (!this->ws_server_->start(this->client_->config_.httpd_psram_stack,
                                  this->client_->config_.httpd_priority,
                                  this->client_->config_.httpd_stack_size)) {
         // A persistent failure (e.g. the server port is already in use) is retried with backoff

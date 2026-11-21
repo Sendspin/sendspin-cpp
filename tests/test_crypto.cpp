@@ -20,6 +20,7 @@
 //   aiosendspin/tests/noise/test_keys.py
 
 #include "crypto/constants.h"
+#include "crypto_test_helpers.h"
 #include "test_util.h"
 #include "crypto/keys.h"
 #include "platform/base64.h"
@@ -133,8 +134,8 @@ TEST(HmacSha512, Rfc4231Case2) {
               "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737");
 }
 
-// The long-key branch (key_len > 128 is hashed down to 64 bytes first). Currently dead in
-// production - CPace's mac_key is 64 bytes - but hmac_sha512() claims generic HMAC.
+// The long-key branch (key_len > 128 is hashed down to 64 bytes first). Dead in production, where
+// CPace's mac_key is 64 bytes, but hmac_sha512_streamed() claims generic HMAC.
 TEST(HmacSha512, Rfc4231Case6) {
     std::vector<uint8_t> key(131, 0xaa);
     const char* data = "Test Using Larger Than Block-Size Key - Hash Key First";
@@ -159,7 +160,7 @@ TEST(HmacSha512, BlockSizeKeyIsUsedWithoutHashing) {
 }
 
 // ============================================================================
-// SHA-256 (Sha256 class / sha256_oneshot) KATs
+// SHA-256 (Sha256 class) KATs
 //
 // noise-c's SHA256 backend has no test hook to force an allocation/finalize failure, so the
 // failure branch inside Sha256::ok() cannot be exercised here; the callers that must surface it
@@ -168,13 +169,10 @@ TEST(HmacSha512, BlockSizeKeyIsUsedWithoutHashing) {
 // ============================================================================
 
 TEST(Sha256, KatAbc) {
-    // NIST FIPS 180-4 SHA-256("abc"), via both the one-shot helper and the streaming class.
+    // NIST FIPS 180-4 SHA-256("abc").
     const char* m = "abc";
     const std::string expected =
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-
-    auto d = sha256_oneshot(reinterpret_cast<const uint8_t*>(m), std::strlen(m));
-    EXPECT_EQ(to_hex(d), expected);
 
     Sha256 h;
     h.update(reinterpret_cast<const uint8_t*>(m), std::strlen(m));

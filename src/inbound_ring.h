@@ -343,11 +343,6 @@ public:
     bool create(size_t storage_bytes, MemoryLocation location,
                 size_t largest_message_bytes = INBOUND_MAX_MESSAGE_BYTES);
 
-    /// @brief Whether create() succeeded
-    bool is_created() const {
-        return this->ring_.is_created();
-    }
-
     /// @brief The longest received message a transport writes into a ring item:
     /// max_item_message_bytes() capped at INBOUND_MAX_MESSAGE_BYTES, since a conforming peer's
     /// WebSocket message is at most one Noise frame. The derivation sizes the ring for the
@@ -591,7 +586,7 @@ public:
     /// only.
     /// @return The bits among `bits` that were set; 0 on timeout.
     uint32_t take_signals(uint32_t bits, uint32_t timeout_ms) {
-        return this->flags_.wait(bits, false, true, timeout_ms) & bits;
+        return this->flags_.wait(bits, true, timeout_ms) & bits;
     }
 
     /// @brief Clears every bit. Before the consumer thread starts, while the list is empty.
@@ -1203,12 +1198,8 @@ static constexpr size_t INBOUND_MIN_AUDIO_FRAME_BYTES = 160;
 /// Frames per second at INBOUND_MIN_AUDIO_FRAME_BYTES: one every 20 ms, Opus's default frame.
 static constexpr size_t INBOUND_MIN_AUDIO_FRAMES_PER_SECOND = 50;
 
-/// The lowest audio rate the library budgets for, in encoded bytes per second (64 kbit/s).
-static constexpr size_t MIN_ADVERTISED_AUDIO_BYTES_PER_SECOND =
-    INBOUND_MIN_AUDIO_FRAME_BYTES * INBOUND_MIN_AUDIO_FRAMES_PER_SECOND;
-
-/// Ring storage per second of audio at MIN_ADVERTISED_AUDIO_BYTES_PER_SECOND: each frame stored
-/// as one item with its chunk header and the stored overhead.
+/// Ring storage per second of INBOUND_MIN_AUDIO_FRAMES_PER_SECOND frames of
+/// INBOUND_MIN_AUDIO_FRAME_BYTES, each stored as one item with its chunk header and overhead.
 static constexpr size_t INBOUND_MIN_AUDIO_STORED_BYTES_PER_SECOND =
     (INBOUND_MIN_AUDIO_FRAME_BYTES + INBOUND_AUDIO_CHUNK_HEADER_BYTES +
      INBOUND_ITEM_STORED_OVERHEAD_BYTES) *

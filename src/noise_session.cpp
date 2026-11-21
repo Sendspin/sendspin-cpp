@@ -93,7 +93,7 @@ NoiseSession& NoiseSession::operator=(NoiseSession&& other) noexcept {
 /// Returns nullptr on any error; the caller must free on failure.
 static NoiseHandshakeState* build_responder_hs(const char* suite_name, const uint8_t* local_priv,
                                                const uint8_t* remote_pub, const uint8_t* prologue,
-                                               size_t prologue_len, const uint8_t* psk) {
+                                               size_t prologue_len) {
     NoiseHandshakeState* hs = nullptr;
     const int err = noise_handshakestate_new_by_name(&hs, suite_name, NOISE_ROLE_RESPONDER);
     if (err != NOISE_ERROR_NONE) {
@@ -128,17 +128,6 @@ static NoiseHandshakeState* build_responder_hs(const char* suite_name, const uin
         }
     }
 
-    // PSK: optional at this point. noise-c allows the PSK to be set any time before the
-    // "psk" token is processed (KKpsk2 mixes it only in msg2), so a null psk here just
-    // defers binding to a later NoiseSession::set_psk call.
-    if (psk) {
-        if (noise_handshakestate_set_pre_shared_key(hs, psk, NOISE_PSK_SIZE) != NOISE_ERROR_NONE) {
-            SS_LOGE(TAG, "noise_handshakestate_set_pre_shared_key failed");
-            noise_handshakestate_free(hs);
-            return nullptr;
-        }
-    }
-
     if (noise_handshakestate_start(hs) != NOISE_ERROR_NONE) {
         SS_LOGE(TAG, "noise_handshakestate_start failed");
         noise_handshakestate_free(hs);
@@ -155,10 +144,10 @@ static NoiseHandshakeState* build_responder_hs(const char* suite_name, const uin
 std::optional<NoiseSession> NoiseSession::as_responder(const char* suite_name,
                                                        const uint8_t* local_priv,
                                                        const uint8_t* remote_pub,
-                                                       const uint8_t* prologue, size_t prologue_len,
-                                                       const uint8_t* psk) {
+                                                       const uint8_t* prologue,
+                                                       size_t prologue_len) {
     NoiseHandshakeState* hs =
-        build_responder_hs(suite_name, local_priv, remote_pub, prologue, prologue_len, psk);
+        build_responder_hs(suite_name, local_priv, remote_pub, prologue, prologue_len);
     if (!hs) {
         return std::nullopt;
     }

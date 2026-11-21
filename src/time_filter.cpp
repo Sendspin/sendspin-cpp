@@ -20,21 +20,31 @@
 
 namespace sendspin {
 
-// ============================================================================
-// Lifecycle
-// ============================================================================
+/// Offset random-walk variance per us of elapsed time (diffusion coefficient squared), modeling
+/// clock jitter.
+static constexpr double PROCESS_VARIANCE = 0.0;
 
-SendspinTimeFilter::SendspinTimeFilter() : SendspinTimeFilter(Config{}) {}
+/// Drift random-walk variance per us of elapsed time, modeling frequency wander: the square of a
+/// 1e-11 / sqrt(us) diffusion coefficient.
+static constexpr double DRIFT_PROCESS_VARIANCE = 1e-11 * 1e-11;
 
-SendspinTimeFilter::SendspinTimeFilter(const Config& config)
-    : adaptive_forgetting_cutoff(config.adaptive_cutoff),
-      drift_process_variance(config.drift_process_std_dev * config.drift_process_std_dev),
-      drift_significance_threshold_squared(config.drift_significance_threshold *
-                                           config.drift_significance_threshold),
-      forget_variance_factor(config.forget_factor * config.forget_factor),
-      max_error_scale(config.max_error_scale),
-      process_variance(config.process_std_dev * config.process_std_dev),
-      min_samples_for_forgetting(config.min_samples) {}
+/// Factor applied to the covariances when a large residual is detected: the square of a forgetting
+/// factor of 2. Higher values recover faster from disruptions but reduce stability.
+static constexpr double FORGET_VARIANCE_FACTOR = 2.0 * 2.0;
+
+/// Multiple of max_error a residual must exceed to trigger adaptive forgetting.
+static constexpr double ADAPTIVE_CUTOFF = 3.0;
+
+/// Measurements taken before adaptive forgetting is enabled.
+static constexpr uint8_t MIN_SAMPLES_FOR_FORGETTING = 100U;
+
+/// Drift compensation applies only when drift^2 > this * drift_covariance: the square of an SNR
+/// threshold of 2.
+static constexpr double DRIFT_SIGNIFICANCE_THRESHOLD_SQUARED = 2.0 * 2.0;
+
+/// Scale applied to max_error to give the measurement standard deviation; below 1 because the
+/// round-trip half-delay overestimates the true measurement noise.
+static constexpr double MAX_ERROR_SCALE = 0.5;
 
 // ============================================================================
 // Core API
@@ -51,7 +61,7 @@ void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t 
     const double dt_squared = dt * dt;
     this->last_update_ = time_added;
 
-    const double update_std_dev = max_error * this->max_error_scale;
+    const double update_std_dev = max_error * MAX_ERROR_SCALE;
     const double measurement_variance = update_std_dev * update_std_dev;
 
     // Filter initialization: First measurement establishes offset baseline
@@ -88,30 +98,30 @@ void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t 
 
     // Process noise for both offset and drift (full random walk model)
     // We assume clock jitter (offset noise) and wander (drift noise) are independent processes
-    const double drift_process_variance_dt = dt * this->drift_process_variance;
+    const double drift_process_variance_dt = dt * DRIFT_PROCESS_VARIANCE;
     double new_drift_covariance = this->drift_covariance_ + drift_process_variance_dt;
 
     double new_offset_drift_covariance =
         this->offset_drift_covariance_ + this->drift_covariance_ * dt;
 
-    const double offset_process_variance = dt * this->process_variance;
+    const double offset_process_variance = dt * PROCESS_VARIANCE;
     double new_offset_covariance = this->offset_covariance_ +
                                    2 * this->offset_drift_covariance_ * dt +
                                    this->drift_covariance_ * dt_squared + offset_process_variance;
 
     /*** Innovation and Adaptive Forgetting ***/
     const double residual = measurement - offset;  // Innovation: y_k = z_k - H * x_k|k-1
-    const double max_residual_cutoff = max_error * this->adaptive_forgetting_cutoff;
+    const double max_residual_cutoff = max_error * ADAPTIVE_CUTOFF;
 
-    if (this->count_ < this->min_samples_for_forgetting) {
+    if (this->count_ < MIN_SAMPLES_FOR_FORGETTING) {
         // Build sufficient history before enabling adaptive forgetting
         ++this->count_;
     } else if (std::abs(residual) > max_residual_cutoff) {
         // Large prediction error detected - likely network disruption or clock adjustment
         // Apply forgetting factor to increase Kalman gain and accelerate convergence
-        new_drift_covariance *= this->forget_variance_factor;
-        new_offset_drift_covariance *= this->forget_variance_factor;
-        new_offset_covariance *= this->forget_variance_factor;
+        new_drift_covariance *= FORGET_VARIANCE_FACTOR;
+        new_offset_drift_covariance *= FORGET_VARIANCE_FACTOR;
+        new_offset_covariance *= FORGET_VARIANCE_FACTOR;
     }
 
     /*** Kalman Update Step ***/
@@ -137,7 +147,7 @@ void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t 
     // Only apply drift compensation if statistically significant (SNR check)
     const double drift_squared = this->drift_ * this->drift_;
     this->use_drift_ =
-        drift_squared > this->drift_significance_threshold_squared * this->drift_covariance_;
+        drift_squared > DRIFT_SIGNIFICANCE_THRESHOLD_SQUARED * this->drift_covariance_;
 }
 
 int64_t SendspinTimeFilter::compute_server_time(int64_t client_time) const {
@@ -162,10 +172,6 @@ void SendspinTimeFilter::reset() {
 // ============================================================================
 // Accessors
 // ============================================================================
-
-int64_t SendspinTimeFilter::get_covariance() const {
-    return std::round(this->offset_covariance_);
-}
 
 int64_t SendspinTimeFilter::get_error() const {
     return std::round(sqrt(this->offset_covariance_));

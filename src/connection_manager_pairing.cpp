@@ -756,7 +756,7 @@ void ConnectionManager::close_on_malformed_message(SendspinConnection* conn) {
                                     SendspinPairAbortReason::UNKNOWN);
         return;
     }
-    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+    conn->close_silently();
 }
 
 void ConnectionManager::close_on_sequence_violation(SendspinConnection* conn,

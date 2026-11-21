@@ -34,10 +34,6 @@
 
 namespace sendspin {
 
-// Forward declarations
-class SendspinClient;
-class SendspinConnection;
-
 /// @brief An accepted httpd session whose WebSocket upgrade has not yet been observed.
 ///
 /// The session slot (SendspinWsServer::sessions_) remains the authoritative owner of the
@@ -92,14 +88,12 @@ public:
     using WakeCallback = std::function<void()>;
 
     /// @brief Starts the HTTP server and begins listening for WebSocket connections
-    /// @param client Pointer to the SendspinClient (used for context in callbacks).
     /// @param task_stack_in_psram Whether to allocate the HTTP server task stack in PSRAM.
     /// @param task_priority Priority for the HTTP server task.
     /// @param task_stack_size HTTP server task stack size in bytes. Clamped up to
     ///        SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE if lower.
     /// @return true if server started successfully, false otherwise.
-    bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority,
-               size_t task_stack_size);
+    bool start(bool task_stack_in_psram, unsigned task_priority, size_t task_stack_size);
 
     /// @brief Stops the HTTP server
     void stop();
@@ -243,9 +237,6 @@ protected:
     PlatformBuffer discard_buf_;
 
     // Pointer fields
-
-    /// @brief Stored as the httpd user context for the static callbacks
-    SendspinClient* client_{nullptr};
 
     httpd_handle_t server_{nullptr};
 

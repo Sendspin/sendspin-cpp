@@ -201,7 +201,7 @@ public:
     /// "Noise_KKpsk2_25519_ChaChaPoly_SHA256"), or nullptr if none was set.
     /// Used to select the AEAD cipher for pairing.md "Wrapping" (see
     /// platform/crypto.h aead_cipher_name_from_noise_suite()).
-    virtual const char* get_noise_suite_name() const {
+    const char* get_noise_suite_name() const {
         return this->noise_suite_name_;
     }
 
@@ -337,7 +337,7 @@ public:
     /// block on a transport join; see close_transport_now()). The inbound gate is detached first,
     /// so nothing the peer sent after the failure is processed, and the protocol task reports the
     /// loss.
-    void close_silently(SendspinGoodbyeReason /*reason*/) {
+    void close_silently() {
         this->detach_inbound();
         this->close_transport_now();
     }

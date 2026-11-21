@@ -59,22 +59,6 @@ std::optional<std::array<uint8_t, PAIRING_COMMIT_SIZE>> pairing_code_commit(cons
 }
 
 // ============================================================================
-// pairing_code_verify_commit
-// ============================================================================
-
-bool pairing_code_verify_commit(const uint8_t* nonce, size_t nonce_len, const uint8_t* commitment,
-                                size_t commitment_len) {
-    if (commitment_len != PAIRING_COMMIT_SIZE || nonce_len != PAIRING_NONCE_SIZE) {
-        return false;
-    }
-    auto computed = pairing_code_commit(nonce, nonce_len);
-    if (!computed.has_value()) {
-        return false;
-    }
-    return constant_time_equal(computed->data(), commitment, PAIRING_COMMIT_SIZE);
-}
-
-// ============================================================================
 // pairing_code_digest
 // ============================================================================
 
