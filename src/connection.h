@@ -201,7 +201,7 @@ public:
     /// "Noise_KKpsk2_25519_ChaChaPoly_SHA256"), or nullptr if none was set.
     /// Used to select the AEAD cipher for pairing.md "Wrapping" (see
     /// platform/crypto.h aead_cipher_name_from_noise_suite()).
-    virtual const char* get_noise_suite_name() const {
+    const char* get_noise_suite_name() const {
         return this->noise_suite_name_;
     }
 
